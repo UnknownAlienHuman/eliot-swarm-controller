@@ -558,7 +558,7 @@ function Get-AdapterContract {
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send/next_turn', 'task.dispatch', 'native.mcp.arm', 'native.mcp.install', 'native.mcp.observe', 'native.mcp.read');
                 command_schemas = @('swarm.native_mcp_command@1:', 'swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
-                expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '2'; expected_config_schema_sha256 = 'a43c9b7284dba6efd087c04a747d74ef3bd5ce7a648697f160346a8be5265d9d';
+                expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '2'; expected_config_schema_sha256 = '7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68';
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
                 expected_provider = $null; expected_model = $null; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
             }

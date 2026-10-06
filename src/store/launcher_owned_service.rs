@@ -22,7 +22,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
 const MAX_PROOF_BYTES: usize = 8 * 1024;
@@ -839,7 +839,7 @@ fn opening_scope(
                     .as_str()
                     .unwrap_or_default()
             )
-        || binding.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
+        || !owned_opencode_artifact(&binding.module_artifact_id)
         || manifest["task"]["task_id"] != task_id
         || manifest["task"]["attempt_id"] != attempt_id
         || manifest["binding"]["binding_id"] != binding_id
@@ -1004,6 +1004,133 @@ fn make_admission(scope: &OpeningScope, owner_nonce: String) -> Result<StartAdmi
         intent,
         row,
     })
+}
+
+/// Retain the existing Store-owned intent and immutable nonce before the
+/// standalone module supervisor asks for launch. This is admission only: it
+/// performs no file reads, provider work, HTTP, or native process effect.
+pub(crate) fn ensure_module_owned_service_intent(
+    tx: &Transaction<'_>,
+    config: &Config,
+    binding_id: &str,
+    generation: i64,
+) -> Result<()> {
+    let scope = opening_scope(tx, config, binding_id, generation)?;
+    let existing = load_start_row(tx, binding_id, generation)?;
+    let owner_nonce = existing
+        .as_ref()
+        .map(|row| row.owner_nonce.clone())
+        .unwrap_or_else(model::new_id);
+    let admission = make_admission(&scope, owner_nonce)?;
+    let expected_workspace_directory = admission.route.workspace_directory().to_path_buf();
+    verify_scope_for_admission(
+        &scope,
+        &admission.actor,
+        &admission.row,
+        &expected_workspace_directory,
+    )?;
+    match existing {
+        Some(row) => verify_start_row(&row, &admission.row),
+        None => {
+            insert_start_reservation(tx, &admission.row)?;
+            Ok(())
+        }
+    }
+}
+
+/// Build the private owner projection consumed by the standalone mapper. The
+/// route and nonce come from the exact retained Store binding/start intent;
+/// callers never infer ownership from public native options.
+pub(crate) fn module_owned_route_options(
+    db: &Connection,
+    config: &Config,
+    binding_id: &str,
+    generation: i64,
+    native_options: Value,
+) -> Result<Value> {
+    let binding = binding_row(db, binding_id, generation)?;
+    let route = parse_route(&binding.route_json)?;
+    let configured = native_options.as_object().ok_or_else(|| {
+        Error::new(
+            "MODULE_CONFIG_INVALID",
+            "owned module route native options must be an object",
+        )
+    })?;
+    let workspace_directory = configured
+        .get("directory")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                "owned module route has no retained workspace directory",
+            )
+        })?
+        .to_owned();
+    let current = current_owned_route(config, &route, Path::new(&workspace_directory))?;
+    let Some(owned_service) = current.owned_service else {
+        return Ok(native_options);
+    };
+    let row = load_start_row(db, binding_id, generation)?.ok_or_else(|| {
+        Error::new(
+            "OWNED_SERVICE_INTENT_MISSING",
+            "selected owned module has no retained Store start intent",
+        )
+    })?;
+    if row.state != "reserved" {
+        return Err(recovery_required(&row.state));
+    }
+    let base_route = OwnedServiceRoute::from_config(&owned_service)?;
+    let launch_route = base_route.for_launch(&row.owner_nonce, Path::new(&workspace_directory))?;
+    let mut object = serde_json::to_value(launch_route.options())?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                "owned module route options could not be projected",
+            )
+        })?;
+    object.insert("__eliot_owned_service".to_owned(), serde_json::to_value(owned_service)?);
+    object.insert("__eliot_owner_nonce".to_owned(), Value::String(row.owner_nonce));
+    Ok(Value::Object(object))
+}
+
+/// Return only the typed native options for the C8 command envelope. The
+/// standalone launch mapper consumes the two private owner markers above;
+/// they are deliberately removed before a RuntimeCommand reaches the adapter,
+/// whose route decoder accepts only the registered NativeOptions shape.
+pub(crate) fn module_owned_native_options(
+    db: &Connection,
+    config: &Config,
+    binding_id: &str,
+    generation: i64,
+    native_options: Value,
+) -> Result<Value> {
+    let projected =
+        module_owned_route_options(db, config, binding_id, generation, native_options)?;
+    let mut object = projected.as_object().cloned().ok_or_else(|| {
+        Error::new(
+            "MODULE_CONFIG_INVALID",
+            "owned module route options could not be projected",
+        )
+    })?;
+    if object.remove("__eliot_owned_service").is_none()
+        || object.remove("__eliot_owner_nonce").is_none()
+    {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "owned module route is missing its private owner projection",
+        ));
+    }
+    Ok(Value::Object(object))
+}
+
+fn owned_opencode_artifact(artifact: &str) -> bool {
+    matches!(
+        artifact,
+        crate::runtime::opencode_v2::ARTIFACT_ID | crate::config::OPENCODE_RUST_ARTIFACT_ID
+    )
 }
 
 fn insert_start_reservation(tx: &Transaction<'_>, row: &OwnedStartRow) -> Result<()> {
@@ -2449,10 +2576,12 @@ fn current_owned_route(
     expected_workspace_directory: &std::path::Path,
 ) -> Result<Route> {
     let mut current = config.route(&stored.alias)?;
-    if current.runtime != crate::runtime::opencode_v2::RUNTIME
-        || current.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
-        || current.owned_service.is_none()
-    {
+    let supported_route =
+        (current.runtime == crate::runtime::opencode_v2::RUNTIME
+            && current.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+            || (current.runtime == "module"
+                && current.module_artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID);
+    if !supported_route || current.owned_service.is_none() {
         return Err(scope_changed());
     }
     let workspace_directory = expected_workspace_directory

@@ -537,7 +537,8 @@ impl Store {
         &self,
         cursor: Option<module_demand::ModuleDemandCursor>,
     ) -> Result<module_demand::ModuleDemandSnapshot> {
-        self.run(move |db| module_demand::pending(db, cursor.as_ref()))
+        let config = self.config.clone();
+        self.run(move |db| module_demand::pending(db, config.as_ref(), cursor.as_ref()))
             .await
     }
 
@@ -2623,6 +2624,22 @@ fn initialize_database(
             return Err(Error::new(
                 "INTERNAL_CLIENT_CONFLICT",
                 "reserved scheduler identity already has a transport registration",
+            ));
+        }
+    }
+    let c8_native_mcp_key = "client:swarm.internal.c8.native_mcp";
+    let c8_native_mcp_record = json!({
+        "role": "module",
+        "internal_only": true,
+        "disabled": false,
+    });
+    match meta(tx, c8_native_mcp_key)? {
+        None => set_meta(tx, c8_native_mcp_key, &c8_native_mcp_record)?,
+        Some(existing) if existing == c8_native_mcp_record => {}
+        Some(_) => {
+            return Err(Error::new(
+                "INTERNAL_CLIENT_CONFLICT",
+                "reserved native MCP caller identity has incompatible registration",
             ));
         }
     }
@@ -5201,6 +5218,25 @@ pub(super) fn insert_safe_host_terminal_failure_event(
     Ok(())
 }
 
+pub(super) fn is_safe_native_result_error_code(value: &str) -> bool {
+    matches!(
+        value,
+        "MODULE_RECEIPT_INVALID"
+            | "MODULE_RESULT_ACK_INVALID"
+            | "RESULT_BODY_UNAVAILABLE"
+            | "RESULT_ORIGIN_INVALID"
+            | "RESULT_PAGE_UNAVAILABLE"
+            | "RESULT_PROVENANCE_INVALID"
+            | "RESULT_RANGE_INVALID"
+            | "RESULT_SELECTOR_UNSUPPORTED"
+            | "RESULT_TARGET_NOT_ADMITTED"
+            | "RESULT_TARGET_NOT_TERMINAL"
+            | "RESULT_TARGET_ORIGIN_INVALID"
+            | "RESULT_TARGET_RECEIPT_INVALID"
+            | "RESULT_TARGET_SCOPE_INVALID"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn insert_safe_system_event(
     tx: &Transaction<'_>,
@@ -5280,9 +5316,16 @@ pub(super) fn insert_safe_system_event(
             ));
         };
         let expected_id = format!("operation:{operation_id}:{phase}");
+        let native_result_failure = source_stream_id == "controller:runtime"
+            && kind == "native.operation.completed"
+            && phase == "native_outcome_terminal";
         if occurrence_id != Some(expected_id.as_str())
             || host_epoch_pair.is_some()
-            || error_code.is_some()
+            || (!native_result_failure && error_code.is_some())
+            || (native_result_failure && error_code.is_some() && status != "rejected")
+            || error_code.is_some_and(|code| {
+                native_result_failure && !is_safe_native_result_error_code(code)
+            })
         {
             return Err(Error::new(
                 "SYSTEM_EVENT_INVALID",

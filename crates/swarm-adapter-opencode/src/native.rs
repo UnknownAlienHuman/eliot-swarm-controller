@@ -29,6 +29,9 @@ const MAX_NATIVE_ERROR_BODY: usize = 8 * 1024;
 const MAX_CONNECTION_FILE: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_EVENTS: usize = 8192;
+const MAX_MESSAGE_PAGE: usize = 50;
+const MAX_MESSAGE_PAGES: usize = 32;
+const MAX_MESSAGE_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
@@ -69,6 +72,30 @@ pub enum InputEvidence {
 #[derive(Debug, Clone)]
 pub struct InputStatusEvidence {
     pub input_message_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantResultEvidence {
+    pub message_id: String,
+    pub parent_id: String,
+    pub message: Value,
+    pub payload_sha256: String,
+    pub payload_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessagePage {
+    data: Vec<Value>,
+    cursor: MessageCursor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageCursor {
+    next: Option<String>,
+    #[serde(rename = "previous")]
+    _previous: Option<String>,
 }
 
 pub struct NativeClient {
@@ -146,6 +173,61 @@ impl NativeClient {
     pub async fn probe_route(&self, options: &NativeOptions) -> Result<()> {
         self.location(options).await?;
         self.check_route_model_available(options).await
+    }
+
+    /// Read the provider integration projection for one exact workspace. The
+    /// caller validates the returned shape before making any mutation.
+    pub async fn provider_integration(&self, directory: &str) -> Result<Value> {
+        self.get(
+            "/api/integration",
+            &[("location[directory]", directory.to_owned())],
+        )
+        .await
+    }
+
+    /// Perform the one provider API-key POST. The shared request path maps a
+    /// deterministic HTTP rejection to `NATIVE_REJECTED` and every transport
+    /// ambiguity to `NATIVE_OUTCOME_UNKNOWN`.
+    pub async fn post_provider_key(
+        &self,
+        provider_id: &str,
+        key: &str,
+        directory: &str,
+    ) -> Result<()> {
+        if !valid_provider_id(provider_id) {
+            return Err(Error::new(
+                "NATIVE_PROVIDER_ID_INVALID",
+                "selected provider ID is not one safe integration path segment",
+            ));
+        }
+        if key.is_empty() || directory.is_empty() || directory.len() > 4096 {
+            return Err(Error::invalid("provider integration input is invalid"));
+        }
+        let body = json!({"key":key});
+        let path = format!("/api/integration/{provider_id}/connect/key");
+        let value = self
+            .request(
+                Method::POST,
+                &path,
+                &[("location[directory]", directory.to_owned())],
+                Some(&body),
+            )
+            .await?;
+        if !value.is_null() {
+            return Err(Error::new(
+                "NATIVE_SCHEMA_ERROR",
+                "provider key response was not empty",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     pub async fn preflight_open(&self, options: &NativeOptions) -> Result<Value> {
@@ -445,6 +527,225 @@ impl NativeClient {
         }
         Ok(InputStatusEvidence {
             input_message_sha256: digest_json(message)?,
+        })
+    }
+
+    /// Read one exact assistant projection and require the native parent edge
+    /// to the deterministic admitted user message. OpenCode 2.0.7's public
+    /// projection currently omits that edge, so this method fails closed with
+    /// `NATIVE_ASSISTANT_PARENT_UNAVAILABLE`; it never maps by order, latest
+    /// response, timestamp, or a generated sequence.
+    pub async fn read_assistant_result(
+        &self,
+        intent: &OperationIntent,
+        options: &NativeOptions,
+        assistant_message_id: &str,
+    ) -> Result<AssistantResultEvidence> {
+        if intent.method != "task.dispatch"
+            || intent.native_scope_key != options.scope_key()
+            || intent.route_sha256 != digest_json(&serde_json::to_value(options)?)?
+        {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved dispatch intent differs from the exact assistant-result route",
+            ));
+        }
+        let root = intent.native_root_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "saved dispatch intent has no exact native session ID",
+            )
+        })?;
+        let input = intent.native_input_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "saved dispatch intent has no exact native input ID",
+            )
+        })?;
+        if root != root_id(&intent.binding_id, intent.generation)
+            || input != input_id(&intent.operation_id)
+        {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved dispatch session or input differs from its immutable Operation identity",
+            ));
+        }
+        valid_id(root, "ses")?;
+        valid_id(input, "msg_swarm_")?;
+        valid_id(assistant_message_id, "msg_")?;
+        if assistant_message_id == input {
+            return Err(Error::new(
+                "NATIVE_ASSISTANT_PARENT_MISMATCH",
+                "assistant selector names the admitted user message",
+            ));
+        }
+
+        let session = self.session(root).await?;
+        let location = self.location(options).await?;
+        if !session_identity_matches(
+            &session,
+            root,
+            options,
+            &location,
+            &intent.binding_id,
+            intent.generation,
+        ) || session["metadata"]["eliot"]["binding"] != intent.binding_id
+            || session["metadata"]["eliot"]["generation"] != intent.generation
+        {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact saved native session identity was not observed",
+            ));
+        }
+        self.check_route_model_available(options).await?;
+        self.require_durable_root_creation_for_intent(root, intent, options)
+            .await?;
+
+        let first = self
+            .scan_assistant_result(root, input, assistant_message_id, intent)
+            .await?;
+        let second = self
+            .scan_assistant_result(root, input, assistant_message_id, intent)
+            .await?;
+        if first.message != second.message || first.parent_id != second.parent_id {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "repeated assistant projection changed during readback",
+            ));
+        }
+        Ok(first)
+    }
+
+    async fn scan_assistant_result(
+        &self,
+        session: &str,
+        input_id: &str,
+        assistant_id: &str,
+        intent: &OperationIntent,
+    ) -> Result<AssistantResultEvidence> {
+        let mut cursor: Option<String> = None;
+        let mut cursors = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut scanned_bytes = 0usize;
+        let mut input_message: Option<Value> = None;
+        let mut assistant_message: Option<Value> = None;
+
+        for _ in 0..MAX_MESSAGE_PAGES {
+            let mut query = vec![("limit", MAX_MESSAGE_PAGE.to_string())];
+            if let Some(cursor) = &cursor {
+                query.push(("cursor", cursor.clone()));
+            } else {
+                query.push(("order", "desc".to_owned()));
+            }
+            let raw = self
+                .get(&format!("/api/session/{session}/message"), &query)
+                .await?;
+            scanned_bytes = scanned_bytes.saturating_add(canonical_json(&raw)?.len());
+            if scanned_bytes > MAX_MESSAGE_SCAN_BYTES {
+                return Err(Error::new(
+                    "NATIVE_MESSAGE_SCAN_LIMIT",
+                    "native assistant message projection exceeds its read bound",
+                ));
+            }
+            let page: MessagePage = serde_json::from_value(raw).map_err(|_| {
+                Error::new(
+                    "NATIVE_MESSAGE_SCHEMA",
+                    "native assistant message page is outside the pinned contract",
+                )
+            })?;
+            if page.data.len() > MAX_MESSAGE_PAGE
+                || (page.data.is_empty() && page.cursor.next.is_some())
+            {
+                return Err(Error::new(
+                    "NATIVE_MESSAGE_SCHEMA",
+                    "native assistant message page has an invalid bound",
+                ));
+            }
+            for message in page.data {
+                let id = message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "NATIVE_MESSAGE_SCHEMA",
+                            "native message lacks its exact identity",
+                        )
+                    })?;
+                valid_id(id, "msg_")?;
+                if !ids.insert(id.to_owned()) {
+                    return Err(Error::new(
+                        "NATIVE_MESSAGE_AMBIGUOUS",
+                        "native message projection repeated an ID",
+                    ));
+                }
+                if id == input_id {
+                    if !saved_message_matches(
+                        &message,
+                        session,
+                        input_id,
+                        &intent.marker,
+                        intent,
+                    ) {
+                        return Err(Error::new(
+                            "NATIVE_INPUT_MISMATCH",
+                            "native user message differs from the exact admitted input",
+                        ));
+                    }
+                    input_message = Some(message.clone());
+                }
+                if id == assistant_id {
+                    validate_assistant_parent(&message, session, input_id)?;
+                    if assistant_message.replace(message).is_some() {
+                        return Err(Error::new(
+                            "NATIVE_MESSAGE_AMBIGUOUS",
+                            "native assistant projection contains more than one selected ID",
+                        ));
+                    }
+                }
+            }
+            match page.cursor.next {
+                None => break,
+                Some(next)
+                    if !next.is_empty()
+                        && next.len() <= 4096
+                        && cursors.insert(next.clone()) =>
+                {
+                    cursor = Some(next);
+                }
+                Some(_) => {
+                    return Err(Error::new(
+                        "NATIVE_MESSAGE_CURSOR",
+                        "native assistant message cursor repeated or is invalid",
+                    ));
+                }
+            }
+        }
+
+        if cursor.is_some() {
+            return Err(Error::new(
+                "NATIVE_MESSAGE_SCAN_LIMIT",
+                "native assistant message projection exceeded its page bound",
+            ));
+        }
+        if input_message.is_none() {
+            return Err(Error::new(
+                "NATIVE_INPUT_NOT_OBSERVED",
+                "exact admitted native user message was not observed",
+            ));
+        }
+        let message = assistant_message.ok_or_else(|| {
+            Error::new(
+                "NATIVE_ASSISTANT_RESULT_NOT_OBSERVED",
+                "selected native assistant message was not observed",
+            )
+        })?;
+        let encoded = canonical_json(&message)?.into_bytes();
+        Ok(AssistantResultEvidence {
+            message_id: assistant_id.to_owned(),
+            parent_id: input_id.to_owned(),
+            payload_sha256: sha256(&encoded),
+            payload_bytes: encoded.len() as u64,
+            message,
         })
     }
 
@@ -913,6 +1214,45 @@ impl NativeClient {
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::POST, path, &[], Some(&body)).await
     }
+
+    /// Native MCP command consumers use the same authenticated, bounded HTTP
+    /// client as ordinary OpenCode dispatch. These wrappers expose no endpoint
+    /// or credential material beyond the already-admitted local path/body.
+    pub async fn mcp_get(&self, path: &str) -> Result<Value> {
+        self.get(path, &[]).await
+    }
+
+    pub async fn mcp_put(&self, path: &str, body: Value) -> Result<Value> {
+        self.request(Method::PUT, path, &[], Some(&body)).await
+    }
+
+    pub async fn mcp_post(&self, path: &str, body: Value) -> Result<Value> {
+        self.post(path, body).await
+    }
+
+    pub async fn verify_mcp_service(&self) -> Result<()> {
+        let info: ServerInfo = serde_json::from_value(self.get("/api/info", &[]).await?)
+            .map_err(|_| Error::new("NATIVE_SCHEMA_ERROR", "native info response is invalid"))?;
+        if info.pid != self.pid
+            || info.version != self.version
+            || info.urls.is_empty()
+            || info.paths.tmp.is_empty()
+        {
+            return Err(Error::new(
+                "NATIVE_INSTANCE_CHANGED",
+                "native service identity/version differs from the authenticated connection",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn process_version(&self) -> &str {
+        &self.version
+    }
 }
 
 async fn read_native_http_failure(
@@ -992,6 +1332,7 @@ pub fn intent_for(
         prompt_bytes: text.map(|text| text.len() as u64),
         reconcile_target_operation_id,
         result_input_status: None,
+        result_assistant: None,
         dispatch_admission: None,
         route_sha256,
         model: serde_json::to_value(&options.model)?,
@@ -1032,7 +1373,7 @@ pub fn prompt(command: &RuntimeCommand) -> Result<String> {
     ))
 }
 
-fn canonical_json(value: &Value) -> Result<String> {
+pub fn canonical_json(value: &Value) -> Result<String> {
     fn ordered(value: &Value) -> Value {
         match value {
             Value::Object(object) => {
@@ -1243,6 +1584,85 @@ fn saved_message_matches(
         && no_attachments(message)
 }
 
+fn validate_assistant_parent(message: &Value, session: &str, input_id: &str) -> Result<()> {
+    if message["type"] != "assistant" {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_RESULT_NOT_ASSISTANT",
+            "selected native message is not an assistant projection",
+        ));
+    }
+    if message.get("sessionID").is_some_and(|value| value != session) {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_SESSION_MISMATCH",
+            "selected assistant message names another native session",
+        ));
+    }
+    let parent = message
+        .get("parentID")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_ASSISTANT_PARENT_UNAVAILABLE",
+                "pinned native assistant projection has no parent message identity",
+            )
+        })?;
+    if parent != input_id {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_PARENT_MISMATCH",
+            "assistant parent does not name the exact admitted user message",
+        ));
+    }
+    let created = message["time"]["created"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| {
+            Error::new("NATIVE_ASSISTANT_SCHEMA", "assistant creation time is invalid")
+        })?;
+    message["time"]["completed"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= created)
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_ASSISTANT_NOT_COMPLETE",
+                "assistant projection has no completed timestamp",
+            )
+        })?;
+    if message.get("truncated").is_some_and(|value| value == true) {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_TRUNCATED",
+            "assistant projection is truncated",
+        ));
+    }
+    let finish = message["finish"].as_str().ok_or_else(|| {
+        Error::new(
+            "NATIVE_ASSISTANT_NOT_COMPLETE",
+            "assistant projection has no terminal finish",
+        )
+    })?;
+    if !matches!(
+        finish,
+        "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
+    ) {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_SCHEMA",
+            "assistant projection has an unsupported terminal finish",
+        ));
+    }
+    let content = message["content"].as_array().ok_or_else(|| {
+        Error::new(
+            "NATIVE_ASSISTANT_SCHEMA",
+            "assistant projection lacks its complete content body",
+        )
+    })?;
+    if content.iter().any(|part| part["truncated"] == true) {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_TRUNCATED",
+            "assistant content projection is truncated",
+        ));
+    }
+    Ok(())
+}
+
 fn saved_text_matches(text: &str, intent: &OperationIntent) -> bool {
     let digest = sha256(text.as_bytes());
     intent.prompt_sha256.as_deref() == Some(digest.as_str())
@@ -1368,6 +1788,14 @@ fn valid_id(value: &str, prefix: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 pub fn root_id(binding: &str, generation: i64) -> String {

@@ -251,7 +251,7 @@ fn attach_batch(db: &mut Connection, binding: &Value, boot: &str) -> Result<Prin
     };
     let now = model::now_ms()?;
     tx.execute(
-        "UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted') AND method IN ('agent.open','task.dispatch','agent.refresh','agent.reconcile','agent.result')",
+        "UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted') AND method IN ('agent.open','task.dispatch','agent.refresh','agent.reconcile','agent.result','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')",
         params![id, generation, now],
     )?;
     super::capacity::sync_binding(&tx, id, generation, now)?;
@@ -282,7 +282,7 @@ fn batch_original(
         |row| row.get(0),
     )?;
     let mut input: Value = serde_json::from_str(&raw)?;
-    let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
+    let mut input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&operation, "method")?.to_owned();
     if method == "task.dispatch" {
         let attempt = tasks::get_attempt(db, model::text(&input, "attempt_id")?)?;
@@ -538,9 +538,9 @@ pub(super) fn hello(
     let mut needs_recovery = false;
     if old_boot.is_some_and(|old| old != boot) {
         let possible: i64 = if sessionless_batch {
-            tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.refresh','agent.reconcile')",params![id,generation],|r|r.get(0))?
+            tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.refresh','agent.reconcile','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')",params![id,generation],|r|r.get(0))?
         } else {
-            tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown','settled') AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal')",params![id,generation],|r|r.get(0))?
+            tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown','settled') AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')",params![id,generation],|r|r.get(0))?
         };
         needs_recovery = possible > 0 || (!sessionless_batch && !b["native_root_id"].is_null());
         if needs_recovery && !recovered {
@@ -688,15 +688,16 @@ fn next_internal(
              WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
                AND (?5=0 OR (method='agent.result' AND json_type(candidate.effective_request_json,'$.normalized_result_origin')='object'))
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
-               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
-               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
+               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
+               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
                  OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
                  OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
                  OR NOT EXISTS (SELECT 1 FROM operations AS pending
                    WHERE pending.binding_id=?1 AND pending.binding_generation=?2
                      AND pending.state IN ('sending','native_accepted','outcome_unknown')
-                     AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover')))
-             ORDER BY CASE WHEN method IN ('agent.reply','agent.background') THEN 0
+                      AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')))
+             ORDER BY CASE WHEN method IN ('native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read') THEN 0
+                           WHEN method IN ('agent.reply','agent.background') THEN 1
                            WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
                            WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
                            WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
@@ -799,13 +800,45 @@ fn next_internal(
         }
     };
     let mut input: Value = serde_json::from_str(&raw)?;
-    let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
+    let mut input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let effective_raw: String = tx.query_row(
         "SELECT effective_request_json FROM operations WHERE operation_id=?1",
         [&op],
         |row| row.get(0),
     )?;
     let effective: Value = serde_json::from_str(&effective_raw)?;
+    if matches!(
+        method.as_str(),
+        "native.mcp.install"
+            | "native.mcp.observe"
+            | "native.mcp.arm"
+            | "native.mcp.read"
+    ) {
+        // Native C8 children retain the original pre-enrichment DTO digest.
+        // The private effect is injected only at this authenticated module
+        // boundary and is never part of the immutable input identity.
+        input_sha256 = effective["native_mcp"]["input_sha256"]
+            .as_str()
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "NATIVE_MCP_INPUT_INVALID",
+                    "native MCP input digest is invalid",
+                )
+            })?
+            .to_owned();
+        input["input_sha256"] = json!(input_sha256.clone());
+        let effect = effective["native_mcp"]["effect"].clone();
+        if !effect.is_object() {
+            return Err(Error::new(
+                "NATIVE_MCP_HANDOFF_MISSING",
+                "native MCP private effect handoff is missing",
+            ));
+        }
+        input["effect"] = effect;
+    }
     if method == "agent.result" && effective["normalized_result_origin"].is_object() {
         input["normalized_result_origin"] = effective["normalized_result_origin"].clone();
         if effective["normalized_result_payload_identity"].is_object() {
@@ -830,8 +863,38 @@ fn next_internal(
         } else {
             None
         };
+        let internal_native_mcp = o["caller_id"] == "swarm.internal.c8.native_mcp"
+            && matches!(
+                method.as_str(),
+                "native.mcp.install"
+                    | "native.mcp.observe"
+                    | "native.mcp.arm"
+                    | "native.mcp.read"
+            );
+        if internal_native_mcp {
+            let registration = meta(&tx, "client:swarm.internal.c8.native_mcp")?
+                .ok_or_else(|| {
+                    Error::new(
+                        "INTERNAL_CLIENT_NOT_REGISTERED",
+                        "native MCP phase caller is not durably registered",
+                    )
+                })?;
+            if registration["role"] != "module"
+                || registration["internal_only"] != true
+                || registration["disabled"] == true
+            {
+                return Err(Error::new(
+                    "INTERNAL_CLIENT_INVALID",
+                    "native MCP phase caller has no internal module scope",
+                ));
+            }
+        }
         let caller =
-            if opening_actor.is_some() || repair_context.is_some() || normalized_result_admitted {
+            if opening_actor.is_some()
+                || repair_context.is_some()
+                || normalized_result_admitted
+                || internal_native_mcp
+            {
                 // The exact opening guard above validated the retained actor in
                 // this transaction. A technical requester is not a registered
                 // client or a Principal; no synthetic profile is created here.
@@ -949,6 +1012,7 @@ fn next_internal(
         if method != "agent.open"
             && repair_context.is_none()
             && !normalized_result_admitted
+            && !internal_native_mcp
             && caller["role"] != "operator"
         {
             let caller_id = model::text(&o, "caller_id")?;
@@ -1036,10 +1100,23 @@ fn next_internal(
                 "owned command requires the current controller configuration",
             )
         })?;
-        let options = super::launcher_owned_service::effective_options_for_binding(
-            &tx, config, &id, generation,
-        )?;
-        command_route["native_options"] = json!(options);
+        let module_owned = command_route["runtime"] == "module"
+            && command_route["module_artifact_id"] == crate::config::OPENCODE_RUST_ARTIFACT_ID;
+        command_route["native_options"] = if module_owned {
+            super::launcher_owned_service::module_owned_native_options(
+                &tx,
+                config,
+                &id,
+                generation,
+                command_route["native_options"].clone(),
+            )?
+        } else {
+            json!(
+                super::launcher_owned_service::effective_options_for_binding(
+                    &tx, config, &id, generation,
+                )?
+            )
+        };
     }
     let now = model::now_ms()?;
     let won=tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND state='queued'",params![op,now])?;
@@ -2322,6 +2399,19 @@ pub(super) fn outcome_with_artifacts(
             EffectOutcome::Accepted | EffectOutcome::Unknown => unreachable!(),
         };
         let occurrence_id = format!("operation:{}:{}", r.operation_id, phase);
+        // A deterministic result rejection already has an authenticated,
+        // retained Operation receipt. Carry only the closed result-diagnostic
+        // vocabulary into the Manager event projection; transport uncertainty
+        // remains the existing outcome_unknown path.
+        let result_failure_code = if o["method"] == "agent.result"
+            && matches!(r.outcome, EffectOutcome::Rejected)
+        {
+            r.details["diagnostic_code"]
+                .as_str()
+                .filter(|code| super::is_safe_native_result_error_code(code))
+        } else {
+            None
+        };
         super::insert_safe_system_event(
             &tx,
             "controller:runtime",
@@ -2332,7 +2422,7 @@ pub(super) fn outcome_with_artifacts(
             status,
             Some(&occurrence_id),
             None,
-            None,
+            result_failure_code,
             now,
         )?;
     }
@@ -2510,7 +2600,7 @@ fn ensure_batch_root(data_dir: &Path) -> Result<PathBuf> {
 fn batch_pending_ids(db: &Connection, p: &Principal) -> Result<Vec<String>> {
     let (id, generation, _) = scope(db, p, true)?;
     let mut stmt = db.prepare(
-        "SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.refresh','agent.reconcile','agent.result') ORDER BY created_at_ms,operation_id",
+        "SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.refresh','agent.reconcile','agent.result','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read') ORDER BY created_at_ms,operation_id",
     )?;
     Ok(stmt
         .query_map(params![id, generation], |row| row.get::<_, String>(0))?

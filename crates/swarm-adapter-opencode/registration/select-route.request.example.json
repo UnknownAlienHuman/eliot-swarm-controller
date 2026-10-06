@@ -2,6 +2,6 @@
   "route_alias": "<operator-selected-route-alias>",
   "module_id": "eliot.opencode.v2",
   "artifact_id": "eliot-opencode-v2.rust-http.1",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "expected_catalog_revision": 0
 }

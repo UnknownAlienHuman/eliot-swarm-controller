@@ -158,81 +158,44 @@ impl Store {
             )
             .await?;
 
+        if let Some(module_operation_id) = initial["install"]["module_operation_id"].as_str() {
+            let module_operation_phase = initial["install"]["module_operation_phase"]
+                .as_str()
+                .ok_or_else(|| record_error("native MCP install operation phase is missing"))?;
+            if self
+                .consume_native_mcp_operation(
+                    &facts,
+                    &credential,
+                    &assignment,
+                    module_operation_id,
+                    module_operation_phase,
+                    &install_identity,
+                    service.pid,
+                    &service.version,
+                )
+                .await?
+            {
+                return self.summary(&facts, &credential, &assignment).await;
+            }
+        }
+
         match initial["install"]["state"].as_str() {
             Some("prepared") => {
+                let command = prepared.native_mcp_command(
+                    "install",
+                    assignment.binding_id(),
+                    assignment.binding_generation(),
+                    service.pid,
+                )?;
                 if self
-                    .reserve_install_effect(&facts, &credential, &assignment)
+                    .reserve_install_effect(&facts, &credential, &assignment, command)
                     .await?
                 {
-                    // Recheck the Store scope and the exact process identity
-                    // after the durable reservation and immediately before
-                    // the one allowed PUT attempt.
-                    let (effect_service, _) = self
-                        .connect_current(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            Some((service.pid, service.version.as_str())),
-                        )
-                        .await?;
-                    let install = tokio::time::timeout(
-                        NATIVE_ACTION_TIMEOUT,
-                        crate::runtime::opencode_v2::mcp_install::register(
-                            &effect_service,
-                            &facts.options,
-                            &prepared,
-                        ),
-                    )
-                    .await;
-                    self.current_scope(&facts, &credential, Some(&assignment))
-                        .await?;
-                    let after_service = self
-                        .verify_current_service(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            (service.pid, service.version.as_str()),
-                            &effect_service,
-                        )
-                        .await;
-                    after_service?;
-                    match install {
-                        Ok(Ok(readback)) => {
-                            let payload = readback.as_value();
-                            self.record_install_ack(
-                                &facts,
-                                &credential,
-                                &assignment,
-                                &install_identity,
-                                service.pid,
-                                &service.version,
-                                payload,
-                            )
-                            .await?;
-                        }
-                        Ok(Err(error)) => {
-                            self.record_safe_error(
-                                &facts,
-                                &credential,
-                                &assignment,
-                                "install",
-                                &error.code,
-                            )
-                            .await?;
-                            return self.summary(&facts, &credential, &assignment).await;
-                        }
-                        Err(_) => {
-                            self.record_safe_error(
-                                &facts,
-                                &credential,
-                                &assignment,
-                                "install",
-                                "NATIVE_MCP_INSTALL_TIMEOUT",
-                            )
-                            .await?;
-                            return self.summary(&facts, &credential, &assignment).await;
-                        }
-                    }
+                    // The reservation and module Operation are committed
+                    // together. The independent adapter will perform the
+                    // one PUT and retain its RuntimeOutcome in that child
+                    // Operation; this tick only reports the queued phase.
+                    return self.summary(&facts, &credential, &assignment).await;
                 }
                 // The phase changed to `outcome_unknown` before any possible
                 // network effect. The next call must use observe-only.
@@ -242,64 +205,20 @@ impl Store {
                 // A lost/uncertain PUT is never sent again. Read only the
                 // uniquely derived name at its original process/location.
                 let target = install_target(&initial)?;
-                let (observe_service, _) = self
-                    .connect_current(
-                        &facts,
-                        &credential,
-                        &assignment,
-                        Some((target.0, target.1.as_str())),
-                    )
-                    .await?;
-                let observed = tokio::time::timeout(
-                    NATIVE_ACTION_TIMEOUT,
-                    crate::runtime::opencode_v2::mcp_install::observe(
-                        &observe_service,
-                        &facts.options,
-                        &prepared,
-                    ),
-                )
-                .await;
-                self.current_scope(&facts, &credential, Some(&assignment))
-                    .await?;
-                self.verify_current_service(
+                let command = prepared.native_mcp_command(
+                    "observe",
+                    assignment.binding_id(),
+                    assignment.binding_generation(),
+                    target.0,
+                )?;
+                self.queue_install_observation(
                     &facts,
                     &credential,
                     &assignment,
-                    (target.0, target.1.as_str()),
-                    &observe_service,
+                    command,
+                    "observe_unknown",
                 )
                 .await?;
-                match observed {
-                    Ok(Ok(readback)) => {
-                        self.record_install_observation(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            readback.map(|value| value.as_value()),
-                        )
-                        .await?;
-                    }
-                    Ok(Err(error)) => {
-                        self.record_safe_error(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            "install_readback",
-                            &error.code,
-                        )
-                        .await?;
-                    }
-                    Err(_) => {
-                        self.record_safe_error(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            "install_readback",
-                            "NATIVE_MCP_READBACK_TIMEOUT",
-                        )
-                        .await?;
-                    }
-                }
                 return self.summary(&facts, &credential, &assignment).await;
             }
             Some("registered") => {}
@@ -325,64 +244,44 @@ impl Store {
             // Connection state is refreshable by GET, but it never causes a
             // second PUT. A recovered status also cannot prove the local
             // command/config because the pinned API does not expose it.
-            let observed = tokio::time::timeout(
-                NATIVE_ACTION_TIMEOUT,
-                crate::runtime::opencode_v2::mcp_install::observe(
-                    &service,
-                    &facts.options,
-                    &prepared,
-                ),
-            )
-            .await;
-            self.current_scope(&facts, &credential, Some(&assignment))
-                .await?;
-            self.verify_current_service(
+            let command = prepared.native_mcp_command(
+                "observe",
+                assignment.binding_id(),
+                assignment.binding_generation(),
+                registered_target.0,
+            )?;
+            self.queue_install_observation(
                 &facts,
                 &credential,
                 &assignment,
-                (registered_target.0, registered_target.1.as_str()),
-                &service,
+                command,
+                "observe_refresh",
             )
             .await?;
-            match observed {
-                Ok(Ok(Some(readback))) => {
-                    self.record_install_refresh(
-                        &facts,
-                        &credential,
-                        &assignment,
-                        &prepared.identity(),
-                        registered_target.0,
-                        &registered_target.1,
-                        readback.as_value(),
-                    )
-                    .await?;
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    self.record_safe_error(
-                        &facts,
-                        &credential,
-                        &assignment,
-                        "install_readback",
-                        &error.code,
-                    )
-                    .await?;
-                }
-                Err(_) => {
-                    self.record_safe_error(
-                        &facts,
-                        &credential,
-                        &assignment,
-                        "install_readback",
-                        "NATIVE_MCP_READBACK_TIMEOUT",
-                    )
-                    .await?;
-                }
-            }
             return self.summary(&facts, &credential, &assignment).await;
         }
 
         let record = self.load_record(&facts, &credential, &assignment).await?;
+        if let Some(module_operation_id) = record["challenge"]["module_operation_id"].as_str() {
+            let module_operation_phase = record["challenge"]["module_operation_phase"]
+                .as_str()
+                .ok_or_else(|| record_error("native MCP challenge operation phase is missing"))?;
+            if self
+                .consume_native_mcp_operation(
+                    &facts,
+                    &credential,
+                    &assignment,
+                    module_operation_id,
+                    module_operation_phase,
+                    &install_identity,
+                    service.pid,
+                    &service.version,
+                )
+                .await?
+            {
+                return self.summary(&facts, &credential, &assignment).await;
+            }
+        }
         match record["challenge"]["state"].as_str() {
             Some("not_started") => {
                 let (_, current_assignment) = self
@@ -444,18 +343,13 @@ impl Store {
                     &service,
                 )
                 .await?;
-                let preflight = tokio::time::timeout(
-                    NATIVE_ACTION_TIMEOUT,
-                    crate::runtime::opencode_v2::mcp_tools::preflight_arm(
-                        &service,
-                        &facts.options,
-                        &challenge,
-                    ),
-                )
-                .await;
-                let prepared_arm = match preflight {
-                    Ok(Ok(prepared_arm)) => prepared_arm,
-                    Ok(Err(error)) if challenge_replacement_reason(&error.code).is_some() => {
+                let prepared_arm = match crate::runtime::opencode_v2::mcp_tools::prepare_arm(
+                    &service,
+                    &facts.options,
+                    &challenge,
+                ) {
+                    Ok(prepared_arm) => prepared_arm,
+                    Err(error) if challenge_replacement_reason(&error.code).is_some() => {
                         let reason =
                             challenge_replacement_reason(&error.code).ok_or_else(|| {
                                 record_error("challenge replacement reason disappeared")
@@ -471,24 +365,13 @@ impl Store {
                             )
                             .await;
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         self.record_safe_error(
                             &facts,
                             &credential,
                             &assignment,
                             "challenge_preflight",
                             &error.code,
-                        )
-                        .await?;
-                        return self.summary(&facts, &credential, &assignment).await;
-                    }
-                    Err(_) => {
-                        self.record_safe_error(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            "challenge_preflight",
-                            "NATIVE_MCP_PROOF_PREFLIGHT_TIMEOUT",
                         )
                         .await?;
                         return self.summary(&facts, &credential, &assignment).await;
@@ -506,55 +389,18 @@ impl Store {
                     &service,
                 )
                 .await?;
+                let command = prepared_arm.native_mcp_command(
+                    "arm",
+                    assignment.binding_id(),
+                    assignment.binding_generation(),
+                )?;
                 if self
-                    .reserve_challenge_effect(&facts, &credential, &assignment)
+                    .reserve_challenge_effect(&facts, &credential, &assignment, command)
                     .await?
                 {
-                    let armed = tokio::time::timeout(
-                        NATIVE_ACTION_TIMEOUT,
-                        crate::runtime::opencode_v2::mcp_tools::arm_prepared(
-                            &service,
-                            &facts.options,
-                            prepared_arm,
-                        ),
-                    )
-                    .await;
-                    self.current_scope(&facts, &credential, Some(&assignment))
-                        .await?;
-                    self.verify_current_service(
-                        &facts,
-                        &credential,
-                        &assignment,
-                        (service.pid, service.version.as_str()),
-                        &service,
-                    )
-                    .await?;
-                    match armed {
-                        Ok(Ok(())) => {
-                            self.record_challenge_armed(&facts, &credential, &assignment)
-                                .await?;
-                        }
-                        Ok(Err(error)) => {
-                            self.record_safe_rpc_error(
-                                &facts,
-                                &credential,
-                                &assignment,
-                                "challenge",
-                                &error,
-                            )
-                            .await?;
-                        }
-                        Err(_) => {
-                            self.record_safe_error(
-                                &facts,
-                                &credential,
-                                &assignment,
-                                "challenge",
-                                "NATIVE_MCP_PROOF_TIMEOUT",
-                            )
-                            .await?;
-                        }
-                    }
+                    // The arm POST is now issued only by the module worker;
+                    // this tick has committed its one-shot reservation.
+                    return self.summary(&facts, &credential, &assignment).await;
                 }
                 return self.summary(&facts, &credential, &assignment).await;
             }
@@ -576,15 +422,6 @@ impl Store {
                     &facts.options,
                     record["challenge"]["metadata"].clone(),
                 )?;
-                let readback = tokio::time::timeout(
-                    NATIVE_ACTION_TIMEOUT,
-                    crate::runtime::opencode_v2::mcp_tools::read(
-                        &read_service,
-                        &facts.options,
-                        &challenge,
-                    ),
-                )
-                .await;
                 self.current_scope(&facts, &credential, Some(&assignment))
                     .await?;
                 self.verify_current_service(
@@ -595,44 +432,18 @@ impl Store {
                     &read_service,
                 )
                 .await?;
-                match readback {
-                    Ok(Ok(readback)) => {
-                        if readback.scope() != &assignment {
-                            return Err(scope_error(
-                                "native tools readback does not match the current assignment",
-                            ));
-                        }
-                        let payload = readback.as_value();
-                        if model::canonical(&payload)?.len() > MAX_PRIVATE_READBACK_BYTES {
-                            return Err(Error::new(
-                                "NATIVE_MCP_PROOF_SCHEMA",
-                                "native tools readback exceeds the private Store bound",
-                            ));
-                        }
-                        self.record_tools_readback(&facts, &credential, &assignment, payload)
-                            .await?;
-                    }
-                    Ok(Err(error)) => {
-                        self.record_safe_rpc_error(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            "tools_readback",
-                            &error,
-                        )
-                        .await?;
-                    }
-                    Err(_) => {
-                        self.record_safe_error(
-                            &facts,
-                            &credential,
-                            &assignment,
-                            "tools_readback",
-                            "NATIVE_MCP_PROOF_TIMEOUT",
-                        )
-                        .await?;
-                    }
-                }
+                let prepared_arm = crate::runtime::opencode_v2::mcp_tools::prepare_arm(
+                    &read_service,
+                    &facts.options,
+                    &challenge,
+                )?;
+                let command = prepared_arm.native_mcp_command(
+                    "read",
+                    assignment.binding_id(),
+                    assignment.binding_generation(),
+                )?;
+                self.queue_challenge_read(&facts, &credential, &assignment, command)
+                    .await?;
                 return self.summary(&facts, &credential, &assignment).await;
             }
             Some("observed") => self.summary(&facts, &credential, &assignment).await,
@@ -1063,6 +874,8 @@ impl Store {
                                 "readback":null,
                                 "recovered_readback":null,
                                 "effect_reserved_at_ms":null,
+                                "module_operation_id":null,
+                                "module_operation_phase":null,
                             },
                             "challenge":{
                                 "state":"not_started",
@@ -1070,6 +883,8 @@ impl Store {
                                 "replaced_metadata":[],
                                 "replacement_archive":{"count":0,"digest":null},
                                 "effect_reserved_at_ms":null,
+                                "module_operation_id":null,
+                                "module_operation_phase":null,
                             },
                             "tools_readback":null,
                             "last_error":null,
@@ -1095,16 +910,328 @@ impl Store {
         facts: &LaunchFacts,
         credential: &Credential,
         assignment: &crate::native_mcp::AssignmentContext,
+        command: Value,
     ) -> Result<bool> {
-        self.transition(facts, credential, assignment, |record, now| {
-            if record["install"]["state"] == "prepared" {
+        let principal = self.authenticate(credential.clone()).await?;
+        let facts = facts.clone();
+        let assignment = assignment.clone();
+        let key = record_key(&facts.operation_id);
+        let result = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                validate_current_scope(&tx, &facts, &principal, &assignment)?;
+                let mut record = meta(&tx, &key)?
+                    .ok_or_else(|| Error::new("NOT_FOUND", "native MCP intent is missing"))?;
+                validate_record(&record, &facts, &assignment)?;
+                if record["install"]["state"] != "prepared" {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                let operation_id = queue_native_mcp_operation(
+                    &tx,
+                    &facts,
+                    &assignment,
+                    "native.mcp.install",
+                    "install",
+                    command,
+                )?;
+                let now = model::now_ms()?;
                 record["install"]["state"] = json!("outcome_unknown");
                 record["install"]["effect_reserved_at_ms"] = json!(now);
+                record["install"]["module_operation_id"] = json!(operation_id);
+                record["install"]["module_operation_phase"] = json!("install");
                 record["last_error"] = Value::Null;
+                record["updated_at_ms"] = json!(now);
+                set_meta(&tx, &key, &record)?;
+                tx.commit()?;
                 Ok(true)
-            } else {
-                Ok(false)
+            })
+            .await?;
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(result)
+    }
+
+    /// Consume the retained RuntimeOutcome for one C8 child Operation. A
+    /// queued/sending child remains pending; a rejected or unknown child is
+    /// recorded as bounded failure and is never replayed by this consumer.
+    /// Applied receipts are validated against the original challenge/intent
+    /// before the parent C8 record advances.
+    async fn consume_native_mcp_operation(
+        &self,
+        facts: &LaunchFacts,
+        credential: &Credential,
+        assignment: &crate::native_mcp::AssignmentContext,
+        operation_id: &str,
+        phase: &str,
+        install_identity: &Value,
+        service_pid: u32,
+        service_version: &str,
+    ) -> Result<bool> {
+        let operation_id_owned = operation_id.to_owned();
+        let operation = self
+            .run(move |db| super::operations::get_operation(db, &operation_id_owned))
+            .await?;
+        let (expected_method, expected_phase) = match phase {
+            "install" => ("native.mcp.install", "install"),
+            "observe_unknown" => ("native.mcp.observe", "observe_unknown"),
+            "observe_refresh" => ("native.mcp.observe", "observe_refresh"),
+            "arm" => ("native.mcp.arm", "arm"),
+            "read" => ("native.mcp.read", "read"),
+            _ => return Err(Error::invalid("native MCP module phase is invalid")),
+        };
+        let assignment_value = assignment.as_value();
+        if operation["caller_id"] != INTERNAL_NATIVE_MCP_CALLER
+            || operation["method"] != expected_method
+            || operation["native_mcp_parent_launch_operation_id"] != facts.operation_id
+            || operation["native_mcp_phase"] != expected_phase
+            || operation["binding_id"] != assignment_value["binding_id"]
+            || operation["binding_generation"] != assignment_value["binding_generation"]
+            || operation["task_id"] != assignment_value["task_id"]
+            || operation["attempt_id"] != assignment_value["attempt_id"]
+        {
+            return Err(stale_scope());
+        }
+        let state = operation["state"].as_str().unwrap_or_default();
+        if matches!(state, "queued" | "sending" | "native_accepted") {
+            return Ok(true);
+        }
+        let outcome = operation["result"]["outcome"].as_str();
+        if state == "outcome_unknown" || outcome == Some("unknown") {
+            let code = operation_error_code(&operation, "NATIVE_MCP_MODULE_OUTCOME_UNKNOWN");
+            self.record_safe_error(facts, credential, assignment, phase, &code)
+                .await?;
+            self.clear_native_mcp_operation(facts, credential, assignment, phase)
+                .await?;
+            return Ok(true);
+        }
+        if state == "rejected" || outcome == Some("rejected") {
+            let code = operation_error_code(&operation, "NATIVE_MCP_MODULE_REJECTED");
+            self.record_safe_error(facts, credential, assignment, phase, &code)
+                .await?;
+            self.clear_native_mcp_operation(facts, credential, assignment, phase)
+                .await?;
+            return Ok(true);
+        }
+        if state != "settled" || outcome != Some("applied") {
+            return Err(Error::new(
+                "NATIVE_MCP_OPERATION_STATE",
+                "native MCP child Operation has an unrecognized terminal state",
+            ));
+        }
+        let receipt = operation["result"]["details"]["native_mcp"].clone();
+        if !receipt.is_object() || receipt["native_replay"] != false {
+            return Err(Error::new(
+                "NATIVE_MCP_RECEIPT_INVALID",
+                "native MCP child outcome lacks its non-replayed effect receipt",
+            ));
+        }
+        match phase {
+            "install" => {
+                let readback = receipt["readback"].clone();
+                self.record_install_ack(
+                    facts,
+                    credential,
+                    assignment,
+                    install_identity,
+                    service_pid,
+                    service_version,
+                    readback,
+                )
+                .await?;
             }
+            "observe_unknown" => {
+                let readback = receipt["readback"].clone();
+                self.record_install_observation(
+                    facts,
+                    credential,
+                    assignment,
+                    Some(readback),
+                )
+                .await?;
+            }
+            "observe_refresh" => {
+                let readback = receipt["readback"].clone();
+                self.record_install_refresh(
+                    facts,
+                    credential,
+                    assignment,
+                    install_identity,
+                    service_pid,
+                    service_version,
+                    readback,
+                )
+                .await?;
+            }
+            "arm" => {
+                let (current_service, _) = self
+                    .connect_current(
+                        facts,
+                        credential,
+                        assignment,
+                        Some((service_pid, service_version)),
+                    )
+                    .await?;
+                let record = self.load_record(facts, credential, assignment).await?;
+                let challenge = crate::runtime::opencode_v2::mcp_tools::restore_challenge_metadata(
+                    assignment.clone(),
+                    &current_service,
+                    &facts.options,
+                    record["challenge"]["metadata"].clone(),
+                )?;
+                let response = receipt["response"].clone();
+                crate::runtime::opencode_v2::mcp_tools::validate_external_arm_response(
+                    response,
+                    &challenge,
+                    &current_service,
+                    &facts.options,
+                )?;
+                self.record_challenge_armed(facts, credential, assignment)
+                    .await?;
+            }
+            "read" => {
+                let (current_service, _) = self
+                    .connect_current(
+                        facts,
+                        credential,
+                        assignment,
+                        Some((service_pid, service_version)),
+                    )
+                    .await?;
+                let record = self.load_record(facts, credential, assignment).await?;
+                let challenge = crate::runtime::opencode_v2::mcp_tools::restore_challenge_metadata(
+                    assignment.clone(),
+                    &current_service,
+                    &facts.options,
+                    record["challenge"]["metadata"].clone(),
+                )?;
+                let readback =
+                    crate::runtime::opencode_v2::mcp_tools::validate_external_read_response(
+                        receipt["response"].clone(),
+                        &challenge,
+                        &current_service,
+                        &facts.options,
+                    )?;
+                let payload = readback.as_value();
+                if model::canonical(&payload)?.len() > MAX_PRIVATE_READBACK_BYTES
+                    || readback.scope() != assignment
+                {
+                    return Err(Error::new(
+                        "NATIVE_MCP_PROOF_SCHEMA",
+                        "native tools readback exceeds its bound or differs from assignment",
+                    ));
+                }
+                self.record_tools_readback(facts, credential, assignment, payload)
+                    .await?;
+            }
+            _ => unreachable!("native MCP phase was validated above"),
+        }
+        Ok(true)
+    }
+
+    async fn queue_install_observation(
+        &self,
+        facts: &LaunchFacts,
+        credential: &Credential,
+        assignment: &crate::native_mcp::AssignmentContext,
+        command: Value,
+        phase: &str,
+    ) -> Result<()> {
+        let principal = self.authenticate(credential.clone()).await?;
+        let facts = facts.clone();
+        let assignment = assignment.clone();
+        let phase = phase.to_owned();
+        let key = record_key(&facts.operation_id);
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_current_scope(&tx, &facts, &principal, &assignment)?;
+            let mut record = meta(&tx, &key)?
+                .ok_or_else(|| Error::new("NOT_FOUND", "native MCP intent is missing"))?;
+            validate_record(&record, &facts, &assignment)?;
+            if record["install"]["module_operation_id"].is_null() {
+                let operation_id = queue_native_mcp_operation(
+                    &tx,
+                    &facts,
+                    &assignment,
+                    "native.mcp.observe",
+                    &phase,
+                    command,
+                )?;
+                record["install"]["module_operation_id"] = json!(operation_id);
+                record["install"]["module_operation_phase"] = json!(phase);
+                record["updated_at_ms"] = json!(model::now_ms()?);
+                set_meta(&tx, &key, &record)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(())
+    }
+
+    async fn queue_challenge_read(
+        &self,
+        facts: &LaunchFacts,
+        credential: &Credential,
+        assignment: &crate::native_mcp::AssignmentContext,
+        command: Value,
+    ) -> Result<()> {
+        let principal = self.authenticate(credential.clone()).await?;
+        let facts = facts.clone();
+        let assignment = assignment.clone();
+        let key = record_key(&facts.operation_id);
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_current_scope(&tx, &facts, &principal, &assignment)?;
+            let mut record = meta(&tx, &key)?
+                .ok_or_else(|| Error::new("NOT_FOUND", "native MCP intent is missing"))?;
+            validate_record(&record, &facts, &assignment)?;
+            if record["challenge"]["module_operation_id"].is_null() {
+                let operation_id = queue_native_mcp_operation(
+                    &tx,
+                    &facts,
+                    &assignment,
+                    "native.mcp.read",
+                    "read",
+                    command,
+                )?;
+                record["challenge"]["module_operation_id"] = json!(operation_id);
+                record["challenge"]["module_operation_phase"] = json!("read");
+                record["updated_at_ms"] = json!(model::now_ms()?);
+                set_meta(&tx, &key, &record)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(())
+    }
+
+    async fn clear_native_mcp_operation(
+        &self,
+        facts: &LaunchFacts,
+        credential: &Credential,
+        assignment: &crate::native_mcp::AssignmentContext,
+        phase: &str,
+    ) -> Result<()> {
+        let phase = phase.to_owned();
+        self.transition(facts, credential, assignment, move |record, _| {
+            match phase.as_str() {
+                "install" | "observe_unknown" | "observe_refresh" => {
+                    record["install"]["module_operation_id"] = Value::Null;
+                    record["install"]["module_operation_phase"] = Value::Null;
+                }
+                "arm" | "read" => {
+                    record["challenge"]["module_operation_id"] = Value::Null;
+                    record["challenge"]["module_operation_phase"] = Value::Null;
+                }
+                _ => return Err(Error::invalid("native MCP phase is invalid")),
+            }
+            Ok(())
         })
         .await
     }
@@ -1141,6 +1268,8 @@ impl Store {
             record["install"]["state"] = json!("registered");
             record["install"]["readback"] = readback;
             record["install"]["acknowledged_at_ms"] = json!(now);
+            record["install"]["module_operation_id"] = Value::Null;
+            record["install"]["module_operation_phase"] = Value::Null;
             record["last_error"] = Value::Null;
             Ok(())
         })
@@ -1172,6 +1301,8 @@ impl Store {
                 record["install"]["recovered_readback"] = readback;
                 record["install"]["state"] = json!("observed_after_unknown");
             }
+            record["install"]["module_operation_id"] = Value::Null;
+            record["install"]["module_operation_phase"] = Value::Null;
             record["install"]["last_observed_at_ms"] = json!(now);
             Ok(())
         })
@@ -1209,6 +1340,8 @@ impl Store {
                 ));
             }
             record["install"]["readback"] = readback;
+            record["install"]["module_operation_id"] = Value::Null;
+            record["install"]["module_operation_phase"] = Value::Null;
             record["install"]["last_observed_at_ms"] = json!(now);
             record["last_error"] = Value::Null;
             Ok(())
@@ -1463,24 +1596,51 @@ impl Store {
         facts: &LaunchFacts,
         credential: &Credential,
         assignment: &crate::native_mcp::AssignmentContext,
+        command: Value,
     ) -> Result<bool> {
-        self.transition(facts, credential, assignment, |record, now| {
-            if record["challenge"]["state"] == "prepared"
-                && record["challenge"]["effect_reserved_at_ms"].is_null()
-            {
+        let principal = self.authenticate(credential.clone()).await?;
+        let facts = facts.clone();
+        let assignment = assignment.clone();
+        let key = record_key(&facts.operation_id);
+        let result = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                validate_current_scope(&tx, &facts, &principal, &assignment)?;
+                let mut record = meta(&tx, &key)?
+                    .ok_or_else(|| Error::new("NOT_FOUND", "native MCP intent is missing"))?;
+                validate_record(&record, &facts, &assignment)?;
+                if record["challenge"]["state"] != "prepared" {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                if !record["challenge"]["effect_reserved_at_ms"].is_null() {
+                    return Err(record_error(
+                        "prepared challenge already has an effect reservation",
+                    ));
+                }
+                let operation_id = queue_native_mcp_operation(
+                    &tx,
+                    &facts,
+                    &assignment,
+                    "native.mcp.arm",
+                    "arm",
+                    command,
+                )?;
+                let now = model::now_ms()?;
                 record["challenge"]["state"] = json!("outcome_unknown");
                 record["challenge"]["effect_reserved_at_ms"] = json!(now);
+                record["challenge"]["module_operation_id"] = json!(operation_id);
+                record["challenge"]["module_operation_phase"] = json!("arm");
                 record["last_error"] = Value::Null;
+                record["updated_at_ms"] = json!(now);
+                set_meta(&tx, &key, &record)?;
+                tx.commit()?;
                 Ok(true)
-            } else if record["challenge"]["state"] == "prepared" {
-                Err(record_error(
-                    "prepared challenge already has an effect reservation",
-                ))
-            } else {
-                Ok(false)
-            }
-        })
-        .await
+            })
+            .await?;
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(result)
     }
 
     async fn record_challenge_armed(
@@ -1497,6 +1657,8 @@ impl Store {
             }
             record["challenge"]["state"] = json!("armed");
             record["challenge"]["armed_at_ms"] = json!(now);
+            record["challenge"]["module_operation_id"] = Value::Null;
+            record["challenge"]["module_operation_phase"] = Value::Null;
             record["last_error"] = Value::Null;
             Ok(())
         })
@@ -1524,6 +1686,8 @@ impl Store {
             }
             record["challenge"]["state"] = json!("observed");
             record["challenge"]["observed_at_ms"] = json!(now);
+            record["challenge"]["module_operation_id"] = Value::Null;
+            record["challenge"]["module_operation_phase"] = Value::Null;
             record["tools_readback"] = payload;
             record["last_error"] = Value::Null;
             Ok(())
@@ -1679,6 +1843,191 @@ fn load_launch_facts(db: &Connection, config: &Config, operation_id: &str) -> Re
         owned_service: snapshot.owned_service_expectation(),
         config: Arc::new(config.clone()),
     })
+}
+
+const INTERNAL_NATIVE_MCP_CALLER: &str = "swarm.internal.c8.native_mcp";
+
+fn require_internal_native_mcp_client(tx: &Connection) -> Result<()> {
+    let registration = super::meta(
+        tx,
+        &format!("client:{INTERNAL_NATIVE_MCP_CALLER}"),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "INTERNAL_CLIENT_NOT_REGISTERED",
+            "native MCP phase caller is not durably registered",
+        )
+    })?;
+    if registration["role"] != "module"
+        || registration["internal_only"] != true
+        || registration["disabled"] == true
+    {
+        return Err(Error::new(
+            "INTERNAL_CLIENT_INVALID",
+            "native MCP phase caller has no internal module scope",
+        ));
+    }
+    Ok(())
+}
+
+fn operation_error_code(operation: &Value, fallback: &str) -> String {
+    operation["result"]["details"]["diagnostic_code"]
+        .as_str()
+        .or_else(|| operation["result"]["failure"]["code"].as_str())
+        .filter(|code| !code.is_empty() && code.len() <= 128)
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+/// Insert one descriptor-bound native command in the existing Operations
+/// queue. The caller is an internal Store linkage, never a public credential;
+/// the immutable row stores the descriptor DTO template while its actual
+/// prepared command/challenge remains in the private effective handoff. The
+/// surrounding C8 reservation updates its retained phase marker in the same
+/// transaction as this insert.
+fn queue_native_mcp_operation(
+    tx: &Transaction<'_>,
+    facts: &LaunchFacts,
+    assignment: &crate::native_mcp::AssignmentContext,
+    method: &str,
+    phase: &str,
+    command: Value,
+) -> Result<String> {
+    if !matches!(
+        method,
+        "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read"
+    ) || !matches!(phase, "install" | "observe_unknown" | "observe_refresh" | "arm" | "read")
+    {
+        return Err(Error::invalid("native MCP module operation phase is invalid"));
+    }
+    require_internal_native_mcp_client(tx)?;
+    let scope = assignment.as_value();
+    let task_id = model::text(&scope, "task_id")?;
+    let attempt_id = model::text(&scope, "attempt_id")?;
+    let binding_id = model::text(&scope, "binding_id")?;
+    let binding_generation = model::positive(&scope, "binding_generation")?;
+    let command_bytes = model::canonical(&command)?;
+    if command_bytes.len() > MAX_PRIVATE_READBACK_BYTES {
+        return Err(Error::new(
+            "NATIVE_MCP_COMMAND_LIMIT",
+            "native MCP module command exceeds its private handoff bound",
+        ));
+    }
+    let action = match method {
+        "native.mcp.install" => "install",
+        "native.mcp.observe" => "observe",
+        "native.mcp.arm" => "arm",
+        "native.mcp.read" => "read",
+        _ => unreachable!("native MCP method was checked above"),
+    };
+    let command_scope = command["scope"]
+        .as_object()
+        .ok_or_else(|| Error::invalid("native MCP command scope is missing"))?;
+    if command_scope["binding_id"] != binding_id
+        || command_scope["binding_generation"] != binding_generation
+        || command_scope["assignment"] != scope
+    {
+        return Err(scope_error(
+            "native MCP command is bound to a different assignment",
+        ));
+    }
+    let native_session_id = model::text(&scope, "native_session_id")?;
+    let service_id = model::text(command_scope, "service_id")?;
+    let service_version = model::text(command_scope, "expected_version")?;
+    let service_pid = command_scope["service_pid"]
+        .as_u64()
+        .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
+        .ok_or_else(|| Error::invalid("native MCP service process identity is invalid"))?
+        as u32;
+    let directory = model::text(command_scope, "directory")?;
+    let assignment_sha256 = model::digest(model::canonical(&scope)?.as_bytes());
+    let location_sha256 = model::digest(directory.as_bytes());
+    let artifact_key = if matches!(action, "install" | "observe") {
+        "prepared"
+    } else {
+        "challenge"
+    };
+    let artifact = command[artifact_key]
+        .as_object()
+        .ok_or_else(|| Error::invalid("native MCP private artifact is missing"))?;
+    let artifact_sha256 = model::digest(model::canonical(artifact)?.as_bytes());
+    let operation_id = model::new_id();
+    let request_id = format!("native-mcp:{}", operation_id);
+    let now = model::now_ms()?;
+    let artifact_ref = format!(
+        "store://native-mcp/{}/{}/{}",
+        operation_id, action, artifact_key
+    );
+    let mut original = json!({
+        "schema_version":1,
+        "operation_id":operation_id.clone(),
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+        // The runtime fills this reserved field before module admission. The
+        // null-bearing template itself is the immutable Operation input whose
+        // digest is retained by the normal module-receipt validator.
+        "input_sha256":Value::Null,
+        "assignment_sha256":assignment_sha256.clone(),
+        "native_session_id":native_session_id,
+        "service_id":service_id,
+        "service_version":service_version,
+        "service_pid":service_pid,
+        "location_sha256":location_sha256.clone(),
+        "phase":action,
+    });
+    original
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid("native MCP DTO is not an object"))?
+        .insert(
+            artifact_key.to_owned(),
+            json!({
+                "protected_ref":artifact_ref.clone(),
+                "sha256":artifact_sha256,
+            }),
+        );
+    let input_sha256 = model::digest(model::canonical(&original)?.as_bytes());
+    let effective = json!({
+        "native_mcp":{
+            "schema_version":1,
+            "child_operation_id":operation_id,
+            "parent_launch_operation_id":facts.operation_id,
+            "launch_identity_digest":facts.identity_digest,
+            "phase":phase,
+            "method":method,
+            "task_id":task_id,
+            "task_revision":scope["task_revision"],
+            "attempt_id":attempt_id,
+            "binding_id":binding_id,
+            "binding_generation":binding_generation,
+            "assignment_digest":assignment_sha256,
+            "input_sha256":input_sha256,
+            "native_session_id":native_session_id,
+            "service_id":service_id,
+            "service_version":service_version,
+            "service_pid":service_pid,
+            "location_sha256":location_sha256,
+            "command_sha256":model::digest(command_bytes.as_bytes()),
+            "artifact_ref":artifact_ref,
+            "effect":command,
+        }
+    });
+    tx.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,native_refs_json,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued','{}',?11,?11,?11)",
+        params![
+            operation_id,
+            INTERNAL_NATIVE_MCP_CALLER,
+            request_id,
+            method,
+            model::canonical(&original)?,
+            model::canonical(&effective)?,
+            task_id,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            now,
+        ],
+    )?;
+    Ok(operation_id)
 }
 
 fn validate_current_scope(

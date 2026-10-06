@@ -11,6 +11,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use swarm_contracts::{Credential, module_catalog::ProtectedRef};
@@ -47,26 +48,27 @@ pub(crate) struct ModuleSupervisorHostConfig {
 
 impl ModuleSupervisorHostConfig {
     pub(crate) fn from_runtime_config(
-        config: &crate::config::ModuleSupervisorConfig,
+        config: &crate::config::Config,
         root: &Path,
     ) -> Result<Option<Self>> {
-        config.validate()?;
-        if !config.enabled {
+        config.module_supervisor.validate()?;
+        if !config.module_supervisor.enabled {
             return Ok(None);
         }
-        let install_root = config.install_root.clone().ok_or_else(|| {
+        let module_config = &config.module_supervisor;
+        let install_root = module_config.install_root.clone().ok_or_else(|| {
             Error::new(
                 "MODULE_SUPERVISOR_CONFIG_INVALID",
                 "enabled module supervisor needs install_root",
             )
         })?;
-        let owner_path = config.owner_helper.clone().ok_or_else(|| {
+        let owner_path = module_config.owner_helper.clone().ok_or_else(|| {
             Error::new(
                 "MODULE_SUPERVISOR_CONFIG_INVALID",
                 "enabled module supervisor needs owner_helper",
             )
         })?;
-        let owner_digest = config.owner_helper_sha256.clone().ok_or_else(|| {
+        let owner_digest = module_config.owner_helper_sha256.clone().ok_or_else(|| {
             Error::new(
                 "MODULE_SUPERVISOR_CONFIG_INVALID",
                 "enabled module supervisor needs owner_helper_sha256",
@@ -79,7 +81,7 @@ impl ModuleSupervisorHostConfig {
             })?,
         };
         let mut protected_files = BTreeMap::new();
-        for (reference, path) in &config.protected_files {
+        for (reference, path) in &module_config.protected_files {
             let reference = ProtectedRef::new(reference.clone()).map_err(|error| {
                 Error::new("MODULE_SUPERVISOR_CONFIG_INVALID", error.to_string())
             })?;
@@ -90,14 +92,30 @@ impl ModuleSupervisorHostConfig {
                 ));
             }
         }
+        // Owned OpenCode auth sources are private host paths, not credential
+        // bytes. Carry the configured opaque reference through the supervisor
+        // bootstrap so the route mapper can retain the exact source path.
+        for (reference, source) in &config.opencode_provider_auth_sources {
+            let reference = ProtectedRef::new(reference.clone()).map_err(|error| {
+                Error::new("MODULE_SUPERVISOR_CONFIG_INVALID", error.to_string())
+            })?;
+            if let Some(previous) = protected_files.insert(reference, source.auth_file.clone()) {
+                if previous != source.auth_file {
+                    return Err(Error::new(
+                        "MODULE_SUPERVISOR_CONFIG_INVALID",
+                        "protected reference maps to conflicting host files",
+                    ));
+                }
+            }
+        }
         let value = Self {
             install_root,
-            descriptor_files: config.descriptor_files.clone(),
+            descriptor_files: module_config.descriptor_files.clone(),
             state_root: root.join("module-supervisor/state"),
             resolver_root: root.join("module-supervisor/resolver"),
             owner_helper,
             protected_files,
-            route_config_mapper: config.route_config_mapper,
+            route_config_mapper: module_config.route_config_mapper,
         };
         validate_host_config(&value)?;
         Ok(Some(value))
@@ -163,7 +181,7 @@ pub(crate) fn spawn_independent_module_supervisor(
     supervisor_credential: Credential,
     root: PathBuf,
     ipc: swarm_client::IpcConfig,
-    config: crate::config::ModuleSupervisorConfig,
+    config: Arc<crate::config::Config>,
     stopping: watch::Receiver<bool>,
 ) -> OptionalModuleSupervisor {
     let task = tokio::spawn(async move {
@@ -178,7 +196,7 @@ pub(crate) fn spawn_independent_module_supervisor(
                 return;
             }
         };
-        let host_config = match ModuleSupervisorHostConfig::from_runtime_config(&config, &root) {
+        let host_config = match ModuleSupervisorHostConfig::from_runtime_config(config.as_ref(), &root) {
             Ok(Some(value)) => value,
             Ok(None) => return,
             Err(error) => {
@@ -227,7 +245,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
     supervisor_credential: Credential,
     root: PathBuf,
     ipc: swarm_client::IpcConfig,
-    config: crate::config::ModuleSupervisorConfig,
+    config: Arc<crate::config::Config>,
     stopping: watch::Receiver<bool>,
 ) -> OptionalModuleSupervisor {
     spawn_independent_module_supervisor(store, supervisor_credential, root, ipc, config, stopping)

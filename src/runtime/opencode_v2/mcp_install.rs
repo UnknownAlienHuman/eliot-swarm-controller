@@ -57,6 +57,7 @@ impl PreparedMcpInstall {
             "location_sha256":self.directory_sha256,
             "server_name":self.server_name,
             "command_sha256":self.command_sha256,
+            "executable_sha256":self.executable_sha256,
             "current_executable_file_sha256":self.executable_sha256,
             "current_executable_identity":"file_hash_only",
             "native_tool_set":"unknown",
@@ -64,6 +65,75 @@ impl PreparedMcpInstall {
             "model_consumption":"unknown",
             "dispatch_permitted":false
         })
+    }
+
+    /// Build the private command envelope consumed by the independently
+    /// launched OpenCode adapter. The actual command and HTTP bodies remain
+    /// inside this authenticated module handoff; the Store never exposes them
+    /// through the public identity/readback projection.
+    pub(crate) fn native_mcp_command(
+        &self,
+        action: &str,
+        binding_id: &str,
+        binding_generation: i64,
+        service_pid: u32,
+    ) -> Result<Value> {
+        if !matches!(action, "install" | "observe") {
+            return Err(Error::invalid("prepared MCP install only supports install/observe"));
+        }
+        let list_path = list_route(self)?;
+        let install_path = install_route(self)?;
+        let config = json!({
+            "type":"local",
+            "command":self.command.clone(),
+            "cwd":self.directory_text,
+            "disabled":false
+        });
+        let mut envelope = json!({
+            "schema_version":1,
+            "kind":"swarm.native_mcp_command",
+            "action":action,
+            "scope":{
+                "binding_id":binding_id,
+                "binding_generation":binding_generation,
+                "native_scope_key":format!("opencode-v2:{}", self.service_id),
+                "service_id":self.service_id,
+                "expected_version":self.expected_version,
+                "service_pid":service_pid,
+                "directory":self.directory_text,
+                "assignment":self.assignment.as_value(),
+            },
+            "prepared":{
+                "server_name":self.server_name,
+                "install_intent":self.identity(),
+                "command_sha256":self.command_sha256,
+                "location_sha256":self.directory_sha256,
+                "executable_sha256":self.executable_sha256,
+            },
+            "request":if action == "install" {
+                json!({"method":"PUT","path":install_path,"body":{"config":config}})
+            } else {
+                json!({"method":"GET","path":list_path})
+            },
+            "precondition":if action == "install" {
+                json!({"method":"GET","path":list_path})
+            } else {
+                Value::Null
+            },
+            "readback":if action == "install" {
+                json!({"method":"GET","path":list_path})
+            } else {
+                Value::Null
+            },
+        });
+        if action == "observe" {
+            let object = envelope.as_object_mut().ok_or_else(|| {
+                Error::invalid("native MCP command envelope is not an object")
+            })?;
+            object.remove("precondition");
+            object.remove("readback");
+        }
+        Ok(envelope)
     }
 }
 
@@ -211,7 +281,10 @@ pub(crate) fn prepare(
         ));
     }
 
-    let executable = current_executable()?;
+    // The native MCP command is run by the independently installed sibling,
+    // never by the kernel host. Keep this path explicit so a future kernel
+    // relocation cannot silently turn the command into `<kernel> mcp`.
+    let executable = sibling_mcp_executable()?;
     let executable_sha256 = hash_executable(&executable)?;
     let directory_text = options.directory.to_str().ok_or_else(|| {
         Error::new(
@@ -222,15 +295,17 @@ pub(crate) fn prepare(
     validate_text(directory_text, "OpenCode location", MAX_TEXT_BYTES)?;
     let credential_text = path_text(&credential_path, "credential path")?;
     let profile_arg = path_text(&profile_path, "profile path")?;
-    let executable_text = path_text(&executable, "current executable")?;
+    let data_dir_arg = path_text(&scoped_data_dir, "controller data directory")?;
+    let executable_text = path_text(&executable, "swarm-mcp executable")?;
     let profile_name = &scoped_config.mcp.default_profile;
     let command = vec![
         executable_text,
         "--config".to_owned(),
         profile_arg,
+        "--data-dir".to_owned(),
+        data_dir_arg,
         "--credential".to_owned(),
         credential_text,
-        "mcp".to_owned(),
         "--profile".to_owned(),
         profile_name.clone(),
     ];
@@ -504,6 +579,21 @@ fn install_route(prepared: &PreparedMcpInstall) -> Result<String> {
     Ok(format!("{}?{}", url.path(), query))
 }
 
+fn list_route(prepared: &PreparedMcpInstall) -> Result<String> {
+    let mut url = Url::parse("http://127.0.0.1/")
+        .map_err(|_| Error::new("NATIVE_ENDPOINT", "cannot construct local MCP route"))?;
+    url.set_path("/api/mcp");
+    url.query_pairs_mut()
+        .append_pair("location[directory]", &prepared.directory_text);
+    let query = url.query().ok_or_else(|| {
+        Error::new(
+            "NATIVE_ENDPOINT",
+            "cannot construct location-scoped MCP route",
+        )
+    })?;
+    Ok(format!("{}?{}", url.path(), query))
+}
+
 fn unknown_after_put(message: &str) -> Error {
     Error::new("NATIVE_OUTCOME_UNKNOWN", message)
 }
@@ -608,32 +698,38 @@ fn same_ipc(left: &Ipc, right: &Ipc) -> bool {
         && left.write_timeout_seconds == right.write_timeout_seconds
 }
 
-fn current_executable() -> Result<PathBuf> {
+fn sibling_mcp_executable() -> Result<PathBuf> {
     let current = std::env::current_exe().map_err(|_| {
         Error::new(
             "NATIVE_MCP_LAUNCHER",
-            "current controller executable cannot be identified",
+            "current launcher executable cannot be identified",
         )
     })?;
-    let path = fs::canonicalize(&current).map_err(|_| {
+    let mut path = fs::canonicalize(&current).map_err(|_| {
         Error::new(
             "NATIVE_MCP_LAUNCHER",
-            "current controller executable path cannot be resolved",
+            "current launcher executable path cannot be resolved",
         )
     })?;
+    path.set_file_name(if cfg!(windows) { "swarm-mcp.exe" } else { "swarm-mcp" });
     let metadata = fs::symlink_metadata(&path).map_err(|_| {
         Error::new(
             "NATIVE_MCP_LAUNCHER",
-            "current controller executable cannot be verified",
+            "installed swarm-mcp sibling cannot be verified",
         )
     })?;
     if !metadata.is_file() || is_link_or_reparse(&metadata) {
         return Err(Error::new(
             "NATIVE_MCP_LAUNCHER",
-            "current controller executable must resolve to a regular file",
+            "installed swarm-mcp sibling must resolve to a regular file",
         ));
     }
-    Ok(path)
+    fs::canonicalize(&path).map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_LAUNCHER",
+            "installed swarm-mcp sibling path cannot be resolved",
+        )
+    })
 }
 
 fn hash_executable(path: &Path) -> Result<String> {

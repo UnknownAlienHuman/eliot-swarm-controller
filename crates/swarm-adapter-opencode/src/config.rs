@@ -10,9 +10,10 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
 };
+use crate::provider_auth::ProviderAuthOptions;
 
 pub const ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
-pub const ARTIFACT_VERSION: &str = "0.2.0";
+pub const ARTIFACT_VERSION: &str = "0.3.0";
 pub const MODULE_ID: &str = "eliot.opencode.v2";
 pub const RUNTIME: &str = "module";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -46,6 +47,62 @@ pub struct NativeOptions {
     pub expected_version: String,
     pub directory: PathBuf,
     pub model: ModelRef,
+}
+
+/// Exact native owner inputs for a fresh OpenCode service.
+///
+/// These values are descriptor supplied and binding scoped.  The adapter
+/// never derives an executable, server module, or state root from the host
+/// process environment.  `connection_file` and `password_file` are private
+/// receipts under the same fresh state root; the owner refuses to reuse a
+/// root after an uncertain launch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedNativeOptions {
+    pub origin: String,
+    pub owner_nonce: String,
+    pub bun_executable: PathBuf,
+    pub bun_sha256: String,
+    pub server_program: PathBuf,
+    pub server_program_sha256: String,
+    pub state_root: PathBuf,
+    pub password_file: PathBuf,
+    pub port: u16,
+    pub model_catalog: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_auth: Option<ProviderAuthOptions>,
+}
+
+impl OwnedNativeOptions {
+    pub fn validate_for(&self, native: &NativeOptions) -> Result<()> {
+        let canonical_uuid = uuid::Uuid::parse_str(&self.owner_nonce)
+            .is_ok_and(|uuid| uuid.hyphenated().to_string() == self.owner_nonce);
+        let expected_connection = self.state_root.join("connection.json");
+        let expected_password = self.state_root.join("server.password");
+        if self.origin != "fresh_owned_service"
+            || !canonical_uuid
+            || !absolute_plain_path(&self.bun_executable)
+            || !absolute_plain_path(&self.server_program)
+            || !absolute_plain_path(&self.state_root)
+            || !absolute_plain_path(&self.password_file)
+            || self.password_file != expected_password
+            || native.connection_file != expected_connection
+            || native.directory == self.state_root
+            || !matches!(self.model_catalog.as_str(), "offline" | "refresh")
+            || !is_sha256(&self.bun_sha256)
+            || !is_sha256(&self.server_program_sha256)
+            || self
+                .provider_auth
+                .as_ref()
+                .is_some_and(|auth| auth.validate_for(native).is_err())
+        {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "fresh OpenCode owner paths, nonce, catalog, and executable pins are invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl NativeOptions {
@@ -86,6 +143,10 @@ pub struct AdapterConfig {
     pub generation: i64,
     pub module_artifact_id: String,
     pub native_options: NativeOptions,
+    /// Optional fresh-owner declaration.  The absence of this value keeps
+    /// the existing external-attach adapter behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_native: Option<OwnedNativeOptions>,
     #[serde(default)]
     pub ipc: IpcConfig,
 }
@@ -132,7 +193,17 @@ impl AdapterConfig {
                 "module config requires exact artifact, binding generation and absolute local paths",
             ));
         }
-        self.native_options.validate()
+        self.native_options.validate()?;
+        if let Some(owner) = &self.owned_native {
+            owner.validate_for(&self.native_options)?;
+            if owner.state_root == self.state_dir {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "native owner state must be separate from adapter journal state",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -194,4 +265,18 @@ pub fn is_loopback_endpoint(url: &reqwest::Url) -> bool {
                 .parse::<IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
     })
+}
+
+fn absolute_plain_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+        })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }

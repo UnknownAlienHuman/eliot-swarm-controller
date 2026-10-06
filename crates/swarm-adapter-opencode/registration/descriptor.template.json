@@ -3,7 +3,7 @@
   "module_id": "eliot.opencode.v2",
   "artifact": {
     "artifact_id": "eliot-opencode-v2.rust-http.1",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "build_id": null
   },
   "launch": {
@@ -20,8 +20,8 @@
   },
   "config_schema": {
     "schema_id": "opencode-v2-native-options",
-    "version": "1",
-    "sha256": "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662"
+    "version": "2",
+    "sha256": "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68"
   },
   "workspace_option": {
     "schema_version": 1,
@@ -29,10 +29,13 @@
     "semantics": "replace_with_admitted_absolute_workspace"
   },
   "command_schemas": [
+    {"schema_id": "swarm.native_mcp_command", "version": "1"},
+    {"schema_id": "swarm.normalized_result_context", "version": "1"},
     {"schema_id": "swarm.runtime_command", "version": "1"},
     {"schema_id": "swarm.task_dispatch_context", "version": "1"}
   ],
   "event_schemas": [
+    {"schema_id": "swarm.normalized_result_page", "version": "1"},
     {"schema_id": "swarm.runtime_outcome", "version": "1"},
     {"schema_id": "swarm.task_dispatch_admission", "version": "1"}
   ],
@@ -45,9 +48,13 @@
     "agent.reconcile",
     "agent.result",
     "agent.send/next_turn",
+    "native.mcp.arm",
+    "native.mcp.install",
+    "native.mcp.observe",
+    "native.mcp.read",
     "task.dispatch"
   ],
-  "lifecycle": "external_attach",
+  "lifecycle": "owned_service",
   "activation": "on_demand",
   "enabled": false,
   "restart": {

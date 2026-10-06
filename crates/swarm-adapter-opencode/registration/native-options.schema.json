@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://eliot.invalid/schemas/opencode-v2-native-options/1",
+  "$id": "https://eliot.invalid/schemas/opencode-v2-native-options/2",
   "title": "OpenCode V2 binding launch values",
   "description": "Values passed individually as ELIOT_SWARM_CONFIG_<KEY>; they are copied from the exact immutable OpenCode route and are not synthesized by the supervisor.",
   "type": "object",
@@ -57,6 +57,67 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 256
+    },
+    "OPENCODE_OWNER_ORIGIN": {
+      "type": "string",
+      "const": "fresh_owned_service",
+      "description": "Explicit fresh-owner mode; omitted only for the retained external-attach compatibility path."
+    },
+    "OPENCODE_OWNER_NONCE": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "OPENCODE_OWNER_BUN_EXECUTABLE": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)"
+    },
+    "OPENCODE_OWNER_BUN_SHA256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "OPENCODE_OWNER_SERVER_PROGRAM": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)"
+    },
+    "OPENCODE_OWNER_SERVER_PROGRAM_SHA256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "OPENCODE_OWNER_STATE_ROOT": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)"
+    },
+    "OPENCODE_OWNER_PASSWORD_FILE": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)"
+    },
+    "OPENCODE_OWNER_PORT": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,4})$"
+    },
+    "OPENCODE_OWNER_MODEL_CATALOG": {
+      "type": "string",
+      "enum": ["offline", "refresh"]
+    },
+    "OPENCODE_OWNER_PROVIDER_AUTH_FILE": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)"
+    },
+    "OPENCODE_OWNER_PROVIDER_CREDENTIAL_REF": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
     }
   }
 }

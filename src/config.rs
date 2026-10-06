@@ -12,7 +12,7 @@ pub use swarm_contracts::mcp_frontend::{McpConfig, McpProfileConfig, McpToolProf
 const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
 // Stable route ID; Store selection pins the concrete descriptor version for new bindings.
 const CODEX_RUST_ARTIFACT_ID: &str = "codex-rust-controller.1";
-const OPENCODE_RUST_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
+pub(crate) const OPENCODE_RUST_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
 const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const ANTIGRAVITY_RUST_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 const ANTIGRAVITY_RUST_MODEL_ID: &str = "gemini-3.8-flash-high";
@@ -275,9 +275,12 @@ impl Route {
         let Some(definition) = &self.owned_service else {
             return Ok(None);
         };
-        if self.runtime != crate::runtime::opencode_v2::RUNTIME
-            || self.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
-        {
+        let supported_route =
+            (self.runtime == crate::runtime::opencode_v2::RUNTIME
+                && self.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+                || (self.runtime == "module"
+                    && self.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
+        if !supported_route {
             return Err(Error::new(
                 "CONFIG_ERROR",
                 "owned service requires an OpenCode V2 route",
@@ -456,12 +459,7 @@ impl Config {
         model: &crate::runtime::opencode_v2::ModelRef,
     ) -> Result<Option<PathBuf>> {
         validate_provider_credential_ref(credential_ref)?;
-        if model.provider_id != "opencode-go" {
-            return Err(Error::new(
-                "CONFIG_ERROR",
-                "owned provider credentials are restricted to opencode-go",
-            ));
-        }
+        validate_provider_id(&model.provider_id)?;
         let source = self
             .opencode_provider_auth_sources
             .get(credential_ref)
@@ -472,6 +470,12 @@ impl Config {
                 )
             })?;
         validate_provider_auth_source(credential_ref, source)?;
+        if source.provider_id != model.provider_id {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "owned provider auth source does not match the admitted model provider",
+            ));
+        }
         Ok(Some(source.auth_file.clone()))
     }
 
@@ -488,8 +492,8 @@ fn validate_provider_auth_source(
     source: &OwnedProviderAuthSourceConfig,
 ) -> Result<()> {
     validate_provider_credential_ref(credential_ref)?;
-    if source.provider_id != "opencode-go"
-        || !source.auth_file.is_absolute()
+    validate_provider_id(&source.provider_id)?;
+    if !source.auth_file.is_absolute()
         || source.auth_file.file_name().and_then(|name| name.to_str()) != Some("auth.json")
         || source.auth_file.components().any(|component| {
             matches!(
@@ -500,7 +504,22 @@ fn validate_provider_auth_source(
     {
         return Err(Error::new(
             "CONFIG_ERROR",
-            "owned provider auth source must be an absolute opencode-go auth.json path",
+            "owned provider auth source must be an absolute selected-provider auth.json path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_id(provider_id: &str) -> Result<()> {
+    if provider_id.is_empty()
+        || provider_id.len() > 256
+        || !provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "owned provider auth source provider ID is malformed",
         ));
     }
     Ok(())
@@ -740,9 +759,18 @@ impl Config {
         for route in cfg
             .routes
             .iter()
-            .filter(|r| r.enabled && r.runtime == crate::runtime::opencode_v2::RUNTIME)
+            .filter(|r| {
+                r.enabled
+                    && (r.runtime == crate::runtime::opencode_v2::RUNTIME
+                        || (r.runtime == "module" && r.owned_service.is_some()))
+            })
         {
-            if route.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID {
+            let supported_route =
+                (route.runtime == crate::runtime::opencode_v2::RUNTIME
+                    && route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+                    || (route.runtime == "module"
+                        && route.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
+            if !supported_route {
                 return Err(Error::new(
                     "CONFIG_ERROR",
                     "unsupported builtin OpenCode module artifact",

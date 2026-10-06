@@ -36,6 +36,11 @@ pub struct OperationIntent {
     /// readback-only input-status page. Missing on older journal records.
     #[serde(default)]
     pub result_input_status: Option<ResultInputStatusIntent>,
+    /// Exact normalized assistant result selector and its parent link. Missing
+    /// on older journal records; a result page is never inferred from a
+    /// timeline position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_assistant: Option<ResultAssistantIntent>,
     /// Exact normalized dispatch admission persisted before the native POST.
     /// Missing on legacy records; a normalized descriptor fails closed if the
     /// record cannot prove this pre-effect marker.
@@ -52,6 +57,19 @@ pub struct ResultInputStatusIntent {
     pub input_operation_id: String,
     pub native_session_id: String,
     pub native_input_id: String,
+    pub target_module_receipt: swarm_contracts::runtime::ModuleReceiptIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResultAssistantIntent {
+    pub input_operation_id: String,
+    pub native_session_id: String,
+    pub native_input_id: String,
+    pub assistant_message_id: String,
+    pub assistant_parent_id: String,
+    pub target_input_sha256: String,
+    pub selector_sha256: String,
     pub target_module_receipt: swarm_contracts::runtime::ModuleReceiptIdentity,
 }
 
@@ -272,6 +290,46 @@ impl Journal {
                         ));
                     }
                     history.acknowledged_sha256 = Some(digest);
+                }
+                "result_page" => {
+                    let params = record.result_params.ok_or_else(|| {
+                        Error::new("ADAPTER_JOURNAL", "saved result page is missing")
+                    })?;
+                    if params["operation_id"] != operation_id {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "saved result page identity changed",
+                        ));
+                    }
+                    let digest = digest_json(&params)?;
+                    if record.result_sha256.as_deref() != Some(digest.as_str())
+                        || history
+                            .result_sha256
+                            .as_deref()
+                            .is_some_and(|old| old != digest)
+                    {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "saved result page digest changed",
+                        ));
+                    }
+                    history.result_params = Some(params);
+                    history.result_sha256 = Some(digest);
+                }
+                "result_acknowledged" => {
+                    let digest = record.result_sha256.ok_or_else(|| {
+                        Error::new(
+                            "ADAPTER_JOURNAL",
+                            "result acknowledgement digest is missing",
+                        )
+                    })?;
+                    if history.result_sha256.as_deref() != Some(digest.as_str()) {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "result acknowledgement does not match the saved page",
+                        ));
+                    }
+                    history.result_acknowledged_sha256 = Some(digest);
                 }
                 _ => return Err(Error::new("ADAPTER_JOURNAL", "unknown journal record")),
             }

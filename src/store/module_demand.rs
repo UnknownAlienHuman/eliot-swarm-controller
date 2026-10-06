@@ -1,12 +1,14 @@
-//! Read-only, Store-owned projection of already-admitted module work.
+//! Store-owned projection of already-admitted module work.
 //!
-//! This source does not read the metadata catalogue to activate a worker. It
-//! starts from exact retained Operation rows and active native-session rows,
-//! then resolves each candidate through the immutable selector on its binding.
+//! The page performs only the idempotent Store intent reservation needed to
+//! carry a fresh owner nonce across the process boundary; it does not read the
+//! metadata catalogue to activate a worker. It starts from exact retained
+//! Operation rows and active native-session rows, then resolves each candidate
+//! through the immutable selector on its binding.
 
-use super::{module_handshake, operations};
-use crate::error::{Error, Result};
-use rusqlite::{Connection, params};
+use super::{launcher_owned_service, module_handshake, operations};
+use crate::{config::Config, error::{Error, Result}};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -321,13 +323,57 @@ pub(super) fn scope_readback(
     })
 }
 
+/// Retain one exact owned-service intent for each selected module opening
+/// before the demand page crosses the Store/process boundary. This is an
+/// idempotent Store write containing only route/Task/Attempt/lease facts; all
+/// filesystem reads and native effects remain outside the Store writer.
+fn prepare_owned_intents(
+    db: &mut Connection,
+    config: &Config,
+) -> Result<BTreeMap<(String, i64), String>> {
+    let candidates = {
+        let mut statement = db.prepare(
+            "SELECT DISTINCT b.binding_id,b.generation
+             FROM bindings AS b
+             JOIN operations AS o
+               ON o.binding_id=b.binding_id AND o.binding_generation=b.generation
+             WHERE b.released_at_ms IS NULL
+               AND json_type(b.route_json,'$.owned_service')='object'
+               AND json_type(b.state_json,'$.module_contract_selector')='object'
+               AND o.method='agent.open' AND o.state='queued'",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if candidates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut errors = BTreeMap::new();
+    for (binding_id, generation) in candidates {
+        if let Err(error) = launcher_owned_service::ensure_module_owned_service_intent(
+            &tx,
+            config,
+            &binding_id,
+            generation,
+        ) {
+            errors.insert((binding_id, generation), error.code);
+        }
+    }
+    tx.commit()?;
+    Ok(errors)
+}
+
 /// Build a bounded in-process snapshot from committed Operations. Automation
 /// dispatches are included because admitted automation actions use the same
 /// `operations` rows and binding tuple as direct manager admissions.
 pub(super) fn pending(
-    db: &Connection,
+    db: &mut Connection,
+    config: &Config,
     cursor: Option<&ModuleDemandCursor>,
 ) -> Result<ModuleDemandSnapshot> {
+    let preparation_errors = prepare_owned_intents(db, config)?;
     let (candidates, truncated, next_cursor) = operation_candidates(db, cursor)?;
     let mut output = ModuleDemandSnapshot {
         truncated,
@@ -419,6 +465,16 @@ pub(super) fn pending(
             continue;
         }
         let scope_key = (operation.binding_id.clone(), operation.generation);
+        if let Some(error_code) = preparation_errors.get(&scope_key) {
+            output.blocked.push(ModuleDemandBlock {
+                binding_id: operation.binding_id,
+                generation,
+                operation_id: operation.operation_id,
+                error_code: error_code.clone(),
+                descriptor: Some(descriptor.clone()),
+            });
+            continue;
+        }
         if !readbacks.contains_key(&scope_key) {
             match scoped_operation_readback(db, &scope_key.0, scope_key.1) {
                 Ok(readback) => {
@@ -437,6 +493,25 @@ pub(super) fn pending(
             }
         }
         let operation_readback = readbacks.get(&scope_key).cloned().unwrap_or_default();
+        let route_native_options = match launcher_owned_service::module_owned_route_options(
+            db,
+            config,
+            &operation.binding_id,
+            operation.generation,
+            binding["route"]["native_options"].clone(),
+        ) {
+            Ok(options) => options,
+            Err(error) => {
+                output.blocked.push(ModuleDemandBlock {
+                    binding_id: operation.binding_id,
+                    generation,
+                    operation_id: operation.operation_id,
+                    error_code: error.code,
+                    descriptor: Some(descriptor.clone()),
+                });
+                continue;
+            }
+        };
         let launch_credential_ref = descriptor
             .launch
             .credential_ref
@@ -456,7 +531,7 @@ pub(super) fn pending(
                 .as_str()
                 .map(str::to_owned),
             credential_ref: launch_credential_ref,
-            route_native_options: binding["route"]["native_options"].clone(),
+            route_native_options,
             operation_readback,
         });
     }

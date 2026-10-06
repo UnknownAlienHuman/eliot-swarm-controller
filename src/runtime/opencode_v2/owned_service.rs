@@ -82,7 +82,7 @@ impl OwnedServiceRoute {
                 .as_deref()
                 .is_some_and(|credential_ref| {
                     provider_auth::validate_ref(credential_ref).is_err()
-                        || config.model.provider_id != "opencode-go"
+                        || provider_auth::validate_provider_id(&config.model.provider_id).is_err()
                 })
         {
             return Err(config_error("invalid fresh-owned OpenCode declaration"));
@@ -2830,7 +2830,7 @@ fn validate_plan(plan: &HelperPlan, plan_path: &Path) -> Result<()> {
             .as_deref()
             .is_some_and(|credential_ref| {
                 provider_auth::validate_ref(credential_ref).is_err()
-                    || plan.model.provider_id != "opencode-go"
+                    || provider_auth::validate_provider_id(&plan.model.provider_id).is_err()
             })
         || !is_sha256(&plan.route_digest)
         || !is_sha256(&plan.config_digest)

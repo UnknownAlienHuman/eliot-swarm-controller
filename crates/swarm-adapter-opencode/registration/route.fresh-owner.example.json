@@ -1,0 +1,27 @@
+{
+  "alias": "<operator-selected-fresh-owner-route>",
+  "runtime": "module",
+  "module_artifact_id": "eliot-opencode-v2.rust-http.1",
+  "enabled": false,
+  "workspace_option": "directory",
+  "native_options": {
+    "directory": "<absolute-admitted-workspace-path>"
+  },
+  "owned_service": {
+    "origin": "fresh_owned_service",
+    "service_id": "<operator-stable-service-id>",
+    "model": {
+      "id": "ling-3.1-flash",
+      "providerID": "inclusionai",
+      "variant": "<exact-selected-variant>"
+    },
+    "model_catalog": "offline",
+    "credential_ref": "protected:inclusionai:example-provider-credential-ref",
+    "bun_executable": "C:\\<PINNED_BUN_EXECUTABLE>",
+    "bun_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "server_program": "C:\\<REPOSITORY_ROOT>\\crates\\swarm-adapter-opencode\\modules\\opencode\\serve.mjs",
+    "server_program_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "state_root": "C:\\<PRIVATE_OWNER_STATE_ROOT>",
+    "port": 43123
+  }
+}

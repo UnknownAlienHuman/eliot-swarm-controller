@@ -1136,17 +1136,38 @@ pub(crate) fn safe_event_projection(
     {
         return Ok(Default::default());
     }
-    let expected_error_code = match (event.source_id.as_str(), event.event_kind.as_str()) {
-        ("controller:host-lifecycle", "host.interrupted") => Some("HOST_INTERRUPTED"),
-        ("controller:operations", "operation.rejected") => Some("OPERATION_REJECTED"),
-        ("controller:operations", "operation.outcome_unknown") => Some("OUTCOME_UNKNOWN"),
-        ("controller:operations", "operation.cancelled") => Some("OPERATION_CANCELLED"),
-        _ => None,
-    };
-    let error_code = match expected_error_code {
-        Some(code) if value["error_code"] == code => Some(code.to_owned()),
-        Some(_) => return Ok(Default::default()),
-        None => None,
+    let error_code = if event.source_id == "controller:runtime"
+        && event.event_kind == "native.operation.completed"
+    {
+        match status {
+            EventStatus::Rejected => match value["error_code"].as_str() {
+                Some(code) if super::is_safe_native_result_error_code(code) => {
+                    Some(code.to_owned())
+                }
+                Some(_) => return Ok(Default::default()),
+                // Other native adapters may retain a rejected terminal event
+                // without a normalized result diagnostic.
+                None => None,
+            },
+            EventStatus::Applied if !value["error_code"].is_null() => {
+                return Ok(Default::default());
+            }
+            EventStatus::Applied => None,
+            _ => return Ok(Default::default()),
+        }
+    } else {
+        let expected_error_code = match (event.source_id.as_str(), event.event_kind.as_str()) {
+            ("controller:host-lifecycle", "host.interrupted") => Some("HOST_INTERRUPTED"),
+            ("controller:operations", "operation.rejected") => Some("OPERATION_REJECTED"),
+            ("controller:operations", "operation.outcome_unknown") => Some("OUTCOME_UNKNOWN"),
+            ("controller:operations", "operation.cancelled") => Some("OPERATION_CANCELLED"),
+            _ => None,
+        };
+        match expected_error_code {
+            Some(code) if value["error_code"] == code => Some(code.to_owned()),
+            Some(_) => return Ok(Default::default()),
+            None => None,
+        }
     };
     if event.source_id == "controller:operations" && event.operation_id.is_none() {
         return Ok(Default::default());

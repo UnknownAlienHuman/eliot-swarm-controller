@@ -2,8 +2,9 @@
 
 use crate::config::{
     ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, HostConnectionConfig, MODULE_ID, NativeOptions,
-    read_credential, read_host_config,
+    OwnedNativeOptions, read_credential, read_host_config,
 };
+use crate::provider_auth::ProviderAuthOptions;
 use std::{
     env,
     path::{Path, PathBuf},
@@ -18,13 +19,29 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
 const NATIVE_OPTIONS_SCHEMA_SHA256: &str =
-    "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
-const CAPABILITIES: [&str; 5] = [
+    "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68";
+const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "2";
+const CAPABILITIES: [&str; 9] = [
     "agent.open",
     "agent.reconcile",
     "agent.result",
     "agent.send/next_turn",
+    "native.mcp.arm",
+    "native.mcp.install",
+    "native.mcp.observe",
+    "native.mcp.read",
     "task.dispatch",
+];
+const COMMAND_SCHEMAS: [&str; 4] = [
+    "swarm.native_mcp_command",
+    "swarm.normalized_result_context",
+    "swarm.runtime_command",
+    "swarm.task_dispatch_context",
+];
+const EVENT_SCHEMAS: [&str; 3] = [
+    "swarm.normalized_result_page",
+    "swarm.runtime_outcome",
+    "swarm.task_dispatch_admission",
 ];
 
 pub struct OwnedBootstrap {
@@ -102,6 +119,7 @@ impl OwnedBootstrap {
                 variant: required_env("ELIOT_SWARM_CONFIG_OPENCODE_VARIANT")?,
             },
         };
+        let owned_native = owned_native_options(&native_options)?;
         let config = AdapterConfig {
             schema_version: 1,
             host_data_dir: host.host_data_dir,
@@ -113,6 +131,7 @@ impl OwnedBootstrap {
             generation,
             module_artifact_id: artifact_id,
             native_options,
+            owned_native,
             ipc: host.ipc,
         };
         config.validate()?;
@@ -132,51 +151,106 @@ impl OwnedBootstrap {
     }
 }
 
+/// Descriptor protected references are resolved by the module owner into
+/// these binding-scoped values.  The adapter accepts the complete owner set or
+/// no owner at all; a partial set is a launch configuration error, never an
+/// external-attach fallback.
+fn owned_native_options(native: &NativeOptions) -> Result<Option<OwnedNativeOptions>> {
+    let Some(origin) = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_ORIGIN")? else {
+        return Ok(None);
+    };
+    let port = required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PORT")?
+        .parse::<u16>()
+        .map_err(|_| Error::new("MODULE_LAUNCH_CONFIG", "native owner port is invalid"))?;
+    let owner = OwnedNativeOptions {
+        origin,
+        owner_nonce: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_NONCE")?,
+        bun_executable: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_BUN_EXECUTABLE")?,
+        bun_sha256: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_BUN_SHA256")?,
+        server_program: absolute_config_path(
+            "ELIOT_SWARM_CONFIG_OPENCODE_OWNER_SERVER_PROGRAM",
+        )?,
+        server_program_sha256: required_env(
+            "ELIOT_SWARM_CONFIG_OPENCODE_OWNER_SERVER_PROGRAM_SHA256",
+        )?,
+        state_root: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_STATE_ROOT")?,
+        password_file: absolute_config_path(
+            "ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PASSWORD_FILE",
+        )?,
+        port,
+        model_catalog: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_MODEL_CATALOG")?,
+        provider_auth: provider_auth_options(native)?,
+    };
+    owner.validate_for(native)?;
+    if owner.state_root == owner.password_file {
+        return Err(Error::new(
+            "MODULE_LAUNCH_CONFIG",
+            "native owner password file must be below its private state root",
+        ));
+    }
+    Ok(Some(owner))
+}
+
+fn provider_auth_options(native: &NativeOptions) -> Result<Option<ProviderAuthOptions>> {
+    let Some(source) = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PROVIDER_AUTH_FILE")?
+    else {
+        return Ok(None);
+    };
+    let source_file = absolute_config_path_value(source)?;
+    let credential_ref = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PROVIDER_CREDENTIAL_REF")?;
+    let auth = ProviderAuthOptions {
+        source_file,
+        credential_ref,
+    };
+    auth.validate_for(native)?;
+    Ok(Some(auth))
+}
+
 fn capabilities_match(claim: &ModuleContractClaim) -> bool {
     let values = claim
         .capabilities
         .iter()
         .map(CapabilityId::as_str)
         .collect::<Vec<_>>();
-    values.as_slice() == CAPABILITIES.as_slice()
+    values.len() == CAPABILITIES.len()
+        && CAPABILITIES.iter().all(|capability| values.contains(capability))
 }
 
 fn config_schema_matches(claim: &ModuleContractClaim) -> bool {
     claim.config_schema.as_ref().is_some_and(|schema| {
         schema.schema_id == "opencode-v2-native-options"
-            && schema.version == "1"
+            && schema.version == NATIVE_OPTIONS_SCHEMA_VERSION
             && schema.sha256.as_ref().map(|digest| digest.as_str())
                 == Some(NATIVE_OPTIONS_SCHEMA_SHA256)
     })
 }
 
+fn schema_set_matches(schemas: &[SchemaDescriptor], expected: &[&str]) -> bool {
+    schemas.len() == expected.len()
+        && expected.iter().all(|expected_id| {
+            schemas.iter().any(|schema| {
+                schema.schema_id == *expected_id
+                    && schema.version == "1"
+                    && schema.sha256.is_none()
+            })
+        })
+}
+
 fn command_event_schemas_match(claim: &ModuleContractClaim) -> bool {
-    fn is_schema(schema: &SchemaDescriptor, id: &str) -> bool {
-        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
-    }
-    let legacy = claim.command_schemas.len() == 1
-        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
-        && claim.event_schemas.len() == 1
-        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome");
-    let normalized = claim.command_schemas.len() == 2
-        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
-        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
-        && claim.event_schemas.len() == 2
-        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
-        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission");
-    legacy || normalized
+    schema_set_matches(&claim.command_schemas, &COMMAND_SCHEMAS)
+        && schema_set_matches(&claim.event_schemas, &EVENT_SCHEMAS)
+}
+
+pub fn native_mcp_enabled(claim: &ModuleContractClaim) -> bool {
+    capabilities_match(claim) && command_event_schemas_match(claim)
 }
 
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
-    fn is_schema(schema: &SchemaDescriptor, id: &str) -> bool {
-        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
-    }
-    claim.command_schemas.len() == 2
-        && claim.event_schemas.len() == 2
-        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
-        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
-        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
-        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission")
+    capabilities_match(claim) && command_event_schemas_match(claim)
+}
+
+pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
+    capabilities_match(claim) && command_event_schemas_match(claim)
 }
 
 fn parse_protocol(value: &str) -> Result<ProtocolVersion> {
@@ -251,6 +325,10 @@ fn absolute_env_path(name: &'static str) -> Result<PathBuf> {
 
 fn absolute_config_path(name: &'static str) -> Result<PathBuf> {
     let value = required_env(name)?;
+    absolute_config_path_value(value)
+}
+
+fn absolute_config_path_value(value: String) -> Result<PathBuf> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(Error::new(

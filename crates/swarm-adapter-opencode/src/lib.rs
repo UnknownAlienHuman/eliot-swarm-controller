@@ -3,14 +3,27 @@ mod journal;
 mod module_link;
 mod module_receipt;
 mod module_runtime;
+mod mcp_plugin;
 mod native;
+mod native_owner;
+mod provider_auth;
+mod native_mcp;
+mod native_mcp_intake;
 
-pub use config::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, ModelRef, NativeOptions, RUNTIME};
+pub use config::{
+    ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, ModelRef, NativeOptions, OwnedNativeOptions,
+    RUNTIME,
+};
 pub use module_runtime::OwnedBootstrap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use journal::{Journal, OperationIntent, ResultInputStatusIntent, digest_json};
-use native::{InputEvidence, NativeClient, input_id, input_payload, intent_for, root_id};
+use journal::{
+    Journal, OperationIntent, ResultAssistantIntent, ResultInputStatusIntent, digest_json,
+};
+use native::{
+    AssistantResultEvidence, InputEvidence, NativeClient, canonical_json, input_id, input_payload,
+    intent_for, root_id,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{sync::Mutex, time::Duration};
@@ -19,8 +32,8 @@ use swarm_contracts::{
     error::{Error, Result},
     module_contract::ModuleContractClaim,
     runtime::{
-        EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
-        TaskDispatchContext,
+        EffectOutcome, NormalizedResultOriginContext, NormalizedResultPageSource, RuntimeCommand,
+        RuntimeOutcome, TaskDispatchAdmissionReceipt, TaskDispatchContext,
     },
 };
 use tokio::time::sleep;
@@ -56,9 +69,11 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &route_sha256,
     )?;
     journal.recover_outbox()?;
+    let mut native_owner = native_owner::NativeOwnerController::new(config.owned_native.clone());
 
     // The verified owner and boot identity come from the per-scope helper.
-    // That group owns this adapter process tree only; OpenCode stays external.
+    // The helper owns this adapter process; any OpenCode child is a separate
+    // native owner with its own pinned image and state-root receipts.
     let boot_id = worker.boot_id.clone();
     let scope = config.native_options.scope_key();
     let root_hint = journal.native_root_for_hello(&config.binding_id, config.generation, &scope)?;
@@ -112,6 +127,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         let response = tokio::select! {
             signal = &mut ctrl_c => {
                 signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
+                native_owner.shutdown().await?;
                 return Ok(());
             }
             result = host.call("module.next", json!({})) => result?,
@@ -131,7 +147,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     )
                 })?;
             verify_command_scope(host.config, &command, host.claim)?;
-            handle_command(&host, &command).await?;
+            handle_command(&host, &command, &mut native_owner).await?;
             flush_outbox(&host).await?;
         } else {
             sleep(Duration::from_millis(IDLE_POLL_MS)).await;
@@ -142,7 +158,11 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     }
 }
 
-async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Result<()> {
+async fn handle_command(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    native_owner: &mut native_owner::NativeOwnerController,
+) -> Result<()> {
     let config = host.config;
     let journal = host.journal;
     let claim = host.claim;
@@ -208,10 +228,13 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
     };
 
     match command.method.as_str() {
-        "agent.open" => handle_open(host, command, &options).await,
+        "agent.open" => handle_open(host, command, &options, native_owner).await,
         "task.dispatch" | "agent.send" => handle_send(host, command, &options).await,
         "agent.reconcile" => handle_reconcile(host, command, &options).await,
         "agent.result" => handle_result(host, command, &options).await,
+        "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read" => {
+            handle_native_mcp(host, command, &options).await
+        }
         _ => {
             let error = Error::new(
                 "UNSUPPORTED_CAPABILITY",
@@ -232,12 +255,88 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
     }
 }
 
+async fn handle_native_mcp(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> Result<()> {
+    let journal = host.journal;
+    let claim = host.claim;
+    let admitted = match native_mcp_intake::admit(command, claim) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            let outcome = outcome(
+                command,
+                claim,
+                EffectOutcome::Rejected,
+                options,
+                command.native_root_id.clone(),
+                None,
+                diagnostic(&error),
+            )?;
+            journal.queue_outcome(&outcome)?;
+            return flush_outbox(host).await;
+        }
+    };
+    let intent = intent_for(command, claim, options, None, None)?;
+    journal.write_intent(&intent)?;
+    let result = match NativeClient::connect(options).await {
+        Ok((native, _)) => match native_mcp::execute(&native, &admitted.effect_command, options).await {
+            Ok(receipt) => outcome(
+                command,
+                claim,
+                EffectOutcome::Applied,
+                options,
+                command.native_root_id.clone(),
+                None,
+                json!({
+                    "native_mcp":receipt,
+                    "native_replay":false,
+                }),
+            )?,
+            Err(failure) => outcome(
+                command,
+                claim,
+                failure.outcome,
+                options,
+                command.native_root_id.clone(),
+                None,
+                {
+                    let mut details = diagnostic(&failure.error);
+                    details["native_mcp_action"] = json!(command.method);
+                    details["native_replay"] = json!(false);
+                    details
+                },
+            )?,
+        },
+        Err(error) => outcome(
+            command,
+            claim,
+            EffectOutcome::Rejected,
+            options,
+            command.native_root_id.clone(),
+            None,
+            {
+                let mut details = diagnostic(&error);
+                details["native_mcp_action"] = json!(command.method);
+                details["native_replay"] = json!(false);
+                details
+            },
+        )?,
+    };
+    journal.queue_outcome(&result)?;
+    flush_outbox(host).await
+}
+
 async fn handle_result(
     host: &HostSession<'_>,
     command: &RuntimeCommand,
     options: &NativeOptions,
 ) -> Result<()> {
     let selector = &command.input["selector"];
+    if selector["kind"] == "opencode_assistant_result" {
+        return handle_assistant_result(host, command, options).await;
+    }
     let selector_fields = ["kind", "input_operation_id", "session_id"];
     if selector.as_object().is_none_or(|object| {
         object.len() != selector_fields.len()
@@ -406,25 +505,435 @@ async fn handle_result(
     flush_outbox(host).await
 }
 
+async fn handle_assistant_result(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> Result<()> {
+    if !module_runtime::normalized_result_enabled(host.claim) {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            command.native_root_id.clone(),
+            &Error::new(
+                "NORMALIZED_RESULT_CONTRACT_UNAVAILABLE",
+                "OpenCode assistant pages require the exact normalized-result descriptor opt-in",
+            ),
+        )
+        .await;
+    }
+    let selector = &command.input["selector"];
+    let selector_fields = ["kind", "input_operation_id", "session_id", "message_id"];
+    if selector.as_object().is_none_or(|object| {
+        object.len() != selector_fields.len()
+            || object
+                .keys()
+                .any(|field| !selector_fields.contains(&field.as_str()))
+    }) || selector["kind"] != "opencode_assistant_result"
+    {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            command.native_root_id.clone(),
+            &Error::new(
+                "UNSUPPORTED_RESULT_SELECTOR",
+                "normalized OpenCode result delivery requires one exact assistant message selector",
+            ),
+        )
+        .await;
+    }
+    let input_operation_id = selector["input_operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::invalid("assistant result selector lacks its input Operation ID"))?;
+    let session_id = selector["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::invalid("assistant result selector lacks its native session ID"))?;
+    let assistant_message_id = selector["message_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::invalid("assistant result selector lacks its message ID"))?;
+    let root = command.native_root_id.as_deref().ok_or_else(|| {
+        Error::new(
+            "NATIVE_ROOT_MISSING",
+            "assistant result requires the exact binding session",
+        )
+    })?;
+    if session_id != root {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.to_owned()),
+            &Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "assistant result selector names another native session",
+            ),
+        )
+        .await;
+    }
+
+    let target_history = host.journal.load(input_operation_id)?;
+    let Some(target_intent) = target_history.intent.as_ref() else {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.to_owned()),
+            &Error::new(
+                "RESULT_TARGET_INTENT_MISSING",
+                "assistant result requires the saved task.dispatch intent",
+            ),
+        )
+        .await;
+    };
+    if target_intent.method != "task.dispatch" {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.to_owned()),
+            &Error::new(
+                "RESULT_TARGET_METHOD",
+                "normalized assistant result target must be task.dispatch",
+            ),
+        )
+        .await;
+    }
+    let target_receipt = module_receipt::for_target_intent(
+        host.claim,
+        target_intent,
+        input_operation_id,
+        command.target_input_sha256.as_deref(),
+        &command.binding_id,
+        command.generation,
+    )?;
+    let target_native_input_id = input_id(input_operation_id);
+    if target_intent.native_root_id.as_deref() != Some(root)
+        || target_intent.native_input_id.as_deref() != Some(target_native_input_id.as_str())
+        || target_intent.native_scope_key != options.scope_key()
+    {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.to_owned()),
+            &Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved task.dispatch intent differs from the selected assistant session or input",
+            ),
+        )
+        .await;
+    }
+
+    let admission = target_intent.dispatch_admission.clone().ok_or_else(|| {
+        Error::new(
+            "RESULT_DISPATCH_ADMISSION_MISSING",
+            "normalized assistant result target lacks its typed dispatch admission",
+        )
+    })?;
+    admission.validate().map_err(|_| {
+        Error::new(
+            "RESULT_DISPATCH_ADMISSION_INVALID",
+            "saved task.dispatch admission receipt is invalid",
+        )
+    })?;
+    let target_outcome = target_history.outcome.as_ref().ok_or_else(|| {
+        Error::new(
+            "RESULT_DISPATCH_OUTCOME_MISSING",
+            "normalized assistant result target has no retained dispatch outcome",
+        )
+    })?;
+    let target_outcome: RuntimeOutcome = serde_json::from_value(target_outcome.clone()).map_err(
+        |_| {
+            Error::new(
+                "RESULT_DISPATCH_OUTCOME_INVALID",
+                "saved task.dispatch outcome is not a runtime outcome",
+            )
+        },
+    )?;
+    let saved_admission: TaskDispatchAdmissionReceipt =
+        serde_json::from_value(target_outcome.details["dispatch_admission"].clone()).map_err(
+            |_| {
+                Error::new(
+                    "RESULT_DISPATCH_ADMISSION_INVALID",
+                    "saved task.dispatch outcome lacks its typed admission receipt",
+                )
+            },
+        )?;
+    if !matches!(target_outcome.outcome, EffectOutcome::Applied | EffectOutcome::Accepted)
+        || target_outcome.operation_id != input_operation_id
+        || target_outcome.native_input_id.as_deref() != Some(target_native_input_id.as_str())
+        || target_outcome.details["module_receipt"] != serde_json::to_value(&target_receipt)?
+        || saved_admission != admission
+        || admission.module_receipt != target_receipt
+        || admission.operation_id != input_operation_id
+        || admission.binding_id != command.binding_id
+        || admission.binding_generation != command.generation
+        || admission.native_input_id.as_deref() != Some(target_native_input_id.as_str())
+    {
+        return Err(Error::new(
+            "RESULT_DISPATCH_ADMISSION_MISMATCH",
+            "saved dispatch outcome does not prove the exact admitted input receipt",
+        ));
+    }
+
+    let origin: NormalizedResultOriginContext = serde_json::from_value(
+        command.input["normalized_result_origin"].clone(),
+    )
+    .map_err(|_| {
+        Error::new(
+            "NORMALIZED_RESULT_ORIGIN_INVALID",
+            "Store-supplied normalized result origin is malformed",
+        )
+    })?;
+    origin.validate().map_err(|_| {
+        Error::new(
+            "NORMALIZED_RESULT_ORIGIN_INVALID",
+            "Store-supplied normalized result origin is invalid",
+        )
+    })?;
+    let selector_sha256 = sha256(canonical_json(selector)?.as_bytes());
+    let context = admission.context();
+    if origin.binding_id != command.binding_id
+        || origin.binding_generation != command.generation
+        || origin.target_operation_id != input_operation_id
+        || origin.target_input_sha256 != target_receipt.input_sha256
+        || origin.selector_sha256 != selector_sha256
+        || origin.attempt_id != context.attempt_id
+        || origin.task_id != context.task_id
+        || origin.task_revision != context.task_revision
+        || origin.task_snapshot_sha256 != context.task_snapshot_sha256
+        || origin.producer.assignment_id != input_operation_id
+        || origin.producer.dispatch_operation_id != input_operation_id
+        || origin.producer.attempt_id != context.attempt_id
+        || origin.producer.task_id != context.task_id
+        || origin.producer.task_revision != context.task_revision
+        || origin.producer.source_text_sha256 != context.source_text_sha256
+        || origin.producer.source_text_bytes != context.source_text_bytes
+        || origin.producer.native_payload_sha256 != admission.native_payload_sha256
+        || origin.producer.native_payload_bytes != admission.native_payload_bytes
+        || origin.producer.native_input_id.as_deref() != Some(target_native_input_id.as_str())
+        || origin.producer.module_receipt != target_receipt
+    {
+        return Err(Error::new(
+            "NORMALIZED_RESULT_ORIGIN_MISMATCH",
+            "normalized result origin differs from the retained dispatch admission",
+        ));
+    }
+
+    let mut result_intent = intent_for(command, host.claim, options, None, None)?;
+    result_intent.result_assistant = Some(ResultAssistantIntent {
+        input_operation_id: input_operation_id.to_owned(),
+        native_session_id: session_id.to_owned(),
+        native_input_id: target_native_input_id.clone(),
+        assistant_message_id: assistant_message_id.to_owned(),
+        assistant_parent_id: target_native_input_id.clone(),
+        target_input_sha256: target_receipt.input_sha256.clone(),
+        selector_sha256: selector_sha256.clone(),
+        target_module_receipt: target_receipt.clone(),
+    });
+    let own_history = host.journal.load(&command.operation_id)?;
+    if let Some(saved_intent) = own_history.intent.as_ref() {
+        if saved_intent != &result_intent {
+            return Err(Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved assistant result selector differs from the exact admitted readback request",
+            ));
+        }
+    } else {
+        host.journal.write_intent(&result_intent)?;
+    }
+    let native_identity = assistant_identity(assistant_message_id, &target_native_input_id);
+    if let Some(saved) = own_history.result_params.as_ref() {
+        let source: NormalizedResultPageSource = serde_json::from_value(
+            saved["page"]["source"].clone(),
+        )
+        .map_err(|_| {
+            Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved normalized assistant result page is malformed",
+            )
+        })?;
+        if source.origin != origin
+            || source.result_module_receipt != result_intent.module_receipt
+            || source.native_response_identity.as_deref() != Some(native_identity.as_str())
+        {
+            return Err(Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved normalized assistant page differs from its exact source identity",
+            ));
+        }
+        let digest = digest_json(saved)?;
+        if own_history.result_acknowledged_sha256.as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
+        host.journal.queue_result(saved)?;
+        return flush_outbox(host).await;
+    }
+
+    let native = match NativeClient::connect(options).await {
+        Ok((native, _)) => native,
+        Err(error) => return queue_unknown_result(host, &result_intent, &error).await,
+    };
+    let evidence = match native
+        .read_assistant_result(target_intent, options, assistant_message_id)
+        .await
+    {
+        Ok(evidence) => evidence,
+        Err(error) => return queue_unknown_result(host, &result_intent, &error).await,
+    };
+    let params = normalized_assistant_result_page(
+        command,
+        &result_intent,
+        origin,
+        target_receipt,
+        &evidence,
+        &native_identity,
+    )?;
+    host.journal.queue_result(&params)?;
+    flush_outbox(host).await
+}
+
+fn assistant_identity(message_id: &str, parent_id: &str) -> String {
+    format!("opencode:assistant:{message_id}:parent:{parent_id}")
+}
+
+fn normalized_assistant_result_page(
+    command: &RuntimeCommand,
+    result_intent: &OperationIntent,
+    origin: NormalizedResultOriginContext,
+    target_receipt: swarm_contracts::runtime::ModuleReceiptIdentity,
+    evidence: &AssistantResultEvidence,
+    native_identity: &str,
+) -> Result<Value> {
+    let target = result_intent.result_assistant.as_ref().ok_or_else(|| {
+        Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "assistant result intent has no exact target",
+        )
+    })?;
+    if target.target_module_receipt != target_receipt
+        || target.input_operation_id != origin.target_operation_id
+        || origin.producer.native_input_id.as_deref() != Some(target.native_input_id.as_str())
+        || target.assistant_message_id != evidence.message_id
+        || target.assistant_parent_id != evidence.parent_id
+        || native_identity != assistant_identity(&evidence.message_id, &evidence.parent_id)
+    {
+        return Err(Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "assistant result evidence differs from the sealed target identity",
+        ));
+    }
+    let body = canonical_json(&evidence.message)?.into_bytes();
+    let payload_sha256 = sha256(&body);
+    if payload_sha256 != evidence.payload_sha256 || body.len() as u64 != evidence.payload_bytes {
+        return Err(Error::new(
+            "NATIVE_ASSISTANT_PAYLOAD_MISMATCH",
+            "assistant result body digest changed during normalization",
+        ));
+    }
+    if let Some(expected) = command
+        .input
+        .get("normalized_result_payload_identity")
+        .filter(|value| value.is_object())
+    {
+        if expected["sha256"].as_str() != Some(payload_sha256.as_str())
+            || expected["byte_length"].as_u64() != Some(body.len() as u64)
+            || expected["complete"] == false
+        {
+            return Err(Error::new(
+                "NORMALIZED_RESULT_PAYLOAD_MISMATCH",
+                "assistant result body differs from the Store-admitted payload identity",
+            ));
+        }
+    }
+    let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
+    let requested = command.input["length_bytes"]
+        .as_u64()
+        .unwrap_or(65_536)
+        .min(65_536);
+    let total = body.len() as u64;
+    if offset > total || (requested == 0 && offset < total) {
+        return Err(Error::invalid("assistant result page range is invalid"));
+    }
+    let end = offset.checked_add(requested).unwrap_or(u64::MAX).min(total);
+    let start = usize::try_from(offset)
+        .map_err(|_| Error::invalid("assistant result page offset is invalid"))?;
+    let stop = usize::try_from(end)
+        .map_err(|_| Error::invalid("assistant result page end is invalid"))?;
+    let page = &body[start..stop];
+    let source = NormalizedResultPageSource {
+        schema_id: "swarm.normalized_result_page".to_owned(),
+        schema_version: 1,
+        origin,
+        result_operation_id: command.operation_id.clone(),
+        result_input_sha256: result_intent.module_receipt.input_sha256.clone(),
+        result_module_receipt: result_intent.module_receipt.clone(),
+        payload_sha256,
+        payload_bytes: total,
+        native_response_identity: Some(native_identity.to_owned()),
+        execution_complete: false,
+        task_completion: "unknown".to_owned(),
+        native_replay: false,
+    };
+    source.validate().map_err(|_| {
+        Error::new(
+            "NORMALIZED_RESULT_SOURCE_INVALID",
+            "normalized assistant result source failed the shared contract",
+        )
+    })?;
+    Ok(json!({
+        "operation_id":command.operation_id,
+        "page":{
+            "source":source,
+            "offset_bytes":offset,
+            "byte_length":page.len(),
+            "total_bytes":total,
+            "eof":end == total,
+            "media_type":"application/json",
+            "content_base64":STANDARD.encode(page),
+            "page_sha256":sha256(page),
+        }
+    }))
+}
+
 async fn queue_unknown_result(
     host: &HostSession<'_>,
     intent: &OperationIntent,
     error: &Error,
 ) -> Result<()> {
-    let target = intent.result_input_status.as_ref().ok_or_else(|| {
-        Error::new(
-            "ADAPTER_INTENT_MISMATCH",
-            "result status intent is missing its exact target",
-        )
-    })?;
     let mut unknown = unknown_from_intent(intent, &error.code)?;
     attach_native_http_failure(&mut unknown.details, error);
-    unknown.details["completion_condition"] = json!("input_status_unavailable");
-    unknown.details["input_operation_id"] = json!(target.input_operation_id);
-    unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
-    unknown.details["assistant_result_correlation"] = json!("not_exposed");
-    unknown.details["assistant_result_correlation_reason"] =
-        json!("assistant_message_has_no_input_parent_in_public_projection");
+    if let Some(target) = intent.result_input_status.as_ref() {
+        unknown.details["completion_condition"] = json!("input_status_unavailable");
+        unknown.details["input_operation_id"] = json!(target.input_operation_id);
+        unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
+        unknown.details["assistant_result_correlation"] = json!("not_exposed");
+        unknown.details["assistant_result_correlation_reason"] =
+            json!("assistant_message_has_no_input_parent_in_public_projection");
+    } else if let Some(target) = intent.result_assistant.as_ref() {
+        unknown.details["completion_condition"] = json!("assistant_result_unavailable");
+        unknown.details["input_operation_id"] = json!(target.input_operation_id);
+        unknown.details["native_session_id"] = json!(target.native_session_id);
+        unknown.details["native_input_id"] = json!(target.native_input_id);
+        unknown.details["assistant_message_id"] = json!(target.assistant_message_id);
+        unknown.details["assistant_parent_id"] = json!(target.assistant_parent_id);
+        unknown.details["target_input_sha256"] = json!(target.target_input_sha256);
+        unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
+        unknown.details["assistant_result_correlation"] = json!("unknown");
+        unknown.details["assistant_result_correlation_reason"] =
+            json!("exact_parent_identity_unavailable_or_native_readback_failed");
+        unknown.details["native_response_identity"] = json!("unavailable");
+    } else {
+        return Err(Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "result intent is missing its exact target",
+        ));
+    }
     unknown.details["task_completion"] = json!("unknown");
     unknown.details["execution_complete"] = json!(false);
     unknown.details["native_replay"] = json!(false);
@@ -533,13 +1042,43 @@ async fn handle_open(
     host: &HostSession<'_>,
     command: &RuntimeCommand,
     options: &NativeOptions,
+    native_owner: &mut native_owner::NativeOwnerController,
 ) -> Result<()> {
     let journal = host.journal;
     let claim = host.claim;
+    let root = root_id(&command.binding_id, command.generation);
+    host.set_root_hint(&root)?;
+    let intent = intent_for(command, claim, options, None, None)?;
+    // The adapter-owned service is a native effect too.  Persist the exact
+    // operation marker before either starting Bun or sending HTTP.
+    journal.write_intent(&intent)?;
+    let owner_ready = match native_owner.ensure_started(options).await {
+        Ok(receipt) => receipt,
+        Err(failure) => {
+            let state = if failure.effect_attempted {
+                EffectOutcome::Unknown
+            } else {
+                EffectOutcome::Rejected
+            };
+            let mut details = failure.details;
+            details["diagnostic_code"] = json!(failure.error.code);
+            let outcome = outcome(command, claim, state, options, Some(root), None, details)?;
+            journal.queue_outcome(&outcome)?;
+            return flush_outbox(host).await;
+        }
+    };
     let native = match NativeClient::connect(options).await {
         Ok((native, _)) => native,
         Err(error) => {
             return queue_rejected(host, command, options, None, &error).await;
+        }
+    };
+    let provider_auth = match native_owner.bootstrap_provider_auth(&native, options).await {
+        Ok(proof) => proof,
+        Err(error) => {
+            let outcome = effect_failure(command, claim, options, Some(root), None, &error, true)?;
+            journal.queue_outcome(&outcome)?;
+            return flush_outbox(host).await;
         }
     };
     let location = match native.preflight_open(options).await {
@@ -548,27 +1087,32 @@ async fn handle_open(
             return queue_rejected(host, command, options, None, &error).await;
         }
     };
-    let root = root_id(&command.binding_id, command.generation);
-    host.set_root_hint(&root)?;
-    let intent = intent_for(command, claim, options, None, None)?;
     // This fsync is the barrier before the one native create POST. On any
     // later crash this operation becomes Unknown and can only be read back.
-    journal.write_intent(&intent)?;
     let outcome = match native.create_root(command, options, &root, location).await {
-        Ok(()) => outcome(
-            command,
-            claim,
-            EffectOutcome::Applied,
-            options,
-            Some(root),
-            None,
-            json!({
+        Ok(()) => {
+            let mut details = json!({
                 "completion_condition":"native_session_created",
                 "durable_origin":"exact_session_created_event",
                 "native_replay":false,
                 "model":options.model
-            }),
-        )?,
+            });
+            if let Some(receipt) = owner_ready {
+                details["owned_service_ready"] = serde_json::to_value(receipt)?;
+            }
+            if let Some(proof) = provider_auth {
+                details["provider_auth"] = proof;
+            }
+            outcome(
+                command,
+                claim,
+                EffectOutcome::Applied,
+                options,
+                Some(root),
+                None,
+                details,
+            )?
+        }
         Err(error) => effect_failure(command, claim, options, Some(root), None, &error, true)?,
     };
     journal.queue_outcome(&outcome)?;

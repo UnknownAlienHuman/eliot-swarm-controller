@@ -32,6 +32,7 @@ use swarm_contracts::{
 };
 use tokio::{sync::watch, time};
 use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
 const CONFIG_SCHEMA_VERSION: u16 = 1;
 const HOST_MODULE_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
@@ -45,8 +46,15 @@ const MAX_LAUNCH_CONFIGS: usize = 256;
 const MAX_STATUS_QUEUE: usize = 1_024;
 const MODULE_SUPERVISOR_CLIENT_ID: &str = "eliot-module-supervisor-v1";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_ID: &str = "opencode-v2-native-options";
-const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256: &str =
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY: &str = "1";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER: &str = "2";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY: &str =
     "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER: &str =
+    "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68";
+const OPENCODE_OWNED_SERVICE_VERSION: &str = "2.0.7";
+const OWNER_ROUTE_KEY: &str = "__eliot_owned_service";
+const OWNER_NONCE_KEY: &str = "__eliot_owner_nonce";
 
 /// A launch configuration bound to one exact descriptor artifact and route
 /// option digest. Route options themselves remain in the authenticated demand
@@ -287,6 +295,9 @@ pub trait LaunchConfigProvider: Send + Sync + 'static {
 struct StaticLaunchConfigProvider {
     entries: BTreeMap<String, StandaloneLaunchConfig>,
     mapper: StandaloneRouteConfigMapper,
+    /// Host-only reference -> pinned source path. The mapper receives paths,
+    /// never file contents or provider secrets.
+    protected_files: BTreeMap<ProtectedRef, PathBuf>,
 }
 
 impl LaunchConfigProvider for StaticLaunchConfigProvider {
@@ -297,7 +308,12 @@ impl LaunchConfigProvider for StaticLaunchConfigProvider {
     ) -> Result<BindingLaunchConfig> {
         let module_id = descriptor.module_id.as_str();
         let Some(entry) = self.entries.get(module_id) else {
-            return map_route_config(self.mapper, descriptor, route_native_options);
+            return map_route_config(
+                self.mapper,
+                descriptor,
+                route_native_options,
+                &self.protected_files,
+            );
         };
         if entry.artifact_id != descriptor.artifact.artifact_id.as_str()
             || entry.artifact_version != descriptor.artifact.version.as_str()
@@ -317,6 +333,7 @@ fn map_route_config(
     mapper: StandaloneRouteConfigMapper,
     descriptor: &ModuleDescriptor,
     route_native_options: &Value,
+    protected_files: &BTreeMap<ProtectedRef, PathBuf>,
 ) -> Result<BindingLaunchConfig> {
     match mapper {
         StandaloneRouteConfigMapper::EmptyOnly => {
@@ -332,40 +349,78 @@ fn map_route_config(
                 ))
             }
         }
-        StandaloneRouteConfigMapper::DescriptorSchema => match descriptor.config_schema.as_ref() {
-            None => Ok(BindingLaunchConfig::default()),
-            Some(schema)
-                if schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
-                    && schema.version == "1"
-                    && schema.sha256.as_ref().is_some_and(|digest| {
-                        digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256
-                    }) =>
-            {
-                open_code_route_config(descriptor, route_native_options)
+        StandaloneRouteConfigMapper::DescriptorSchema => {
+            match descriptor.config_schema.as_ref() {
+                None => Ok(BindingLaunchConfig::default()),
+                Some(_) if opencode_schema_supported(descriptor) => {
+                    open_code_route_config(descriptor, route_native_options, protected_files)
+                }
+                Some(_) => Err(Error::new(
+                    "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+                    "the retained descriptor names a launch config schema with no supervisor mapper",
+                )),
             }
-            Some(_) => Err(Error::new(
-                "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
-                "the retained descriptor names a launch config schema with no supervisor mapper",
-            )),
-        },
+        }
         StandaloneRouteConfigMapper::OpenCodeSevenField => {
-            open_code_route_config(descriptor, route_native_options)
+            open_code_route_config(descriptor, route_native_options, protected_files)
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedRouteModel {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    variant: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedRouteConfig {
+    origin: String,
+    service_id: String,
+    model: OwnedRouteModel,
+    model_catalog: String,
+    #[serde(default)]
+    credential_ref: Option<String>,
+    bun_executable: PathBuf,
+    bun_sha256: String,
+    server_program: PathBuf,
+    server_program_sha256: String,
+    state_root: PathBuf,
+    port: u16,
+}
+
+fn opencode_schema_supported(descriptor: &ModuleDescriptor) -> bool {
+    descriptor.config_schema.as_ref().is_some_and(|schema| {
+        schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
+            && schema.sha256.as_ref().is_some_and(|digest| {
+                (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY
+                    && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY)
+                    || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
+                        && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER)
+            })
+    })
+}
+
+fn opencode_owner_schema(descriptor: &ModuleDescriptor) -> bool {
+    descriptor.config_schema.as_ref().is_some_and(|schema| {
+        schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
+            && schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
+            && schema.sha256.as_ref().is_some_and(|digest| {
+                digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER
+            })
+    })
 }
 
 fn open_code_route_config(
     descriptor: &ModuleDescriptor,
     options: &Value,
+    protected_files: &BTreeMap<ProtectedRef, PathBuf>,
 ) -> Result<BindingLaunchConfig> {
-    if !descriptor.config_schema.as_ref().is_some_and(|schema| {
-        schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
-            && schema.version == "1"
-            && schema
-                .sha256
-                .as_ref()
-                .is_some_and(|digest| digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256)
-    }) {
+    if !opencode_schema_supported(descriptor) {
         return Err(Error::new(
             "MODULE_CONFIG_SCHEMA_MISMATCH",
             "OpenCode route values require the exact registered native-options schema",
@@ -377,17 +432,32 @@ fn open_code_route_config(
             "OpenCode route options must be an object",
         )
     })?;
-    let allowed = [
+    let base_allowed = [
         "service_id",
         "connection_file",
         "expected_version",
         "directory",
         "model",
     ];
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) || object.len() != allowed.len() {
+    let has_owner_service = object.contains_key(OWNER_ROUTE_KEY);
+    let has_owner_nonce = object.contains_key(OWNER_NONCE_KEY);
+    if has_owner_service != has_owner_nonce
+        || object.keys().any(|key| {
+            !base_allowed.contains(&key.as_str())
+                && key != OWNER_ROUTE_KEY
+                && key != OWNER_NONCE_KEY
+        })
+        || object.len() != base_allowed.len() + usize::from(has_owner_service) * 2
+    {
         return Err(Error::new(
             "MODULE_CONFIG_INVALID",
-            "OpenCode route options must contain only the seven declared adapter values",
+            "OpenCode route options contain an unknown or incomplete owner projection",
+        ));
+    }
+    if has_owner_service && !opencode_owner_schema(descriptor) {
+        return Err(Error::new(
+            "MODULE_CONFIG_SCHEMA_MISMATCH",
+            "fresh owned OpenCode values require the owner-native options schema",
         ));
     }
     let model = object["model"].as_object().ok_or_else(|| {
@@ -406,13 +476,16 @@ fn open_code_route_config(
             "OpenCode model options must contain id, providerID, and variant only",
         ));
     }
-    let service_id = required_config_string(&object["service_id"], "service_id", 128)?;
-    let connection_file =
+    let configured_service_id =
+        required_config_string(&object["service_id"], "service_id", 128)?;
+    let configured_connection_file =
         required_config_string(&object["connection_file"], "connection_file", 4096)?;
     let expected_version =
         required_config_string(&object["expected_version"], "expected_version", 256)?;
     let directory = required_config_string(&object["directory"], "directory", 4096)?;
-    if !Path::new(&connection_file).is_absolute() || !Path::new(&directory).is_absolute() {
+    if !Path::new(&configured_connection_file).is_absolute()
+        || !Path::new(&directory).is_absolute()
+    {
         return Err(Error::new(
             "MODULE_CONFIG_INVALID",
             "OpenCode connection_file and directory values must be absolute paths",
@@ -421,50 +494,206 @@ fn open_code_route_config(
     let model_id = required_config_string(&model["id"], "model.id", 256)?;
     let provider_id = required_config_string(&model["providerID"], "model.providerID", 256)?;
     let variant = required_config_string(&model["variant"], "model.variant", 256)?;
-    let config = BindingLaunchConfig {
-        values: BTreeMap::from([
+
+    let mut values = BTreeMap::from([
+        (
+            "OPENCODE_SERVICE_ID".to_owned(),
+            LaunchValue::Literal(configured_service_id.clone()),
+        ),
+        (
+            "OPENCODE_CONNECTION_FILE".to_owned(),
+            LaunchValue::Literal(configured_connection_file.clone()),
+        ),
+        (
+            "OPENCODE_EXPECTED_VERSION".to_owned(),
+            LaunchValue::Literal(expected_version.clone()),
+        ),
+        (
+            "OPENCODE_DIRECTORY".to_owned(),
+            LaunchValue::Literal(directory.clone()),
+        ),
+        (
+            "OPENCODE_MODEL_ID".to_owned(),
+            LaunchValue::Literal(model_id.clone()),
+        ),
+        (
+            "OPENCODE_PROVIDER_ID".to_owned(),
+            LaunchValue::Literal(provider_id.clone()),
+        ),
+        ("OPENCODE_VARIANT".to_owned(), LaunchValue::Literal(variant.clone())),
+    ]);
+
+    if has_owner_service {
+        let owner: OwnedRouteConfig = serde_json::from_value(
+            object[OWNER_ROUTE_KEY].clone(),
+        )
+        .map_err(|_| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                "owned OpenCode route declaration has an invalid shape",
+            )
+        })?;
+        let owner_nonce = required_config_string(&object[OWNER_NONCE_KEY], "owner_nonce", 64)?;
+        let uuid = Uuid::parse_str(&owner_nonce).ok();
+        if owner.origin != "fresh_owned_service"
+            || uuid.is_none_or(|value| value.hyphenated().to_string() != owner_nonce)
+            || owner.model.id != model_id
+            || owner.model.provider_id != provider_id
+            || owner.model.variant != variant
+            || !valid_provider_id(provider_id)
+            || !valid_service_id(&owner.service_id)
+            || !matches!(owner.model_catalog.as_str(), "offline" | "refresh")
+            || !absolute_plain_path(&owner.bun_executable)
+            || !absolute_plain_path(&owner.server_program)
+            || !absolute_plain_path(&owner.state_root)
+            || !is_lower_sha256(&owner.bun_sha256)
+            || !is_lower_sha256(&owner.server_program_sha256)
+            || expected_version != OPENCODE_OWNED_SERVICE_VERSION
+        {
+            return Err(Error::new(
+                "MODULE_CONFIG_INVALID",
+                "owned OpenCode route does not retain the exact configured owner",
+            ));
+        }
+        let owner_digest = sha256_hex(owner_nonce.as_bytes());
+        let owner_suffix = &owner_digest[..16];
+        let owner_service_id = format!(
+            "{}-{owner_suffix}",
+            owner.service_id.chars().take(108).collect::<String>()
+        );
+        let owner_state_root = owner
+            .state_root
+            .join("launches")
+            .join(&owner_nonce);
+        let owner_connection_file = owner_state_root.join("connection.json");
+        let owner_password_file = owner_state_root.join("server.password");
+        if configured_service_id != owner_service_id
+            || PathBuf::from(configured_connection_file.clone()) != owner_connection_file
+        {
+            return Err(Error::new(
+                "MODULE_CONFIG_SCOPE_MISMATCH",
+                "owned OpenCode native options differ from the retained Store owner nonce",
+            ));
+        }
+        for (key, value) in [
+            ("OPENCODE_OWNER_ORIGIN", owner.origin),
+            ("OPENCODE_OWNER_NONCE", owner_nonce),
             (
-                "OPENCODE_SERVICE_ID".to_owned(),
-                LaunchValue::Literal(service_id),
+                "OPENCODE_OWNER_BUN_EXECUTABLE",
+                path_text(&owner.bun_executable)?,
+            ),
+            ("OPENCODE_OWNER_BUN_SHA256", owner.bun_sha256),
+            (
+                "OPENCODE_OWNER_SERVER_PROGRAM",
+                path_text(&owner.server_program)?,
             ),
             (
-                "OPENCODE_CONNECTION_FILE".to_owned(),
-                LaunchValue::Literal(connection_file),
+                "OPENCODE_OWNER_SERVER_PROGRAM_SHA256",
+                owner.server_program_sha256,
             ),
             (
-                "OPENCODE_EXPECTED_VERSION".to_owned(),
-                LaunchValue::Literal(expected_version),
+                "OPENCODE_OWNER_STATE_ROOT",
+                path_text(&owner_state_root)?,
             ),
             (
-                "OPENCODE_DIRECTORY".to_owned(),
-                LaunchValue::Literal(directory),
+                "OPENCODE_OWNER_PASSWORD_FILE",
+                path_text(&owner_password_file)?,
             ),
-            (
-                "OPENCODE_MODEL_ID".to_owned(),
-                LaunchValue::Literal(model_id),
-            ),
-            (
-                "OPENCODE_PROVIDER_ID".to_owned(),
-                LaunchValue::Literal(provider_id),
-            ),
-            ("OPENCODE_VARIANT".to_owned(), LaunchValue::Literal(variant)),
-        ]),
-    };
+            ("OPENCODE_OWNER_PORT", owner.port.to_string()),
+            ("OPENCODE_OWNER_MODEL_CATALOG", owner.model_catalog),
+        ] {
+            values.insert(key.to_owned(), LaunchValue::Literal(value));
+        }
+        if let Some(credential_ref) = owner.credential_ref {
+            if !valid_provider_id(provider_id) || !valid_credential_ref(&credential_ref) {
+                return Err(Error::new(
+                    "MODULE_CONFIG_INVALID",
+                    "owned OpenCode credential reference is not valid for the selected provider",
+                ));
+            }
+            let reference = ProtectedRef::new(credential_ref.clone()).map_err(|error| {
+                Error::new("MODULE_CONFIG_PROVIDER_AUTH_UNAVAILABLE", error.to_string())
+            })?;
+            let source = protected_files.get(&reference).ok_or_else(|| {
+                Error::new(
+                    "MODULE_CONFIG_PROVIDER_AUTH_UNAVAILABLE",
+                    "owned OpenCode provider auth reference has no configured host path",
+                )
+            })?;
+            if !absolute_plain_path(source) {
+                return Err(Error::new(
+                    "MODULE_CONFIG_PROVIDER_AUTH_UNAVAILABLE",
+                    "owned OpenCode provider auth source path is not an absolute plain path",
+                ));
+            }
+            values.insert(
+                "OPENCODE_OWNER_PROVIDER_AUTH_FILE".to_owned(),
+                LaunchValue::Protected(reference),
+            );
+            values.insert(
+                "OPENCODE_OWNER_PROVIDER_CREDENTIAL_REF".to_owned(),
+                LaunchValue::Literal(credential_ref),
+            );
+        }
+    }
+    let config = BindingLaunchConfig { values };
     config.validate().map_err(module_error)?;
     Ok(config)
 }
 
-fn required_config_string(value: &Value, field: &str, max: usize) -> Result<String> {
-    value
-        .as_str()
-        .filter(|text| !text.is_empty() && text.len() <= max && !text.chars().any(char::is_control))
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            Error::new(
-                "MODULE_CONFIG_INVALID",
-                format!("OpenCode {field} is missing or invalid"),
-            )
+fn valid_service_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
         })
+}
+
+fn valid_credential_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn absolute_plain_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.to_str().is_some_and(|value| !value.is_empty())
+        && !path.components().any(|component| {
+            matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+        })
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn path_text(path: &Path) -> Result<String> {
+    path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode owner path is not valid UTF-8",
+        )
+    })
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -499,6 +728,7 @@ impl StandaloneSupervisor {
         let provider = Arc::new(StaticLaunchConfigProvider {
             entries: config.launch_configs.clone(),
             mapper: config.route_config_mapper,
+            protected_files: config.protected_files.clone(),
         });
         Self::start_with_provider(config, provider).await
     }

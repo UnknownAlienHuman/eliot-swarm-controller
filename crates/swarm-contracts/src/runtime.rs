@@ -313,6 +313,75 @@ pub enum EffectOutcome {
     Unknown,
 }
 
+/// Bounded, non-secret proof that the adapter-owned native service published
+/// its validated readiness records.  The adapter never projects the owner
+/// JSON, endpoint, password, or stderr into this DTO.  Store adds its
+/// retained route digest before persisting the existing owned-service proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedServiceProcessIdentity {
+    pub pid: u32,
+    pub birth_token: String,
+    pub binary_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedServiceReadyReceipt {
+    pub schema_version: u16,
+    pub status: String,
+    pub service_id: String,
+    pub service_version: String,
+    pub owner_nonce: String,
+    pub process: OwnedServiceProcessIdentity,
+    pub endpoint_digest: String,
+    pub connection_digest: String,
+    pub config_digest: String,
+    pub plugin_module_sha256: String,
+    pub plugin_entrypoint_sha256: String,
+    pub server_program_sha256: String,
+    pub bun_sha256: String,
+    pub readiness_observed: bool,
+    pub plugin_loaded: String,
+    pub dispatch_permitted: bool,
+}
+
+impl OwnedServiceReadyReceipt {
+    /// Validate only the adapter-owned shape.  Binding, nonce, route, and
+    /// operation identity are checked by Store against its retained row.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let process = &self.process;
+        if self.schema_version != 1
+            || self.status != "ready"
+            || !valid_bounded_identity(&self.service_id, 128)
+            || !valid_bounded_identity(&self.service_version, 128)
+            || !valid_bounded_identity(&self.owner_nonce, 128)
+            || process.pid == 0
+            || !is_lower_sha256(&process.birth_token)
+            || !is_lower_sha256(&process.binary_sha256)
+            || !is_lower_sha256(&self.endpoint_digest)
+            || !is_lower_sha256(&self.connection_digest)
+            || !is_lower_sha256(&self.config_digest)
+            || !is_lower_sha256(&self.plugin_module_sha256)
+            || !is_lower_sha256(&self.plugin_entrypoint_sha256)
+            || !is_lower_sha256(&self.server_program_sha256)
+            || !is_lower_sha256(&self.bun_sha256)
+            || !self.readiness_observed
+            || self.plugin_loaded != "unknown"
+            || self.dispatch_permitted
+        {
+            return Err("owned service readiness receipt is invalid");
+        }
+        Ok(())
+    }
+}
+
+fn valid_bounded_identity(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && !value.chars().any(char::is_control)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOutcome {

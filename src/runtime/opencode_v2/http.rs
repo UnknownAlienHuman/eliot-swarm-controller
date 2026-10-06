@@ -177,6 +177,14 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 fn normalized_image_sha256(value: &str) -> Option<String> {
     let digest = value.strip_prefix("sha256:").unwrap_or(value);
     valid_sha256(digest).then(|| format!("sha256:{digest}"))
@@ -381,8 +389,11 @@ impl Service {
         key: &str,
         directory: &str,
     ) -> Result<()> {
-        if integration_id != "opencode-go" {
-            return Err(Error::invalid("unsupported provider integration"));
+        if !valid_provider_id(integration_id) {
+            return Err(Error::new(
+                "NATIVE_PROVIDER_ID_INVALID",
+                "selected provider ID is not one safe integration path segment",
+            ));
         }
         if key.is_empty() {
             return Err(Error::invalid("provider integration key is empty"));
@@ -396,13 +407,24 @@ impl Service {
                 "provider integration key requires a verified owned service",
             ));
         }
-        self.with_owned_process_check(self.post_integration_key_unchecked(key, directory))
-            .await
+        self.with_owned_process_check(self.post_integration_key_unchecked(
+            integration_id,
+            key,
+            directory,
+        ))
+        .await
     }
-    async fn post_integration_key_unchecked(&self, key: &str, directory: &str) -> Result<()> {
+    async fn post_integration_key_unchecked(
+        &self,
+        integration_id: &str,
+        key: &str,
+        directory: &str,
+    ) -> Result<()> {
         let mut url = self
             .endpoint
-            .join("/api/integration/opencode-go/connect/key")
+            .join(&format!(
+                "/api/integration/{integration_id}/connect/key"
+            ))
             .map_err(|_| Error::new("NATIVE_ENDPOINT", "invalid provider integration route"))?;
         // OpenCode 2.0.7's LocationMiddleware defaults an omitted directory to
         // the server's process.cwd(). Bind this mutation to the same explicit

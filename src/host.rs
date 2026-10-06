@@ -176,7 +176,7 @@ async fn run_until(
                 owner.module_supervisor_credential(),
                 root_path.clone(),
                 (*ipc_config).clone(),
-                config.module_supervisor.clone(),
+                config.clone(),
                 stopping.clone(),
             ),
         )

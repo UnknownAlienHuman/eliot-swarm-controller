@@ -21,7 +21,6 @@ use std::{
     sync::atomic::{Ordering, compiler_fence},
 };
 
-const PROVIDER_ID: &str = "opencode-go";
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 16 * 1024;
 const MAX_SAFE_ID_BYTES: usize = 256;
@@ -127,12 +126,13 @@ pub(super) fn prepare_credential(
     scope_digest: &str,
 ) -> Result<PreparedProviderCredential> {
     validate_ref(credential_ref)?;
-    if model_ref.provider_id != PROVIDER_ID || !model_ref.valid() {
+    validate_provider_id(&model_ref.provider_id)?;
+    if !model_ref.valid() {
         return Err(auth_error(
             "configured provider credential does not match the retained model",
         ));
     }
-    let key = read_selected_key(source_path)?;
+    let key = read_selected_key(source_path, &model_ref.provider_id)?;
     Ok(PreparedProviderCredential {
         credential_ref: credential_ref.to_owned(),
         model_digest: model_digest(model_ref)?,
@@ -161,7 +161,7 @@ pub(super) async fn bootstrap_once(
         || credential.scope_digest != permit.scope_digest
         || scope.owner_nonce != permit.owner_nonce
         || scope.credential_ref != credential.credential_ref
-        || scope.model_ref.provider_id != PROVIDER_ID
+        || validate_provider_id(&scope.model_ref.provider_id).is_err()
         || scope.pid == 0
         || !is_sha256(scope.birth_token)
     {
@@ -178,7 +178,8 @@ pub(super) async fn bootstrap_once(
         .to_str()
         .filter(|text| !text.is_empty() && text.len() <= 4096)
         .ok_or_else(|| auth_error("owned service directory is not a bounded path"))?;
-    let before = get_integration(service, location).await?;
+    let provider_id = scope.model_ref.provider_id.as_str();
+    let before = get_integration(service, location, provider_id).await?;
     validate_key_method(&before)?;
     if !before.credential_ids.is_empty() {
         return Err(auth_error(
@@ -187,14 +188,14 @@ pub(super) async fn bootstrap_once(
     }
 
     let post_result = service
-        .post_integration_key(PROVIDER_ID, credential.key.as_str()?, location)
+        .post_integration_key(provider_id, credential.key.as_str()?, location)
         .await;
     let mut credential = credential;
     credential.key.clear();
     post_result?;
     // The API key is dropped and zeroed as soon as the one POST completes.
     // Only safe credential metadata is read back and retained below.
-    let after = get_integration(service, location).await?;
+    let after = get_integration(service, location, provider_id).await?;
     validate_key_method(&after)?;
     let metadata = one_credential_connection(&after)?;
     provider_auth_proof(scope, &credential.model_digest, metadata)
@@ -206,8 +207,8 @@ pub(super) async fn verify_retained_connection(
     scope: OwnedServiceAuthScope<'_>,
 ) -> Result<Value> {
     validate_ref(scope.credential_ref)?;
-    if scope.model_ref.provider_id != PROVIDER_ID || scope.pid == 0 || !is_sha256(scope.birth_token)
-    {
+    validate_provider_id(&scope.model_ref.provider_id)?;
+    if scope.pid == 0 || !is_sha256(scope.birth_token) {
         return Err(auth_error("retained provider identity is invalid"));
     }
     let location = scope
@@ -215,7 +216,7 @@ pub(super) async fn verify_retained_connection(
         .to_str()
         .filter(|text| !text.is_empty() && text.len() <= 4096)
         .ok_or_else(|| auth_error("owned service directory is not a bounded path"))?;
-    let integration = get_integration(service, location).await?;
+    let integration = get_integration(service, location, &scope.model_ref.provider_id).await?;
     validate_key_method(&integration)?;
     let metadata = one_credential_connection(&integration)?;
     provider_auth_proof(scope, &model_digest(scope.model_ref)?, metadata)
@@ -250,7 +251,7 @@ pub(super) fn validate_proof(proof: &Value, scope: OwnedServiceAuthScope<'_>) ->
             .any(|key| !expected_keys.contains(&key.as_str()))
         || proof["status"] != "stored_unverified"
         || proof["credential_ref"] != scope.credential_ref
-        || proof["provider_id"] != PROVIDER_ID
+        || proof["provider_id"] != scope.model_ref.provider_id
         || proof["model_digest"] != expected_model_digest
         || proof["service_id"] != scope.service_id
         || proof["service_version"] != scope.service_version
@@ -263,7 +264,7 @@ pub(super) fn validate_proof(proof: &Value, scope: OwnedServiceAuthScope<'_>) ->
                 || object.get("pid").and_then(Value::as_u64) != Some(u64::from(scope.pid))
                 || object.get("birth_token").and_then(Value::as_str) != Some(scope.birth_token)
         })
-        || proof["integration_id"] != PROVIDER_ID
+        || proof["integration_id"] != scope.model_ref.provider_id
         || proof["key_method"] != "key"
         || proof["connection_metadata_digest"]
             .as_str()
@@ -288,13 +289,13 @@ fn provider_auth_proof(
     Ok(json!({
         "status":"stored_unverified",
         "credential_ref":scope.credential_ref,
-        "provider_id":PROVIDER_ID,
+        "provider_id":scope.model_ref.provider_id,
         "model_digest":model_digest,
         "service_id":scope.service_id,
         "service_version":scope.service_version,
         "owner_nonce_digest":model::digest(scope.owner_nonce.as_bytes()),
         "process":{"pid":scope.pid,"birth_token":scope.birth_token},
-        "integration_id":PROVIDER_ID,
+        "integration_id":scope.model_ref.provider_id,
         "key_method":"key",
         "connection_metadata_digest":model::digest(model::canonical(&metadata)?.as_bytes()),
     }))
@@ -305,7 +306,12 @@ struct IntegrationSnapshot {
     credential_ids: Vec<String>,
 }
 
-async fn get_integration(service: &Service, directory: &str) -> Result<IntegrationSnapshot> {
+async fn get_integration(
+    service: &Service,
+    directory: &str,
+    provider_id: &str,
+) -> Result<IntegrationSnapshot> {
+    validate_provider_id(provider_id)?;
     let response = service
         .get(
             "/api/integration",
@@ -331,7 +337,7 @@ async fn get_integration(service: &Service, directory: &str) -> Result<Integrati
             .and_then(Value::as_str)
             .filter(|value| safe_metadata_text(value))
             .ok_or_else(|| auth_error("provider integration identity is malformed"))?;
-        if id == PROVIDER_ID {
+        if id == provider_id {
             if selected.is_some() {
                 return Err(auth_error("provider integration identity is ambiguous"));
             }
@@ -394,7 +400,8 @@ fn safe_metadata_text(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn read_selected_key(path: &Path) -> Result<SecretKey> {
+fn read_selected_key(path: &Path, provider_id: &str) -> Result<SecretKey> {
+    validate_provider_id(provider_id)?;
     validate_source_path(path)?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| auth_error("authorized provider credential source is unavailable"))?;
@@ -455,7 +462,7 @@ fn read_selected_key(path: &Path) -> Result<SecretKey> {
             "authorized provider credential source was redirected while reading",
         ));
     }
-    let parsed = serde_json::from_slice::<SelectedAuthFile>(&bytes);
+    let parsed = parse_selected_auth(&bytes, provider_id);
     wipe(&mut bytes);
     let key = parsed
         .map_err(|_| auth_error("authorized provider credential entry is invalid or ambiguous"))?
@@ -573,6 +580,18 @@ pub(super) fn validate_ref(value: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn validate_provider_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_SAFE_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(auth_error("selected provider ID is malformed"));
+    }
+    Ok(())
+}
+
 fn model_digest(model_ref: &ModelRef) -> Result<String> {
     Ok(model::digest(
         model::canonical(&serde_json::to_value(model_ref)?)?.as_bytes(),
@@ -648,43 +667,48 @@ impl<'de> Deserialize<'de> for SelectedProviderEntry {
 
 struct SelectedAuthFile(SelectedProviderEntry);
 
-impl<'de> Deserialize<'de> for SelectedAuthFile {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct AuthVisitor;
-        impl<'de> Visitor<'de> for AuthVisitor {
-            type Value = SelectedAuthFile;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an auth.json provider map with one opencode-go entry")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut selected: Option<SelectedProviderEntry> = None;
-                while let Some(provider) = map.next_key::<String>()? {
-                    if provider == PROVIDER_ID {
-                        if selected.is_some() {
-                            return Err(serde::de::Error::custom(
-                                "duplicate opencode-go provider entry",
-                            ));
-                        }
-                        selected = Some(map.next_value::<SelectedProviderEntry>()?);
-                    } else {
-                        map.next_value::<IgnoredAny>()?;
-                    }
-                }
-                selected
-                    .map(SelectedAuthFile)
-                    .ok_or_else(|| serde::de::Error::custom("opencode-go entry is missing"))
-            }
-        }
-        deserializer.deserialize_map(AuthVisitor)
+fn parse_selected_auth(
+    bytes: &[u8],
+    provider_id: &str,
+) -> std::result::Result<SelectedAuthFile, serde_json::Error> {
+    struct AuthVisitor<'a> {
+        provider_id: &'a str,
     }
+
+    impl<'de, 'a> Visitor<'de> for AuthVisitor<'a> {
+        type Value = SelectedAuthFile;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an auth.json provider map with one selected provider entry")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut selected: Option<SelectedProviderEntry> = None;
+            while let Some(provider) = map.next_key::<String>()? {
+                if provider == self.provider_id {
+                    if selected.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "duplicate selected provider entry",
+                        ));
+                    }
+                    selected = Some(map.next_value::<SelectedProviderEntry>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            selected
+                .map(SelectedAuthFile)
+                .ok_or_else(|| serde::de::Error::custom("selected provider entry is missing"))
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let selected = deserializer.deserialize_map(AuthVisitor { provider_id })?;
+    deserializer.end()?;
+    Ok(selected)
 }
 
 fn auth_error(message: &str) -> Error {

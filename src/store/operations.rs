@@ -31,7 +31,7 @@ const START_FAILURE_V2_KEYS: [&str; 7] = [
 ];
 
 pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
-    let raw:Option<String>=db.query_row("SELECT json_object('operation_id',operation_id,'caller_id',caller_id,'method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id,'binding_id',binding_id,'binding_generation',binding_generation,'prerequisite_operation_id',prerequisite_operation_id,'operation_contract',json_extract(effective_request_json,'$.operation_contract'),'native_refs',json(native_refs_json),'result',json(result_json),'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM operations WHERE operation_id=?1",[id],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('operation_id',operation_id,'caller_id',caller_id,'method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id,'binding_id',binding_id,'binding_generation',binding_generation,'prerequisite_operation_id',prerequisite_operation_id,'operation_contract',json_extract(effective_request_json,'$.operation_contract'),'native_mcp_parent_launch_operation_id',json_extract(effective_request_json,'$.native_mcp.parent_launch_operation_id'),'native_mcp_phase',json_extract(effective_request_json,'$.native_mcp.phase'),'native_refs',json(native_refs_json),'result',json(result_json),'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM operations WHERE operation_id=?1",[id],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", format!("Operation {id}"))
     })?)?)

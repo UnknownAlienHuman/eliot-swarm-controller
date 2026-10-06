@@ -41,25 +41,38 @@ fn bindings(db: &Connection, service: Option<&str>) -> Result<Vec<Value>> {
 
 fn owned_bindings(db: &Connection) -> Result<Vec<Value>> {
     let mut stmt = db.prepare(
-        "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id=?2 AND json_type(route_json,'$.owned_service')='object' ORDER BY created_at_ms,binding_id,generation",
+        "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id IN (?2,?3) AND json_type(route_json,'$.owned_service')='object' ORDER BY created_at_ms,binding_id,generation",
     )?;
     let ids = stmt
-        .query_map(params![oc::RUNTIME, oc::ARTIFACT_ID], |row| {
+        .query_map(
+            params![oc::RUNTIME, oc::ARTIFACT_ID, crate::config::OPENCODE_RUST_ARTIFACT_ID],
+            |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    ids.into_iter()
-        .map(|(id, generation)| operations::get_binding(db, &id, generation))
-        .collect()
+    let mut result = Vec::new();
+    for (id, generation) in ids {
+        let binding = operations::get_binding(db, &id, generation)?;
+        // A selected module descriptor is the handoff point to the
+        // independently owned adapter. The legacy Store worker remains
+        // available for unselected compatibility bindings only.
+        if binding["observation"]["module_contract_selector"].is_object() {
+            continue;
+        }
+        result.push(binding);
+    }
+    Ok(result)
 }
 
 fn active_owned_binding(db: &Connection, id: &str, generation: i64) -> Result<Option<Value>> {
     let active: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE binding_id=?1 AND generation=?2
           AND released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?3
-          AND module_artifact_id=?4 AND json_type(route_json,'$.owned_service')='object')",
-        params![id, generation, oc::RUNTIME, oc::ARTIFACT_ID],
+          AND module_artifact_id IN (?4,?5)
+          AND json_type(route_json,'$.owned_service')='object'
+          AND json_type(state_json,'$.module_contract_selector') IS NULL)",
+        params![id, generation, oc::RUNTIME, oc::ARTIFACT_ID, crate::config::OPENCODE_RUST_ARTIFACT_ID],
         |row| row.get(0),
     )?;
     if !active {
@@ -322,7 +335,7 @@ impl Store {
                         }));
                     }
                 }
-                let active_owned_bindings = self.run(|db| owned_bindings(db)).await?;
+                    let active_owned_bindings = self.run(owned_bindings).await?;
                 for binding in active_owned_bindings {
                     let key = (
                         binding["binding_id"]

@@ -52,6 +52,53 @@ pub(crate) struct PreparedNativeMcpArm {
     request_body: Value,
 }
 
+impl PreparedNativeMcpArm {
+    /// Project the Store-prepared arm/read request into the shared native MCP
+    /// command envelope. The request body is retained only at the private
+    /// authenticated module boundary; public challenge/readback projections
+    /// continue to omit it.
+    pub(crate) fn native_mcp_command(
+        &self,
+        action: &str,
+        binding_id: &str,
+        binding_generation: i64,
+    ) -> Result<Value> {
+        if !matches!(action, "arm" | "read") {
+            return Err(Error::invalid("prepared observer only supports arm/read"));
+        }
+        let request_path = rpc_path(action, &self.challenge.directory)?;
+        let request_body = if action == "arm" {
+            self.request_body.clone()
+        } else {
+            json!({"input": {
+                "challenge_id": self.challenge.challenge_id,
+                "nonce": self.challenge.nonce,
+            }})
+        };
+        Ok(json!({
+            "schema_version":1,
+            "kind":"swarm.native_mcp_command",
+            "action":action,
+            "scope":{
+                "binding_id":binding_id,
+                "binding_generation":binding_generation,
+                "native_scope_key":format!("opencode-v2:{}", self.challenge.service_id),
+                "service_id":self.challenge.service_id,
+                "expected_version":self.challenge.service_version,
+                "service_pid":self.challenge.service_pid,
+                "directory":self.challenge.directory,
+                "assignment":self.challenge.assignment.as_value(),
+            },
+            "prepared":{
+                "challenge":challenge_metadata(&self.challenge),
+                "expected_plugin_config":self.expected_plugin_config,
+            },
+            "challenge":challenge_metadata(&self.challenge),
+            "request":{"method":"POST","path":request_path,"body":request_body},
+        }))
+    }
+}
+
 /// Construct a new opaque challenge only from an AssignmentContext minted by
 /// the authorized Store read path. The type deliberately has no Serde input.
 pub(crate) fn new_challenge(
@@ -298,6 +345,19 @@ pub(crate) async fn preflight_arm(
     verify_plugin_source(service, options, challenge).await?;
     service.verify().await?;
 
+    prepare_arm(service, options, challenge)
+}
+
+/// Prepare the exact arm request after Store has already checked the current
+/// service identity. This pure path performs no native HTTP probe; the
+/// independent adapter owns the subsequent RPC effect and its receipt.
+pub(crate) fn prepare_arm(
+    service: &Service,
+    options: &Options,
+    challenge: &NativeMcpChallenge,
+) -> Result<PreparedNativeMcpArm> {
+    validate_challenge(challenge, service, options)?;
+
     let expected_plugin_config = expected_plugin_config(options, challenge)?;
     let request_path = rpc_path("arm", &challenge.directory)?;
     let request_body = json!({
@@ -368,6 +428,41 @@ pub(crate) async fn arm_prepared(
     Ok(())
 }
 
+/// Validate the already-received adapter arm receipt without sending another
+/// request. The adapter owns the POST; this helper only lets Store retain a
+/// typed acknowledgement against its original challenge.
+pub(crate) fn validate_external_arm_response(
+    response: Value,
+    challenge: &NativeMcpChallenge,
+    service: &Service,
+    options: &Options,
+) -> Result<Value> {
+    validate_challenge(challenge, service, options)?;
+    let envelope: RpcEnvelope<ArmAck> = decode(response)?;
+    let ack = envelope.output;
+    if !ack.accepted
+        || ack.challenge_id != challenge.challenge_id
+        || ack.nonce != challenge.nonce
+        || ack.module_sha256 != challenge.module_sha256
+        || ack.service_id != challenge.service_id
+        || ack.service_pid != challenge.service_pid
+        || ack.service_version != challenge.service_version
+    {
+        return Err(challenge_error(
+            "native observer adapter acknowledgement differs from the exact challenge",
+        ));
+    }
+    Ok(json!({
+        "accepted":true,
+        "challenge_id":ack.challenge_id,
+        "nonce":ack.nonce,
+        "module_sha256":ack.module_sha256,
+        "service_id":ack.service_id,
+        "service_pid":ack.service_pid,
+        "service_version":ack.service_version,
+    }))
+}
+
 fn expected_plugin_config(options: &Options, challenge: &NativeMcpChallenge) -> Result<Value> {
     let config = plugin_config_value(options)?;
     plugin_entry_path(&challenge.module_path)?;
@@ -433,6 +528,26 @@ pub(crate) async fn read(
         return Err(rotated_module());
     }
 
+    let value = project_readback(raw, challenge, service)?;
+    Ok(NativeMcpToolsReadback {
+        scope: challenge.assignment.clone(),
+        value,
+    })
+}
+
+/// Validate and project a read receipt returned by the adapter. This is a
+/// pure projection over the response and does not call OpenCode or touch the
+/// plugin/config files.
+pub(crate) fn validate_external_read_response(
+    response: Value,
+    challenge: &NativeMcpChallenge,
+    service: &Service,
+    options: &Options,
+) -> Result<NativeMcpToolsReadback> {
+    validate_challenge(challenge, service, options)?;
+    let envelope: RpcEnvelope<PluginReadback> = decode(response)?;
+    let raw = envelope.output;
+    validate_readback(&raw, challenge, service, options)?;
     let value = project_readback(raw, challenge, service)?;
     Ok(NativeMcpToolsReadback {
         scope: challenge.assignment.clone(),

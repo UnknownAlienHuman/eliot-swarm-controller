@@ -10,9 +10,9 @@
     "expected_version": "<exact-version-from-attached-server>",
     "directory": "<absolute-workspace-path>",
     "model": {
-      "id": "<exact-model-id-from-manager-route>",
-      "providerID": "<exact-case-sensitive-providerID-from-manager-route>",
-      "variant": "<exact-variant-from-manager-route>"
+      "id": "ling-3.1-flash",
+      "providerID": "inclusionai",
+      "variant": "<exact-selected-variant>"
     }
   }
 }
