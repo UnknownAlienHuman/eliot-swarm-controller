@@ -573,13 +573,14 @@ fn event_identity(event: &ReviewResultEvent) -> Result<(String, String)> {
             "canonical review result payload is invalid JSON",
         )
     })?;
-    review_contract::validate_result_event(&record, assignment_id, result_operation_id)
-        .map_err(|_| {
+    review_contract::validate_result_event(&record, assignment_id, result_operation_id).map_err(
+        |_| {
             Error::new(
                 "REVIEW_DISPOSITION_EVENT_DAMAGED",
                 "canonical review result event identity differs from its retained payload",
             )
-        })?;
+        },
+    )?;
     Ok((assignment_id.to_owned(), result_operation_id.to_owned()))
 }
 
@@ -691,7 +692,7 @@ fn select_entry_keys(
         "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 \
          AND json_extract(value_json,'$.record.enabled')=1 \
          AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value IN ('review_disposition','acceptance')) \
+                    WHERE step.value IN ('review_disposition','repair_dispatch','acceptance')) \
          ORDER BY key LIMIT ?3",
     )?;
     Ok(statement
@@ -713,7 +714,7 @@ fn select_entry_keys_before(
         "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 \
          AND json_extract(value_json,'$.record.enabled')=1 \
          AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value IN ('review_disposition','acceptance')) \
+                    WHERE step.value IN ('review_disposition','repair_dispatch','acceptance')) \
          ORDER BY key LIMIT ?4",
     )?;
     Ok(statement

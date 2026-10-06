@@ -63,12 +63,25 @@ qualification. Concilium methods start no model or native adapter and mutate no
 Task state; close is advisory. The historical checks above retain their narrow
 scopes, and product status remains `PARTIAL_PROGRESS`.
 
+RepairDispatch-only entries are now discovered by both the paginated and
+wraparound review-result cursor queries. They reach the existing typed repair
+consumer, which still validates exact applied feedback, current Task/Attempt,
+candidate and manager authority before admitting a correction. This source
+repair has not been compiled or tested.
+
 The dependency source repair moves the selected rustls lock from `0.23.44` to
 `0.23.45` for GHSA-2mjx-qc3c-rqvc. The registry checksum and unchanged dependency
 requirements were checked against official metadata; only the version and
 checksum change. Cargo has not resolved or compiled this source repair.
-The legacy JavaScript and Python bridge dependency alerts are being classified
-against actual package usage before changing or removing those bridges.
+The 2026-10-06 dependency source audit found three unresolved dependencies in
+the optional installable OpenCode service bundle: `sprintf-js`,
+`http-cache-semantics`, and `braces`. Their current advisories publish no patched
+version, so the pinned bundle remains unchanged and is not dependency-qualified.
+This audit establishes package inclusion, not an exploit path. The nine Python
+alerts concern development-only `datamodel-code-generator` in the retained
+Codex SDK donor; the Rust adapter does not use that environment. Its fix belongs
+to a deliberate donor refresh with updated upstream identity and checksums,
+not an isolated edit that would invalidate the retained donor provenance.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility
