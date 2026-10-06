@@ -328,19 +328,36 @@ async fn run() -> Result<()> {
                 };
                 match params {
                     Ok(params) => {
-                        let response = host
+                        let response = match host
                             .request_saved("module.result", params, &controller, native_live)
-                            .await?;
+                            .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                let Some(diagnostic_code) =
+                                    result_ack_diagnostic(error.code.as_str())
+                                else {
+                                    return Err(error);
+                                };
+                                controller.reject_command(&command, diagnostic_code)?;
+                                dirty = true;
+                                flush_reports(&mut host, &mut controller, &mut dirty, native_live)
+                                    .await?;
+                                continue;
+                            }
+                        };
                         if response["recorded"] != true {
-                            return Err(Error::new(
-                                "MODULE_RESULT_ACK_INVALID",
-                                "manager did not acknowledge the immutable status page",
-                            ));
+                            controller.reject_command(&command, "MODULE_RESULT_ACK_INVALID")?;
+                            dirty = true;
+                            flush_reports(&mut host, &mut controller, &mut dirty, native_live)
+                                .await?;
                         }
                     }
                     Err(error) => {
-                        controller
-                            .reject_command(&command, result_page_diagnostic(error.code.as_str()))?;
+                        controller.reject_command(
+                            &command,
+                            result_page_diagnostic(error.code.as_str()),
+                        )?;
                         dirty = true;
                         flush_reports(&mut host, &mut controller, &mut dirty, native_live).await?;
                     }
@@ -389,8 +406,30 @@ fn result_page_diagnostic(code: &str) -> &'static str {
     match code {
         "RESULT_RANGE_INVALID" => "RESULT_RANGE_INVALID",
         "RESULT_BODY_UNAVAILABLE" => "RESULT_BODY_UNAVAILABLE",
-        "RESULT_PROVENANCE_INVALID" | "RESULT_SELECTOR_UNSUPPORTED" => "RESULT_PROVENANCE_INVALID",
+        "RESULT_PROVENANCE_INVALID" => "RESULT_PROVENANCE_INVALID",
+        "RESULT_SELECTOR_UNSUPPORTED" => "RESULT_SELECTOR_UNSUPPORTED",
         _ => "RESULT_PAGE_UNAVAILABLE",
+    }
+}
+
+/// Store can reject a fully built page before it is durably registered. Keep
+/// deterministic result/provenance diagnostics on the same admitted result
+/// Operation; transport-uncertain failures stay unresolved because the page
+/// may already have been recorded.
+fn result_ack_diagnostic(code: &str) -> Option<&'static str> {
+    match code {
+        "MODULE_RECEIPT_INVALID" => Some("MODULE_RECEIPT_INVALID"),
+        "RESULT_BODY_UNAVAILABLE" => Some("RESULT_BODY_UNAVAILABLE"),
+        "RESULT_PROVENANCE_INVALID" => Some("RESULT_PROVENANCE_INVALID"),
+        "RESULT_RANGE_INVALID" => Some("RESULT_RANGE_INVALID"),
+        "RESULT_ORIGIN_INVALID" => Some("RESULT_ORIGIN_INVALID"),
+        "RESULT_SELECTOR_UNSUPPORTED" => Some("RESULT_SELECTOR_UNSUPPORTED"),
+        "RESULT_TARGET_NOT_ADMITTED" => Some("RESULT_TARGET_NOT_ADMITTED"),
+        "RESULT_TARGET_NOT_TERMINAL" => Some("RESULT_TARGET_NOT_TERMINAL"),
+        "RESULT_TARGET_ORIGIN_INVALID" => Some("RESULT_TARGET_ORIGIN_INVALID"),
+        "RESULT_TARGET_RECEIPT_INVALID" => Some("RESULT_TARGET_RECEIPT_INVALID"),
+        "RESULT_TARGET_SCOPE_INVALID" => Some("RESULT_TARGET_SCOPE_INVALID"),
+        _ => None,
     }
 }
 
@@ -424,9 +463,10 @@ fn controller_from_hello(host: &HostSession, hello: &VerifiedModuleHello) -> Res
             "manager returned an incomplete or foreign native root identity",
         ));
     }
-    let normalized_dispatch_enabled = swarm_antigravity_adapter::contract::normalized_dispatch_enabled(
-        &swarm_antigravity_adapter::contract::claim()?,
-    );
+    let normalized_dispatch_enabled =
+        swarm_antigravity_adapter::contract::normalized_dispatch_enabled(
+            &swarm_antigravity_adapter::contract::claim()?,
+        );
     Ok(Controller::new(
         host.boot_id.clone(),
         host.native_scope_key.clone(),

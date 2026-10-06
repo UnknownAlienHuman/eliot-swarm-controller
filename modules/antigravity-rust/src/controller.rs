@@ -10,9 +10,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::{
     module_receipt,
     stream::{StreamState, TerminalDisposition, Turn},
-    wire::{
-        OperationIdentity, encode_user_line, normalized_dispatch_admission, prompt_for,
-    },
+    wire::{OperationIdentity, encode_user_line, normalized_dispatch_admission, prompt_for},
 };
 
 const MAX_RECONCILE_RECEIPTS: usize = 128;
@@ -299,16 +297,15 @@ impl Controller {
         }
         let text = prompt_for(command).map_err(swarm_contracts::error::Error::invalid)?;
         let line = encode_user_line(&text).map_err(swarm_contracts::error::Error::invalid)?;
-        let dispatch_admission = if self.normalized_dispatch_enabled
-            && identity.method == "task.dispatch"
-        {
-            Some(
-                normalized_dispatch_admission(command, &identity, &self.boot_id, &line)
-                    .map_err(swarm_contracts::error::Error::invalid)?,
-            )
-        } else {
-            None
-        };
+        let dispatch_admission =
+            if self.normalized_dispatch_enabled && identity.method == "task.dispatch" {
+                Some(
+                    normalized_dispatch_admission(command, &identity, &self.boot_id, &line)
+                        .map_err(swarm_contracts::error::Error::invalid)?,
+                )
+            } else {
+                None
+            };
         self.pending = Some(PendingPrompt {
             identity,
             conversation_id: conversation_id.to_owned(),
@@ -552,6 +549,18 @@ impl Controller {
         diagnostic_code: &'static str,
     ) -> Result<RuntimeOutcome> {
         let identity = self.identity_for(command)?;
+        let details = if diagnostic_code == "RESULT_BODY_UNAVAILABLE" {
+            json!({
+                "diagnostic_code": diagnostic_code,
+                "completion_condition": "result_body_unavailable",
+                "native_response_identity": "unavailable",
+                "execution_complete": false,
+                "task_completion": "unknown",
+                "native_replay": false,
+            })
+        } else {
+            json!({ "diagnostic_code": diagnostic_code })
+        };
         let outcome = RuntimeOutcome {
             operation_id: identity.operation_id.clone(),
             outcome: EffectOutcome::Rejected,
@@ -559,7 +568,7 @@ impl Controller {
             native_root_id: self.native_root_id.clone(),
             turn_id: None,
             native_input_id: None,
-            details: json!({ "diagnostic_code": diagnostic_code }),
+            details,
         };
         self.record_outcome(&outcome, &identity.method, &identity.module_receipt)?;
         Ok(outcome)

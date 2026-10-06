@@ -423,6 +423,14 @@ function Read-JsonFile {
     catch { Stop-Qualification 'JSON_INPUT_INVALID' }
 }
 
+function Test-ExactObjectKeys {
+    param([AllowNull()] $Value, [Parameter(Mandatory)][string[]] $ExpectedKeys)
+    if (-not ($Value -is [System.Collections.IDictionary])) { return $false }
+    $actual = @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)
+    $expected = @($ExpectedKeys | Sort-Object -CaseSensitive)
+    return (($actual -join ',') -ceq ($expected -join ','))
+}
+
 function Get-OptionalField {
     param([AllowNull()] $Object, [Parameter(Mandatory)][string] $Name)
     if ($null -eq $Object) { return $null }
@@ -545,38 +553,62 @@ function Get-AdapterContract {
     switch ($Adapter) {
         'OpenCode' {
             return [pscustomobject]@{
-                module_id = 'eliot.opencode.v2'; artifact_id = 'eliot-opencode-v2.rust-http.1'; version = '0.1.0'; runtime = 'module';
+                module_id = 'eliot.opencode.v2'; artifact_id = 'eliot-opencode-v2.rust-http.1'; version = '0.3.0'; runtime = 'module';
                 build_package = 'swarm-adapter-opencode'; build_target = 'swarm-adapter-opencode';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send/next_turn', 'task.dispatch', 'native.mcp.arm', 'native.mcp.install', 'native.mcp.observe', 'native.mcp.read');
+                command_schemas = @('swarm.native_mcp_command@1:', 'swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
+                expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '2'; expected_config_schema_sha256 = 'a43c9b7284dba6efd087c04a747d74ef3bd5ce7a648697f160346a8be5265d9d';
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
                 expected_provider = $null; expected_model = $null; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
             }
         }
         'Command' {
             return [pscustomobject]@{
-                module_id = 'runtime.command'; artifact_id = 'eliot-command.rust-headless.1'; version = '1'; runtime = 'command';
+                module_id = 'runtime.command'; artifact_id = 'eliot-command.rust-headless.1'; version = '3'; runtime = 'command';
                 build_package = 'swarm-adapter-command'; build_target = 'swarm-adapter-command';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'task.dispatch');
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.result', 'task.dispatch');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
+                expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
                 expected_provider = $null; expected_model = $OpenCodeCommandTestModelRef; expected_model_ref = $null; expected_effort = $null
             }
         }
         'Codex' {
             return [pscustomobject]@{
-                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '1'; runtime = 'codex';
+                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '4'; runtime = 'codex';
                 build_package = 'swarm-adapter-codex'; build_target = 'swarm-codex-adapter';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.send', 'task.dispatch');
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send', 'task.dispatch');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
+                expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = 'modelProvider'; model_field = 'model'; effort_field = $null;
                 expected_provider = $null; expected_model = $null; expected_model_ref = $null; expected_effort = $null
             }
         }
         'Antigravity' {
             return [pscustomobject]@{
-                module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '1'; runtime = 'antigravity';
+                module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '4'; runtime = 'antigravity';
                 build_package = 'swarm-antigravity-adapter'; build_target = 'swarm-antigravity';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch');
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
+                expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
                 expected_provider = $null; expected_model = 'gemini-3.8-flash-high'; expected_model_ref = $null; expected_effort = $null
+            }
+        }
+        'Claude' {
+            return [pscustomobject]@{
+                module_id = 'claude'; artifact_id = 'claude-agent-sdk-0.3.287-rust-controller.4'; version = '4'; runtime = 'claude';
+                build_package = 'swarm-adapter-claude'; build_target = 'swarm-adapter-claude';
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch');
+                command_schemas = @('swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                event_schemas = @('swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
+                expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
+                model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
+                expected_provider = $null; expected_model = $null; expected_model_ref = $null; expected_effort = $null
             }
         }
         default { Stop-Qualification 'CLAUDE_ADAPTER_UNAVAILABLE' }
@@ -706,8 +738,8 @@ function Get-InstalledModuleFacts {
     $descriptorBytes = [System.IO.File]::ReadAllBytes($descriptorFile)
     $descriptorHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($descriptorBytes)).ToLowerInvariant()
     $descriptor = Read-JsonFile $descriptorFile
-    if ($descriptor.schema_version -ne 1 -or $descriptor.module_id -ne $Contract.module_id -or
-        $descriptor.artifact.artifact_id -ne $Contract.artifact_id -or $descriptor.artifact.version -ne $Contract.version -or
+    if ($descriptor.schema_version -ne 1 -or $descriptor.module_id -cne $Contract.module_id -or
+        $descriptor.artifact.artifact_id -cne $Contract.artifact_id -or $descriptor.artifact.version -cne $Contract.version -or
         $descriptor.enabled -ne $true -or $descriptor.launch.executable -ne $exe -or
         $descriptor.launch.executable_sha256 -ne $exeHash) {
         Stop-Qualification 'MODULE_DESCRIPTOR_IDENTITY_MISMATCH'
@@ -717,14 +749,32 @@ function Get-InstalledModuleFacts {
         ($descriptor.protocol.maximum.major -eq 1 -and $descriptor.protocol.maximum.minor -lt 0)) {
         Stop-Qualification 'MODULE_PROTOCOL_INCOMPATIBLE'
     }
+    if ($null -eq $Contract.expected_config_schema_id) {
+        if ($null -ne $descriptor.config_schema) { Stop-Qualification 'MODULE_CONFIG_SCHEMA_MISMATCH' }
+    }
+    else {
+        $configSchema = $descriptor.config_schema
+        if ($null -eq $configSchema) { Stop-Qualification 'MODULE_CONFIG_SCHEMA_MISMATCH' }
+        $configSchemaSha256 = [string]$configSchema.sha256
+        if ($configSchema.schema_id -cne $Contract.expected_config_schema_id -or
+            $configSchema.version -cne $Contract.expected_config_schema_version -or
+            $configSchemaSha256 -cnotmatch '^[a-f0-9]{64}$' -or
+            ($null -ne $Contract.expected_config_schema_sha256 -and
+                $configSchemaSha256 -cne $Contract.expected_config_schema_sha256)) {
+            Stop-Qualification 'MODULE_CONFIG_SCHEMA_MISMATCH'
+        }
+    }
     $commandSchemas = @($descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
     $eventSchemas = @($descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
-    if (($commandSchemas -join ',') -ne 'swarm.runtime_command@1' -or ($eventSchemas -join ',') -ne 'swarm.runtime_outcome@1') {
+    $expectedCommandSchemas = @($Contract.command_schemas | Sort-Object)
+    $expectedEventSchemas = @($Contract.event_schemas | Sort-Object)
+    if (($commandSchemas -join ',') -cne ($expectedCommandSchemas -join ',') -or
+        ($eventSchemas -join ',') -cne ($expectedEventSchemas -join ',')) {
         Stop-Qualification 'MODULE_SCHEMA_SET_MISMATCH'
     }
     $capabilities = @($descriptor.capabilities | ForEach-Object { [string]$_ } | Sort-Object)
     $expectedCapabilities = @($Contract.capabilities | Sort-Object)
-    if (($capabilities -join ',') -ne ($expectedCapabilities -join ',')) { Stop-Qualification 'MODULE_CAPABILITY_SET_MISMATCH' }
+    if (($capabilities -join ',') -cne ($expectedCapabilities -join ',')) { Stop-Qualification 'MODULE_CAPABILITY_SET_MISMATCH' }
     if ($descriptor.lifecycle -notin @('external_attach', 'owned_service') -or $descriptor.activation -ne 'on_demand') {
         Stop-Qualification 'MODULE_LIFECYCLE_UNSUPPORTED'
     }
@@ -763,6 +813,23 @@ function Get-InstalledModuleFacts {
 function Get-AdapterConfigPath {
     param([Parameter(Mandatory)] $Descriptor)
     $arguments = @($Descriptor.launch.argv)
+    if ($Descriptor.module_id -ceq 'runtime.command') {
+        if ($arguments.Count -ne 4 -or
+            -not (Test-ExactObjectKeys -Value $arguments[0] -ExpectedKeys @('kind', 'value')) -or
+            -not (Test-ExactObjectKeys -Value $arguments[1] -ExpectedKeys @('kind', 'value')) -or
+            -not (Test-ExactObjectKeys -Value $arguments[2] -ExpectedKeys @('kind', 'value')) -or
+            -not (Test-ExactObjectKeys -Value $arguments[3] -ExpectedKeys @('kind', 'value')) -or
+            $arguments[0].kind -cne 'literal' -or $arguments[0].value -cne '--module-host-config' -or
+            $arguments[1].kind -cne 'module_host_config_path' -or
+            -not (Test-ExactObjectKeys -Value $arguments[1].value -ExpectedKeys @('schema_version')) -or
+            $arguments[1].value.schema_version -isnot [int] -or $arguments[1].value.schema_version -ne 1 -or
+            $arguments[2].kind -cne 'literal' -or $arguments[2].value -cne '--config' -or
+            $arguments[3].kind -cne 'literal' -or -not ($arguments[3].value -is [string]) -or
+            -not [System.IO.Path]::IsPathFullyQualified([string]$arguments[3].value)) {
+            Stop-Qualification 'COMMAND_DESCRIPTOR_LAUNCH_CONTRACT_MISMATCH'
+        }
+        return (Assert-ExistingFile ([string]$arguments[3].value))
+    }
     for ($index = 0; $index -lt $arguments.Count; $index++) {
         $argument = $arguments[$index]
         if ($argument.kind -ne 'literal' -or -not ($argument.value -is [string])) { continue }
@@ -777,6 +844,63 @@ function Get-AdapterConfigPath {
         }
     }
     Stop-Qualification 'ADAPTER_CONFIG_ARGUMENT_UNKNOWN'
+}
+
+function Assert-CommandAdapterConfig {
+    param([Parameter(Mandatory)][string] $Path)
+    $config = Read-JsonFile $Path
+    if (-not ($config -is [System.Collections.IDictionary])) { Stop-Qualification 'COMMAND_CONFIG_INVALID' }
+    if (-not (Test-ExactObjectKeys -Value $config -ExpectedKeys @('command', 'command_args', 'mod_path', 'module_artifact_id', 'run_timeout_ms')) -or
+        $config.module_artifact_id -cne 'eliot-command.rust-headless.1' -or
+        -not ($config.command -is [string]) -or -not ($config.mod_path -is [string]) -or
+        -not [System.IO.Path]::IsPathFullyQualified([string]$config.command) -or
+        -not [System.IO.Path]::IsPathFullyQualified([string]$config.mod_path) -or
+        -not ($config.command_args -is [System.Collections.IList]) -or
+        $config.command_args.Count -gt 32 -or
+        ($config.run_timeout_ms -isnot [int] -and $config.run_timeout_ms -isnot [long]) -or
+        [long]$config.run_timeout_ms -lt 100 -or [long]$config.run_timeout_ms -gt 86400000) {
+        Stop-Qualification 'COMMAND_CONFIG_INVALID'
+    }
+    $commandPath = Assert-ExistingFile ([string]$config.command)
+    $modPath = Assert-ExistingFile ([string]$config.mod_path)
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows) -and
+        [System.IO.Path]::GetExtension($commandPath) -in @('.cmd', '.bat')) {
+        Stop-Qualification 'COMMAND_CONFIG_INVALID'
+    }
+    foreach ($argument in $config.command_args) {
+        $hasControl = $false
+        if ($argument -is [string]) {
+            $hasControl = [string]$argument -match '[\x00-\x1F\x7F]'
+        }
+        if (-not ($argument -is [string]) -or
+            -not [System.IO.Path]::IsPathFullyQualified([string]$argument) -or
+            [System.Text.Encoding]::UTF8.GetByteCount([string]$argument) -gt 4096 -or
+            $hasControl) {
+            Stop-Qualification 'COMMAND_CONFIG_INVALID'
+        }
+    }
+    $modItem = Get-Item -LiteralPath $modPath -Force
+    if ($modItem.Length -gt 2MB) { Stop-Qualification 'COMMAND_CONFIG_INVALID' }
+    $modBytes = [System.IO.File]::ReadAllBytes($modPath)
+    $normalizedMod = [System.Collections.Generic.List[byte]]::new()
+    for ($index = 0; $index -lt $modBytes.Length; $index++) {
+        if ($modBytes[$index] -eq 13 -and $index + 1 -lt $modBytes.Length -and $modBytes[$index + 1] -eq 10) {
+            $normalizedMod.Add(10)
+            $index++
+        }
+        else { $normalizedMod.Add($modBytes[$index]) }
+    }
+    $modSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($normalizedMod.ToArray())).ToLowerInvariant()
+    if ($modSha256 -cne '513eaa7d6034cc22b5abf14d080888cdd3e8782133e39f859b7703db123e1f80') {
+        Stop-Qualification 'COMMAND_MOD_PIN_MISMATCH'
+    }
+    return [ordered]@{
+        executable_sha256 = Get-FileSha256 $commandPath
+        mod_sha256 = $modSha256
+        fixed_argument_count = $config.command_args.Count
+        run_timeout_ms = [long]$config.run_timeout_ms
+        content = 'configuration_and_file_digests_verified; native process execution is not established by this check'
+    }
 }
 
 function Assert-CodexProcessAttachment {
@@ -837,9 +961,30 @@ function Get-RouteModelFacts {
             Stop-Qualification 'CODEX_ROUTE_CONFIG_INCOMPLETE'
         }
     }
+    elseif ($Contract.runtime -eq 'command') {
+        if ($Route.workspace_option -cne 'workspaceRoot' -or
+            -not ($options -is [System.Collections.IDictionary])) {
+            Stop-Qualification 'COMMAND_ROUTE_CONFIG_INCOMPLETE'
+        }
+        $optionKeys = @($options.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)
+        if (($optionKeys -join ',') -cne 'modelId,workspaceRoot' -or
+            -not ($options.modelId -is [string]) -or
+            -not ($options.workspaceRoot -is [string]) -or
+            -not [System.IO.Path]::IsPathFullyQualified([string]$options.workspaceRoot)) {
+            Stop-Qualification 'COMMAND_ROUTE_CONFIG_INCOMPLETE'
+        }
+        $modelId = [string]$options.modelId
+        if ([string]::IsNullOrWhiteSpace($modelId) -or
+            ($null -ne $Contract.expected_model -and $modelId -cne $Contract.expected_model)) {
+            Stop-Qualification 'ROUTE_MODEL_MISMATCH'
+        }
+    }
     else {
         $modelId = [string]$options.modelId
-        if ($modelId -ne $Contract.expected_model) { Stop-Qualification 'ROUTE_MODEL_MISMATCH' }
+        if ([string]::IsNullOrWhiteSpace($modelId) -or
+            ($null -ne $Contract.expected_model -and $modelId -cne $Contract.expected_model)) {
+            Stop-Qualification 'ROUTE_MODEL_MISMATCH'
+        }
     }
     return [pscustomobject]@{ model_id = $modelId; provider_id = $provider; variant = $effort; requested_model_ref = $Contract.expected_model_ref }
 }
@@ -1060,7 +1205,7 @@ try {
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $catalogDeadline -and -not $script:HostProcess.HasExited)
     if (-not $catalog.success) { Stop-Qualification $(if ($catalog.code) { $catalog.code } else { 'MODULE_CATALOG_UNAVAILABLE' }) }
-    $descriptorEntry = @($catalog.descriptors | Where-Object { $_.module_id -eq $contract.module_id -and $_.artifact.artifact_id -eq $contract.artifact_id -and $_.artifact.version -eq $contract.version })
+    $descriptorEntry = @($catalog.descriptors | Where-Object { $_.module_id -ceq $contract.module_id -and $_.artifact.artifact_id -ceq $contract.artifact_id -and $_.artifact.version -ceq $contract.version })
     if ($descriptorEntry.Count -ne 1 -or $descriptorEntry[0].enabled -ne $true -or $descriptorEntry[0].protocol.minimum.major -gt 1 -or $descriptorEntry[0].protocol.maximum.major -lt 1 -or
         ($descriptorEntry[0].protocol.minimum.major -eq 1 -and $descriptorEntry[0].protocol.minimum.minor -gt 0) -or
         ($descriptorEntry[0].protocol.maximum.major -eq 1 -and $descriptorEntry[0].protocol.maximum.minor -lt 0)) {
@@ -1068,17 +1213,19 @@ try {
     }
     $catalogCaps = @($descriptorEntry[0].capabilities | ForEach-Object { [string]$_ } | Sort-Object)
     $expectedCaps = @($contract.capabilities | Sort-Object)
+    $expectedCommands = @($contract.command_schemas | Sort-Object)
+    $expectedEvents = @($contract.event_schemas | Sort-Object)
     $catalogCommands = @($descriptorEntry[0].command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
     $catalogEvents = @($descriptorEntry[0].event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
     $localCommands = @($module.descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
     $localEvents = @($module.descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
     $configSchemaMatches = (ConvertTo-Json -InputObject $descriptorEntry[0].config_schema -Depth 16 -Compress) -ceq (ConvertTo-Json -InputObject $module.descriptor.config_schema -Depth 16 -Compress)
     $protocolMatches = (ConvertTo-Json -InputObject $descriptorEntry[0].protocol -Depth 16 -Compress) -ceq (ConvertTo-Json -InputObject $module.descriptor.protocol -Depth 16 -Compress)
-    if (($catalogCaps -join ',') -ne ($expectedCaps -join ',') -or
-        ($catalogCommands -join ',') -ne 'swarm.runtime_command@1:' -or
-        ($catalogEvents -join ',') -ne 'swarm.runtime_outcome@1:' -or
-        ($localCommands -join ',') -ne ($catalogCommands -join ',') -or
-        ($localEvents -join ',') -ne ($catalogEvents -join ',') -or
+    if (($catalogCaps -join ',') -cne ($expectedCaps -join ',') -or
+        ($catalogCommands -join ',') -cne ($expectedCommands -join ',') -or
+        ($catalogEvents -join ',') -cne ($expectedEvents -join ',') -or
+        ($localCommands -join ',') -cne ($catalogCommands -join ',') -or
+        ($localEvents -join ',') -cne ($catalogEvents -join ',') -or
         -not $configSchemaMatches -or -not $protocolMatches -or
         $descriptorEntry[0].artifact.build_id -ne $module.descriptor.artifact.build_id -or
         $descriptorEntry[0].lifecycle -ne $module.descriptor.lifecycle -or
@@ -1090,13 +1237,13 @@ try {
     $script:CurrentStage = 'route_configuration'
     $routeCall = Invoke-ManagerCall -Method 'route.list' -Params ([ordered]@{}) -TimeoutMilliseconds 30000
     if (-not $routeCall.completed -or $routeCall.exit_code -ne 0 -or $null -eq $routeCall.value) { Stop-Qualification $(if ($routeCall.error_code) { $routeCall.error_code } else { 'ROUTE_LIST_UNAVAILABLE' }) }
-    $routes = @($routeCall.value.routes | Where-Object { $_.runtime -eq $contract.runtime -and $_.module_artifact_id -eq $contract.artifact_id -and $_.enabled -eq $true })
+    $routes = @($routeCall.value.routes | Where-Object { $_.runtime -ceq $contract.runtime -and $_.module_artifact_id -ceq $contract.artifact_id -and $_.enabled -eq $true })
     if ($routes.Count -ne 1) { Stop-Qualification 'EXACT_ENABLED_ROUTE_NOT_UNIQUE' }
     $route = $routes[0]
     $routeModel = Get-RouteModelFacts -Route $route -Contract $contract
-    if ($null -ne $launchSettings.requested_model -and $launchSettings.requested_model -ne $routeModel.model_id) { Stop-Qualification 'REQUESTED_MODEL_DIFFERS_FROM_ROUTE' }
+    if ($null -ne $launchSettings.requested_model -and $launchSettings.requested_model -cne $routeModel.model_id) { Stop-Qualification 'REQUESTED_MODEL_DIFFERS_FROM_ROUTE' }
     if ($null -eq $launchSettings.requested_model -and $null -ne $routeModel.model_id) { Stop-Qualification 'REQUESTED_MODEL_MUST_MATCH_ROUTE' }
-    if ($null -ne $launchSettings.requested_effort -and ($null -eq $routeModel.variant -or $launchSettings.requested_effort -ne $routeModel.variant)) { Stop-Qualification 'REQUESTED_EFFORT_DIFFERS_FROM_ROUTE' }
+    if ($null -ne $launchSettings.requested_effort -and ($null -eq $routeModel.variant -or $launchSettings.requested_effort -cne $routeModel.variant)) { Stop-Qualification 'REQUESTED_EFFORT_DIFFERS_FROM_ROUTE' }
     if ($null -ne $routeModel.variant -and $null -eq $launchSettings.requested_effort -and $contract.module_id -eq 'eliot.opencode.v2' -and $routeModel.variant -ne '') {
         # Effort remains optional; the exact configured route variant is retained only when the caller explicitly selects it.
     }
@@ -1109,6 +1256,9 @@ try {
     else {
         $module.config_path = Get-AdapterConfigPath -Descriptor $module.descriptor
         $script:Report.safe_facts.adapter_config_sha256 = Get-FileSha256 $module.config_path
+    }
+    if ($Adapter -eq 'Command') {
+        $script:Report.safe_facts.command_config = Assert-CommandAdapterConfig -Path $module.config_path
     }
     Add-Stage -Name 'route_configuration' -Status 'passed' -Facts ([ordered]@{ route_alias = $route.alias; runtime = $route.runtime; artifact_id = $route.module_artifact_id; model_id = $routeModel.model_id; provider_id = $routeModel.provider_id; variant = $routeModel.variant; requested_model_ref = $routeModel.requested_model_ref })
 
