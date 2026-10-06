@@ -1254,12 +1254,38 @@ pub(super) fn finish(
         }
         Err(e) => json!({"operation_id":id,"outcome":"failed","error":e,"task_accepted":false}),
     };
+    let observation = submission_diagnostic_observation(&value);
     tx.execute("UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1", params![id,model::canonical(&value)?,now])?;
     super::capacity::sync_attempt(&tx, &input.attempt_id, now)?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?2,'task.submission',?3,?4)",
-        params![format!("submission:{id}"),id,model::canonical(&value)?,now])?;
+        params![format!("submission:{id}"),id,model::canonical(&observation)?,now])?;
     tx.commit()?;
     Ok(())
+}
+
+fn submission_diagnostic_observation(value: &Value) -> Value {
+    if value["outcome"] != "failed" {
+        return value.clone();
+    }
+    let code = value["error"]["code"]
+        .as_str()
+        .filter(|code| safe_submission_error_code(code))
+        .unwrap_or("SUBMISSION_FAILED");
+    json!({
+        "operation_id":value["operation_id"],
+        "outcome":"failed",
+        "error":{"code":code},
+        "task_accepted":false,
+    })
+}
+
+fn safe_submission_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 pub(super) fn document(db: &Connection, submission_ref: &str) -> Result<Value> {
