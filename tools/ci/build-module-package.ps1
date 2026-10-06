@@ -31,6 +31,26 @@ function Test-PathWithin([string] $Path, [string] $Root) {
     return $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)
 }
 
+function Assert-NoReparseTraversal([string] $Path) {
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root)) { throw 'Path has no filesystem root.' }
+    $cursor = $root
+    $segments = $fullPath.Substring($root.Length).Split(
+        [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar),
+        [StringSplitOptions]::RemoveEmptyEntries
+    )
+    foreach ($segment in $segments) {
+        $cursor = [IO.Path]::Combine($cursor, $segment)
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Reparse points are not accepted in package paths: $cursor"
+        }
+    }
+}
+
+Assert-NoReparseTraversal $repoRoot
+
 function Invoke-NativeText([string] $File, [string[]] $Arguments) {
     $captured = & $File @Arguments 2>&1
     $exitCode = $LASTEXITCODE
@@ -112,24 +132,27 @@ function Get-SupervisorTarget([object] $Metadata, [object[]] $MemberIds) {
 }
 
 function Get-PolicySiblingBinaries([object] $Coordinate) {
-    if ($null -eq $Coordinate.required_sibling_binaries) { return @() }
-    return @($Coordinate.required_sibling_binaries | ForEach-Object { [string]$_ })
+    if ($null -eq $Coordinate['required_sibling_binaries']) { return @() }
+    return @($Coordinate['required_sibling_binaries'] | ForEach-Object { [string]$_ })
 }
 
 function Assert-PolicyResourceCoordinate([object] $Coordinate) {
-    if ($null -eq $Coordinate.resource_coordinate) {
+    if ($null -eq $Coordinate['resource_coordinate']) {
         foreach ($field in @('resource_installed_relative_root', 'resource_repository_relative_root', 'resource_files', 'resource_dependency_install')) {
             if ($null -ne $Coordinate[$field]) {
                 throw "Package '$($Coordinate.package_name)' has resource metadata without a resource coordinate."
             }
         }
+        if ([string]$Coordinate['package_name'] -ceq 'swarm-kernel-host') {
+            throw "Package 'swarm-kernel-host' is missing its required resource coordinate."
+        }
         return
     }
-    if ([string]$Coordinate.resource_coordinate -cne 'swarm-kernel-host-opencode-resources' -or
-        [string]$Coordinate.resource_installed_relative_root -cne 'resources/modules/opencode' -or
-        [string]$Coordinate.resource_repository_relative_root -cne 'modules/opencode' -or
-        $Coordinate.resource_files -isnot [array] -or
-        $Coordinate.resource_dependency_install -isnot [System.Collections.IDictionary]) {
+    if ([string]$Coordinate['resource_coordinate'] -cne 'swarm-kernel-host-opencode-resources' -or
+        [string]$Coordinate['resource_installed_relative_root'] -cne 'resources/modules/opencode' -or
+        [string]$Coordinate['resource_repository_relative_root'] -cne 'modules/opencode' -or
+        $Coordinate['resource_files'] -isnot [array] -or
+        $Coordinate['resource_dependency_install'] -isnot [System.Collections.IDictionary]) {
         throw "Package '$($Coordinate.package_name)' has an unsupported resource coordinate."
     }
     $expected = @(
@@ -139,26 +162,27 @@ function Assert-PolicyResourceCoordinate([object] $Coordinate) {
         @{ path = 'package.json'; role = 'dependency_manifest' },
         @{ path = 'package-lock.json'; role = 'dependency_lock' }
     )
-    $actual = @($Coordinate.resource_files)
+    $actual = @($Coordinate['resource_files'])
     if ($actual.Count -ne $expected.Count) { throw "Package '$($Coordinate.package_name)' has an incomplete resource file coordinate." }
     for ($index = 0; $index -lt $expected.Count; $index++) {
-        if ($actual[$index] -isnot [System.Collections.IDictionary] -or
-            [string]$actual[$index].path -cne $expected[$index].path -or
-            [string]$actual[$index].role -cne $expected[$index].role) {
+        $fileCoordinate = $actual[$index]
+        if ($fileCoordinate -isnot [System.Collections.IDictionary] -or
+            [string]$fileCoordinate['path'] -cne $expected[$index].path -or
+            [string]$fileCoordinate['role'] -cne $expected[$index].role) {
             throw "Package '$($Coordinate.package_name)' resource file coordinate drifted from the pinned OpenCode set."
         }
     }
-    $install = $Coordinate.resource_dependency_install
+    $install = $Coordinate['resource_dependency_install']
     $expectedArguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--loglevel=error')
-    $actualArguments = @($install.arguments | ForEach-Object { [string]$_ })
-    if ([string]$install.manager -cne 'npm' -or
-        [string]$install.output_directory -cne 'node_modules' -or
-        [string]$install.closure_manifest_file -cne 'dependency-closure.json' -or
-        [long]$install.max_files -ne 100000 -or
-        [long]$install.max_entries -ne 200000 -or
-        [long]$install.max_total_bytes -ne 1073741824 -or
-        [long]$install.max_manifest_bytes -ne 33554432 -or
-        [long]$install.timeout_seconds -ne 1800 -or
+    $actualArguments = @($install['arguments'] | ForEach-Object { [string]$_ })
+    if ([string]$install['manager'] -cne 'npm' -or
+        [string]$install['output_directory'] -cne 'node_modules' -or
+        [string]$install['closure_manifest_file'] -cne 'dependency-closure.json' -or
+        [long]$install['max_files'] -ne 100000 -or
+        [long]$install['max_entries'] -ne 200000 -or
+        [long]$install['max_total_bytes'] -ne 1073741824 -or
+        [long]$install['max_manifest_bytes'] -ne 33554432 -or
+        [long]$install['timeout_seconds'] -ne 1800 -or
         $actualArguments.Count -ne $expectedArguments.Count) {
         throw "Package '$($Coordinate.package_name)' has an unsupported locked dependency-install contract."
     }
@@ -174,8 +198,8 @@ function Get-KernelHostResourcePins([string] $PackageName, [object] $Coordinate)
     Assert-PolicyResourceCoordinate $Coordinate
     $resourceRoot = Join-Path $repoRoot 'modules/opencode'
     $pins = @(
-        foreach ($entry in @($Coordinate.resource_files)) {
-            $sourcePath = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$entry.path)))
+        foreach ($entry in @($Coordinate['resource_files'])) {
+            $sourcePath = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$entry['path'])))
             if (-not (Test-PathWithin $sourcePath $resourceRoot) -or
                 -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
                 throw "Pinned kernel resource is missing from the repository: $sourcePath"
@@ -185,9 +209,9 @@ function Get-KernelHostResourcePins([string] $PackageName, [object] $Coordinate)
                 throw "Pinned kernel resource is not a regular non-empty file: $sourcePath"
             }
             [ordered]@{
-                path = [string]$entry.path
-                role = [string]$entry.role
-                file = 'resources/modules/opencode/' + [string]$entry.path
+                path = [string]$entry['path']
+                role = [string]$entry['role']
+                file = 'resources/modules/opencode/' + [string]$entry['path']
                 bytes = [long]$item.Length
                 source_sha256 = Get-Sha256 $sourcePath
             }
@@ -213,6 +237,8 @@ if ((Test-PathWithin $outputPath $repoRoot) -or (Test-PathWithin $repoRoot $outp
 if ((Test-PathWithin $targetPath $outputPath) -or (Test-PathWithin $outputPath $targetPath)) {
     throw 'TargetDir and OutputDir must be separate, non-overlapping directories.'
 }
+Assert-NoReparseTraversal $targetPath
+Assert-NoReparseTraversal $outputPath
 if (Test-Path -LiteralPath $targetPath -PathType Leaf) { throw 'TargetDir names a file.' }
 if (Test-Path -LiteralPath $outputPath) {
     throw 'OutputDir must not already exist; refusing to reuse or overwrite a package artifact.'
@@ -242,14 +268,14 @@ if ($policy.schema_version -ne 2 -or $policy.format -cne 'eliot.module_build_pol
 $policyNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($coordinate in $policy.approved_package_coordinates) {
     if ($coordinate -isnot [System.Collections.IDictionary] -or
-        [string]$coordinate.package_name -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\z' -or
-        [string]$coordinate.manifest -cnotmatch '\A[A-Za-z0-9._/-]{1,512}\z' -or
-        [string]$coordinate.manifest -match '(^|/)\.\.(/|$)' -or
-        [string]$coordinate.binary_target -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,99}\z' -or
-        ($null -ne $coordinate.role -and [string]$coordinate.role -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\z') -or
-        ($null -ne $coordinate.required_sibling_binaries -and
-            $coordinate.required_sibling_binaries -isnot [array]) -or
-        -not $policyNames.Add([string]$coordinate.package_name)) {
+        [string]$coordinate['package_name'] -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\z' -or
+        [string]$coordinate['manifest'] -cnotmatch '\A[A-Za-z0-9._/-]{1,512}\z' -or
+        [string]$coordinate['manifest'] -match '(^|/)\.\.(/|$)' -or
+        [string]$coordinate['binary_target'] -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,99}\z' -or
+        ($null -ne $coordinate['role'] -and [string]$coordinate['role'] -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\z') -or
+        ($null -ne $coordinate['required_sibling_binaries'] -and
+            $coordinate['required_sibling_binaries'] -isnot [array]) -or
+        -not $policyNames.Add([string]$coordinate['package_name'])) {
         throw 'Module package policy has a malformed or repeated package/manifest/binary coordinate.'
     }
     Assert-PolicyResourceCoordinate $coordinate
@@ -263,13 +289,17 @@ foreach ($coordinate in $policy.approved_package_coordinates) {
 }
 $selectedCoordinates = @(
     $policy.approved_package_coordinates | Where-Object {
-        [string]$_.package_name -ceq $Package
+        [string]$_['package_name'] -ceq $Package
     }
 )
 if ($selectedCoordinates.Count -ne 1) {
     throw "Package '$Package' is not on the explicit module-package allowlist."
 }
 $selectedCoordinate = $selectedCoordinates[0]
+if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor') -and
+    [string]::IsNullOrWhiteSpace([string]$selectedCoordinate['role'])) {
+    throw "Package '$Package' is missing its required host compatibility role."
+}
 
 Push-Location $repoRoot
 try {
@@ -367,7 +397,7 @@ if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervi
         role = 'host_supervisor'
     }
     $compatibility = [ordered]@{
-        process_role = [string]$selectedCoordinate.role
+        process_role = [string]$selectedCoordinate['role']
         required_sibling_binaries = @(Get-PolicySiblingBinaries $selectedCoordinate)
         host_ipc = [ordered]@{ protocol_version = $hostIpcProtocolVersion }
         target = [ordered]@{ rustc_host_triple = $rustcHostTriple }
@@ -472,6 +502,7 @@ $selectedManifestPin = Get-PackageManifestPin $selected $repoRoot
 if ([string]$selectedManifestPin.path -cne $manifestRelative) {
     throw 'Selected package manifest provenance differs from its exact Cargo metadata path.'
 }
+$resourceDependencyInstall = $selectedCoordinate['resource_dependency_install']
 $buildManifest = [ordered]@{
     schema_version = 1
     format = 'eliot.module_build_manifest.v1'
@@ -512,22 +543,22 @@ $buildManifest = [ordered]@{
     resources = if ($resourceRows.Count -gt 0) {
         [ordered]@{
             schema_version = 1
-            coordinate = [string]$selectedCoordinate.resource_coordinate
-            repository_relative_root = [string]$selectedCoordinate.resource_repository_relative_root
-            installed_relative_root = [string]$selectedCoordinate.resource_installed_relative_root
+            coordinate = [string]$selectedCoordinate['resource_coordinate']
+            repository_relative_root = [string]$selectedCoordinate['resource_repository_relative_root']
+            installed_relative_root = [string]$selectedCoordinate['resource_installed_relative_root']
             files = @($resourceRows)
             dependency_policy = [ordered]@{
                 node_modules = 'installer_generated_locked_closure'
-                manager = [string]$selectedCoordinate.resource_dependency_install.manager
+                manager = [string]$resourceDependencyInstall['manager']
                 install_command = 'npm ci --ignore-scripts'
-                arguments = @($selectedCoordinate.resource_dependency_install.arguments)
-                output_directory = [string]$selectedCoordinate.resource_dependency_install.output_directory
-                closure_manifest_file = [string]$selectedCoordinate.resource_dependency_install.closure_manifest_file
-                max_files = [long]$selectedCoordinate.resource_dependency_install.max_files
-                max_entries = [long]$selectedCoordinate.resource_dependency_install.max_entries
-                max_total_bytes = [long]$selectedCoordinate.resource_dependency_install.max_total_bytes
-                max_manifest_bytes = [long]$selectedCoordinate.resource_dependency_install.max_manifest_bytes
-                timeout_seconds = [long]$selectedCoordinate.resource_dependency_install.timeout_seconds
+                arguments = @($resourceDependencyInstall['arguments'])
+                output_directory = [string]$resourceDependencyInstall['output_directory']
+                closure_manifest_file = [string]$resourceDependencyInstall['closure_manifest_file']
+                max_files = [long]$resourceDependencyInstall['max_files']
+                max_entries = [long]$resourceDependencyInstall['max_entries']
+                max_total_bytes = [long]$resourceDependencyInstall['max_total_bytes']
+                max_manifest_bytes = [long]$resourceDependencyInstall['max_manifest_bytes']
+                timeout_seconds = [long]$resourceDependencyInstall['timeout_seconds']
             }
         }
     } else { $null }
@@ -539,8 +570,8 @@ $buildManifest = [ordered]@{
         activated = $false
     }
 }
-if ($null -ne $selectedCoordinate.role) {
-    $buildManifest.build['role'] = [string]$selectedCoordinate.role
+if ($null -ne $selectedCoordinate['role']) {
+    $buildManifest.build['role'] = [string]$selectedCoordinate['role']
 }
 if ($null -ne $compatibility) { $buildManifest['compatibility'] = $compatibility }
 $json = ConvertTo-Json -InputObject $buildManifest -Depth 12

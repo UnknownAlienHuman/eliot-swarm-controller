@@ -13,16 +13,36 @@ that same commit, including a deterministic initializer-error case after
 admission closure and confirmed writer exit. Source closure preceded these
 tests.
 
-The first Store failure selector stopped during test compilation: six stale
-fixture errors and six warnings prevented its execution. The subsequent
-test-only source batch updates the real bootstrap/config arguments and typed
-writer owner, preserves the existing authorization and failure assertions, and
-removes the reported unused imports and binding. Store failure/recovery and
-native qualification remain pending. The product remains `PARTIAL_PROGRESS`;
-production compilation and four writer cases do not qualify installed adapters
-or productive execution. No full builds or native/provider/model calls have run
-in this qualification phase. Historical binaries and qualification receipts
+The first Store failure selector stopped during test compilation. The test-only
+batch at `9b5acc98243bb9419046546e3743b3a60b6b2b56` repaired the stale bootstrap
+arguments and writer owner without weakening authorization or failure assertions.
+Six exact Store selectors then passed: terminal error/event propagation, worker
+panic without replay, writer join after reader panic, retained restart hold,
+bootstrap credential validation and module handshake rejection. Two release
+process cases also passed for bounded probe/descendant cleanup and retained
+Task/Operation recovery after host interruption. Together with the four writer
+cases, these are 12 focused cases, rather than a full suite or native qualification.
+
+One consolidated release build of 17 production binary packages passed at
+`9b5acc9`. It reported two warnings in debug-only OpenCode resource code. The
+current source scopes those declarations to debug builds. Formal
+packaging exposed strict-mode accesses to absent optional policy fields and an
+IPC provenance path left behind by Kernel relocation. Source now handles optional
+policy fields, rejects reparse traversal before build activity and reads the
+actual Kernel IPC source. Dependency provenance distinguishes absent fields
+from valid empty arrays and nullable sources. These repairs precede further
+packaging and tests. Native CLI metadata was read without model
+inference. Command Code's bundled model selector is
+`inclusionai/ling-3.1-flash:free`; upstream execution remains unverified.
+The product remains `PARTIAL_PROGRESS`. Installed adapter qualification and the
+complete productive workflow remain pending. Historical binaries and receipts
 retain only their recorded scope.
+
+Source work continues before further tests: durable Concilium wire, Store and
+MCP/CLI methods are being implemented, together with their shared event-bus
+translation. The automation audit also identified unrevalidated event holds and
+Goal source-gap cursor loss; those production corrections remain in progress.
+These authored lanes do not yet establish callable or compiled functionality.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility

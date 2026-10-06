@@ -433,14 +433,14 @@ fn verify_server_dependency_closure(server_program: &Path) -> Result<()> {
         ));
     }
 
-    let source_tree_server = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("modules")
-        .join("opencode")
-        .join("serve.mjs");
     #[cfg(debug_assertions)]
     {
+        let source_tree_server = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("modules")
+            .join("opencode")
+            .join("serve.mjs");
         let source_resources_enabled =
             std::env::var("ELIOT_OPENCODE_SOURCE_RESOURCES").is_ok_and(|value| value == "1");
         if source_resources_enabled

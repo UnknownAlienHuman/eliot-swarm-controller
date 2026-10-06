@@ -216,6 +216,7 @@ fn complete_source_root(root: PathBuf) -> Option<PathBuf> {
     Some(canonical)
 }
 
+#[cfg(debug_assertions)]
 fn complete_base_root(root: PathBuf) -> Option<PathBuf> {
     let metadata = fs::symlink_metadata(&root).ok()?;
     if !metadata.is_dir() || is_reparse_point(&metadata) {
