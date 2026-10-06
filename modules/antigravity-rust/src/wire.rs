@@ -6,7 +6,7 @@ use swarm_contracts::runtime::{
 };
 
 pub const ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-pub const ARTIFACT_VERSION: &str = "3";
+pub const ARTIFACT_VERSION: &str = "4";
 pub const REQUIRED_MODEL_ID: &str = "gemini-3.8-flash-high";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +81,9 @@ impl TryFrom<&RuntimeCommand> for OperationIdentity {
                 .to_owned();
             (Some(target_operation_id), Some(target_input_sha256))
         } else if command.method == "agent.result" {
-            if command.input["selector"]["kind"] != "antigravity_status" {
+            if command.input["selector"]["kind"] != "antigravity_status"
+                && !command.input["normalized_result_origin"].is_object()
+            {
                 return Err("UNSUPPORTED_RESULT_SELECTOR");
             }
             let target_operation_id = command

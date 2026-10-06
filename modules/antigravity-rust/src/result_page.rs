@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use swarm_contracts::{
     error::{Error, Result},
-    runtime::RuntimeCommand,
+    runtime::{NormalizedResultOriginContext, RuntimeCommand},
 };
 
 use crate::{module_receipt, wire::OperationIdentity};
@@ -175,6 +175,76 @@ pub fn build(command: &RuntimeCommand) -> Result<Value> {
         "operation_id":identity.operation_id,
         "page":page,
     }))
+}
+
+/// Validate a Store-admitted normalized result request, then report the
+/// native protocol's bounded body capability. Antigravity's stream result
+/// has no request, item, or turn parent; conversation plus this adapter's
+/// local ordinal cannot prove that response text belongs to this input.
+pub fn build_normalized(command: &RuntimeCommand) -> Result<Value> {
+    if command.method != "agent.result"
+        || command.route["runtime"].as_str() != Some("antigravity")
+        || !command.input["normalized_result_origin"].is_object()
+    {
+        return Err(Error::new(
+            "RESULT_SELECTOR_UNSUPPORTED",
+            "normalized Antigravity result origin was not admitted",
+        ));
+    }
+    let identity = OperationIdentity::try_from(command).map_err(|_| {
+        Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "normalized result command identity is invalid",
+        )
+    })?;
+    let origin: NormalizedResultOriginContext =
+        serde_json::from_value(command.input["normalized_result_origin"].clone()).map_err(
+            |_| {
+                Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "normalized result origin is malformed",
+                )
+            },
+        )?;
+    origin.validate().map_err(|_| {
+        Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "normalized result origin is invalid",
+        )
+    })?;
+    let target_id = command.input["selector"]["input_operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_PROVENANCE_INVALID",
+                "normalized result selector has no exact input Operation",
+            )
+        })?;
+    let session_id = command.input["selector"]["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_PROVENANCE_INVALID",
+                "normalized result selector has no native session identity",
+            )
+        })?;
+    if command.native_root_id.as_deref() != Some(session_id)
+        || identity.target_operation_id.as_deref() != Some(target_id)
+        || identity.target_input_sha256.as_deref() != Some(origin.target_input_sha256.as_str())
+        || origin.binding_id != command.binding_id
+        || origin.binding_generation != command.generation
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "normalized result origin differs from the admitted binding or input",
+        ));
+    }
+    Err(Error::new(
+        "RESULT_BODY_UNAVAILABLE",
+        "Antigravity exposes response text without a native request, item, or turn parent; conversation and local ordinal do not prove input causality",
+    ))
 }
 
 fn status_body(source: &Value) -> Value {

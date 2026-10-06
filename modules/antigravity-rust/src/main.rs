@@ -320,25 +320,32 @@ async fn run() -> Result<()> {
                 )
                 .await?
             }
-            "agent.result" => match result_page::build(&command) {
-                Ok(params) => {
-                    let response = host
-                        .request_saved("module.result", params, &controller, native_live)
-                        .await?;
-                    if response["recorded"] != true {
-                        return Err(Error::new(
-                            "MODULE_RESULT_ACK_INVALID",
-                            "manager did not acknowledge the immutable status page",
-                        ));
+            "agent.result" => {
+                let params = if command.input["normalized_result_origin"].is_object() {
+                    result_page::build_normalized(&command)
+                } else {
+                    result_page::build(&command)
+                };
+                match params {
+                    Ok(params) => {
+                        let response = host
+                            .request_saved("module.result", params, &controller, native_live)
+                            .await?;
+                        if response["recorded"] != true {
+                            return Err(Error::new(
+                                "MODULE_RESULT_ACK_INVALID",
+                                "manager did not acknowledge the immutable status page",
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        controller
+                            .reject_command(&command, result_page_diagnostic(error.code.as_str()))?;
+                        dirty = true;
+                        flush_reports(&mut host, &mut controller, &mut dirty, native_live).await?;
                     }
                 }
-                Err(error) => {
-                    controller
-                        .reject_command(&command, result_page_diagnostic(error.code.as_str()))?;
-                    dirty = true;
-                    flush_reports(&mut host, &mut controller, &mut dirty, native_live).await?;
-                }
-            },
+            }
             "agent.recover" => {
                 reject_and_report(
                     &mut host,
@@ -381,6 +388,7 @@ async fn reject_and_report(
 fn result_page_diagnostic(code: &str) -> &'static str {
     match code {
         "RESULT_RANGE_INVALID" => "RESULT_RANGE_INVALID",
+        "RESULT_BODY_UNAVAILABLE" => "RESULT_BODY_UNAVAILABLE",
         "RESULT_PROVENANCE_INVALID" | "RESULT_SELECTOR_UNSUPPORTED" => "RESULT_PROVENANCE_INVALID",
         _ => "RESULT_PAGE_UNAVAILABLE",
     }
