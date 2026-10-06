@@ -527,7 +527,16 @@ async fn call_automatic_with_api<A: GitHubLabelApi + ?Sized>(
             )
         })?
         .to_owned();
-    let (context, target) = load_automatic_target(store, &operation_id, &request).await?;
+    let (context, target) = match load_automatic_target(store, &operation_id, &request).await {
+        Ok(loaded) => loaded,
+        Err(error) if is_automatic_prewrite_stale_error(&error) => {
+            if reject_stale_queued_automatic(store, &operation_id, &request).await? {
+                return operation_result(store, &operation_id).await;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let repository = RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
     let initial = match read_remote(api, &repository, &target).await {
         Ok(initial) => initial,
@@ -564,7 +573,16 @@ async fn call_automatic_with_api<A: GitHubLabelApi + ?Sized>(
         .await;
     }
 
-    begin_automatic_write(store, &operation_id, &context, &target, &request).await?;
+    if let Err(error) =
+        begin_automatic_write(store, &operation_id, &context, &target, &request).await
+    {
+        if is_automatic_prewrite_stale_error(&error)
+            && reject_stale_queued_automatic(store, &operation_id, &request).await?
+        {
+            return operation_result(store, &operation_id).await;
+        }
+        return Err(error);
+    }
     // The write call is issued once. From the durable `sending` transition
     // onward, all recovery is readback-only.
     let write_error = api
@@ -666,10 +684,212 @@ async fn load_automatic_target(
             context.require_request_matches(&request)?;
             let target = resolve_target_identity(db, &request, true)?;
             validate_automatic_target(&context, &request, &target)?;
+            RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
             require_automatic_slot(db, &request, &target, &operation_id)?;
             Ok((context, target))
         })
         .await
+}
+
+/// Terminalize only an exact internal Operation that is still queued, has no
+/// sent timestamp, retains its typed cause/admission receipt, and still owns
+/// the exact durable label slot. This releases a provably unstarted stale
+/// effect without creating a Principal or touching `sending`/unknown writes.
+async fn reject_stale_queued_automatic(
+    store: &Store,
+    operation_id: &str,
+    request: &ManagedLabelRequest,
+) -> Result<bool> {
+    let operation_id = operation_id.to_owned();
+    let request = request.clone();
+    store
+        .run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            if operation["state"].as_str() != Some("queued")
+                || operation["caller_id"].as_str()
+                    != Some(authorization::AUTOMATION_TECHNICAL_REQUESTER_ID)
+                || operation["method"].as_str() != Some(METHOD)
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let context = GithubProjectionContext::from_committed_operation(&tx, &operation_id)?;
+            context.require_request_matches(&request)?;
+            if operation["task_id"].as_str() != Some(context.task_id())
+                || operation["attempt_id"].as_str() != Some(context.attempt_id())
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+
+            let sent_at_ms: Option<i64> = tx.query_row(
+                "SELECT sent_at_ms FROM operations WHERE operation_id=?1 AND caller_id=?2 AND method=?3",
+                params![operation_id, authorization::AUTOMATION_TECHNICAL_REQUESTER_ID, METHOD],
+                |row| row.get(0),
+            )?;
+            if sent_at_ms.is_some() {
+                tx.commit()?;
+                return Ok(false);
+            }
+
+            let stale = (|| {
+                context.require_current(&tx)?;
+                let target = resolve_target_identity(&tx, &request, true)?;
+                validate_automatic_target(&context, &request, &target)?;
+                RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
+                require_automatic_slot(&tx, &request, &target, &operation_id)
+            })();
+            let Err(stale_error) = stale else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            if !is_automatic_prewrite_stale_error(&stale_error) {
+                tx.commit()?;
+                return Ok(false);
+            }
+
+            let effective_json: String = tx.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let effective: Value = serde_json::from_str(&effective_json).map_err(|_| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "managed-label effective request is invalid",
+                )
+            })?;
+            let receipt = effective.get("receipt").ok_or_else(|| {
+                Error::new(
+                    "GITHUB_EFFECT_OPERATION_MISMATCH",
+                    "the retained automated Operation has no admission receipt",
+                )
+            })?;
+            let linkage = context.linkage_value();
+            if receipt["ok"] != true
+                || receipt["value"]["operation_id"] != operation_id
+                || effective.get("automation_on_behalf") != Some(&linkage)
+            {
+                return Err(Error::new(
+                    "GITHUB_EFFECT_OPERATION_MISMATCH",
+                    "the retained automated admission receipt does not match its typed cause",
+                ));
+            }
+            let admission = &receipt["value"];
+            validate_retained_effect_result(&operation["result"], admission, &operation_id, &request)?;
+            if admission["source_id"] != context.source_id()
+                || admission["project_id"] != context.project_id()
+                || admission["task_id"] != context.task_id()
+                || admission["task_revision"] != context.task_revision()
+                || admission["source_revision"] != context.source_revision()
+                || admission["label"] != context.label()
+                || admission["present"] != context.present()
+                || admission["desired_present"] != context.present()
+                || admission["outcome"] != "managed_label_queued"
+            {
+                return Err(Error::new(
+                    "GITHUB_EFFECT_OPERATION_MISMATCH",
+                    "the retained admission receipt differs from its exact projection context",
+                ));
+            }
+
+            let mut slot_statement = tx.prepare(
+                "SELECT source_id,issue_id,label,desired_present FROM github_label_effect_slots WHERE operation_id=?1",
+            )?;
+            let slots = slot_statement
+                .query_map([&operation_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(slot_statement);
+            let (slot_source_id, slot_issue_id, slot_label, slot_present) = match slots.as_slice() {
+                [slot] => slot,
+                _ => {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+            };
+            if slot_source_id != context.source_id()
+                || Some(*slot_issue_id) != admission["issue_id"].as_i64()
+                || slot_label != context.label()
+                || *slot_present != i64::from(context.present())
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+
+            let result = json!({
+                "operation_id":operation_id,
+                "source_id":context.source_id(),
+                "project_id":context.project_id(),
+                "task_id":context.task_id(),
+                "task_revision_at_observation":context.task_revision(),
+                "expected_task_revision":request.expected_task_revision,
+                "issue_id":admission["issue_id"],
+                "issue_number":admission["issue_number"],
+                "source_revision":context.source_revision(),
+                "label":request.label,
+                "desired_present":request.present,
+                "observed_present":null,
+                "write_attempted":false,
+                "readback":"not_confirmed",
+                "outcome":"rejected_before_write",
+                "error":{"code":stale_error.code,"message":stale_error.message},
+                "current_state_read_method":"operation.get"
+            });
+            let changed = tx.execute(
+                "UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND caller_id=?4 AND method=?5 AND state='queued' AND sent_at_ms IS NULL",
+                params![
+                    operation_id,
+                    model::canonical(&result)?,
+                    now,
+                    authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                    METHOD
+                ],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(false);
+            }
+            capacity::sync_operation(&tx, &operation_id, now)?;
+            let event_key = format!("rejected:{operation_id}");
+            tx.execute(
+                "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('github:managed-label',?1,?2,'github.effect.managed_label',?3,?4)",
+                params![event_key, operation_id, model::canonical(&result)?, now],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+}
+
+fn is_automatic_prewrite_stale_error(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "AUTOMATION_ACTION_CHANGED"
+            | "AUTOMATION_CURRENT_GM_REQUIRED"
+            | "AUTOMATION_FACT_CORRUPT"
+            | "AUTOMATION_FACT_MISSING"
+            | "AUTOMATION_FACT_NOT_APPLIED"
+            | "AUTOMATION_GITHUB_PROJECTION_SETTINGS_REQUIRED"
+            | "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE"
+            | "AUTOMATION_TRANSFER_SCOPE"
+            | "FORBIDDEN"
+            | "FORGE_ACCEPTANCE_STALE"
+            | "GITHUB_EFFECT_SLOT_MISMATCH"
+            | "GITHUB_EFFECT_STALE_TASK"
+            | "GITHUB_EFFECT_TARGET_CHANGED"
+            | "GITHUB_EFFECT_TARGET_INVALID"
+            | "GITHUB_EFFECT_TARGET_NOT_FOUND"
+            | "INVALID_PARAMS"
+    )
 }
 
 async fn validate_automatic_readback(

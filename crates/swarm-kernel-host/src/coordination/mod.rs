@@ -10,8 +10,11 @@ use crate::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod code_scope;
 pub mod concilium;
+pub mod contract;
 pub mod integration;
+pub mod thread;
 pub mod watch;
 
 pub const MAX_CARD_BYTES: usize = 32 * 1024;
@@ -227,6 +230,15 @@ fn identifier_invalid(value: &str, max_bytes: usize) -> bool {
 /// mutations. Store authorization and current Task/Attempt checks remain the
 /// authority at application time.
 pub fn validate_mutation(method: &str, value: &Value) -> Result<()> {
+    match method {
+        "coordination.contract.propose" => {
+            return contract::parse_proposal_request(value).map(|_| ());
+        }
+        "coordination.contract.respond" => {
+            return contract::parse_response_request(value).map(|_| ());
+        }
+        _ => {}
+    }
     let allowed: &[&str] = match method {
         "coordination.participant.register" => &[
             "client_request_id",

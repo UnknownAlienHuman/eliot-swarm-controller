@@ -21,9 +21,11 @@ mod c33_restart_diagnosis_fixture;
 mod c34_workspace_start_diagnosis_fixture;
 pub(crate) mod capacity;
 mod checks;
+mod code_scopes;
 mod command_results;
 mod concilium;
 mod coordination;
+mod coordination_threads;
 mod coordination_watch;
 mod forge;
 mod github;
@@ -1862,6 +1864,21 @@ impl Store {
                         if matches!(method.as_str(), "concilium.get" | "concilium.list") {
                             return concilium::read(db, &principal, &method, &params);
                         }
+                        if matches!(
+                            method.as_str(),
+                            "coordination.thread.get" | "coordination.thread.list"
+                        ) {
+                            return coordination_threads::read(db, &principal, &method, &params);
+                        }
+                        if matches!(
+                            method.as_str(),
+                            "code.scope.inspect" | "code.scope.conflicts"
+                        ) {
+                            return code_scopes::read(db, &principal, &method, &params);
+                        }
+                        if method == "coordination.agreement.get" {
+                            return integration::read(db, &principal, &method, &params);
+                        }
                         if method == "swarm.overlap.check" {
                             return integration::read(db, &principal, &method, &params);
                         }
@@ -1878,6 +1895,33 @@ impl Store {
                                 model::fields(&params, &["operation_id"])?;
                                 return operations::get_operation(db, id);
                             }
+                            let is_thread_operation: bool = db.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND method IN ('coordination.thread.open','coordination.message.send','coordination.thread.resolve','coordination.thread.withdraw','coordination.thread.supersede'))",
+                                [id],
+                                |row| row.get(0),
+                            )?;
+                            if is_thread_operation
+                                && coordination_threads::authorize_operation_read(
+                                    db, &principal, id,
+                                )
+                                .is_ok()
+                            {
+                                model::fields(&params, &["operation_id"])?;
+                                return operations::get_operation(db, id);
+                            }
+                            if integration::authorize_operation_read(db, &principal, id).is_ok() {
+                                model::fields(&params, &["operation_id"])?;
+                                return operations::get_operation(db, id);
+                            }
+                            let own_code_scope_receipt: bool = db.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND caller_id=?2 AND method IN ('code.scope.propose','code.scope.release'))",
+                                params![id, principal.client_id],
+                                |row| row.get(0),
+                            )?;
+                            if own_code_scope_receipt {
+                                model::fields(&params, &["operation_id"])?;
+                                return operations::get_operation(db, id);
+                            }
                         }
                         return coordination::read(db, &principal, &method, &params);
                     }
@@ -1891,7 +1935,24 @@ impl Store {
                         reviews::authorize_evidence_read(db, &principal, &method, &params)?;
                         return read(db, &principal, &method, &params, &config);
                     }
+                    if method == "coordination.integration.ack"
+                        || matches!(method.as_str(), "code.scope.propose" | "code.scope.release")
+                    {
+                        return mutate(db, &principal, &method, &params, &config);
+                    }
                     if swarm_contracts::method_policy::participant_coordination_mutation(&method) {
+                        if matches!(
+                            method.as_str(),
+                            "coordination.thread.open"
+                                | "coordination.message.send"
+                                | "coordination.thread.resolve"
+                                | "coordination.thread.withdraw"
+                                | "coordination.thread.supersede"
+                                | "coordination.contract.propose"
+                                | "coordination.contract.respond"
+                        ) {
+                            return mutate(db, &principal, &method, &params, &config);
+                        }
                         if matches!(
                             method.as_str(),
                             "concilium.propose" | "concilium.position.submit"
@@ -4224,6 +4285,13 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
             // acquire a new action grant. Their handlers resolve the exact
             // historical actor/scope even after this assignment has ended.
             allowed.extend(["concilium.get", "concilium.list", "operation.get"]);
+            allowed.extend([
+                "coordination.thread.get",
+                "coordination.thread.list",
+                "coordination.contract.get",
+                "coordination.contract.list",
+                "coordination.agreement.get",
+            ]);
             match coordination::current_scope(db, p) {
                 Ok(scope) => {
                     revision_context["scope_state"] = json!("current");
@@ -4324,6 +4392,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         | "automation.config.explain"
                 )
                 && !method.starts_with("coordination.")
+                && !method.starts_with("code.scope.")
                 && !method.starts_with("script.")
                 && !method.starts_with("goal.")
                 && !method.starts_with("hook.")
@@ -4365,6 +4434,11 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "concilium.preview" | "concilium.get" | "concilium.list" => {
             concilium::read(db, p, method, v)
         }
+        "coordination.thread.get" | "coordination.thread.list" => {
+            coordination_threads::read(db, p, method, v)
+        }
+        "code.scope.inspect" | "code.scope.conflicts" => code_scopes::read(db, p, method, v),
+        "coordination.agreement.get" => integration::read(db, p, method, v),
         "goal.get" | "goal.list" => goals::read(db, p, method, v),
         "mcp.authorization" => mcp_authorization(db, p, v),
         "swarm.context.get"
@@ -4375,6 +4449,8 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         | "coordination.work_card.list"
         | "coordination.contract_card.get"
         | "coordination.contract_card.list"
+        | "coordination.contract.get"
+        | "coordination.contract.list"
         | "coordination.inbox" => coordination::read(db, p, method, v),
         "coordination.watch.list" => coordination_watch::read(db, p, v),
         "bus.events.page" => bus_kernel::read(db, p, method, v, config),
@@ -5256,6 +5332,57 @@ fn mutate_in_transaction_with_authority(
     if let Some(launch_operation_id) = plan.launch_operation_id {
         let admission_path = format!("$.{admission_key}");
         tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,?3,json(?2)) WHERE operation_id=?1", params![id, model::canonical(&json!({"launch_operation_id":launch_operation_id}))?, admission_path])?;
+    }
+    if let MutationAuthority::Direct(principal) = &authority
+        && matches!(
+            method,
+            "coordination.thread.open"
+                | "coordination.message.send"
+                | "coordination.thread.resolve"
+                | "coordination.thread.withdraw"
+                | "coordination.thread.supersede"
+                | "coordination.contract.propose"
+                | "coordination.contract.respond"
+        )
+        && let Some((task_id, task_revision, attempt_id)) =
+            coordination_threads::admitted_thread_operation_scope(tx, principal, method, v)?
+    {
+        let changed = if matches!(
+            method,
+            "coordination.contract.propose" | "coordination.contract.respond"
+        ) {
+            let thread_id = model::text(v, "thread_id")?;
+            let retained_scope = json!({
+                "kind": "contract_thread",
+                "thread_id": thread_id,
+                "task_id": task_id,
+                "task_revision": task_revision,
+                "attempt_id": attempt_id,
+            });
+            tx.execute(
+                "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=json_set(effective_request_json,'$.coordination_scope',json(?7)) WHERE operation_id=?1 AND caller_id=?4 AND method=?5 AND client_request_id=?6",
+                params![
+                    id,
+                    task_id,
+                    attempt_id,
+                    principal.client_id,
+                    method,
+                    request_id,
+                    model::canonical(&retained_scope)?,
+                ],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1 AND caller_id=?4 AND method=?5 AND client_request_id=?6",
+                params![id, task_id, attempt_id, principal.client_id, method, request_id],
+            )?
+        };
+        if changed != 1 {
+            return Err(Error::new(
+                "STORE_INVARIANT",
+                "Thread-backed Operation scope could not be attached to its admitted receipt",
+            ));
+        }
     }
     tx.execute_batch("SAVEPOINT mutation_effect")?;
     let result = match &authority {
@@ -6248,7 +6375,19 @@ fn apply(
             value["operation_id"] = json!(id);
             (value, false)
         }),
-        "coordination.sync_integration" => integration::apply(tx, p, method, v, config, id, now),
+        "coordination.sync_integration" | "coordination.integration.ack" => {
+            integration::apply(tx, p, method, v, config, id, now)
+        }
+        "coordination.thread.open"
+        | "coordination.message.send"
+        | "coordination.thread.resolve"
+        | "coordination.thread.withdraw"
+        | "coordination.thread.supersede" => {
+            coordination_threads::apply(tx, p, method, v, id, now).map(|value| (value, false))
+        }
+        "code.scope.propose" | "code.scope.accept" | "code.scope.release" => {
+            code_scopes::apply(tx, p, method, v, id, now)
+        }
         "concilium.propose"
         | "concilium.open"
         | "concilium.position.submit"
@@ -6267,6 +6406,8 @@ fn apply(
         | "coordination.work_card.withdraw"
         | "coordination.contract_card.publish"
         | "coordination.contract_card.withdraw"
+        | "coordination.contract.propose"
+        | "coordination.contract.respond"
         | "coordination.send"
         | "coordination.consult" => coordination::apply(tx, p, method, v, config, id, now),
         "review.assign" => {

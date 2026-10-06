@@ -12,7 +12,7 @@
 //! same style as the Tasks projection (protocol methods on the
 //! handler, never tools, never a second store of state).
 //!
-//! Categories derive ONLY from committed facts. All four are exact
+//! Categories derive ONLY from committed facts. All five are exact
 //! filters over the one committed observation stream that
 //! `report.delta` reads, so every category shares the stream's single
 //! cursor space and a cursor from any notification resyncs through any
@@ -39,13 +39,18 @@
 //!   carry only the cursor, method kind, Operation ID, and Concilium ID;
 //!   clients resync the authorized projection through `concilium.get` or
 //!   `concilium.list`.
+//! - `coordination` — committed Thread and contract Operation facts. This
+//!   category shares the `report.delta` cursor and projects only the cursor,
+//!   kind, Operation ID, Thread ID and proposal identifiers. Participant
+//!   profiles cannot subscribe because they do not expose `report.delta`;
+//!   manager profiles also need the typed Thread and contract resync reads.
 //!
 //! Nothing is sourced from a volatile or native live stream, and a
 //! subscription never creates facts: it forwards reads of the durable
 //! stream only. The categories expose nothing the facade's credential
 //! cannot already read through the `report_delta` / `message_read` /
-//! `operation_get` tools; a Concilium subscription also names its exact
-//! `concilium.get` / `concilium.list` resync reads.
+//! `operation_get` tools; Concilium and coordination subscriptions also
+//! name their exact typed resync reads.
 //!
 //! Bounds: each subscription owns a queue of at most
 //! [`MAX_QUEUE_DEPTH`] undelivered notifications and the session holds
@@ -59,7 +64,8 @@
 //! bound. Authority is never the notification tail: resync is
 //! `report.delta` / `message.read` / `operation.get` from
 //! `from_cursor`, adding `concilium.get` / `concilium.list` for a
-//! `concilium` subscription, and the lagged notification names exactly
+//! `concilium` subscription and the typed Thread/contract reads for a
+//! `coordination` subscription; the lagged notification names exactly
 //! those reads.
 //!
 //! Reconnect is not replay continuity. Subscriptions live and die with
@@ -131,14 +137,25 @@ const PAGE_LIMIT: i64 = 50;
 /// yielding to the next tick — a busy stream cannot starve the
 /// session, and the queue bound still applies within the tick.
 const MAX_PAGES_PER_TICK: usize = 8;
-/// Base exact reads for every category; Concilium-specific reads are
-/// appended for subscriptions that include `Category::Concilium`.
+/// Base exact reads for every category; Concilium and coordination reads
+/// are appended only for their corresponding categories.
 const RESYNC_READS: [&str; 3] = ["report.delta", "message.read", "operation.get"];
 const CONCILIUM_RESYNC_READS: [&str; 2] = ["concilium.get", "concilium.list"];
+const COORDINATION_RESYNC_READS: [&str; 4] = [
+    "coordination.thread.get",
+    "coordination.thread.list",
+    "coordination.contract.get",
+    "coordination.contract.list",
+];
 /// The committed kinds `message.read` returns, mirrored from the
 /// store's mailbox filter: the pump applies the same predicate to the
 /// same stream the store filters server-side.
-const MAILBOX_KINDS: [&str; 3] = ["message.send", "task.feedback", "check.completed"];
+const MAILBOX_KINDS: [&str; 4] = [
+    "message.send",
+    "coordination.message.send",
+    "task.feedback",
+    "check.completed",
+];
 
 /// One subscription category: an exact filter over the committed
 /// observation stream, never a source of its own.
@@ -154,6 +171,8 @@ pub enum Category {
     Operations,
     /// Committed Concilium Operation facts, projected as IDs and cursor only.
     Concilium,
+    /// Committed Thread and contract Operation facts, projected as IDs and cursor only.
+    Coordination,
 }
 
 impl Category {
@@ -163,6 +182,7 @@ impl Category {
             Category::Mailbox => "mailbox",
             Category::Operations => "operations",
             Category::Concilium => "concilium",
+            Category::Coordination => "coordination",
         }
     }
 
@@ -172,6 +192,7 @@ impl Category {
             "mailbox" => Some(Category::Mailbox),
             "operations" => Some(Category::Operations),
             "concilium" => Some(Category::Concilium),
+            "coordination" => Some(Category::Coordination),
             _ => None,
         }
     }
@@ -181,6 +202,7 @@ impl Category {
             Category::Reports => true,
             Category::Operations => item["operation_id"].is_string(),
             Category::Concilium => is_concilium_fact(item),
+            Category::Coordination => is_coordination_fact(item),
             Category::Mailbox => {
                 MAILBOX_KINDS.contains(&item["kind"].as_str().unwrap_or_default())
                     && item["payload"]["recipient"].as_str() == Some(client_id)
@@ -195,6 +217,29 @@ fn is_concilium_fact(item: &Value) -> bool {
         .is_some_and(|kind| kind.starts_with("concilium."))
 }
 
+fn is_coordination_fact(item: &Value) -> bool {
+    const KINDS: [&str; 5] = [
+        "coordination.thread_opened",
+        "coordination.message",
+        "coordination.thread_closed",
+        "coordination.contract_proposed",
+        "coordination.contract_response",
+    ];
+    let kind = item["kind"].as_str().unwrap_or_default();
+    item["operation_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+        && item["payload"]["thread_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        && KINDS.contains(&kind)
+        && (!matches!(
+            kind,
+            "coordination.contract_proposed" | "coordination.contract_response"
+        ) || (item["payload"]["proposal_id"].as_str().is_some()
+            && item["payload"]["proposal_revision_id"].as_str().is_some()))
+}
+
 fn notification_item(item: &Value) -> Value {
     if is_concilium_fact(item) {
         return json!({
@@ -203,6 +248,22 @@ fn notification_item(item: &Value) -> Value {
             "operation_id": item["operation_id"],
             "concilium_id": item["payload"]["concilium_id"]
         });
+    }
+    if is_coordination_fact(item) {
+        let mut projected = json!({
+            "cursor": item["cursor"],
+            "kind": item["kind"],
+            "operation_id": item["operation_id"],
+            "thread_id": item["payload"]["thread_id"]
+        });
+        if matches!(
+            item["kind"].as_str(),
+            Some("coordination.contract_proposed" | "coordination.contract_response")
+        ) {
+            projected["proposal_id"] = item["payload"]["proposal_id"].clone();
+            projected["proposal_revision_id"] = item["payload"]["proposal_revision_id"].clone();
+        }
+        return projected;
     }
     item.clone()
 }
@@ -232,6 +293,12 @@ fn resync_reads(categories: &[Category]) -> Vec<&'static str> {
         )
     }) {
         reads.extend(CONCILIUM_RESYNC_READS);
+    }
+    if categories
+        .iter()
+        .any(|category| *category == Category::Coordination)
+    {
+        reads.extend(COORDINATION_RESYNC_READS);
     }
     reads
 }

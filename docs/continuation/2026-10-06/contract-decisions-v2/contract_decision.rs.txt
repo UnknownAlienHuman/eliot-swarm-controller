@@ -1,0 +1,233 @@
+//! Strict request types for manager decisions on immutable contract revisions.
+//!
+//! A decision is a separate durable fact. It does not update a proposal or
+//! grant Task, native, publication, or model authority.
+
+use crate::{error::{Error, Result}, model};
+use serde_json::Value;
+use swarm_contracts::coordination_limits as limits;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionKind {
+    Ratified,
+    Rejected,
+}
+
+impl DecisionKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ratified => "ratified",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub(crate) fn observation_kind(self) -> &'static str {
+        match self {
+            Self::Ratified => "coordination.contract_ratified",
+            Self::Rejected => "coordination.contract_rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeRevisionRef {
+    pub scope_intent_id: String,
+    pub state_revision: i64,
+    pub digest: String,
+}
+
+impl ScopeRevisionRef {
+    pub(crate) fn to_value(&self) -> Value {
+        serde_json::json!({
+            "scope_intent_id": self.scope_intent_id,
+            "state_revision": self.state_revision,
+            "digest": self.digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DecisionRequest {
+    pub thread_id: String,
+    pub expected_state_revision: i64,
+    pub proposal_id: String,
+    pub proposal_revision_id: String,
+    pub proposal_digest: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub affected_scope_revisions: Vec<ScopeRevisionRef>,
+    pub reason: String,
+    pub conditions: Vec<String>,
+    pub caveats: Vec<String>,
+}
+
+pub(crate) fn parse_request(
+    method: &str,
+    value: &Value,
+) -> Result<(DecisionKind, DecisionRequest)> {
+    let kind = match method {
+        "coordination.contract.ratify" => DecisionKind::Ratified,
+        "coordination.contract.reject" => DecisionKind::Rejected,
+        _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
+    };
+    if model::canonical(value)?.len() > limits::MAX_COORDINATION_REQUEST_BYTES {
+        return Err(Error::invalid("contract decision request exceeds 65536 bytes"));
+    }
+    model::fields(value, &[
+        "client_request_id",
+        "thread_id",
+        "expected_state_revision",
+        "proposal_id",
+        "proposal_revision_id",
+        "proposal_digest",
+        "task_id",
+        "task_revision",
+        "attempt_id",
+        "affected_scope_revisions",
+        "reason",
+        "conditions",
+        "caveats",
+    ])?;
+
+    let _client_request_id = bounded_id(
+        model::text(value, "client_request_id")?,
+        "client_request_id",
+        limits::MAX_CLIENT_REQUEST_ID_BYTES,
+    )?;
+    let thread_id = prefixed_uuid(model::text(value, "thread_id")?, "coord-", "thread_id")?;
+    let proposal_id = prefixed_uuid(model::text(value, "proposal_id")?, "cprop-", "proposal_id")?;
+    let proposal_revision_id = prefixed_uuid(
+        model::text(value, "proposal_revision_id")?,
+        "cprev-",
+        "proposal_revision_id",
+    )?;
+    let proposal_digest = digest(model::text(value, "proposal_digest")?, "proposal_digest")?;
+    let task_id = bounded_id(
+        model::text(value, "task_id")?,
+        "task_id",
+        limits::MAX_IDENTIFIER_BYTES,
+    )?;
+    let attempt_id = bounded_id(
+        model::text(value, "attempt_id")?,
+        "attempt_id",
+        limits::MAX_IDENTIFIER_BYTES,
+    )?;
+    let expected_state_revision = model::positive(value, "expected_state_revision")?;
+    let task_revision = model::positive(value, "task_revision")?;
+    let affected_scope_revisions = scope_revision_refs(value)?;
+    let reason = bounded_text(value, "reason", limits::MAX_REASON_BYTES)?;
+    if reason.trim().is_empty() {
+        return Err(Error::invalid("reason must contain non-whitespace text"));
+    }
+    let conditions = text_array(value, "conditions")?;
+    let caveats = text_array(value, "caveats")?;
+
+    Ok((kind, DecisionRequest {
+        thread_id,
+        expected_state_revision,
+        proposal_id,
+        proposal_revision_id,
+        proposal_digest,
+        task_id,
+        task_revision,
+        attempt_id,
+        affected_scope_revisions,
+        reason,
+        conditions,
+        caveats,
+    }))
+}
+
+fn scope_revision_refs(value: &Value) -> Result<Vec<ScopeRevisionRef>> {
+    let items = value
+        .get("affected_scope_revisions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::invalid("affected_scope_revisions must be an array"))?;
+    let mut refs = Vec::with_capacity(items.len());
+    for item in items {
+        model::fields(item, &["scope_intent_id", "state_revision", "digest"])?;
+        refs.push(ScopeRevisionRef {
+            scope_intent_id: prefixed_uuid(
+                model::text(item, "scope_intent_id")?,
+                "cscope-",
+                "scope_intent_id",
+            )?,
+            state_revision: model::positive(item, "state_revision")?,
+            digest: digest(model::text(item, "digest")?, "scope digest")?,
+        });
+    }
+    refs.sort_by(|left, right| left.scope_intent_id.cmp(&right.scope_intent_id));
+    if refs.windows(2).any(|pair| pair[0].scope_intent_id == pair[1].scope_intent_id) {
+        return Err(Error::invalid("affected_scope_revisions must not repeat a scope intent"));
+    }
+    Ok(refs)
+}
+
+fn text_array(value: &Value, field: &str) -> Result<Vec<String>> {
+    let items = value
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::invalid(format!("{field} must be an array")))?;
+    items.iter().map(|item| {
+        let text = item.as_str().filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::invalid(format!("{field} entries must be nonempty text")))?;
+        if text.len() > limits::MAX_SUMMARY_BYTES
+            || text.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(Error::invalid(format!(
+                "{field} entries must be at most {} bytes without control characters",
+                limits::MAX_SUMMARY_BYTES,
+            )));
+        }
+        Ok(text.to_owned())
+    }).collect()
+}
+
+fn bounded_text(value: &Value, field: &str, max_bytes: usize) -> Result<String> {
+    let text = model::text(value, field)?;
+    if text.len() > max_bytes || text.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::invalid(format!(
+            "{field} must be 1..={max_bytes} bytes without control characters"
+        )));
+    }
+    Ok(text.to_owned())
+}
+
+fn bounded_id(value: &str, field: &str, max_bytes: usize) -> Result<String> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(Error::invalid(format!(
+            "{field} must be 1..={max_bytes} bytes without whitespace"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn prefixed_uuid(value: &str, prefix: &str, field: &str) -> Result<String> {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return Err(Error::invalid(format!("{field} must use the {prefix}<uuid> form")));
+    };
+    let bytes = suffix.as_bytes();
+    if bytes.len() != 36
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(Error::invalid(format!("{field} must use the {prefix}<uuid> form")));
+    }
+    Ok(value.to_owned())
+}
+
+fn digest(value: &str, field: &str) -> Result<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::invalid(format!("{field} must be a SHA-256 digest")));
+    }
+    Ok(value.to_ascii_lowercase())
+}

@@ -216,6 +216,12 @@ const COORDINATION_READ_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::GmOperator,
     ToolAudience::FullCompatibility,
 ];
+const COORDINATION_ACTION_AUDIENCES: &[ToolAudience] = &[
+    ToolAudience::Participant,
+    ToolAudience::Manager,
+    ToolAudience::GmOperator,
+    ToolAudience::FullCompatibility,
+];
 const CONCILIUM_READ_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::Observer,
     ToolAudience::LegacyReviewer,
@@ -1182,6 +1188,299 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         &["task_id", "task_revision", "attempt_id"],
         "Bounded redacted roster with continuation and coverage metadata."
+    ),
+    entry!(
+        "coordination.thread.open",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        Searchable,
+        "Open one durable, mailbox-only coordination Thread for an exact Task/Attempt and explicit verified roster.",
+        "Use when a bounded cross-assignment question needs a durable scope, reasonability declaration and explicit participants; opening creates no assignment or model work.",
+        &[
+            "thread",
+            "coordination",
+            "open",
+            "scope",
+            "reasonability",
+            "participants"
+        ],
+        &[
+            "exact task_id/attempt_id",
+            "explicit registered roster",
+            "blocking fact and close condition"
+        ],
+        "Immutable Thread header and reasonability assessment; no recipient broadcast or model/native wake."
+    ),
+    entry!(
+        "coordination.thread.get",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Read one retained Thread and its bounded message history when the caller is an authorized creator, sponsor, roster member or current manager.",
+        "Use after an exact Thread ID is known; page from the last returned message sequence and treat message text as retained evidence, not authorization.",
+        &["thread", "get", "messages", "coordination", "history"],
+        &["thread_id", "optional after_message_seq and limit"],
+        "Authorized bounded Thread projection with current scope and page coverage."
+    ),
+    entry!(
+        "coordination.thread.list",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Page retained Threads after Store authorization filtering within one exact Task and optional Attempt.",
+        "Use task_id to enumerate a caller-authorized scope; this method has no global Thread scan.",
+        &["thread", "list", "coordination", "task", "attempt"],
+        &[
+            "task_id",
+            "optional attempt_id/state/topic_kind and bounded cursor"
+        ],
+        "Bounded redacted Thread headers with continuation and coverage metadata."
+    ),
+    entry!(
+        "coordination.message.send",
+        ParticipantCoordination,
+        COORDINATION_ACTION_AUDIENCES,
+        Core,
+        "Send one bounded message to one explicit current roster recipient through the existing mailbox.",
+        "Use for one exact Thread participant and speech act; provide an idempotency request ID and retain the returned message/operation identity.",
+        &[
+            "thread",
+            "message",
+            "send",
+            "recipient",
+            "mailbox",
+            "proposal"
+        ],
+        &[
+            "thread_id",
+            "one roster recipient",
+            "speech_act",
+            "summary",
+            "mailbox_only"
+        ],
+        "One durable addressed message; no broadcast, new queue, Task mutation or model/native call."
+    ),
+    entry!(
+        "coordination.thread.resolve",
+        ParticipantCoordination,
+        COORDINATION_ACTION_AUDIENCES,
+        Searchable,
+        "Close one exact Thread as resolved, unresolved, or withdrawn using its expected state revision.",
+        "Use only when the caller has current scope authority; a contract Thread needs its exact manager-ratification Operation before it can resolve.",
+        &["thread", "resolve", "unresolved", "close", "state revision"],
+        &[
+            "thread_id",
+            "expected_state_revision",
+            "outcome",
+            "resolution_summary"
+        ],
+        "One retained closure transition; closure creates no follow-up work automatically."
+    ),
+    entry!(
+        "coordination.thread.withdraw",
+        ParticipantCoordination,
+        COORDINATION_ACTION_AUDIENCES,
+        Searchable,
+        "Withdraw one exact Thread under current creator or manager authority.",
+        "Use when the Thread no longer needs a resolution; retain the reason and expected state revision.",
+        &["thread", "withdraw", "close", "state revision"],
+        &["thread_id", "expected_state_revision", "reason"],
+        "One retained withdrawal transition; authorized history remains available."
+    ),
+    entry!(
+        "coordination.thread.supersede",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        Searchable,
+        "Supersede one exact Thread with an already-open successor on the same Task/Attempt.",
+        "Use when the scope is materially revised; name the exact successor and expected predecessor state revision.",
+        &["thread", "supersede", "successor", "state revision"],
+        &[
+            "thread_id",
+            "expected_state_revision",
+            "superseding_thread_id",
+            "reason"
+        ],
+        "One retained predecessor/successor linkage; no automatic work assignment."
+    ),
+    entry!(
+        "coordination.contract.propose",
+        ParticipantCoordination,
+        COORDINATION_ACTION_AUDIENCES,
+        Searchable,
+        "Create an immutable contract proposal revision in an exact authorized Thread.",
+        "Use to state producer/consumer identity, payload, observation boundary, failure semantics and versioning; a revision is a proposal, not agreement.",
+        &[
+            "contract",
+            "proposal",
+            "producer",
+            "consumer",
+            "identity",
+            "versioning"
+        ],
+        &[
+            "thread_id",
+            "affected path/symbol/schema sets",
+            "seven-field statement",
+            "64 KiB canonical request cap"
+        ],
+        "Immutable canonical proposal and digest; no implementation verification or implicit ratification."
+    ),
+    entry!(
+        "coordination.contract.respond",
+        ParticipantCoordination,
+        COORDINATION_ACTION_AUDIENCES,
+        Searchable,
+        "Record one exact participant response to an immutable contract revision and digest.",
+        "Use counterproposal, object, support or withdraw; unsupported/empty objection basis is retained as no material progress.",
+        &[
+            "contract",
+            "respond",
+            "counterproposal",
+            "object",
+            "support",
+            "withdraw"
+        ],
+        &[
+            "thread_id",
+            "proposal_id",
+            "proposal_revision_id",
+            "proposal_digest",
+            "act"
+        ],
+        "Immutable advisory response; support never ratifies a contract."
+    ),
+    entry!(
+        "coordination.contract.get",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Read one immutable proposal revision and its bounded response history in an authorized Thread.",
+        "Use exact proposal and revision IDs; response/evidence text is available only through this scoped read, never a subscription hint.",
+        &["contract", "proposal", "get", "revision", "responses"],
+        &[
+            "thread_id",
+            "proposal_id",
+            "proposal_revision_id",
+            "optional observation cursor and limit"
+        ],
+        "Scoped immutable revision packet with bounded response history."
+    ),
+    entry!(
+        "coordination.contract.list",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Page metadata-only contract proposal headers in one authorized Thread.",
+        "Use a monotonic sequence cursor when the exact proposal revision is not known; fetch a specific immutable revision through coordination.contract.get.",
+        &["contract", "proposal", "list", "sequence", "thread"],
+        &["thread_id", "optional after_sequence and limit"],
+        "Metadata-only bounded proposal index page with continuation."
+    ),
+    entry!(
+        "coordination.integration.ack",
+        ParticipantCoordination,
+        PARTICIPANT_ONLY_AUDIENCES,
+        Core,
+        "Record one Participant's accept or dissent position against the exact agreement-cell state and comparison digests.",
+        "Use only for the named cell, Task/Attempt and expected state/material/membership revisions; acceptance is not Task acceptance, code verification or contract ratification.",
+        &[
+            "integration",
+            "agreement",
+            "cell",
+            "accept",
+            "dissent",
+            "position"
+        ],
+        &[
+            "cell_id",
+            "exact Task/Attempt",
+            "expected revisions/digests",
+            "accept or dissent"
+        ],
+        "One retained Participant position receipt; no new event stream or independent agreement authority."
+    ),
+    entry!(
+        "coordination.agreement.get",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Read one bounded agreement cell and its paged positions for an exact Task/Attempt.",
+        "Omit state_revision/material_digest for the current cell or supply both to read an exact historical version; continue with the returned position cursor.",
+        &["agreement", "cell", "positions", "history", "get"],
+        &[
+            "cell_id",
+            "task_id/task_revision/attempt_id",
+            "paired optional revision and material digest"
+        ],
+        "Bounded cell and position projection with explicit current/history identity; position is advisory."
+    ),
+    entry!(
+        "code.scope.propose",
+        ParticipantCoordination,
+        PARTICIPANT_ONLY_AUDIENCES,
+        Searchable,
+        "Propose bounded paths, symbols or interfaces for manager review within one Task/Attempt.",
+        "Use exact repository-relative selectors and a recorded baseline reference; a proposal does not reserve files, run Git or become accepted ownership.",
+        &["code", "scope", "propose", "paths", "symbols", "interfaces"],
+        &[
+            "task_id",
+            "attempt_id",
+            "mode",
+            "selectors",
+            "baseline_candidate_ref",
+            "reason"
+        ],
+        "One immutable advisory scope proposal with digest; no lock or process is created."
+    ),
+    entry!(
+        "code.scope.accept",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        Searchable,
+        "Accept or explicitly revise one scope proposal under exact current manager authority.",
+        "Name the expected state revision and proposal digest; broad-scope acknowledgement and override IDs are explicit recorded inputs.",
+        &["code", "scope", "accept", "proposal", "override"],
+        &[
+            "scope_intent_id",
+            "expected_state_revision",
+            "proposal_digest",
+            "reason"
+        ],
+        "Retained accepted scope intent and revision; never a filesystem lock."
+    ),
+    entry!(
+        "code.scope.inspect",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Inspect retained active, stale or unknown scope intents with exact Task and optional selector filters.",
+        "Use a bounded path, symbol, interface, actor or scope-intent selector; missing coverage remains explicit.",
+        &["code", "scope", "inspect", "ownership", "baseline"],
+        &["task_id", "optional exact scope filters and cursor"],
+        "Bounded retained scope projection with coverage and gaps."
+    ),
+    entry!(
+        "code.scope.conflicts",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Searchable,
+        "Compare exact scope intents for path, symbol or interface overlap.",
+        "Use to find recorded conflicts or coordination-required overlap; unknown selector coverage is never reported as no conflict.",
+        &["code", "scope", "conflicts", "overlap", "coverage"],
+        &["task_id", "one or more bounded scope selectors"],
+        "Bounded advisory conflict classification with explicit unknown/partial coverage."
+    ),
+    entry!(
+        "code.scope.release",
+        ParticipantCoordination,
+        COORDINATION_ACTION_AUDIENCES,
+        Searchable,
+        "Release one exact accepted scope intent under manager or current scope-owner authority.",
+        "Use an expected state revision and reason; expiry alone never performs release.",
+        &["code", "scope", "release", "owner", "revision"],
+        &["scope_intent_id", "expected_state_revision", "reason"],
+        "Previous/current state and revision with retained readback verification."
     ),
     entry!(
         "concilium.preview",

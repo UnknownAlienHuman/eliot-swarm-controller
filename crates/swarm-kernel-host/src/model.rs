@@ -525,8 +525,24 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             crate::coordination::integration::SyncRequest::parse(params)?;
             return Ok(());
         }
+        "coordination.integration.ack" => {
+            crate::coordination::integration::AckRequest::parse(params)?;
+            return Ok(());
+        }
         "coordination.watch.create" | "coordination.watch.cancel" => {
             crate::coordination::watch::validate_mutation(method, params)?;
+            return Ok(());
+        }
+        "coordination.thread.open"
+        | "coordination.message.send"
+        | "coordination.thread.resolve"
+        | "coordination.thread.withdraw"
+        | "coordination.thread.supersede" => {
+            crate::coordination::thread::validate_mutation(method, params)?;
+            return Ok(());
+        }
+        "code.scope.propose" | "code.scope.accept" | "code.scope.release" => {
+            crate::coordination::code_scope::validate_mutation(method, params)?;
             return Ok(());
         }
         "bus.consumer.register" | "bus.consumer.revoke" | "bus.consumer.admit" => {
@@ -539,6 +555,8 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         | "coordination.work_card.withdraw"
         | "coordination.contract_card.publish"
         | "coordination.contract_card.withdraw"
+        | "coordination.contract.propose"
+        | "coordination.contract.respond"
         | "coordination.send"
         | "coordination.consult" => {
             crate::coordination::validate_mutation(method, params)?;

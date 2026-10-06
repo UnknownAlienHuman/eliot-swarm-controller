@@ -693,6 +693,8 @@ pub(super) fn read(
         "coordination.work_card.list" => card_list(db, principal, "work", value),
         "coordination.contract_card.get" => card_get(db, principal, "contract", value),
         "coordination.contract_card.list" => card_list(db, principal, "contract", value),
+        "coordination.contract.get" => contract_get(db, principal, value),
+        "coordination.contract.list" => contract_list(db, principal, value),
         "coordination.inbox" => inbox(db, principal, value),
         "operation.get" => participant_operation_get(db, principal, value),
         _ => Err(Error::new(
@@ -737,6 +739,12 @@ pub(super) fn apply(
         "coordination.contract_card.withdraw" => {
             withdraw_card(tx, principal, "contract", value, operation_id, now)
                 .map(|value| (value, false))
+        }
+        "coordination.contract.propose" => {
+            propose_contract(tx, principal, value, operation_id, now).map(|value| (value, false))
+        }
+        "coordination.contract.respond" => {
+            respond_contract(tx, principal, value, operation_id, now).map(|value| (value, false))
         }
         "coordination.send" => {
             send(tx, principal, value, config, operation_id, now).map(|value| (value, false))
@@ -3346,8 +3354,11 @@ fn participant_operation_get(
 ) -> Result<Value> {
     principal.require_participant()?;
     model::fields(value, &["operation_id"])?;
-    let scope = load_current_scope(db, principal)?;
     let operation_id = model::text(value, "operation_id")?;
+    if let Some(operation) = authorize_contract_operation_read(db, principal, operation_id)? {
+        return Ok(operation);
+    }
+    let scope = load_current_scope(db, principal)?;
     let raw: Option<ParticipantOperationRecord> = db
         .query_row(
             "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,result_json \
@@ -4150,4 +4161,772 @@ fn scoped_consult_result(
         &sender.attempt,
     )?;
     Ok(result)
+}
+
+fn contract_thread_context(
+    db: &Connection,
+    principal: &Principal,
+    thread_id: &str,
+) -> Result<(super::coordination_threads::ThreadContext, ScopeData, Value)> {
+    let context =
+        super::coordination_threads::authorize_current_thread_mutation(db, principal, thread_id)?;
+    if context.topic_kind != "contract" || context.state != "open" {
+        return Err(Error::new(
+            "THREAD_STATE_CONFLICT",
+            "contract proposals require an open contract Thread",
+        ));
+    }
+    let participant = super::coordination_threads::require_thread_participant(&context, principal)?;
+    super::coordination_threads::validate_thread_participant_current(db, &context, principal)?;
+    let sender = load_current_scope(db, principal)?;
+    if sender.task["task_id"].as_str() != Some(context.task_id.as_str())
+        || sender.task["revision"].as_i64() != Some(context.task_revision)
+        || sender.attempt["attempt_id"].as_str() != Some(context.attempt_id.as_str())
+    {
+        return Err(Error::new(
+            "STALE_THREAD_SCOPE",
+            "current Participant scope no longer matches the contract Thread",
+        ));
+    }
+    let author = json!({
+        "client_id": participant.client_id,
+        "role": participant.role,
+        "generation": participant.generation,
+        "participation_basis": participant.participation_basis,
+        "registration_fingerprint": participant.registration_fingerprint,
+        "actor": participant.actor,
+        "scope": participant.scope,
+    });
+    Ok((context, sender, author))
+}
+
+fn propose_contract(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let request = crate::coordination::contract::parse_proposal_request(value)?;
+    let (context, sender, author) = contract_thread_context(tx, principal, &request.thread_id)?;
+    let (proposal_id, revision_number, proposal_sequence, created_at_ms) =
+        if let Some(prior_revision_id) = request.supersedes_revision_id.as_deref() {
+            let pointer_key = proposal_revision_pointer_key(prior_revision_id);
+            let pointer = meta(tx, &pointer_key)?.ok_or_else(|| {
+                Error::new(
+                    "STALE_CONTRACT_REVISION",
+                    "supersedes_revision_id is not retained",
+                )
+            })?;
+            if pointer["thread_id"] != context.thread_id {
+                return Err(Error::new(
+                    "STALE_CONTRACT_REVISION",
+                    "superseded revision belongs to another Thread",
+                ));
+            }
+            let proposal_id = model::text(&pointer, "proposal_id")?.to_owned();
+            let head = meta(tx, &proposal_head_key(&proposal_id))?.ok_or_else(|| {
+                Error::new(
+                    "COORDINATION_INDEX_CORRUPT",
+                    "proposal revision pointer has no proposal header",
+                )
+            })?;
+            if head["thread_id"] != context.thread_id
+                || head["latest_revision_id"] != prior_revision_id
+            {
+                return Err(Error::new(
+                    "STALE_CONTRACT_REVISION",
+                    "supersedes_revision_id must name the current proposal head in this Thread",
+                ));
+            }
+            let prior = meta(tx, &proposal_revision_key(&proposal_id, prior_revision_id))?
+                .ok_or_else(|| {
+                    Error::new(
+                        "COORDINATION_INDEX_CORRUPT",
+                        "proposal header points to a missing revision",
+                    )
+                })?;
+            if prior["proposal_digest"] != head["latest_digest"] {
+                return Err(Error::new(
+                    "COORDINATION_INDEX_CORRUPT",
+                    "proposal header digest does not match its latest revision",
+                ));
+            }
+            let revision_number = head["revision_count"]
+                .as_i64()
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(|| Error::new("REVISION_OVERFLOW", "proposal revision exhausted"))?;
+            let proposal_sequence = head["proposal_sequence"]
+                .as_i64()
+                .filter(|sequence| *sequence > 0)
+                .ok_or_else(|| {
+                    Error::new("COORDINATION_INDEX_CORRUPT", "proposal sequence is missing")
+                })?;
+            let created_at_ms = head["created_at_ms"]
+                .as_i64()
+                .filter(|timestamp| *timestamp > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        "COORDINATION_INDEX_CORRUPT",
+                        "proposal creation time is missing",
+                    )
+                })?;
+            (
+                proposal_id,
+                revision_number,
+                proposal_sequence,
+                created_at_ms,
+            )
+        } else {
+            let proposal_id = format!("cprop-{}", uuid::Uuid::new_v4());
+            if meta(tx, &proposal_head_key(&proposal_id))?.is_some() {
+                return Err(Error::new(
+                    "ID_COLLISION",
+                    "proposal identifier already exists",
+                ));
+            }
+            let sequence_key = proposal_thread_sequence_key(&context.thread_id);
+            let prior_sequence = match meta(tx, &sequence_key)? {
+                None => 0,
+                Some(record) => record["last_sequence"]
+                    .as_i64()
+                    .filter(|sequence| *sequence >= 0)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "COORDINATION_INDEX_CORRUPT",
+                            "proposal sequence record is invalid",
+                        )
+                    })?,
+            };
+            let proposal_sequence = prior_sequence.checked_add(1).ok_or_else(|| {
+                Error::new("REVISION_OVERFLOW", "Thread proposal sequence exhausted")
+            })?;
+            set_meta(
+                tx,
+                &sequence_key,
+                &json!({"last_sequence":proposal_sequence}),
+            )?;
+            (proposal_id, 1, proposal_sequence, now)
+        };
+    let proposal_revision_id = format!("cprev-{}", uuid::Uuid::new_v4());
+    if meta(tx, &proposal_revision_pointer_key(&proposal_revision_id))?.is_some() {
+        return Err(Error::new(
+            "ID_COLLISION",
+            "proposal revision identifier already exists",
+        ));
+    }
+    let revision = json!({
+        "schema_version": 1,
+        "record_type": "contract_proposal_revision",
+        "proposal_id": proposal_id,
+        "proposal_revision_id": proposal_revision_id,
+        "revision": revision_number,
+        "thread_id": context.thread_id,
+        "task_id": context.task_id,
+        "task_revision": context.task_revision,
+        "attempt_id": context.attempt_id,
+        "sponsor_owner_id": context.sponsor_owner_id,
+        "author": author,
+        "supersedes_revision_id": request.supersedes_revision_id,
+        "proposal_digest": request.digest,
+        "proposal": request.canonical_body,
+        "operation_id": operation_id,
+        "created_at_ms": now,
+    });
+    let head_key = proposal_head_key(&proposal_id);
+    let prior_head = meta(tx, &head_key)?;
+    let header = json!({
+        "schema_version": 1,
+        "record_type": "contract_proposal_head",
+        "proposal_id": proposal_id,
+        "thread_id": context.thread_id,
+        "topic": request.topic,
+        "latest_revision_id": proposal_revision_id,
+        "latest_digest": request.digest,
+        "revision_count": revision_number,
+        "proposal_sequence": proposal_sequence,
+        "sponsor_owner_id": context.sponsor_owner_id,
+        "created_at_ms": prior_head.as_ref().and_then(|head| head["created_at_ms"].as_i64()).unwrap_or(created_at_ms),
+        "updated_at_ms": now,
+    });
+    let index_key = proposal_thread_index_key(&context.thread_id, &proposal_id);
+    let index = json!({
+        "proposal_id": proposal_id,
+        "thread_id": context.thread_id,
+        "topic": request.topic,
+        "latest_revision_id": proposal_revision_id,
+        "latest_digest": request.digest,
+        "revision_count": revision_number,
+        "proposal_sequence": proposal_sequence,
+        "sponsor_owner_id": context.sponsor_owner_id,
+        "created_at_ms": header["created_at_ms"],
+        "updated_at_ms": now,
+    });
+    let revision_key = proposal_revision_key(&proposal_id, &proposal_revision_id);
+    let pointer_key = proposal_revision_pointer_key(&proposal_revision_id);
+    set_meta(tx, &revision_key, &revision)?;
+    set_meta(
+        tx,
+        &pointer_key,
+        &json!({
+            "proposal_id": proposal_id,
+            "thread_id": context.thread_id,
+            "revision": revision_number,
+        }),
+    )?;
+    set_meta(tx, &head_key, &header)?;
+    set_meta(tx, &index_key, &index)?;
+    if revision_number == 1 {
+        let page_key = proposal_thread_page_key(&context.thread_id, proposal_sequence);
+        if meta(tx, &page_key)?.is_some() {
+            return Err(Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "Thread proposal sequence is already indexed",
+            ));
+        }
+        set_meta(
+            tx,
+            &page_key,
+            &json!({"proposal_id":proposal_id,"proposal_sequence":proposal_sequence}),
+        )?;
+    }
+    let stream_id = proposal_stream_id(&proposal_id);
+    let source_event_key = format!("revision:{proposal_revision_id}");
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,'coordination.contract_proposed',?4,?5)",
+        params![stream_id, source_event_key, operation_id, model::canonical(&revision)?, now],
+    )?;
+    attach_operation_scope(
+        tx,
+        operation_id,
+        sender.task["task_id"].as_str().unwrap_or_default(),
+        sender.attempt["attempt_id"].as_str().unwrap_or_default(),
+        &sender.attempt,
+    )?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "thread_id": context.thread_id,
+        "proposal_id": proposal_id,
+        "proposal_revision_id": proposal_revision_id,
+        "proposal_digest": request.digest,
+        "proposal_sequence": proposal_sequence,
+        "revision": revision_number,
+        "changed": true,
+        "model_work_started": false,
+    }))
+}
+
+fn respond_contract(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let request = crate::coordination::contract::parse_response_request(value)?;
+    let (context, sender, author) = contract_thread_context(tx, principal, &request.thread_id)?;
+    let header = meta(tx, &proposal_head_key(&request.proposal_id))?
+        .ok_or_else(|| Error::new("CONTRACT_PROPOSAL_NOT_FOUND", "proposal is not retained"))?;
+    if header["thread_id"] != context.thread_id {
+        return Err(Error::new("NOT_FOUND", "proposal is outside this Thread"));
+    }
+    let revision = meta(
+        tx,
+        &proposal_revision_key(&request.proposal_id, &request.proposal_revision_id),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "CONTRACT_PROPOSAL_NOT_FOUND",
+            "proposal revision is not retained",
+        )
+    })?;
+    if revision["thread_id"] != context.thread_id
+        || revision["proposal_digest"] != request.proposal_digest
+    {
+        return Err(Error::new(
+            "DIGEST_MISMATCH",
+            "proposal revision digest or Thread does not match",
+        ));
+    }
+    if revision["task_id"].as_str() != Some(context.task_id.as_str())
+        || revision["task_revision"].as_i64() != Some(context.task_revision)
+        || revision["attempt_id"].as_str() != Some(context.attempt_id.as_str())
+    {
+        return Err(Error::new(
+            "STALE_THREAD_SCOPE",
+            "proposal revision is outside the pinned Thread Task/Attempt",
+        ));
+    }
+    let response_key = proposal_response_key(&request.proposal_id, operation_id);
+    if meta(tx, &response_key)?.is_some() {
+        return Err(Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "response Operation already has a response record",
+        ));
+    }
+    let mut response = json!({
+        "schema_version": 1,
+        "record_type": "contract_proposal_response",
+        "thread_id": context.thread_id,
+        "proposal_id": request.proposal_id,
+        "proposal_revision_id": request.proposal_revision_id,
+        "proposal_digest": request.proposal_digest,
+        "act": request.act.as_str(),
+        "objection_basis": request.objection_basis,
+        "normalized_objection_basis": request.normalized_objection_basis,
+        "material_basis": request.material_basis,
+        "classification": if request.material_basis { "material_objection" } else { "no_progress" },
+        "reason": request.reason,
+        "evidence_refs": request.evidence_refs,
+        "task_id": context.task_id,
+        "task_revision": context.task_revision,
+        "attempt_id": context.attempt_id,
+        "sponsor_owner_id": context.sponsor_owner_id,
+        "author": author,
+        "operation_id": operation_id,
+        "recorded_at_ms": now,
+    });
+    let stream_id = proposal_stream_id(&request.proposal_id);
+    let source_event_key = format!("response:{operation_id}");
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,'coordination.contract_response',?4,?5)",
+        params![stream_id, source_event_key, operation_id, model::canonical(&response)?, now],
+    )?;
+    let observation_id = tx.last_insert_rowid();
+    response["observation_id"] = json!(observation_id);
+    set_meta(tx, &response_key, &response)?;
+    let page_key = proposal_response_page_key(
+        &request.proposal_id,
+        &request.proposal_revision_id,
+        observation_id,
+    );
+    set_meta(
+        tx,
+        &page_key,
+        &json!({"response_key":response_key,"operation_id":operation_id,"observation_id":observation_id}),
+    )?;
+    attach_operation_scope(
+        tx,
+        operation_id,
+        sender.task["task_id"].as_str().unwrap_or_default(),
+        sender.attempt["attempt_id"].as_str().unwrap_or_default(),
+        &sender.attempt,
+    )?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "thread_id": context.thread_id,
+        "proposal_id": request.proposal_id,
+        "proposal_revision_id": request.proposal_revision_id,
+        "proposal_digest": request.proposal_digest,
+        "act": request.act.as_str(),
+        "objection_basis": request.objection_basis,
+        "material_basis": request.material_basis,
+        "response_observation_id": observation_id,
+        "changed": true,
+        "model_work_started": false,
+    }))
+}
+
+fn contract_get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    let request = crate::coordination::contract::parse_get_request(value)?;
+    let context = super::coordination_threads::authorize_retained_thread_read(
+        db,
+        principal,
+        &request.thread_id,
+    )?;
+    if context.topic_kind != "contract" {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "contract proposal is outside this Thread",
+        ));
+    }
+    let header = meta(db, &proposal_head_key(&request.proposal_id))?
+        .ok_or_else(|| Error::new("CONTRACT_PROPOSAL_NOT_FOUND", "proposal is not retained"))?;
+    if header["thread_id"] != context.thread_id {
+        return Err(Error::new("NOT_FOUND", "proposal is outside this Thread"));
+    }
+    let pointer = meta(
+        db,
+        &proposal_revision_pointer_key(&request.proposal_revision_id),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "CONTRACT_PROPOSAL_NOT_FOUND",
+            "proposal revision is not retained",
+        )
+    })?;
+    if pointer["proposal_id"] != request.proposal_id || pointer["thread_id"] != context.thread_id {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "proposal revision is outside this Thread",
+        ));
+    }
+    let revision = meta(
+        db,
+        &proposal_revision_key(&request.proposal_id, &request.proposal_revision_id),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "proposal revision pointer has no record",
+        )
+    })?;
+    let prefix = proposal_response_page_prefix(&request.proposal_id, &request.proposal_revision_id);
+    let upper = format!("{prefix}g");
+    let (lower, comparison) = match request.after_observation_id {
+        Some(cursor) => (
+            proposal_response_page_key(&request.proposal_id, &request.proposal_revision_id, cursor),
+            ">",
+        ),
+        None => (prefix, ">="),
+    };
+    let mut statement = db.prepare(&format!(
+        "SELECT value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    ))?;
+    let rows: Vec<String> = statement
+        .query_map(params![lower, upper, request.limit + 1], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let has_more = rows.len() as i64 > request.limit;
+    let mut responses = Vec::with_capacity(rows.len().min(request.limit as usize));
+    let mut last_observation_id = None;
+    for raw in rows.into_iter().take(request.limit as usize) {
+        let page: Value = serde_json::from_str(&raw)?;
+        let response_key = model::text(&page, "response_key")?;
+        let response = meta(db, response_key)?.ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "response page points to a missing record",
+            )
+        })?;
+        if response["thread_id"] != context.thread_id
+            || response["proposal_id"] != request.proposal_id
+            || response["proposal_revision_id"] != request.proposal_revision_id
+            || response["proposal_digest"] != revision["proposal_digest"]
+        {
+            return Err(Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "response record does not match its proposal revision",
+            ));
+        }
+        last_observation_id = page["observation_id"].as_i64();
+        responses.push(response);
+    }
+    let next_after_observation_id = if has_more { last_observation_id } else { None };
+    Ok(json!({
+        "thread_id": context.thread_id,
+        "proposal_id": request.proposal_id,
+        "proposal_revision_id": request.proposal_revision_id,
+        "proposal_digest": revision["proposal_digest"],
+        "proposal": revision["proposal"],
+        "revision_metadata": revision,
+        "responses": responses,
+        "next_after_observation_id": next_after_observation_id,
+        "coverage": if has_more { "partial" } else { "complete" },
+    }))
+}
+
+fn contract_list(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    let request = crate::coordination::contract::parse_list_request(value)?;
+    let context = super::coordination_threads::authorize_retained_thread_read(
+        db,
+        principal,
+        &request.thread_id,
+    )?;
+    if context.topic_kind != "contract" {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "contract proposals are outside this Thread",
+        ));
+    }
+    let prefix = proposal_thread_page_prefix(&context.thread_id);
+    let upper = format!("{prefix}g");
+    let (lower, comparison) = match request.after_sequence {
+        Some(sequence) => (format!("{prefix}{:020}", sequence), ">"),
+        None => (prefix, ">="),
+    };
+    let mut statement = db.prepare(&format!(
+        "SELECT value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    ))?;
+    let rows: Vec<String> = statement
+        .query_map(params![lower, upper, request.limit + 1], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let has_more = rows.len() as i64 > request.limit;
+    let mut items = Vec::with_capacity(rows.len().min(request.limit as usize));
+    let mut last_sequence = None;
+    for raw in rows.into_iter().take(request.limit as usize) {
+        let page: Value = serde_json::from_str(&raw)?;
+        let proposal_id = model::text(&page, "proposal_id")?;
+        let header = meta(db, &proposal_head_key(proposal_id))?.ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "Thread proposal page points to a missing header",
+            )
+        })?;
+        if header["thread_id"] != context.thread_id
+            || header["proposal_sequence"] != page["proposal_sequence"]
+        {
+            return Err(Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "Thread proposal page does not match its current header",
+            ));
+        }
+        last_sequence = page["proposal_sequence"].as_i64();
+        items.push(json!({
+            "proposal_id": header["proposal_id"],
+            "thread_id": header["thread_id"],
+            "topic": header["topic"],
+            "latest_revision_id": header["latest_revision_id"],
+            "latest_digest": header["latest_digest"],
+            "revision_count": header["revision_count"],
+            "proposal_sequence": header["proposal_sequence"],
+            "sponsor_owner_id": header["sponsor_owner_id"],
+            "updated_at_ms": header["updated_at_ms"],
+        }));
+    }
+    Ok(json!({
+        "thread_id": context.thread_id,
+        "items": items,
+        "next_after_sequence": if has_more { last_sequence } else { None },
+        "coverage": if has_more { "partial" } else { "complete" },
+    }))
+}
+
+fn authorize_contract_operation_read(
+    db: &Connection,
+    principal: &Principal,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let raw: Option<(String, String, String, Option<String>, Option<String>, Option<String>, Option<i64>, String, Option<String>)> = db.query_row(
+        "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,original_request_json,result_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+    ).optional()?;
+    let Some((
+        caller_id,
+        method,
+        state,
+        task_id,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        original_request,
+        result_json,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        method.as_str(),
+        "coordination.contract.propose" | "coordination.contract.respond"
+    ) {
+        return Ok(None);
+    }
+    // A caller may read its own generic rejection receipt even when the
+    // supplied Thread was invalid, inaccessible, or later became unreadable.
+    // In that case no Thread-derived Task scope is exposed by this API.
+    if caller_id == principal.client_id {
+        return Ok(Some(operations::get_operation(db, operation_id)?));
+    }
+    if state != "settled" {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "rejected contract Operation is visible only to its caller",
+        ));
+    }
+    super::coordination_threads::authorize_operation_read(db, principal, operation_id).map_err(
+        |_| {
+            Error::new(
+                "NOT_FOUND",
+                "Operation is outside the retained Thread scope",
+            )
+        },
+    )?;
+    let request: Value = serde_json::from_str(&original_request)?;
+    let thread_id = request
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::new(
+                "NOT_FOUND",
+                "contract Operation has no retained Thread scope",
+            )
+        })?;
+    let context =
+        super::coordination_threads::authorize_retained_thread_read(db, principal, thread_id)
+            .map_err(|_| {
+                Error::new(
+                    "NOT_FOUND",
+                    "Operation is outside the retained Thread scope",
+                )
+            })?;
+    if context.topic_kind != "contract"
+        || task_id.as_deref().is_some_and(|id| id != context.task_id)
+        || attempt_id
+            .as_deref()
+            .is_some_and(|id| id != context.attempt_id)
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "Operation is outside the retained Thread scope",
+        ));
+    }
+    super::coordination_threads::require_thread_participant(&context, principal).map_err(|_| {
+        Error::new(
+            "NOT_FOUND",
+            "Operation is outside the retained Thread roster",
+        )
+    })?;
+    let author = context
+        .participants
+        .iter()
+        .find(|participant| {
+            participant.client_id == caller_id
+                && participant.scope.get("binding_id").and_then(Value::as_str)
+                    == binding_id.as_deref()
+                && participant
+                    .scope
+                    .get("binding_generation")
+                    .and_then(Value::as_i64)
+                    == binding_generation
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "NOT_FOUND",
+                "Operation author is outside the retained Thread roster",
+            )
+        })?;
+    let result: Value = serde_json::from_str(result_json.as_deref().ok_or_else(|| {
+        Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "settled contract Operation has no result",
+        )
+    })?)?;
+    match method.as_str() {
+        "coordination.contract.propose" => {
+            let proposal_id = model::text(&result, "proposal_id")?;
+            let revision_id = model::text(&result, "proposal_revision_id")?;
+            let revision =
+                meta(db, &proposal_revision_key(proposal_id, revision_id))?.ok_or_else(|| {
+                    Error::new(
+                        "COORDINATION_INDEX_CORRUPT",
+                        "settled proposal Operation has no revision",
+                    )
+                })?;
+            let pointer =
+                meta(db, &proposal_revision_pointer_key(revision_id))?.ok_or_else(|| {
+                    Error::new(
+                        "COORDINATION_INDEX_CORRUPT",
+                        "settled proposal Operation has no revision pointer",
+                    )
+                })?;
+            if pointer["proposal_id"] != proposal_id
+                || pointer["thread_id"] != context.thread_id
+                || pointer["revision"] != result["revision"]
+                || revision["operation_id"] != operation_id
+                || revision["proposal_id"] != proposal_id
+                || revision["proposal_revision_id"] != revision_id
+                || revision["revision"] != result["revision"]
+                || revision["proposal_digest"] != result["proposal_digest"]
+                || revision["thread_id"] != context.thread_id
+                || revision["task_id"] != context.task_id
+                || revision["task_revision"] != context.task_revision
+                || revision["attempt_id"] != context.attempt_id
+                || revision["author"]["client_id"] != caller_id
+                || revision["author"]["role"] != author.role
+                || revision["author"]["generation"].as_i64() != author.generation
+                || revision["author"]["registration_fingerprint"] != author.registration_fingerprint
+                || revision["author"]["actor"] != author.actor
+                || revision["author"]["scope"] != author.scope
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "Operation is outside the retained Thread scope",
+                ));
+            }
+        }
+        "coordination.contract.respond" => {
+            let proposal_id = model::text(&result, "proposal_id")?;
+            let response = meta(db, &proposal_response_key(proposal_id, operation_id))?
+                .ok_or_else(|| {
+                    Error::new(
+                        "COORDINATION_INDEX_CORRUPT",
+                        "settled response Operation has no response record",
+                    )
+                })?;
+            if response["operation_id"] != operation_id
+                || response["thread_id"] != context.thread_id
+                || response["proposal_id"] != proposal_id
+                || response["proposal_revision_id"] != result["proposal_revision_id"]
+                || response["proposal_digest"] != result["proposal_digest"]
+                || response["act"] != result["act"]
+                || response["objection_basis"] != result["objection_basis"]
+                || response["material_basis"] != result["material_basis"]
+                || response["observation_id"] != result["response_observation_id"]
+                || response["task_id"] != context.task_id
+                || response["task_revision"] != context.task_revision
+                || response["attempt_id"] != context.attempt_id
+                || response["author"]["client_id"] != caller_id
+                || response["author"]["role"] != author.role
+                || response["author"]["generation"].as_i64() != author.generation
+                || response["author"]["registration_fingerprint"] != author.registration_fingerprint
+                || response["author"]["actor"] != author.actor
+                || response["author"]["scope"] != author.scope
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "Operation is outside the retained Thread scope",
+                ));
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(Some(operations::get_operation(db, operation_id)?))
+}
+
+fn proposal_head_key(proposal_id: &str) -> String {
+    format!("coordination:proposal:{proposal_id}")
+}
+
+fn proposal_revision_key(proposal_id: &str, revision_id: &str) -> String {
+    format!("coordination:proposal:{proposal_id}:revision:{revision_id}")
+}
+
+fn proposal_revision_pointer_key(revision_id: &str) -> String {
+    format!("coordination:proposal-revision:{revision_id}")
+}
+
+fn proposal_response_key(proposal_id: &str, operation_id: &str) -> String {
+    format!("coordination:proposal:{proposal_id}:response:{operation_id}")
+}
+
+fn proposal_stream_id(proposal_id: &str) -> String {
+    format!("coordination:proposal:{proposal_id}")
+}
+
+fn proposal_thread_sequence_key(thread_id: &str) -> String {
+    format!("coordination:proposal-thread-sequence:{thread_id}")
+}
+
+fn proposal_thread_index_key(thread_id: &str, proposal_id: &str) -> String {
+    format!("coordination:proposal-thread:{thread_id}:{proposal_id}")
+}
+
+fn proposal_thread_page_prefix(thread_id: &str) -> String {
+    format!("coordination:proposal-thread-page:{thread_id}:")
+}
+
+fn proposal_thread_page_key(thread_id: &str, sequence: i64) -> String {
+    format!("{}{:020}", proposal_thread_page_prefix(thread_id), sequence)
+}
+
+fn proposal_response_page_prefix(proposal_id: &str, revision_id: &str) -> String {
+    format!("coordination:proposal-response:{proposal_id}:{revision_id}:")
+}
+
+fn proposal_response_page_key(proposal_id: &str, revision_id: &str, observation_id: i64) -> String {
+    format!(
+        "{}{:020}",
+        proposal_response_page_prefix(proposal_id, revision_id),
+        observation_id
+    )
 }

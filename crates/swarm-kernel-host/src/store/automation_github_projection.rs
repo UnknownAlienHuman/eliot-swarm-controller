@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:github-projection:global-cursor";
+const EFFECT_DRAIN_CURSOR_KEY: &str = "automation:v1:github-projection:effect-drain-cursor";
 const STATE_PREFIX: &str = "automation:v1:github-projection:state:";
 const ACCEPTANCE_STREAM: &str = "controller:acceptance";
 const METHOD: &str = "github.effect.managed_label";
@@ -31,6 +32,14 @@ const MAX_RECENT: usize = 32;
 struct GlobalCursor {
     schema_version: u32,
     last_entry_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectDrainCursor {
+    schema_version: u32,
+    last_created_at_ms: i64,
+    last_operation_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,18 +192,56 @@ pub(crate) async fn reconcile_effects_once(store: &Store, budget: usize) -> Resu
     }
     let operation_ids = store
         .run(move |db| {
-            let mut statement = db.prepare(
-                "SELECT operation_id FROM operations WHERE method=?1 AND caller_id=?2 AND state='queued' \
-                 AND json_extract(effective_request_json,'$.automation_on_behalf.action')=?1 \
-                 ORDER BY created_at_ms,operation_id LIMIT ?3",
-            )?;
-            let rows = statement
-                .query_map(
-                    params![METHOD, authorization::AUTOMATION_TECHNICAL_REQUESTER_ID, limit as i64],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(rows)
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let cursor = config::read_record(
+                &tx,
+                EFFECT_DRAIN_CURSOR_KEY,
+                "GitHub projection effect drain cursor",
+            )?
+            .map(|value| {
+                let cursor: EffectDrainCursor = serde_json::from_value(value).map_err(|_| {
+                    Error::new(
+                        "AUTOMATION_GITHUB_PROJECTION_CURSOR_CORRUPT",
+                        "GitHub projection effect drain cursor fields are invalid",
+                    )
+                })?;
+                if cursor.schema_version != 1
+                    || cursor.last_created_at_ms < 0
+                    || cursor.last_operation_id.is_empty()
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_GITHUB_PROJECTION_CURSOR_CORRUPT",
+                        "GitHub projection effect drain cursor is invalid",
+                    ));
+                }
+                Ok(cursor)
+            })
+            .transpose()?;
+
+            let mut rows = select_queued_effect_page(&tx, cursor.as_ref(), limit)?;
+            // Wrap to the oldest retained queued Operation after reaching the
+            // end. Advancing this durable cursor before dispatch means a
+            // transiently failing Operation cannot monopolize every pass; if
+            // the process stops, wrapped paging will still rediscover it.
+            if rows.is_empty() && cursor.is_some() {
+                rows = select_queued_effect_page(&tx, None, limit)?;
+            }
+            if let Some((last_created_at_ms, last_operation_id)) = rows.last() {
+                config::write_record(
+                    &tx,
+                    EFFECT_DRAIN_CURSOR_KEY,
+                    &json!({
+                        "schema_version":1,
+                        "last_created_at_ms":last_created_at_ms,
+                        "last_operation_id":last_operation_id
+                    }),
+                )?;
+            }
+            tx.commit()?;
+            Ok(rows
+                .into_iter()
+                .map(|(_, operation_id)| operation_id)
+                .collect::<Vec<_>>())
         })
         .await?;
     let mut results = Vec::with_capacity(operation_ids.len());
@@ -214,6 +261,31 @@ pub(crate) async fn reconcile_effects_once(store: &Store, budget: usize) -> Resu
         "processed":processed,
         "budget":limit
     }))
+}
+
+fn select_queued_effect_page(
+    db: &Connection,
+    after: Option<&EffectDrainCursor>,
+    limit: usize,
+) -> Result<Vec<(i64, String)>> {
+    let mut statement = db.prepare(
+        "SELECT created_at_ms,operation_id FROM operations WHERE method=?1 AND caller_id=?2 AND state='queued' \
+         AND json_extract(effective_request_json,'$.automation_on_behalf.action')=?1 \
+         AND (?3 IS NULL OR created_at_ms>?3 OR (created_at_ms=?3 AND operation_id>?4)) \
+         ORDER BY created_at_ms,operation_id LIMIT ?5",
+    )?;
+    Ok(statement
+        .query_map(
+            params![
+                METHOD,
+                authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                after.map(|cursor| cursor.last_created_at_ms),
+                after.map(|cursor| cursor.last_operation_id.as_str()),
+                limit as i64
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// Bounded manager-facing state for automation explain/readback.

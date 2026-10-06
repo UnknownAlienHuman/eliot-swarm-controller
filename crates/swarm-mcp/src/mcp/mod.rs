@@ -84,7 +84,7 @@ use serde_json::{Map, Value, json};
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use swarm_client::Client;
 use swarm_contracts::{
-    Credential, concilium_limits as limits,
+    Credential, concilium_limits as limits, coordination_limits,
     error::{Error, Result},
 };
 use tokio::sync::Mutex;
@@ -318,6 +318,40 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["task_id", "task_revision", "attempt_id"],
     ),
     read(
+        "code.scope.inspect",
+        "Read retained scope intents with exact Task and optional Attempt/identity/path/symbol/interface selectors; this is advisory and never locks files.",
+        &[
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("scope_intent_id", S),
+            f("client_id", S),
+            f("path", S),
+            f("symbol", S),
+            f("interface", S),
+            f("after_scope_id", S),
+            f("limit", I),
+        ],
+        &["task_id"],
+    ),
+    read(
+        "code.scope.conflicts",
+        "Compare retained scope intents by exact bounded selectors; incomplete or unsupported coverage remains unknown rather than no-conflict.",
+        &[
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("scope_intent_id", S),
+            f("client_id", S),
+            f("path", S),
+            f("symbol", S),
+            f("interface", S),
+            f("after_scope_id", S),
+            f("limit", I),
+        ],
+        &["task_id"],
+    ),
+    read(
         "concilium.preview",
         "Build a deterministic scoped plan and packet digest for a proposed Concilium; preview has no model or native effect.",
         &[f("proposal_operation_id", S)],
@@ -437,6 +471,58 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Read bounded durable deliveries addressed to the authenticated Participant in its exact current scope.",
         &[f("limit", I), f("after_operation_id", S)],
         &[],
+    ),
+    read(
+        "coordination.thread.get",
+        "Read one authorized retained coordination Thread with bounded message history; Store authorization is rechecked for the exact Thread.",
+        &[f("thread_id", S), f("after_message_seq", I), f("limit", I)],
+        &["thread_id"],
+    ),
+    read(
+        "coordination.thread.list",
+        "Page authorized retained Threads within one exact Task and optional Attempt; there is no global Thread scan.",
+        &[
+            f("task_id", S),
+            f("attempt_id", S),
+            f("state", S),
+            f("topic_kind", S),
+            f("limit", I),
+            f("after_thread_id", S),
+        ],
+        &["task_id"],
+    ),
+    read(
+        "coordination.contract.get",
+        "Read one immutable contract proposal revision in its exact authorized Thread; use its revision ID and digest for decision or response calls.",
+        &[
+            f("thread_id", S),
+            f("proposal_id", S),
+            f("proposal_revision_id", S),
+            f("after_observation_id", I),
+            f("limit", I),
+        ],
+        &["thread_id", "proposal_id", "proposal_revision_id"],
+    ),
+    read(
+        "coordination.contract.list",
+        "Page metadata-only contract proposals in one authorized Thread; fetch an exact revision through coordination.contract.get.",
+        &[f("thread_id", S), f("after_sequence", I), f("limit", I)],
+        &["thread_id"],
+    ),
+    read(
+        "coordination.agreement.get",
+        "Read the bounded retained agreement cell and position history for one exact Task/Attempt and optional historical revision+digest pair.",
+        &[
+            f("cell_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("state_revision", I),
+            f("material_digest", S),
+            f("limit", I),
+            f("after_position_id", S),
+        ],
+        &["cell_id", "task_id", "task_revision", "attempt_id"],
     ),
     read(
         "coordination.watch.list",
@@ -697,6 +783,241 @@ static TOOLS: &[(bool, ToolSpec)] = &[
             "task_revision",
             "attempt_id",
             "participation_basis",
+        ],
+    ),
+    mutation(
+        "code.scope.propose",
+        "Propose advisory paths, symbols or interfaces for exact Attempt ownership review; proposals reserve no files and invoke no Git process.",
+        &[
+            f("task_id", S),
+            f("task_revision", IN),
+            f("attempt_id", S),
+            f("assignment_id", SN),
+            f("mode", S),
+            f("paths", A),
+            f("symbols", A),
+            f("interfaces", A),
+            f("baseline_candidate_ref", S),
+            f("reason", S),
+            f("suggested_expires_at_ms", IN),
+        ],
+        &[
+            "task_id",
+            "attempt_id",
+            "mode",
+            "paths",
+            "symbols",
+            "interfaces",
+            "baseline_candidate_ref",
+            "reason",
+        ],
+    ),
+    mutation(
+        "code.scope.accept",
+        "Accept one exact scope-intent proposal digest under current Task/Attempt authority, recording any explicit narrowing, broad-scope acknowledgement or override.",
+        &[
+            f("scope_intent_id", S),
+            f("expected_state_revision", I),
+            f("proposal_digest", S),
+            f("mode", SN),
+            f("paths", A),
+            f("symbols", A),
+            f("interfaces", A),
+            f("expires_at_ms", IN),
+            f("reason", S),
+            f("acknowledge_broad_scope", B),
+            f("override_scope_intent_ids", A),
+        ],
+        &[
+            "scope_intent_id",
+            "expected_state_revision",
+            "proposal_digest",
+            "reason",
+        ],
+    ),
+    mutation(
+        "code.scope.release",
+        "Release one exact accepted scope intent with a reason and verified retained readback; expiry alone never releases it.",
+        &[
+            f("scope_intent_id", S),
+            f("expected_state_revision", I),
+            f("reason", S),
+        ],
+        &["scope_intent_id", "expected_state_revision", "reason"],
+    ),
+    mutation(
+        "coordination.thread.open",
+        "Open one durable mailbox-only Thread in an exact Task/Attempt with an explicit, verified Manager/Participant roster; this creates no assignment or model work.",
+        &[
+            f("task_id", S),
+            f("attempt_id", S),
+            f("assignment_id", SN),
+            f("topic_kind", S),
+            f("subject", S),
+            f("participants", A),
+            f("reasonability", O),
+            f("related_scopes", A),
+            f("body_ref", SN),
+            f("delivery_mode", S),
+            f("supersedes_thread_id", SN),
+        ],
+        &[
+            "task_id",
+            "attempt_id",
+            "topic_kind",
+            "subject",
+            "participants",
+            "reasonability",
+            "delivery_mode",
+        ],
+    ),
+    mutation(
+        "coordination.message.send",
+        "Send one bounded mailbox-only message to one exact current Thread roster recipient; it does not add recipients, assign work, or start a model call.",
+        &[
+            f("thread_id", S),
+            f("recipient", S),
+            f("speech_act", S),
+            f("subject", S),
+            f("summary", S),
+            f("inline_body", SN),
+            f("body_ref", SN),
+            f("reply_to_message_id", SN),
+            f("in_reply_to_digest", SN),
+            f("requires_reply", B),
+            f("reply_deadline_ms", IN),
+            f("evidence_refs", A),
+            f("proposal_revision_id", SN),
+            f("delivery_mode", S),
+        ],
+        &[
+            "thread_id",
+            "recipient",
+            "speech_act",
+            "subject",
+            "summary",
+            "requires_reply",
+            "delivery_mode",
+        ],
+    ),
+    mutation(
+        "coordination.thread.resolve",
+        "Close one exact Thread as resolved, unresolved, or withdrawn under current scope authority and expected state revision; a contract Thread requires its exact ratification Operation to resolve.",
+        &[
+            f("thread_id", S),
+            f("expected_state_revision", I),
+            f("outcome", S),
+            f("resolution_summary", S),
+            f("selected_proposal_revision_id", SN),
+            f("remaining_objections", A),
+            f("follow_up_operation_ids", A),
+            f("manager_ratification_operation_id", SN),
+        ],
+        &[
+            "thread_id",
+            "expected_state_revision",
+            "outcome",
+            "resolution_summary",
+            "remaining_objections",
+            "follow_up_operation_ids",
+        ],
+    ),
+    mutation(
+        "coordination.thread.withdraw",
+        "Withdraw one exact Thread under creator/current-scope authority and expected state revision; retained history remains readable to authorized parties.",
+        &[
+            f("thread_id", S),
+            f("expected_state_revision", I),
+            f("reason", S),
+        ],
+        &["thread_id", "expected_state_revision", "reason"],
+    ),
+    mutation(
+        "coordination.thread.supersede",
+        "Supersede one exact Thread with an open successor on the same Task/Attempt under current manager authority.",
+        &[
+            f("thread_id", S),
+            f("expected_state_revision", I),
+            f("superseding_thread_id", S),
+            f("reason", S),
+        ],
+        &[
+            "thread_id",
+            "expected_state_revision",
+            "superseding_thread_id",
+            "reason",
+        ],
+    ),
+    mutation(
+        "coordination.contract.propose",
+        "Create or revise one immutable contract proposal inside an exact authorized coordination Thread; the canonical request is capped at 64 KiB.",
+        &[
+            f("thread_id", S),
+            f("supersedes_revision_id", SN),
+            f("topic", S),
+            f("affected", O),
+            f("statement", O),
+            f("acceptance_conditions", A),
+            f("claims", A),
+            f("open_questions", A),
+        ],
+        &[
+            "thread_id",
+            "supersedes_revision_id",
+            "topic",
+            "affected",
+            "statement",
+            "acceptance_conditions",
+            "claims",
+            "open_questions",
+        ],
+    ),
+    mutation(
+        "coordination.contract.respond",
+        "Record one exact participant response to an immutable contract revision; support is advisory and never ratifies a proposal.",
+        &[
+            f("thread_id", S),
+            f("proposal_id", S),
+            f("proposal_revision_id", S),
+            f("proposal_digest", S),
+            f("act", S),
+            f("objection_basis", SN),
+            f("reason", S),
+            f("evidence_refs", A),
+        ],
+        &[
+            "thread_id",
+            "proposal_id",
+            "proposal_revision_id",
+            "proposal_digest",
+            "act",
+            "objection_basis",
+            "reason",
+            "evidence_refs",
+        ],
+    ),
+    mutation(
+        "coordination.integration.ack",
+        "Record one Participant's accept/dissent position against the exact current agreement cell state and digests; acceptance applies only to this comparison and does not accept the Task or ratify a contract.",
+        &[
+            f("cell_id", S),
+            f("expected_state_revision", I),
+            f("expected_material_digest", S),
+            f("expected_membership_digest", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("decision", S),
+        ],
+        &[
+            "cell_id",
+            "expected_state_revision",
+            "expected_material_digest",
+            "expected_membership_digest",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "decision",
         ],
     ),
     mutation(
@@ -2525,6 +2846,486 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         }
         _ => {}
     }
+    refine_coordination_input_schema(method, schema);
+}
+
+fn refine_coordination_input_schema(method: &str, schema: &mut Value) {
+    let coordination_methods = matches!(
+        method,
+        "coordination.thread.open"
+            | "coordination.thread.get"
+            | "coordination.thread.list"
+            | "coordination.thread.resolve"
+            | "coordination.thread.withdraw"
+            | "coordination.thread.supersede"
+            | "coordination.message.send"
+            | "coordination.contract.propose"
+            | "coordination.contract.respond"
+            | "coordination.contract.get"
+            | "coordination.contract.list"
+            | "coordination.integration.ack"
+            | "coordination.agreement.get"
+            | "code.scope.propose"
+            | "code.scope.accept"
+            | "code.scope.inspect"
+            | "code.scope.conflicts"
+            | "code.scope.release"
+    );
+    if !coordination_methods {
+        return;
+    }
+    schema["description"] = json!(format!(
+        "Coordination request is limited to {} UTF-8 bytes. The wire parser enforces byte bounds because JSON Schema maxLength counts Unicode code points.",
+        coordination_limits::MAX_COORDINATION_REQUEST_BYTES
+    ));
+    let properties = &mut schema["properties"];
+    if !matches!(
+        method,
+        "coordination.thread.get"
+            | "coordination.thread.list"
+            | "coordination.contract.get"
+            | "coordination.contract.list"
+            | "coordination.agreement.get"
+            | "code.scope.inspect"
+            | "code.scope.conflicts"
+    ) {
+        properties["client_request_id"] = json!({
+            "type":"string",
+            "minLength":1,
+            "maxLength":coordination_limits::MAX_CLIENT_REQUEST_ID_BYTES,
+            "pattern":"^\\S+$",
+            "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points."
+        });
+    }
+    match method {
+        "coordination.thread.open" => {
+            for field in ["task_id", "attempt_id"] {
+                properties[field] = coordination_id_schema();
+            }
+            properties["assignment_id"] = coordination_optional_id_schema();
+            properties["topic_kind"] = coordination_limited_id_schema(128);
+            properties["subject"] =
+                coordination_text_schema(coordination_limits::MAX_SUBJECT_BYTES, 1);
+            properties["participants"] = json!({
+                "type":"array",
+                "minItems":1,
+                "description":"Explicit registered Manager/Participant identities and exact optional generations; the total request byte bound supplies the collection bound.",
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "client_id":coordination_client_id_schema(),
+                        "generation":{"type":["integer","null"],"minimum":1,"maximum":9223372036854775807_i64},
+                        "reason":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1)
+                    },
+                    "required":["client_id","reason"],
+                    "additionalProperties":false
+                }
+            });
+            properties["reasonability"] = json!({
+                "type":"object",
+                "properties":{
+                    "blocking_fact":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "decision_needed":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "why_coordination_is_needed":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "expected_output":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "close_condition":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1)
+                },
+                "required":["blocking_fact","decision_needed","why_coordination_is_needed","expected_output","close_condition"],
+                "additionalProperties":false
+            });
+            properties["related_scopes"] = json!({
+                "type":"array",
+                "maxItems":64,
+                "uniqueItems":true,
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "kind":coordination_limited_id_schema(64),
+                        "value":coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES,1)
+                    },
+                    "required":["kind","value"],
+                    "additionalProperties":false
+                }
+            });
+            properties["body_ref"] = coordination_optional_reference_schema();
+            properties["delivery_mode"] = json!({"const":"mailbox_only"});
+            properties["supersedes_thread_id"] = coordination_optional_id_schema();
+        }
+        "coordination.thread.get" => {
+            properties["thread_id"] = coordination_id_schema();
+            properties["after_message_seq"] =
+                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
+            properties["limit"] = coordination_optional_page_limit_schema();
+        }
+        "coordination.thread.list" => {
+            properties["task_id"] = coordination_id_schema();
+            properties["attempt_id"] = coordination_optional_id_schema();
+            properties["state"] = json!({"type":["string","null"],"enum":["open","resolved","unresolved","withdrawn","superseded",null]});
+            properties["topic_kind"] = json!({"type":["string","null"],"minLength":1,"maxLength":128,"pattern":"^\\S+$","description":"The Store enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."});
+            properties["limit"] = coordination_optional_page_limit_schema();
+            properties["after_thread_id"] = coordination_optional_id_schema();
+        }
+        "coordination.message.send" => {
+            properties["thread_id"] = coordination_id_schema();
+            properties["recipient"] = coordination_client_id_schema();
+            properties["speech_act"] = json!({"type":"string","enum":["inform","query","answer","propose","counterproposal","object","support","withdraw","not_understood","resolution_summary"]});
+            properties["subject"] =
+                coordination_text_schema(coordination_limits::MAX_SUBJECT_BYTES, 1);
+            properties["summary"] =
+                coordination_text_schema(coordination_limits::MAX_SUMMARY_BYTES, 1);
+            properties["inline_body"] = json!({
+                "type":["string","null"],
+                "maxLength":coordination_limits::MAX_INLINE_BODY_BYTES,
+                "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points. Inline text and body_ref cannot both be non-null."
+            });
+            properties["body_ref"] = coordination_optional_reference_schema();
+            properties["reply_to_message_id"] = coordination_optional_id_schema();
+            properties["in_reply_to_digest"] = json!({"type":["string","null"],"minLength":71,"maxLength":71,"pattern":"^sha256:[0-9a-f]{64}$"});
+            properties["requires_reply"] = json!({"type":"boolean"});
+            properties["reply_deadline_ms"] =
+                json!({"type":["integer","null"],"minimum":1,"maximum":9223372036854775807_i64});
+            properties["evidence_refs"] = coordination_evidence_refs_schema();
+            properties["proposal_revision_id"] = coordination_optional_id_schema();
+            properties["delivery_mode"] = json!({"const":"mailbox_only"});
+            append_all_of(
+                schema,
+                json!({"not":{"required":["inline_body","body_ref"],"properties":{"inline_body":{"type":"string"},"body_ref":{"type":"string"}}}}),
+            );
+        }
+        "coordination.thread.resolve" => {
+            properties["thread_id"] = coordination_id_schema();
+            properties["expected_state_revision"] = coordination_positive_integer_schema();
+            properties["outcome"] =
+                json!({"type":"string","enum":["resolved","unresolved","withdrawn"]});
+            properties["resolution_summary"] =
+                coordination_text_schema(coordination_limits::MAX_SUMMARY_BYTES, 1);
+            properties["selected_proposal_revision_id"] = coordination_optional_id_schema();
+            properties["remaining_objections"] = json!({"type":"array","maxItems":64,"uniqueItems":true,"items":coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES,1)});
+            properties["follow_up_operation_ids"] = json!({"type":"array","maxItems":64,"uniqueItems":true,"items":coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES,1)});
+            properties["manager_ratification_operation_id"] = coordination_optional_id_schema();
+        }
+        "coordination.thread.withdraw" => {
+            properties["thread_id"] = coordination_id_schema();
+            properties["expected_state_revision"] = coordination_positive_integer_schema();
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+        }
+        "coordination.thread.supersede" => {
+            properties["thread_id"] = coordination_id_schema();
+            properties["expected_state_revision"] = coordination_positive_integer_schema();
+            properties["superseding_thread_id"] = coordination_id_schema();
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+        }
+        "coordination.contract.propose" => {
+            properties["thread_id"] = coordination_prefixed_uuid_schema("coord-");
+            properties["supersedes_revision_id"] =
+                coordination_optional_prefixed_uuid_schema("cprev-");
+            properties["topic"] =
+                coordination_text_schema(coordination_limits::MAX_SUBJECT_BYTES, 1);
+            properties["affected"] = json!({
+                "type":"object",
+                "properties":{
+                    "paths":coordination_unique_string_array_schema(coordination_limits::MAX_REFERENCE_BYTES),
+                    "symbols":coordination_unique_string_array_schema(coordination_limits::MAX_REFERENCE_BYTES),
+                    "schemas":coordination_unique_string_array_schema(coordination_limits::MAX_REFERENCE_BYTES)
+                },
+                "required":["paths","symbols","schemas"],
+                "additionalProperties":false,
+                "anyOf":[
+                    {"properties":{"paths":{"minItems":1}}},
+                    {"properties":{"symbols":{"minItems":1}}},
+                    {"properties":{"schemas":{"minItems":1}}}
+                ],
+                "description":"Each set is unique and bounded; the Store limits 64 total entries across all three arrays."
+            });
+            properties["statement"] = json!({
+                "type":"object",
+                "properties":{
+                    "producer":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "consumer":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "identity":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "payload":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "observation_boundary":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "failure_semantics":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1),
+                    "versioning":coordination_text_schema(coordination_limits::MAX_REASON_BYTES,1)
+                },
+                "required":["producer","consumer","identity","payload","observation_boundary","failure_semantics","versioning"],
+                "additionalProperties":false
+            });
+            properties["acceptance_conditions"] = json!({"type":"array","maxItems":64,"uniqueItems":true,"items":coordination_text_schema(coordination_limits::MAX_SUMMARY_BYTES,1)});
+            properties["claims"] = json!({"type":"array","items":{},"description":"Bounded arbitrary JSON claim values; the server assigns no invented claim semantics."});
+            properties["open_questions"] = json!({"type":"array","maxItems":64,"uniqueItems":true,"items":coordination_text_schema(coordination_limits::MAX_SUMMARY_BYTES,1)});
+        }
+        "coordination.contract.respond" => {
+            properties["thread_id"] = coordination_prefixed_uuid_schema("coord-");
+            properties["proposal_id"] = coordination_prefixed_uuid_schema("cprop-");
+            properties["proposal_revision_id"] = coordination_prefixed_uuid_schema("cprev-");
+            properties["proposal_digest"] = json!({"type":"string","minLength":64,"maxLength":64,"pattern":"^[A-Fa-f0-9]{64}$"});
+            properties["act"] =
+                json!({"type":"string","enum":["counterproposal","object","support","withdraw"]});
+            properties["objection_basis"] = json!({"type":["string","null"],"maxLength":128,"description":"Raw bounded basis is retained; empty or unrecognized basis is classified as no material progress."});
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+            properties["evidence_refs"] = coordination_evidence_refs_schema();
+        }
+        "coordination.contract.get" => {
+            properties["thread_id"] = coordination_prefixed_uuid_schema("coord-");
+            properties["proposal_id"] = coordination_prefixed_uuid_schema("cprop-");
+            properties["proposal_revision_id"] = coordination_prefixed_uuid_schema("cprev-");
+            properties["after_observation_id"] =
+                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
+            properties["limit"] = coordination_optional_page_limit_schema();
+        }
+        "coordination.contract.list" => {
+            properties["thread_id"] = coordination_prefixed_uuid_schema("coord-");
+            properties["after_sequence"] =
+                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
+            properties["limit"] = coordination_optional_page_limit_schema();
+        }
+        "coordination.integration.ack" => {
+            properties["cell_id"] = coordination_sha256_hex_schema();
+            properties["expected_state_revision"] = coordination_positive_integer_schema();
+            properties["expected_material_digest"] = coordination_sha256_hex_schema();
+            properties["expected_membership_digest"] = coordination_sha256_hex_schema();
+            properties["task_id"] = coordination_id_schema();
+            properties["task_revision"] = coordination_positive_integer_schema();
+            properties["attempt_id"] = coordination_id_schema();
+            properties["decision"] = json!({"type":"string","enum":["accept","dissent"]});
+        }
+        "coordination.agreement.get" => {
+            for field in ["task_id", "attempt_id"] {
+                properties[field] = coordination_id_schema();
+            }
+            properties["cell_id"] = coordination_sha256_hex_schema();
+            properties["task_revision"] = coordination_positive_integer_schema();
+            properties["state_revision"] =
+                json!({"type":["integer","null"],"minimum":1,"maximum":9223372036854775807_i64});
+            properties["material_digest"] =
+                json!({"oneOf":[coordination_sha256_hex_schema(),{"type":"null"}]});
+            properties["limit"] = coordination_optional_page_limit_schema();
+            properties["after_position_id"] = json!({"type":["string","null"],"pattern":"^p[0-9]{20}$","minLength":21,"maxLength":21});
+            append_all_of(
+                schema,
+                json!({"oneOf":[
+                    {"not":{"anyOf":[{"required":["state_revision"]},{"required":["material_digest"]}]}},
+                    {"required":["state_revision","material_digest"]}
+                ]}),
+            );
+        }
+        "code.scope.propose" => {
+            properties["task_id"] = coordination_id_schema();
+            properties["task_revision"] =
+                json!({"type":["integer","null"],"minimum":1,"maximum":9223372036854775807_i64});
+            properties["attempt_id"] = coordination_id_schema();
+            properties["assignment_id"] = coordination_optional_id_schema();
+            properties["mode"] = code_scope_mode_schema();
+            for field in ["paths", "symbols", "interfaces"] {
+                properties[field] =
+                    coordination_string_array_schema(coordination_limits::MAX_REFERENCE_BYTES);
+            }
+            append_all_of(
+                schema,
+                json!({"anyOf":[
+                    {"required":["paths"],"properties":{"paths":{"minItems":1}}},
+                    {"required":["symbols"],"properties":{"symbols":{"minItems":1}}},
+                    {"required":["interfaces"],"properties":{"interfaces":{"minItems":1}}}
+                ]}),
+            );
+            properties["baseline_candidate_ref"] =
+                coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES, 1);
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+            properties["suggested_expires_at_ms"] =
+                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
+        }
+        "code.scope.accept" => {
+            properties["scope_intent_id"] = code_scope_id_schema();
+            properties["expected_state_revision"] = coordination_positive_integer_schema();
+            properties["proposal_digest"] =
+                json!({"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"});
+            properties["mode"] = code_scope_mode_schema();
+            for field in ["paths", "symbols", "interfaces"] {
+                properties[field] =
+                    coordination_string_array_schema(coordination_limits::MAX_REFERENCE_BYTES);
+            }
+            properties["expires_at_ms"] =
+                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+            properties["acknowledge_broad_scope"] = json!({"type":"boolean"});
+            properties["override_scope_intent_ids"] =
+                json!({"type":"array","items":code_scope_id_schema()});
+        }
+        "code.scope.inspect" | "code.scope.conflicts" => {
+            properties["task_id"] = coordination_id_schema();
+            properties["task_revision"] = json!({"type":["integer","null"],"minimum":1});
+            properties["attempt_id"] = coordination_optional_id_schema();
+            properties["scope_intent_id"] = code_scope_optional_id_schema();
+            properties["client_id"] = json!({"type":["string","null"],"minLength":1,"maxLength":coordination_limits::MAX_CLIENT_ID_BYTES});
+            for field in ["path", "symbol", "interface"] {
+                properties[field] = json!({"type":["string","null"],"minLength":1,"maxLength":coordination_limits::MAX_REFERENCE_BYTES});
+            }
+            properties["after_scope_id"] = code_scope_optional_id_schema();
+            properties["limit"] = coordination_page_limit_schema();
+        }
+        "code.scope.release" => {
+            properties["scope_intent_id"] = code_scope_id_schema();
+            properties["expected_state_revision"] = coordination_positive_integer_schema();
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+        }
+        _ => {}
+    }
+}
+
+fn coordination_text_schema(max_bytes: usize, min_length: usize) -> Value {
+    let mut schema = json!({
+        "type":"string",
+        "minLength":min_length,
+        "maxLength":max_bytes,
+        "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points."
+    });
+    if min_length > 0 {
+        schema["pattern"] = json!("\\S");
+    }
+    schema
+}
+
+fn coordination_limited_id_schema(max_bytes: usize) -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":max_bytes,
+        "pattern":"^\\S+$",
+        "description":"The Store enforces this UTF-8 byte limit; identifiers cannot contain whitespace. JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn coordination_prefixed_uuid_schema(prefix: &str) -> Value {
+    let pattern = format!(
+        "^{prefix}[0-9A-Fa-f]{{8}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{12}}$"
+    );
+    let length = prefix.len() + 36;
+    json!({"type":"string","minLength":length,"maxLength":length,"pattern":pattern})
+}
+
+fn coordination_optional_prefixed_uuid_schema(prefix: &str) -> Value {
+    json!({
+        "oneOf":[coordination_prefixed_uuid_schema(prefix),{"type":"null"}]
+    })
+}
+
+fn coordination_id_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":coordination_limits::MAX_IDENTIFIER_BYTES,
+        "pattern":"^\\S+$",
+        "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn coordination_optional_id_schema() -> Value {
+    json!({
+        "type":["string","null"],
+        "minLength":1,
+        "maxLength":coordination_limits::MAX_IDENTIFIER_BYTES,
+        "pattern":"^\\S+$",
+        "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn code_scope_id_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":43,
+        "maxLength":43,
+        "pattern":"^cscope-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    })
+}
+
+fn code_scope_optional_id_schema() -> Value {
+    json!({
+        "type":["string","null"],
+        "minLength":43,
+        "maxLength":43,
+        "pattern":"^cscope-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    })
+}
+
+fn coordination_client_id_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":coordination_limits::MAX_CLIENT_ID_BYTES,
+        "pattern":"^\\S+$",
+        "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn coordination_optional_reference_schema() -> Value {
+    json!({
+        "type":["string","null"],
+        "minLength":1,
+        "maxLength":coordination_limits::MAX_REFERENCE_BYTES,
+        "pattern":"^\\S+$",
+        "description":"UTF-8 byte limit is enforced by the wire parser; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn coordination_positive_integer_schema() -> Value {
+    json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64})
+}
+
+fn coordination_page_limit_schema() -> Value {
+    json!({
+        "type":"integer",
+        "minimum":1,
+        "maximum":coordination_limits::MAX_READ_PAGE_SIZE,
+        "default":coordination_limits::DEFAULT_READ_PAGE_SIZE
+    })
+}
+
+fn coordination_optional_page_limit_schema() -> Value {
+    json!({
+        "type":["integer","null"],
+        "minimum":1,
+        "maximum":coordination_limits::MAX_READ_PAGE_SIZE,
+        "default":coordination_limits::DEFAULT_READ_PAGE_SIZE
+    })
+}
+
+fn coordination_sha256_hex_schema() -> Value {
+    json!({"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"})
+}
+
+fn coordination_string_array_schema(max_bytes: usize) -> Value {
+    json!({
+        "type":"array",
+        "items":coordination_text_schema(max_bytes,1),
+        "description":"The shared request byte cap bounds collection size; each UTF-8 string byte cap is enforced by the wire parser."
+    })
+}
+
+fn coordination_unique_string_array_schema(max_bytes: usize) -> Value {
+    let mut schema = coordination_string_array_schema(max_bytes);
+    schema["uniqueItems"] = json!(true);
+    schema["maxItems"] = json!(64);
+    schema
+}
+
+fn coordination_evidence_refs_schema() -> Value {
+    json!({
+        "type":"array",
+        "maxItems":coordination_limits::MAX_EVIDENCE_REFS,
+        "uniqueItems":true,
+        "items":coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES,1)
+    })
+}
+
+fn code_scope_mode_schema() -> Value {
+    json!({"type":"string","enum":["exclusive_edit","shared_edit","read_review"]})
 }
 
 fn automation_config_changes_schema() -> Value {
@@ -2573,10 +3374,25 @@ fn automation_config_patch_schema() -> Value {
                     }
                 ]
             },
+            "github_projection":{
+                "oneOf":[
+                    {"type":"null"},
+                    {
+                        "type":"object",
+                        "properties":{
+                            "source_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"The Store enforces this UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."},
+                            "label":{"type":"string","minLength":10,"maxLength":50,"pattern":"^eliot-[a-z0-9-]*[a-z0-9]$","description":"The Store enforces a 10..=50 UTF-8 byte lowercase eliot-* label without a trailing hyphen; JSON Schema maxLength counts Unicode code points."},
+                            "present":{"type":"boolean"}
+                        },
+                        "additionalProperties":false,
+                        "description":"Optional partial merge patch: omitted fields retain their stored values; null clears the full setting. A new setting must provide source_id, label, and present together after merge."
+                    }
+                ]
+            },
             "event_rules":automation_event_rules_schema()
         },
         "additionalProperties":true,
-        "description":"The O8 enabled, steps, script_run and event_rules fields are typed here. Other existing patch settings remain accepted; Store enforces their complete allowlist and shapes."
+        "description":"The O8 enabled, steps, script_run, github_projection and event_rules fields are typed here. Other existing patch settings remain accepted; Store enforces their complete allowlist and shapes."
     })
 }
 

@@ -9,6 +9,7 @@ use crate::{
 };
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+use swarm_contracts::coordination_limits as limits;
 
 pub const MAX_ASSUMPTIONS: usize = 20;
 pub const MAX_REQUIRED_DIMENSIONS: usize = 16;
@@ -102,6 +103,52 @@ pub struct SyncRequest {
     pub side: Side,
 }
 
+/// One authenticated participant's factual position on one exact retained
+/// integration-cell revision. Principal identity and participation basis are
+/// derived by Store and are never accepted from the request.
+#[derive(Debug, Clone)]
+pub struct AckRequest {
+    pub client_request_id: String,
+    pub cell_id: String,
+    pub expected_state_revision: i64,
+    pub expected_material_digest: String,
+    pub expected_membership_digest: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub decision: AckDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckDecision {
+    Accept,
+    Dissent,
+}
+
+impl AckDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Dissent => "dissent",
+        }
+    }
+}
+
+/// Read one exact integration cell and a bounded page of its retained
+/// participant positions. Omitted revision/digest selects the current cell
+/// version; historical reads must name both.
+#[derive(Debug, Clone)]
+pub struct AgreementGetRequest {
+    pub cell_id: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub state_revision: Option<i64>,
+    pub material_digest: Option<String>,
+    pub limit: i64,
+    pub after_position_revision: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OverlapRequest {
     pub task_id: Option<String>,
@@ -154,6 +201,162 @@ impl SyncRequest {
             side,
         })
     }
+}
+
+impl AckRequest {
+    pub fn parse(value: &Value) -> Result<Self> {
+        model::fields(
+            value,
+            &[
+                "client_request_id",
+                "cell_id",
+                "expected_state_revision",
+                "expected_material_digest",
+                "expected_membership_digest",
+                "task_id",
+                "task_revision",
+                "attempt_id",
+                "decision",
+            ],
+        )?;
+        let client_request_id = bounded_text(
+            value,
+            "client_request_id",
+            limits::MAX_CLIENT_REQUEST_ID_BYTES,
+            true,
+        )?;
+        let cell_id = bounded_text(value, "cell_id", 64, true)?;
+        require_hex_digest(&cell_id, "cell_id")?;
+        let expected_state_revision = model::positive(value, "expected_state_revision")?;
+        let expected_material_digest = bounded_text(value, "expected_material_digest", 64, true)?;
+        require_hex_digest(&expected_material_digest, "expected_material_digest")?;
+        let expected_membership_digest =
+            bounded_text(value, "expected_membership_digest", 64, true)?;
+        require_hex_digest(&expected_membership_digest, "expected_membership_digest")?;
+        let task_id = bounded_text(value, "task_id", limits::MAX_IDENTIFIER_BYTES, true)?;
+        let task_revision = model::positive(value, "task_revision")?;
+        let attempt_id = bounded_text(value, "attempt_id", limits::MAX_IDENTIFIER_BYTES, true)?;
+        let decision = match model::text(value, "decision")? {
+            "accept" => AckDecision::Accept,
+            "dissent" => AckDecision::Dissent,
+            _ => return Err(Error::invalid("decision must be accept or dissent")),
+        };
+        Ok(Self {
+            client_request_id,
+            cell_id,
+            expected_state_revision,
+            expected_material_digest,
+            expected_membership_digest,
+            task_id,
+            task_revision,
+            attempt_id,
+            decision,
+        })
+    }
+}
+
+impl AgreementGetRequest {
+    pub fn parse(value: &Value) -> Result<Self> {
+        model::fields(
+            value,
+            &[
+                "cell_id",
+                "task_id",
+                "task_revision",
+                "attempt_id",
+                "state_revision",
+                "material_digest",
+                "limit",
+                "after_position_id",
+            ],
+        )?;
+        let cell_id = bounded_text(value, "cell_id", 64, true)?;
+        require_hex_digest(&cell_id, "cell_id")?;
+        let task_id = bounded_text(value, "task_id", limits::MAX_IDENTIFIER_BYTES, true)?;
+        let task_revision = model::positive(value, "task_revision")?;
+        let attempt_id = bounded_text(value, "attempt_id", limits::MAX_IDENTIFIER_BYTES, true)?;
+        let state_revision = optional_positive(value, "state_revision")?;
+        let material_digest = match value.get("material_digest") {
+            None | Some(Value::Null) => None,
+            Some(_) => {
+                let digest = bounded_text(value, "material_digest", 64, true)?;
+                require_hex_digest(&digest, "material_digest")?;
+                Some(digest)
+            }
+        };
+        if state_revision.is_some() != material_digest.is_some() {
+            return Err(Error::invalid(
+                "state_revision and material_digest must be supplied together",
+            ));
+        }
+        let limit = match value.get("limit") {
+            None | Some(Value::Null) => limits::DEFAULT_READ_PAGE_SIZE,
+            Some(Value::Number(number)) => number
+                .as_i64()
+                .ok_or_else(|| Error::invalid("limit must be an integer"))?,
+            Some(_) => return Err(Error::invalid("limit must be an integer")),
+        };
+        if !(1..=limits::MAX_READ_PAGE_SIZE).contains(&limit) {
+            return Err(Error::invalid(format!(
+                "limit must be 1..={}",
+                limits::MAX_READ_PAGE_SIZE
+            )));
+        }
+        let after_position_revision = match value.get("after_position_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(parse_position_id(id)?),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "after_position_id must be p followed by 20 decimal digits or null",
+                ));
+            }
+        };
+        Ok(Self {
+            cell_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            state_revision,
+            material_digest,
+            limit,
+            after_position_revision,
+        })
+    }
+}
+
+fn require_hex_digest(value: &str, field: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::invalid(format!(
+            "{field} must be 64 lowercase hexadecimal characters"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_position_id(value: &str) -> Result<i64> {
+    let Some(revision) = value.strip_prefix('p') else {
+        return Err(Error::invalid(
+            "after_position_id must be p followed by 20 decimal digits",
+        ));
+    };
+    if revision.len() != 20 || !revision.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::invalid(
+            "after_position_id must be p followed by 20 decimal digits",
+        ));
+    }
+    let parsed = revision
+        .parse::<i64>()
+        .map_err(|_| Error::invalid("after_position_id revision is out of range"))?;
+    if parsed <= 0 {
+        return Err(Error::invalid(
+            "after_position_id revision must be positive",
+        ));
+    }
+    Ok(parsed)
 }
 
 impl OverlapRequest {

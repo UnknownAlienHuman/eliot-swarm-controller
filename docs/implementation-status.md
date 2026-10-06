@@ -2,47 +2,39 @@
 
 ## Current state
 
-### Current queue source integration — 2026-10-06
+### Current queue source closeout — 2026-10-06
 
-The current queue is being closed and saved before further verification. The
-shared immutable mailbox implementation, Codex Goal terminal-evidence and
-continuation-admission source, and configured GitHub managed-Issue-label
-projection are integrated. Thread, immutable peer-contract, code-scope,
-integration-agreement and public frontend packets remain in the assigned source
-queue. No new Git inspection module has been started for this closeout.
+The owner requested stopping development and saving/pushing the current work.
+The queue is **not fully complete**. The source closeout includes shared mailbox,
+Goal V5, managed-Issue-label GitHub projection with stale queued-operation
+rejection/fair drain, Thread V4, immutable contract proposals/responses,
+advisory Scope intents, integration acknowledgements/agreements and their
+18-method Store routing. Final frontend state and the exact publication are
+recorded in [the restart checkpoint](restart-checkpoint-2026-10-06.md).
 
-Mailbox admission keeps one immutable body and one explicit recipient through
-the existing Operation/Observation path. Legacy addressed messages and typed
-Thread messages share admission and exact delivery read/cancellation logic;
-feedback and check Operations are not treated as deliveries.
+Thread IDs now follow `coord-<uuid>`. Retained Thread/cell history uses actual
+Task/Attempt relationships and currently registered Manager/GM/Operator or exact
+retained-owner authority; the former GM session and old Attempt liveness do not
+lock out history. Current writes still require their exact active scope. Own
+rejected ACK receipts return before cell lookup; stale agreements cannot become
+`peer_agreed`.
 
-Codex Goal continuation now carries a distinct Store-authenticated admission
-context and adapter receipt for the new `agent.send` Operation, exact
-Task/Attempt, prior terminal EventRef and observed native input. It does not reuse
-`task.dispatch` admission. Saved outcomes replay their retained bytes. The common
-terminal-evidence envelope preserves the existing strict OpenCode execution
-proof; supported producer paths remain limited to Codex and OpenCode. Command
-and Antigravity Goal progression remain unavailable.
+The automatic GitHub action is limited to one configured managed Issue label.
+Only provably unsent stale queued Operations may be rejected; sending/uncertain
+writes remain readback-only. Goal Accepted/Applied outcomes require exact native
+admission; Rejected/Unknown outcomes retain errors without success evidence.
+Truthful terminal producer coverage remains limited to Codex/OpenCode.
 
-Authenticated rejected or uncertain Codex continuations now reach the existing
-Operation/Observation error path without a successful native-input admission
-receipt. Accepted/applied outcomes still require that exact receipt. Failed or
-uncertain outcomes cannot attach admission or completed-terminal evidence. This
-source correction prevents the failed continuation report from being held at
-`sending` solely by the successful-admission validator; runtime verification
-remains pending.
+Contract `ratify/reject` is **not integrated or publicly exposed**. Frozen V1
+and incomplete private V2 candidates are preserved for continuation. I6 Git
+inspection, the remaining Thread lifecycle, cross-adapter Goal parity, broader
+automatic GitHub effects and native qualification remain unfinished. No further
+source slices or verification are started after this closeout.
 
-The first automatic GitHub projection is one explicitly configured managed
-Issue label derived from an exact retained accepted-candidate fact. It uses
-current Manager/GM and source-map authority, the existing durable label slot,
-transactional activation/cursors and a post-commit drain of queued Operations.
-An uncertain remote write remains readback-only. Checks, PR summaries and
-closure are not implemented by this action.
-
-These changes have only source inspection, owned-file formatter parsing and
-whitespace verification. They have not been compiled, tested or exercised with
-a native provider/model. Product status remains `PARTIAL_PROGRESS`; historical
-qualification below applies only to its recorded commits.
+Current checks are source inspection, exact hashes, owned-file formatter parsing
+and whitespace checks only. **No current compiler/build, tests or native/provider/
+model calls ran.** Product status remains `PARTIAL_PROGRESS`; historical checks
+below apply only to their recorded commits.
 
 ### Source delivery and remaining qualification — 2026-10-06
 
@@ -131,11 +123,11 @@ provide the existing `swarm.exceptions.get` requery. The public page size remain
 50 and the internal raw attention scan remains 200. These source changes have
 not been compiled or tested.
 
-Shared `coordination_limits` are present for the Thread, peer-contract and
-integration-acknowledgement source implementations in progress. They retain the
+Shared `coordination_limits` are present for the integrated Thread, peer-contract and
+integration-acknowledgement source implementations. They retain the
 64 KiB request bound, bounded UTF-8 fields and read pages, without adding a roster
-count cap. Their backend and frontend packets are still being implemented; the
-constants alone do not make these methods available.
+count cap. The exact delivered methods and remaining public frontend work are recorded in
+the current checkpoint; constants alone do not qualify runtime behavior.
 
 The dependency source repair moves the selected rustls lock from `0.23.44` to
 `0.23.45` for GHSA-2mjx-qc3c-rqvc. The registry checksum and unchanged dependency

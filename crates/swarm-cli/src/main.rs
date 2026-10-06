@@ -10,7 +10,7 @@ use std::{
 };
 use swarm_cli::{ClientConfig, call, prepare_call, validate_call_method};
 use swarm_contracts::{
-    Credential, concilium_limits as limits,
+    Credential, concilium_limits as limits, coordination_limits,
     error::{Error, Result},
 };
 use swarm_process::child_error::{
@@ -83,6 +83,11 @@ enum Command {
     Source {
         #[command(subcommand)]
         command: SourceCommand,
+    },
+    /// Propose, accept, inspect, compare and release advisory code scopes.
+    Code {
+        #[command(subcommand)]
+        command: CodeCommand,
     },
     Check {
         #[command(subcommand)]
@@ -273,6 +278,83 @@ enum SourceCommand {
     },
 }
 #[derive(Subcommand)]
+enum CodeCommand {
+    Scope {
+        #[command(subcommand)]
+        command: CodeScopeCommand,
+    },
+}
+#[derive(Subcommand)]
+enum CodeScopeCommand {
+    /// Propose paths, symbols or interfaces for manager review; this reserves nothing.
+    Propose {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Accept one exact proposal digest, optionally revising its declared scope.
+    Accept {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Inspect retained scope intents within one Task and optional selector filters.
+    Inspect {
+        task_id: String,
+        #[arg(long)]
+        task_revision: Option<i64>,
+        #[arg(long)]
+        attempt_id: Option<String>,
+        #[arg(long)]
+        scope_intent_id: Option<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        interface: Option<String>,
+        #[arg(long)]
+        after_scope_id: Option<String>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+    /// Compare exact scoped ownership selectors; unknown coverage is not a no-conflict result.
+    Conflicts {
+        task_id: String,
+        #[arg(long)]
+        task_revision: Option<i64>,
+        #[arg(long)]
+        attempt_id: Option<String>,
+        #[arg(long)]
+        scope_intent_id: Option<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        interface: Option<String>,
+        #[arg(long)]
+        after_scope_id: Option<String>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+    /// Release one exact accepted scope revision with a reason.
+    Release {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
 enum CheckCommand {
     Run {
         #[arg(long)]
@@ -445,6 +527,31 @@ enum CoordinationCommand {
         #[command(subcommand)]
         command: CoordinationWatchCommand,
     },
+    /// Open and inspect scoped, durable coordination Threads.
+    Thread {
+        #[command(subcommand)]
+        command: CoordinationThreadCommand,
+    },
+    /// Send one addressed message inside an exact coordination Thread.
+    Message {
+        #[command(subcommand)]
+        command: CoordinationMessageCommand,
+    },
+    /// Propose, respond to, and inspect immutable contract revisions.
+    Contract {
+        #[command(subcommand)]
+        command: CoordinationContractCommand,
+    },
+    /// Record a Participant's exact agreement-cell position.
+    Integration {
+        #[command(subcommand)]
+        command: CoordinationIntegrationCommand,
+    },
+    /// Read a bounded retained agreement-cell projection.
+    Agreement {
+        #[command(subcommand)]
+        command: CoordinationAgreementCommand,
+    },
     Send {
         #[arg(long)]
         file: PathBuf,
@@ -456,6 +563,136 @@ enum CoordinationCommand {
     Context {
         #[arg(long)]
         file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationThreadCommand {
+    /// Open a Thread from an exact JSON request file.
+    Open {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read one authorized Thread and messages after an optional sequence cursor.
+    Get {
+        thread_id: String,
+        #[arg(long)]
+        after_message_seq: Option<i64>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+    /// Page Threads in one exact Task and optional Attempt scope.
+    List {
+        task_id: String,
+        #[arg(long)]
+        attempt_id: Option<String>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        topic_kind: Option<String>,
+        #[arg(long)]
+        after_thread_id: Option<String>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+    /// Close one Thread with an exact expected state revision.
+    Resolve {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Withdraw one Thread with an exact expected state revision.
+    Withdraw {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Link an open successor and supersede the exact current Thread.
+    Supersede {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationMessageCommand {
+    /// Send to one explicit roster recipient using the existing coordination mailbox.
+    Send {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationContractCommand {
+    /// Propose a canonical contract revision in an exact Thread.
+    Propose {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Record one response to an exact proposal revision and digest.
+    Respond {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read one immutable contract revision.
+    Get {
+        thread_id: String,
+        proposal_id: String,
+        proposal_revision_id: String,
+        #[arg(long)]
+        after_observation_id: Option<i64>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+    /// Page proposal metadata in one exact Thread.
+    List {
+        thread_id: String,
+        #[arg(long)]
+        after_sequence: Option<i64>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationIntegrationCommand {
+    /// Acknowledge or dissent on one exact agreement-cell revision and comparison.
+    Ack {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationAgreementCommand {
+    /// Read current or exact historical agreement state; revision and digest are paired.
+    Get {
+        cell_id: String,
+        task_id: String,
+        task_revision: i64,
+        attempt_id: String,
+        #[arg(long)]
+        state_revision: Option<i64>,
+        #[arg(long)]
+        material_digest: Option<String>,
+        #[arg(long)]
+        after_position_id: Option<String>,
+        #[arg(
+            long,
+            default_value_t = coordination_limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=coordination_limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
     },
 }
 #[derive(Subcommand)]
@@ -1246,6 +1483,91 @@ fn map_command(command: Command) -> Result<(String, Value)> {
         Command::Source {
             command: SourceCommand::Capture { file },
         } => ("source.capture".into(), read_json(&file)?),
+        Command::Code {
+            command: CodeCommand::Scope { command },
+        } => match command {
+            CodeScopeCommand::Propose { file } => ("code.scope.propose".into(), read_json(&file)?),
+            CodeScopeCommand::Accept { file } => ("code.scope.accept".into(), read_json(&file)?),
+            CodeScopeCommand::Inspect {
+                task_id,
+                task_revision,
+                attempt_id,
+                scope_intent_id,
+                client_id,
+                path,
+                symbol,
+                interface,
+                after_scope_id,
+                limit,
+            } => {
+                let mut params = json!({"task_id":task_id,"limit":limit});
+                if let Some(task_revision) = task_revision {
+                    params["task_revision"] = json!(task_revision);
+                }
+                if let Some(attempt_id) = attempt_id {
+                    params["attempt_id"] = json!(attempt_id);
+                }
+                if let Some(scope_intent_id) = scope_intent_id {
+                    params["scope_intent_id"] = json!(scope_intent_id);
+                }
+                if let Some(client_id) = client_id {
+                    params["client_id"] = json!(client_id);
+                }
+                if let Some(path) = path {
+                    params["path"] = json!(path);
+                }
+                if let Some(symbol) = symbol {
+                    params["symbol"] = json!(symbol);
+                }
+                if let Some(interface) = interface {
+                    params["interface"] = json!(interface);
+                }
+                if let Some(after_scope_id) = after_scope_id {
+                    params["after_scope_id"] = json!(after_scope_id);
+                }
+                ("code.scope.inspect".into(), params)
+            }
+            CodeScopeCommand::Conflicts {
+                task_id,
+                task_revision,
+                attempt_id,
+                scope_intent_id,
+                client_id,
+                path,
+                symbol,
+                interface,
+                after_scope_id,
+                limit,
+            } => {
+                let mut params = json!({"task_id":task_id,"limit":limit});
+                if let Some(task_revision) = task_revision {
+                    params["task_revision"] = json!(task_revision);
+                }
+                if let Some(attempt_id) = attempt_id {
+                    params["attempt_id"] = json!(attempt_id);
+                }
+                if let Some(scope_intent_id) = scope_intent_id {
+                    params["scope_intent_id"] = json!(scope_intent_id);
+                }
+                if let Some(client_id) = client_id {
+                    params["client_id"] = json!(client_id);
+                }
+                if let Some(path) = path {
+                    params["path"] = json!(path);
+                }
+                if let Some(symbol) = symbol {
+                    params["symbol"] = json!(symbol);
+                }
+                if let Some(interface) = interface {
+                    params["interface"] = json!(interface);
+                }
+                if let Some(after_scope_id) = after_scope_id {
+                    params["after_scope_id"] = json!(after_scope_id);
+                }
+                ("code.scope.conflicts".into(), params)
+            }
+            CodeScopeCommand::Release { file } => ("code.scope.release".into(), read_json(&file)?),
+        },
         Command::Check { command } => match command {
             CheckCommand::Run { file } => ("check.run".into(), read_json(&file)?),
             CheckCommand::Get { check_id } => ("check.get".into(), json!({"check_id":check_id})),
@@ -1488,6 +1810,122 @@ fn map_command(command: Command) -> Result<(String, Value)> {
                 }
                 CoordinationWatchCommand::Cancel { file } => {
                     ("coordination.watch.cancel".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::Thread { command } => match command {
+                CoordinationThreadCommand::Open { file } => {
+                    ("coordination.thread.open".into(), read_json(&file)?)
+                }
+                CoordinationThreadCommand::Get {
+                    thread_id,
+                    after_message_seq,
+                    limit,
+                } => {
+                    let mut params = json!({"thread_id":thread_id,"limit":limit});
+                    if let Some(after_message_seq) = after_message_seq {
+                        params["after_message_seq"] = json!(after_message_seq);
+                    }
+                    ("coordination.thread.get".into(), params)
+                }
+                CoordinationThreadCommand::List {
+                    task_id,
+                    attempt_id,
+                    state,
+                    topic_kind,
+                    after_thread_id,
+                    limit,
+                } => {
+                    let mut params = json!({"task_id":task_id,"limit":limit});
+                    if let Some(attempt_id) = attempt_id {
+                        params["attempt_id"] = json!(attempt_id);
+                    }
+                    if let Some(state) = state {
+                        params["state"] = json!(state);
+                    }
+                    if let Some(topic_kind) = topic_kind {
+                        params["topic_kind"] = json!(topic_kind);
+                    }
+                    if let Some(after_thread_id) = after_thread_id {
+                        params["after_thread_id"] = json!(after_thread_id);
+                    }
+                    ("coordination.thread.list".into(), params)
+                }
+                CoordinationThreadCommand::Resolve { file } => {
+                    ("coordination.thread.resolve".into(), read_json(&file)?)
+                }
+                CoordinationThreadCommand::Withdraw { file } => {
+                    ("coordination.thread.withdraw".into(), read_json(&file)?)
+                }
+                CoordinationThreadCommand::Supersede { file } => {
+                    ("coordination.thread.supersede".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::Message { command } => match command {
+                CoordinationMessageCommand::Send { file } => {
+                    ("coordination.message.send".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::Contract { command } => match command {
+                CoordinationContractCommand::Propose { file } => {
+                    ("coordination.contract.propose".into(), read_json(&file)?)
+                }
+                CoordinationContractCommand::Respond { file } => {
+                    ("coordination.contract.respond".into(), read_json(&file)?)
+                }
+                CoordinationContractCommand::Get {
+                    thread_id,
+                    proposal_id,
+                    proposal_revision_id,
+                    after_observation_id,
+                    limit,
+                } => {
+                    let mut params = json!({"thread_id":thread_id,"proposal_id":proposal_id,
+                        "proposal_revision_id":proposal_revision_id,"limit":limit});
+                    if let Some(after_observation_id) = after_observation_id {
+                        params["after_observation_id"] = json!(after_observation_id);
+                    }
+                    ("coordination.contract.get".into(), params)
+                }
+                CoordinationContractCommand::List {
+                    thread_id,
+                    after_sequence,
+                    limit,
+                } => {
+                    let mut params = json!({"thread_id":thread_id,"limit":limit});
+                    if let Some(after_sequence) = after_sequence {
+                        params["after_sequence"] = json!(after_sequence);
+                    }
+                    ("coordination.contract.list".into(), params)
+                }
+            },
+            CoordinationCommand::Integration { command } => match command {
+                CoordinationIntegrationCommand::Ack { file } => {
+                    ("coordination.integration.ack".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::Agreement { command } => match command {
+                CoordinationAgreementCommand::Get {
+                    cell_id,
+                    task_id,
+                    task_revision,
+                    attempt_id,
+                    state_revision,
+                    material_digest,
+                    after_position_id,
+                    limit,
+                } => {
+                    let mut params = json!({"cell_id":cell_id,"task_id":task_id,
+                        "task_revision":task_revision,"attempt_id":attempt_id,"limit":limit});
+                    if let Some(state_revision) = state_revision {
+                        params["state_revision"] = json!(state_revision);
+                    }
+                    if let Some(material_digest) = material_digest {
+                        params["material_digest"] = json!(material_digest);
+                    }
+                    if let Some(after_position_id) = after_position_id {
+                        params["after_position_id"] = json!(after_position_id);
+                    }
+                    ("coordination.agreement.get".into(), params)
                 }
             },
             CoordinationCommand::Send { file } => ("coordination.send".into(), read_json(&file)?),

@@ -117,6 +117,23 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "coordination.participant.disable"
                 | "coordination.participant.get"
                 | "coordination.participant.list"
+                | "coordination.thread.open"
+                | "coordination.thread.get"
+                | "coordination.thread.list"
+                | "coordination.message.send"
+                | "coordination.thread.resolve"
+                | "coordination.thread.withdraw"
+                | "coordination.thread.supersede"
+                | "coordination.contract.propose"
+                | "coordination.contract.respond"
+                | "coordination.contract.get"
+                | "coordination.contract.list"
+                | "coordination.agreement.get"
+                | "code.scope.propose"
+                | "code.scope.accept"
+                | "code.scope.inspect"
+                | "code.scope.conflicts"
+                | "code.scope.release"
                 | "swarm.context.get"
                 | "coordination.peer.find"
                 | "coordination.work_card.get"
@@ -211,6 +228,12 @@ pub(super) fn allows_subscription_category(profile: McpToolProfile, category: Ca
             Category::Concilium => {
                 exposes_method(profile, "concilium.get")
                     || exposes_method(profile, "concilium.list")
+            }
+            Category::Coordination => {
+                exposes_method(profile, "coordination.thread.get")
+                    && exposes_method(profile, "coordination.thread.list")
+                    && exposes_method(profile, "coordination.contract.get")
+                    && exposes_method(profile, "coordination.contract.list")
             }
         }
 }

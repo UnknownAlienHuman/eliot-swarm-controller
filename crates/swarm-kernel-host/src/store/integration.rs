@@ -50,6 +50,7 @@ pub(super) fn read(
 ) -> Result<Value> {
     match method {
         "swarm.overlap.check" => overlap_check(db, principal, value),
+        "coordination.agreement.get" => agreement_get(db, principal, value),
         _ => Err(Error::new(
             "METHOD_NOT_FOUND",
             format!("{method} is not an implemented integration read"),
@@ -69,6 +70,9 @@ pub(super) fn apply(
     match method {
         "coordination.sync_integration" => {
             sync_integration(tx, principal, value, operation_id, now).map(|result| (result, false))
+        }
+        "coordination.integration.ack" => {
+            integration_ack(tx, principal, value, operation_id, now).map(|result| (result, false))
         }
         _ => Err(Error::new(
             "METHOD_NOT_FOUND",
@@ -334,6 +338,24 @@ fn sync_integration(
         previous_id.unwrap_or_default().to_owned()
     };
     if membership_changed
+        && let (Some(previous_id), Some(previous)) = (previous_id, previous_cell.as_ref())
+    {
+        retain_cell_version(tx, scope_id, &request.contract_key, previous)?;
+        set_meta(
+            tx,
+            &cell_id_index_key(previous_id),
+            &json!({
+                "cell_id":previous_id,
+                "scope_id":scope_id,
+                "task_id":previous["facts"]["task_revision_set"][0]["task_id"],
+                "task_revision":previous["facts"]["task_revision_set"][0]["task_revision"],
+                "attempt_id":previous["facts"]["attempt_id"],
+                "contract_key":request.contract_key,
+                "cell_record_key":previous_cell_key,
+            }),
+        )?;
+    }
+    if membership_changed
         && let (Some(old_key), Some(mut old_cell)) =
             (previous_cell_key.as_deref(), previous_cell.clone())
     {
@@ -353,6 +375,7 @@ fn sync_integration(
             "state_revision":old_cell["state_revision"],
         }))?);
         set_meta(tx, old_key, &old_cell)?;
+        retain_cell_version(tx, scope_id, &request.contract_key, &old_cell)?;
     }
     let cell_record_key = cell_record_key(scope_id, &request.contract_key, &cell_id);
     let prior_cell = if membership_changed {
@@ -393,7 +416,24 @@ fn sync_integration(
         "close_condition":"all required dimensions match or exact mismatch is escalated",
         "facts":facts,
     });
+    if let Some(previous) = prior_cell.as_ref() {
+        retain_cell_version(tx, scope_id, &request.contract_key, previous)?;
+    }
     set_meta(tx, &cell_record_key, &cell)?;
+    retain_cell_version(tx, scope_id, &request.contract_key, &cell)?;
+    set_meta(
+        tx,
+        &cell_id_index_key(&cell_id),
+        &json!({
+            "cell_id":cell_id,
+            "scope_id":scope_id,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "contract_key":request.contract_key,
+            "cell_record_key":cell_record_key,
+        }),
+    )?;
     set_meta(
         tx,
         &current_index_key,
@@ -419,6 +459,984 @@ fn sync_integration(
         "coverage":coverage,
         "gaps":gaps,
     }))
+}
+
+fn integration_ack(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    principal.require_participant()?;
+    let request = wire::AckRequest::parse(value)?;
+    let scope = super::coordination::current_scope(tx, principal)?;
+    let scope_id = text_at(&scope, &["scope_id"], "current scope id")?;
+    let task_id = text_at(&scope, &["task", "task_id"], "current Task id")?;
+    let task_revision = int_at(&scope, &["task", "revision"], "current Task revision")?;
+    let attempt_id = text_at(&scope, &["attempt", "attempt_id"], "current Attempt id")?;
+    if request.task_id != task_id
+        || request.task_revision != task_revision
+        || request.attempt_id != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "acknowledgement scope does not match the authenticated current Task/Attempt",
+        ));
+    }
+    let location = cell_location(tx, &request.cell_id)?;
+    if location["scope_id"] != scope_id
+        || location["task_id"] != task_id
+        || location["task_revision"] != task_revision
+        || location["attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "integration cell is outside the authenticated exact Task/Attempt scope",
+        ));
+    }
+    let cell_key = text_at(
+        &location,
+        &["cell_record_key"],
+        "integration cell record key",
+    )?;
+    let cell = meta(tx, cell_key)?.ok_or_else(|| {
+        Error::new(
+            "NOT_FOUND",
+            "integration cell has no retained current projection",
+        )
+    })?;
+    if cell["cell_id"] != request.cell_id
+        || cell["state_revision"] != request.expected_state_revision
+        || cell["material_digest"] != request.expected_material_digest
+        || cell["membership_digest"] != request.expected_membership_digest
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "acknowledgement does not name the current exact cell revision, material, and membership",
+        ));
+    }
+    let caller_basis = scope
+        .pointer("/participant/participation_basis")
+        .ok_or_else(|| Error::new("STORE_INVARIANT", "current scope lacks participant basis"))?;
+    let member = cell["facts"]["member_basis_set"]
+        .as_array()
+        .and_then(|members| {
+            members
+                .iter()
+                .find(|member| member["client_id"].as_str() == Some(principal.client_id.as_str()))
+        })
+        .ok_or_else(|| Error::new("FORBIDDEN", "participant is not a member of this cell"))?;
+    if member.get("participation_basis") != Some(caller_basis) {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant basis differs from the exact basis retained by this cell",
+        ));
+    }
+    match current_cell_freshness(
+        tx,
+        principal,
+        scope_id,
+        task_id,
+        task_revision,
+        attempt_id,
+        text_at(&location, &["contract_key"], "contract key")?,
+        &cell,
+    )? {
+        CellFreshness::Current => {}
+        CellFreshness::Changed => {
+            return Err(Error::new(
+                "STALE_REVISION",
+                "integration cell no longer represents every current participant and contract card",
+            ));
+        }
+        CellFreshness::Incomplete => {
+            return Err(Error::new(
+                "INCOMPLETE_COVERAGE",
+                "current exact participant/card coverage is incomplete for this acknowledgement",
+            ));
+        }
+    }
+
+    let version_prefix = position_prefix(
+        &request.cell_id,
+        request.expected_state_revision,
+        &request.expected_material_digest,
+    );
+    let counter_key = position_counter_key(&version_prefix);
+    let revision = meta(tx, &counter_key)?
+        .as_ref()
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::new("STORE_INVARIANT", "agreement position revision overflow"))?;
+    let position_id = format!("p{revision:020}");
+    let scope_snapshot = classify_scope_authority(tx, &cell)?;
+    let position = json!({
+        "schema":"eliot.integration.position.v1",
+        "position_id":position_id,
+        "position_revision":revision,
+        "cell_id":request.cell_id,
+        "state_revision":request.expected_state_revision,
+        "material_digest":request.expected_material_digest,
+        "membership_digest":request.expected_membership_digest,
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+        "actor_client_id":principal.client_id,
+        "participation_basis":caller_basis,
+        "decision":request.decision.as_str(),
+        "autonomy_digest":scope_snapshot["autonomy_digest"],
+        "scope_refs":scope_snapshot["scope_refs"],
+        "operation_id":operation_id,
+        "created_at_ms":now,
+    });
+    set_meta(
+        tx,
+        &position_record_key(&version_prefix, revision),
+        &position,
+    )?;
+    set_meta(tx, &counter_key, &json!(revision))?;
+    set_meta(
+        tx,
+        &position_head_key(&version_prefix, &principal.client_id),
+        &json!({"position_id":position_id,"position_revision":revision}),
+    )?;
+    let attempt = scope
+        .get("attempt")
+        .filter(|attempt| attempt.is_object())
+        .ok_or_else(|| Error::new("STORE_INVARIANT", "current scope lacks Attempt projection"))?;
+    super::coordination::attach_operation_scope(tx, operation_id, task_id, attempt_id, attempt)?;
+    let classification = classify_agreement(tx, &cell, &version_prefix)?;
+    Ok(json!({
+        "operation_id":operation_id,
+        "client_request_id":request.client_request_id,
+        "cell_id":request.cell_id,
+        "state_revision":request.expected_state_revision,
+        "material_digest":request.expected_material_digest,
+        "membership_digest":request.expected_membership_digest,
+        "position":public_position(&position),
+        "classification":classification,
+        "advisory_only":true,
+        "changed":true,
+    }))
+}
+
+fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    let request = wire::AgreementGetRequest::parse(value)?;
+    let location = cell_location(db, &request.cell_id)?;
+    if location["task_id"] != request.task_id
+        || location["task_revision"] != request.task_revision
+        || location["attempt_id"] != request.attempt_id
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "integration cell does not match the requested Task/Attempt scope",
+        ));
+    }
+    if principal.role != Role::Participant {
+        authorize_retained_cell_read(db, principal, &request, &location)?;
+    }
+    let scope_id = text_at(&location, &["scope_id"], "scope id")?;
+    let contract_key = text_at(&location, &["contract_key"], "contract key")?;
+    let (state_revision, material_digest, cell) =
+        match (request.state_revision, request.material_digest.as_deref()) {
+            (Some(revision), Some(digest)) => {
+                let key =
+                    cell_version_key(scope_id, contract_key, &request.cell_id, revision, digest);
+                let cell = meta(db, &key)?.ok_or_else(|| {
+                    Error::new(
+                        "NOT_FOUND",
+                        "exact integration cell revision is not retained",
+                    )
+                })?;
+                (revision, digest.to_owned(), cell)
+            }
+            (None, None) => {
+                let key = text_at(&location, &["cell_record_key"], "cell record key")?;
+                let cell = meta(db, key)?.ok_or_else(|| {
+                    Error::new("NOT_FOUND", "current integration cell is not retained")
+                })?;
+                let revision = int_at(&cell, &["state_revision"], "cell state revision")?;
+                let digest =
+                    text_at(&cell, &["material_digest"], "cell material digest")?.to_owned();
+                (revision, digest, cell)
+            }
+            _ => {
+                return Err(Error::invalid(
+                    "state_revision and material_digest must be supplied together",
+                ));
+            }
+        };
+    if principal.role == Role::Participant
+        && cell["facts"]["member_basis_set"]
+            .as_array()
+            .is_none_or(|members| {
+                !members.iter().any(|member| {
+                    member["client_id"].as_str() == Some(principal.client_id.as_str())
+                })
+            })
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "integration cell is not visible to this participant",
+        ));
+    }
+    let version_prefix = position_prefix(&request.cell_id, state_revision, &material_digest);
+    if let Some(after_revision) = request.after_position_revision
+        && meta(db, &position_record_key(&version_prefix, after_revision))?.is_none()
+    {
+        return Err(Error::invalid(
+            "after_position_id must name a retained position in this exact cell revision",
+        ));
+    }
+    let (positions, next_after) = position_page(
+        db,
+        &version_prefix,
+        request.after_position_revision,
+        request.limit,
+    )?;
+    let current = meta(
+        db,
+        text_at(&location, &["cell_record_key"], "cell record key")?,
+    )?
+    .ok_or_else(|| Error::new("NOT_FOUND", "current integration cell is not retained"))?;
+    let is_current = current["state_revision"] == state_revision
+        && current["material_digest"] == material_digest;
+    let classification = if is_current {
+        let freshness = current_cell_freshness(
+            db,
+            principal,
+            scope_id,
+            &request.task_id,
+            request.task_revision,
+            &request.attempt_id,
+            contract_key,
+            &cell,
+        );
+        let freshness = match freshness {
+            Ok(freshness) => freshness,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "FORBIDDEN"
+                        | "NOT_FOUND"
+                        | "UNAUTHORIZED"
+                        | "STALE_PARTICIPANT"
+                        | "STALE_REVISION"
+                        | "PARTICIPANT_NOT_ASSIGNED"
+                        | "STALE_REVIEW_ASSIGNMENT"
+                ) =>
+            {
+                // The retained cell is still readable, but the live Task or
+                // Attempt scope needed to prove present agreement is stale.
+                CellFreshness::Changed
+            }
+            Err(error) => return Err(error),
+        };
+        match freshness {
+            CellFreshness::Current => classify_agreement(db, &cell, &version_prefix)?,
+            CellFreshness::Changed => {
+                json!({"state":"stale","autonomy":"manager_required","reasons":["cell_participants_or_contract_cards_changed"],"peer_agreed":false})
+            }
+            CellFreshness::Incomplete => {
+                json!({"state":"stale","autonomy":"manager_required","reasons":["current_participant_or_contract_card_coverage_incomplete"],"peer_agreed":false})
+            }
+        }
+    } else {
+        json!({"state":"stale","autonomy":"manager_required","reasons":["retained_cell_revision_is_not_current"],"peer_agreed":false})
+    };
+    Ok(json!({
+        "cell":public_cell(&cell),
+        "positions":{
+            "items":positions,
+            "next_after_position_id":next_after,
+            "limit":request.limit,
+        },
+        "classification":classification,
+        "advisory_only":true,
+        "current":is_current,
+    }))
+}
+
+fn classify_agreement(db: &Connection, cell: &Value, version_prefix: &str) -> Result<Value> {
+    let snapshot = classify_scope_authority(db, cell)?;
+    let members = cell["facts"]["member_basis_set"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut latest = Vec::with_capacity(members.len());
+    let mut dissent = Vec::new();
+    let mut missing = Vec::new();
+    let mut scope_changed = false;
+    for member in &members {
+        let Some(client_id) = member["client_id"].as_str() else {
+            continue;
+        };
+        let head = meta(db, &position_head_key(version_prefix, client_id))?;
+        let Some(head) = head else {
+            missing.push(client_id.to_owned());
+            continue;
+        };
+        let revision = head["position_revision"].as_i64().unwrap_or(0);
+        let position =
+            meta(db, &position_record_key(version_prefix, revision))?.ok_or_else(|| {
+                Error::new(
+                    "STORE_INVARIANT",
+                    "agreement position head is missing its immutable record",
+                )
+            })?;
+        if position["actor_client_id"] != client_id
+            || position["state_revision"] != cell["state_revision"]
+            || position["material_digest"] != cell["material_digest"]
+            || position["membership_digest"] != cell["membership_digest"]
+        {
+            return Err(Error::new(
+                "STORE_INVARIANT",
+                "agreement position does not match its exact retained cell",
+            ));
+        }
+        if position["decision"] == "dissent" {
+            dissent.push(client_id.to_owned());
+        }
+        if position["autonomy_digest"] != snapshot["autonomy_digest"]
+            || position["scope_refs"] != snapshot["scope_refs"]
+        {
+            scope_changed = true;
+        }
+        latest.push(public_position(&position));
+    }
+    let facts = &cell["facts"];
+    let mut reasons = snapshot["reasons"].as_array().cloned().unwrap_or_default();
+    if cell["state"] != "compatible"
+        || facts["coverage"] != "complete"
+        || facts["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+    {
+        reasons.push(json!("cell_comparison_incomplete_or_noncompatible"));
+    }
+    if !dissent.is_empty() {
+        return Ok(json!({
+            "state":"dissent",
+            "autonomy":"manager_required",
+            "reasons":["affected_participant_dissent"],
+            "dissenting_client_ids":dissent,
+            "missing_client_ids":missing,
+            "scope_refs":snapshot["scope_refs"],
+            "latest_positions":latest,
+            "peer_agreed":false,
+        }));
+    }
+    if snapshot["autonomy"] != "peer_local" {
+        return Ok(json!({
+            "state":"pending_manager",
+            "autonomy":"manager_required",
+            "reasons":reasons,
+            "unrepresented_owner_client_ids":snapshot["unrepresented_owner_client_ids"],
+            "unknown_dimensions":snapshot["unknown_dimensions"],
+            "scope_refs":snapshot["scope_refs"],
+            "missing_client_ids":missing,
+            "latest_positions":latest,
+            "peer_agreed":false,
+        }));
+    }
+    if cell["state"] != "compatible"
+        || facts["coverage"] != "complete"
+        || facts["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+    {
+        return Ok(json!({
+            "state":"pending_manager",
+            "autonomy":"manager_required",
+            "reasons":reasons,
+            "scope_refs":snapshot["scope_refs"],
+            "missing_client_ids":missing,
+            "latest_positions":latest,
+            "peer_agreed":false,
+        }));
+    }
+    if members.len() < 2 {
+        return Ok(json!({
+            "state":"pending_manager",
+            "autonomy":"manager_required",
+            "reasons":["no_second_affected_owner"],
+            "scope_refs":snapshot["scope_refs"],
+            "missing_client_ids":missing,
+            "latest_positions":latest,
+            "peer_agreed":false,
+        }));
+    }
+    if scope_changed {
+        return Ok(json!({
+            "state":"pending_manager",
+            "autonomy":"manager_required",
+            "reasons":["autonomy_scope_digest_changed_after_acknowledgement"],
+            "scope_refs":snapshot["scope_refs"],
+            "missing_client_ids":missing,
+            "latest_positions":latest,
+            "peer_agreed":false,
+        }));
+    }
+    if !missing.is_empty() {
+        return Ok(json!({
+            "state":"pending",
+            "autonomy":"peer_local",
+            "reasons":["awaiting_all_affected_current_participants"],
+            "scope_refs":snapshot["scope_refs"],
+            "missing_client_ids":missing,
+            "latest_positions":latest,
+            "peer_agreed":false,
+        }));
+    }
+    Ok(json!({
+        "state":"peer_agreed",
+        "autonomy":"peer_local",
+        "reasons":[],
+        "scope_refs":snapshot["scope_refs"],
+        "autonomy_digest":snapshot["autonomy_digest"],
+        "latest_positions":latest,
+        "peer_agreed":true,
+        "advisory_only":true,
+    }))
+}
+
+fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
+    let facts = &cell["facts"];
+    let task_revision_fact = facts["task_revision_set"]
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| Error::new("STORE_INVARIANT", "cell Task revision set is missing"))?;
+    let task_id = text_at(task_revision_fact, &["task_id"], "cell Task id")?;
+    let task_revision = task_revision_fact["task_revision"]
+        .as_i64()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| Error::new("STORE_INVARIANT", "cell Task revision is missing"))?;
+    let attempt_id = text_at(facts, &["attempt_id"], "cell Attempt id")?;
+    let scope_evidence =
+        super::code_scopes::current_scope_revisions(db, task_id, task_revision, attempt_id)?;
+    let members = facts["member_basis_set"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let member_ids = members
+        .iter()
+        .filter_map(|member| member["client_id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let mut required_by_owner = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+    let contract_key = text_at(facts, &["contract_key"], "cell contract key")?.to_owned();
+    for client_id in &member_ids {
+        required_by_owner
+            .entry(client_id.clone())
+            .or_default()
+            .insert(("interface".to_owned(), contract_key.clone()));
+    }
+    for item in facts["offers"].as_array().into_iter().flatten() {
+        let Some(client_id) = item["client_id"].as_str() else {
+            continue;
+        };
+        let terms = required_by_owner.entry(client_id.to_owned()).or_default();
+        if let Some(path) = item
+            .pointer("/offer/will_be_available_at/path")
+            .and_then(Value::as_str)
+        {
+            terms.insert(("path".to_owned(), path.to_owned()));
+        }
+        if let Some(symbol) = item
+            .pointer("/offer/will_be_available_at/symbol")
+            .and_then(Value::as_str)
+        {
+            terms.insert(("symbol".to_owned(), symbol.to_owned()));
+        }
+    }
+    for item in facts["requirements"].as_array().into_iter().flatten() {
+        let Some(client_id) = item["client_id"].as_str() else {
+            continue;
+        };
+        let terms = required_by_owner.entry(client_id.to_owned()).or_default();
+        if let Some(path) = item
+            .pointer("/requirement/consumer_path")
+            .and_then(Value::as_str)
+        {
+            terms.insert(("path".to_owned(), path.to_owned()));
+        }
+        if let Some(symbol) = item
+            .pointer("/requirement/consumer_symbol")
+            .and_then(Value::as_str)
+        {
+            terms.insert(("symbol".to_owned(), symbol.to_owned()));
+        }
+    }
+    let mut reasons = BTreeSet::new();
+    if scope_evidence["task_id"] != task_id
+        || scope_evidence["task_revision"] != task_revision
+        || scope_evidence["attempt_id"] != attempt_id
+    {
+        reasons.insert("scope_evidence_scope_mismatch".to_owned());
+    }
+    if scope_evidence["coverage"] != "complete"
+        || scope_evidence["gaps"]
+            .as_array()
+            .is_none_or(|gaps| !gaps.is_empty())
+    {
+        reasons.insert("current_scope_coverage_incomplete".to_owned());
+    }
+    let scopes = scope_evidence["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut scope_refs = BTreeMap::<String, Value>::new();
+    let mut unrepresented = BTreeSet::new();
+    let mut unknown_dimensions = BTreeSet::new();
+    let mut terms = BTreeSet::<(String, String)>::new();
+    for owned_terms in required_by_owner.values() {
+        terms.extend(owned_terms.iter().cloned());
+    }
+    let mut scopes_by_owner = BTreeMap::<String, Vec<&Value>>::new();
+    for scope in &scopes {
+        if scope["state"] != "active" {
+            reasons.insert("scope_state_not_active".to_owned());
+            continue;
+        }
+        let Some(owner_id) = scope["owner_client_id"].as_str() else {
+            reasons.insert("scope_owner_missing".to_owned());
+            continue;
+        };
+        if scope.pointer("/actor/client_id").and_then(Value::as_str) != Some(owner_id) {
+            reasons.insert("scope_actor_owner_mismatch".to_owned());
+            continue;
+        }
+        if scope["paths"].as_array().is_some_and(|paths| {
+            paths.iter().filter_map(Value::as_str).any(|path| {
+                path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
+            })
+        }) {
+            reasons.insert("scope_glob_requires_manager_review".to_owned());
+        }
+        scopes_by_owner
+            .entry(owner_id.to_owned())
+            .or_default()
+            .push(scope);
+        if scope_intersects_terms(scope, &terms) && !member_ids.contains(owner_id) {
+            unrepresented.insert(owner_id.to_owned());
+        }
+    }
+    if !unrepresented.is_empty() {
+        reasons.insert("unrepresented_scope_owner".to_owned());
+    }
+    let mut matching_scopes = Vec::new();
+    for member in &members {
+        let Some(client_id) = member["client_id"].as_str() else {
+            reasons.insert("affected_owner_identity_missing".to_owned());
+            continue;
+        };
+        let Some(owner_scopes) = scopes_by_owner.get(client_id) else {
+            reasons.insert("affected_owner_scope_missing".to_owned());
+            continue;
+        };
+        if !owner_scopes.iter().any(|scope| {
+            scope.get("participation_basis") == member.get("participation_basis")
+                && scope.pointer("/actor/client_id").and_then(Value::as_str) == Some(client_id)
+        }) {
+            reasons.insert("affected_owner_scope_basis_stale".to_owned());
+            continue;
+        }
+        let required = required_by_owner
+            .get(client_id)
+            .cloned()
+            .unwrap_or_default();
+        if required.is_empty()
+            || required.iter().any(|term| {
+                !owner_scopes
+                    .iter()
+                    .any(|scope| scope_covers_term(scope, term))
+            })
+        {
+            reasons.insert("affected_scope_does_not_cover_exact_integration_terms".to_owned());
+            continue;
+        }
+        for scope in owner_scopes {
+            if required.iter().any(|term| scope_covers_term(scope, term)) {
+                let scope_id = scope["scope_intent_id"].as_str().unwrap_or_default();
+                let state_revision = scope["state_revision"].as_i64().unwrap_or(0);
+                let digest = scope["digest"].as_str().unwrap_or_default();
+                if scope_id.is_empty() || state_revision <= 0 || !is_lower_hex_digest(digest) {
+                    reasons.insert("scope_reference_incomplete".to_owned());
+                    continue;
+                }
+                scope_refs.insert(
+                    format!("{scope_id}:{state_revision}:{digest}"),
+                    json!({
+                        "scope_intent_id":scope_id,
+                        "state_revision":state_revision,
+                        "digest":digest,
+                        "owner_client_id":client_id,
+                    }),
+                );
+                matching_scopes.push(*scope);
+            }
+        }
+    }
+    for comparison in facts["comparisons"].as_array().into_iter().flatten() {
+        if comparison["status"] == "unknown" {
+            for dimension in comparison["dimensions"].as_array().into_iter().flatten() {
+                if dimension["counts"]["unknown"]
+                    .as_i64()
+                    .is_some_and(|count| count > 0)
+                    && let Some(name) = dimension["dimension"].as_str()
+                {
+                    unknown_dimensions.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    for left_index in 0..matching_scopes.len() {
+        for right_index in (left_index + 1)..matching_scopes.len() {
+            let left = matching_scopes[left_index];
+            let right = matching_scopes[right_index];
+            if left["owner_client_id"] == right["owner_client_id"]
+                || (left["mode"] != "exclusive_edit" && right["mode"] != "exclusive_edit")
+            {
+                continue;
+            }
+            if scope_terms_overlap(left, right) {
+                reasons.insert("active_exclusive_scope_overlap".to_owned());
+            }
+        }
+    }
+    if cell["state"] != "compatible"
+        || facts["coverage"] != "complete"
+        || facts["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+    {
+        reasons.insert("cell_comparison_incomplete_or_noncompatible".to_owned());
+    }
+    if member_ids.len() < 2 {
+        reasons.insert("no_second_affected_owner".to_owned());
+    }
+    let autonomy = if reasons.is_empty() {
+        "peer_local"
+    } else {
+        "manager_required"
+    };
+    let scope_refs = scope_refs.into_values().collect::<Vec<_>>();
+    let proof = json!({
+        "cell_id":cell["cell_id"],
+        "state_revision":cell["state_revision"],
+        "material_digest":cell["material_digest"],
+        "membership_digest":cell["membership_digest"],
+        "autonomy":autonomy,
+        "reasons":reasons,
+        "scope_refs":scope_refs,
+    });
+    let autonomy_digest = digest(&proof)?;
+    Ok(json!({
+        "autonomy":autonomy,
+        "reasons":proof["reasons"],
+        "scope_refs":proof["scope_refs"],
+        "unrepresented_owner_client_ids":unrepresented,
+        "unknown_dimensions":unknown_dimensions,
+        "canonical_sources":facts["canonical_sources"],
+        "autonomy_digest":autonomy_digest,
+    }))
+}
+
+fn scope_term_set(scope: &Value) -> BTreeSet<(String, String)> {
+    let mut terms = BTreeSet::new();
+    for (field, kind) in [
+        ("paths", "path"),
+        ("symbols", "symbol"),
+        ("interfaces", "interface"),
+    ] {
+        if let Some(values) = scope.get(field).and_then(Value::as_array) {
+            for value in values.iter().filter_map(Value::as_str) {
+                terms.insert((kind.to_owned(), value.to_owned()));
+            }
+        }
+    }
+    terms
+}
+
+fn scope_intersects_terms(scope: &Value, terms: &BTreeSet<(String, String)>) -> bool {
+    terms.iter().any(|term| scope_covers_term(scope, term))
+        || scope_term_set(scope)
+            .iter()
+            .any(|declared| terms.iter().any(|term| terms_overlap(declared, term)))
+}
+
+fn scope_covers_term(scope: &Value, term: &(String, String)) -> bool {
+    let values = scope
+        .get(match term.0.as_str() {
+            "path" => "paths",
+            "symbol" => "symbols",
+            "interface" => "interfaces",
+            _ => return false,
+        })
+        .and_then(Value::as_array);
+    values.is_some_and(|values| {
+        values.iter().filter_map(Value::as_str).any(|declared| {
+            if term.0 == "path" {
+                path_scope_covers(declared, &term.1)
+            } else {
+                declared == term.1
+            }
+        })
+    })
+}
+
+fn scope_terms_overlap(left: &Value, right: &Value) -> bool {
+    scope_term_set(left).iter().any(|left_term| {
+        scope_term_set(right)
+            .iter()
+            .any(|right_term| terms_overlap(left_term, right_term))
+    }) || [left, right].iter().any(|scope| {
+        scope["paths"].as_array().is_some_and(|paths| {
+            paths.iter().filter_map(Value::as_str).any(|path| {
+                path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
+            })
+        })
+    })
+}
+
+fn terms_overlap(left: &(String, String), right: &(String, String)) -> bool {
+    if left.0 != right.0 {
+        return false;
+    }
+    if left.0 != "path" {
+        return left.1 == right.1;
+    }
+    path_scope_covers(&left.1, &right.1) || path_scope_covers(&right.1, &left.1)
+}
+
+fn path_scope_covers(declared: &str, target: &str) -> bool {
+    if declared.contains('*')
+        || declared.contains('?')
+        || declared.contains('[')
+        || declared.contains('{')
+    {
+        return false;
+    }
+    target == declared || target.starts_with(&format!("{}/", declared.trim_end_matches('/')))
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn public_position(position: &Value) -> Value {
+    json!({
+        "position_id":position["position_id"],
+        "position_revision":position["position_revision"],
+        "cell_id":position["cell_id"],
+        "state_revision":position["state_revision"],
+        "material_digest":position["material_digest"],
+        "membership_digest":position["membership_digest"],
+        "task_id":position["task_id"],
+        "task_revision":position["task_revision"],
+        "attempt_id":position["attempt_id"],
+        "actor_client_id":position["actor_client_id"],
+        "participation_basis_kind":position.pointer("/participation_basis/kind").cloned().unwrap_or(Value::Null),
+        "decision":position["decision"],
+        "autonomy_digest":position["autonomy_digest"],
+        "scope_refs":position["scope_refs"],
+        "operation_id":position["operation_id"],
+        "created_at_ms":position["created_at_ms"],
+    })
+}
+
+fn position_page(
+    db: &Connection,
+    prefix: &str,
+    after_revision: Option<i64>,
+    limit: i64,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let record_prefix = format!("{prefix}:position:");
+    let after_key = after_revision.map(|revision| position_record_key(prefix, revision));
+    let mut statement = db.prepare(
+        "SELECT key,value_json FROM meta WHERE substr(key,1,length(?1))=?1 AND (?2 IS NULL OR key>?2) ORDER BY key LIMIT ?3",
+    )?;
+    let rows = statement
+        .query_map(params![record_prefix, after_key, limit + 1], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = rows.len() > limit as usize;
+    let mut items = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(|(_, raw)| {
+            serde_json::from_str::<Value>(&raw).map(|position| public_position(&position))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let next_after = if has_more {
+        items
+            .last()
+            .and_then(|position| position["position_id"].as_str())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    Ok((std::mem::take(&mut items), next_after))
+}
+
+fn retain_cell_version(
+    tx: &Transaction<'_>,
+    scope_id: &str,
+    contract_key: &str,
+    cell: &Value,
+) -> Result<()> {
+    let cell_id = text_at(cell, &["cell_id"], "cell id")?;
+    let revision = int_at(cell, &["state_revision"], "cell state revision")?;
+    let digest = text_at(cell, &["material_digest"], "cell material digest")?;
+    let key = cell_version_key(scope_id, contract_key, cell_id, revision, digest);
+    if meta(tx, &key)?.is_none() {
+        set_meta(tx, &key, cell)?;
+    }
+    Ok(())
+}
+
+fn cell_location(db: &Connection, cell_id: &str) -> Result<Value> {
+    let location = meta(db, &cell_id_index_key(cell_id))?
+        .ok_or_else(|| Error::new("NOT_FOUND", "integration cell is not retained"))?;
+    if location["cell_id"] != cell_id {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "cell ID index points to another integration cell",
+        ));
+    }
+    Ok(location)
+}
+
+fn authorize_retained_cell_read(
+    db: &Connection,
+    principal: &Principal,
+    request: &wire::AgreementGetRequest,
+    location: &Value,
+) -> Result<()> {
+    let task = super::tasks::get_task(db, &request.task_id)?;
+    let retained_attempt = super::tasks::get_attempt(db, &request.attempt_id)?;
+    let expected_scope_id =
+        keys::scope_id(&request.task_id, request.task_revision, &request.attempt_id)?;
+    if task["task_id"] != request.task_id
+        || retained_attempt["task_id"] != request.task_id
+        || retained_attempt["task_revision"] != request.task_revision
+        || location["scope_id"] != expected_scope_id
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "retained integration cell does not match an actual Task/Attempt pair",
+        ));
+    }
+
+    let current = super::current_principal(db, principal.clone())?;
+    match current.role {
+        Role::Operator => super::require_local_operator(db, &current.client_id),
+        Role::Manager => {
+            match super::gm::require_authority(db, &current) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code == "FORBIDDEN" => {}
+                Err(error) => return Err(error),
+            }
+            if retained_attempt["owner_id"] == current.client_id {
+                return Ok(());
+            }
+            if task["state"] == "open"
+                && let Some(current_attempt_id) = task["current_attempt_id"].as_str()
+            {
+                let current_attempt = super::tasks::get_attempt(db, current_attempt_id)?;
+                if current_attempt["attempt_id"] == current_attempt_id
+                    && current_attempt["task_id"] == request.task_id
+                    && current_attempt["task_revision"] == task["revision"]
+                    && current_attempt["released_at_ms"].is_null()
+                    && current_attempt["owner_id"] == current.client_id
+                {
+                    return Ok(());
+                }
+            }
+            Err(Error::new(
+                "FORBIDDEN",
+                "current GM, current Task manager, retained Attempt owner, or local Operator authority required",
+            ))
+        }
+        _ => Err(Error::new(
+            "FORBIDDEN",
+            "integration cell history requires a current Manager or local Operator",
+        )),
+    }
+}
+
+pub(super) fn authorize_operation_read(
+    db: &Connection,
+    principal: &Principal,
+    operation_id: &str,
+) -> Result<()> {
+    if principal.role != Role::Participant {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "participant operation receipt authorization required",
+        ));
+    }
+    let row: Option<(String, String, String, String, Option<String>)> = db
+        .query_row(
+            "SELECT caller_id,method,state,original_request_json,result_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((caller_id, method, state, raw_request, raw_result)) = row else {
+        return Err(Error::new("NOT_FOUND", format!("Operation {operation_id}")));
+    };
+    if caller_id != principal.client_id || method != "coordination.integration.ack" {
+        return Err(Error::new("NOT_FOUND", format!("Operation {operation_id}")));
+    }
+    if state == "rejected" {
+        // Rejection receipts are caller-owned. Their original request may name
+        // a foreign or absent cell, so readback must not resolve it.
+        return Ok(());
+    }
+    let result = raw_result
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if result.get("code").is_some()
+        || result.get("error").is_some()
+        || result.pointer("/failure/code").is_some()
+    {
+        // Failed ACKs are caller-owned receipts. Their original request may
+        // name a foreign or absent cell, so readback must not resolve it.
+        return Ok(());
+    }
+    let request: Value = serde_json::from_str(&raw_request)?;
+    let ack = wire::AckRequest::parse(&request)?;
+    let location = cell_location(db, &ack.cell_id)?;
+    if location["task_id"] != ack.task_id
+        || location["task_revision"] != ack.task_revision
+        || location["attempt_id"] != ack.attempt_id
+    {
+        return Err(Error::new("NOT_FOUND", format!("Operation {operation_id}")));
+    }
+    let version = meta(
+        db,
+        &cell_version_key(
+            text_at(&location, &["scope_id"], "scope id")?,
+            text_at(&location, &["contract_key"], "contract key")?,
+            &ack.cell_id,
+            ack.expected_state_revision,
+            &ack.expected_material_digest,
+        ),
+    )?
+    .ok_or_else(|| Error::new("NOT_FOUND", format!("Operation {operation_id}")))?;
+    let member = version["facts"]["member_basis_set"]
+        .as_array()
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| member["client_id"].as_str() == Some(principal.client_id.as_str()))
+        });
+    if !member {
+        return Err(Error::new("NOT_FOUND", format!("Operation {operation_id}")));
+    }
+    Ok(())
 }
 
 fn current_members(
@@ -1223,6 +2241,20 @@ fn current_cell_freshness(
         {
             return Ok(CellFreshness::Changed);
         }
+        if principal.role == Role::Participant {
+            let current_basis = item.get("participation_basis");
+            let retained_basis = cell["facts"]["member_basis_set"]
+                .as_array()
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find(|member| member["client_id"].as_str() == Some(client_id))
+                })
+                .and_then(|member| member.get("participation_basis"));
+            if current_basis.is_none() || current_basis != retained_basis {
+                return Ok(CellFreshness::Changed);
+            }
+        }
         let Some(card_revision) = card.get("card_revision").and_then(Value::as_i64) else {
             return Ok(CellFreshness::Incomplete);
         };
@@ -1444,6 +2476,48 @@ fn cell_record_key(scope_id: &str, contract_key: &str, cell_id: &str) -> String 
         keys::key_component(contract_key),
         keys::key_component(cell_id),
     )
+}
+
+fn cell_version_key(
+    scope_id: &str,
+    contract_key: &str,
+    cell_id: &str,
+    state_revision: i64,
+    material_digest: &str,
+) -> String {
+    format!(
+        "coordination:integration-cell-version:v1:{scope_id}:{}:{}:{state_revision}:{}",
+        keys::key_component(contract_key),
+        keys::key_component(cell_id),
+        keys::key_component(material_digest),
+    )
+}
+
+fn cell_id_index_key(cell_id: &str) -> String {
+    format!(
+        "coordination:integration-cell-id:v1:{}",
+        keys::key_component(cell_id),
+    )
+}
+
+fn position_prefix(cell_id: &str, state_revision: i64, material_digest: &str) -> String {
+    format!(
+        "coordination:integration-position:v1:{}:{state_revision}:{}",
+        keys::key_component(cell_id),
+        keys::key_component(material_digest),
+    )
+}
+
+fn position_counter_key(prefix: &str) -> String {
+    format!("{prefix}:counter")
+}
+
+fn position_record_key(prefix: &str, revision: i64) -> String {
+    format!("{prefix}:position:p{revision:020}")
+}
+
+fn position_head_key(prefix: &str, client_id: &str) -> String {
+    format!("{prefix}:head:{}", keys::key_component(client_id))
 }
 
 fn digest(value: &Value) -> Result<String> {

@@ -1,0 +1,421 @@
+//! Durable, exact-scope Manager decisions for retained contract revisions.
+//!
+//! Proposal bodies remain immutable in the proposal lane. This module stores
+//! one decision per exact proposal revision in existing `meta`, plus a
+//! metadata-only Thread page index and an ID-only Observation hint.
+
+use super::{code_scopes, gm, meta, set_meta, tasks};
+use crate::{
+    coordination::contract_decision as wire,
+    error::{Error, Result},
+    model::{self, Principal, Role},
+};
+use rusqlite::{Connection, Transaction, params};
+use serde_json::{Value, json};
+use swarm_contracts::coordination_limits as limits;
+
+const DECISION_PREFIX: &str = "coordination:contract-decision:";
+
+/// Apply either exact contract decision inside the Store's existing mutation
+/// transaction. All authority and CAS checks are repeated at commit time.
+pub(crate) fn apply(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    method: &str,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let (kind, request) = wire::parse_request(method, value)?;
+    let context = super::coordination_threads::authorize_current_thread_mutation(
+        tx,
+        principal,
+        &request.thread_id,
+    )?;
+    if context.topic_kind != "contract" {
+        return Err(Error::new("NOT_FOUND", "contract decision requires a contract Thread"));
+    }
+    if context.state != "open" || context.state_revision != request.expected_state_revision {
+        return Err(Error::new(
+            "STALE_THREAD_REVISION",
+            "decision must name the current open Thread revision",
+        ));
+    }
+    if !matches!(&principal.role, Role::Manager | Role::Operator) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "contract decisions require the current Attempt owner, current GM, or local Operator",
+        ));
+    }
+    if context.task_id != request.task_id
+        || context.task_revision != request.task_revision
+        || context.attempt_id != request.attempt_id
+    {
+        return Err(Error::new(
+            "STALE_THREAD_SCOPE",
+            "decision must name the Thread's exact Task and Attempt",
+        ));
+    }
+
+    let task = tasks::get_task(tx, &request.task_id)?;
+    let attempt = tasks::get_attempt(tx, &request.attempt_id)?;
+    if task["task_id"] != request.task_id
+        || task["revision"] != request.task_revision
+        || task["state"] != "open"
+        || task["current_attempt_id"] != request.attempt_id
+        || attempt["task_id"] != request.task_id
+        || attempt["task_revision"] != request.task_revision
+        || !attempt["released_at_ms"].is_null()
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "contract decision requires the exact current open Task revision and unreleased Attempt",
+        ));
+    }
+    gm::require_attempt_control(tx, principal, &attempt)?;
+    let (authority_basis, gm_epoch) = decision_authority(tx, principal, &attempt)?;
+
+    let proposal = load_current_proposal(tx, &context, &request)?;
+    let current_scopes = code_scopes::current_scope_revisions(
+        tx,
+        &request.task_id,
+        request.task_revision,
+        &request.attempt_id,
+    )?;
+    let expected_scope_refs = affected_scope_refs(&current_scopes, &proposal["proposal"]["affected"])?;
+    if current_scopes["coverage"] != "complete" {
+        return Err(Error::new(
+            "SCOPE_COVERAGE_INCOMPLETE",
+            "affected accepted code scopes are not completely available for this decision",
+        ));
+    }
+    let supplied_scope_refs = request
+        .affected_scope_revisions
+        .iter()
+        .map(wire::ScopeRevisionRef::to_value)
+        .collect::<Vec<_>>();
+    let expected_scope_values = expected_scope_refs
+        .iter()
+        .map(wire::ScopeRevisionRef::to_value)
+        .collect::<Vec<_>>();
+    if supplied_scope_refs != expected_scope_values {
+        return Err(Error::new(
+            "STALE_SCOPE",
+            "affected_scope_revisions must match every current relevant accepted scope revision",
+        ));
+    }
+
+    let record_key = decision_record_key(&request.proposal_id, &request.proposal_revision_id);
+    if meta(tx, &record_key)?.is_some() {
+        return Err(Error::conflict(
+            "this immutable proposal revision already has a contract decision",
+        ));
+    }
+    let mut record = json!({
+        "schema_version": 1,
+        "record_type": "contract_decision",
+        "decision": kind.as_str(),
+        "decision_operation_id": operation_id,
+        "thread_id": request.thread_id,
+        "thread_state_revision": request.expected_state_revision,
+        "proposal_id": request.proposal_id,
+        "proposal_revision_id": request.proposal_revision_id,
+        "proposal_digest": request.proposal_digest,
+        "task_id": request.task_id,
+        "task_revision": request.task_revision,
+        "attempt_id": request.attempt_id,
+        "attempt_owner_id": attempt["owner_id"],
+        "decision_actor": {
+            "client_id": principal.client_id,
+            "role": match &principal.role { Role::Operator => "operator", _ => "manager" },
+            "authority_basis": authority_basis,
+            "gm_epoch": gm_epoch,
+        },
+        "affected_scope_revisions": expected_scope_values,
+        "scope_coverage": "complete",
+        "reason": request.reason,
+        "conditions": request.conditions,
+        "caveats": request.caveats,
+        "created_at_ms": now,
+        "model_work_started": false,
+        "native_execution": false,
+    });
+    // The searchable event contains identifiers only. The manager rationale,
+    // conditions, caveats, and scope snapshot remain in the scoped meta record.
+    let event_payload = json!({
+        "thread_id":request.thread_id,
+        "proposal_id":request.proposal_id,
+        "proposal_revision_id":request.proposal_revision_id,
+        "decision_operation_id":operation_id,
+    });
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            format!("coordination:proposal:{}", request.proposal_id),
+            format!("decision:{}", request.proposal_revision_id),
+            operation_id,
+            kind.observation_kind(),
+            model::canonical(&event_payload)?,
+            now,
+        ],
+    )?;
+    let observation_id = tx.last_insert_rowid();
+    record["decision_observation_id"] = json!(observation_id);
+    let encoded_record = model::canonical(&record)?;
+    if encoded_record.len() > limits::MAX_COORDINATION_REQUEST_BYTES {
+        return Err(Error::invalid("retained contract decision exceeds 65536 bytes"));
+    }
+    set_meta(tx, &record_key, &record)?;
+
+    Ok(json!({
+        "operation_id":operation_id,
+        "decision_operation_id":operation_id,
+        "decision_observation_id":observation_id,
+        "decision":kind.as_str(),
+        "thread_id":request.thread_id,
+        "thread_state_revision":request.expected_state_revision,
+        "proposal_id":request.proposal_id,
+        "proposal_revision_id":request.proposal_revision_id,
+        "proposal_digest":request.proposal_digest,
+        "task_id":request.task_id,
+        "task_revision":request.task_revision,
+        "attempt_id":request.attempt_id,
+        "scope_coverage":"complete",
+        "changed":true,
+        "model_work_started":false,
+        "native_execution":false,
+    }))
+}
+
+/// Read the full immutable decision for one retained proposal revision.
+/// Callers must already expose this through a Thread-authorized contract read.
+pub(crate) fn read_for_revision(
+    db: &Connection,
+    principal: &Principal,
+    thread_id: &str,
+    proposal_id: &str,
+    proposal_revision_id: &str,
+) -> Result<Value> {
+    let context = super::coordination_threads::authorize_retained_thread_read(db, principal, thread_id)?;
+    if context.topic_kind != "contract" {
+        return Err(Error::new("NOT_FOUND", "contract decision is outside this Thread"));
+    }
+    let pointer = meta(db, &proposal_pointer_key(proposal_revision_id))?
+        .ok_or_else(|| Error::new("CONTRACT_PROPOSAL_NOT_FOUND", "proposal revision is not retained"))?;
+    if pointer["proposal_id"] != proposal_id || pointer["thread_id"] != thread_id {
+        return Err(Error::new("NOT_FOUND", "proposal revision is outside this Thread"));
+    }
+    let key = decision_record_key(proposal_id, proposal_revision_id);
+    let Some(record) = meta(db, &key)? else {
+        return Ok(json!({"decision":null,"coverage":"complete_for_revision"}));
+    };
+    verify_decision_record(&record, thread_id, proposal_id, proposal_revision_id)?;
+    Ok(json!({"decision":record,"coverage":"complete_for_revision"}))
+}
+
+fn load_current_proposal(
+    db: &Connection,
+    context: &super::coordination_threads::ThreadContext,
+    request: &wire::DecisionRequest,
+) -> Result<Value> {
+    let pointer = meta(db, &proposal_pointer_key(&request.proposal_revision_id))?
+        .ok_or_else(|| Error::new("CONTRACT_PROPOSAL_NOT_FOUND", "proposal revision is not retained"))?;
+    if pointer["proposal_id"] != request.proposal_id
+        || pointer["thread_id"] != context.thread_id
+    {
+        return Err(Error::new("NOT_FOUND", "proposal revision is outside this Thread"));
+    }
+    let head = meta(db, &proposal_head_key(&request.proposal_id))?
+        .ok_or_else(|| Error::new("CONTRACT_PROPOSAL_NOT_FOUND", "proposal is not retained"))?;
+    if head["thread_id"] != context.thread_id
+        || head["latest_revision_id"] != request.proposal_revision_id
+        || head["latest_digest"] != request.proposal_digest
+    {
+        return Err(Error::new(
+            "STALE_CONTRACT_REVISION",
+            "decision must name the exact current proposal revision and digest",
+        ));
+    }
+    let revision = meta(db, &proposal_revision_key(&request.proposal_id, &request.proposal_revision_id))?
+        .ok_or_else(|| Error::new("COORDINATION_INDEX_CORRUPT", "proposal head has no immutable revision"))?;
+    if revision["record_type"] != "contract_proposal_revision"
+        || revision["proposal_id"] != request.proposal_id
+        || revision["proposal_revision_id"] != request.proposal_revision_id
+        || revision["thread_id"] != context.thread_id
+        || revision["task_id"] != request.task_id
+        || revision["task_revision"] != request.task_revision
+        || revision["attempt_id"] != request.attempt_id
+        || revision["proposal_digest"] != request.proposal_digest
+        || pointer["revision"] != revision["revision"]
+    {
+        return Err(Error::new("COORDINATION_INDEX_CORRUPT", "proposal revision identity or scope differs"));
+    }
+    let canonical_proposal = model::canonical(&revision["proposal"])?;
+    if model::digest(canonical_proposal.as_bytes()) != request.proposal_digest {
+        return Err(Error::new("COORDINATION_INDEX_CORRUPT", "proposal digest does not match its immutable body"));
+    }
+    Ok(revision)
+}
+
+fn decision_authority(
+    db: &Connection,
+    principal: &Principal,
+    attempt: &Value,
+) -> Result<(&'static str, Option<i64>)> {
+    if principal.role == Role::Operator {
+        return Ok(("local_operator", None));
+    }
+    let owner_id = model::text(attempt, "owner_id")?;
+    if principal.client_id == owner_id {
+        return Ok(("attempt_owner", None));
+    }
+    if principal.role == Role::Manager {
+        if let Some(record) = gm::record(db)?
+            && record["client_id"] == principal.client_id
+        {
+            let epoch = record["epoch"].as_i64().filter(|epoch| *epoch > 0)
+                .ok_or_else(|| Error::new("GM_RECORD_DAMAGED", "current GM epoch is invalid"))?;
+            return Ok(("current_gm", Some(epoch)));
+        }
+    }
+    Err(Error::new("FORBIDDEN", "current Attempt owner, current GM, or local Operator authority required"))
+}
+
+fn affected_scope_refs(snapshot: &Value, affected: &Value) -> Result<Vec<wire::ScopeRevisionRef>> {
+    if snapshot["coverage"] != "complete" {
+        return Err(Error::new(
+            "SCOPE_COVERAGE_INCOMPLETE",
+            "current affected code-scope coverage is partial or unavailable",
+        ));
+    }
+    let scopes = snapshot["items"].as_array()
+        .ok_or_else(|| Error::new("COORDINATION_INDEX_CORRUPT", "scope snapshot has no item list"))?;
+    let paths = text_values(&affected["paths"], "proposal affected paths")?;
+    let symbols = text_values(&affected["symbols"], "proposal affected symbols")?;
+    let schemas = text_values(&affected["schemas"], "proposal affected schemas")?;
+    let mut refs = Vec::new();
+    for scope in scopes {
+        if scope["state"] != "active" {
+            return Err(Error::new("COORDINATION_INDEX_CORRUPT", "scope snapshot contains a non-active scope"));
+        }
+        let scope_paths = text_values(&scope["paths"], "accepted scope paths")?;
+        let scope_symbols = text_values(&scope["symbols"], "accepted scope symbols")?;
+        let scope_interfaces = text_values(&scope["interfaces"], "accepted scope interfaces")?;
+        let mut relevant = intersects(&scope_symbols, &symbols) || intersects(&scope_interfaces, &schemas);
+        let mut unknown_path_relation = false;
+        for scope_path in &scope_paths {
+            for affected_path in &paths {
+                match path_overlap(scope_path, affected_path) {
+                    Some(true) => relevant = true,
+                    Some(false) => {}
+                    None => unknown_path_relation = true,
+                }
+            }
+        }
+        if unknown_path_relation && !relevant {
+            return Err(Error::new(
+                "SCOPE_COVERAGE_INCOMPLETE",
+                "an accepted path scope cannot be conservatively classified against the proposal",
+            ));
+        }
+        if relevant {
+            refs.push(wire::ScopeRevisionRef {
+                scope_intent_id: model::text(scope, "scope_intent_id")?.to_owned(),
+                state_revision: model::positive(scope, "state_revision")?,
+                digest: model::text(scope, "digest")?.to_owned(),
+            });
+        }
+    }
+    refs.sort_by(|left, right| left.scope_intent_id.cmp(&right.scope_intent_id));
+    if refs.windows(2).any(|pair| pair[0].scope_intent_id == pair[1].scope_intent_id) {
+        return Err(Error::new("COORDINATION_INDEX_CORRUPT", "scope snapshot repeats a scope intent"));
+    }
+    Ok(refs)
+}
+
+fn text_values(value: &Value, label: &str) -> Result<Vec<String>> {
+    value.as_array()
+        .ok_or_else(|| Error::new("COORDINATION_INDEX_CORRUPT", format!("{label} are not an array")))?
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned)
+            .ok_or_else(|| Error::new("COORDINATION_INDEX_CORRUPT", format!("{label} contain non-text"))))
+        .collect()
+}
+
+fn intersects(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|value| right.iter().any(|other| value == other))
+}
+
+/// Match the v1 scope evaluator: exact terms, terminal `/**` prefixes, and
+/// broad `**` forms are determinate; unsupported globs remain unknown.
+fn path_overlap(left: &str, right: &str) -> Option<bool> {
+    if matches!(left, "**/*" | "**") || matches!(right, "**/*" | "**") {
+        return Some(true);
+    }
+    if left == right {
+        return Some(true);
+    }
+    let left_prefix = left.strip_suffix("/**").filter(|prefix| !prefix.is_empty());
+    let right_prefix = right.strip_suffix("/**").filter(|prefix| !prefix.is_empty());
+    if let Some(prefix) = left_prefix {
+        if right_prefix.is_some_and(|other| prefixes_overlap(prefix, other))
+            || (right_prefix.is_none() && right.starts_with(&format!("{prefix}/")))
+        {
+            return Some(true);
+        }
+    }
+    if let Some(prefix) = right_prefix
+        && left_prefix.is_none()
+        && left.starts_with(&format!("{prefix}/"))
+    {
+        return Some(true);
+    }
+    if has_unsupported_glob(left) || has_unsupported_glob(right) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn prefixes_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+fn has_unsupported_glob(path: &str) -> bool {
+    path.contains('*') || path.contains('?') || path.contains('[') || path.contains(']')
+}
+
+fn verify_decision_record(record: &Value, thread_id: &str, proposal_id: &str, revision_id: &str) -> Result<()> {
+    if record["schema_version"] != 1
+        || record["record_type"] != "contract_decision"
+        || record["thread_id"] != thread_id
+        || record["proposal_id"] != proposal_id
+        || record["proposal_revision_id"] != revision_id
+        || !matches!(record["decision"].as_str(), Some("ratified" | "rejected"))
+        || record["proposal_digest"].as_str().is_none_or(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(Error::new("COORDINATION_INDEX_CORRUPT", "contract decision record identity or digest is invalid"));
+    }
+    Ok(())
+}
+
+fn proposal_head_key(proposal_id: &str) -> String {
+    format!("coordination:proposal:{proposal_id}")
+}
+
+fn proposal_revision_key(proposal_id: &str, revision_id: &str) -> String {
+    format!("coordination:proposal:{proposal_id}:revision:{revision_id}")
+}
+
+fn proposal_pointer_key(revision_id: &str) -> String {
+    format!("coordination:proposal-revision:{revision_id}")
+}
+
+fn decision_record_key(proposal_id: &str, revision_id: &str) -> String {
+    format!("{DECISION_PREFIX}{proposal_id}:{revision_id}")
+}
+
