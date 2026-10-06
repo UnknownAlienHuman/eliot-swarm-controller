@@ -4,13 +4,114 @@
 //! open the Store, apply role policy, or start the host. Only `hook.emit` may
 //! replay, using its Store-deduplicated stable event identity.
 
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use swarm_client::{Client, IpcConfig};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
+    method_policy,
 };
+
+/// The public CLI's intentionally small configuration slice. The host owns
+/// the full controller configuration; this frontend only needs the IPC
+/// transport limits and the Store-owned data root for authenticated calls.
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    pub data_dir: PathBuf,
+    pub ipc: IpcConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ExistingConfigSlice {
+    schema_version: Option<u32>,
+    storage: ExistingStorageSlice,
+    ipc: IpcConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ExistingStorageSlice {
+    data_dir: Option<PathBuf>,
+}
+
+impl ClientConfig {
+    /// Load only the existing public-client configuration slice. Unrelated
+    /// host keys remain host-owned and are ignored by this package.
+    pub fn load(path: Option<&Path>, data_override: Option<&Path>) -> Result<Self> {
+        let mut loaded = if let Some(path) = path {
+            let source = std::fs::read_to_string(path)?;
+            let mut parsed: ExistingConfigSlice = toml::from_str(&source)
+                .map_err(|error| Error::new("CONFIG_ERROR", error.to_string()))?;
+            if parsed.schema_version.unwrap_or(1) != 1 {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "unsupported config schema version",
+                ));
+            }
+            let mut data_dir = parsed
+                .storage
+                .data_dir
+                .take()
+                .unwrap_or_else(default_data_dir);
+            if data_dir.is_relative() {
+                data_dir = path.parent().unwrap_or(Path::new(".")).join(data_dir);
+            }
+            Self {
+                data_dir,
+                ipc: parsed.ipc,
+            }
+        } else {
+            Self {
+                data_dir: default_data_dir(),
+                ipc: IpcConfig::default(),
+            }
+        };
+
+        if let Some(data_dir) = data_override {
+            loaded.data_dir = data_dir.to_path_buf();
+        }
+        if loaded.data_dir.is_relative() {
+            loaded.data_dir = std::env::current_dir()?.join(&loaded.data_dir);
+        }
+        loaded.validate()?;
+        Ok(loaded)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.ipc.max_connections == 0
+            || self.ipc.max_inflight_per_connection == 0
+            || self.ipc.max_frame_bytes < 1024
+            || self.ipc.write_timeout_seconds == 0
+        {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "invalid IPC limits in frontend configuration",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    if let Some(root) = std::env::var_os(if cfg!(windows) {
+        "LOCALAPPDATA"
+    } else {
+        "XDG_STATE_HOME"
+    }) {
+        PathBuf::from(root).join("eliot-swarm-controller")
+    } else if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+    {
+        PathBuf::from(home).join(".local/state/eliot-swarm-controller")
+    } else {
+        PathBuf::from(".swarm-controller")
+    }
+}
 
 /// Send an application request through the existing authenticated IPC client.
 /// Ordinary calls are sent once; only `hook.emit` uses the Store's durable
@@ -55,8 +156,11 @@ pub fn prepare_call(
         return Ok((hook_emit_params(&params)?, None));
     }
 
-    let read_only =
-        swarm_mcp::application_method_read_only(method).unwrap_or(method == "doctor.inspect");
+    // Only positive read-only entries in the shared closed registry bypass
+    // request correlation. Mutation, internal, facade-only, and unknown names
+    // retain the existing mutation-shaped object/request-ID path; authorization
+    // and method validation remain host-owned.
+    let read_only = method_policy::read_only(method).unwrap_or(false);
     if read_only {
         return Ok((params, None));
     }

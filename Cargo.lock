@@ -1734,11 +1734,12 @@ name = "swarm-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "swarm-client",
  "swarm-contracts",
- "swarm-mcp",
  "tokio",
+ "toml",
  "uuid",
 ]
 

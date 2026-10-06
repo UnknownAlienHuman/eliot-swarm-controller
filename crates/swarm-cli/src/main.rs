@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode},
 };
-use swarm_cli::{call, prepare_call, validate_call_method};
+use swarm_cli::{ClientConfig, call, prepare_call, validate_call_method};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
@@ -808,6 +808,9 @@ async fn main() -> ExitCode {
             return ExitCode::from(code.clamp(0, 255) as u8);
         }
     };
+    if command_uses_mcp(&cli.command) {
+        return delegate_to_mcp(&cli);
+    }
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if command_uses_host(&cli.command) {
         return delegate_to_host(&raw_args);
@@ -819,6 +822,10 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn command_uses_mcp(command: &Command) -> bool {
+    matches!(command, Command::Mcp { .. })
 }
 
 fn command_uses_host(command: &Command) -> bool {
@@ -895,11 +902,85 @@ fn delegate_to_host(arguments: &[OsString]) -> ExitCode {
     }
 }
 
+fn delegate_to_mcp(cli: &Cli) -> ExitCode {
+    let profile = match &cli.command {
+        Command::Mcp { profile } => profile.as_deref(),
+        _ => unreachable!("MCP delegation called for a different command"),
+    };
+    let mut arguments = Vec::new();
+    if let Some(path) = cli.config.as_deref() {
+        arguments.push(OsString::from("--config"));
+        arguments.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = cli.data_dir.as_deref() {
+        arguments.push(OsString::from("--data-dir"));
+        arguments.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = cli.credential.as_deref() {
+        arguments.push(OsString::from("--credential"));
+        arguments.push(path.as_os_str().to_owned());
+    }
+    if let Some(profile) = profile {
+        arguments.push(OsString::from("--profile"));
+        arguments.push(OsString::from(profile));
+    }
+
+    let mut executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!(
+                "{}",
+                json!({"error":{"code":"MCP_BINARY_PATH_FAILED","message":"could not locate the public CLI executable"}})
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    executable.set_file_name(if cfg!(windows) {
+        "swarm-mcp.exe"
+    } else {
+        "swarm-mcp"
+    });
+    let sibling_is_file = executable.is_file();
+    match ProcessCommand::new(&executable).args(arguments).status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!(
+                "{}",
+                json!({"error":{"code":"MCP_COMMAND_FAILED","message":"the explicit MCP command exited unsuccessfully","exit_code":status.code()}})
+            );
+            ExitCode::from(
+                status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .filter(|code| *code != 0)
+                    .unwrap_or(1),
+            )
+        }
+        Err(error) => {
+            let (code, message) = if error.kind() == std::io::ErrorKind::NotFound
+                && !sibling_is_file
+            {
+                (
+                    "MCP_BINARY_MISSING",
+                    "install the swarm-mcp sibling beside the public swarm executable and retry",
+                )
+            } else {
+                (
+                    "MCP_START_FAILED",
+                    "check the MCP executable, runtime dependencies and launch permissions, then retry",
+                )
+            };
+            eprintln!("{}", json!({"error":{"code":code,"message":message}}));
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<()> {
-    let config = swarm_mcp::Config::load(cli.config.as_deref(), cli.data_dir.as_deref())?;
+    let config = ClientConfig::load(cli.config.as_deref(), cli.data_dir.as_deref())?;
     let credential_path = cli
         .credential
-        .unwrap_or_else(|| config.storage.data_dir.join("operator.json"));
+        .unwrap_or_else(|| config.data_dir.join("operator.json"));
     let credential = load_credential(&credential_path)?;
     let request_id = cli.request_id;
     if let Command::Call { method, .. } = &cli.command
@@ -910,9 +991,7 @@ async fn run(cli: Cli) -> Result<()> {
         ));
     }
     match cli.command {
-        Command::Mcp { profile } => {
-            swarm_mcp::run_profiled(config, credential, profile.as_deref()).await
-        }
+        Command::Mcp { .. } => unreachable!("MCP delegation returned above"),
         command => {
             let (method, params) = map_command(command)?;
             validate_call_method(&method)?;
@@ -920,14 +999,7 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(request_id) = prepared_id {
                 eprintln!("client_request_id={request_id}");
             }
-            let result = call(
-                &config.storage.data_dir,
-                &credential,
-                &config.ipc,
-                &method,
-                params,
-            )
-            .await?;
+            let result = call(&config.data_dir, &credential, &config.ipc, &method, params).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
