@@ -276,6 +276,15 @@ fn child_error_value(child_error: &ChildError) -> Value {
     Value::Object(error)
 }
 
+/// Project one bounded structured diagnostic without retaining raw messages.
+/// Callers draining async child pipes can reuse the wrapper's safe code parser.
+pub fn project_child_error_line(line: &[u8]) -> Option<ChildError> {
+    if line.is_empty() || line.len() > MAX_ERROR_LINE_BYTES {
+        return None;
+    }
+    parse_child_error_line(line)
+}
+
 fn parse_child_error_line(line: &[u8]) -> Option<ChildError> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let envelope: Value = serde_json::from_slice(line).ok()?;

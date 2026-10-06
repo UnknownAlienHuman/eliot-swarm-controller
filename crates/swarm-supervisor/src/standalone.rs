@@ -884,11 +884,11 @@ impl StandaloneSupervisor {
                     Some(error_code),
                     Some(RECONCILE_INTERVAL),
                 )
-                .await;
+                .await?;
             } else if recovered {
                 consecutive_failures = 0;
                 self.publish_health(&mut last_health, "running", 0, None, None)
-                    .await;
+                    .await?;
             }
             if recovered
                 && cycle_error.is_none()
@@ -930,17 +930,17 @@ impl StandaloneSupervisor {
         consecutive_failures: u32,
         error_code: Option<&str>,
         retry: Option<Duration>,
-    ) {
-        let error_code = error_code.map(safe_health_code);
+    ) -> Result<()> {
+        let safe_error_code = error_code.map(safe_health_code);
         let retry_in_ms = retry.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
         let next = HealthSnapshot {
             state: state.to_owned(),
             consecutive_failures,
-            error_code,
+            error_code: safe_error_code.clone(),
             retry_in_ms,
         };
         if last.as_ref() == Some(&next) {
-            return;
+            return Ok(());
         }
         match self
             .control
@@ -953,11 +953,23 @@ impl StandaloneSupervisor {
             .await
         {
             Ok(()) => *last = Some(next),
-            Err(error) => eprintln!(
-                "module supervisor health readback unavailable: {}",
-                error.code
-            ),
+            Err(_) => {
+                if let Some(primary_code) = safe_error_code {
+                    eprintln!(
+                        "standalone module supervisor: {{\"error\":{{\"code\":\"{primary_code}\",\"secondary_codes\":[\"MODULE_HEALTH_WRITE_FAILED\"],\"phase\":\"module_supervisor\"}}}}"
+                    );
+                    return Err(Error::new(
+                        primary_code,
+                        "module supervisor could not persist health while reporting a reconciliation failure",
+                    ));
+                }
+                return Err(Error::new(
+                    "MODULE_HEALTH_WRITE_FAILED",
+                    "standalone module supervisor could not persist health",
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Confirm only the exact boot retained by Store's accepted module.hello.

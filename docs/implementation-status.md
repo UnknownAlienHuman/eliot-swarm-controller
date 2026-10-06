@@ -72,6 +72,16 @@ and terminal observation retain those codes without replacing the primary
 failure. A refresh racing with writer exit cannot suppress the retained watch
 notification, and initialization failures keep their original readiness/join
 identity. Host shutdown consumes module and managed-bus supervisor join errors.
+Readiness commits and watch publication share the existing status mutex, so
+late readiness cannot overwrite an already published writer failure. Public
+pre-readiness admission closure does not misclassify an initializer failure.
+
+Standalone and managed-bus outer health persistence errors now propagate
+through their existing result paths. Standalone emits a bounded safe secondary
+diagnostic when a reconciliation failure already supplies the primary. The
+structured async host reader is part of the remaining child ownership change.
+Per-slot managed-bus retries retain their existing child handles on Store
+outages.
 
 The public host and CLI wrappers drain a child's stderr independently of its
 inherited output sink. A bounded queue and one post-exit deadline keep blocked
@@ -98,9 +108,10 @@ Module facts wait for missing source proof; release recognizes the exact
 status or occurrence. The method is internal and has no MCP exposure.
 
 Remaining source work closes exact live-child ownership and restart
-reconciliation, propagates module/bus health persistence failures, and updates
-the canonical generic Module event documentation. These changes must finish
-before compiler, tests or native qualification.
+reconciliation, connects structured child diagnostics, removes the live-GM gate
+from otherwise authorized retained Operation diagnostics, and updates the
+canonical generic Module event documentation. These changes must finish before
+compiler, tests or native qualification.
 
 The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,

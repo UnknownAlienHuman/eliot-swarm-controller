@@ -397,6 +397,7 @@ pub struct KernelHost<Run, Batch, InitError> {
     status: Arc<Mutex<KernelHostSnapshot>>,
     status_updates: watch::Sender<KernelHostSnapshot>,
     writer_finished: Arc<AtomicBool>,
+    initialization_succeeded: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     writer_thread: Arc<Thread>,
 }
@@ -411,6 +412,7 @@ pub struct KernelHostHandle<Run, Batch> {
     status: Arc<Mutex<KernelHostSnapshot>>,
     status_updates: watch::Sender<KernelHostSnapshot>,
     writer_finished: Arc<AtomicBool>,
+    initialization_succeeded: Arc<AtomicBool>,
     writer_thread: Arc<Thread>,
 }
 
@@ -423,13 +425,19 @@ impl<Run, Batch> Clone for KernelHostHandle<Run, Batch> {
             status: Arc::clone(&self.status),
             status_updates: self.status_updates.clone(),
             writer_finished: Arc::clone(&self.writer_finished),
+            initialization_succeeded: Arc::clone(&self.initialization_succeeded),
             writer_thread: Arc::clone(&self.writer_thread),
         }
     }
 }
 
-fn refresh_writer_status(status: &Arc<Mutex<KernelHostSnapshot>>, writer_finished: &AtomicBool) {
-    if !writer_finished.load(Ordering::Acquire) {
+fn refresh_writer_status(
+    status: &Arc<Mutex<KernelHostSnapshot>>,
+    writer_finished: &AtomicBool,
+    initialization_succeeded: &AtomicBool,
+) {
+    if !writer_finished.load(Ordering::Acquire) || !initialization_succeeded.load(Ordering::Acquire)
+    {
         return;
     }
     let mut snapshot = status
@@ -462,7 +470,11 @@ impl<Run, Batch> KernelHostHandle<Run, Batch> {
     }
 
     pub fn snapshot(&self) -> KernelHostSnapshot {
-        refresh_writer_status(&self.status, &self.writer_finished);
+        refresh_writer_status(
+            &self.status,
+            &self.writer_finished,
+            &self.initialization_succeeded,
+        );
         *self.status_lock()
     }
 
@@ -527,7 +539,11 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
     }
 
     pub fn snapshot(&self) -> KernelHostSnapshot {
-        refresh_writer_status(&self.status, &self.writer_finished);
+        refresh_writer_status(
+            &self.status,
+            &self.writer_finished,
+            &self.initialization_succeeded,
+        );
         *self.status_lock()
     }
 
@@ -555,6 +571,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
             status: Arc::clone(&self.status),
             status_updates: self.status_updates.clone(),
             writer_finished: Arc::clone(&self.writer_finished),
+            initialization_succeeded: Arc::clone(&self.initialization_succeeded),
             writer_thread: Arc::clone(&self.writer_thread),
         }
     }
@@ -586,6 +603,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
                     status.admission = KernelAdmissionState::Open;
                     status.lifecycle = KernelHostLifecycle::Ready;
                 }
+                let _ = self.status_updates.send_replace(*status);
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -594,6 +612,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
                     fault: KernelAdmissionFault::InitializationFailed,
                 };
                 status.lifecycle = KernelHostLifecycle::Failed;
+                let _ = self.status_updates.send_replace(*status);
                 Err(KernelHostReadyError::Initialization(error))
             }
             Err(_) => {
@@ -602,6 +621,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
                     fault: KernelAdmissionFault::InitializationFailed,
                 };
                 status.lifecycle = KernelHostLifecycle::Failed;
+                let _ = self.status_updates.send_replace(*status);
                 Err(KernelHostReadyError::ChannelClosed)
             }
         }
@@ -645,6 +665,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
             status,
             status_updates: _,
             writer_finished: _,
+            initialization_succeeded: _,
             stop_requested,
             writer_thread,
         } = self;
@@ -762,6 +783,7 @@ where
         status,
         status_updates,
         writer_finished,
+        initialization_succeeded,
         stop_requested,
         writer_thread,
     })
