@@ -16,8 +16,9 @@ use swarm_contracts::DeclaredServiceScope;
 #[path = "bus_service.rs"]
 mod managed_service;
 pub(crate) use managed_service::{
-    ManagedBusOwnerState, ManagedBusServiceDemand, health_projection as managed_health_projection,
-    managed_demands as managed_service_demands, record_health as record_managed_service_health,
+    DemandState, ManagedBusOwnerState, ManagedBusServiceDemand,
+    health_projection as managed_health_projection, managed_demands as managed_service_demands,
+    record_health as record_managed_service_health,
     record_owner_readback as record_managed_service_owner_readback,
     record_start as record_managed_service_start,
     reset_for_host_start as reset_managed_service_health_for_host_start,
@@ -80,6 +81,7 @@ impl ScriptRunConsumerBinding {
             self.consumer_client_id.clone(),
             self.service_generation,
         )
+        .map_err(Into::into)
     }
 
     pub(crate) fn worker_config_sha256(&self) -> Option<&str> {

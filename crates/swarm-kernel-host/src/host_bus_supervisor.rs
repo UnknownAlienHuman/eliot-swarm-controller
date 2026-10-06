@@ -39,7 +39,6 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
-use zeroize::Zeroizing;
 
 const SCAN_FALLBACK: Duration = Duration::from_secs(2);
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -282,7 +281,7 @@ pub(crate) async fn run(
                 let code = safe_reconcile_error(&error.code);
                 slot.last_error = Some(code);
                 if let Err(status_error) =
-                    persist_status(store, slot, "unknown", Some(code), None).await
+                    persist_status(&store, slot, "unknown", Some(code), None).await
                 {
                     if is_store_unavailable(&status_error) {
                         store_failed = true;
@@ -453,7 +452,10 @@ async fn record_managed_bus_actor_status(
         )
         .await
     {
-        eprintln!("managed bus supervisor health readback unavailable: {}", error.code);
+        eprintln!(
+            "managed bus supervisor health readback unavailable: {}",
+            error.code
+        );
     }
 }
 
@@ -473,39 +475,42 @@ fn is_store_unavailable(error: &Error) -> bool {
 }
 
 fn safe_reconcile_error(code: &str) -> &'static str {
-    match code {
-        "BUS_CONSUMER_REGISTRATION_CORRUPT"
-        | "BUS_SERVICE_CAPACITY"
-        | "BUS_SERVICE_SCOPE_DUPLICATE"
-        | "BUS_SERVICE_SCOPE_STALE"
-        | "BUS_SERVICE_SCOPE_INACTIVE"
-        | "BUS_SERVICE_START_LIMIT"
-        | "BUS_SERVICE_GENERATION_CORRUPT"
-        | "BUS_SERVICE_GENERATION_EXHAUSTED"
-        | "BUS_SERVICE_HEALTH_CORRUPT"
-        | "BUS_SERVICE_HEALTH_INVALID"
-        | "BUS_SERVICE_OWNER_UNKNOWN"
-        | "BUS_SERVICE_OWNER_READ_FAILED"
-        | "BUS_SERVICE_OWNER_READBACK_INVALID"
-        | "BUS_SERVICE_OWNER_READBACK_STALE"
-        | "BUS_SERVICE_OWNER_SCOPE_MISMATCH"
-        | "BUS_SERVICE_OWNER_DIRECTORY_INVALID"
-        | "BUS_SERVICE_STOP_REQUEST_INVALID"
-        | "BUS_SERVICE_STOP_REQUEST_UNKNOWN"
-        | "BUS_WORKER_CONFIG_MISMATCH"
-        | "BUS_WORKER_CONFIG_MISSING"
-        | "BUS_WORKER_CONFIG_INVALID"
-        | "BUS_WORKER_CONFIG_DIGEST_MISMATCH"
-        | "BUS_DISPATCHER_PIN_INVALID"
-        | "BUS_DISPATCHER_START_FAILED"
-        | "BUS_DISPATCHER_IMAGE_UNKNOWN"
-        | "BUS_DISPATCHER_EXIT"
-        | "BUS_WORKER_WAIT_UNKNOWN"
-        | "BUS_SUPERVISOR_ERROR" => code,
-        _ => "BUS_SUPERVISOR_ERROR",
-    }
+    const ALLOWED: &[&str] = &[
+        "BUS_CONSUMER_REGISTRATION_CORRUPT",
+        "BUS_SERVICE_CAPACITY",
+        "BUS_SERVICE_SCOPE_DUPLICATE",
+        "BUS_SERVICE_SCOPE_STALE",
+        "BUS_SERVICE_SCOPE_INACTIVE",
+        "BUS_SERVICE_START_LIMIT",
+        "BUS_SERVICE_GENERATION_CORRUPT",
+        "BUS_SERVICE_GENERATION_EXHAUSTED",
+        "BUS_SERVICE_HEALTH_CORRUPT",
+        "BUS_SERVICE_HEALTH_INVALID",
+        "BUS_SERVICE_OWNER_UNKNOWN",
+        "BUS_SERVICE_OWNER_READ_FAILED",
+        "BUS_SERVICE_OWNER_READBACK_INVALID",
+        "BUS_SERVICE_OWNER_READBACK_STALE",
+        "BUS_SERVICE_OWNER_SCOPE_MISMATCH",
+        "BUS_SERVICE_OWNER_DIRECTORY_INVALID",
+        "BUS_SERVICE_STOP_REQUEST_INVALID",
+        "BUS_SERVICE_STOP_REQUEST_UNKNOWN",
+        "BUS_WORKER_CONFIG_MISMATCH",
+        "BUS_WORKER_CONFIG_MISSING",
+        "BUS_WORKER_CONFIG_INVALID",
+        "BUS_WORKER_CONFIG_DIGEST_MISMATCH",
+        "BUS_DISPATCHER_PIN_INVALID",
+        "BUS_DISPATCHER_START_FAILED",
+        "BUS_DISPATCHER_IMAGE_UNKNOWN",
+        "BUS_DISPATCHER_EXIT",
+        "BUS_WORKER_WAIT_UNKNOWN",
+        "BUS_SUPERVISOR_ERROR",
+    ];
+    ALLOWED
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == code)
+        .unwrap_or("BUS_SUPERVISOR_ERROR")
 }
-
 async fn reconcile_slot(
     store: &Store,
     pin: &DispatcherPin,
@@ -1370,7 +1375,7 @@ fn request_stop(slot: &mut Slot) -> Result<()> {
     if !slot.stopping {
         ensure_private_dir(&slot.data_root, &slot.owner_dir)?;
         let path = slot.owner_dir.join("stop.request");
-        match write_private_new(&path, Zeroizing::new(Vec::new()).as_slice()) {
+        match write_private_new(&path, &[]) {
             Ok(()) => {}
             Err(error) if error.code == "FILE_EXISTS" => {
                 let metadata = fs::symlink_metadata(&path)?;
@@ -1381,7 +1386,7 @@ fn request_stop(slot: &mut Slot) -> Result<()> {
                     ));
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
         slot.stopping = true;
     }

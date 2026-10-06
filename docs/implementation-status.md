@@ -2,7 +2,7 @@
 
 ## Current state
 
-### Source delivery and remaining qualification — 2026-10-05
+### Source delivery and remaining qualification — 2026-10-06
 
 The product source integration, physical Kernel relocation, five Rust adapter
 paths and public CLI/host coordinates are present. Production source at
@@ -62,8 +62,16 @@ events. Scoped logging and read-only monitoring are connected in source;
 selected metadata/redacted content policy is resolved before capture. Raw
 native-frame capture remains unavailable.
 
-The required product source integrations listed in the preceding code-phase
-checkpoint are delivered. The native qualification script now validates the
+The previously listed product source integrations are delivered. A subsequent
+bounded source review found further required closure work: wake and retain a
+Kernel writer failure, record truthful final Store close diagnostics, preserve
+primary startup errors, retain standalone supervisor child identity and exit
+causes, and carry child structured failures through the public wrappers. The
+installed OpenCode resources also require an explicit locked dependency closure
+and correctly labeled package-manifest hashes. These source changes must finish
+before tests or native qualification.
+
+The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,
 records the actual Kernel PID, and closes only its own Kernel stdin for shutdown.
 Claude's qualification entrypoint now uses its existing version-4 typed

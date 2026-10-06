@@ -691,3 +691,5 @@ fn valid_name(value: &str, max_bytes: usize) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte))
 }
+
+pub use service_scope::{managed_service_state_path, managed_worker_config_path};

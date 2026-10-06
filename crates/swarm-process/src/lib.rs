@@ -12,6 +12,6 @@ pub mod process_group;
 pub use module_membership::module_child_belongs_to_owner;
 pub use permissions::{private_permissions, write_private_new};
 pub use process_group::{
-    Group, departed_empty, process_birth_identity, process_image_identity, spawned_departed,
-    spawned_identity,
+    Group, departed_empty, process_birth_identity, process_image_identity, service_owner_is_live,
+    spawned_departed, spawned_identity,
 };
