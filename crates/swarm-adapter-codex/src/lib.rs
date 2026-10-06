@@ -2449,10 +2449,10 @@ fn accepted_after_exact_input(
     accepted.details["task_completion"] = json!("unknown");
     accepted.details["disposition"] = json!("admitted");
     accepted.details["native_replay"] = json!(false);
-    if let Some(admission) = record.dispatch_admission.as_ref() {
-        if let Ok(value) = serde_json::to_value(admission) {
-            accepted.details["dispatch_admission"] = value;
-        }
+    if let Some(admission) = record.dispatch_admission.as_ref()
+        && let Ok(value) = serde_json::to_value(admission)
+    {
+        accepted.details["dispatch_admission"] = value;
     }
     accepted
 }
@@ -2641,19 +2641,17 @@ async fn reconcile_send(
         "billing_status": "unknown",
         "fallback_used": false,
     });
-    if !status_is_failed {
-        if let Some(admission) = dispatch_admission.as_ref() {
-            details["dispatch_admission"] = match serde_json::to_value(admission) {
-                Ok(value) => value,
-                Err(_) => {
-                    return unknown_send(
-                        record,
-                        operation_id,
-                        "DISPATCH_ADMISSION_SERIALIZATION_FAILED",
-                    );
-                }
-            };
-        }
+    if !status_is_failed && let Some(admission) = dispatch_admission.as_ref() {
+        details["dispatch_admission"] = match serde_json::to_value(admission) {
+            Ok(value) => value,
+            Err(_) => {
+                return unknown_send(
+                    record,
+                    operation_id,
+                    "DISPATCH_ADMISSION_SERIALIZATION_FAILED",
+                );
+            }
+        };
     }
     if status_is_failed {
         let failure_code = turn_error_diagnostic(&turn);
@@ -4100,13 +4098,11 @@ async fn build_normalized_result_page(
         .input
         .get("normalized_result_payload_identity")
         .filter(|value| value.is_object())
-    {
-        if expected["sha256"].as_str() != Some(response_sha256.as_str())
+        && (expected["sha256"].as_str() != Some(response_sha256.as_str())
             || expected["byte_length"].as_u64() != Some(body.len() as u64)
-            || expected["complete"] == false
-        {
-            return Err("CODEX_RESULT_PAYLOAD_IDENTITY_MISMATCH");
-        }
+            || expected["complete"] == false)
+    {
+        return Err("CODEX_RESULT_PAYLOAD_IDENTITY_MISMATCH");
     }
     let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
     let requested = command.input["length_bytes"]
@@ -4117,7 +4113,7 @@ async fn build_normalized_result_page(
     if offset > total || (requested == 0 && offset < total) {
         return Err("CODEX_RESULT_RANGE_INVALID");
     }
-    let end = offset.checked_add(requested).unwrap_or(u64::MAX).min(total);
+    let end = offset.saturating_add(requested).min(total);
     let start = usize::try_from(offset).map_err(|_| "CODEX_RESULT_RANGE_INVALID")?;
     let stop = usize::try_from(end).map_err(|_| "CODEX_RESULT_RANGE_INVALID")?;
     let selected = &body[start..stop];

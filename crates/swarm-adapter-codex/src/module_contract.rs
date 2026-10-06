@@ -135,8 +135,10 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
     let dispatch_admission = schema("swarm.task_dispatch_admission", "1");
     let result_context = schema("swarm.normalized_result_context", "1");
     let result_page = schema("swarm.normalized_result_page", "1");
-    (exact_schemas(&claim.command_schemas, &[runtime_command.clone()])
-        && exact_schemas(&claim.event_schemas, &[runtime_outcome.clone()]))
+    (exact_schemas(
+        &claim.command_schemas,
+        std::slice::from_ref(&runtime_command),
+    ) && exact_schemas(&claim.event_schemas, std::slice::from_ref(&runtime_outcome)))
         || (exact_schemas(
             &claim.command_schemas,
             &[runtime_command.clone(), dispatch_context.clone()],
