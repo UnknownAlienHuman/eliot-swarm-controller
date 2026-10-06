@@ -63,6 +63,13 @@ qualification. Concilium methods start no model or native adapter and mutate no
 Task state; close is advisory. The historical checks above retain their narrow
 scopes, and product status remains `PARTIAL_PROGRESS`.
 
+The dependency source repair moves the selected rustls lock from `0.23.44` to
+`0.23.45` for GHSA-2mjx-qc3c-rqvc. The registry checksum and unchanged dependency
+requirements were checked against official metadata; only the version and
+checksum change. Cargo has not resolved or compiled this source repair.
+The legacy JavaScript and Python bridge dependency alerts are being classified
+against actual package usage before changing or removing those bridges.
+
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility
 facade, and public `swarm-host` launches the Kernel sibling. The independent
@@ -2083,8 +2090,10 @@ and qualification follow it.
    `task_revision_changed`, `attempt_disposition_changed` and
    `exact_deadline_reached`, plus `coordination.sync_integration` and recomputed
    `swarm.overlap.check`. Broader integration-cell negotiation, assumptions,
-   negotiated contracts, unsupported watch predicates and durable Concilium
-   rounds remain.
+   negotiated contracts and unsupported watch predicates remain. Durable
+   Concilium rounds, their retained scoped reads and their shared event-bus
+   translation are integrated in source as described in Current State; current
+   compilation and runtime qualification remain pending.
 
 2. **O1 manager-owned automation actions — Partial.** Owner-scoped configuration get/preview/apply/explain, WorkDispatch, ReviewDispatch, bounded ReviewDisposition, typed manager authority, and shared manual/automatic semantic slots are wired. C10 publishes the launch-parent dispatch schema and Store gate. C11 adds RepairDispatch and acceptance consumers on typed ledgers/cursors, with same-slot reuse, GM epoch and byte-verification checks, structured reviews, and manager history/visibility. C12 publishes owner-sponsored acceptance to an independent GM. C13 implements automated accepted-candidate publication; live publication qualification and GitHub projection remain gaps.
 
