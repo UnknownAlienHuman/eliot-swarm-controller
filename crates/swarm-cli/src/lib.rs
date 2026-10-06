@@ -169,14 +169,14 @@ pub fn prepare_call(
     }
 
     if method == "swarm.launch" {
-        let original_id = required_text(&params, "client_request_id")?;
+        let original_id = required_text(&params, "client_request_id")?.to_owned();
         required_text(&params, "plan_digest")?;
-        if request_id.is_some_and(|requested| requested != original_id) {
+        if request_id.is_some_and(|requested| requested != original_id.as_str()) {
             return Err(Error::invalid(
                 "--request-id must match the client_request_id in the swarm.launch params file",
             ));
         }
-        return Ok((params, Some(original_id.to_owned())));
+        return Ok((params, Some(original_id)));
     }
 
     if let Some(request_id) = request_id {

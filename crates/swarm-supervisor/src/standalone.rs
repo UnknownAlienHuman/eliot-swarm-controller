@@ -16,6 +16,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
@@ -32,7 +33,6 @@ use swarm_contracts::{
 };
 use tokio::{sync::watch, time};
 use uuid::Uuid;
-use sha2::{Digest, Sha256};
 
 const CONFIG_SCHEMA_VERSION: u16 = 1;
 const HOST_MODULE_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
@@ -349,18 +349,16 @@ fn map_route_config(
                 ))
             }
         }
-        StandaloneRouteConfigMapper::DescriptorSchema => {
-            match descriptor.config_schema.as_ref() {
-                None => Ok(BindingLaunchConfig::default()),
-                Some(_) if opencode_schema_supported(descriptor) => {
-                    open_code_route_config(descriptor, route_native_options, protected_files)
-                }
-                Some(_) => Err(Error::new(
-                    "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
-                    "the retained descriptor names a launch config schema with no supervisor mapper",
-                )),
+        StandaloneRouteConfigMapper::DescriptorSchema => match descriptor.config_schema.as_ref() {
+            None => Ok(BindingLaunchConfig::default()),
+            Some(_) if opencode_schema_supported(descriptor) => {
+                open_code_route_config(descriptor, route_native_options, protected_files)
             }
-        }
+            Some(_) => Err(Error::new(
+                "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+                "the retained descriptor names a launch config schema with no supervisor mapper",
+            )),
+        },
         StandaloneRouteConfigMapper::OpenCodeSevenField => {
             open_code_route_config(descriptor, route_native_options, protected_files)
         }
@@ -476,15 +474,13 @@ fn open_code_route_config(
             "OpenCode model options must contain id, providerID, and variant only",
         ));
     }
-    let configured_service_id =
-        required_config_string(&object["service_id"], "service_id", 128)?;
+    let configured_service_id = required_config_string(&object["service_id"], "service_id", 128)?;
     let configured_connection_file =
         required_config_string(&object["connection_file"], "connection_file", 4096)?;
     let expected_version =
         required_config_string(&object["expected_version"], "expected_version", 256)?;
     let directory = required_config_string(&object["directory"], "directory", 4096)?;
-    if !Path::new(&configured_connection_file).is_absolute()
-        || !Path::new(&directory).is_absolute()
+    if !Path::new(&configured_connection_file).is_absolute() || !Path::new(&directory).is_absolute()
     {
         return Err(Error::new(
             "MODULE_CONFIG_INVALID",
@@ -520,19 +516,20 @@ fn open_code_route_config(
             "OPENCODE_PROVIDER_ID".to_owned(),
             LaunchValue::Literal(provider_id.clone()),
         ),
-        ("OPENCODE_VARIANT".to_owned(), LaunchValue::Literal(variant.clone())),
+        (
+            "OPENCODE_VARIANT".to_owned(),
+            LaunchValue::Literal(variant.clone()),
+        ),
     ]);
 
     if has_owner_service {
-        let owner: OwnedRouteConfig = serde_json::from_value(
-            object[OWNER_ROUTE_KEY].clone(),
-        )
-        .map_err(|_| {
-            Error::new(
-                "MODULE_CONFIG_INVALID",
-                "owned OpenCode route declaration has an invalid shape",
-            )
-        })?;
+        let owner: OwnedRouteConfig = serde_json::from_value(object[OWNER_ROUTE_KEY].clone())
+            .map_err(|_| {
+                Error::new(
+                    "MODULE_CONFIG_INVALID",
+                    "owned OpenCode route declaration has an invalid shape",
+                )
+            })?;
         let owner_nonce = required_config_string(&object[OWNER_NONCE_KEY], "owner_nonce", 64)?;
         let uuid = Uuid::parse_str(&owner_nonce).ok();
         if owner.origin != "fresh_owned_service"
@@ -561,10 +558,7 @@ fn open_code_route_config(
             "{}-{owner_suffix}",
             owner.service_id.chars().take(108).collect::<String>()
         );
-        let owner_state_root = owner
-            .state_root
-            .join("launches")
-            .join(&owner_nonce);
+        let owner_state_root = owner.state_root.join("launches").join(&owner_nonce);
         let owner_connection_file = owner_state_root.join("connection.json");
         let owner_password_file = owner_state_root.join("server.password");
         if configured_service_id != owner_service_id
@@ -591,10 +585,7 @@ fn open_code_route_config(
                 "OPENCODE_OWNER_SERVER_PROGRAM_SHA256",
                 owner.server_program_sha256,
             ),
-            (
-                "OPENCODE_OWNER_STATE_ROOT",
-                path_text(&owner_state_root)?,
-            ),
+            ("OPENCODE_OWNER_STATE_ROOT", path_text(&owner_state_root)?),
             (
                 "OPENCODE_OWNER_PASSWORD_FILE",
                 path_text(&owner_password_file)?,
@@ -641,6 +632,19 @@ fn open_code_route_config(
     Ok(config)
 }
 
+fn required_config_string(value: &Value, field: &str, max: usize) -> Result<String> {
+    let text = value
+        .as_str()
+        .filter(|text| !text.is_empty() && text.len() <= max && !text.chars().any(char::is_control))
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                format!("OpenCode {field} is missing or invalid"),
+            )
+        })?;
+    Ok(text.to_owned())
+}
+
 fn valid_service_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -652,9 +656,9 @@ fn valid_service_id(value: &str) -> bool {
 fn valid_provider_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn valid_credential_ref(value: &str) -> bool {
@@ -669,7 +673,10 @@ fn absolute_plain_path(path: &Path) -> bool {
     path.is_absolute()
         && path.to_str().is_some_and(|value| !value.is_empty())
         && !path.components().any(|component| {
-            matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
         })
 }
 

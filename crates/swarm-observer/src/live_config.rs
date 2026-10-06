@@ -14,7 +14,7 @@ use std::{
 };
 use swarm_contracts::error::{Error, Result};
 
-use crate::{MAX_RETENTION_BYTES, MAX_RETENTION_DAYS};
+use crate::{MAX_RETENTION_BYTES, MAX_RETENTION_DAYS, now_unix_ms};
 
 const MAX_LIVE_CONFIG_BYTES: usize = 16_384;
 const MAX_SCOPE_ID_BYTES: usize = 4_096;

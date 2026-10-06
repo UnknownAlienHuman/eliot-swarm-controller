@@ -156,6 +156,14 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
 }
 
 fn validate_record(record: &DiagnosticRecord) -> Result<()> {
+    let has_schema3_identity = record.event_id.is_some()
+        || record.component.is_some()
+        || record.module_id.is_some()
+        || record.artifact_id.is_some()
+        || record.artifact_version.is_some()
+        || record.build_id.is_some()
+        || record.task_id.is_some()
+        || record.attempt_id.is_some();
     if record.binding_generation.is_some_and(|generation| {
         generation == 0 || generation > i64::MAX as u64 || record.binding_id.is_none()
     }) {

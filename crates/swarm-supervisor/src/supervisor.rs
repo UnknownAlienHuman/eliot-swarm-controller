@@ -322,6 +322,7 @@ pub struct ModuleDemandRequest {
     pub readback: Option<OperationReadback>,
 }
 
+#[derive(Clone)]
 struct RegistryKey {
     module_id: String,
     scope: ServiceScope,

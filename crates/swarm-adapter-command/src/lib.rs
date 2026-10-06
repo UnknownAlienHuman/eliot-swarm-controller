@@ -3,6 +3,8 @@
 //! This package owns native invocation and its bounded receipt. Swarm keeps
 //! ownership of admission, Task policy, binding identity, and final acceptance.
 
+#![recursion_limit = "256"]
+
 mod adapter;
 mod journal;
 mod module_host;

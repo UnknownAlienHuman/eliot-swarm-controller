@@ -5,6 +5,14 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSha256,
     [Parameter(Mandatory)][string] $HostBuildManifestPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostBuildManifestSha256,
+    [Parameter(Mandatory)][string] $HostSupervisorExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSupervisorSha256,
+    [Parameter(Mandatory)][string] $HostSupervisorBuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSupervisorBuildManifestSha256,
+    [Parameter(Mandatory)][string] $HostLauncherExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostLauncherSha256,
+    [Parameter(Mandatory)][string] $HostLauncherBuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostLauncherBuildManifestSha256,
     [Parameter(Mandatory)][string] $PublicCliExecutable,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedPublicCliSha256,
     [Parameter(Mandatory)][string] $PublicCliBuildManifestPath,
@@ -40,12 +48,18 @@ $script:RequestDirectory = $null
 $script:RunDirectory = $null
 $script:StateDirectory = $null
 $script:HostPath = $null
+$script:HostSupervisorPath = $null
+$script:HostLauncherPath = $null
 $script:PublicCliPath = $null
 $script:ConfigPath = $null
 $script:ManagerCredentialPath = $null
 $script:OperatorCredentialPath = $null
 $script:HostProcess = $null
+$script:HostProcessId = $null
+$script:HostProcessExited = $false
+$script:HostOutputDrainTasks = @()
 $script:HostInputOpen = $false
+$script:HostStdinEofSent = $false
 $script:HostPendingProcessId = $null
 $script:DispatchSubmitted = $false
 $script:CurrentStage = 'preflight'
@@ -159,6 +173,7 @@ function Get-BuildProvenance {
         [Parameter(Mandatory)][string] $BinaryPath,
         [Parameter(Mandatory)][string] $ExpectedPackage,
         [Parameter(Mandatory)][string] $ExpectedTarget,
+        [switch] $HostComponent,
         [switch] $RequireBinaryPathMatch
     )
     $manifestFile = Assert-ExistingFile $ManifestPath
@@ -221,6 +236,26 @@ function Get-BuildProvenance {
     }
     $hostTripleMatches = [System.Text.RegularExpressions.Regex]::Matches([string]$manifest.toolchain.rustc_version_verbose, '(?m)^host:\s*(?<triple>[A-Za-z0-9_-]+)\s*$')
     if ($hostTripleMatches.Count -ne 1) { Stop-Qualification 'BUILD_MANIFEST_TARGET_TRIPLE_INVALID' }
+    $hostRuntime = $null
+    $hostSupervisor = $null
+    $hostIpcProtocolVersion = $null
+    if ($HostComponent) {
+        $compatibility = $manifest.compatibility
+        if ($null -eq $compatibility -or $null -eq $compatibility.host_ipc) {
+            Stop-Qualification 'HOST_COMPONENT_RUNTIME_CONTRACT_INVALID'
+        }
+        $hostRuntime = $compatibility.host_runtime
+        $hostSupervisor = $compatibility.host_supervisor
+        $hostIpcProtocolVersion = $compatibility.host_ipc.protocol_version
+        if ($null -eq $hostRuntime -or $hostRuntime.package_name -cne 'swarm-kernel-host' -or
+            $hostRuntime.binary_target -cne 'swarm-kernel-host' -or
+            $null -eq $hostSupervisor -or $hostSupervisor.package_name -cne 'swarm-supervisor' -or
+            $hostSupervisor.binary_target -cne 'swarm-supervisor' -or
+            $hostSupervisor.role -cne 'host_supervisor' -or
+            $null -eq $hostIpcProtocolVersion -or [int]$hostIpcProtocolVersion -le 0) {
+            Stop-Qualification 'HOST_COMPONENT_RUNTIME_CONTRACT_INVALID'
+        }
+    }
     $targetDirCanonical = [System.IO.Path]::GetFullPath([string]$manifest.build.target_dir).ToUpperInvariant()
     $targetDirIdentity = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($targetDirCanonical))).ToLowerInvariant()
     return [ordered]@{
@@ -242,6 +277,11 @@ function Get-BuildProvenance {
         rustc_version_verbose = $manifest.toolchain.rustc_version_verbose
         cargo_version_verbose = $manifest.toolchain.cargo_version_verbose
         rustc_host_triple = $hostTripleMatches[0].Groups['triple'].Value
+        host_ipc_protocol_version = if ($null -ne $hostIpcProtocolVersion) { [int]$hostIpcProtocolVersion } else { $null }
+        host_runtime_package_name = if ($null -ne $hostRuntime) { $hostRuntime.package_name } else { $null }
+        host_runtime_binary_target = if ($null -ne $hostRuntime) { $hostRuntime.binary_target } else { $null }
+        host_supervisor_package_name = if ($null -ne $hostSupervisor) { $hostSupervisor.package_name } else { $null }
+        host_supervisor_binary_target = if ($null -ne $hostSupervisor) { $hostSupervisor.binary_target } else { $null }
         provenance = 'manifest_sha256_and_image_hash_verified; manifest_is_not_signed'
     }
 }
@@ -261,6 +301,8 @@ function Get-PublicCliBuildProvenance {
     if ($manifestHash -cne $ExpectedManifestSha256.ToLowerInvariant()) { Stop-Qualification 'PUBLIC_CLI_MANIFEST_HASH_MISMATCH' }
     if ($binaryHash -cne $ExpectedBinarySha256.ToLowerInvariant()) { Stop-Qualification 'PUBLIC_CLI_BINARY_HASH_MISMATCH' }
     $manifest = Read-JsonFile $manifestFile
+    $hostTripleMatches = [System.Text.RegularExpressions.Regex]::Matches([string]$manifest.toolchain.rustc_version_verbose, '(?m)^host:\s*(?<triple>[A-Za-z0-9_-]+)\s*$')
+    if ($hostTripleMatches.Count -ne 1) { Stop-Qualification 'PUBLIC_CLI_TARGET_TRIPLE_INVALID' }
     if ($manifest.schema_version -ne 1 -or $manifest.format -cne 'eliot.frontend_build_manifest.v1' -or
         $manifest.source.checkout_clean_before -ne $true -or $manifest.source.checkout_clean_after -ne $true -or
         $manifest.source.commit -notmatch '\A[a-f0-9]{40}\z' -or $manifest.source.tree -notmatch '\A[a-f0-9]{40}\z' -or
@@ -295,13 +337,20 @@ function Get-PublicCliBuildProvenance {
         }
     }
     $launcher = $manifest.compatibility.host_launcher
+    $runtime = $manifest.compatibility.host_runtime
+    $supervisor = $manifest.compatibility.host_supervisor
     $protocolVersion = $manifest.compatibility.host_ipc.protocol_version
     $targetTriple = [string]$manifest.compatibility.target.rustc_host_triple
     if ($null -eq $launcher -or $launcher.package_name -cne 'eliot-swarm-controller' -or
         $launcher.binary_target -cne 'swarm-host' -or @($launcher.required_arguments).Count -ne 0 -or
+        $null -eq $runtime -or $runtime.package_name -cne 'swarm-kernel-host' -or
+        $runtime.binary_target -cne 'swarm-kernel-host' -or
+        $null -eq $supervisor -or $supervisor.package_name -cne 'swarm-supervisor' -or
+        $supervisor.binary_target -cne 'swarm-supervisor' -or $supervisor.role -cne 'host_supervisor' -or
         $null -eq $protocolVersion -or [int]$protocolVersion -le 0 -or
-        [string]::IsNullOrWhiteSpace($targetTriple)) {
-        Stop-Qualification 'PUBLIC_CLI_HOST_LAUNCHER_CONTRACT_INVALID'
+        [string]::IsNullOrWhiteSpace($targetTriple) -or
+        $targetTriple -cne $hostTripleMatches[0].Groups['triple'].Value) {
+        Stop-Qualification 'PUBLIC_CLI_HOST_SIBLING_CONTRACT_INVALID'
     }
     $artifacts = @($manifest.artifacts)
     if ($artifacts.Count -ne 1 -or $artifacts[0].target_name -cne 'swarm' -or
@@ -340,6 +389,11 @@ function Get-PublicCliBuildProvenance {
         cargo_version_verbose = $manifest.toolchain.cargo_version_verbose
         host_launcher_package_name = $launcher.package_name
         host_launcher_binary_target = $launcher.binary_target
+        host_runtime_package_name = $runtime.package_name
+        host_runtime_binary_target = $runtime.binary_target
+        host_supervisor_package_name = $supervisor.package_name
+        host_supervisor_binary_target = $supervisor.binary_target
+        host_supervisor_role = $supervisor.role
         host_ipc_protocol_version = [int]$protocolVersion
         rustc_host_triple = $targetTriple
         provenance = 'frontend_manifest_sha256_and_image_hash_verified; manifest_is_not_signed'
@@ -348,18 +402,39 @@ function Get-PublicCliBuildProvenance {
 
 function Assert-PublicCliHostSibling {
     param(
-        [Parameter(Mandatory)][string] $PublicCliPath,
-        [Parameter(Mandatory)][string] $HostPath,
         [Parameter(Mandatory)][System.Collections.IDictionary] $PublicCliBuild,
-        [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostLauncherBuild,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostSupervisorBuild
     )
-    $expectedSibling = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $PublicCliPath -Parent) 'swarm-host.exe'))
-    if ([System.IO.Path]::GetFileName($PublicCliPath) -cne 'swarm.exe' -or
-        -not [string]::Equals($expectedSibling, $HostPath, [StringComparison]::OrdinalIgnoreCase) -or
-        $PublicCliBuild.host_launcher_package_name -cne $HostBuild.package_name -or
-        $PublicCliBuild.host_launcher_binary_target -cne $HostBuild.binary_target -or
+    $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-host.exe'))
+    $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-kernel-host.exe'))
+    $expectedSupervisor = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-supervisor.exe'))
+    if ([System.IO.Path]::GetFileName($script:PublicCliPath) -cne 'swarm.exe' -or
+        -not [string]::Equals($expectedLauncher, $script:HostLauncherPath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($expectedRuntime, $script:HostPath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($expectedSupervisor, $script:HostSupervisorPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $PublicCliBuild.host_launcher_package_name -cne $HostLauncherBuild.package_name -or
+        $PublicCliBuild.host_launcher_binary_target -cne $HostLauncherBuild.binary_target -or
+        $PublicCliBuild.host_runtime_package_name -cne $HostBuild.package_name -or
+        $PublicCliBuild.host_runtime_binary_target -cne $HostBuild.binary_target -or
+        $PublicCliBuild.host_supervisor_package_name -cne $HostSupervisorBuild.package_name -or
+        $PublicCliBuild.host_supervisor_binary_target -cne $HostSupervisorBuild.binary_target -or
+        $HostLauncherBuild.package_name -cne 'eliot-swarm-controller' -or
+        $HostLauncherBuild.binary_target -cne 'swarm-host' -or
+        $HostBuild.package_name -cne 'swarm-kernel-host' -or
+        $HostBuild.binary_target -cne 'swarm-kernel-host' -or
+        $HostSupervisorBuild.package_name -cne 'swarm-supervisor' -or
+        $HostSupervisorBuild.binary_target -cne 'swarm-supervisor' -or
+        $PublicCliBuild.host_ipc_protocol_version -ne $HostBuild.host_ipc_protocol_version -or
+        $HostLauncherBuild.host_ipc_protocol_version -ne $HostBuild.host_ipc_protocol_version -or
+        $HostSupervisorBuild.host_ipc_protocol_version -ne $HostBuild.host_ipc_protocol_version -or
         $PublicCliBuild.rustc_host_triple -cne $HostBuild.rustc_host_triple -or
-        (Get-FileSha256 $expectedSibling) -cne $HostBuild.binary_sha256) {
+        $HostLauncherBuild.rustc_host_triple -cne $HostBuild.rustc_host_triple -or
+        $HostSupervisorBuild.rustc_host_triple -cne $HostBuild.rustc_host_triple -or
+        (Get-FileSha256 $expectedLauncher) -cne $HostLauncherBuild.binary_sha256 -or
+        (Get-FileSha256 $expectedRuntime) -cne $HostBuild.binary_sha256 -or
+        (Get-FileSha256 $expectedSupervisor) -cne $HostSupervisorBuild.binary_sha256) {
         Stop-Qualification 'PUBLIC_CLI_HOST_COORDINATE_MISMATCH'
     }
 }
@@ -480,11 +555,9 @@ function Invoke-SwarmProcess {
         if (-not $process.Start()) { return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_START_FAILED'; stdout = $null; process_id = $null } }
         $processId = $process.Id
         if ($HostProcess) {
-            $process.add_OutputDataReceived([System.Diagnostics.DataReceivedEventHandler]{ param($sender, $eventArgs) })
-            $process.add_ErrorDataReceived([System.Diagnostics.DataReceivedEventHandler]{ param($sender, $eventArgs) })
-            $process.BeginOutputReadLine()
-            $process.BeginErrorReadLine()
-            return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = $null; stdout = $null; process_id = $processId; process = $process }
+            $stdoutDrain = $process.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+            $stderrDrain = $process.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+            return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = $null; stdout = $null; process_id = $processId; process = $process; stdout_drain = $stdoutDrain; stderr_drain = $stderrDrain }
         }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
@@ -1079,6 +1152,7 @@ function Close-IsolatedHost {
         if (-not $script:HostProcess.HasExited -and $script:HostInputOpen) {
             $script:HostProcess.StandardInput.Close()
             $script:HostInputOpen = $false
+            $script:HostStdinEofSent = $true
             if (-not $script:HostProcess.WaitForExit(10000)) { $script:HostPendingProcessId = $script:HostProcess.Id }
         }
         elseif (-not $script:HostProcess.HasExited) { $script:HostPendingProcessId = $script:HostProcess.Id }
@@ -1086,7 +1160,17 @@ function Close-IsolatedHost {
     catch {
         if ($null -ne $script:HostProcess -and -not $script:HostProcess.HasExited) { $script:HostPendingProcessId = $script:HostProcess.Id }
     }
-    finally { $script:HostProcess.Dispose(); $script:HostProcess = $null }
+    finally {
+        if ($script:HostProcess.HasExited) {
+            $script:HostProcessExited = $true
+            foreach ($drain in $script:HostOutputDrainTasks) {
+                if ($null -ne $drain) { try { [void]$drain.Wait(1000) } catch { } }
+            }
+        }
+        $script:HostProcess.Dispose()
+        $script:HostProcess = $null
+        $script:HostOutputDrainTasks = @()
+    }
 }
 
 $summaryPath = $null
@@ -1098,14 +1182,22 @@ try {
     }
     $contract = Get-AdapterContract
     $script:HostPath = Assert-ExistingFile $HostExecutable
+    $script:HostSupervisorPath = Assert-ExistingFile $HostSupervisorExecutable
+    $script:HostLauncherPath = Assert-ExistingFile $HostLauncherExecutable
     $script:PublicCliPath = Assert-ExistingFile $PublicCliExecutable
     $actualHostHash = Get-FileSha256 $script:HostPath
+    $actualHostSupervisorHash = Get-FileSha256 $script:HostSupervisorPath
+    $actualHostLauncherHash = Get-FileSha256 $script:HostLauncherPath
     $actualPublicCliHash = Get-FileSha256 $script:PublicCliPath
     if ($actualHostHash -cne $ExpectedHostSha256.ToLowerInvariant()) { Stop-Qualification 'HOST_BINARY_HASH_MISMATCH' }
+    if ($actualHostSupervisorHash -cne $ExpectedHostSupervisorSha256.ToLowerInvariant()) { Stop-Qualification 'HOST_SUPERVISOR_BINARY_HASH_MISMATCH' }
+    if ($actualHostLauncherHash -cne $ExpectedHostLauncherSha256.ToLowerInvariant()) { Stop-Qualification 'HOST_LAUNCHER_BINARY_HASH_MISMATCH' }
     if ($actualPublicCliHash -cne $ExpectedPublicCliSha256.ToLowerInvariant()) { Stop-Qualification 'PUBLIC_CLI_BINARY_HASH_MISMATCH' }
-    $hostBuild = Get-BuildProvenance -ManifestPath $HostBuildManifestPath -ExpectedManifestSha256 $ExpectedHostBuildManifestSha256 -BinaryPath $script:HostPath -ExpectedPackage 'eliot-swarm-controller' -ExpectedTarget 'swarm-host'
+    $hostBuild = Get-BuildProvenance -ManifestPath $HostBuildManifestPath -ExpectedManifestSha256 $ExpectedHostBuildManifestSha256 -BinaryPath $script:HostPath -ExpectedPackage 'swarm-kernel-host' -ExpectedTarget 'swarm-kernel-host' -HostComponent
+    $hostSupervisorBuild = Get-BuildProvenance -ManifestPath $HostSupervisorBuildManifestPath -ExpectedManifestSha256 $ExpectedHostSupervisorBuildManifestSha256 -BinaryPath $script:HostSupervisorPath -ExpectedPackage 'swarm-supervisor' -ExpectedTarget 'swarm-supervisor' -HostComponent
+    $hostLauncherBuild = Get-BuildProvenance -ManifestPath $HostLauncherBuildManifestPath -ExpectedManifestSha256 $ExpectedHostLauncherBuildManifestSha256 -BinaryPath $script:HostLauncherPath -ExpectedPackage 'eliot-swarm-controller' -ExpectedTarget 'swarm-host' -HostComponent
     $publicCliBuild = Get-PublicCliBuildProvenance -ManifestPath $PublicCliBuildManifestPath -ExpectedManifestSha256 $ExpectedPublicCliBuildManifestSha256 -BinaryPath $script:PublicCliPath -ExpectedBinarySha256 $actualPublicCliHash
-    Assert-PublicCliHostSibling -PublicCliPath $script:PublicCliPath -HostPath $script:HostPath -PublicCliBuild $publicCliBuild -HostBuild $hostBuild
+    Assert-PublicCliHostSibling -PublicCliBuild $publicCliBuild -HostLauncherBuild $hostLauncherBuild -HostBuild $hostBuild -HostSupervisorBuild $hostSupervisorBuild
     $script:ConfigPath = Assert-ExistingFile $HostConfigPath
     $outputRoot = Assert-ExistingDirectory $OutputRoot
     New-PrivateRunDirectory -Parent $outputRoot
@@ -1131,6 +1223,8 @@ try {
         $CodexAppServerImagePath = Assert-ExistingFile $CodexAppServerImagePath
     }
     $script:Report.safe_facts.host_binary = $hostBuild
+    $script:Report.safe_facts.host_launcher = $hostLauncherBuild
+    $script:Report.safe_facts.host_supervisor = $hostSupervisorBuild
     $script:Report.safe_facts.public_cli = $publicCliBuild
     $script:Report.safe_facts.owner_helper_sha256 = (Get-FileSha256 $ownerHelper)
     $script:Report.safe_facts.task_spec_sha256 = Get-FileSha256 $taskPath
@@ -1157,28 +1251,99 @@ try {
     $script:Report.safe_facts.module.descriptor_sha256 = $module.descriptor_sha256
     $script:Report.safe_facts.host_build = $hostBuild
     $script:Report.safe_facts.module_build = $moduleBuild
-    $script:Report.safe_facts.build_set = [ordered]@{ source_commit = $hostBuild.source_commit; source_tree = $hostBuild.source_tree; lock_sha256 = $hostBuild.cargo_lock_sha256; toolchain_sha256 = $hostBuild.rust_toolchain_toml_sha256; shared_active_toolchain = $hostBuild.active_toolchain }
-    Add-Stage -Name 'preflight' -Status 'passed' -Facts ([ordered]@{ host_binary_sha256 = $actualHostHash; public_cli_sha256 = $actualPublicCliHash; host_build = $hostBuild; public_cli_build = $publicCliBuild; cli_host_sibling_verified = $true; cli_host_ipc_protocol_version = $publicCliBuild.host_ipc_protocol_version; module_executable_sha256 = $module.executable_sha256; descriptor_sha256 = $module.descriptor_sha256; install_receipt_sha256 = $module.receipt_sha256; module_identity = $script:Report.safe_facts.module; module_build = $moduleBuild })
+    $script:Report.safe_facts.build_set = [ordered]@{
+        source_commit = $hostBuild.source_commit
+        source_tree = $hostBuild.source_tree
+        lock_sha256 = $hostBuild.cargo_lock_sha256
+        toolchain_sha256 = $hostBuild.rust_toolchain_toml_sha256
+        shared_active_toolchain = $hostBuild.active_toolchain
+        public_cli_manifest_sha256 = $publicCliBuild.manifest_sha256
+        host_launcher_manifest_sha256 = $hostLauncherBuild.manifest_sha256
+        kernel_host_manifest_sha256 = $hostBuild.manifest_sha256
+        host_supervisor_manifest_sha256 = $hostSupervisorBuild.manifest_sha256
+    }
+    Add-Stage -Name 'preflight' -Status 'passed' -Facts ([ordered]@{
+        kernel_host_binary_sha256 = $actualHostHash
+        host_launcher_binary_sha256 = $actualHostLauncherHash
+        host_supervisor_binary_sha256 = $actualHostSupervisorHash
+        public_cli_sha256 = $actualPublicCliHash
+        kernel_host_build = $hostBuild
+        host_launcher_build = $hostLauncherBuild
+        host_supervisor_build = $hostSupervisorBuild
+        public_cli_build = $publicCliBuild
+        cli_host_siblings_verified = $true
+        cli_host_ipc_protocol_version = $publicCliBuild.host_ipc_protocol_version
+        module_executable_sha256 = $module.executable_sha256
+        descriptor_sha256 = $module.descriptor_sha256
+        install_receipt_sha256 = $module.receipt_sha256
+        module_identity = $script:Report.safe_facts.module
+        module_build = $moduleBuild
+    })
 
     $script:CurrentStage = 'isolated_host'
     $hostArgs = @('--config', $script:ConfigPath, '--data-dir', $script:StateDirectory, 'host', '--stop-on-stdin-eof')
     $hostStart = Invoke-SwarmProcess -Arguments $hostArgs -TimeoutMilliseconds 0 -HostProcess
     if (-not $hostStart.started) { Stop-Qualification $hostStart.error_code }
     $script:HostProcess = $hostStart.process
+    $script:HostProcessId = [int]$hostStart.process_id
+    $script:HostOutputDrainTasks = @($hostStart.stdout_drain, $hostStart.stderr_drain)
     $script:HostInputOpen = $true
     $script:OperatorCredentialPath = Join-Path $script:StateDirectory 'operator.json'
     $hostReady = $false
+    $readinessCode = 'HOST_NOT_READY'
+    $hostReadinessFacts = $null
     $hostDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(30, $TimeoutSeconds))
     while ([DateTime]::UtcNow -lt $hostDeadline) {
         if ($script:HostProcess.HasExited) { break }
         if (Test-Path -LiteralPath $script:OperatorCredentialPath) {
             $operatorStatus = Invoke-ApplicationCall -CredentialPath $script:OperatorCredentialPath -Method 'host.status' -Params ([ordered]@{}) -TimeoutMilliseconds 10000
-            if ($operatorStatus.completed -and $operatorStatus.exit_code -eq 0 -and $null -ne $operatorStatus.value) { $hostReady = $true; break }
+            if ($operatorStatus.completed -and $operatorStatus.exit_code -eq 0 -and $null -ne $operatorStatus.value) {
+                $kernelState = ''
+                $moduleSupervisorState = ''
+                $hostLifecycle = $operatorStatus.value.host_lifecycle
+                if ($hostLifecycle -is [System.Collections.IDictionary]) {
+                    $currentLifecycle = $hostLifecycle['current']
+                    if ($currentLifecycle -is [System.Collections.IDictionary]) {
+                        $kernelState = [string]$currentLifecycle['state']
+                    }
+                    $optionalWorkers = $hostLifecycle['optional_workers']
+                    if ($optionalWorkers -is [System.Collections.IDictionary]) {
+                        $moduleSupervisor = $optionalWorkers['module-supervisor']
+                        if ($moduleSupervisor -is [System.Collections.IDictionary]) {
+                            $moduleSupervisorState = [string]$moduleSupervisor['state']
+                        }
+                    }
+                }
+                [long]$hostEpoch = 0
+                [void][long]::TryParse([string]$operatorStatus.value.host_epoch, [ref]$hostEpoch)
+                if ($kernelState -ceq 'running' -and $hostEpoch -gt 0) {
+                    $readinessCode = 'HOST_SUPERVISOR_NOT_READY'
+                    if ($moduleSupervisorState -ceq 'running') {
+                        $hostReadinessFacts = [ordered]@{
+                            host_epoch = $hostEpoch
+                            kernel_lifecycle_state = $kernelState
+                            module_supervisor_state = $moduleSupervisorState
+                        }
+                        $hostReady = $true
+                        break
+                    }
+                }
+            }
         }
         Start-Sleep -Milliseconds 500
     }
-    if (-not $hostReady) { Add-Stage -Name 'isolated_host' -Status 'blocked' -Code 'HOST_NOT_READY'; Stop-Qualification 'HOST_NOT_READY' }
-    Add-Stage -Name 'isolated_host' -Status 'passed' -Facts ([ordered]@{ isolated_data_root = $true; host_process_id = $script:HostProcess.Id; host_image_sha256 = $actualHostHash; public_cli_image_sha256 = $actualPublicCliHash; operator_credential_created = (Test-Path -LiteralPath $script:OperatorCredentialPath) })
+    if (-not $hostReady) { Add-Stage -Name 'isolated_host' -Status 'blocked' -Code $readinessCode; Stop-Qualification $readinessCode }
+    $script:Report.safe_facts.host_readiness = $hostReadinessFacts
+    Add-Stage -Name 'isolated_host' -Status 'passed' -Facts ([ordered]@{
+        isolated_data_root = $true
+        kernel_process_id = $script:HostProcessId
+        kernel_image_sha256 = $actualHostHash
+        host_launcher_image_sha256 = $actualHostLauncherHash
+        host_supervisor_image_sha256 = $actualHostSupervisorHash
+        public_cli_image_sha256 = $actualPublicCliHash
+        host_readiness = $hostReadinessFacts
+        operator_credential_created = (Test-Path -LiteralPath $script:OperatorCredentialPath)
+    })
 
     $script:CurrentStage = 'manager_admission'
     $managerId = 'native-qualification-' + [Guid]::NewGuid().ToString('N')
@@ -1533,11 +1698,22 @@ finally {
         }
     }
     if ($null -ne $script:HostPendingProcessId) {
-        $script:Report.safe_facts.host_shutdown = [ordered]@{ graceful_eof_sent = $true; pending_host_process_id = $script:HostPendingProcessId; force_terminated = $false }
+        $script:Report.safe_facts.host_shutdown = [ordered]@{
+            graceful_eof_sent = $script:HostStdinEofSent
+            kernel_process_id = $script:HostProcessId
+            pending_kernel_process_id = $script:HostPendingProcessId
+            pending_host_process_id = $script:HostPendingProcessId
+            force_terminated = $false
+        }
         $script:Report.status = if ($script:Report.status -eq 'running') { 'host_shutdown_pending' } else { $script:Report.status }
     }
     elseif ($null -ne $script:HostProcess -or $null -ne $script:OperatorCredentialPath) {
-        $script:Report.safe_facts.host_shutdown = [ordered]@{ graceful_eof_sent = $true; exited = $true; force_terminated = $false }
+        $script:Report.safe_facts.host_shutdown = [ordered]@{
+            graceful_eof_sent = $script:HostStdinEofSent
+            kernel_process_id = $script:HostProcessId
+            exited = $script:HostProcessExited
+            force_terminated = $false
+        }
     }
     if ($script:PublicCliProcessIdsPending.Count -gt 0) { $script:Report.safe_facts.public_cli_processes_timed_out = @($script:PublicCliProcessIdsPending.ToArray()) }
     if ($script:Report.status -eq 'running') { $script:Report.status = if ($script:FailureCode) { 'blocked' } else { 'dispatch_readback_complete' } }

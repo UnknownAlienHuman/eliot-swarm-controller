@@ -95,7 +95,7 @@ pub fn verify_managed_worker_config(expected: &ManagedWorkerConfigExpectation) -
     swarm_process::private_permissions(&expected.path, false)?;
 
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    let mut file = OpenOptions::new().read(true).open(&expected.path)?;
+    let file = OpenOptions::new().read(true).open(&expected.path)?;
     file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES
         || hex_sha256(&bytes) != expected.worker_config_sha256.to_ascii_lowercase()

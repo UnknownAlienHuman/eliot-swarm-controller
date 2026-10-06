@@ -120,7 +120,7 @@ pub struct ModuleBindingCredential {
 /// Client for the host-owned supervisor scope.  Every method opens one
 /// authenticated transport exchange; the underlying client never replays a
 /// request after an uncertain write or reply.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SupervisorControlClient {
     root: PathBuf,
     credential: Credential,

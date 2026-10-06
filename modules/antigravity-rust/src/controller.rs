@@ -808,11 +808,11 @@ fn terminal_outcome(
         "num_turns": turn.num_turns,
         "local_execution_ref": reference,
     });
-    if matches!(disposition, TerminalDisposition::Applied) {
-        if let Some(admission) = dispatch_admission {
-            details["dispatch_admission"] =
-                serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
-        }
+    if matches!(disposition, TerminalDisposition::Applied)
+        && let Some(admission) = dispatch_admission
+    {
+        details["dispatch_admission"] =
+            serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
     }
     RuntimeOutcome {
         operation_id: identity.operation_id.clone(),

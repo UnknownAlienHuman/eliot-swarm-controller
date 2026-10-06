@@ -4,11 +4,14 @@
 
 ### Source delivery and remaining qualification — 2026-10-05
 
-Main source is published through `3fff155ba822021d080c014c9e61a33ab1fe147e`.
-The owner requires finishing the source changes before compiler, tests, builds
-or native/model execution. The current delivery has not run those gates and
-remains `PARTIAL_PROGRESS`; historical binaries and receipts retain their
-recorded scope.
+Main source is published through `01e37558a1f1a27564a5c55959f909bc40ee487f`.
+The owner requires finishing the source changes before tests and native/model
+execution. Production-only Clippy reached the extracted packages and reported
+compile defects; the current source delivery repairs that batch in Command,
+Claude, CLI, supervisor, observer and the Kernel MCP facade. It remains
+`PARTIAL_PROGRESS` until the corrected source passes its scoped compiler gate.
+No tests, full builds or native/model calls have run in this source phase;
+historical binaries and receipts retain their recorded scope.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility
@@ -55,9 +58,13 @@ events. Scoped logging and read-only monitoring are connected in source;
 selected metadata/redacted content policy is resolved before capture. Raw
 native-frame capture remains unavailable.
 
-The required source integrations listed in the preceding code-phase checkpoint
-are now delivered. Remaining acceptance work begins with one scoped compiler
-gate, then the necessary core failure/recovery and adapter qualification runs.
+The required product source integrations listed in the preceding code-phase
+checkpoint are delivered. The native qualification script now validates the
+public CLI, host wrapper, actual Kernel and supervisor coordinates separately,
+records the actual Kernel PID, and closes only its own Kernel stdin for shutdown.
+Claude's qualification entrypoint is still being aligned with its existing
+version-4 typed host-config route. Remaining acceptance work follows source
+closure: a scoped compiler gate, then core failure/recovery and adapter runs.
 The selected model is `inclusionai/ling-3.1-flash`; Bunny is disabled. Local
 models, Linux/WSL and Zed remain deferred. The active desktop Codex/OpenCodex
 process and configuration are preserved; Claude qualification follows the other

@@ -49,6 +49,18 @@ pub fn application_method_read_only(method: &str) -> Option<bool> {
     swarm_mcp::application_method_read_only(method)
 }
 
+pub(crate) fn registered_application_methods() -> Vec<&'static str> {
+    swarm_contracts::method_policy::METHOD_REGISTRY
+        .iter()
+        .filter_map(|entry| {
+            (entry.mcp
+                && entry.method != "swarm.tools.search"
+                && swarm_mcp::application_method_read_only(entry.method).is_some())
+            .then_some(entry.method)
+        })
+        .collect()
+}
+
 pub(crate) fn participant_core_tool_contracts() -> Result<Vec<Value>> {
     swarm_mcp::participant_core_tool_contracts().map_err(Into::into)
 }

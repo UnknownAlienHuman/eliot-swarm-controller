@@ -13,7 +13,7 @@ use std::{
 use swarm_contracts::error::{Error, Result};
 use swarm_process::{private_permissions, write_private_new};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::mpsc,
 };

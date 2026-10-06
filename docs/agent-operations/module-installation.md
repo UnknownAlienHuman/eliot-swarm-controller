@@ -208,12 +208,14 @@ just package-module swarm-bus release `
   'D:\build-cache\eliot-shared-target' 'D:\artifacts\swarm-bus-release'
 ```
 
-The root host is its own coordinate: `eliot-swarm-controller` / binary `swarm-host`,
-built in release profile by `Build-SwarmHostProvenance.ps1` or
-`just package-host`. The manual workflow offers the twelve module coordinates
-above, that host, and the three independent frontends. It selects one package
-per run, creates one external shared target and fresh package output, and keeps
-host/frontend builds release-only. Gateway is optional for the base host.
+The host chain has three separate coordinates: the public `swarm-host` wrapper
+in `eliot-swarm-controller`, the actual `swarm-kernel-host`, and the independent
+`swarm-supervisor`. `Build-SwarmHostProvenance.ps1` records the selected host
+coordinate; frontend manifests declare all required sibling coordinates. The
+manual workflow offers the declared module, host and frontend packages. It
+selects one package per run, uses one external shared target and a fresh package
+output, and keeps host/frontend builds release-only. Gateway is optional for
+the base host.
 
 ## Build and install the standalone automation worker
 
@@ -335,47 +337,53 @@ registration and keeps the dispatcher lifecycle isolated. Installing the
 binary and setting its pin do not create that registration or qualify a live
 bus service.
 
-## Package the host with source provenance
+## Package runtime processes with source provenance
 
-`tools/ci/Build-SwarmHostProvenance.ps1 -TargetDir <existing-shared-target>
--OutputDir <new-package-directory>` manually builds only the release host package
-through the existing builder. It emits `bin/swarm-host.exe` and the source/build/image
-manifest used to bind a qualification run to an exact artifact. Normal source
-pushes do not invoke this release entrypoint. The caller supplies the existing
-shared target directory; no separate worker or worktree build cache is required.
+Use `Build-SwarmHostProvenance.ps1` for the public `swarm-host` launcher,
+`Build-SwarmKernelHostProvenance.ps1` for `swarm-kernel-host`, and
+`Build-SwarmSupervisorProvenance.ps1` for `swarm-supervisor`. Each accepts the
+existing shared `-TargetDir` and a fresh `-OutputDir`; each emits its own
+binary and source/build/image manifest. The public launcher forwards arguments
+to the Kernel sibling. The Kernel owns Store, the database lock and IPC.
+Normal source pushes do not invoke these manual release builders.
 
 ## Optional checks and local observer
 
-The manual `module-package.yml` workflow offers 14 current executable package
-coordinates: ten module roles, the root host, and three standalone frontends.
-Select one package and profile; host and frontends require `release`. All choices
-use one runner shared target directory and produce one package manifest.
-Library-only scheduler/supervisor crates are not executable selections.
-For current-source native qualification, use
-`tools/qualification/New-NativeQualification.ps1` with separate explicit
-`-HostExecutable`, `-ExpectedHostSha256`, `-HostBuildManifestPath`,
-`-ExpectedHostBuildManifestSha256` and `-PublicCliExecutable`,
-`-ExpectedPublicCliSha256`, `-PublicCliBuildManifestPath`,
-`-ExpectedPublicCliBuildManifestSha256` arguments, plus the installed module
-descriptor, module manifest, and private configuration inputs. The host image
-is `swarm-host.exe`; the public CLI is `swarm.exe` and is staged beside its
-required host sibling. Their manifests and image hashes are independently
-pinned; the CLI and host may have different source revisions. The installed
-module still has to match the host's retained build-set contract. The harness
-starts the host directly, uses the public CLI for ordinary IPC, creates a fresh
-DataRoot, protects unrelated/current Codex processes, and submits one native
-input. Unknown effects use bounded readback rather than another send.
-Source/manifest consistency is recorded separately from the runtime result.
+The manual `module-package.yml` workflow offers explicit executable package
+coordinates, including module roles, the public launcher, Kernel, supervisor
+and standalone frontends. Select one package and profile; runtime processes and
+frontends require `release`. All choices use one shared target and produce one
+package manifest.
 
-`tools/qualification/Invoke-CoreFailureQualification.ps1` uses an explicitly
-pinned `-HostExecutable` and `-PublicCliExecutable` with their independent image
-hashes and build manifests. It starts only the host image directly; the public
-CLI handles Manager operations, ordinary IPC, and independent readback. It uses
-a fresh private DataRoot for lost-caller-ACK, request-conflict and optional
-HookSource deduplication checks. Readback must prove admission before graceful
-restart. The harness never treats a missing caller reply as a native-effect
-unknown outcome, injects a vendor effect, or stops another host. Source
-availability and AST validation do not establish a passing run.
+Both `tools/qualification/New-NativeQualification.ps1` and
+`tools/qualification/Invoke-CoreFailureQualification.ps1` require four
+independently pinned process coordinates:
+
+| Coordinate | Executable | Required argument family |
+| --- | --- | --- |
+| Actual Store/IPC owner | `swarm-kernel-host.exe` | `HostExecutable`, `ExpectedHostSha256`, `HostBuildManifestPath`, `ExpectedHostBuildManifestSha256` |
+| Public launcher | `swarm-host.exe` | `HostLauncherExecutable`, `ExpectedHostLauncherSha256`, `HostLauncherBuildManifestPath`, `ExpectedHostLauncherBuildManifestSha256` |
+| Module supervisor | `swarm-supervisor.exe` | `HostSupervisorExecutable`, `ExpectedHostSupervisorSha256`, `HostSupervisorBuildManifestPath`, `ExpectedHostSupervisorBuildManifestSha256` |
+| Public IPC CLI | `swarm.exe` | `PublicCliExecutable`, `ExpectedPublicCliSha256`, `PublicCliBuildManifestPath`, `ExpectedPublicCliBuildManifestSha256` |
+
+The binaries are staged together with the complete declared sibling chain and
+Kernel resources. Their manifests and image hashes are independent; source
+revisions may differ if their declared contracts agree. Readiness and recorded
+host PID/image refer to the Kernel. The harness owns that Kernel's stdin for
+graceful EOF shutdown, while ordinary requests use the public CLI.
+
+Native qualification also takes the installed module descriptor, module build
+manifest, owner helper and private configuration inputs. The installed module
+must match the retained build-set contract. The harness creates a fresh
+DataRoot, protects unrelated/current Codex processes and submits one native
+input. Unknown effects use bounded readback. Source/manifest consistency and
+runtime outcome are recorded separately.
+
+Core failure qualification uses a fresh private DataRoot for lost-caller-ACK,
+request-conflict and optional HookSource deduplication. Readback proves admission
+before graceful restart. Missing caller replies remain delivery uncertainty;
+this harness does not inject vendor effects or stop another host. Source and
+AST checks alone do not establish a passing run.
 
 The checks executor is a separate optional process pin, not a module descriptor. Build package `swarm-checks` and configure its binary using `[checks.executor]`. Checks default disabled, and the executor pin defaults absent:
 
