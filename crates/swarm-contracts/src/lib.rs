@@ -15,6 +15,7 @@ pub use declared_service_scope::{DeclaredServicePurpose, DeclaredServiceScope};
 pub use error::{Error, NativeRpcRejectionClass, Result};
 pub use rpc::Request;
 pub use runtime::{
-    EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome,
+    EffectOutcome, ModuleReceiptIdentity, NormalizedResultOriginContext,
+    NormalizedResultPageSource, NormalizedResultProducerOrigin, RuntimeCommand, RuntimeOutcome,
     TaskDispatchAdmissionReceipt, TaskDispatchContext,
 };

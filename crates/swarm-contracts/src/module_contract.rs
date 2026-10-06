@@ -18,6 +18,8 @@ pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
 pub const TASK_DISPATCH_ADMISSION_SCHEMA_ID: &str = "swarm.task_dispatch_admission";
+pub const NORMALIZED_RESULT_CONTEXT_SCHEMA_ID: &str = "swarm.normalized_result_context";
+pub const NORMALIZED_RESULT_PAGE_SCHEMA_ID: &str = "swarm.normalized_result_page";
 pub const RUNTIME_SCHEMA_VERSION: &str = "1";
 
 pub fn runtime_command_schema() -> SchemaDescriptor {
@@ -51,6 +53,24 @@ pub fn task_dispatch_context_schema() -> SchemaDescriptor {
 pub fn task_dispatch_admission_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         schema_id: TASK_DISPATCH_ADMISSION_SCHEMA_ID.to_owned(),
+        version: RUNTIME_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor declaration for Store-sealed normalized result origin context.
+pub fn normalized_result_context_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: NORMALIZED_RESULT_CONTEXT_SCHEMA_ID.to_owned(),
+        version: RUNTIME_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor declaration for typed normalized result pages.
+pub fn normalized_result_page_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
         version: RUNTIME_SCHEMA_VERSION.to_owned(),
         sha256: None,
     }

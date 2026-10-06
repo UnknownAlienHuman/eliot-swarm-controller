@@ -10,9 +10,7 @@ use serde_json::Value;
 use swarm_contracts::{
     error::{Error, Result},
     module_contract::ModuleContractClaim,
-    runtime::{
-        ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome,
-    },
+    runtime::{ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome},
 };
 
 pub struct ModuleHostIdentity {
@@ -161,32 +159,63 @@ fn command_capabilities_match(claim: &ModuleContractClaim) -> bool {
 }
 
 fn schemas_match(claim: &ModuleContractClaim) -> bool {
-    fn is_schema(schema: &swarm_contracts::module_catalog::SchemaDescriptor, id: &str) -> bool {
-        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
-    }
-    let legacy = claim.command_schemas.len() == 1
-        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
-        && claim.event_schemas.len() == 1
-        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome");
-    let normalized = claim.command_schemas.len() == 2
-        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
-        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
-        && claim.event_schemas.len() == 2
-        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
-        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission");
-    legacy || normalized
+    let legacy = exact_schema_set(&claim.command_schemas, &["swarm.runtime_command"])
+        && exact_schema_set(&claim.event_schemas, &["swarm.runtime_outcome"]);
+    let normalized = exact_schema_set(
+        &claim.command_schemas,
+        &["swarm.runtime_command", "swarm.task_dispatch_context"],
+    ) && exact_schema_set(
+        &claim.event_schemas,
+        &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
+    );
+    let normalized_results = normalized_result_schemas_match(claim);
+    legacy || normalized || normalized_results
 }
 
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
-    fn is_schema(schema: &swarm_contracts::module_catalog::SchemaDescriptor, id: &str) -> bool {
-        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
-    }
-    claim.command_schemas.len() == 2
-        && claim.event_schemas.len() == 2
-        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
-        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
-        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
-        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission")
+    exact_schema_set(
+        &claim.command_schemas,
+        &["swarm.runtime_command", "swarm.task_dispatch_context"],
+    ) && exact_schema_set(
+        &claim.event_schemas,
+        &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
+    ) || normalized_result_schemas_match(claim)
+}
+
+pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
+    normalized_result_schemas_match(claim)
+}
+
+fn is_schema(schema: &swarm_contracts::module_catalog::SchemaDescriptor, id: &str) -> bool {
+    schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
+}
+
+fn exact_schema_set(
+    actual: &[swarm_contracts::module_catalog::SchemaDescriptor],
+    expected: &[&str],
+) -> bool {
+    actual.len() == expected.len()
+        && expected
+            .iter()
+            .all(|id| actual.iter().any(|schema| is_schema(schema, id)))
+}
+
+fn normalized_result_schemas_match(claim: &ModuleContractClaim) -> bool {
+    exact_schema_set(
+        &claim.command_schemas,
+        &[
+            "swarm.normalized_result_context",
+            "swarm.runtime_command",
+            "swarm.task_dispatch_context",
+        ],
+    ) && exact_schema_set(
+        &claim.event_schemas,
+        &[
+            "swarm.normalized_result_page",
+            "swarm.runtime_outcome",
+            "swarm.task_dispatch_admission",
+        ],
+    )
 }
 
 pub fn receipt_identity_for_input(

@@ -336,6 +336,59 @@ pub(super) fn scope(
     Ok((id, generation, b))
 }
 
+/// Permit an already-admitted normalized page to be persisted or replayed
+/// after a binding release or module-link change. This grants no new command;
+/// the exact Operation origin is checked by normalized_result::validate_source.
+pub(super) fn admitted_result_scope(
+    db: &Connection,
+    p: &Principal,
+    operation_id: &str,
+) -> Result<(String, i64, Value)> {
+    if p.role != Role::Module {
+        return Err(Error::new("FORBIDDEN", "module credential required"));
+    }
+    let client = meta(db, &format!("client:{}", p.client_id))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "module is not registered"))?;
+    if client["role"] != "module" {
+        return Err(Error::new("UNAUTHORIZED", "client is not a module"));
+    }
+    let id = model::text(&client, "binding_id")?.to_owned();
+    let generation = model::positive(&client, "binding_generation")?;
+    let operation = operations::get_operation(db, operation_id)?;
+    let effective_raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let origin = &effective["normalized_result_origin"];
+    if operation["method"] != "agent.result"
+        || operation["binding_id"] != id
+        || operation["binding_generation"] != generation
+        || operation["task_id"] != origin["task_id"]
+        || operation["attempt_id"] != origin["attempt_id"]
+        || origin["binding_id"] != id
+        || origin["binding_generation"] != generation
+        || !matches!(
+            operation["state"].as_str(),
+            Some("queued" | "sending" | "native_accepted" | "outcome_unknown" | "settled")
+        )
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "module may only persist a page for its exact admitted result Operation",
+        ));
+    }
+    let binding = operations::get_binding(db, &id, generation)?;
+    if binding["observation"]["module_client_id"] != p.client_id {
+        return Err(Error::new(
+            "MODULE_OWNER_MISMATCH",
+            "credential does not own this registered module binding",
+        ));
+    }
+    Ok((id, generation, binding))
+}
+
 pub(super) fn register(db: &Connection, v: &Value, client_id: &str) -> Result<Value> {
     let id = model::text(v, "binding_id")?;
     let generation = model::positive(v, "binding_generation")?;
@@ -568,17 +621,63 @@ fn next_internal(
     config: Option<&crate::config::Config>,
 ) -> Result<Value> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (id, generation, b) = scope(&tx, p, true)?;
-    let pre_input_open = descriptor_pre_input_open(&tx, &b)?;
+    let (id, generation, b, admitted_result_only) = match scope(&tx, p, true) {
+        Ok((id, generation, binding)) => (id, generation, binding, false),
+        Err(error) if error.code == "BINDING_CLOSED" => {
+            let client = meta(&tx, &format!("client:{}", p.client_id))?
+                .ok_or_else(|| Error::new("UNAUTHORIZED", "module is not registered"))?;
+            if p.role != Role::Module || client["role"] != "module" || client["disabled"] == true {
+                return Err(error);
+            }
+            let id = model::text(&client, "binding_id")?.to_owned();
+            let generation = model::positive(&client, "binding_generation")?;
+            let queued_result: Option<String> = tx
+                .query_row(
+                    "SELECT operation_id FROM operations
+                     WHERE binding_id=?1 AND binding_generation=?2 AND state='queued'
+                       AND method='agent.result'
+                       AND json_type(effective_request_json,'$.normalized_result_origin')='object'
+                     ORDER BY due_at_ms,created_at_ms,operation_id LIMIT 1",
+                    params![id, generation],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(operation_id) = queued_result else {
+                return Err(error);
+            };
+            let effective_raw: String = tx.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let effective: Value = serde_json::from_str(&effective_raw)?;
+            super::normalized_result::validate_admitted_operation(
+                &tx,
+                &operation_id,
+                &effective["normalized_result_origin"],
+            )?;
+            let (scoped_id, scoped_generation, binding) =
+                admitted_result_scope(&tx, p, &operation_id)?;
+            (scoped_id, scoped_generation, binding, true)
+        }
+        Err(error) => return Err(error),
+    };
+    let pre_input_open = if admitted_result_only {
+        None
+    } else {
+        descriptor_pre_input_open(&tx, &b)?
+    };
     if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
         // Artifact .2 is retained for historical operation reads only. Never
         // hand queued work to an old bridge after the .3 receipt contract ships.
         return Ok(json!({"command":null,"reason":"command_artifact_retired"}));
     }
-    if !matches!(
-        b["state"].as_str(),
-        Some("opening" | "ready" | "reconciling")
-    ) {
+    if !admitted_result_only
+        && !matches!(
+            b["state"].as_str(),
+            Some("opening" | "ready" | "reconciling")
+        )
+    {
         return Ok(json!({"command":null}));
     }
     // Readback, replies and continuation-stop controls stay available while an
@@ -587,6 +686,7 @@ fn next_internal(
         let row:Option<(String,String,String,i64)>=tx.query_row(
             "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
              WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
+               AND (?5=0 OR (method='agent.result' AND json_type(candidate.effective_request_json,'$.normalized_result_origin')='object'))
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
                AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
                AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
@@ -600,7 +700,7 @@ fn next_internal(
                            WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
                            WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
                            WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
-            params![id,generation,model::now_ms()?,model::canonical(&b["observation"])?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+            params![id,generation,model::now_ms()?,model::canonical(&b["observation"])?,admitted_result_only],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let Some((op, method, raw, created)) = row else {
             return Ok(json!({"command":null}));
         };
@@ -700,6 +800,24 @@ fn next_internal(
     };
     let mut input: Value = serde_json::from_str(&raw)?;
     let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
+    let effective_raw: String = tx.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [&op],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    if method == "agent.result" && effective["normalized_result_origin"].is_object() {
+        input["normalized_result_origin"] = effective["normalized_result_origin"].clone();
+        if effective["normalized_result_payload_identity"].is_object() {
+            input["normalized_result_payload_identity"] =
+                effective["normalized_result_payload_identity"].clone();
+        }
+        if effective["command_output_target_snapshot"].is_object() {
+            input["target_command_output"] = effective["command_output_target_snapshot"].clone();
+        }
+    }
+    let normalized_result_admitted =
+        method == "agent.result" && effective["normalized_result_origin"].is_object();
     let mut trusted_launch_dispatch_packet: Option<Value> = None;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
@@ -712,26 +830,27 @@ fn next_internal(
         } else {
             None
         };
-        let caller = if opening_actor.is_some() || repair_context.is_some() {
-            // The exact opening guard above validated the retained actor in
-            // this transaction. A technical requester is not a registered
-            // client or a Principal; no synthetic profile is created here.
-            Value::Null
-        } else {
-            let caller = meta(&tx, &format!("client:{}", model::text(&o, "caller_id")?))?
-                .ok_or_else(|| {
-                    Error::new("UNAUTHORIZED", "original caller no longer registered")
-                })?;
-            if caller["disabled"] == true {
-                return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
-            }
-            // Existing queued work must not retain an old remote Operator's
-            // privilege after the local bootstrap identity has been anchored.
-            if caller["role"] == "operator" {
-                super::require_local_operator(&tx, model::text(&o, "caller_id")?)?;
-            }
-            caller
-        };
+        let caller =
+            if opening_actor.is_some() || repair_context.is_some() || normalized_result_admitted {
+                // The exact opening guard above validated the retained actor in
+                // this transaction. A technical requester is not a registered
+                // client or a Principal; no synthetic profile is created here.
+                Value::Null
+            } else {
+                let caller = meta(&tx, &format!("client:{}", model::text(&o, "caller_id")?))?
+                    .ok_or_else(|| {
+                        Error::new("UNAUTHORIZED", "original caller no longer registered")
+                    })?;
+                if caller["disabled"] == true {
+                    return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
+                }
+                // Existing queued work must not retain an old remote Operator's
+                // privilege after the local bootstrap identity has been anchored.
+                if caller["role"] == "operator" {
+                    super::require_local_operator(&tx, model::text(&o, "caller_id")?)?;
+                }
+                caller
+            };
         let reconcile_starts_work = if method == "agent.reconcile"
             && b["observation"].get("module_contract_selector").is_some()
         {
@@ -817,7 +936,8 @@ fn next_internal(
         } else {
             let rootless_open_reconcile =
                 allows_rootless_open_reconcile(&tx, &method, &input, &b, &id, generation)?;
-            if b["state"] != "ready"
+            if !normalized_result_admitted
+                && b["state"] != "ready"
                 && !is_recovery_control(&method, &input, &b, rootless_open_reconcile)
             {
                 return Err(Error::new(
@@ -826,7 +946,11 @@ fn next_internal(
                 ));
             }
         }
-        if method != "agent.open" && repair_context.is_none() && caller["role"] != "operator" {
+        if method != "agent.open"
+            && repair_context.is_none()
+            && !normalized_result_admitted
+            && caller["role"] != "operator"
+        {
             let caller_id = model::text(&o, "caller_id")?;
             let owns: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",
@@ -880,14 +1004,16 @@ fn next_internal(
             trusted_launch_dispatch_packet =
                 super::launcher_dispatch::validate_before_effect(&tx, config, &op, &input, &b)?;
         }
-        super::module_handshake::require_selected_native_command(
-            &tx,
-            &id,
-            model::text(&b, "module_artifact_id")?,
-            b["observation"].get("module_contract_selector"),
-            &method,
-            &input,
-        )?;
+        if !normalized_result_admitted {
+            super::module_handshake::require_selected_native_command(
+                &tx,
+                &id,
+                model::text(&b, "module_artifact_id")?,
+                b["observation"].get("module_contract_selector"),
+                &method,
+                &input,
+            )?;
+        }
         Ok(())
     })();
     if let Err(e) = guard {
@@ -995,6 +1121,8 @@ fn next_internal(
         method == "agent.result" && input["selector"]["kind"] == "command_output";
     let claude_assistant_result =
         method == "agent.result" && input["selector"]["kind"] == "claude_assistant_result";
+    let normalized_result_page =
+        method == "agent.result" && input["normalized_result_origin"].is_object();
     let mut sealed_claude_result_origin = None;
     let target_input_sha256 = if method == "agent.reconcile"
         || input_status_result
@@ -1002,12 +1130,14 @@ fn next_internal(
         || command_status_result
         || command_output_result
         || claude_assistant_result
+        || normalized_result_page
     {
         let target_id = if input_status_result
             || antigravity_status_result
             || command_status_result
             || command_output_result
             || claude_assistant_result
+            || normalized_result_page
         {
             model::text(&input["selector"], "input_operation_id")?
         } else {
@@ -1019,6 +1149,25 @@ fn next_internal(
                 "FORBIDDEN",
                 "readback target belongs to another binding generation",
             ));
+        }
+        if normalized_result_page {
+            let target_raw: String = tx.query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [target_id],
+                |row| row.get(0),
+            )?;
+            let target_request: Value = serde_json::from_str(&target_raw)?;
+            if target["method"] != "task.dispatch"
+                || target_id != input["normalized_result_origin"]["target_operation_id"]
+                || input["selector"]["input_operation_id"] != target_id
+                || input["normalized_result_origin"]["target_input_sha256"]
+                    != model::digest(model::canonical(&target_request)?.as_bytes())
+            {
+                return Err(Error::new(
+                    "RESULT_ORIGIN_INVALID",
+                    "normalized result no longer names its sealed task.dispatch request",
+                ));
+            }
         }
         if input_status_result
             && !matches!(
@@ -1078,17 +1227,35 @@ fn next_internal(
             input["target_operation_status"] = snapshot;
             Some(digest)
         } else if command_output_result {
-            let native_output = model::text(&input["selector"], "native_output")?;
-            let snapshot = super::command_results::admitted_output_snapshot(
-                &tx,
-                &op,
-                &id,
-                generation,
-                target_id,
-                native_output,
-            )?;
+            let snapshot = if normalized_result_page
+                && effective["command_output_target_snapshot"].is_object()
+            {
+                effective["command_output_target_snapshot"].clone()
+            } else {
+                let native_output = model::text(&input["selector"], "native_output")?;
+                super::command_results::admitted_output_snapshot(
+                    &tx,
+                    &op,
+                    &id,
+                    generation,
+                    target_id,
+                    native_output,
+                )?
+            };
             let digest = model::text(&snapshot, "input_sha256")?.to_owned();
+            if normalized_result_page
+                && digest != input["normalized_result_origin"]["target_input_sha256"]
+            {
+                return Err(Error::new(
+                    "RESULT_ORIGIN_INVALID",
+                    "sealed Command output snapshot differs from the normalized origin",
+                ));
+            }
             input["target_command_output"] = snapshot;
+            Some(digest)
+        } else if normalized_result_page {
+            let digest =
+                model::text(&input["normalized_result_origin"], "target_input_sha256")?.to_owned();
             Some(digest)
         } else {
             let raw: String = tx.query_row(
@@ -3595,16 +3762,50 @@ fn user_command_with_actor(
     let id = model::text(v, "binding_id")?;
     let generation = model::positive(v, "generation")?;
     let b = operations::get_binding(tx, id, generation)?;
-    let strict_command_result =
+    let generic_result_selector =
+        method == "agent.result" && super::normalized_result::uses_generic_selector(&v["selector"]);
+    let normalized_result_request =
+        generic_result_selector && super::normalized_result::enabled(tx, &b)?;
+    if generic_result_selector && !normalized_result_request {
+        return Err(Error::new(
+            "RESULT_SELECTOR_UNSUPPORTED",
+            "result selector requires the descriptor-admitted normalized result contract",
+        ));
+    }
+    let command_result_route =
         method == "agent.result" && crate::runtime::batch::is_rust_command_route(&b["route"]);
-    let command_result_target_snapshot = if strict_command_result {
+    let strict_command_result = command_result_route && !normalized_result_request;
+    let command_result_target_snapshot = if command_result_route
+        && matches!(
+            v["selector"]["kind"].as_str(),
+            Some("command_status" | "command_output")
+        ) {
         Some(super::command_results::validate_request(tx, &b, v)?)
     } else {
         None
     };
-    if crate::runtime::batch::is_sessionless_route(&b["route"]) && !strict_command_result {
+    if crate::runtime::batch::is_sessionless_route(&b["route"])
+        && !strict_command_result
+        && !normalized_result_request
+    {
         crate::runtime::batch::validate_command(&b["route"], method, v)?;
     }
+    let normalized_target_attempt_id = if normalized_result_request {
+        let target_id = model::text(&v["selector"], "input_operation_id")?;
+        let target = operations::get_operation(tx, target_id)?;
+        if target["method"] != "task.dispatch"
+            || target["binding_id"] != id
+            || target["binding_generation"] != generation
+        {
+            return Err(Error::new(
+                "RESULT_ORIGIN_INVALID",
+                "normalized result selector must name a task.dispatch on this binding generation",
+            ));
+        }
+        Some(model::text(&target, "attempt_id")?.to_owned())
+    } else {
+        None
+    };
     let rootless_open_reconcile =
         allows_rootless_open_reconcile(tx, method, v, &b, id, generation)?;
     if b["state"] != "ready" && !is_recovery_control(method, v, &b, rootless_open_reconcile) {
@@ -3697,11 +3898,14 @@ fn user_command_with_actor(
             }
             UserCommandActor::Direct(principal) if principal.role == Role::Manager => {
                 let principal = super::current_principal(tx, (*principal).clone())?;
-                let requested_attempt = v
-                    .get("attempt_id")
-                    .filter(|value| !value.is_null())
-                    .map(|_| model::text(v, "attempt_id").map(str::to_owned))
-                    .transpose()?;
+                let requested_attempt = if normalized_result_request {
+                    normalized_target_attempt_id.clone()
+                } else {
+                    v.get("attempt_id")
+                        .filter(|value| !value.is_null())
+                        .map(|_| model::text(v, "attempt_id").map(str::to_owned))
+                        .transpose()?
+                };
                 let attempts = current_attempts_for_binding(tx, id, generation)?;
                 let selected = if let Some(requested) = requested_attempt {
                     let attempt = tasks::get_attempt(tx, &requested)?;
@@ -3738,6 +3942,47 @@ fn user_command_with_actor(
             _ => {}
         }
     }
+    let normalized_result_origin = if let Some(attempt_id) = normalized_target_attempt_id.as_deref()
+    {
+        let attempt = tasks::get_attempt(tx, attempt_id)?;
+        match &actor {
+            UserCommandActor::Direct(principal) if principal.role == Role::Participant => {
+                let principal = super::current_principal(tx, (*principal).clone())?;
+                if principal.role != Role::Participant
+                    || principal.owns(model::text(&attempt, "owner_id")?).is_err()
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "Participant does not own the exact result Attempt",
+                    ));
+                }
+            }
+            UserCommandActor::Direct(principal) if principal.role == Role::Manager => {
+                if manager_attempt
+                    .as_ref()
+                    .is_none_or(|selected| selected["attempt_id"] != attempt["attempt_id"])
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "Manager authority was not established for the exact result Attempt",
+                    ));
+                }
+            }
+            UserCommandActor::Direct(principal) if principal.role == Role::Operator => {}
+            _ => {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "normalized result admission requires its assigned Participant, current GM, or Operator",
+                ));
+            }
+        }
+        Some((
+            attempt.clone(),
+            super::normalized_result::admitted_origin(tx, &b, &attempt, v)?,
+        ))
+    } else {
+        None
+    };
     if method == "agent.recover" {
         actor.require_operator()?;
         model::text(v, "reason")?;
@@ -3756,6 +4001,7 @@ fn user_command_with_actor(
     if method == "agent.result"
         && b["route"]["runtime"] == "antigravity"
         && b["observation"]["module_contract_selector"].is_object()
+        && !normalized_result_request
     {
         model::fields(
             &v["selector"],
@@ -3774,6 +4020,7 @@ fn user_command_with_actor(
     if method == "agent.result"
         && crate::runtime::batch::is_sessionless_route(&b["route"])
         && !strict_command_result
+        && !normalized_result_request
     {
         let target = operations::get_operation(tx, model::text(&v["selector"], "operation_id")?)?;
         if target["method"] != "task.dispatch"
@@ -3927,11 +4174,33 @@ fn user_command_with_actor(
             params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
+    effective["native_scope_key"] = b["native_scope_key"].clone();
+    if let Some((_, origin)) = normalized_result_origin.as_ref() {
+        effective["normalized_result_origin"] = origin.clone();
+    }
     if let Some(origin) = sealed_claude_result_origin.as_ref() {
         effective["claude_result_origin"] = origin.clone();
     }
     if let Some(snapshot) = command_result_target_snapshot {
         if v["selector"]["kind"] == "command_output" {
+            if normalized_result_request {
+                let stored_bytes = snapshot["stored_bytes"].as_u64().ok_or_else(|| {
+                    Error::new(
+                        "RESULT_PROVENANCE_INVALID",
+                        "Command capture length is invalid",
+                    )
+                })?;
+                let stored_sha = model::text(&snapshot, "stored_sha256")?;
+                let capture_complete = snapshot["truncated"] == false
+                    && snapshot["read_error"] == false
+                    && snapshot["stream_bytes"] == json!(stored_bytes)
+                    && snapshot["stream_sha256"] == stored_sha;
+                effective["normalized_result_payload_identity"] = json!({
+                    "sha256":stored_sha,
+                    "byte_length":stored_bytes,
+                    "complete":capture_complete
+                });
+            }
             effective["command_output_target_snapshot"] = snapshot;
         } else {
             effective["command_status_target_snapshot"] = snapshot;
@@ -4039,6 +4308,16 @@ fn user_command_with_actor(
                 op,
                 origin["target_task_id"].as_str(),
                 origin["target_attempt_id"].as_str()
+            ],
+        )?;
+    }
+    if let Some((attempt, _)) = normalized_result_origin.as_ref() {
+        tx.execute(
+            "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+            params![
+                op,
+                attempt["task_id"].as_str(),
+                attempt["attempt_id"].as_str()
             ],
         )?;
     }

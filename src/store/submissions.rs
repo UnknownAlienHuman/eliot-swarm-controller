@@ -87,6 +87,9 @@ fn candidate_for_attempt(
         }
         return Ok(record);
     }
+    if super::normalized_result::validate_candidate_origin(db, a, &record)? {
+        return Ok(record);
+    }
     let identity = match record.kind.as_str() {
         "native_result" if record.metadata["coverage"] == "complete" => {
             &record.metadata["identity"]
@@ -243,6 +246,9 @@ fn authorize_participant_candidate(
             "CANDIDATE_SCOPE",
             "source snapshot belongs to another Task or Attempt",
         ));
+    }
+    if super::normalized_result::validate_candidate_origin(db, attempt, candidate)? {
+        return Ok(());
     }
     let claude_candidate = match candidate.kind.as_str() {
         "native_result_page" => candidate.metadata["source"]["kind"] == "claude_assistant_result",

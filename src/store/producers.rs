@@ -397,10 +397,9 @@ pub(super) fn record_batch(
     Ok(producer)
 }
 
-/// Record the normalized descriptor-backed dispatch admission for the exact
-/// Attempt that owns the Operation. The receipt proves native input admission;
-/// it carries no terminal Task evidence and therefore never invokes
-/// `apply_evidence`.
+/// Record the normalized descriptor-backed dispatch receipt for the exact
+/// Attempt that owns the Operation. The allowlisted execution facts distinguish
+/// input admission from one completed native turn and never complete a Task.
 pub(super) fn record_task_dispatch(
     tx: &Transaction<'_>,
     operation: &Value,
@@ -435,6 +434,44 @@ pub(super) fn record_task_dispatch(
         ));
     }
 
+    let reported_completion = outcome.details["completion_condition"].as_str();
+    let reported_execution_complete = outcome.details.get("execution_complete");
+    let reported_task_completion = outcome.details.get("task_completion");
+    let (completion_condition, execution_complete, disposition) = if reported_completion
+        == Some("native_turn_completed")
+    {
+        if reported_execution_complete.and_then(Value::as_bool) != Some(true)
+            || reported_task_completion.is_some_and(|value| value != "unknown")
+            || !matches!(outcome.outcome, crate::runtime::EffectOutcome::Applied)
+        {
+            return Err(Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "completed-turn producer facts are inconsistent",
+            ));
+        }
+        ("native_turn_completed", true, "completed")
+    } else {
+        if reported_completion.is_some_and(|condition| {
+            !matches!(
+                condition,
+                "native_input_admitted" | "native_result_observed"
+            )
+        }) || reported_execution_complete.is_some_and(|value| value != false)
+            || reported_task_completion.is_some_and(|value| value != "unknown")
+            || !matches!(
+                outcome.outcome,
+                crate::runtime::EffectOutcome::Applied | crate::runtime::EffectOutcome::Accepted
+            )
+        {
+            return Err(Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "dispatch producer may claim input admission only, not native or Task completion",
+            ));
+        }
+        ("native_input_admitted", false, "admitted")
+    };
+    let task_completion = "unknown";
+
     let producer = json!({
         "assignment_id": outcome.operation_id,
         "dispatch_operation_id": outcome.operation_id,
@@ -450,10 +487,10 @@ pub(super) fn record_task_dispatch(
         "native_payload_bytes": admission.native_payload_bytes,
         "module_receipt": admission.module_receipt,
         "admission_kind": "normalized_task_dispatch",
-        "completion_condition": "native_input_admitted",
-        "execution_complete": false,
-        "task_completion": "unknown",
-        "disposition": "admitted"
+        "completion_condition": completion_condition,
+        "execution_complete": execution_complete,
+        "task_completion": task_completion,
+        "disposition": disposition
     });
     let mut producers: Vec<Value> = serde_json::from_value(attempt["producers"].clone())?;
     if let Some(index) = producers.iter().position(|item| {

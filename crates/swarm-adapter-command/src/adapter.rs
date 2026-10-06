@@ -644,7 +644,11 @@ async fn process_command(
                     // first page was not sealed before a crash, regenerate it
                     // from the exact current Store snapshot in this command.
                     let params = if command.input["selector"]["kind"] == "command_output" {
-                        result_page::build_output(command, &owner.host.claim, store)?
+                        if module_host::normalized_result_enabled(&owner.host.claim) {
+                            result_page::build_normalized_output(command, &owner.host.claim, store)?
+                        } else {
+                            result_page::build_output(command, &owner.host.claim, store)?
+                        }
                     } else {
                         result_page::build(command, &owner.host.claim)?
                     };

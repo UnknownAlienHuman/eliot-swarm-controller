@@ -484,9 +484,15 @@ pub(super) fn prepare(
     operation_id: &str,
     source: &Value,
 ) -> Result<Value> {
-    let (id, generation, b) = match admitted_claude_result_scope(db, p, operation_id)? {
-        Some(scope) => scope,
-        None => runtime::scope(db, p, true)?,
+    let normalized_result_page =
+        source["schema_id"] == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID;
+    let (id, generation, b) = if normalized_result_page {
+        runtime::admitted_result_scope(db, p, operation_id)?
+    } else {
+        match admitted_claude_result_scope(db, p, operation_id)? {
+            Some(scope) => scope,
+            None => runtime::scope(db, p, true)?,
+        }
     };
     let op = operations::get_operation(db, operation_id)?;
     if op["method"] != "agent.result"
@@ -522,7 +528,18 @@ pub(super) fn prepare(
         "requested_offset":request["offset_bytes"].as_u64().unwrap_or(0),
         "requested_length":request["length_bytes"].as_u64().unwrap_or(crate::artifacts::MAX_PAGE_BYTES as u64)
     });
-    if request["selector"]["kind"] == "input_status" {
+    if normalized_result_page {
+        let (_, origin) = super::normalized_result::validate_source(db, operation_id, source)?;
+        let effective_raw: String = db.query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let effective: Value = serde_json::from_str(&effective_raw)?;
+        context["native_root_id"] = effective["native_root_id"].clone();
+        context["native_scope_key"] = effective["native_scope_key"].clone();
+        context["normalized_result_origin"] = origin;
+    } else if request["selector"]["kind"] == "input_status" {
         model::fields(
             &request["selector"],
             &["kind", "input_operation_id", "session_id"],
@@ -958,6 +975,10 @@ pub(super) fn record(
             "task_completion",
             "native_replay",
         ]);
+    } else if artifact.metadata["source"]["schema_id"]
+        == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
+    {
+        context_keys.push("normalized_result_origin");
     }
     for key in context_keys {
         if context[key] != artifact.metadata[key] {

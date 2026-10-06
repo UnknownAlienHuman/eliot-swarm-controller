@@ -58,6 +58,7 @@ mod module_handshake;
 mod module_supervisor_observation;
 mod monitor;
 mod native_mcp;
+mod normalized_result;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
 mod opencode;
@@ -2037,10 +2038,13 @@ impl Store {
         let page: ResultPage = serde_json::from_value(params["page"].clone())?;
         let p = principal.clone();
         let source = page.source.clone();
-        let command_result_page = matches!(
-            page.source["kind"].as_str(),
-            Some("command_status" | "command_output")
-        );
+        let normalized_result_page = source["schema_id"]
+            == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID;
+        let command_result_page = !normalized_result_page
+            && matches!(
+                page.source["kind"].as_str(),
+                Some("command_status" | "command_output")
+            );
         let mut metadata = self
             .run(move |db| {
                 if command_result_page {
@@ -2051,6 +2055,9 @@ impl Store {
             })
             .await?;
         let bytes = page.decode()?;
+        if normalized_result_page {
+            normalized_result::validate_page(&page, &metadata, &bytes)?;
+        }
         if metadata["selector"]["kind"] == "input_status" {
             let status_bytes = serde_json::to_vec(&json!({
                 "status":"native_input_admitted",
@@ -2114,7 +2121,7 @@ impl Store {
                 ));
             }
         }
-        if metadata["selector"]["kind"] == "command_output" {
+        if !normalized_result_page && metadata["selector"]["kind"] == "command_output" {
             command_results::validate_output_page(&page, &metadata, &bytes)?;
         }
         if metadata["requested_offset"].as_u64() != Some(page.offset_bytes)
@@ -2137,10 +2144,11 @@ impl Store {
         let saved = record.clone();
         self.file_io(move |files| files.publish(&saved, &bytes))
             .await?;
-        let command_result_page = matches!(
-            record.metadata["selector"]["kind"].as_str(),
-            Some("command_status" | "command_output")
-        );
+        let command_result_page = !normalized_result_page
+            && matches!(
+                record.metadata["selector"]["kind"].as_str(),
+                Some("command_status" | "command_output")
+            );
         let result = self
             .run(move |db| {
                 if command_result_page {

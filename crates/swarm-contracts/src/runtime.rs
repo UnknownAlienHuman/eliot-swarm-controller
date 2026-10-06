@@ -132,7 +132,10 @@ impl TaskDispatchAdmissionReceipt {
             || self.module_receipt.validate().is_err()
             || !is_lower_sha256(&self.native_payload_sha256)
             || self.native_payload_bytes == 0
-            || self.native_input_id.as_ref().is_some_and(|id| id.trim().is_empty())
+            || self
+                .native_input_id
+                .as_ref()
+                .is_some_and(|id| id.trim().is_empty())
         {
             return Err("task dispatch admission receipt is invalid");
         }
@@ -153,6 +156,143 @@ impl TaskDispatchAdmissionReceipt {
             source_text_sha256: self.source_text_sha256.clone(),
             source_text_bytes: self.source_text_bytes,
         }
+    }
+}
+
+/// Immutable Attempt and dispatch origin sealed by Store when it admits an
+/// opted-in `agent.result` request. This is provenance only: it does not
+/// assert native execution or Task completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedResultOriginContext {
+    pub schema_version: u16,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub task_snapshot_sha256: String,
+    pub attempt_id: String,
+    pub target_operation_id: String,
+    pub target_input_sha256: String,
+    pub selector_sha256: String,
+    pub producer: NormalizedResultProducerOrigin,
+}
+
+/// Exact durable normalized `task.dispatch` producer retained on the Attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedResultProducerOrigin {
+    pub assignment_id: String,
+    pub dispatch_operation_id: String,
+    pub attempt_id: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub task_snapshot_sha256: String,
+    pub source_text_sha256: String,
+    pub source_text_bytes: u64,
+    pub native_payload_sha256: String,
+    pub native_payload_bytes: u64,
+    pub completion_condition: String,
+    pub execution_complete: bool,
+    pub task_completion: String,
+    pub disposition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input_id: Option<String>,
+    pub module_receipt: ModuleReceiptIdentity,
+}
+
+impl NormalizedResultOriginContext {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let producer = &self.producer;
+        if self.schema_version != 1
+            || self.binding_id.trim().is_empty()
+            || self.binding_generation <= 0
+            || self.task_id.trim().is_empty()
+            || self.task_revision <= 0
+            || self.attempt_id.trim().is_empty()
+            || self.target_operation_id.trim().is_empty()
+            || !is_lower_sha256(&self.task_snapshot_sha256)
+            || !is_lower_sha256(&self.target_input_sha256)
+            || !is_lower_sha256(&self.selector_sha256)
+            || producer.assignment_id != self.target_operation_id
+            || producer.dispatch_operation_id != self.target_operation_id
+            || producer.attempt_id != self.attempt_id
+            || producer.task_id != self.task_id
+            || producer.task_revision != self.task_revision
+            || producer.task_snapshot_sha256 != self.task_snapshot_sha256
+            || !is_lower_sha256(&producer.source_text_sha256)
+            || producer.source_text_bytes > i64::MAX as u64
+            || !is_lower_sha256(&producer.native_payload_sha256)
+            || producer.native_payload_bytes > i64::MAX as u64
+            || producer.task_completion != "unknown"
+            || !matches!(
+                (
+                    producer.completion_condition.as_str(),
+                    producer.execution_complete,
+                    producer.disposition.as_str()
+                ),
+                ("native_input_admitted", false, "admitted")
+                    | ("native_turn_completed", true, "completed")
+            )
+            || producer.module_receipt.validate().is_err()
+            || producer.module_receipt.operation_id != self.target_operation_id
+            || producer.module_receipt.binding_id != self.binding_id
+            || producer.module_receipt.binding_generation != self.binding_generation
+            || producer.module_receipt.input_sha256 != self.target_input_sha256
+            || producer
+                .native_input_id
+                .as_ref()
+                .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err("normalized result origin is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Typed, bounded output page from any descriptor-admitted executor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedResultPageSource {
+    pub schema_id: String,
+    pub schema_version: u16,
+    pub origin: NormalizedResultOriginContext,
+    pub result_operation_id: String,
+    pub result_input_sha256: String,
+    pub result_module_receipt: ModuleReceiptIdentity,
+    pub payload_sha256: String,
+    pub payload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_response_identity: Option<String>,
+    pub execution_complete: bool,
+    pub task_completion: String,
+    pub native_replay: bool,
+}
+
+impl NormalizedResultPageSource {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_id != crate::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
+            || self.schema_version != 1
+            || self.origin.validate().is_err()
+            || self.result_operation_id.trim().is_empty()
+            || !is_lower_sha256(&self.result_input_sha256)
+            || self.result_module_receipt.validate().is_err()
+            || self.result_module_receipt.operation_id != self.result_operation_id
+            || self.result_module_receipt.binding_id != self.origin.binding_id
+            || self.result_module_receipt.binding_generation != self.origin.binding_generation
+            || self.result_module_receipt.input_sha256 != self.result_input_sha256
+            || !is_lower_sha256(&self.payload_sha256)
+            || self.payload_bytes > i64::MAX as u64
+            || self.native_response_identity.as_ref().is_some_and(|id| {
+                id.trim().is_empty() || id.len() > 512 || id.chars().any(char::is_control)
+            })
+            || self.execution_complete
+            || self.task_completion != "unknown"
+            || self.native_replay
+        {
+            return Err("normalized result page source is invalid");
+        }
+        Ok(())
     }
 }
 

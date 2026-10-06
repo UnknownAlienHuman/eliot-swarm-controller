@@ -74,6 +74,8 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
     }
     let command_output = m["source"]["kind"] == "command_output";
     let claude_assistant_result = m["source"]["kind"] == "claude_assistant_result";
+    let normalized_result_page = m["source"]["schema_id"]
+        == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID;
     model::text(m, "binding_id")?;
     model::positive(m, "generation")?;
     if command_output {
@@ -83,7 +85,7 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
                 "Command output selector differs from its page provenance",
             ));
         }
-    } else {
+    } else if !normalized_result_page {
         for key in ["native_scope_key", "native_root_id"] {
             model::text(m, key)?;
         }
@@ -94,7 +96,7 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
         .as_object_mut()
         .expect("checked object")
         .remove("whole_digest_verified");
-    if command_output || claude_assistant_result {
+    if command_output || claude_assistant_result || normalized_result_page {
         let source = source.as_object_mut().expect("checked object");
         source.remove("result_operation_id");
         source.remove("result_input_sha256");
@@ -198,6 +200,8 @@ impl ArtifactFiles {
                 ));
             }
             let command_output = identity["source"]["kind"] == "command_output";
+            let normalized_result_page = identity["source"]["schema_id"]
+                == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID;
             let capture = &identity["source"]["target_command_output"];
             let stored_sha = command_output
                 .then(|| capture["stored_sha256"].as_str())
@@ -219,6 +223,17 @@ impl ArtifactFiles {
                     .as_str()
                     .and_then(|h| h.strip_prefix("sha256:"))
             };
+            let normalized_payload_sha = normalized_result_page
+                .then(|| identity["source"]["payload_sha256"].as_str())
+                .flatten();
+            if normalized_payload_sha
+                .is_some_and(|expected| !expected.eq_ignore_ascii_case(&digest))
+            {
+                return Err(Error::new(
+                    "RESULT_DIGEST_MISMATCH",
+                    "assembled bytes differ from the normalized source payload digest",
+                ));
+            }
             if native_sha.is_some_and(|h| !h.eq_ignore_ascii_case(&digest)) {
                 return Err(Error::new(
                     "RESULT_DIGEST_MISMATCH",
@@ -237,6 +252,7 @@ impl ArtifactFiles {
                     "part_count":pages.len(),"coverage":"complete","byte_length":total,
                     "sha256":digest,"expected_sha256":expected,"expected_digest_verified":expected.is_some(),
                     "native_digest_verified":native_sha.is_some(),
+                    "normalized_payload_digest_verified":normalized_payload_sha.is_some(),
                     "capture_prefix_verified":stored_sha.is_some(),
                     "capture_truncated":if command_output {capture["truncated"].clone()} else {Value::Null},
                     "capture_read_error":if command_output {capture["read_error"].clone()} else {Value::Null},

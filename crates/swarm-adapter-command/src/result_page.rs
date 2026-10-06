@@ -10,7 +10,8 @@ use swarm_contracts::{
     error::{Error, Result},
     module_contract::ModuleContractClaim,
     runtime::{
-        ModuleReceiptIdentity, RuntimeCommand, TaskDispatchAdmissionReceipt, TaskDispatchContext,
+        ModuleReceiptIdentity, NormalizedResultPageSource, RuntimeCommand,
+        TaskDispatchAdmissionReceipt, TaskDispatchContext,
     },
 };
 
@@ -241,6 +242,148 @@ pub fn build_output(
     Ok(params)
 }
 
+/// Emit Command's captured stdout/stderr through the shared normalized page
+/// contract. Store seals the origin and expected capture digest at admission;
+/// this adapter only returns bytes from that exact journal snapshot.
+pub fn build_normalized_output(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    store: &RunStore,
+) -> Result<Value> {
+    if command.method != "agent.result"
+        || command.route["runtime"] != "command"
+        || command.route["module_artifact_id"] != "eliot-command.rust-headless.1"
+        || command.input["selector"]["kind"] != "command_output"
+        || !crate::module_host::normalized_result_enabled(claim)
+    {
+        return Err(invalid("normalized Command output contract is unavailable"));
+    }
+    let origin: swarm_contracts::runtime::NormalizedResultOriginContext =
+        serde_json::from_value(command.input["normalized_result_origin"].clone())
+            .map_err(|_| invalid("Store omitted the sealed normalized result origin"))?;
+    origin
+        .validate()
+        .map_err(|_| invalid("Store supplied an invalid normalized result origin"))?;
+    if origin.binding_id != command.binding_id
+        || origin.binding_generation != command.generation
+        || origin.target_operation_id != command.input["selector"]["input_operation_id"]
+    {
+        return Err(invalid(
+            "normalized result origin differs from its Command request",
+        ));
+    }
+    let result_input_sha256 = command
+        .input_sha256
+        .as_deref()
+        .filter(|digest| is_sha256(digest))
+        .ok_or_else(|| invalid("Store omitted the exact result Operation digest"))?;
+    let target_id = origin.target_operation_id.as_str();
+    let native_output = command.input["selector"]["native_output"]
+        .as_str()
+        .filter(|value| matches!(*value, "stdout.ndjson" | "stderr.txt"))
+        .ok_or_else(|| invalid("output selector names an unsupported stream"))?;
+    let target_input_sha256 = command
+        .target_input_sha256
+        .as_deref()
+        .filter(|digest| is_sha256(digest))
+        .ok_or_else(|| invalid("Store omitted the exact target Operation digest"))?;
+    if target_input_sha256 != origin.target_input_sha256 {
+        return Err(invalid(
+            "target digest differs from the sealed result origin",
+        ));
+    }
+    let target = &command.input["target_command_output"];
+    validate_target_output(
+        target,
+        target_id,
+        target_input_sha256,
+        native_output,
+        claim,
+        &command.binding_id,
+        command.generation,
+    )?;
+    let expected = &command.input["normalized_result_payload_identity"];
+    let payload_sha256 = text(expected, "sha256")?;
+    let payload_bytes = expected["byte_length"]
+        .as_u64()
+        .ok_or_else(|| invalid("Store omitted the sealed output byte length"))?;
+    if !is_sha256(payload_sha256)
+        || payload_sha256 != text(target, "stored_sha256")?
+        || payload_bytes != target["stored_bytes"].as_u64().unwrap_or(u64::MAX)
+        || expected["complete"].as_bool().is_none()
+    {
+        return Err(invalid(
+            "output differs from the Store-sealed payload identity",
+        ));
+    }
+    let result_receipt = receipt(command, claim, &command.operation_id, result_input_sha256)?;
+    let bytes = store.read_native_output(
+        target_id,
+        target_input_sha256,
+        &command.binding_id,
+        command.generation,
+        &command.route,
+        target,
+    )?;
+    if bytes.len() as u64 != payload_bytes || sha256_hex(&bytes) != payload_sha256 {
+        return Err(invalid(
+            "journal output differs from the sealed payload identity",
+        ));
+    }
+    let source = NormalizedResultPageSource {
+        schema_id: swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
+        schema_version: 1,
+        origin,
+        result_operation_id: command.operation_id.clone(),
+        result_input_sha256: result_input_sha256.to_owned(),
+        result_module_receipt: result_receipt,
+        payload_sha256: payload_sha256.to_owned(),
+        payload_bytes,
+        native_response_identity: None,
+        execution_complete: false,
+        task_completion: "unknown".to_owned(),
+        native_replay: false,
+    };
+    source
+        .validate()
+        .map_err(|_| invalid("normalized Command result source is invalid"))?;
+    let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
+    let requested = command.input["length_bytes"]
+        .as_u64()
+        .unwrap_or(MAX_PAGE_BYTES as u64)
+        .min(MAX_PAGE_BYTES as u64);
+    if offset > payload_bytes || (requested == 0 && offset < payload_bytes) {
+        return Err(Error::new(
+            "RESULT_RANGE_INVALID",
+            "requested Command output page range is invalid",
+        ));
+    }
+    let end = offset
+        .checked_add(requested)
+        .unwrap_or(u64::MAX)
+        .min(payload_bytes);
+    let start = usize::try_from(offset)
+        .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
+    let end_index = usize::try_from(end)
+        .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page end is too large"))?;
+    let selected = &bytes[start..end_index];
+    let params = json!({
+        "operation_id":command.operation_id,
+        "page":{
+            "source":source,
+            "offset_bytes":offset,
+            "byte_length":selected.len(),
+            "total_bytes":payload_bytes,
+            "eof":end == payload_bytes,
+            "media_type":if native_output == "stdout.ndjson" { "application/x-ndjson" } else { "text/plain; charset=utf-8" },
+            "content_base64":encode_base64(selected),
+            "page_sha256":sha256_hex(selected)
+        }
+    });
+    validate_saved(&params, claim, &command.binding_id, command.generation)?;
+    Ok(params)
+}
+
 /// Validate a persisted page before an acknowledgement retry. The bytes and
 /// source must be derivable from its exact stored target snapshot and receipts.
 pub fn validate_saved(
@@ -260,6 +403,15 @@ pub fn validate_saved(
     }
     let page = Value::Object(page.clone());
     let source = &page["source"];
+    if source["schema_id"] == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID {
+        return validate_saved_normalized(
+            &params["operation_id"],
+            &page,
+            claim,
+            binding_id,
+            generation,
+        );
+    }
     if source["kind"] == "command_output" {
         return validate_saved_output(params, &page, claim, binding_id, generation);
     }
@@ -353,6 +505,73 @@ pub fn validate_saved(
         || byte_length != selected.len() as u64
     {
         return Err(invalid("saved page bytes differ from its status body"));
+    }
+    Ok(())
+}
+
+fn validate_saved_normalized(
+    operation_id: &Value,
+    page: &Value,
+    claim: &ModuleContractClaim,
+    binding_id: &str,
+    generation: i64,
+) -> Result<()> {
+    let source: NormalizedResultPageSource = serde_json::from_value(page["source"].clone())
+        .map_err(|_| invalid("saved normalized result source is malformed"))?;
+    source
+        .validate()
+        .map_err(|_| invalid("saved normalized result source is invalid"))?;
+    let receipt = &source.result_module_receipt;
+    if source.result_operation_id
+        != operation_id
+            .as_str()
+            .ok_or_else(|| invalid("saved result operation ID is malformed"))?
+        || receipt.operation_id != source.result_operation_id
+        || receipt.input_sha256 != source.result_input_sha256
+        || receipt.module_id != claim.module_id
+        || receipt.artifact != claim.artifact
+        || receipt.protocol != claim.protocol
+        || receipt.binding_id != binding_id
+        || receipt.binding_generation != generation
+        || source.origin.binding_id != binding_id
+        || source.origin.binding_generation != generation
+        || !crate::module_host::normalized_result_enabled(claim)
+    {
+        return Err(invalid(
+            "saved normalized result receipt differs from this binding",
+        ));
+    }
+    let offset = page["offset_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved page offset is invalid"))?;
+    let byte_length = page["byte_length"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved page length is invalid"))?;
+    let total = page["total_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved page total is invalid"))?;
+    let end = offset
+        .checked_add(byte_length)
+        .ok_or_else(|| invalid("saved page range overflows"))?;
+    let encoded = page["content_base64"]
+        .as_str()
+        .ok_or_else(|| invalid("saved result body is missing"))?;
+    let bytes = decode_base64(encoded)?;
+    let media_type = page["media_type"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid("saved result media type is missing"))?;
+    if total != source.payload_bytes
+        || end > total
+        || byte_length != bytes.len() as u64
+        || page["eof"] != (end == total)
+        || media_type.len() > 128
+        || page["page_sha256"] != sha256_hex(&bytes)
+        || (offset == 0 && end == total && sha256_hex(&bytes) != source.payload_sha256)
+    {
+        return Err(invalid(
+            "saved normalized result bytes differ from their source digest",
+        ));
     }
     Ok(())
 }

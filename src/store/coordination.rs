@@ -5,8 +5,8 @@
 //! authority; this module adds no schema or Task graph.
 
 use super::{
-    gm, meta, operations, participant_capability_projection, results, set_meta, tasks,
-    ParticipantCapabilityScope,
+    ParticipantCapabilityScope, gm, meta, operations, participant_capability_projection, results,
+    set_meta, tasks,
 };
 use crate::{
     config::Config,
@@ -3374,12 +3374,15 @@ fn participant_native_operation_projection(
                     "native result is not linked to the current Attempt binding",
                 )
             })?;
-            let binding_generation = scope.attempt["binding_generation"].as_i64().ok_or_else(|| {
-                Error::new(
-                    "NOT_FOUND",
-                    "native result is not linked to the current Attempt generation",
-                )
-            })?;
+            let binding_generation =
+                scope.attempt["binding_generation"]
+                    .as_i64()
+                    .ok_or_else(|| {
+                        Error::new(
+                            "NOT_FOUND",
+                            "native result is not linked to the current Attempt generation",
+                        )
+                    })?;
             if record.binding_id.as_deref() != Some(binding_id)
                 || record.binding_generation != Some(binding_generation)
             {
@@ -3389,6 +3392,52 @@ fn participant_native_operation_projection(
                 ));
             }
             let details = &record.result["details"];
+            if details["completion_condition"] == "result_page_persisted"
+                && details["source"]["schema_id"]
+                    == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
+            {
+                let page_id = details["artifact_ref"].as_str().ok_or_else(|| {
+                    Error::new(
+                        "NOT_FOUND",
+                        "normalized result has no retained page artifact",
+                    )
+                })?;
+                let page = results::get(db, page_id)?;
+                if !super::normalized_result::validate_page_artifact(db, &scope.attempt, &page)?
+                    || page.metadata["operation_id"] != operation_id
+                {
+                    return Err(Error::new(
+                        "NOT_FOUND",
+                        "normalized result page is outside the retained Participant Attempt",
+                    ));
+                }
+                let whole_body = page.metadata["offset_bytes"] == 0
+                    && page.metadata["total_bytes"] == page.byte_length
+                    && page.metadata["eof"] == true;
+                return Ok(json!({
+                    "operation_id":base["operation_id"],
+                    "method":base["method"],
+                    "state":base["state"],
+                    "task_id":base["task_id"],
+                    "task_revision":base["task_revision"],
+                    "attempt_id":base["attempt_id"],
+                    "binding_id":binding_id,
+                    "binding_generation":binding_generation,
+                    "candidate_ref":if whole_body { json!(page_id) } else { Value::Null },
+                    "candidate_refs":[page_id],
+                    "candidate_kind":page.kind,
+                    "candidate_sha256":page.content_digest,
+                    "candidate_byte_length":page.byte_length,
+                    "result":{
+                        "outcome":"applied",
+                        "completion_condition":"result_page_persisted",
+                        "artifact_ref":page_id,
+                        "offset_bytes":page.metadata["offset_bytes"],
+                        "total_bytes":page.metadata["total_bytes"],
+                        "eof":page.metadata["eof"]
+                    }
+                }));
+            }
             if details["completion_condition"] != "batch_output_artifacts_selected"
                 || details["dispatch_operation_id"].as_str().is_none()
             {
@@ -3397,7 +3446,9 @@ fn participant_native_operation_projection(
                     "native result has no complete retained candidate origin",
                 ));
             }
-            let dispatch_id = details["dispatch_operation_id"].as_str().unwrap_or_default();
+            let dispatch_id = details["dispatch_operation_id"]
+                .as_str()
+                .unwrap_or_default();
             let dispatch = operations::get_operation(db, dispatch_id)?;
             if dispatch["method"] != "task.dispatch"
                 || !matches!(dispatch["state"].as_str(), Some("settled" | "rejected"))
@@ -3412,10 +3463,7 @@ fn participant_native_operation_projection(
                 ));
             }
             let refs = details["artifact_refs"].as_array().ok_or_else(|| {
-                Error::new(
-                    "NOT_FOUND",
-                    "native result has no retained artifact pages",
-                )
+                Error::new("NOT_FOUND", "native result has no retained artifact pages")
             })?;
             if refs.is_empty() {
                 return Err(Error::new(
