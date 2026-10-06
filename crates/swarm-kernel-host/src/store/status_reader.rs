@@ -213,6 +213,14 @@ mod tests {
         }
     }
 
+    struct WriterOwnerNotice(Arc<AtomicBool>);
+
+    impl Drop for WriterOwnerNotice {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     struct Fixture {
         directory: ScratchDir,
         owner: super::super::StoreOwner,
@@ -442,13 +450,24 @@ mod tests {
     #[tokio::test]
     async fn owner_close_joins_database_even_if_status_reader_panicked() {
         let database_joined = Arc::new(AtomicBool::new(false));
+        let mut database_owner = swarm_kernel::spawn_kernel_host(
+            swarm_kernel::KernelHostConfig {
+                queue_capacity: 1,
+                batch_capacity: 1,
+            },
+            WriterOwnerNotice(Arc::clone(&database_joined)),
+            || rusqlite::Connection::open_in_memory().map_err(Error::from),
+            |db, job: super::super::RunJob| job(db),
+            |_: &mut rusqlite::Connection, _: Vec<super::super::message_batch::Request>| {},
+        )
+        .expect("database owner spawn");
+        database_owner
+            .wait_ready()
+            .await
+            .expect("database owner ready");
         let status_thread = std::thread::spawn(|| panic!("simulated status-reader panic"));
-        let joined = database_joined.clone();
-        let database_thread = std::thread::spawn(move || {
-            joined.store(true, Ordering::SeqCst);
-        });
 
-        let error = super::super::join_store_threads(status_thread, database_thread)
+        let error = super::super::join_store_threads(status_thread, database_owner)
             .await
             .expect_err("the status-reader panic is reported");
         assert_eq!(error.code, "STORE_PANIC");

@@ -5,22 +5,24 @@
 ### Source delivery and remaining qualification — 2026-10-06
 
 The product source integration, physical Kernel relocation, five Rust adapter
-paths and public CLI/host coordinates are present. Production diagnostics at
-`870f0595ae713746e89c7789fc697951d83cdb78` checked all 24 selected packages,
-including the five Rust adapters, without type errors. Diagnostic mode allowed
-warnings and reported 79 Kernel warnings, so it is not an acceptance result.
-The integrated source batch repairs their mechanical predicates, local row type
-aliases, internal visibility and unused compatibility helpers. Narrow reasoned
-lint expectations retain existing receipt and startup signatures. Four focused
-writer readiness/failure regression cases are present in source, including a
-deterministic initializer-error case after admission closure and confirmed
-writer exit. They have not run yet. The final production compiler gate still
-requires no warnings.
-Source closure precedes tests and native qualification. The product remains
-`PARTIAL_PROGRESS`; compiler success alone does not qualify failure recovery,
-installed adapters or productive execution. No tests, full builds or
-native/provider/model calls have run in this source phase. Historical binaries
-and qualification receipts retain only their recorded scope.
+paths and public CLI/host coordinates are present. Strict production Clippy at
+`6074dcf3be886d33a6cac12f6dab3f3a1bce10cd` checked all 24 selected packages,
+including the five Rust adapters, with `-D warnings` and passed without warnings.
+Four focused writer readiness/failure regression cases passed in one run at
+that same commit, including a deterministic initializer-error case after
+admission closure and confirmed writer exit. Source closure preceded these
+tests.
+
+The first Store failure selector stopped during test compilation: six stale
+fixture errors and six warnings prevented its execution. The subsequent
+test-only source batch updates the real bootstrap/config arguments and typed
+writer owner, preserves the existing authorization and failure assertions, and
+removes the reported unused imports and binding. Store failure/recovery and
+native qualification remain pending. The product remains `PARTIAL_PROGRESS`;
+production compilation and four writer cases do not qualify installed adapters
+or productive execution. No full builds or native/provider/model calls have run
+in this qualification phase. Historical binaries and qualification receipts
+retain only their recorded scope.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility

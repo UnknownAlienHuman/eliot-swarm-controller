@@ -981,11 +981,11 @@ mod tests {
             selected_revision: item.registered_revision,
         })
         .unwrap();
-        let descriptor = &item.descriptor;
+        let registered_descriptor = &item.descriptor;
         let mut mismatched = json!({
             "schema_version":1,
-            "module_id":descriptor.module_id,
-            "artifact":descriptor.artifact,
+            "module_id":registered_descriptor.module_id,
+            "artifact":registered_descriptor.artifact,
             "protocol":HOST_PROTOCOL,
             "capabilities":["native.forged"],
             "config_schema":null,

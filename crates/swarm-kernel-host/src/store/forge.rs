@@ -3429,7 +3429,22 @@ mod tests {
             client_id: "operator".into(),
             token: "forge-restart-fixture-token".into(),
         };
-        let db = super::super::open_database(&directory, &credential).unwrap();
+        let module_supervisor_credential = crate::model::Credential {
+            client_id: model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID.to_owned(),
+            token: format!("{}{}", model::new_id(), model::new_id()),
+        };
+        let mut config = Config::default();
+        config.storage.data_dir = directory.clone();
+        let db = super::super::open_database(
+            &directory,
+            &credential,
+            &module_supervisor_credential,
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         seed_reconciliation_operation(
             &db,
             "op-interrupted-send",
@@ -3444,7 +3459,16 @@ mod tests {
 
         // Reopening exercises the real host-startup transaction before any
         // Forge reconciliation can observe this interrupted send.
-        let mut db = super::super::open_database(&directory, &credential).unwrap();
+        let mut db = super::super::open_database(
+            &directory,
+            &credential,
+            &module_supervisor_credential,
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let restarted = operations::get_operation(&db, "op-interrupted-send").unwrap();
         assert_eq!(restarted["state"], "outcome_unknown");
         assert_eq!(restarted["result"]["outcome"], "unknown");

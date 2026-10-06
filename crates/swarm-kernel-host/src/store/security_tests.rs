@@ -209,13 +209,25 @@ async fn legacy_database_pins_custom_bootstrap_identity_only_after_credential_va
         })
         .await
         .unwrap();
-    owner.close().await.unwrap();
-
     let wrong_credential = Credential {
         client_id: credential.client_id.clone(),
         token: "wrong-token-for-legacy-upgrade".into(),
     };
-    let error = open_database(&directory, &wrong_credential).err().unwrap();
+    let module_supervisor_credential = owner.module_supervisor_credential();
+    owner.close().await.unwrap();
+    let mut reopen_config = Config::default();
+    reopen_config.storage.data_dir = directory.clone();
+    let error = open_database(
+        &directory,
+        &wrong_credential,
+        &module_supervisor_credential,
+        &reopen_config,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.code, "UNAUTHORIZED");
     let db = Connection::open(directory.join("swarm.db")).unwrap();
     assert!(meta(&db, LOCAL_OPERATOR_CLIENT_ID_KEY).unwrap().is_none());
@@ -243,7 +255,17 @@ async fn legacy_database_pins_custom_bootstrap_identity_only_after_credential_va
     )
     .unwrap();
     drop(db);
-    let error = open_database(&directory, &credential).err().unwrap();
+    let error = open_database(
+        &directory,
+        &credential,
+        &module_supervisor_credential,
+        &reopen_config,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.code, "LOCAL_OPERATOR_MISMATCH");
     let db = Connection::open(directory.join("swarm.db")).unwrap();
     assert_eq!(

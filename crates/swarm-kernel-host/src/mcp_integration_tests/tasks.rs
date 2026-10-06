@@ -11,7 +11,6 @@ use crate::{
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use swarm_mcp::config::{McpConfig, McpProfileConfig, Storage};
 use tokio::sync::watch;
 
 use super::public_facade;

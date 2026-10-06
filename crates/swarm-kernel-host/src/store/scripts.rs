@@ -4582,7 +4582,7 @@ mod controller_effect_tests {
 
     #[test]
     fn owning_manager_keeps_script_and_attempt_scope_after_gm_handover() {
-        let mut fixture = fixture(Vec::new());
+        let fixture = fixture(Vec::new());
         fixture
             .db
             .execute(

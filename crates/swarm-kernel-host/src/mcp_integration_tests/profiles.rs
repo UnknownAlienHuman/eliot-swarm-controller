@@ -2,15 +2,13 @@
 
 use crate::{
     config::{Config, McpToolProfile},
-    error::Result,
-    ipc, model,
+    ipc,
     platform::{DataRoot, bootstrap_credential},
     store::StoreOwner,
 };
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use swarm_mcp::config::{McpConfig, McpProfileConfig, Storage};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
     sync::watch,

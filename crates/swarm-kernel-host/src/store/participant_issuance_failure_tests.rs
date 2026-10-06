@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     config::{Config, McpProfileConfig, McpToolProfile},
-    model::{self, Credential, Principal, Role},
+    model::{self, Credential, Principal},
     participant_credentials::{InboundPolicy, IssueRequest, ParticipationBasis},
     platform::{DataRoot, bootstrap_credential},
     store::{Store, StoreOwner},
