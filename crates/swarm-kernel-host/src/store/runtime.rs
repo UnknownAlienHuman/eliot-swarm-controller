@@ -2187,13 +2187,35 @@ pub(super) fn outcome_with_artifacts(
         && effective["automation_on_behalf"]["action"] == "agent.send"
         && effective["automation_on_behalf"]["cause"]["kind"] == "goal_progression";
     if continuation_expected {
-        let receipt = module_receipt.as_ref().ok_or_else(|| {
-            Error::new(
-                "GOAL_CONTINUATION_ADMISSION_INVALID",
-                "Codex Goal continuation requires a typed module receipt",
-            )
-        })?;
-        validate_goal_continuation_admission(&tx, &id, generation, &b, &o, &r, receipt)?;
+        match r.outcome {
+            EffectOutcome::Accepted | EffectOutcome::Applied => {
+                let receipt = module_receipt.as_ref().ok_or_else(|| {
+                    Error::new(
+                        "GOAL_CONTINUATION_ADMISSION_INVALID",
+                        "Codex Goal continuation requires a typed module receipt",
+                    )
+                })?;
+                validate_goal_continuation_admission(&tx, &id, generation, &b, &o, &r, receipt)?;
+            }
+            EffectOutcome::Rejected | EffectOutcome::Unknown => {
+                // A failed or transport-uncertain continuation still has an
+                // authenticated ordinary Operation outcome and must reach the
+                // existing rejection/unknown observation path. It cannot carry
+                // a receipt or terminal marker that would imply native input
+                // admission or completed Goal evidence.
+                if r.details.get("goal_continuation_admission").is_some()
+                    || r.details.get("dispatch_admission").is_some()
+                    || r.details
+                        .get("goal_terminal_event")
+                        .is_some_and(|value| !value.is_null())
+                {
+                    return Err(Error::new(
+                        "GOAL_CONTINUATION_ADMISSION_INVALID",
+                        "failed or uncertain Goal continuation cannot carry admission or terminal evidence",
+                    ));
+                }
+            }
+        }
     } else if r.details.get("goal_continuation_admission").is_some() {
         return Err(Error::new(
             "GOAL_CONTINUATION_ADMISSION_INVALID",

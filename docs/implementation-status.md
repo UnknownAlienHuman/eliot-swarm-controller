@@ -24,6 +24,14 @@ terminal-evidence envelope preserves the existing strict OpenCode execution
 proof; supported producer paths remain limited to Codex and OpenCode. Command
 and Antigravity Goal progression remain unavailable.
 
+Authenticated rejected or uncertain Codex continuations now reach the existing
+Operation/Observation error path without a successful native-input admission
+receipt. Accepted/applied outcomes still require that exact receipt. Failed or
+uncertain outcomes cannot attach admission or completed-terminal evidence. This
+source correction prevents the failed continuation report from being held at
+`sending` solely by the successful-admission validator; runtime verification
+remains pending.
+
 The first automatic GitHub projection is one explicitly configured managed
 Issue label derived from an exact retained accepted-candidate fact. It uses
 current Manager/GM and source-map authority, the existing durable label slot,
