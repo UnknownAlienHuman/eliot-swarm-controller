@@ -285,6 +285,7 @@ pub fn validate_check(
     let required = policy
         .get("required_check_profiles")
         .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !required.iter().any(|required| {
         required["profile_id"] == profile && required["profile_revision"] == revision
