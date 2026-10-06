@@ -20,6 +20,15 @@ struct Fixture {
     operator: Credential,
 }
 
+fn kernel_host_executable() -> PathBuf {
+    let compatibility_launcher = PathBuf::from(env!("CARGO_BIN_EXE_swarm-host"));
+    compatibility_launcher.with_file_name(if cfg!(windows) {
+        "swarm-kernel-host.exe"
+    } else {
+        "swarm-kernel-host"
+    })
+}
+
 impl Fixture {
     fn new() -> Self {
         let directory = std::env::temp_dir().join(format!("swarm-recovery-{}", model::new_id()));
@@ -41,7 +50,10 @@ impl Fixture {
     }
 
     fn start(&self, sequence: u8) -> HostChild {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_swarm-host"));
+        // The wrapper is a public compatibility coordinate. Start the actual
+        // kernel image so crash/EOF ownership and PID assertions cover the
+        // process that owns DataRoot, Store and IPC.
+        let mut command = Command::new(kernel_host_executable());
         command
             .arg("--config")
             .arg(&self.config_path)

@@ -255,6 +255,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $sharedTargetDir -PathType Container)) {
             [void][IO.Directory]::CreateDirectory($sharedTargetDir)
           }
+          & cargo build --locked --package swarm-kernel-host --bin swarm-kernel-host --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --package swarm-supervisor --bin swarm-supervisor --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Atlas donor snapshot
@@ -328,6 +332,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package swarm-kernel-host --bin swarm-kernel-host --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package swarm-supervisor --bin swarm-supervisor --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record build inputs
         if: always()
         shell: bash
@@ -368,3 +376,7 @@ jobs:
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm.exe
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-host
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-host.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-kernel-host
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-kernel-host.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor.exe

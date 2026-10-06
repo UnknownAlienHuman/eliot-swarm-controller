@@ -56,17 +56,124 @@ function Get-Sha256([string] $Path) {
 
 . (Join-Path $PSScriptRoot 'SwarmBuildProvenanceHelpers.ps1')
 
-function Get-RootGatewayLauncherArguments([object[]] $Targets) {
-    $matches = @($Targets | Where-Object { [string]$_.name -ceq 'swarm-host' -and @($_.kind) -contains 'bin' })
-    if ($matches.Count -ne 1) { throw 'Root host package must expose exactly one swarm-host binary for gateway compatibility.' }
-    $source = Get-Content -LiteralPath ([string]$matches[0].src_path) -Raw
+function Get-HostGatewayLauncherArguments([object] $Target) {
+    if ($null -eq $Target -or [string]$Target.name -cne 'swarm-kernel-host' -or
+        @($Target.kind) -notcontains 'bin') {
+        throw 'The durable host package must expose exactly one swarm-kernel-host binary for gateway compatibility.'
+    }
+    $source = Get-Content -LiteralPath ([string]$Target.src_path) -Raw
     $start = $source.IndexOf('async fn run_gateway_binary', [StringComparison]::Ordinal)
-    if ($start -lt 0) { throw 'Root swarm-host binary has no run_gateway_binary compatibility launcher.' }
+    if ($start -lt 0) { throw 'The swarm-kernel-host binary has no run_gateway_binary compatibility launcher.' }
     $launcher = $source.Substring($start)
     foreach ($literal in @('"swarm-gateway.exe"', '"swarm-gateway"', 'child.arg("--config").arg(path)', 'child.arg("--data-dir").arg(path)')) {
-        if (-not $launcher.Contains($literal)) { throw "Root gateway launcher no longer satisfies the sibling CLI contract: missing $literal" }
+        if (-not $launcher.Contains($literal)) { throw "The durable host gateway launcher no longer satisfies the sibling CLI contract: missing $literal" }
     }
     return @('--config', '--data-dir')
+}
+
+function Get-KernelHostTarget([object] $Metadata, [object[]] $MemberIds) {
+    $matches = @($Metadata.packages | ForEach-Object {
+        $package = $_
+        if ([string]$package.name -ceq 'swarm-kernel-host' -and
+            @($MemberIds | Where-Object { [string]$_ -ceq [string]$package.id }).Count -eq 1) {
+            $package
+        }
+    })
+    if ($matches.Count -ne 1) {
+        throw 'The workspace must contain exactly one member named swarm-kernel-host before host provenance can be packaged.'
+    }
+    $targets = @($matches[0].targets | Where-Object {
+        [string]$_.name -ceq 'swarm-kernel-host' -and @($_.kind) -contains 'bin'
+    })
+    if ($targets.Count -ne 1) {
+        throw 'The swarm-kernel-host workspace member must expose exactly one swarm-kernel-host binary target.'
+    }
+    return $targets[0]
+}
+
+function Get-SupervisorTarget([object] $Metadata, [object[]] $MemberIds) {
+    $matches = @($Metadata.packages | ForEach-Object {
+        $package = $_
+        if ([string]$package.name -ceq 'swarm-supervisor' -and
+            @($MemberIds | Where-Object { [string]$_ -ceq [string]$package.id }).Count -eq 1) {
+            $package
+        }
+    })
+    if ($matches.Count -ne 1) {
+        throw 'The workspace must contain exactly one member named swarm-supervisor before host provenance can be packaged.'
+    }
+    $targets = @($matches[0].targets | Where-Object {
+        [string]$_.name -ceq 'swarm-supervisor' -and @($_.kind) -contains 'bin'
+    })
+    if ($targets.Count -ne 1) {
+        throw 'The swarm-supervisor workspace member must expose exactly one swarm-supervisor binary target.'
+    }
+    return $targets[0]
+}
+
+function Get-PolicySiblingBinaries([object] $Coordinate) {
+    if ($null -eq $Coordinate.required_sibling_binaries) { return @() }
+    return @($Coordinate.required_sibling_binaries | ForEach-Object { [string]$_ })
+}
+
+function Assert-PolicyResourceCoordinate([object] $Coordinate) {
+    if ($null -eq $Coordinate.resource_coordinate) {
+        foreach ($field in @('resource_installed_relative_root', 'resource_repository_relative_root', 'resource_files')) {
+            if ($null -ne $Coordinate[$field]) {
+                throw "Package '$($Coordinate.package_name)' has resource metadata without a resource coordinate."
+            }
+        }
+        return
+    }
+    if ([string]$Coordinate.resource_coordinate -cne 'swarm-kernel-host-opencode-resources' -or
+        [string]$Coordinate.resource_installed_relative_root -cne 'resources/modules/opencode' -or
+        [string]$Coordinate.resource_repository_relative_root -cne 'modules/opencode' -or
+        $Coordinate.resource_files -isnot [array]) {
+        throw "Package '$($Coordinate.package_name)' has an unsupported resource coordinate."
+    }
+    $expected = @(
+        @{ path = 'serve.mjs'; role = 'server_program' },
+        @{ path = 'native-mcp-proof.mjs'; role = 'plugin_module' },
+        @{ path = 'index.mjs'; role = 'plugin_entry' },
+        @{ path = 'package.json'; role = 'dependency_manifest' },
+        @{ path = 'package-lock.json'; role = 'dependency_lock' }
+    )
+    $actual = @($Coordinate.resource_files)
+    if ($actual.Count -ne $expected.Count) { throw "Package '$($Coordinate.package_name)' has an incomplete resource file coordinate." }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($actual[$index] -isnot [System.Collections.IDictionary] -or
+            [string]$actual[$index].path -cne $expected[$index].path -or
+            [string]$actual[$index].role -cne $expected[$index].role) {
+            throw "Package '$($Coordinate.package_name)' resource file coordinate drifted from the pinned OpenCode set."
+        }
+    }
+}
+
+function Get-KernelHostResourcePins([string] $PackageName, [object] $Coordinate) {
+    if ($PackageName -cne 'swarm-kernel-host') { return @() }
+    Assert-PolicyResourceCoordinate $Coordinate
+    $resourceRoot = Join-Path $repoRoot 'modules/opencode'
+    $pins = @(
+        foreach ($entry in @($Coordinate.resource_files)) {
+            $sourcePath = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$entry.path)))
+            if (-not (Test-PathWithin $sourcePath $resourceRoot) -or
+                -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "Pinned kernel resource is missing from the repository: $sourcePath"
+            }
+            $item = Get-Item -LiteralPath $sourcePath -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0) {
+                throw "Pinned kernel resource is not a regular non-empty file: $sourcePath"
+            }
+            [ordered]@{
+                path = [string]$entry.path
+                role = [string]$entry.role
+                file = 'resources/modules/opencode/' + [string]$entry.path
+                bytes = [long]$item.Length
+                source_sha256 = Get-Sha256 $sourcePath
+            }
+        }
+    )
+    return $pins
 }
 
 if (-not (Test-Path -LiteralPath $rootManifest -PathType Leaf) -or
@@ -119,8 +226,19 @@ foreach ($coordinate in $policy.approved_package_coordinates) {
         [string]$coordinate.manifest -cnotmatch '\A[A-Za-z0-9._/-]{1,512}\z' -or
         [string]$coordinate.manifest -match '(^|/)\.\.(/|$)' -or
         [string]$coordinate.binary_target -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,99}\z' -or
+        ($null -ne $coordinate.role -and [string]$coordinate.role -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\z') -or
+        ($null -ne $coordinate.required_sibling_binaries -and
+            $coordinate.required_sibling_binaries -isnot [array]) -or
         -not $policyNames.Add([string]$coordinate.package_name)) {
         throw 'Module package policy has a malformed or repeated package/manifest/binary coordinate.'
+    }
+    Assert-PolicyResourceCoordinate $coordinate
+    $siblingNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($sibling in @(Get-PolicySiblingBinaries $coordinate)) {
+        if ($sibling -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\z' -or
+            -not $siblingNames.Add($sibling)) {
+            throw "Package '$($coordinate.package_name)' repeats or malformed required sibling coordinate."
+        }
     }
 }
 $selectedCoordinates = @(
@@ -204,15 +322,37 @@ if ($actualBinTargets.Count -ne 1 -or $binTargets.Count -ne 1) {
     throw "Package '$Package' target drift: policy names only '$($selectedCoordinate.binary_target)' but Cargo metadata reports [$($actualNames -join ', ')]. Update the explicit coordinate policy before packaging."
 }
 $dependencyPins = Get-ResolvedDependencyPins $metadata $selected $repoRoot $lockFile
+$resourcePins = @(Get-KernelHostResourcePins $Package $selectedCoordinate)
 $compatibility = $null
-if ($Package -ceq 'eliot-swarm-controller') {
+if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor')) {
+    $kernelTarget = Get-KernelHostTarget $metadata $memberIds
+    $supervisorTarget = Get-SupervisorTarget $metadata $memberIds
     $hostIpcProtocolVersion = Get-HostIpcProtocolVersion $repoRoot
     $rustcHostTriple = Get-RustcHostTriple $rustcVersion
-    $gatewayArguments = Get-RootGatewayLauncherArguments @($selected.targets)
+    $gatewayArguments = if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host')) {
+        Get-HostGatewayLauncherArguments $kernelTarget
+    } else { @() }
+    $hostRuntime = [ordered]@{
+        package_name = 'swarm-kernel-host'
+        manifest = 'crates/swarm-kernel-host/Cargo.toml'
+        binary_target = 'swarm-kernel-host'
+        role = 'host_runtime'
+        resource_coordinate = 'swarm-kernel-host-opencode-resources'
+        resource_installed_relative_root = 'resources/modules/opencode'
+    }
+    $hostSupervisor = [ordered]@{
+        package_name = 'swarm-supervisor'
+        manifest = 'crates/swarm-supervisor/Cargo.toml'
+        binary_target = 'swarm-supervisor'
+        role = 'host_supervisor'
+    }
     $compatibility = [ordered]@{
-        required_sibling_binaries = @()
+        process_role = [string]$selectedCoordinate.role
+        required_sibling_binaries = @(Get-PolicySiblingBinaries $selectedCoordinate)
         host_ipc = [ordered]@{ protocol_version = $hostIpcProtocolVersion }
         target = [ordered]@{ rustc_host_triple = $rustcHostTriple }
+        host_runtime = $hostRuntime
+        host_supervisor = $hostSupervisor
         gateway_launcher = [ordered]@{
             package_name = 'swarm-gateway'
             binary_target = 'swarm-gateway'
@@ -267,6 +407,27 @@ if (Test-Path -LiteralPath $outputPath) {
 [void][IO.Directory]::CreateDirectory($outputPath)
 $binaryOutputDir = Join-Path $outputPath 'bin'
 [void][IO.Directory]::CreateDirectory($binaryOutputDir)
+$resourceRows = @(
+    foreach ($resource in $resourcePins) {
+        $sourcePath = Join-Path (Join-Path $repoRoot 'modules/opencode') ([string]$resource.path)
+        $stagedPath = Join-Path $outputPath ([string]$resource.file -replace '/', [IO.Path]::DirectorySeparatorChar)
+        $stagedParent = Split-Path -Parent $stagedPath
+        [void][IO.Directory]::CreateDirectory($stagedParent)
+        Copy-Item -LiteralPath $sourcePath -Destination $stagedPath
+        $artifactHash = Get-Sha256 $stagedPath
+        if ($artifactHash -cne [string]$resource.source_sha256) {
+            throw "Staged hash mismatch for pinned kernel resource '$($resource.path)'."
+        }
+        [ordered]@{
+            path = [string]$resource.path
+            role = [string]$resource.role
+            file = [string]$resource.file
+            bytes = (Get-Item -LiteralPath $stagedPath).Length
+            source_sha256 = [string]$resource.source_sha256
+            artifact_sha256 = $artifactHash
+        }
+    }
+)
 
 $binaryRows = @(
     foreach ($binary in $binarySources) {
@@ -321,6 +482,16 @@ $buildManifest = [ordered]@{
         feature_sets = 'workspace_unified_not_package_specific_build_features'
     }
     artifacts = @($binaryRows)
+    resources = if ($resourceRows.Count -gt 0) {
+        [ordered]@{
+            schema_version = 1
+            coordinate = [string]$selectedCoordinate.resource_coordinate
+            repository_relative_root = [string]$selectedCoordinate.resource_repository_relative_root
+            installed_relative_root = [string]$selectedCoordinate.resource_installed_relative_root
+            files = @($resourceRows)
+            dependency_policy = [ordered]@{ node_modules = 'external_locked_installation' }
+        }
+    } else { $null }
     installation = [ordered]@{
         descriptor_generated = $false
         installed = $false
@@ -328,6 +499,9 @@ $buildManifest = [ordered]@{
         route_enabled = $false
         activated = $false
     }
+}
+if ($null -ne $selectedCoordinate.role) {
+    $buildManifest.build['role'] = [string]$selectedCoordinate.role
 }
 if ($null -ne $compatibility) { $buildManifest['compatibility'] = $compatibility }
 $json = ConvertTo-Json -InputObject $buildManifest -Depth 12

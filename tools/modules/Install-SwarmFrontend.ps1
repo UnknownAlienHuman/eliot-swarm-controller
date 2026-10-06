@@ -12,8 +12,29 @@ $packageMap = @{
     'eliot-swarm-controller' = [ordered]@{
         manifest = 'Cargo.toml'
         binary = 'swarm-host'
-        role = 'host_runtime'
+        role = 'host_launcher'
+        required_siblings = @('swarm-kernel-host')
+    }
+    'swarm-supervisor' = [ordered]@{
+        manifest = 'crates/swarm-supervisor/Cargo.toml'
+        binary = 'swarm-supervisor'
+        role = 'host_supervisor'
         required_siblings = @()
+    }
+    'swarm-kernel-host' = [ordered]@{
+        manifest = 'crates/swarm-kernel-host/Cargo.toml'
+        binary = 'swarm-kernel-host'
+        role = 'host_runtime'
+        required_siblings = @('swarm-supervisor')
+        resource_coordinate = 'swarm-kernel-host-opencode-resources'
+        resource_installed_relative_root = 'resources/modules/opencode'
+        resource_files = @(
+            [ordered]@{ path = 'serve.mjs'; role = 'server_program' },
+            [ordered]@{ path = 'native-mcp-proof.mjs'; role = 'plugin_module' },
+            [ordered]@{ path = 'index.mjs'; role = 'plugin_entry' },
+            [ordered]@{ path = 'package.json'; role = 'dependency_manifest' },
+            [ordered]@{ path = 'package-lock.json'; role = 'dependency_lock' }
+        )
     }
     'swarm-mcp' = [ordered]@{
         manifest = 'crates/swarm-mcp/Cargo.toml'
@@ -33,6 +54,10 @@ $packageMap = @{
         role = 'cli_client'
         required_siblings = @('eliot-swarm-controller')
     }
+}
+
+function Test-HostPackage([string] $Name) {
+    return $Name -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor')
 }
 
 function Get-CanonicalPath([string] $Path, [string] $Label) {
@@ -74,6 +99,101 @@ function Get-Sha256([string] $Path) {
 function Assert-Hash([object] $Value, [string] $Field) {
     if ($Value -isnot [string] -or $Value -cnotmatch '\A[0-9a-f]{64}\z') {
         throw "Invalid lowercase SHA-256 field: $Field"
+    }
+}
+
+function Get-ResourceSpecFiles([System.Collections.IDictionary] $Spec) {
+    if ($null -eq $Spec.resource_coordinate) { return @() }
+    return @($Spec.resource_files)
+}
+
+function Assert-ResourceManifest(
+    [object] $Manifest,
+    [System.Collections.IDictionary] $Spec,
+    [string] $Label
+) {
+    $expected = @(Get-ResourceSpecFiles $Spec)
+    if ($expected.Count -eq 0) {
+        if ($null -ne $Manifest.resources) { throw "$Label advertises undeclared package resources." }
+        return $null
+    }
+    $resources = $Manifest.resources
+    if ($resources -isnot [System.Collections.IDictionary] -or
+        $resources.schema_version -ne 1 -or
+        $resources.coordinate -cne [string]$Spec.resource_coordinate -or
+        $resources.repository_relative_root -cne 'modules/opencode' -or
+        $resources.installed_relative_root -cne [string]$Spec.resource_installed_relative_root -or
+        $resources.files -isnot [array] -or
+        $resources.dependency_policy.node_modules -cne 'external_locked_installation') {
+        throw "$Label does not carry the pinned kernel resource coordinate."
+    }
+    $actual = @($resources.files)
+    if ($actual.Count -ne $expected.Count) { throw "$Label has an incomplete pinned kernel resource set." }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        $row = $actual[$index]
+        $entry = $expected[$index]
+        $expectedFile = [string]$Spec.resource_installed_relative_root + '/' + [string]$entry.path
+        if ($row -isnot [System.Collections.IDictionary] -or
+            [string]$row.path -cne [string]$entry.path -or
+            [string]$row.role -cne [string]$entry.role -or
+            [string]$row.file -cne $expectedFile -or
+            [long]$row.bytes -le 0) {
+            throw "$Label kernel resource row $index does not match the package coordinate."
+        }
+        Assert-Hash $row.source_sha256 "$Label.resources.files[$index].source_sha256"
+        Assert-Hash $row.artifact_sha256 "$Label.resources.files[$index].artifact_sha256"
+        if ([string]$row.source_sha256 -cne [string]$row.artifact_sha256) {
+            throw "$Label kernel resource row $index has different source and artifact digests."
+        }
+    }
+    return $resources
+}
+
+function Assert-InstalledResourceFiles(
+    [string] $InstallRoot,
+    [System.Collections.IDictionary] $Spec,
+    [object] $Resources,
+    [string] $Label
+) {
+    if ($null -eq $Resources) { return }
+    $resourceRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$Spec.resource_installed_relative_root)))
+    foreach ($row in @($Resources.files)) {
+        $path = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$row.path)))
+        if (-not (Test-PathWithin $path $resourceRoot) -or -not (Test-PathWithin $path $InstallRoot) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$Label is missing pinned kernel resource '$($row.path)'."
+        }
+        Assert-NoReparseTraversal $path
+        $item = Get-Item -LiteralPath $path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -ne [long]$row.bytes -or
+            (Get-Sha256 $path) -cne [string]$row.artifact_sha256) {
+            throw "$Label kernel resource '$($row.path)' differs from its pinned digest or size."
+        }
+    }
+}
+
+function Assert-ReceiptResourceContract([object] $Receipt, [object] $Resources, [string] $Label) {
+    if ($null -eq $Resources) {
+        if ($null -ne $Receipt.resources) { throw "$Label receipt advertises undeclared package resources." }
+        return
+    }
+    $receiptResources = $Receipt.resources
+    if ($receiptResources -isnot [System.Collections.IDictionary] -or
+        $receiptResources.coordinate -cne [string]$Resources.coordinate -or
+        $receiptResources.installed_relative_root -cne [string]$Resources.installed_relative_root -or
+        $receiptResources.files -isnot [array]) {
+        throw "$Label receipt does not carry the pinned kernel resource coordinate."
+    }
+    $manifestRows = @($Resources.files)
+    $receiptRows = @($receiptResources.files)
+    if ($manifestRows.Count -ne $receiptRows.Count) { throw "$Label receipt has an incomplete kernel resource set." }
+    for ($index = 0; $index -lt $manifestRows.Count; $index++) {
+        if ([string]$receiptRows[$index].path -cne [string]$manifestRows[$index].path -or
+            [string]$receiptRows[$index].file -cne [string]$manifestRows[$index].file -or
+            [string]$receiptRows[$index].artifact_sha256 -cne [string]$manifestRows[$index].artifact_sha256) {
+            throw "$Label receipt kernel resource row $index does not match its build manifest."
+        }
     }
 }
 
@@ -119,6 +239,32 @@ function Get-HostIpcVersion([object] $Manifest, [string] $Label) {
     return $version
 }
 
+function Get-HostRuntimeCoordinate([object] $Manifest, [string] $Label) {
+    $runtime = $Manifest.compatibility.host_runtime
+    if ($runtime -isnot [System.Collections.IDictionary] -or
+        $runtime.package_name -cne 'swarm-kernel-host' -or
+        $runtime.manifest -cne 'crates/swarm-kernel-host/Cargo.toml' -or
+        $runtime.binary_target -cne 'swarm-kernel-host' -or
+        $runtime.role -cne 'host_runtime' -or
+        $runtime.resource_coordinate -cne 'swarm-kernel-host-opencode-resources' -or
+        $runtime.resource_installed_relative_root -cne 'resources/modules/opencode') {
+        throw "$Label does not pin the independent swarm-kernel-host runtime coordinate. Rebuild it with the current provenance builder."
+    }
+    return $runtime
+}
+
+function Get-HostSupervisorCoordinate([object] $Manifest, [string] $Label) {
+    $supervisor = $Manifest.compatibility.host_supervisor
+    if ($supervisor -isnot [System.Collections.IDictionary] -or
+        $supervisor.package_name -cne 'swarm-supervisor' -or
+        $supervisor.manifest -cne 'crates/swarm-supervisor/Cargo.toml' -or
+        $supervisor.binary_target -cne 'swarm-supervisor' -or
+        $supervisor.role -cne 'host_supervisor') {
+        throw "$Label does not pin the standalone swarm-supervisor coordinate. Rebuild it with the current provenance builder."
+    }
+    return $supervisor
+}
+
 function Assert-CompatibilityManifest(
     [object] $Manifest,
     [string] $PackageName,
@@ -129,6 +275,12 @@ function Assert-CompatibilityManifest(
         throw "$Label is missing its explicit host IPC/launcher compatibility record. Repackage it with the updated provenance builder."
     }
     [void](Get-HostIpcVersion $Manifest $Label)
+    $runtime = $null
+    $supervisor = $null
+    if ($PackageName -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor', 'swarm-cli')) {
+        $runtime = Get-HostRuntimeCoordinate $Manifest $Label
+        $supervisor = Get-HostSupervisorCoordinate $Manifest $Label
+    }
     $targetTriple = [string]$Manifest.compatibility.target.rustc_host_triple
     if ($targetTriple -cnotmatch '\A[A-Za-z0-9_-]{1,128}\z') {
         throw "$Label does not pin the executable target triple. Repackage it with the updated provenance builder."
@@ -144,6 +296,10 @@ function Assert-CompatibilityManifest(
         }
     }
     if ($PackageName -ceq 'eliot-swarm-controller') {
+        if ([string]$Manifest.compatibility.process_role -cne 'host_launcher' -or
+            @($recordedSiblings | Where-Object { $_ -ceq 'swarm-kernel-host' }).Count -ne 1) {
+            throw "$Label must require the independent swarm-kernel-host sibling for the public swarm-host launcher."
+        }
         $launcher = $Manifest.compatibility.gateway_launcher
         $arguments = @($launcher.required_arguments | ForEach-Object { [string]$_ })
         if ($launcher.package_name -cne 'swarm-gateway' -or
@@ -151,12 +307,25 @@ function Assert-CompatibilityManifest(
             $arguments.Count -ne 2 -or $arguments[0] -cne '--config' -or $arguments[1] -cne '--data-dir') {
             throw "$Label does not declare the observed swarm-gateway binary and argv contract. Rebuild the root swarm-host package with the updated provenance builder."
         }
+    } elseif ($PackageName -ceq 'swarm-kernel-host') {
+        if ([string]$Manifest.compatibility.process_role -cne 'host_runtime' -or
+            @($recordedSiblings | Where-Object { $_ -ceq 'swarm-supervisor' }).Count -ne 1) {
+            throw "$Label does not identify swarm-kernel-host as the standalone Store/IPC owner with its supervisor sibling."
+        }
+    } elseif ($PackageName -ceq 'swarm-supervisor') {
+        if ([string]$Manifest.compatibility.process_role -cne 'host_supervisor' -or
+            @($recordedSiblings).Count -ne 0) {
+            throw "$Label does not identify swarm-supervisor as the standalone supervisor process."
+        }
     } elseif ($PackageName -ceq 'swarm-cli') {
         $launcher = $Manifest.compatibility.host_launcher
+        $runtime = Get-HostRuntimeCoordinate $Manifest $Label
         if ($launcher.package_name -cne 'eliot-swarm-controller' -or
             $launcher.binary_target -cne 'swarm-host' -or
+            $runtime.package_name -cne 'swarm-kernel-host' -or
+            $supervisor.package_name -cne 'swarm-supervisor' -or
             @($Manifest.compatibility.required_sibling_binaries | Where-Object { [string]$_ -ceq 'eliot-swarm-controller' }).Count -ne 1) {
-            throw "$Label does not declare its exact required swarm-host sibling. Rebuild the public CLI with the updated provenance builder."
+            throw "$Label does not declare its exact swarm-host launcher and swarm-kernel-host runtime coordinates. Rebuild the public CLI with the updated provenance builder."
         }
     } elseif ($PackageName -ceq 'swarm-gateway') {
         $arguments = @($Manifest.compatibility.accepted_launcher_arguments | ForEach-Object { [string]$_ })
@@ -173,7 +342,21 @@ function Assert-HostIpcCompatible([object] $Left, [string] $LeftLabel, [object] 
     $rightVersion = Get-HostIpcVersion $Right $RightLabel
     $leftTarget = [string]$Left.compatibility.target.rustc_host_triple
     $rightTarget = [string]$Right.compatibility.target.rustc_host_triple
-    if ($leftVersion -ne $rightVersion -or $leftTarget -cne $rightTarget) {
+    $leftRuntime = if ($null -ne $Left.compatibility.host_runtime) { Get-HostRuntimeCoordinate $Left $LeftLabel } else { $null }
+    $rightRuntime = if ($null -ne $Right.compatibility.host_runtime) { Get-HostRuntimeCoordinate $Right $RightLabel } else { $null }
+    $leftSupervisor = if ($null -ne $Left.compatibility.host_supervisor) { Get-HostSupervisorCoordinate $Left $LeftLabel } else { $null }
+    $rightSupervisor = if ($null -ne $Right.compatibility.host_supervisor) { Get-HostSupervisorCoordinate $Right $RightLabel } else { $null }
+    $runtimeMismatch = $null -ne $leftRuntime -and $null -ne $rightRuntime -and
+        ($leftRuntime.package_name -cne $rightRuntime.package_name -or
+         $leftRuntime.binary_target -cne $rightRuntime.binary_target -or
+         $leftRuntime.resource_coordinate -cne $rightRuntime.resource_coordinate -or
+         $leftRuntime.resource_installed_relative_root -cne $rightRuntime.resource_installed_relative_root)
+    $supervisorMismatch = $null -ne $leftSupervisor -and $null -ne $rightSupervisor -and
+        ($leftSupervisor.package_name -cne $rightSupervisor.package_name -or
+         $leftSupervisor.binary_target -cne $rightSupervisor.binary_target -or
+         $leftSupervisor.manifest -cne $rightSupervisor.manifest)
+    if ($leftVersion -ne $rightVersion -or $leftTarget -cne $rightTarget -or
+        $runtimeMismatch -or $supervisorMismatch) {
         throw "Frontend runtime contract mismatch: $LeftLabel uses client.hello v$leftVersion / $leftTarget while $RightLabel uses v$rightVersion / $rightTarget. Install compatible versioned frontend artifacts together."
     }
 }
@@ -226,7 +409,12 @@ function Get-InstalledFrontend(
     $binaryPath = Join-Path $Root $binaryLeaf
     $buildPath = Join-Path $Root ([string]$Spec.binary + '.build-manifest.json')
     $receiptPath = Join-Path $Root ([string]$Spec.binary + '.install-receipt.json')
-    $paths = @($binaryPath, $buildPath, $receiptPath)
+    $resourcePaths = @(
+        foreach ($entry in @(Get-ResourceSpecFiles $Spec)) {
+            Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$entry.path)
+        }
+    )
+    $paths = @($binaryPath, $buildPath, $receiptPath) + $resourcePaths
     $present = @($paths | Where-Object { Test-Path -LiteralPath $_ })
     if ($present.Count -eq 0) { return $null }
     if ($present.Count -ne $paths.Count) {
@@ -244,12 +432,13 @@ function Get-InstalledFrontend(
 
     $receipt = Read-JsonMap $receiptPath 'Installed frontend receipt'
     $manifest = Read-JsonMap $buildPath 'Installed frontend build manifest'
-    $expectedManifestFormat = if ($Name -ceq 'eliot-swarm-controller') {
+    $isHostPackage = Test-HostPackage $Name
+    $expectedManifestFormat = if ($isHostPackage) {
         'eliot.module_build_manifest.v1'
     } else {
         'eliot.frontend_build_manifest.v1'
     }
-    $buildTargetValid = if ($Name -ceq 'eliot-swarm-controller') {
+    $buildTargetValid = if ($isHostPackage) {
         @($manifest.build.binary_targets | Where-Object { [string]$_ -ceq [string]$Spec.binary }).Count -eq 1
     } else {
         $manifest.build.binary_target -ceq [string]$Spec.binary
@@ -263,7 +452,7 @@ function Get-InstalledFrontend(
         $receipt.build_manifest_file -cne ([string]$Spec.binary + '.build-manifest.json') -or
         $manifest.schema_version -ne 1 -or
         $manifest.format -cne $expectedManifestFormat -or
-        ($Name -cne 'eliot-swarm-controller' -and $manifest.build.role -cne [string]$Spec.role) -or
+        (-not $isHostPackage -and $manifest.build.role -cne [string]$Spec.role) -or
         $manifest.build.package_name -cne $Name -or
         $manifest.build.package_manifest -cne [string]$Spec.manifest -or
         -not $buildTargetValid -or
@@ -281,11 +470,14 @@ function Get-InstalledFrontend(
             throw "Installed frontend '$Name' receipt has incompatible sibling requirements."
         }
     }
-    Assert-SourceIdentity $manifest.source 'Installed build source' ($Name -cne 'eliot-swarm-controller')
+    Assert-SourceIdentity $manifest.source 'Installed build source' (-not $isHostPackage)
     Assert-DependencyPins $manifest "Installed frontend '$Name' build manifest"
     Assert-CompatibilityManifest $manifest $Name $Spec "Installed frontend '$Name' build manifest"
+    $resources = Assert-ResourceManifest $manifest $Spec "Installed frontend '$Name' build manifest"
+    Assert-ReceiptResourceContract $receipt $resources "Installed frontend '$Name'"
+    Assert-InstalledResourceFiles $Root $Spec $resources "Installed frontend '$Name'"
     Assert-Hash $receipt.package_manifest_sha256 'receipt.package_manifest_sha256'
-    $expectedPackageManifestHash = if ($Name -ceq 'eliot-swarm-controller') {
+    $expectedPackageManifestHash = if ($isHostPackage) {
         [string]$manifest.source.cargo_toml_sha256
     } else {
         [string]$manifest.source.package_manifest_sha256
@@ -329,6 +521,7 @@ function Get-InstalledFrontend(
         rustc_version_verbose = [string]$manifest.toolchain.rustc_version_verbose
         cargo_version_verbose = [string]$manifest.toolchain.cargo_version_verbose
         pinned_channel = [string]$manifest.toolchain.pinned_channel
+        resources = $resources
     }
 }
 
@@ -361,10 +554,10 @@ Assert-NoReparseTraversal $manifestPath
 $provenance = Read-JsonMap $manifestPath 'Frontend build manifest'
 $packageName = [string]$provenance.build.package_name
 if (-not $packageMap.Contains($packageName)) {
-    throw "Build manifest names unsupported package '$packageName'. Select swarm-mcp, swarm-gateway, swarm-cli, or eliot-swarm-controller."
+    throw "Build manifest names unsupported package '$packageName'. Select swarm-mcp, swarm-gateway, swarm-cli, eliot-swarm-controller, swarm-supervisor, or swarm-kernel-host."
 }
 $selectedSpec = $packageMap[$packageName]
-$isHostPackage = $packageName -ceq 'eliot-swarm-controller'
+$isHostPackage = Test-HostPackage $packageName
 $expectedManifestFormat = if ($isHostPackage) { 'eliot.module_build_manifest.v1' } else { 'eliot.frontend_build_manifest.v1' }
 $selectedTargetValid = if ($isHostPackage) {
     @($provenance.build.binary_targets | Where-Object { [string]$_ -ceq [string]$selectedSpec.binary }).Count -eq 1
@@ -383,6 +576,8 @@ if ($provenance.schema_version -ne 1 -or
 Assert-SourceIdentity $provenance.source 'Build source' (-not $isHostPackage)
 Assert-DependencyPins $provenance 'Build manifest'
 Assert-CompatibilityManifest $provenance $packageName $selectedSpec 'Build manifest'
+$provenanceResources = Assert-ResourceManifest $provenance $selectedSpec 'Build manifest'
+Assert-InstalledResourceFiles $packagePath $selectedSpec $provenanceResources 'Frontend package'
 if ([string]$provenance.toolchain.pinned_channel -notmatch '\A[A-Za-z0-9._-]{1,128}\z' -or
     [string]::IsNullOrWhiteSpace([string]$provenance.toolchain.rustc_version_verbose) -or
     [string]::IsNullOrWhiteSpace([string]$provenance.toolchain.cargo_version_verbose)) {
@@ -441,6 +636,9 @@ foreach ($name in $packageMap.Keys) {
 $binaryDestination = Join-Path $installRoot $binaryLeaf
 $buildDestination = Join-Path $installRoot ([string]$selectedSpec.binary + '.build-manifest.json')
 $receiptDestination = Join-Path $installRoot ([string]$selectedSpec.binary + '.install-receipt.json')
+$resourceDestinationRoot = if ($null -ne $provenanceResources) {
+    [IO.Path]::GetFullPath((Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)))
+} else { $null }
 if ($packageName -ceq 'eliot-swarm-controller') {
     $gateway = $existing['swarm-gateway']
     if ($null -ne $gateway) {
@@ -476,11 +674,31 @@ if ($null -ne $existing[$packageName]) {
         $stageBinary = Join-Path $installRoot ('.' + $binaryLeaf + '.' + $nonce + '.stage')
         $stageBuild = Join-Path $installRoot ('.' + [string]$selectedSpec.binary + '.build-manifest.' + $nonce + '.stage')
         $stageReceipt = Join-Path $installRoot ('.' + [string]$selectedSpec.binary + '.install-receipt.' + $nonce + '.stage')
+        $stageResourceRoot = if ($null -ne $provenanceResources) {
+            Join-Path $installRoot ('.resources.' + $nonce + '.stage')
+        } else { $null }
+        $resourceParent = if ($null -ne $resourceDestinationRoot) { Split-Path -Parent $resourceDestinationRoot } else { $null }
+        $resourceParentCreated = $false
+        $resourceMoved = $false
         $createdDestinations = [Collections.Generic.List[string]]::new()
         $receiptHash = $null
         try {
             Copy-ToStage $packageBinary $stageBinary
             Copy-ToStage $manifestPath $stageBuild
+            if ($null -ne $provenanceResources) {
+                [void][IO.Directory]::CreateDirectory($stageResourceRoot)
+                foreach ($row in @($provenanceResources.files)) {
+                    $stageResourcePath = Join-Path $stageResourceRoot ([string]$row.path)
+                    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $stageResourcePath))
+                    $packageResourcePath = Join-Path $packagePath ([string]$row.file -replace '/', [IO.Path]::DirectorySeparatorChar)
+                    Copy-ToStage $packageResourcePath $stageResourcePath
+                    $stageResourceItem = Get-Item -LiteralPath $stageResourcePath -Force
+                    if ([long]$stageResourceItem.Length -ne [long]$row.bytes -or
+                        (Get-Sha256 $stageResourcePath) -cne [string]$row.artifact_sha256) {
+                        throw "Staged kernel resource '$($row.path)' failed its pinned size or SHA-256 check."
+                    }
+                }
+            }
             $packageManifestHash = if ($isHostPackage) {
                 [string]$provenance.source.cargo_toml_sha256
             } else {
@@ -505,6 +723,13 @@ if ($null -ne $existing[$packageName]) {
                 cargo_toml_sha256 = [string]$provenance.source.cargo_toml_sha256
                 cargo_lock_sha256 = [string]$provenance.source.cargo_lock_sha256
                 rust_toolchain_toml_sha256 = [string]$provenance.source.rust_toolchain_toml_sha256
+                resources = if ($null -ne $provenanceResources) {
+                    [ordered]@{
+                        coordinate = [string]$provenanceResources.coordinate
+                        installed_relative_root = [string]$provenanceResources.installed_relative_root
+                        files = @($provenanceResources.files)
+                    }
+                } else { $null }
             }
             $receiptJson = ConvertTo-Json -InputObject $receipt -Depth 6
             $receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
@@ -518,7 +743,9 @@ if ($null -ne $existing[$packageName]) {
                 (Get-Sha256 $stageBuild) -cne $buildManifestHash) {
                 throw 'Staged frontend executable or build manifest failed its pinned SHA-256 check.'
             }
-            foreach ($destination in @($binaryDestination, $buildDestination, $receiptDestination)) {
+            $installDestinations = @($binaryDestination, $buildDestination, $receiptDestination)
+            if ($null -ne $resourceDestinationRoot) { $installDestinations += $resourceDestinationRoot }
+            foreach ($destination in $installDestinations) {
                 if (Test-Path -LiteralPath $destination) {
                     throw "Install destination appeared during create-only installation: $destination"
                 }
@@ -529,13 +756,22 @@ if ($null -ne $existing[$packageName]) {
             $createdDestinations.Add($buildDestination)
             [IO.File]::Move($stageReceipt, $receiptDestination)
             $createdDestinations.Add($receiptDestination)
-            foreach ($destination in @($binaryDestination, $buildDestination, $receiptDestination)) {
+            if ($null -ne $resourceDestinationRoot) {
+                if (-not (Test-Path -LiteralPath $resourceParent -PathType Container)) {
+                    [void][IO.Directory]::CreateDirectory($resourceParent)
+                    $resourceParentCreated = $true
+                }
+                [IO.Directory]::Move($stageResourceRoot, $resourceDestinationRoot)
+                $resourceMoved = $true
+            }
+            foreach ($destination in $installDestinations) {
                 Assert-NoReparseTraversal $destination
             }
             if ((Get-Sha256 $binaryDestination) -cne $executableHash -or
                 (Get-Sha256 $buildDestination) -cne $buildManifestHash) {
                 throw 'Installed frontend bytes differ from the staged package pins.'
             }
+            Assert-InstalledResourceFiles $installRoot $selectedSpec $provenanceResources 'Installed frontend'
             $status = 'installed'
         } catch {
             $installFailure = $_
@@ -544,6 +780,15 @@ if ($null -ne $existing[$packageName]) {
             $cleanupHashes[$binaryDestination] = $executableHash
             $cleanupHashes[$buildDestination] = $buildManifestHash
             $cleanupHashes[$receiptDestination] = $receiptHash
+            if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
+                try {
+                    Assert-InstalledResourceFiles $installRoot $selectedSpec $provenanceResources 'Rollback resource check'
+                    Remove-Item -LiteralPath $resourceDestinationRoot -Recurse -Force -Confirm:$false
+                    $resourceMoved = $false
+                } catch {
+                    $cleanupFailures.Add("could not roll back resource root ${resourceDestinationRoot}: $($_.Exception.Message)")
+                }
+            }
             for ($index = $createdDestinations.Count - 1; $index -ge 0; $index--) {
                 $createdPath = $createdDestinations[$index]
                 try {
@@ -558,6 +803,16 @@ if ($null -ne $existing[$packageName]) {
                     $cleanupFailures.Add("could not roll back ${createdPath}: $($_.Exception.Message)")
                 }
             }
+            if ($resourceParentCreated -and $null -ne $resourceParent) {
+                try {
+                    if ((Test-Path -LiteralPath $resourceParent -PathType Container) -and
+                        @((Get-ChildItem -LiteralPath $resourceParent -Force)).Count -eq 0) {
+                        Remove-Item -LiteralPath $resourceParent -Force -Confirm:$false
+                    }
+                } catch {
+                    $cleanupFailures.Add("could not roll back resource parent ${resourceParent}: $($_.Exception.Message)")
+                }
+            }
             if ($cleanupFailures.Count -gt 0) {
                 throw "Create-only install failed: $($installFailure.Exception.Message) Rollback notes: $($cleanupFailures -join '; '). Inspect those exact paths before retrying."
             }
@@ -565,6 +820,9 @@ if ($null -ne $existing[$packageName]) {
         } finally {
             foreach ($stage in @($stageBinary, $stageBuild, $stageReceipt)) {
                 if (Test-Path -LiteralPath $stage -PathType Leaf) { Remove-Item -LiteralPath $stage -Force -Confirm:$false }
+            }
+            if ($null -ne $stageResourceRoot -and (Test-Path -LiteralPath $stageResourceRoot)) {
+                Remove-Item -LiteralPath $stageResourceRoot -Recurse -Force -Confirm:$false
             }
         }
     } else {
@@ -581,6 +839,7 @@ if ($null -ne $existing[$packageName]) {
     build_manifest = [IO.Path]::GetFullPath($buildDestination)
     build_manifest_sha256 = $buildManifestHash
     install_receipt = [IO.Path]::GetFullPath($receiptDestination)
+    resource_root = $resourceDestinationRoot
     source_commit = [string]$provenance.source.commit
     source_tree = [string]$provenance.source.tree
 }

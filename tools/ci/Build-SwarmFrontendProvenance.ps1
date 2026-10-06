@@ -33,7 +33,7 @@ $packageMap = @{
 
 function Get-PublicCliHostRequirement([object] $Target, [object] $SelectedPackage) {
     $source = Get-Content -LiteralPath ([string]$Target.src_path) -Raw
-    foreach ($literal in @('fn command_uses_host(', '"swarm-host.exe"', 'HOST_BINARY_MISSING', '.args(arguments).status()')) {
+    foreach ($literal in @('fn command_uses_host(', '"swarm-host.exe"', 'HOST_BINARY_MISSING', '.args(arguments).status()', 'fn command_uses_mcp(', '"swarm-mcp.exe"', 'MCP_BINARY_MISSING')) {
         if (-not $source.Contains($literal)) { throw "Public swarm CLI is missing its explicit host sibling contract: $literal" }
     }
     if ($source.Contains('eliot_swarm_controller::') -or $source.Contains('swarm_store::') -or $source.Contains('swarm_kernel::')) {
@@ -235,9 +235,25 @@ $rustcHostTriple = Get-RustcHostTriple $rustcVersion
 $gatewayArguments = Get-GatewayAcceptedArguments $repoRoot $targetMatches[0]
 $requiredHostPackages = @()
 $hostLauncher = $null
+$hostRuntime = $null
+$hostSupervisor = $null
 if ($Package -ceq 'swarm-cli') {
     $requiredHostPackages = Get-PublicCliHostRequirement $targetMatches[0] $selected
     $hostLauncher = [ordered]@{ package_name = 'eliot-swarm-controller'; binary_target = 'swarm-host'; required_arguments = @() }
+    $hostRuntime = [ordered]@{
+        package_name = 'swarm-kernel-host'
+        manifest = 'crates/swarm-kernel-host/Cargo.toml'
+        binary_target = 'swarm-kernel-host'
+        role = 'host_runtime'
+        resource_coordinate = 'swarm-kernel-host-opencode-resources'
+        resource_installed_relative_root = 'resources/modules/opencode'
+    }
+    $hostSupervisor = [ordered]@{
+        package_name = 'swarm-supervisor'
+        manifest = 'crates/swarm-supervisor/Cargo.toml'
+        binary_target = 'swarm-supervisor'
+        role = 'host_supervisor'
+    }
 }
 if ([string]$selected.version -cnotmatch '\A[0-9A-Za-z.+-]{1,128}\z') {
     throw "Package '$Package' has an invalid Cargo package version."
@@ -327,6 +343,8 @@ $compatibilityFacts = [ordered]@{
     accepted_launcher_arguments = @($gatewayArguments)
 }
 if ($null -ne $hostLauncher) { $compatibilityFacts['host_launcher'] = $hostLauncher }
+if ($null -ne $hostRuntime) { $compatibilityFacts['host_runtime'] = $hostRuntime }
+if ($null -ne $hostSupervisor) { $compatibilityFacts['host_supervisor'] = $hostSupervisor }
 $provenance = [ordered]@{
     schema_version = 1
     format = 'eliot.frontend_build_manifest.v1'

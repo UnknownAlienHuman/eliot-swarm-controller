@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Host-only load measurement for the Eliot Swarm Controller.
 
-Drives one real `swarm-host host` process over its local IPC (newline-delimited
-JSON-RPC 2.0 on the Unix socket / Windows named pipe endpoint) with
-controller clients only: no native runtimes, no bridges, no model calls.
+Drives one real `swarm-kernel-host host` process over its local IPC
+(newline-delimited JSON-RPC 2.0 on the Unix socket / Windows named pipe
+endpoint) with controller clients only: no native runtimes, no bridges, no
+model calls. The legacy `--swarm` option may name the compatibility
+`swarm-host`; in that case the sibling `swarm-kernel-host` is resolved and
+owned instead, so all PID, RSS, CPU and shutdown facts belong to the Store/IPC
+owner.
 
 What is measured (see docs/host-load-qualification.md for the methodology
 and the recorded run):
@@ -225,6 +229,42 @@ def read_cpu_seconds(pid):
         return None
 
 
+def resolve_kernel_host_executable(requested):
+    """Resolve the actual Store/IPC owner, never the compatibility wrapper."""
+    executable = os.path.abspath(requested)
+    stem, extension = os.path.splitext(os.path.basename(executable))
+    if stem.casefold() == "swarm-host":
+        executable = os.path.join(
+            os.path.dirname(executable), "swarm-kernel-host" + extension
+        )
+        stem = "swarm-kernel-host"
+    if stem.casefold() != "swarm-kernel-host":
+        raise RuntimeError(
+            "--swarm must name swarm-kernel-host or its swarm-host compatibility sibling"
+        )
+    if not os.path.isfile(executable):
+        raise RuntimeError(f"kernel host executable is missing: {executable}")
+    return executable
+
+
+def resolve_supervisor_executable(kernel_host):
+    """Resolve the installed supervisor sibling owned by the kernel host."""
+    executable = os.path.join(
+        os.path.dirname(os.path.abspath(kernel_host)),
+        "swarm-supervisor" + os.path.splitext(kernel_host)[1],
+    )
+    if not os.path.isfile(executable):
+        raise RuntimeError(f"supervisor executable is missing beside kernel host: {executable}")
+    return executable
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 TASK_SPEC = {
     "objective": "Host-load fixture task; no native execution is requested.",
     "phase": "implementation",
@@ -265,6 +305,8 @@ async def drain(client, after, want_kind=None):
 
 
 async def run(args):
+    host_executable = resolve_kernel_host_executable(args.swarm)
+    supervisor_executable = resolve_supervisor_executable(host_executable)
     data_dir = args.data_dir or tempfile.mkdtemp(prefix="swarm-host-load-")
     sock_path = None if os.name == "nt" else os.path.join(data_dir, "control.sock")
     # The host refuses a data directory containing unrelated files, so its
@@ -272,11 +314,25 @@ async def run(args):
     host_log_path = data_dir.rstrip(os.sep) + ".host-stderr.log"
     host_log = open(host_log_path, "wb")
     host = subprocess.Popen(
-        [args.swarm, "--data-dir", data_dir, "host"],
+        [host_executable, "--data-dir", data_dir, "host"],
         stdout=subprocess.DEVNULL,
         stderr=host_log,
     )
-    result = {"scope": "host-only fixture load; no native runtimes, bridges or model calls"}
+    result = {
+        "scope": "host-only fixture load; no native runtimes, bridges or model calls",
+        "host_identity": {
+            "executable": host_executable,
+            "image_sha256": sha256_file(host_executable),
+            "pid": host.pid,
+            "role": "swarm-kernel-host",
+        },
+        "supervisor_identity": {
+            "executable": supervisor_executable,
+            "image_sha256": sha256_file(supervisor_executable),
+            "role": "swarm-supervisor",
+            "started_by": "swarm-kernel-host",
+        },
+    }
     driver_cpu_started = time.process_time()
     try:
         # Wait for the host endpoint and the bootstrap operator credential.
@@ -550,7 +606,11 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--swarm", required=True, help="path to the swarm binary")
+    parser.add_argument(
+        "--swarm",
+        required=True,
+        help="path to swarm-kernel-host or its swarm-host compatibility sibling; swarm-supervisor must be beside it",
+    )
     parser.add_argument("--clients", type=int, default=200)
     parser.add_argument("--senders", type=int, default=32)
     parser.add_argument("--duration", type=float, default=20.0,

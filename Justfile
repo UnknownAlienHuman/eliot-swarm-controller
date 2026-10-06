@@ -28,15 +28,21 @@ fmt-package package:
 check TARGET=shared_target: (_shared-target TARGET)
     cargo check --locked --package eliot-swarm-controller --lib --bins --target-dir "{{TARGET}}"
     cargo check --locked --package swarm-cli --lib --bins --target-dir "{{TARGET}}"
+    cargo check --locked --package swarm-supervisor --lib --bins --target-dir "{{TARGET}}"
 
 clippy TARGET=shared_target: (_shared-target TARGET)
     cargo clippy --locked --package eliot-swarm-controller --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
     cargo clippy --locked --package swarm-cli --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
+    cargo clippy --locked --package swarm-supervisor --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
 
 clippy-package package TARGET=shared_target: (_shared-target TARGET)
     cargo clippy --locked --package "{{package}}" --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
 
 test TARGET=shared_target: (_shared-target TARGET)
+    cargo build --locked --package swarm-kernel-host --bin swarm-kernel-host --target-dir "{{TARGET}}"
+    cargo build --locked --package swarm-supervisor --bin swarm-supervisor --target-dir "{{TARGET}}"
+    cargo test --locked -p swarm-kernel-host --lib --bins --target-dir "{{TARGET}}"
+    cargo test --locked -p swarm-supervisor --lib --bins --target-dir "{{TARGET}}"
     cargo test --locked -p eliot-swarm-controller --lib --bins --target-dir "{{TARGET}}"
     cargo test --locked -p swarm-cli --lib --bins --target-dir "{{TARGET}}"
 
@@ -64,6 +70,8 @@ opencode-fixtures:
 build TARGET=shared_target: (_shared-target TARGET)
     cargo build --locked --release --package swarm-cli --bin swarm --target-dir "{{TARGET}}"
     cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir "{{TARGET}}"
+    cargo build --locked --release --package swarm-kernel-host --bin swarm-kernel-host --target-dir "{{TARGET}}"
+    cargo build --locked --release --package swarm-supervisor --bin swarm-supervisor --target-dir "{{TARGET}}"
 
 # Create one provenance package at a time. The package builders require a
 # caller-owned external shared target and a fresh, separate output directory.
@@ -75,6 +83,12 @@ package-frontend package target output: (_shared-target target)
 
 package-host target output: (_shared-target target)
     pwsh -NoProfile -File tools/ci/Build-SwarmHostProvenance.ps1 -TargetDir "{{target}}" -OutputDir "{{output}}"
+
+package-kernel-host target output: (_shared-target target)
+    pwsh -NoProfile -File tools/ci/Build-SwarmKernelHostProvenance.ps1 -TargetDir "{{target}}" -OutputDir "{{output}}"
+
+package-supervisor target output: (_shared-target target)
+    pwsh -NoProfile -File tools/ci/Build-SwarmSupervisorProvenance.ps1 -TargetDir "{{target}}" -OutputDir "{{output}}"
 
 full-rust TARGET=shared_target:
     pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir "{{TARGET}}"

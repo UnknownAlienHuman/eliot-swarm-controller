@@ -65,7 +65,52 @@
     {
       "package_name": "eliot-swarm-controller",
       "manifest": "Cargo.toml",
-      "binary_target": "swarm-host"
+      "binary_target": "swarm-host",
+      "role": "host_launcher",
+      "required_sibling_binaries": [
+        "swarm-kernel-host"
+      ]
+    },
+    {
+      "package_name": "swarm-supervisor",
+      "manifest": "crates/swarm-supervisor/Cargo.toml",
+      "binary_target": "swarm-supervisor",
+      "role": "host_supervisor",
+      "required_sibling_binaries": []
+    },
+    {
+      "package_name": "swarm-kernel-host",
+      "manifest": "crates/swarm-kernel-host/Cargo.toml",
+      "binary_target": "swarm-kernel-host",
+      "role": "host_runtime",
+      "required_sibling_binaries": [
+        "swarm-supervisor"
+      ],
+      "resource_coordinate": "swarm-kernel-host-opencode-resources",
+      "resource_installed_relative_root": "resources/modules/opencode",
+      "resource_repository_relative_root": "modules/opencode",
+      "resource_files": [
+        {
+          "path": "serve.mjs",
+          "role": "server_program"
+        },
+        {
+          "path": "native-mcp-proof.mjs",
+          "role": "plugin_module"
+        },
+        {
+          "path": "index.mjs",
+          "role": "plugin_entry"
+        },
+        {
+          "path": "package.json",
+          "role": "dependency_manifest"
+        },
+        {
+          "path": "package-lock.json",
+          "role": "dependency_lock"
+        }
+      ]
     }
   ]
 }

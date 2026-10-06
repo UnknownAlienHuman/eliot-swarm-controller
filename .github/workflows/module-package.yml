@@ -22,6 +22,8 @@ on:
           - swarm-bus
           - swarm-automation
           - eliot-swarm-controller
+          - swarm-kernel-host
+          - swarm-supervisor
         required: true
       profile:
         description: Module packages support iterate/release; host and frontend packages are release-only.
@@ -65,13 +67,15 @@ jobs:
             throw 'Unsupported module package policy in the selected source revision.'
           }
           $hostPackage = 'eliot-swarm-controller'
+          $kernelHostPackage = 'swarm-kernel-host'
+          $supervisorPackage = 'swarm-supervisor'
           $modulePackages = @(
             $modulePolicy.approved_package_coordinates |
-              Where-Object { [string]$_.package_name -cne $hostPackage } |
+              Where-Object { [string]$_.package_name -notin @($hostPackage, $kernelHostPackage, $supervisorPackage) } |
               ForEach-Object { [string]$_.package_name }
           )
           $frontendPackages = @('swarm-mcp', 'swarm-cli', 'swarm-gateway')
-          if ($env:MODULE_PACKAGE -cnotin ($modulePackages + $frontendPackages + $hostPackage)) {
+          if ($env:MODULE_PACKAGE -cnotin ($modulePackages + $frontendPackages + @($hostPackage, $kernelHostPackage, $supervisorPackage))) {
             throw 'Choose exactly one package from the declared workflow input list.'
           }
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-module-shared-target'
@@ -89,11 +93,18 @@ jobs:
             & pwsh -NoProfile -File 'tools/ci/Build-SwarmFrontendProvenance.ps1' `
               -Package $env:MODULE_PACKAGE -TargetDir $sharedTargetDir -OutputDir $artifactDir
           }
-          elseif ($env:MODULE_PACKAGE -ceq $hostPackage) {
+          elseif ($env:MODULE_PACKAGE -cin @($hostPackage, $kernelHostPackage, $supervisorPackage)) {
             if ($env:MODULE_PROFILE -cne 'release') {
-              throw 'The host provenance package is release-only.'
+              throw 'Host and supervisor provenance packages are release-only.'
             }
-            & pwsh -NoProfile -File 'tools/ci/Build-SwarmHostProvenance.ps1' `
+            $builder = if ($env:MODULE_PACKAGE -ceq $hostPackage) {
+              'tools/ci/Build-SwarmHostProvenance.ps1'
+            } elseif ($env:MODULE_PACKAGE -ceq $kernelHostPackage) {
+              'tools/ci/Build-SwarmKernelHostProvenance.ps1'
+            } else {
+              'tools/ci/Build-SwarmSupervisorProvenance.ps1'
+            }
+            & pwsh -NoProfile -File $builder `
               -TargetDir $sharedTargetDir -OutputDir $artifactDir
           }
           else {

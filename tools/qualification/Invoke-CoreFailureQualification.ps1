@@ -5,6 +5,14 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSha256,
     [Parameter(Mandatory)][string] $HostBuildManifestPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostBuildManifestSha256,
+    [Parameter(Mandatory)][string] $HostSupervisorExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSupervisorSha256,
+    [Parameter(Mandatory)][string] $HostSupervisorBuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSupervisorBuildManifestSha256,
+    [Parameter(Mandatory)][string] $HostLauncherExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostLauncherSha256,
+    [Parameter(Mandatory)][string] $HostLauncherBuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostLauncherBuildManifestSha256,
     [Parameter(Mandatory)][string] $PublicCliExecutable,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedPublicCliSha256,
     [Parameter(Mandatory)][string] $PublicCliBuildManifestPath,
@@ -26,8 +34,12 @@ $script:MaxCliOutputCharacters = 1MB
 $script:MaxFrameBytes = 1MB
 $script:RunDirectory = $null
 $script:HostPath = $null
+$script:HostSupervisorPath = $null
+$script:HostLauncherPath = $null
 $script:PublicCliPath = $null
 $script:HostBuild = $null
+$script:HostSupervisorBuild = $null
+$script:HostLauncherBuild = $null
 $script:PublicCliBuild = $null
 $script:ConfigPath = $null
 $script:PendingPublicCliPids = [System.Collections.Generic.List[int]]::new()
@@ -125,6 +137,7 @@ function Get-PinnedBuildProvenance {
     if ($hostTripleMatches.Count -ne 1) { Stop-Harness 'BUILD_MANIFEST_TARGET_TRIPLE_INVALID' }
     $arguments = @($manifest.build.cargo_arguments | ForEach-Object { [string]$_ })
     $installation = $manifest.installation
+    $supervisor = $null
     $artifacts = @($manifest.artifacts)
     if ($FrontendCli) {
         if ($manifest.format -cne 'eliot.frontend_build_manifest.v1' -or
@@ -144,10 +157,17 @@ function Get-PinnedBuildProvenance {
         }
         $compatibility = $manifest.compatibility
         $launcher = $compatibility.host_launcher
+        $runtime = $compatibility.host_runtime
+        $supervisor = $compatibility.host_supervisor
         $protocolVersion = $compatibility.host_ipc.protocol_version
         $targetTriple = [string]$compatibility.target.rustc_host_triple
         if ($null -eq $launcher -or $launcher.package_name -cne 'eliot-swarm-controller' -or
             $launcher.binary_target -cne 'swarm-host' -or @($launcher.required_arguments).Count -ne 0 -or
+            $null -eq $runtime -or $runtime.package_name -cne 'swarm-kernel-host' -or
+            $runtime.binary_target -cne 'swarm-kernel-host' -or
+            $null -eq $supervisor -or $supervisor.package_name -cne 'swarm-supervisor' -or
+            $supervisor.binary_target -cne 'swarm-supervisor' -or
+            $supervisor.role -cne 'host_supervisor' -or
             $null -eq $protocolVersion -or [int]$protocolVersion -le 0 -or
             [string]::IsNullOrWhiteSpace($targetTriple) -or $targetTriple -cne $hostTripleMatches[0].Groups['triple'].Value) {
             Stop-Harness 'PUBLIC_CLI_HOST_LAUNCHER_CONTRACT_INVALID'
@@ -175,7 +195,18 @@ function Get-PinnedBuildProvenance {
         $targetDir = [string]$manifest.build.target_dir
         $installationKeys = @('descriptor_generated', 'installed', 'registered', 'route_enabled', 'activated')
         $format = 'eliot.module_build_manifest.v1'
-        $protocolVersion = $null
+        $compatibility = $manifest.compatibility
+        $runtime = $compatibility.host_runtime
+        $supervisor = $compatibility.host_supervisor
+        $protocolVersion = $compatibility.host_ipc.protocol_version
+        if ($null -eq $runtime -or $runtime.package_name -cne 'swarm-kernel-host' -or
+            $runtime.binary_target -cne 'swarm-kernel-host' -or
+            $null -eq $supervisor -or $supervisor.package_name -cne 'swarm-supervisor' -or
+            $supervisor.binary_target -cne 'swarm-supervisor' -or
+            $supervisor.role -cne 'host_supervisor' -or
+            $null -eq $protocolVersion -or [int]$protocolVersion -le 0) {
+            Stop-Harness 'HOST_RUNTIME_COORDINATE_INVALID'
+        }
         $launcher = $null
     }
     foreach ($option in $argumentPairs.Keys) {
@@ -220,6 +251,10 @@ function Get-PinnedBuildProvenance {
         rustc_host_triple = $hostTripleMatches[0].Groups['triple'].Value
         cargo_version_verbose = $manifest.toolchain.cargo_version_verbose
         host_ipc_protocol_version = $protocolVersion
+        host_runtime_package_name = if ($null -ne $runtime) { $runtime.package_name } else { $null }
+        host_runtime_binary_target = if ($null -ne $runtime) { $runtime.binary_target } else { $null }
+        host_supervisor_package_name = if ($null -ne $supervisor) { $supervisor.package_name } else { $null }
+        host_supervisor_binary_target = if ($null -ne $supervisor) { $supervisor.binary_target } else { $null }
         host_launcher_package_name = if ($null -ne $launcher) { $launcher.package_name } else { $null }
         host_launcher_binary_target = if ($null -ne $launcher) { $launcher.binary_target } else { $null }
         manifest_is_unsigned = $true
@@ -227,14 +262,36 @@ function Get-PinnedBuildProvenance {
 }
 
 function Assert-PublicCliHostSibling {
-    param([Parameter(Mandatory)][System.Collections.IDictionary] $PublicCliBuild, [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild)
-    $expectedSibling = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-host.exe'))
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary] $PublicCliBuild,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostLauncherBuild,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostSupervisorBuild
+    )
+    $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-host.exe'))
+    $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-kernel-host.exe'))
+    $expectedSupervisor = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-supervisor.exe'))
     if ([System.IO.Path]::GetFileName($script:PublicCliPath) -cne 'swarm.exe' -or
-        -not [string]::Equals($expectedSibling, $script:HostPath, [StringComparison]::OrdinalIgnoreCase) -or
-        $PublicCliBuild.host_launcher_package_name -cne $HostBuild.package_name -or
-        $PublicCliBuild.host_launcher_binary_target -cne $HostBuild.binary_target -or
+        -not [string]::Equals($expectedLauncher, $script:HostLauncherPath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($expectedRuntime, $script:HostPath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($expectedSupervisor, $script:HostSupervisorPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $PublicCliBuild.host_launcher_package_name -cne $HostLauncherBuild.package_name -or
+        $PublicCliBuild.host_launcher_binary_target -cne $HostLauncherBuild.binary_target -or
+        $PublicCliBuild.host_runtime_package_name -cne $HostBuild.package_name -or
+        $PublicCliBuild.host_runtime_binary_target -cne $HostBuild.binary_target -or
+        $PublicCliBuild.host_supervisor_package_name -cne $HostSupervisorBuild.package_name -or
+        $PublicCliBuild.host_supervisor_binary_target -cne $HostSupervisorBuild.binary_target -or
+        $HostLauncherBuild.package_name -cne 'eliot-swarm-controller' -or
+        $HostLauncherBuild.binary_target -cne 'swarm-host' -or
+        $HostBuild.package_name -cne 'swarm-kernel-host' -or
+        $HostBuild.binary_target -cne 'swarm-kernel-host' -or
+        $HostSupervisorBuild.package_name -cne 'swarm-supervisor' -or
+        $HostSupervisorBuild.binary_target -cne 'swarm-supervisor' -or
+        $PublicCliBuild.host_ipc_protocol_version -ne $HostBuild.host_ipc_protocol_version -or
         $PublicCliBuild.rustc_host_triple -cne $HostBuild.rustc_host_triple -or
-        (Get-Sha256 $expectedSibling) -cne $HostBuild.binary_sha256) {
+        (Get-Sha256 $expectedLauncher) -cne $HostLauncherBuild.binary_sha256 -or
+        (Get-Sha256 $expectedRuntime) -cne $HostBuild.binary_sha256 -or
+        (Get-Sha256 $expectedSupervisor) -cne $HostSupervisorBuild.binary_sha256) {
         Stop-Harness 'PUBLIC_CLI_HOST_COORDINATE_MISMATCH'
     }
 }
@@ -850,14 +907,22 @@ function Invoke-OptionalWorkerObservation {
 try {
     if (-not $IsWindows -or $PSVersionTable.PSVersion.Major -lt 7) { Stop-Harness 'POWERSHELL_7_WINDOWS_REQUIRED' }
     $script:HostPath = Assert-SafeAbsolutePath -Path $HostExecutable -MustExist
+    $script:HostSupervisorPath = Assert-SafeAbsolutePath -Path $HostSupervisorExecutable -MustExist
+    $script:HostLauncherPath = Assert-SafeAbsolutePath -Path $HostLauncherExecutable -MustExist
     $script:PublicCliPath = Assert-SafeAbsolutePath -Path $PublicCliExecutable -MustExist
     $actualHostHash = Get-Sha256 $script:HostPath
+    $actualHostSupervisorHash = Get-Sha256 $script:HostSupervisorPath
+    $actualHostLauncherHash = Get-Sha256 $script:HostLauncherPath
     $actualPublicCliHash = Get-Sha256 $script:PublicCliPath
     if ($actualHostHash -cne $ExpectedHostSha256.ToLowerInvariant()) { Stop-Harness 'HOST_BINARY_HASH_MISMATCH' }
+    if ($actualHostSupervisorHash -cne $ExpectedHostSupervisorSha256.ToLowerInvariant()) { Stop-Harness 'HOST_SUPERVISOR_BINARY_HASH_MISMATCH' }
+    if ($actualHostLauncherHash -cne $ExpectedHostLauncherSha256.ToLowerInvariant()) { Stop-Harness 'HOST_LAUNCHER_BINARY_HASH_MISMATCH' }
     if ($actualPublicCliHash -cne $ExpectedPublicCliSha256.ToLowerInvariant()) { Stop-Harness 'PUBLIC_CLI_BINARY_HASH_MISMATCH' }
-    $script:HostBuild = Get-PinnedBuildProvenance -ManifestPath $HostBuildManifestPath -ExpectedManifestSha256 $ExpectedHostBuildManifestSha256 -BinaryPath $script:HostPath -ExpectedBinarySha256 $actualHostHash -ExpectedPackage 'eliot-swarm-controller' -ExpectedTarget 'swarm-host'
+    $script:HostBuild = Get-PinnedBuildProvenance -ManifestPath $HostBuildManifestPath -ExpectedManifestSha256 $ExpectedHostBuildManifestSha256 -BinaryPath $script:HostPath -ExpectedBinarySha256 $actualHostHash -ExpectedPackage 'swarm-kernel-host' -ExpectedTarget 'swarm-kernel-host'
+    $script:HostSupervisorBuild = Get-PinnedBuildProvenance -ManifestPath $HostSupervisorBuildManifestPath -ExpectedManifestSha256 $ExpectedHostSupervisorBuildManifestSha256 -BinaryPath $script:HostSupervisorPath -ExpectedBinarySha256 $actualHostSupervisorHash -ExpectedPackage 'swarm-supervisor' -ExpectedTarget 'swarm-supervisor'
+    $script:HostLauncherBuild = Get-PinnedBuildProvenance -ManifestPath $HostLauncherBuildManifestPath -ExpectedManifestSha256 $ExpectedHostLauncherBuildManifestSha256 -BinaryPath $script:HostLauncherPath -ExpectedBinarySha256 $actualHostLauncherHash -ExpectedPackage 'eliot-swarm-controller' -ExpectedTarget 'swarm-host'
     $script:PublicCliBuild = Get-PinnedBuildProvenance -ManifestPath $PublicCliBuildManifestPath -ExpectedManifestSha256 $ExpectedPublicCliBuildManifestSha256 -BinaryPath $script:PublicCliPath -ExpectedBinarySha256 $actualPublicCliHash -ExpectedPackage 'swarm-cli' -ExpectedTarget 'swarm' -FrontendCli
-    Assert-PublicCliHostSibling -PublicCliBuild $script:PublicCliBuild -HostBuild $script:HostBuild
+    Assert-PublicCliHostSibling -PublicCliBuild $script:PublicCliBuild -HostLauncherBuild $script:HostLauncherBuild -HostBuild $script:HostBuild -HostSupervisorBuild $script:HostSupervisorBuild
     $script:ConfigPath = Assert-SafeAbsolutePath -Path $HostConfigPath -MustExist
     $output = Assert-SafeAbsolutePath -Path $OutputRoot -MustExist -Directory
     $script:TaskSpecPath = Assert-SafeAbsolutePath -Path $TaskSpecPath -MustExist
@@ -866,8 +931,8 @@ try {
     New-PrivateDirectory -Path $script:RunDirectory
     $script:Summary.status = 'running'
     $script:Summary.host = [ordered]@{
-        package = 'eliot-swarm-controller'
-        target = 'swarm-host'
+        package = 'swarm-kernel-host'
+        target = 'swarm-kernel-host'
         profile = 'release'
         image_sha256 = $actualHostHash
         manifest_sha256 = $script:HostBuild.manifest_sha256
@@ -877,6 +942,24 @@ try {
         host_config_sha256 = Get-Sha256 $script:ConfigPath
         task_spec_sha256 = $script:TaskSpecHash
         target_dir_sha256 = $script:HostBuild.target_dir_sha256
+        manifest_is_unsigned = $true
+    }
+    $script:Summary.host_supervisor = [ordered]@{
+        package = 'swarm-supervisor'
+        target = 'swarm-supervisor'
+        image_sha256 = $actualHostSupervisorHash
+        manifest_sha256 = $script:HostSupervisorBuild.manifest_sha256
+        source_commit = $script:HostSupervisorBuild.source_commit
+        source_tree = $script:HostSupervisorBuild.source_tree
+        manifest_is_unsigned = $true
+    }
+    $script:Summary.host_launcher = [ordered]@{
+        package = 'eliot-swarm-controller'
+        target = 'swarm-host'
+        image_sha256 = $actualHostLauncherHash
+        manifest_sha256 = $script:HostLauncherBuild.manifest_sha256
+        source_commit = $script:HostLauncherBuild.source_commit
+        source_tree = $script:HostLauncherBuild.source_tree
         manifest_is_unsigned = $true
     }
     $script:Summary.public_cli = [ordered]@{
@@ -889,6 +972,10 @@ try {
         target_dir_sha256 = $script:PublicCliBuild.target_dir_sha256
         host_launcher_package = $script:PublicCliBuild.host_launcher_package_name
         host_launcher_target = $script:PublicCliBuild.host_launcher_binary_target
+        host_runtime_package = $script:PublicCliBuild.host_runtime_package_name
+        host_runtime_target = $script:PublicCliBuild.host_runtime_binary_target
+        host_supervisor_package = $script:PublicCliBuild.host_supervisor_package_name
+        host_supervisor_target = $script:PublicCliBuild.host_supervisor_binary_target
         host_ipc_protocol_version = $script:PublicCliBuild.host_ipc_protocol_version
         exact_host_sibling_verified = $true
         manifest_is_unsigned = $true

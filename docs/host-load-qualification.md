@@ -12,11 +12,12 @@ one run measured, under the conditions stated below, and no more.
 ## Scenario
 
 `tools/host-load.py` (Python 3 standard library only) starts one real
-`swarm-host host` process on a fresh temporary data directory and drives it over
-its local IPC — newline-delimited JSON-RPC 2.0 on the Unix socket or the
-Windows named pipe (`control.sock` or the host's announced pipe; the
-request `id` must be a nonempty string,
-`model::Request::validate`). No `--config` is passed, so the `config.rs`
+`swarm-kernel-host host` process on a fresh temporary data directory and drives
+it over its local IPC — newline-delimited JSON-RPC 2.0 on the Unix socket or the
+Windows named pipe (`control.sock` or the host's announced pipe; the request `id` must be a nonempty string,
+`model::Request::validate`). The `swarm-kernel-host` image owns the Store/DB and starts the
+installed `swarm-supervisor` sibling after IPC readiness; the fixture resolves that sibling
+beside the kernel image and records its path and SHA-256 in the result. No `--config` is passed, so the `config.rs`
 defaults apply (`max_connections = 256`,
 `max_inflight_per_connection = 8`, `max_frame_bytes = 1 048 576`).
 
@@ -52,9 +53,13 @@ Phases, in order:
 Reproduce:
 
 ```sh
-cargo build --locked --release --package eliot-swarm-controller --bin swarm-host
-python3 tools/host-load.py --swarm target/release/swarm-host --out result.json
+cargo build --locked --release --package swarm-kernel-host --bin swarm-kernel-host
+python3 tools/host-load.py --swarm target/release/swarm-kernel-host --out result.json
 ```
+
+For compatibility with older invocations, `--swarm target/release/swarm-host`
+is also accepted when the sibling `swarm-kernel-host` image is present; the
+fixture resolves and owns that child, never the wrapper process.
 
 ## Windows owner-machine observation, 2026-10-03
 
