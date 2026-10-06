@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct BusSupervisorConfig {
     pub enabled: bool,
@@ -14,16 +14,6 @@ pub struct BusSupervisorConfig {
     pub dispatcher_executable: Option<PathBuf>,
     /// Operator-pinned SHA-256 of the dispatcher executable bytes.
     pub dispatcher_sha256: Option<String>,
-}
-
-impl Default for BusSupervisorConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dispatcher_executable: None,
-            dispatcher_sha256: None,
-        }
-    }
 }
 
 impl BusSupervisorConfig {

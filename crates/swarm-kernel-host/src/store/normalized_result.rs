@@ -376,16 +376,15 @@ pub(super) fn validate_source(
             "sealed source does not match the retained Task dispatch and module receipts",
         ));
     }
-    if let Some(expected) = effective.get("normalized_result_payload_identity") {
-        if expected["sha256"] != source.payload_sha256
+    if let Some(expected) = effective.get("normalized_result_payload_identity")
+        && (expected["sha256"] != source.payload_sha256
             || expected["byte_length"] != source.payload_bytes
-            || expected["complete"] != true
-        {
-            return Err(Error::new(
-                "RESULT_PROVENANCE_INVALID",
-                "page payload differs from the exact admitted native capture digest",
-            ));
-        }
+            || expected["complete"] != true)
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "page payload differs from the exact admitted native capture digest",
+        ));
     }
     Ok((source, origin_value))
 }

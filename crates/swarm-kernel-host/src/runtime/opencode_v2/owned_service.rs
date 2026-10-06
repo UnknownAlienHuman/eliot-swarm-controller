@@ -734,6 +734,10 @@ impl OwnedServiceHandle {
 
 /// Start one foreground helper only after Store has durably authorized the
 /// effect. The helper enters the non-killing process Job before spawning Bun.
+#[expect(
+    clippy::result_large_err,
+    reason = "The failure retains the exact helper stdin until Store records its diagnostic; changing this ownership handoff could stop a ready helper too early."
+)]
 pub(crate) async fn start_foreground(
     prepared: PreparedOwnedService,
     mut permit: OwnedServiceStartPermit,
@@ -808,6 +812,10 @@ fn start_failure(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The failure retains the exact helper stdin until Store records its diagnostic; changing this ownership handoff could stop a ready helper too early."
+)]
 async fn complete_foreground_start(
     prepared: PreparedOwnedService,
     mut child: Child,

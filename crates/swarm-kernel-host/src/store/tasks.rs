@@ -132,7 +132,7 @@ pub(super) fn create(
     } else {
         None
     };
-    create_validated(tx, &project, &s, origin.as_deref(), id, now)
+    create_validated(tx, project, &s, origin, id, now)
 }
 
 /// Taskless automation can create a Task only in the project retained by its
@@ -155,7 +155,7 @@ pub(super) fn create_for_script_effect(
         ));
     }
     let s = spec(v)?;
-    create_validated(tx, &project, &s, None, id, now)
+    create_validated(tx, project, &s, None, id, now)
 }
 
 fn create_validated(

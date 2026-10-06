@@ -109,11 +109,9 @@ pub(super) fn get(db: &Connection, principal: &Principal, value: &Value) -> Resu
         ));
     }
     let now_ms = model::now_ms()?;
-    let active = policy.as_ref().is_some_and(|policy| {
-        policy
-            .expires_at_ms
-            .map_or(true, |expires| expires > now_ms)
-    });
+    let active = policy
+        .as_ref()
+        .is_some_and(|policy| policy.expires_at_ms.is_none_or(|expires| expires > now_ms));
     Ok(json!({
         "scope": public_scope(&scope),
         "scope_kind": scope_kind(&scope),
@@ -663,23 +661,20 @@ fn resolve_scope(db: &Connection, principal: &Principal, value: &Value) -> Resul
                 ));
             }
         } else {
-            let _ = owned_module_binding(db, principal, module_id)?;
+            owned_module_binding(db, principal, module_id)?;
         }
     }
 
-    if let Some(task) = task.as_ref() {
-        if let (Some(binding_id), Some(binding_generation)) =
+    if let Some(task) = task.as_ref()
+        && let (Some(binding_id), Some(binding_generation)) =
             (binding_id.as_deref(), binding_generation)
-        {
-            if task.binding_id.as_deref() != Some(binding_id)
-                || task.binding_generation != Some(binding_generation)
-            {
-                return Err(Error::new(
-                    "LOGGING_SCOPE_MISMATCH",
-                    "logging binding selector differs from the current Task Attempt",
-                ));
-            }
-        }
+        && (task.binding_id.as_deref() != Some(binding_id)
+            || task.binding_generation != Some(binding_generation))
+    {
+        return Err(Error::new(
+            "LOGGING_SCOPE_MISMATCH",
+            "logging binding selector differs from the current Task Attempt",
+        ));
     }
 
     Ok(Scope {
@@ -1010,7 +1005,7 @@ fn public_policy(policy: &StoredPolicy, now_ms: i64) -> Value {
         "revision":policy.revision,
         "updated_at_ms":policy.updated_at_ms,
         "expires_at_ms":policy.expires_at_ms,
-        "active":policy.expires_at_ms.map_or(true, |expires| expires > now_ms),
+        "active":policy.expires_at_ms.is_none_or(|expires| expires > now_ms),
         "source":"store_meta",
     })
 }

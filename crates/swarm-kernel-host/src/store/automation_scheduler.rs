@@ -23,6 +23,7 @@ const METHOD_SCOPE: [&str; 2] = ["automation.scheduler.page", "automation.schedu
 const MAX_SOURCE_PAGE: usize = 32;
 const CRON_DUE_PREFIX: &str = "automation:v1:cron:due:";
 const GOAL_DUE_PREFIX: &str = "goals:v1:due:";
+type DueIndexSnapshot = (Option<i64>, Vec<(String, String)>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -775,7 +776,7 @@ pub(crate) fn read(
 /// Validate an admission cut using the authenticated service registration.
 /// The host then invokes the existing Store reconcilers; their domain cursors
 /// and normal Operations remain the replay boundary.
-pub(crate) fn prepare_admit(
+fn prepare_admit(
     db: &Connection,
     principal: &Principal,
     params: &Value,
@@ -926,7 +927,7 @@ fn due_index_snapshot(
     db: &Connection,
     prefix: &str,
     timestamp_width: usize,
-) -> Result<(Option<i64>, Vec<(String, String)>)> {
+) -> Result<DueIndexSnapshot> {
     let upper = format!("{prefix}~");
     let mut statement = db.prepare(
         "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT ?3",

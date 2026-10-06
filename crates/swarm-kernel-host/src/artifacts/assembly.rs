@@ -128,23 +128,21 @@ fn identity_comparison_key(identity: &Value) -> Value {
     let mut key = identity.clone();
     if key["source"]["schema_id"]
         == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
-    {
-        if let Some(producer) = key
+        && let Some(producer) = key
             .get_mut("source")
             .and_then(|source| source.get_mut("origin"))
             .and_then(|origin| origin.get_mut("producer"))
             .and_then(Value::as_object_mut)
-        {
-            // Assembly compares a stable origin while retaining the first
-            // page's exact sealed lifecycle facts in the published identity.
-            producer.insert(
-                "completion_condition".to_owned(),
-                json!("native_input_admitted"),
-            );
-            producer.insert("execution_complete".to_owned(), json!(false));
-            producer.insert("task_completion".to_owned(), json!("unknown"));
-            producer.insert("disposition".to_owned(), json!("admitted"));
-        }
+    {
+        // Assembly compares a stable origin while retaining the first
+        // page's exact sealed lifecycle facts in the published identity.
+        producer.insert(
+            "completion_condition".to_owned(),
+            json!("native_input_admitted"),
+        );
+        producer.insert("execution_complete".to_owned(), json!(false));
+        producer.insert("task_completion".to_owned(), json!("unknown"));
+        producer.insert("disposition".to_owned(), json!("admitted"));
     }
     key
 }

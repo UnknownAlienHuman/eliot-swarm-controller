@@ -29,6 +29,69 @@ type ConsumerEventOperationRow = (
     Option<String>,
     Option<i64>,
 );
+type ModuleEventWorkDispatchIdentity = (String, i64, String);
+type ModuleEventOperationLinkOwner = (
+    String,
+    String,
+    String,
+    String,
+    Option<ModuleEventWorkDispatchIdentity>,
+);
+type ModuleEventOperationAncestryRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+type ModuleEventLaunchParentRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+);
+type ModuleEventObservationRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    String,
+    i64,
+);
+type ModuleEventOperationScopeRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+type ModuleEventOpenRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DescriptorModuleEventScope {
@@ -1202,13 +1265,7 @@ fn module_event_task_scopes(
 
 fn module_event_operation_link_owner(
     link: crate::automation::authorization::AnyOnBehalfOperationLink,
-) -> (
-    String,
-    String,
-    String,
-    String,
-    Option<(String, i64, String)>,
-) {
+) -> ModuleEventOperationLinkOwner {
     use crate::automation::authorization::AnyOnBehalfOperationLink as Link;
     match link {
         Link::Review(link)
@@ -1250,6 +1307,10 @@ const NATIVE_MCP_PHASE_OPERATION_CALLER: &str = "swarm.internal.c8.native_mcp";
 /// Read the retained parent of a C8 native MCP phase Operation. The child
 /// Operation stores this link in its immutable native_mcp envelope; no live
 /// AssignmentContext, Task, participant lease, or supervisor record is read.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native MCP phase validation keeps each retained identity field explicit"
+)]
 fn module_event_native_mcp_phase_parent(
     db: &Connection,
     operation_id: &str,
@@ -1519,27 +1580,7 @@ fn module_event_operation_owner(
                 "Module event Operation ancestry is cyclic, ambiguous, or too deep",
             ));
         }
-        let operation: Option<(
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        )> = db
+        let operation: Option<ModuleEventOperationAncestryRow> = db
             .query_row(
                 "SELECT method,caller_id,task_id,attempt_id,binding_id,binding_generation,\
                         prerequisite_operation_id,\
@@ -1651,8 +1692,7 @@ fn module_event_operation_owner(
             }
             if let Some((automation_id, automation_revision, semantic_slot_id)) =
                 work_dispatch_identity
-            {
-                if method != "swarm.launch"
+                && (method != "swarm.launch"
                     || launch_actor_kind.as_deref() != Some("work_dispatch")
                     || launch_actor_client_id.as_deref() != Some(caller_id.as_str())
                     || launch_actor_manager_id.as_deref() != Some(owner_id.as_str())
@@ -1670,12 +1710,11 @@ fn module_event_operation_owner(
                     })
                     || binding_generation.is_some_and(|generation| {
                         launch_manifest_binding_generation != Some(generation)
-                    })
-                {
-                    return Err(unauthorized(
-                        "WorkDispatch link and retained launch manifest disagree about the Manager owner",
-                    ));
-                }
+                    }))
+            {
+                return Err(unauthorized(
+                    "WorkDispatch link and retained launch manifest disagree about the Manager owner",
+                ));
             }
             return Ok(owner_id);
         }
@@ -1689,42 +1728,41 @@ fn module_event_operation_owner(
             ));
         }
 
-        if method == "agent.open" {
-            if let Some(parent_id) = prerequisite_id.as_deref() {
-                validate_module_event_launch_open_parent(
-                    db,
-                    operation_id,
-                    parent_id,
-                    &caller_id,
-                    task_id.as_deref(),
-                    attempt_id.as_deref(),
-                    binding_id.as_deref(),
-                    binding_generation,
-                )?;
-                return resolve(
-                    db,
-                    parent_id,
-                    project_id,
-                    expected_owner_manager_id,
-                    seen,
-                    depth + 1,
-                );
-            }
+        if method == "agent.open"
+            && let Some(parent_id) = prerequisite_id.as_deref()
+        {
+            validate_module_event_launch_open_parent(
+                db,
+                operation_id,
+                parent_id,
+                &caller_id,
+                task_id.as_deref(),
+                attempt_id.as_deref(),
+                binding_id.as_deref(),
+                binding_generation,
+            )?;
+            return resolve(
+                db,
+                parent_id,
+                project_id,
+                expected_owner_manager_id,
+                seen,
+                depth + 1,
+            );
         }
 
-        if method == "task.dispatch" {
-            if let Some(parent_id) =
+        if method == "task.dispatch"
+            && let Some(parent_id) =
                 super::super::launcher_dispatch::historical_parent_for_operation(db, operation_id)?
-            {
-                return resolve(
-                    db,
-                    &parent_id,
-                    project_id,
-                    expected_owner_manager_id,
-                    seen,
-                    depth + 1,
-                );
-            }
+        {
+            return resolve(
+                db,
+                &parent_id,
+                project_id,
+                expected_owner_manager_id,
+                seen,
+                depth + 1,
+            );
         }
 
         if caller_id == expected_owner_manager_id {
@@ -1755,6 +1793,10 @@ fn require_module_event_operation_owner(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "launch/open ancestry validation keeps each retained identity field explicit"
+)]
 fn validate_module_event_launch_open_parent(
     db: &Connection,
     open_operation_id: &str,
@@ -1771,7 +1813,7 @@ fn validate_module_event_launch_open_parent(
             "Module agent.open does not match its retained launch parent",
         )
     };
-    let parent: Option<(String, String, Option<String>, Option<String>, Option<String>, Option<i64>, String)> = db
+    let parent: Option<ModuleEventLaunchParentRow> = db
         .query_row(
             "SELECT caller_id,method,task_id,attempt_id,binding_id,binding_generation,effective_request_json \
              FROM operations WHERE operation_id=?1",
@@ -1864,15 +1906,7 @@ pub(super) fn require_module_event_source_provenance(
                 "Module event source has no registered module identity",
             )
         })?;
-    let observation: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        String,
-        i64,
-    )> = db
+    let observation: Option<ModuleEventObservationRow> = db
         .query_row(
             "SELECT source_stream_id,source_event_key,binding_id,binding_generation,\
                     operation_id,kind,recorded_at_ms \
@@ -2018,14 +2052,7 @@ pub(super) fn require_module_event_source_provenance(
     )?;
 
     let (source_scope, action_scope) = if let Some(operation_id) = event.operation_id.as_deref() {
-        let operation: Option<(
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        )> = db
+        let operation: Option<ModuleEventOperationScopeRow> = db
             .query_row(
                 "SELECT operation_id,caller_id,binding_id,binding_generation,task_id,attempt_id \
                  FROM operations WHERE operation_id=?1",
@@ -2274,15 +2301,7 @@ pub(super) fn validate_retained_module_event_source(
         ));
     }
 
-    let observation: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        String,
-        i64,
-    )> = db
+    let observation: Option<ModuleEventObservationRow> = db
         .query_row(
             "SELECT source_stream_id,source_event_key,binding_id,binding_generation,\
                     operation_id,kind,recorded_at_ms \
@@ -2363,14 +2382,7 @@ pub(super) fn validate_retained_module_event_source(
         ));
     }
 
-    let open: Option<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-    )> = db
+    let open: Option<ModuleEventOpenRow> = db
         .query_row(
             "SELECT operation_id,caller_id,task_id,attempt_id,binding_id,binding_generation \
              FROM operations WHERE operation_id=?1 AND method='agent.open'",
@@ -2429,14 +2441,7 @@ pub(super) fn validate_retained_module_event_source(
     }
 
     let source_origin = if let Some(operation_id) = event.operation_id.as_deref() {
-        let operation: Option<(
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        )> = db
+        let operation: Option<ModuleEventOperationScopeRow> = db
             .query_row(
                 "SELECT operation_id,caller_id,binding_id,binding_generation,task_id,attempt_id \
                  FROM operations WHERE operation_id=?1",

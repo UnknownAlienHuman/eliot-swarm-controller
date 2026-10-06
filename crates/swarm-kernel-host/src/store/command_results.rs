@@ -1429,12 +1429,10 @@ pub(super) fn prepare(
         context["target_command_output"] = snapshot;
         return Ok(context);
     }
-    {
-        return Err(Error::new(
-            "RESULT_SELECTOR_UNSUPPORTED",
-            "Command result page selector is invalid",
-        ));
-    }
+    Err(Error::new(
+        "RESULT_SELECTOR_UNSUPPORTED",
+        "Command result page selector is invalid",
+    ))
 }
 
 fn target_snapshot_from_context(

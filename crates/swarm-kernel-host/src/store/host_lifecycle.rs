@@ -496,27 +496,10 @@ pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
 /// Retain the latest bounded state for the thirteen optional workers. The
 /// Store status reader exposes this through the existing `host.status` path.
 /// Error details, process output, and route/native payloads are never stored.
-pub(super) fn update_optional_worker(
-    tx: &Transaction<'_>,
-    name: &str,
-    state: &str,
-    consecutive_failures: u32,
-    error_code: Option<&str>,
-    retry_in_ms: Option<u64>,
-    now: i64,
-) -> Result<()> {
-    update_optional_worker_with_child(
-        tx,
-        name,
-        state,
-        consecutive_failures,
-        error_code,
-        retry_in_ms,
-        None,
-        now,
-    )
-}
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the existing optional-worker receipt boundary keeps transaction, identity, state, failure metadata, child receipt, and timestamp as separate validated fields"
+)]
 pub(super) fn update_optional_worker_with_child(
     tx: &Transaction<'_>,
     name: &str,

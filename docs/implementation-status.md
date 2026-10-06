@@ -6,12 +6,12 @@
 
 The product source integration, physical Kernel relocation, five Rust adapter
 paths and public CLI/host coordinates are present. Production diagnostics at
-`cf2cf122c0b1b450625c556d980d1ba837dbeb15` reached all five Rust adapters and
-reported 17 Kernel integration diagnostics. That diagnostic pass allowed
-warnings to collect other packages' errors and is not an acceptance result.
-The following source batch repairs typed supervisor error conversion,
-diagnostic-task access, lifecycle readback error types, bus slot ownership,
-scheduler scope ownership and the reported process/control lints. The final
+`870f0595ae713746e89c7789fc697951d83cdb78` checked all 24 selected packages,
+including the five Rust adapters, without type errors. Diagnostic mode allowed
+warnings and reported 79 Kernel warnings, so it is not an acceptance result.
+The following source batch repairs their mechanical predicates, local row type
+aliases, internal visibility and unused compatibility helpers. Narrow reasoned
+lint expectations retain existing receipt and startup signatures. The final
 production compiler gate still requires no warnings.
 Source closure precedes tests and native qualification. The product remains
 `PARTIAL_PROGRESS`; compiler success alone does not qualify failure recovery,

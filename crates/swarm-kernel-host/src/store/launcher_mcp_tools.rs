@@ -957,6 +957,10 @@ impl Store {
     /// recorded as bounded failure and is never replayed by this consumer.
     /// Applied receipts are validated against the original challenge/intent
     /// before the parent C8 record advances.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "These separate immutable launch, binding, phase, process, and service inputs jointly bind one exact C8 child receipt."
+    )]
     async fn consume_native_mcp_operation(
         &self,
         facts: &LaunchFacts,
@@ -1703,6 +1707,10 @@ impl Store {
             .await
     }
 
+    #[expect(
+        dead_code,
+        reason = "Preserve the typed RPC rejection-class recorder; the current C8 receipt consumer has only persisted error data and does not reconstruct a native RPC Error."
+    )]
     async fn record_safe_rpc_error(
         &self,
         facts: &LaunchFacts,

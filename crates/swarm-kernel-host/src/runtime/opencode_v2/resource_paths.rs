@@ -31,7 +31,7 @@ struct CachedInstalledRoot {
 static VERIFIED_ROOTS: OnceLock<Mutex<HashMap<PathBuf, CachedInstalledRoot>>> = OnceLock::new();
 
 pub(crate) fn required_file(name: &str) -> Result<PathBuf> {
-    if !REQUIRED.iter().any(|candidate| *candidate == name) {
+    if !REQUIRED.contains(&name) {
         return Err(Error::new(
             "OPENCODE_RESOURCE_FILE_UNAVAILABLE",
             "requested OpenCode resource is outside the pinned resource set",

@@ -1530,18 +1530,20 @@ fn validate_operation_ids(
     observation: &ModuleSupervisorObservation,
     generation: i64,
 ) -> Result<Option<ValidatedOperationLink>> {
+    type OperationValidationRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
     let has_single_exact_operation = observation.unknown_operation_count == 1
         && observation.unknown_operation_ids.len() == 1
         && !observation.unknown_operation_ids_truncated;
     let mut exact_link = None;
     for operation_id in &observation.unknown_operation_ids {
-        let row: Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = tx
+        let row: Option<OperationValidationRow> = tx
             .query_row(
                 "SELECT o.state,
                         o.task_id,

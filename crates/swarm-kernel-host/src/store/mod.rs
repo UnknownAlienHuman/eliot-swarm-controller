@@ -2698,6 +2698,10 @@ fn open_database(
     Ok(db)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Database initialization keeps the transaction, existing/new state, bootstrap credentials, config, and retained scheduler pins explicit at one boundary."
+)]
 fn initialize_database(
     tx: &Transaction<'_>,
     is_new: bool,
@@ -4843,7 +4847,7 @@ fn mutate_in_transaction_with_check_plan(
     )
 }
 
-pub(super) fn mutate_in_transaction_with_forge_execution(
+pub(in crate::store) fn mutate_in_transaction_with_forge_execution(
     tx: &Transaction<'_>,
     p: &Principal,
     method: &str,

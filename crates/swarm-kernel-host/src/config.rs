@@ -53,16 +53,10 @@ pub struct ScriptConfig {
 /// Explicit opt-in for the independent Store-backed scheduler process. The
 /// built-in scheduler remains the compatibility and recovery path when this
 /// is absent or disabled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutomationSchedulerConfig {
     pub enabled: bool,
-}
-
-impl Default for AutomationSchedulerConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 impl ScriptConfig {
@@ -275,11 +269,9 @@ impl Route {
         let Some(definition) = &self.owned_service else {
             return Ok(None);
         };
-        let supported_route =
-            (self.runtime == crate::runtime::opencode_v2::RUNTIME
-                && self.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-                || (self.runtime == "module"
-                    && self.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
+        let supported_route = (self.runtime == crate::runtime::opencode_v2::RUNTIME
+            && self.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+            || (self.runtime == "module" && self.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
         if !supported_route {
             return Err(Error::new(
                 "CONFIG_ERROR",
@@ -756,20 +748,15 @@ impl Config {
         }
         let mut services = std::collections::BTreeMap::new();
         let mut records = std::collections::BTreeMap::new();
-        for route in cfg
-            .routes
-            .iter()
-            .filter(|r| {
-                r.enabled
-                    && (r.runtime == crate::runtime::opencode_v2::RUNTIME
-                        || (r.runtime == "module" && r.owned_service.is_some()))
-            })
-        {
-            let supported_route =
-                (route.runtime == crate::runtime::opencode_v2::RUNTIME
-                    && route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-                    || (route.runtime == "module"
-                        && route.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
+        for route in cfg.routes.iter().filter(|r| {
+            r.enabled
+                && (r.runtime == crate::runtime::opencode_v2::RUNTIME
+                    || (r.runtime == "module" && r.owned_service.is_some()))
+        }) {
+            let supported_route = (route.runtime == crate::runtime::opencode_v2::RUNTIME
+                && route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+                || (route.runtime == "module"
+                    && route.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
             if !supported_route {
                 return Err(Error::new(
                     "CONFIG_ERROR",

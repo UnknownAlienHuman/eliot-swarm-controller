@@ -426,7 +426,7 @@ pub(super) fn record_task_dispatch(
         )
         || attempt["start_operation_id"] != outcome.operation_id
         || admission.attempt_id != attempt_id
-        || admission.task_id != model::text(&attempt, "task_id")?.to_owned()
+        || admission.task_id != model::text(&attempt, "task_id")?
         || admission.task_revision != model::positive(&attempt, "task_revision")?
     {
         return Err(Error::conflict(

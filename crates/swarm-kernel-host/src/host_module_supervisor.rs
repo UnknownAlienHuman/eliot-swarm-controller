@@ -112,13 +112,13 @@ impl ModuleSupervisorHostConfig {
             let reference = ProtectedRef::new(reference.clone()).map_err(|error| {
                 Error::new("MODULE_SUPERVISOR_CONFIG_INVALID", error.to_string())
             })?;
-            if let Some(previous) = protected_files.insert(reference, source.auth_file.clone()) {
-                if previous != source.auth_file {
-                    return Err(Error::new(
-                        "MODULE_SUPERVISOR_CONFIG_INVALID",
-                        "protected reference maps to conflicting host files",
-                    ));
-                }
+            if let Some(previous) = protected_files.insert(reference, source.auth_file.clone())
+                && previous != source.auth_file
+            {
+                return Err(Error::new(
+                    "MODULE_SUPERVISOR_CONFIG_INVALID",
+                    "protected reference maps to conflicting host files",
+                ));
             }
         }
         let value = Self {
@@ -191,8 +191,8 @@ impl OptionalModuleSupervisor {
                     "MODULE_SUPERVISOR_JOIN_FAILED",
                     "module supervisor task failed",
                 );
-                if let Some(control) = health_control {
-                    if let Err(health_error) = record_module_actor_status(
+                if let Some(control) = health_control
+                    && let Err(health_error) = record_module_actor_status(
                         &control,
                         "isolated",
                         1,
@@ -200,9 +200,8 @@ impl OptionalModuleSupervisor {
                         Some(MODULE_ACTOR_ISOLATED_RETRY),
                     )
                     .await
-                    {
-                        return Err(join_error.with_secondary_error(health_error));
-                    }
+                {
+                    return Err(join_error.with_secondary_error(health_error));
                 }
                 Err(join_error)
             }
@@ -297,8 +296,8 @@ pub(crate) fn spawn_independent_module_supervisor(
             Err(_) => {
                 let panic_error =
                     Error::new(SUPERVISOR_CHILD_PANICKED, "module supervisor task panicked");
-                if let Some(control) = panic_control {
-                    if let Err(health_error) = record_module_actor_status(
+                if let Some(control) = panic_control
+                    && let Err(health_error) = record_module_actor_status(
                         &control,
                         "isolated",
                         1,
@@ -306,9 +305,8 @@ pub(crate) fn spawn_independent_module_supervisor(
                         Some(MODULE_ACTOR_ISOLATED_RETRY),
                     )
                     .await
-                    {
-                        return Err(panic_error.with_secondary_error(health_error));
-                    }
+                {
+                    return Err(panic_error.with_secondary_error(health_error));
                 }
                 Err(panic_error)
             }
@@ -612,9 +610,8 @@ async fn run_supervisor_process_loop(
                     Some(&child_health),
                 )
                 .await
-                .map_err(|error| {
+                .inspect_err(|_| {
                     child.retain_with_code("MODULE_SUPERVISOR_HEALTH_WRITE_FAILED");
-                    error
                 })?;
                 return Ok(());
             }
@@ -1245,9 +1242,7 @@ fn merge_child_diagnostic(
 }
 
 async fn join_child_diagnostic(task: Option<ChildDiagnosticTask>) -> Option<ChildError> {
-    let Some(ChildDiagnosticTask { mut task, latest }) = task else {
-        return None;
-    };
+    let ChildDiagnosticTask { mut task, latest } = task?;
     match time::timeout(SUPERVISOR_PROCESS_STOP_TIMEOUT, &mut task).await {
         Ok(Ok(code)) => code.or_else(|| latest.lock().ok().and_then(|value| value.clone())),
         Ok(Err(_)) | Err(_) => {

@@ -188,7 +188,7 @@ pub(super) fn validate_sealed_module_receipt(
         || receipt.input_sha256 != input_sha256
         || serde_json::to_value(&receipt.module_id)? != descriptor["module_id"]
         || serde_json::to_value(&receipt.artifact)? != descriptor["artifact"]
-        || serde_json::to_value(&receipt.protocol)? != descriptor["protocol"]
+        || serde_json::to_value(receipt.protocol)? != descriptor["protocol"]
     {
         return Err(Error::new(
             "MODULE_RECEIPT_INVALID",
@@ -376,17 +376,16 @@ pub(super) fn load_claude_result_origin(
     if let Some(result_receipt) = operation["result"]
         .get("details")
         .and_then(|d| d.get("module_receipt"))
+        && !result_receipt.is_null()
     {
-        if !result_receipt.is_null() {
-            validate_sealed_module_receipt(
-                &origin["descriptor"],
-                result_receipt,
-                operation_id,
-                binding_id,
-                generation,
-                result_input_sha256.as_str(),
-            )?;
-        }
+        validate_sealed_module_receipt(
+            &origin["descriptor"],
+            result_receipt,
+            operation_id,
+            binding_id,
+            generation,
+            result_input_sha256.as_str(),
+        )?;
     }
     Ok(origin)
 }

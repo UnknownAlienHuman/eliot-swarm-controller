@@ -2212,10 +2212,10 @@ pub(super) fn outcome_with_artifacts(
     }
     // Accepted is a durable native admission for the normalized contract. It
     // records the Attempt producer while keeping Task completion unresolved.
-    if matches!(r.outcome, EffectOutcome::Accepted) {
-        if let Some(admission) = normalized_dispatch_admission.as_ref() {
-            producers::record_task_dispatch(&tx, &o, &r, admission, now)?;
-        }
+    if matches!(r.outcome, EffectOutcome::Accepted)
+        && let Some(admission) = normalized_dispatch_admission.as_ref()
+    {
+        producers::record_task_dispatch(&tx, &o, &r, admission, now)?;
     }
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
@@ -2580,9 +2580,7 @@ pub(super) fn event(db: &mut Connection, p: &Principal, v: &Value) -> Result<Val
     let metadata: swarm_contracts::runtime::ModuleEventMetadata =
         serde_json::from_value(v["metadata"].clone())
             .map_err(|_| Error::invalid("module event metadata has an invalid closed shape"))?;
-    metadata
-        .validate()
-        .map_err(|reason| Error::invalid(reason))?;
+    metadata.validate().map_err(Error::invalid)?;
     if metadata.event_kind != event_kind {
         return Err(Error::invalid(
             "module event metadata kind differs from the admitted event kind",
@@ -3719,6 +3717,10 @@ fn current_attempts_for_binding(
 /// Later page delivery may outlive the current Attempt, GM, and descriptor
 /// registry state, so it must consume this immutable target/Attempt/descriptor
 /// and native admission identity instead of re-authorizing against live rows.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The immutable Claude result-origin join keeps binding, Operation, target, and selector identities explicit for validation in one transaction."
+)]
 fn seal_claude_result_origin(
     db: &Connection,
     binding_id: &str,

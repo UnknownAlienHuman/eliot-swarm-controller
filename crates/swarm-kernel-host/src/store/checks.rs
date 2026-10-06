@@ -865,7 +865,7 @@ fn source_admission_json(
         "attempt_id":input.attempt_id,
         "repository":serde_json::to_value(&input.repository)?,
         "commit":input.commit,
-        "lease_authority":lease_authority.map(|authority| serde_json::to_value(authority)).transpose()?.unwrap_or(Value::Null),
+        "lease_authority":lease_authority.map(serde_json::to_value).transpose()?.unwrap_or(Value::Null),
     }))
 }
 
@@ -1052,11 +1052,10 @@ pub(super) fn reserve_source(
     tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",params![id,a["task_id"].as_str(),input.attempt_id,model::canonical(&json!({"capture":input,"git_executable":config.checks.git_executable,"identity":{"task_id":a["task_id"],"attempt_id":a["attempt_id"],"task_revision":a["task_revision"]},"source_admission":admission}))?])?;
     Ok(json!({"operation_id":id,"state":"queued","admission":"durable_local"}))
 }
-fn begin_source(
-    db: &mut Connection,
-    p: Principal,
-    id: &str,
-) -> Result<Option<(CaptureRequest, PathBuf, Value, Option<PathBuf>)>> {
+
+type BeginSourceCapture = (CaptureRequest, PathBuf, Value, Option<PathBuf>);
+
+fn begin_source(db: &mut Connection, p: Principal, id: &str) -> Result<Option<BeginSourceCapture>> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = current_principal(&tx, p)?;
     let op = operations::get_operation(&tx, id)?;

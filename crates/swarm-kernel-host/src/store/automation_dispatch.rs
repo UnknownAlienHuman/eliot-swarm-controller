@@ -34,6 +34,13 @@ const MAX_SUBMISSION_PAGE: usize = 32;
 const MAX_INTAKE_SOURCE_PAGE: usize = 64;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:dispatch_global_cursor";
 pub(super) const SYSTEM_EVENT_SOURCE_PROOF_PENDING: &str = "system_event_source_proof_pending";
+type RetainedOperationScope = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1757,13 +1764,7 @@ pub(crate) fn validate_retained_script_event_cause(
         None
     };
     if let Some(operation_id) = event.operation_id.as_deref() {
-        let operation_scope: Option<(
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            String,
-        )> = db
+        let operation_scope: Option<RetainedOperationScope> = db
             .query_row(
                 "SELECT task_id,attempt_id,binding_id,binding_generation,caller_id \
                  FROM operations WHERE operation_id=?1",

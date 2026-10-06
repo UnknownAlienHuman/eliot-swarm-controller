@@ -2765,15 +2765,17 @@ fn record_process_control_failure(
     pending: &PendingRun,
     failure: &swarm_scripts::process::ProcessControlFailure,
 ) -> Result<bool> {
+    type ProcessControlOperationRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+    );
+
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let row: Option<(
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        String,
-    )> = tx
+    let row: Option<ProcessControlOperationRow> = tx
         .query_row(
             "SELECT r.operation_id,r.state,r.process_identity_json,o.state,o.result_json,o.method \
              FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id \

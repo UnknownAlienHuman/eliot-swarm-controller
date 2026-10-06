@@ -282,11 +282,10 @@ pub(crate) async fn run(
                 slot.last_error = Some(code);
                 if let Err(status_error) =
                     persist_status(&store, slot, "unknown", Some(code), None).await
+                    && is_store_unavailable(&status_error)
                 {
-                    if is_store_unavailable(&status_error) {
-                        store_failed = true;
-                        break;
-                    }
+                    store_failed = true;
+                    break;
                 }
             }
             let mut remove_slot = false;
@@ -299,11 +298,10 @@ pub(crate) async fn run(
                         slot.last_error = Some(code);
                         if let Err(status_error) =
                             persist_status(&store, slot, "unknown", Some(code), None).await
+                            && is_store_unavailable(&status_error)
                         {
-                            if is_store_unavailable(&status_error) {
-                                store_failed = true;
-                                break;
-                            }
+                            store_failed = true;
+                            break;
                         }
                     }
                 }
@@ -590,7 +588,7 @@ async fn reconcile_slot(
     };
 
     if let Some(receipt) = receipt {
-        if let Err(_) = verify_owner_receipt(slot, &receipt, pin) {
+        if verify_owner_receipt(slot, &receipt, pin).is_err() {
             slot.last_error = Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH");
             persist_status(
                 store,

@@ -15,6 +15,14 @@ use serde_json::{Value, json};
 
 const ACTION: &str = "forge.publish_ref";
 const ACCEPTANCE_KIND: &str = "task.acceptance";
+type ReadbackOperationRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
 /// Exact acceptance provenance carried by a publication reservation.
 ///
@@ -751,14 +759,7 @@ impl PublicationContext {
                 "publication readback has no retained Operation identity",
             )
         })?;
-        let operation: Option<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        )> = db
+        let operation: Option<ReadbackOperationRow> = db
             .query_row(
                 "SELECT caller_id,method,state,task_id,attempt_id,original_request_json \
                  FROM operations WHERE operation_id=?1",
