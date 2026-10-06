@@ -100,12 +100,7 @@ impl OwnedServiceRoute {
         let base_state_root = lexical_absolute(&config.state_root)?;
         let bun_sha256 = normalize_sha256(&config.bun_sha256)?;
         let server_program_sha256 = normalize_sha256(&config.server_program_sha256)?;
-        let expected_server = lexical_absolute(
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("modules")
-                .join("opencode")
-                .join("serve.mjs"),
-        )?;
+        let expected_server = super::resource_paths::required_file("serve.mjs")?;
         if !same_lexical_path(&server_program, &expected_server)? {
             return Err(config_error(
                 "owned OpenCode must use the repository-pinned serve.mjs",

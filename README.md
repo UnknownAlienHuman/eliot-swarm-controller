@@ -1,6 +1,6 @@
 # Eliot Swarm Controller
 
-Headless, provider-neutral transactional Rust framework for durable commands, Operations, events, actions and messages. Its current application orchestrates native coding-agent harnesses as a prototype for the Eliot Memory OS Agent Execution Fabric. Provider and harness adapters translate common commands into concrete native instructions/APIs, and native events and results back into shared contracts, through the existing `RuntimePort` boundary. The kernel owns shared scheduling and durable state transitions independently of provider. One host, one SQLite database, local IPC; no UI, external broker or replacement model loop.
+Headless, provider-neutral transactional Rust framework for durable commands, Operations, events, actions and messages. Its current application orchestrates native coding-agent harnesses as a prototype for the Eliot Memory OS Agent Execution Fabric. Provider and harness adapters translate common commands into concrete native instructions/APIs, and native events and results back into shared contracts, through the existing `RuntimePort` boundary. The kernel owns shared scheduling and durable state transitions independently of provider. One Kernel writer, one SQLite database, local IPC; no UI, external broker or replacement model loop.
 
 Eliot Memory OS is not yet connected on the owner machine. The standalone controller remains usable; the requested conditional `eliot_compile_packet_l3` integration and its verification requirements are recorded in [the integration contract](docs/eliot-memory-os-integration.md). This records a request, not an implemented or qualified packet capability.
 
@@ -13,6 +13,8 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 **CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
 **Still pending:** live Muse resume qualification, native-outcome recovery for unrecorded effects, live child/family evidence, measured performance of the new Store path and OpenCode running-input continuation across service restart. Family projections retain explicit partial coverage where the native API cannot prove completeness. Module updates remain manual for 0.1 under the [accepted owner policy](docs/owner-decisions.md); an automatic installer is deferred. Live Muse/Max inference and Windows native launch remain unqualified. The owner-machine [qualification record](docs/qualification-2026-10-03.md) documents the bounded native OpenCode, Codex, Command and Antigravity contours. The [restart checkpoint](docs/restart-checkpoint-2026-10-03.md) records the new source and remaining gates. Do not mark all C01–C03 complete.
+
+The current source separates `swarm-kernel-host` (Store, database lock and authenticated IPC), the public `swarm-host` launcher, the IPC CLI and the standalone supervisor. Rust adapter sources are integrated for OpenCode (`eliot-opencode-v2.rust-http.1@0.3.0`), Codex (`codex-rust-controller.1@4`), Command (`eliot-command.rust-headless.1@3`), Claude (`claude-agent-sdk-0.3.287-rust-controller.4@4`) and Antigravity (`eliot-antigravity.rust-headless.1@4`). Their current source requires compiler and runtime qualification; the matrix below retains the specifically recorded bridge baselines. See [current source status](docs/implementation-status.md) for the delivered implementation and remaining gates.
 
 ### Capability and qualification matrix
 
@@ -40,22 +42,21 @@ Capability states use the [Documentation Program](docs/documentation-program.md)
 ## Build and run
 
 ```powershell
-$target = Join-Path $env:LOCALAPPDATA 'eliot-swarm-shared-target'
+$target = Join-Path $env:LOCALAPPDATA 'Eliot\build\rust-env-target'
 [void][IO.Directory]::CreateDirectory($target)
-cargo build --locked --release --package swarm-cli --bin swarm --target-dir $target
-cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir $target
+cargo build --locked --release --package swarm-cli --package eliot-swarm-controller --package swarm-kernel-host --package swarm-supervisor --package swarm-mcp --bins --target-dir $target
 $swarmHost = Join-Path (Join-Path $target 'release') 'swarm-host.exe'
 & $swarmHost --data-dir C:\SwarmState host
 ```
 
-Use an initially empty dedicated local directory. The host owns only its marker/lock, database, artifacts and credentials there. It refuses unrelated nonempty directories; global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch the host. The public swarm client invokes the adjacent swarm-host only for explicit local commands; ordinary application requests never start the host.
+Use an initially empty dedicated local directory. The Kernel owns its marker/lock, database, artifacts and credentials there. It refuses unrelated nonempty directories; global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch the host. The public swarm client invokes the adjacent swarm-host only for explicit local commands; ordinary application requests never start the host.
 
-The CLI and host are separately built artifacts, each with its own source commit, tree, and image digest in its provenance manifest. The installer checks each manifest against its own receipt and verifies the declared IPC protocol, target, and host-launch contract; the two artifacts need not come from the same source revision.
+The CLI, public launcher, Kernel and supervisor are separate artifacts, each with its own source commit, tree and image digest in its provenance manifest. Installation validates the complete declared sibling chain, and host readiness and process identity refer to the actual Kernel child. The installer checks each manifest against its own receipt and verifies the declared IPC protocol, target, and host-launch contract; the two artifacts need not come from the same source revision.
 
 In another PowerShell:
 
 ```powershell
-$target = Join-Path $env:LOCALAPPDATA 'eliot-swarm-shared-target'
+$target = Join-Path $env:LOCALAPPDATA 'Eliot\build\rust-env-target'
 $swarm = Join-Path (Join-Path $target 'release') 'swarm.exe'
 & $swarm --data-dir C:\SwarmState status
 & $swarm --data-dir C:\SwarmState --request-id create-demo-1 task create --project eliot-swarm-controller --file config\task.example.json
@@ -79,7 +80,7 @@ The complete pinned `atlas-redact` donor is now used to scrub retained native qu
 
 ## Zed eval-cli batch runtime
 
-`src/runtime/zed.rs` implements the C11 Zed boundary over the pinned native `eval-cli` contract (ZD-EXEC basis `7604aa3f`). The host now owns route admission, the batch supervisor and saved-run readback. `agent.open` is an executor preflight; it creates no native session. `task.dispatch` starts one operation-derived batch run over the frozen Task snapshot. Persistent control, resume, goal, steer and session family remain unavailable. Exit codes keep their native meanings (0 agent finished, 1 error, 2 timeout, 3 interrupted), and exit 0 is a finished run, not Task acceptance. `result.json` is cross-checked against the exit code and configured model, and retained `result.json`/`thread.md`/`thread.json` pages bind to the exact operation, run, binding and generation. Receipt loss invokes readback rather than execution replay. See [Zed batch wiring](docs/zed-batch.md) for configuration and output selectors. Installed-binary qualification remains pending.
+`crates/swarm-kernel-host/src/runtime/zed.rs` implements the C11 Zed boundary over the pinned native `eval-cli` contract (ZD-EXEC basis `7604aa3f`). The host now owns route admission, the batch supervisor and saved-run readback. `agent.open` is an executor preflight; it creates no native session. `task.dispatch` starts one operation-derived batch run over the frozen Task snapshot. Persistent control, resume, goal, steer and session family remain unavailable. Exit codes keep their native meanings (0 agent finished, 1 error, 2 timeout, 3 interrupted), and exit 0 is a finished run, not Task acceptance. `result.json` is cross-checked against the exit code and configured model, and retained `result.json`/`thread.md`/`thread.json` pages bind to the exact operation, run, binding and generation. Receipt loss invokes readback rather than execution replay. See [Zed batch wiring](docs/zed-batch.md) for configuration and output selectors. Installed-binary qualification remains pending.
 
 
 **Why JavaScript exists:** Muse and Claude use their vendors' official Node SDKs; Antigravity and Command glue their native executable contracts. The separate OpenCode service owner runs the pinned official native packages under Bun with durable event persistence. Controller authority and the OpenCode HTTP adapter remain Rust. Muse's first runnable bridge is commit `b2bd0211` (2026-09-30). See [the exact provenance](docs/javascript-provenance.md).
@@ -192,7 +193,7 @@ swarm artifact export OUTPUT_REF --out .\check-stdout.txt
 
 Output reaches the owner's mailbox; full stdout/stderr stay in range-readable artifacts. Cargo profiles require declared targets, valid build-finished evidence and no parsing/coverage gaps. Exit zero or changed sources cannot produce a pass. Semantic review and final acceptance remain separate.
 
-A transient process of the same `swarm` binary owns each check Job/process group. Resource claim and worker identity are committed before tool execution is allowed. Host disconnect/restart does not close admitted workers; the next host collects retained completion. Active identical requests coalesce within an Attempt/candidate/profile. An uncertain outcome retains its resource, not the whole controller.
+A transient worker process owns each check Job/process group. Resource claim and worker identity are committed before tool execution is allowed. Host disconnect/restart does not close admitted workers; the next host collects retained completion. Active identical requests coalesce within an Attempt/candidate/profile. An uncertain outcome retains its resource, not the whole controller.
 
 ### Active cancellation and recovery
 

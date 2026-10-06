@@ -650,13 +650,32 @@ $gatewayManifest = if ($packageName -ceq 'swarm-gateway') { $provenance } elseif
 if ($null -ne $hostManifest -and $null -ne $gatewayManifest) {
     Assert-GatewayLauncherCompatible $hostManifest $gatewayManifest
 }
+$requiredQueue = [Collections.Generic.Queue[string]]::new()
+$visitedRequirements = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+[void]$visitedRequirements.Add($packageName)
 foreach ($requiredName in $expectedSiblings) {
-    if (-not $packageMap.Contains($requiredName) -or $null -eq $existing[$requiredName]) {
+    $requiredQueue.Enqueue([string]$requiredName)
+}
+while ($requiredQueue.Count -gt 0) {
+    $requiredName = $requiredQueue.Dequeue()
+    if (-not $packageMap.Contains($requiredName)) {
+        throw "Package '$packageName' has an unsupported sibling package requirement '$requiredName'."
+    }
+    if ($requiredName -ceq $packageName) {
+        throw "Package '$packageName' has a circular sibling requirement."
+    }
+    if (-not $visitedRequirements.Add($requiredName)) { continue }
+
+    $requiredPackage = $existing[$requiredName]
+    if ($null -eq $requiredPackage) {
         throw "Required sibling package '$requiredName' is not installed with verified provenance. Install that exact package to '$installRoot' first."
     }
     $requiredBinary = [string]$packageMap[$requiredName].binary + '.exe'
     if (-not (Test-Path -LiteralPath (Join-Path $installRoot $requiredBinary) -PathType Leaf)) {
         throw "Required sibling '$requiredBinary' is missing from '$installRoot'."
+    }
+    foreach ($transitiveName in @($packageMap[$requiredName].required_siblings)) {
+        $requiredQueue.Enqueue([string]$transitiveName)
     }
 }
 if ($null -ne $existing[$packageName]) {

@@ -1,37 +1,6 @@
-//! Local task authority and IPC. Native execution is a separate integration boundary.
-pub mod acceptance;
-pub mod artifacts;
-pub mod automation;
-mod bus_supervisor_config;
-pub mod checks;
-pub mod config;
-pub mod coordination;
-pub mod doctor;
-pub mod error;
-pub mod export;
-pub mod forge;
-pub mod github;
-pub mod goals;
-pub mod hooks;
-pub mod host;
-mod host_bus_supervisor;
-mod host_module_supervisor;
-pub mod ipc;
-pub mod launcher;
-pub mod mcp;
-#[cfg(test)]
-mod mcp_integration_tests;
-pub mod model;
-mod module_supervisor_config;
-mod native_mcp;
-mod participant_credentials;
-pub mod platform;
-pub mod policy;
-mod redaction;
-pub mod review;
-pub mod runtime;
-pub mod scheduler;
-pub mod scripts;
-pub mod store;
-pub mod submission;
-pub mod workspace;
+//! Compatibility facade for the relocated kernel host package.
+//!
+//! The durable Store, authenticated IPC, and host lifecycle live in
+//! `swarm-kernel-host`; this facade retains the historical root crate path for
+//! local tests and downstream tooling without retaining a second Store owner.
+pub use swarm_kernel_host::*;

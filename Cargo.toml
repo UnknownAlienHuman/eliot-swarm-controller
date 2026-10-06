@@ -15,45 +15,13 @@ name = "swarm-host"
 path = "src/main.rs"
 
 [dependencies]
-atlas-redact = { path = "modules/atlas-redact" }
-base64 = "=0.22.1"
-clap = { version = "4.5", features = ["derive"] }
-chrono = "0.4"
-chrono-tz = "0.10"
-croner = { version = "4", features = ["chrono"] }
-eventsource-stream = "=0.2.3"
-futures-util = { version = "0.3", features = ["sink"] }
-reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
-rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
-swarm-client = { path = "crates/swarm-client" }
-swarm-bus = { path = "crates/swarm-bus" }
-swarm-automation = { path = "crates/swarm-automation" }
-swarm-contracts = { path = "crates/swarm-contracts" }
-swarm-kernel = { path = "crates/swarm-kernel" }
-swarm-mcp = { path = "crates/swarm-mcp" }
-swarm-process = { path = "crates/swarm-process" }
-swarm-script-worker = { path = "crates/swarm-script-worker" }
-swarm-scripts = { path = "crates/swarm-scripts" }
-swarm-store = { path = "crates/swarm-store" }
-swarm-supervisor = { path = "crates/swarm-supervisor" }
-swarm-telemetry = { path = "crates/swarm-telemetry" }
-serde = { version = "1", features = ["derive"] }
+swarm-kernel-host = { path = "crates/swarm-kernel-host" }
+
+[dev-dependencies]
 serde_json = "1"
-sha2 = "0.10"
-swarm-checks = { path = "crates/swarm-checks" }
-swarm-observer = { path = "crates/swarm-observer" }
-thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "signal", "time"] }
-tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_Pipes", "Win32_Storage_FileSystem"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "=0.2.189"
 
 [profile.release]
 lto = "thin"
@@ -70,6 +38,7 @@ lto = "off"
 # Public default entrypoint is the lightweight IPC CLI; host/admin code remains the explicit root package.
 [workspace]
 members = [
+    "crates/swarm-kernel-host",
     "crates/swarm-adapter-codex",
     "crates/swarm-adapter-command",
     "crates/swarm-adapter-claude",

@@ -19,6 +19,7 @@ verify BASE HEAD TARGET=shared_target:
     pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Verify -BaseSha "{{BASE}}" -HeadSha "{{HEAD}}" -TargetDir "{{TARGET}}"
 
 fmt:
+    cargo fmt -p swarm-kernel-host -- --check
     cargo fmt -p eliot-swarm-controller -- --check
     cargo fmt -p swarm-cli -- --check
 
@@ -26,11 +27,13 @@ fmt-package package:
     cargo fmt --package "{{package}}" -- --check
 
 check TARGET=shared_target: (_shared-target TARGET)
+    cargo check --locked --package swarm-kernel-host --lib --bins --target-dir "{{TARGET}}"
     cargo check --locked --package eliot-swarm-controller --lib --bins --target-dir "{{TARGET}}"
     cargo check --locked --package swarm-cli --lib --bins --target-dir "{{TARGET}}"
     cargo check --locked --package swarm-supervisor --lib --bins --target-dir "{{TARGET}}"
 
 clippy TARGET=shared_target: (_shared-target TARGET)
+    cargo clippy --locked --package swarm-kernel-host --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
     cargo clippy --locked --package eliot-swarm-controller --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
     cargo clippy --locked --package swarm-cli --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
     cargo clippy --locked --package swarm-supervisor --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
@@ -68,10 +71,7 @@ opencode-fixtures:
     node modules/opencode/selftest.mjs
 
 build TARGET=shared_target: (_shared-target TARGET)
-    cargo build --locked --release --package swarm-cli --bin swarm --target-dir "{{TARGET}}"
-    cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir "{{TARGET}}"
-    cargo build --locked --release --package swarm-kernel-host --bin swarm-kernel-host --target-dir "{{TARGET}}"
-    cargo build --locked --release --package swarm-supervisor --bin swarm-supervisor --target-dir "{{TARGET}}"
+    cargo build --locked --release --package swarm-cli --package eliot-swarm-controller --package swarm-kernel-host --package swarm-supervisor --package swarm-mcp --bins --target-dir "{{TARGET}}"
 
 # Create one provenance package at a time. The package builders require a
 # caller-owned external shared target and a fresh, separate output directory.

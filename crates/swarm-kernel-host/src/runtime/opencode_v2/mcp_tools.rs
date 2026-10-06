@@ -747,10 +747,7 @@ fn valid_uuid_v4(value: &str) -> bool {
 }
 
 pub(crate) fn module_source() -> Result<(PathBuf, String)> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("modules")
-        .join("opencode")
-        .join("native-mcp-proof.mjs");
+    let path = super::resource_paths::required_file("native-mcp-proof.mjs")?;
     let metadata = fs::symlink_metadata(&path).map_err(|_| {
         source_error_code(
             "NATIVE_MCP_PROOF_MODULE_UNAVAILABLE",
