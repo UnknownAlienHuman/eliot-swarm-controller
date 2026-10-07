@@ -162,7 +162,7 @@ const AT_MS = 1780000000123;
   await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token}));
   const nativeScope=`muse:${process.platform}:${process.platform==='win32'?canonicalHome.toLowerCase():canonicalHome}`;
   const saved=structuredClone(checkpointFixture.state);
-  saved.module_artifact_id='muse-sdk-1.3.0-bridge.7';
+  saved.module_artifact_id='muse-sdk-1.3.0-bridge.8';
   saved.native_scope=nativeScope;
   saved.route_defaults.workspaceRoot=home;
   saved.route_defaults.modelId=childFixture.root_session.modelId;
@@ -336,7 +336,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.7',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.8',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',nativeFixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};

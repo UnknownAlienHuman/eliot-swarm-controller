@@ -9,7 +9,7 @@ the new version is activated for new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Module artifact | `muse-sdk-1.3.0-bridge.7` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
+| Module artifact | `muse-sdk-1.3.0-bridge.8` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
 | SDK package | `@muse-code/sdk` **1.3.0**, exact, via `package.json` + `package-lock.json`; installed module-locally with `npm ci`, never globally |
 | SDK canonical source | `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT); the MSP schema is pinned at that commit |
 | Bridge code | ELIOT-owned `*.mjs` in this directory (`bridge`, `checkpoint`, `control`, `owned`, `results`, `settings`) |
@@ -33,7 +33,7 @@ handled at the bridge boundary or by a new pin, not by patching
 
 - SDK version change: artifact becomes `muse-sdk-<new-sdk>-bridge.1`.
 - Bridge-only change on the same SDK: increment the suffix,
-  `bridge.6` → `bridge.7`.
+  `bridge.7` → `bridge.8`.
 
 Any change to shipped bridge code or to the SDK pin gets a new artifact
 id. Reusing an existing id for different code is forbidden: bindings
@@ -41,7 +41,9 @@ record the id, and the host trusts it as the version identity.
 
 ## Verification (before activation)
 
-Exactly the checks CI runs for this module:
+Required pre-activation checks are below. The scoped PR workflow parses changed
+JavaScript files; that result alone does not include SDK import or the fixture
+selftest. Record each executed check separately for the exact candidate:
 
 ```bash
 for file in modules/muse/*.mjs; do node --check "$file"; done
@@ -70,7 +72,19 @@ or Windows qualification; live qualification of the new pin against the
 installed runtime is a separate step and never follows from these
 checks.
 
+Bridge.8 changes pending-request freshness and inventory replacement only. The
+SDK pin and native command/recovery protocol are unchanged. The current bridge
+rejects a configuration naming an earlier artifact; do not relabel an existing
+checkpoint or overwrite a running bridge to bypass that check. The fixture
+selftest uses bridge.8 for its generated current-bridge configuration while the
+saved historical checkpoint fixture remains unchanged. No earlier fixture pass
+is transferred to bridge.8.
+
 ## Activation
+
+**Current PR blocker:** `module.example.json` still names bridge.7; its update was
+not published because the write tool rejected that action. Do not activate this
+PR until the example and the selected artifact are consistent.
 
 Activation is per binding, through the recorded artifact id:
 
@@ -86,7 +100,7 @@ Activation is per binding, through the recorded artifact id:
    in `module.hello` and the host rejects a mismatch with
    `ARTIFACT_MISMATCH`. New bindings therefore run the new bridge;
    existing bindings keep the artifact id they recorded (at the
-   bridge.7 update, `muse-sdk-1.3.0-bridge.6`) and are still served
+   bridge.8 update, `muse-sdk-1.3.0-bridge.7`) and are still served
    by the old bridge. The two bridges never cross-serve a binding.
 4. Retire the old bridge only after its bindings are released and its
    managed process group has departed on its own. The module-run owner
