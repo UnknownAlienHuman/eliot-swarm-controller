@@ -161,7 +161,7 @@ pub(super) fn read(
             let mut records = Vec::with_capacity(scanned.len());
             let mut gaps = Vec::new();
             for index in scanned {
-                let Some(record) = meta(db, &record_key(&index.scope_intent_id))? else {
+                let Some(record) = meta(db, &record_key(&index.scope_intent_id)?)? else {
                     gaps.push("scope_index_record_missing".to_owned());
                     continue;
                 };
@@ -299,7 +299,7 @@ pub(crate) fn current_scope_revisions(
     let mut items = Vec::new();
     let mut gaps = Vec::new();
     for row in rows.iter().take(limits::MAX_READ_PAGE_SIZE as usize) {
-        let Some(record) = meta(db, &record_key(&row.scope_intent_id))? else {
+        let Some(record) = meta(db, &record_key(&row.scope_intent_id)?)? else {
             gaps.push("active_scope_record_missing".to_owned());
             continue;
         };
@@ -420,7 +420,7 @@ fn propose(
     let digest = record_digest(&record)?;
     record["digest"] = json!(digest);
     persist_revision(tx, &record, operation_id, now)?;
-    set_meta(tx, &record_key(&scope_intent_id), &record)?;
+    set_meta(tx, &record_key(&scope_intent_id)?, &record)?;
     set_meta(
         tx,
         &task_page_key(&task_id, sequence)?,
@@ -573,7 +573,7 @@ fn accept(
         target["digest"] = json!(target_digest);
         delete_active_index(tx, &target)?;
         persist_revision(tx, &target, operation_id, now)?;
-        set_meta(tx, &record_key(target_id), &target)?;
+        set_meta(tx, &record_key(target_id)?, &target)?;
         changed_targets.push(target_id.clone());
     }
     record["state"] = json!("active");
@@ -601,7 +601,7 @@ fn accept(
     let accepted_digest = record_digest(&record)?;
     record["digest"] = json!(accepted_digest);
     persist_revision(tx, &record, operation_id, now)?;
-    set_meta(tx, &record_key(&request.scope_intent_id), &record)?;
+    set_meta(tx, &record_key(&request.scope_intent_id)?, &record)?;
     add_active_index(tx, &record)?;
     Ok(json!({
         "operation_id":operation_id,
@@ -671,7 +671,7 @@ fn release(
     record["digest"] = json!(released_digest);
     delete_active_index(tx, &record)?;
     persist_revision(tx, &record, operation_id, now)?;
-    set_meta(tx, &record_key(&request.scope_intent_id), &record)?;
+    set_meta(tx, &record_key(&request.scope_intent_id)?, &record)?;
     let readback = load_record(tx, &request.scope_intent_id)?;
     let verified = readback["state"] == "released"
         && readback["state_revision"] == record["state_revision"]

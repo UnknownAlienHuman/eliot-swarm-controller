@@ -1312,6 +1312,7 @@ fn module_event_operation_link_owner(
         | Link::CronCheckRun(link)
         | Link::GoalProgression(link)
         | Link::ScriptRun(link)
+        | Link::GithubProjection(link)
         | Link::ScriptEffect(link) => (
             link.operation_id,
             link.technical_requester_id,
@@ -3147,7 +3148,7 @@ fn load_concilium_authority_link(
     if link_bytes.is_none_or(|bytes| !(0..=MAX_CONCILIUM_LINK_BYTES).contains(&bytes)) {
         return Err(unauthorized());
     }
-    let value = super::meta(db, &key)?.ok_or_else(unauthorized)?;
+    let value = super::super::meta(db, &key)?.ok_or_else(unauthorized)?;
     parse_concilium_authority_link(&value)
 }
 

@@ -9,6 +9,9 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 
 use crate::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterError, MODULE_ID};
 
+pub(crate) const GOAL_CONTINUATION_ADMISSION_SCHEMA_ID: &str =
+    "swarm.goal_continuation_admission";
+
 const CAPABILITIES: [&str; 4] = [
     "agent.open",
     "agent.reconcile",
