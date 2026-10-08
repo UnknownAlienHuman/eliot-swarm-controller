@@ -1,6 +1,6 @@
 # R34. Automation reconcile: poison-fact isolation and one truthful disposition model
 
-**PR task; production code has not been changed.**  
+**PR task; production code has not been changed.**
 Evidence baseline: `40591a295af94b1541ec2ba30afe8e3247701a71`, reviewed 8 October 2026.
 
 This task owns the bounded Store automation reconcilers:
