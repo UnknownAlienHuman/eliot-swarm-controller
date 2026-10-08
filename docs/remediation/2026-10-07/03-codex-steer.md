@@ -1,70 +1,94 @@
-# R03. Codex: exact steer через нативный atomic target guard
+# R03. Codex: убрать лишний history-preflight, сохранить доказательство доставки
 
-**PR #29 · уточнено 7 октября 2026 · код R03 ещё не изменён.** ELIOT main `40591a295af94b1541ec2ba30afe8e3247701a71`, исходный head задания `f2685994514cb31f45a6c15374374facba20fe5b`. Основа AUD-012. Работать в этой ветке, не разделять sender и его readback на разные PR.
+**PR #29 · перепроверено 08.10.2026 · production-код R03 ещё не изменён.** AUD-012, ELIOT `40591a295af94b1541ec2ba30afe8e3247701a71`; проверенный исходник ветки `cbbb49b8207ee935d700478bf001ab9a69067aba`. Реализация — в этой ветке, producer и readback вместе.
 
 ## Результат
 
-Коррекция текущего хода доставляется при любой длине завершённой истории. Строго сохраняются binding/native root/configuration guards, caller-owned input identity и native expectedTurnId. Несовпавшая цель не превращается в следующий ход. Transport failure после отправки не превращается в разрешение повторить prompt.
+Длина завершённой истории не запрещает steer в правильный активный turn. Нативный ACK не выдаётся за сохранённый input, завершённую работу или право повторить запрос. Существующая подписочная авторизация, выбор модели и настройки владельца сохраняются. Внешние версии не закреплять: SHA ниже — координаты исследования, не launch allowlist.
 
-## Документация до кода
+## Читать адресно
 
-- [Module contract](../../agent_swarm.module-contract-v2.md), §1 классы доставки и §4 replay policy.
-- [Codex UPDATE](../../../modules/codex/UPDATE.md): Rust descriptor v4 и Python bridge.3 — разные артефакты с разным parity.
-- [Owner decisions](../../owner-decisions.md), §1.2–1.4/2.2; [Modularity](../../agent-operations/modularity.md), §3.
-- [Официальный app-server](https://learn.chatgpt.com/docs/app-server), разделы turn/steer, initialization и paginated history, прочитан 07.10.2026.
-- [TurnSteerParams на `82e70121f86bc1f6fea7f2bb7bbc169d259b3c6b`](https://github.com/openai/codex/blob/82e70121f86bc1f6fea7f2bb7bbc169d259b3c6b/codex-rs/app-server-protocol/schema/typescript/v2/TurnSteerParams.ts): threadId, input, required expectedTurnId, optional clientUserMessageId. Это current source evidence, не установленная версия .159. Перед реализацией выбрать реально поддерживаемую schema из соответствующего artifact, не обновлять server автоматически.
+- [Module contract](../../agent_swarm.module-contract-v2.md), §1 и §4: классы доставки, ACK и readback неизвестного эффекта.
+- [Owner decisions](../../owner-decisions.md), §1.2–1.4; [Modularity](../../agent-operations/modularity.md), §3; `modules/codex/UPDATE.md` для различия исполнителей, не предписаний удерживать старый native release.
+- [Официальный app-server](https://learn.chatgpt.com/docs/app-server): Steering, initialize/experimental API, paginated history.
+- [TurnSteerParams](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/app-server-protocol/schema/typescript/v2/TurnSteerParams.ts): required `expectedTurnId`, `threadId`, `input`, optional `clientUserMessageId`.
+- [Core turn-input boundary](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/core/src/session/turn_input.rs#L1-L13): ответ после решения start/steer/reject, **до** ожидания hooks, rollout persistence и sampling.
+- [Upstream #40805](https://github.com/openai/codex/issues/40805): пример ACK при ещё volatile pending input. Это чужое воспроизведение; текущий исходник выше подтверждает границу, но не частоту сбоя установленного runtime.
 
-## Реальная цепочка и точка упрощения
+## Существующие функции и точное изменение
 
-`crates/swarm-adapter-codex/src/lib.rs`:
+Все symbols — `crates/swarm-adapter-codex/src/lib.rs`.
+
+| Функция | Действие |
+|---|---|
+| `send_operation` | Удалить только проверку полноты `active_turns` из steer admission. Root/scope, route, workspace и caller target сохранить. |
+| `NativeClient::active_turns` | Сейчас первая страница из 20 turns даёт `page_limited`; это не доказательство неверного target. После удаления caller проверить другие применения; мёртвый helper удалить, не подавлять lint. |
+| `native_send_payload` | Только нативные поля steer; не переносить model/cwd/sandbox/outputSchema overrides из turn/start. |
+| `OperationRecord::intent`, `Journal::save` | Сохранить exact request correlation, prompt digest/bytes и expected target до native I/O. |
+| `NativeClient::{attach,request,receive_response}`, `NativeError` | Согласовать реально используемый handshake/readback; сохранять нужную bounded error evidence, не трактовать любой RPC error как доказанный no-effect. |
+| `reconcile_send`, `NativeClient::read_history`, `read_turn` | Существующий безопасный путь оставить: unique exact input, затем отдельное turn evidence. Не заменять его одним ACK. |
+| `accepted_after_exact_input`, `unknown_send` | Accepted возможен после exact input даже при неполной информации о turn. Нет exact input — unknown/readback-only, не автоматический retry. |
+
+## Порядок реализации
+
+### 1. Упростить admission, а не гарантии
+
+В `send_operation` сохранить непустой `expected_turn_id`, exact binding/root и проверки текущей конфигурации. Удалить steer-ветку `limited || active.len()!=1 || target mismatch` на основе `active_turns`; нативный `expectedTurnId` проверяет цель при самой отправке. Для next-turn сохранить его собственную idle-предпосылку.
+
+Не сканировать всю историю перед каждым steer и не выбирать последний ID вместо caller target. `expectedTurnId` не делает остальные настройки атомарными; совпадение target не доказывает модель или workspace.
+
+### 2. Разделить три ступени подтверждения
 
 ```text
-send_operation
-  → validate_route / проверка сохранённого root и scope
-  → NativeClient::read_thread
-  → NativeClient::active_turns [проблемная дополнительная предпосылка]
-  → native_send_payload / OperationRecord::intent / Journal::save
-  → NativeClient::request("turn/steer", ...)
-  → outcome либо reconcile_send по сохранённой identity
+RPC success + expected turnId
+  → нативное решение принять steer в этот turn
+exact persisted user item + correlation + content
+  → доказанный input admission для ELIOT
+native terminal соответствующего turn
+  → исход исполнения; Task acceptance остаётся отдельным
 ```
 
-`active_turns` читает первые 20 thread/turns/list, возвращает active и page_limited. `send_operation` отвергает steer при любом limited. Наличие старых завершённых ходов поэтому ошибочно объявляет текущую цель неактивной.
+`clientUserMessageId` — корреляция. Рассмотренная форма запроса сама не обещает идемпотентный повтор одинакового ID. Не импортировать сюда гарантии Muse `commandId`.
 
-Native `expectedTurnId` уже проверяется при самом steer. **Не лечить это сканированием всей истории.** Для поддержанного exact-target контракта убрать зависимость write admission от полного active_turns history scan. Сохранить current root/model/provider/workspace preflight; внешний native target guard отвечает за гонку текущего turn. Он не гарантирует атомарную неизменность всех остальных settings.
+ACK без user item сохраняется как известный ACK и неподтверждённая долговечная доставка. Не генерировать user item/turn start в локальной проекции. Новый `turn/started` от steer не требуется. Локальный `returned_turn_status="inProgress"`, синтезируемый из ACK, не должен стать независимым native execution evidence.
 
-Если конкретный поддерживаемый native протокол требует дополнительного read, использовать только реально существующую адресную/metadata форму, а не выдуманный `currentTurn` API. History reader можно оставить для другого реального consumer; после удаления единственного caller удалить мёртвый helper, не добавлять dead_code.
+Сохранить нынешние проверки `reconcile_send`: одна совпавшая correlation, digest и длина текста, expected turn, consistency с returned turn. `NATIVE_ITEM_NOT_OBSERVED` означает отсутствие доказательства на этом чтении, не доказанную потерю/отклонение ввода. Существующий readback после ACK — правильная часть кода.
 
-## Что реализовать по шагам
+### 3. Не потерять отказ и не придумать его
 
-1. Проверить непустой expected_turn_id от authenticated RuntimeCommand и exact binding/root; не выбирать «последний turn» вместо caller target. Убрать page_limited как основание EXPECTED_TURN_NOT_ACTIVE в steer-пути.
-2. Сформировать payload по выбранному TurnSteerParams. Не передавать turn/start overrides (`model`, `cwd`, `sandboxPolicy`, `outputSchema`) через steer. Если clientUserMessageId поддержан, использовать прежнюю operation-derived identity, записанную до отправки; не менять её при reconnect.
-3. Сохранить `OperationRecord::intent`/`Journal::save` до native I/O, dispatch/continuation validators по их реальным условиям. Не переписывать общий receipt validator R05/#31.
-4. Сравнить полученный turnId с expected target. Native отказ из-за другой/завершённой цели — точный отказ; потеря ответа либо противоречивый success после возможного эффекта — unknown с сохранённым context. Не фабриковать no-effect из локального mismatch после отправки.
-5. ACK steer означает принятую коррекцию в прежний turn. **Новый turn/started для неё не ожидается.** Lifecycle/readback привязывается к текущему turn и input identity; отсутствие нового start не повод посылать ещё раз. Completion/Task acceptance не выводятся из ACK.
-6. При replay unresolved Operation использовать существующий reconcile_send с exact clientUserMessageId/target; не вызывать turn/start, новый steer или thread/resume как fallback. Явный новый запрос — другое действие, не скрытое восстановление старого.
+Сейчас `NativeError::Rejected` оставляет лишь RPC code. `send_operation` записывает его и идёт в readback, который при отсутствии item возвращает Unknown. Поэтому обещание «все native stale-target ошибки уже точно отклоняются» неверно.
 
-## Capability: важный независимый остаток
+В той же поставке определить, какие **документированные метод-специфические** error data доказывают отказ до input admission. Для них сохранить точный отказ. Если доступен только общий code, transport failure или неоднозначная форма — оставить Unknown, не классифицировать по человеческому message/регулярке. Изменение error type провести через decoder, record и readback; новый enum без caller не поставлять.
 
-`NativeClient::attach` сейчас отправляет experimentalApi:false, хотя история читается через методы, которые live documentation помечает experimental. Сверить schema выбранного server: не объявлять доказанным дефектом всякой .159 установки и не просто включить true для всех методов. Сам native turn/steer guard не требует полного experimental history scan.
+Противоречивый success с чужим `turnId` после возможного эффекта — unknown/integrity failure. Не отправлять fallback `turn/start`, `thread/resume` или второй steer. Повтор ELIOT request использует сохранённый outcome/readback.
 
-Непрерывный notification pump, account quota API, answers на approvals, children и native goals — отдельный R15/#41 и будущие control parity блоки. Нынешний receive_response пропускает no-id notifications, но исправление всех возможностей не должно блокировать компактную починку steer. R03 не меняет sandbox/approval политику или модель под видом устранения pagination bug.
+### 4. Довести используемый readback до совместимого handshake
 
-## Итоговые сценарии — пока не выполнены
+Текущий `attach` отправляет `experimentalApi:false`; используемые `thread/items/list` и `thread/turns/list` текущая app-server документация относит к experimental. Нельзя убрать первый history check, а обязательный `read_history` оставить на заведомо несовместимом handshake и объявить результат готовым.
+
+Проверить контракт текущего выбранного сервера. Если нужный официальный read требует experimental opt-in, объявить/согласовать его для этого профиля и этих реально используемых readers; это не sandbox bypass и не разрешение произвольных mutations. Не встраивать release allowlist и не переключать модель. При отсутствии поддержанного readback честно обозначить предел гарантии; несохранённый input не повторять.
+
+Границу readback исправлять в R03, не откладывать её на quota PR. Постоянный notification pump и аккаунтная проекция — R15/#41; нужны отдельно, но не требуют переписать весь transport здесь. После его интеграции readers пользуются общим owner.
+
+## Критерии итоговой квалификации — пока не исполнены
 
 | Сценарий | Результат |
 |---|---|
-| 21+ завершённых ходов, current target правильный | Один native steer, нет full-history scan на admission. |
-| Target сменился после preflight | Native guard отвергает; нет нового turn/start. |
-| Нет active turn, caller передал старый ID | Точный отказ; не автоматическое пробуждение новой работы. |
-| ACK с тем же turnId, нет нового turn/started | Принятая коррекция не записывается как потерянная из-за отсутствия нового start. |
-| Timeout после отправки, затем повтор ELIOT request | Readback прежней identity, ни одного дополнительного input. |
-| Success с противоречивым turnId | Unknown/integrity error с evidence; не Rejected-as-no-effect и не replay. |
-| Required native method/schema unavailable | Честная capability gap; no silent downgrade к next-turn или иной модели. |
+| 21+ старых turns, правильный active target | Один steer без полного history-preflight. |
+| Native ACK, sampling ещё идёт, user item отсутствует | ACK сохранён; durable admission не выдуман; повторного input нет. |
+| Позднее появился один exact user item | Связывается с исходной Operation; нет нового turn/start и второго steer. |
+| Exact user item найден, turn page недоступна | Accepted input, неизвестное исполнение — как у существующего helper. |
+| Явный документированный pre-admission отказ / общий RPC error | Точный отказ в первом случае; сохранённая неопределённость во втором. |
+| Потеря ACK; повтор caller request; conflicting payload | Readback старого ID; конфликт не меняет старую запись и не посылает input. |
+| Readback требует opt-in / метод реально отсутствует | Handshake согласован либо конкретная capability gap; не вечный ложный `item missing`. |
+| Корректный target, но чужой input digest/returned turn | Mismatch, не подтверждённая доставка. |
 
-Один manager/worktree, writers без Cargo. После целого кода scoped formatting и:
+## Проверка и сдача
+
+Один manager/worktree; writers без Cargo. Сначала законченный код, затем scoped formatting и:
 
 ```sh
 cargo clippy --locked -p swarm-adapter-codex --lib --bins -- -D warnings
 ```
 
-Tests/native — итоговая фаза; таблица не утверждает выполненные проверки. Сдать exact SHA, producer/payload/ACK/reconcile path, удалённый лишний scan, реальный gate и ограничения выбранной native schema. Compiler baseline #26 не копировать, Python executor не удалять. Эта редакция меняет только задание, не SDK/сервер/код продукта.
+Tests/native — итоговая фаза. Сдать candidate SHA, removed preflight, payload/ACK/error/readback callers, фактический gate и remaining gaps. #26 не копировать; Python executor, goals, approvals, quota policy и SDK/native upgrades не включать. Эта редакция меняет задание, не код и не работающие сессии.
