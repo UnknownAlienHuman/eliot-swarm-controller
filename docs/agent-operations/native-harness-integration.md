@@ -1,277 +1,130 @@
-# Нативная интеграция harness: официальные контракты, capability negotiation и ELIOT authority
+# Нативные harness: подключение по контракту, без второго model loop
 
-**Перепроверено 8 октября 2026.** Нормативная основа этого документа — документация ELIOT и официальные контракты производителей. Скрипты прошлой кампании не определяют API, гарантии или архитектуру; они могут использоваться только как регрессионные сценарии после того, как соответствующее поведение подтверждено документацией harness.
+**Перепроверено 08.10.2026.** Это план интеграции и справочник доказательств, не матрица уже реализованных функций. Нормы ELIOT задают authority/ownership; официальный протокол производителя задаёт смысл native API. Скрипты прежней кампании не являются спецификацией. Внешние версии не закреплять, обновления не отключать, подписочное подключение отдельным inference API не заменять. SHA источника — координата проверки, не условие запуска.
 
-Исторические SHA и номера релизов ниже — координаты прочитанного source. Они не являются allowlist запуска, требованием downgrade или запретом штатных обновлений. Для нового подключения ELIOT обязан наблюдать фактический runtime и согласовать требуемые возможности, а не сравнивать release с одной строкой.
+## 1. Источники и совместимость
 
-## 1. Иерархия источников
+Читать [Module contract](../agent_swarm.module-contract-v2.md), [Modularity](modularity.md), [Owner decisions](../owner-decisions.md), затем официальные docs/schema нужного метода и реальные определения используемого SDK. Реестр доноров — inventory. Проверять актуальный selected runtime через документированный handshake/readback; не придумывать универсальный endpoint discovery.
 
-При конфликте использовать следующий порядок:
+Не склеивать разные публикации в одну якобы установленную схему. В этом проходе рассмотрены Codex `ea27864f99f0b086cec2f9f0251b7190fb9844f1` и Muse `912061bb125b4bff60c9f3089a21cd23b53c6b4f`; live Muse `/next` показывает также более широкую поверхность. Ссылка из `/next` не доказывает, что её новые методы есть в указанном stable source или на машине владельца. Отдельно записывать source revision, документированную стабильность и наблюдённую поддержку.
 
-1. [Контракт модулей ELIOT](../agent_swarm.module-contract-v2.md), [модульность](modularity.md), [решения владельца](../owner-decisions.md): authority, Operation, ownership, replay/readback и границы Store.
-2. Официальная документация, опубликованная wire-schema и публичные типы конкретного harness.
-3. Фактический `initialize`/capability response, server information и адресный readback текущего подключения.
-4. Полный публичный пакет донора, когда он действительно является выбранной границей интеграции.
-5. Исторические журналы и скрипты — только regression corpus. Они не разрешают выдумывать метод или ослаблять официальный контракт.
+Совместимое обновление не отклоняется из-за номера release. Неизвестные optional поля не запрещают независимые функции. Отсутствие обязательной гарантии ограничивает конкретную операцию. Новую сессию подключать к текущей выбранной установке; уже работающую сессию не перезапускать и её runtime не подменять.
 
-Реестр доноров остаётся inventory, а не install lock. Его собственная политика различает reviewed source, установленную реализацию и live qualification; runtime по умолчанию — установленный native harness с уже авторизованным аккаунтом.
+## 2. Общая граница ELIOT
 
-## 2. Что унифицирует ELIOT
+ELIOT сохраняет свою Operation до внешнего эффекта; проверяет caller, binding/generation, native target, source/boot и current authority; различает ACK, сохранённый input, terminal, result и Task acceptance. Unknown разрешается readback, не повторным prompt. Native sessions, tools, permissions, skills, children и model loop принадлежат harness.
 
-ELIOT не переписывает model loop, permissions, skills, tools, сессии и подагентов производителя. Он унифицирует только собственные обязательства:
+Для функции описывать native method, exact target, обязательные поля/guards, эффект, ACK boundary, readback, replay policy, freshness. Это содержание существующего descriptor/контракта, не новый независимый DSL или реестр. Vendor-only функции остаются `native.*`; общее свойство ядра вводится только для реальных потребителей.
 
-- caller-owned Operation ID и сохранённое намерение до внешнего эффекта;
-- binding/generation, native root/turn/request identity и один control owner;
-- проверку текущих полномочий непосредственно перед эффектом;
-- точную семантику ACK, terminal evidence и result bytes;
-- `outcome_unknown → readback`, а не повтор input;
-- bounded observations с freshness/coverage/gaps;
-- отдельные Task acceptance и review — native success их не заменяет.
-
-Vendor-функция может оставаться `native.*`, если общей семантики для двух реальных harness нет. Новый универсальный enum или workflow engine заранее не создаётся.
-
-## 3. Capability — это гарантия, а не имя кнопки
-
-Для каждой подключённой функции descriptor/handshake должен зафиксировать:
-
-| Поле | Смысл |
+| Действие | Не смешивать |
 |---|---|
-| `native_method` | Официальный метод или endpoint, который реально вызывается. |
-| `target` | Session/thread/turn/tool request/subagent/task и обязательные native IDs. |
-| `effect_boundary` | Read, admission, priority interrupt, permission decision, configuration или billing/auth mutation. |
-| `guard` | Expected turn, command ID, request fingerprint, connection generation, capability grant и current authority. |
-| `ack_means` | Что именно подтверждает ответ: принято, применено, остановлено, сохранено или только представлено. |
-| `terminal/readback` | Каким официальным событием/чтением завершается неизвестный исход. |
-| `replay_policy` | Idempotent same-ID, readback-only либо unavailable. |
-| `freshness` | Native observed time, local collection time и условие инвалидирования. |
+| Next turn / queue / loop-step steer / exact-target steer | Очередь не текущий turn; atomic target guard не гарантия durability. |
+| Background / interrupt / cancel / retract | Background не отменяет; ACK stop не доказывает departure. |
+| Goal / обычный input | Продолжение цели может жить после disconnect клиента. |
+| Reply существующему вопросу | Не новый prompt и не разрешение на persistent policy change. |
+| Child control / family observation | Наблюдение не получает writer ownership ребёнка. |
+| Usage / quota / credits / rate-limit | Расход, остаток, throttle и право оплатить — разные оси. |
 
-Нужные классы управления различаются:
+## 3. Codex: app-server и три ступени steer
 
-- `next_turn` — новый ход после текущего;
-- `queue` — сохранённый input, ожидающий допуска;
-- `loop_step_steer` — вмешательство на следующей безопасной границе цикла без exact-turn CAS;
-- `native_expected_target` — точная коррекция конкретного активного turn;
-- `background` — убрать foreground-блокировку, не отменяя работу;
-- `interrupt` — priority stop request, terminal подтверждается отдельно;
-- `cancel/retract` — обычная отмена/удаление admitted input по native правилам;
-- `goal` — долговечное native continuation state;
-- `permission/question reply` — ответ существующему native request, не новый prompt;
-- `child control` — действие над observed child identity, не превращение child в новый root;
-- `usage/quota` — наблюдение аккаунта/окна, не разрешение покупать, менять аккаунт или модель.
+Один adapter-owned connection reader разделяет `response{id}`, `notification{method}` и `request{id,method}`. Ответы, terminal и вопросы не блокируются очередью bulk deltas. Новый connection generation не принимает старые ответы; reconnect не повторяет mutation. Account updates идут тем же reader, без quota-only клиента на каждый вызов.
 
-## 4. Codex: app-server как единственный control plane binding
-
-### Официальная поверхность
-
-Использовать app-server JSON-RPC, а не `exec` и не разбор rollout-файлов. Текущий публичный protocol source содержит `turn/steer`, `turn/interrupt`, `thread/goal/clear`, `account/rateLimits/read` и `account/rateLimits/updated`. ChatGPT-plan авторизация app-server поддерживается официальным OAuth-путём; отдельный inference API key не является обязательным условием этой интеграции.
-
-Требуемая архитектура клиента:
-
-1. Один владелец transport на connection generation.
-2. Непрерывный reader демультиплексирует responses по JSON-RPC ID, notifications и server requests.
-3. Mutation intent сохраняется до отправки; reconnect не повторяет prompt.
-4. `turn/steer` получает caller-selected `expectedTurnId`; длинная history page не является prerequisite.
-5. `turn/interrupt` и `thread/goal/clear` — разные Operations. Выход клиента не доказывает прекращение server-side goal.
-6. Account updates входят тем же reader; quota-only connection на каждое чтение не создаётся.
-
-`turn/steer` не принимает произвольные параметры `turn/start`. Противоречивый success либо lost reply остаётся unknown. Не ожидать новый `turn/started` как обязательное доказательство steer: коррекция относится к уже существующему turn.
-
-Rate-limit update является sparse patch: доступные значения объединяются с последним `account/rateLimits/read` либо snapshot перечитывается. Nullable metadata в sparse update не стирает ранее наблюдённое значение. Поля `limitId`, окна, credits, spend-control и plan type остаются разными осями.
-
-Официальные источники:
-
-- [Codex app-server с ChatGPT-plan OAuth](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server)
-- [текущий registry app-server methods](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/app-server-protocol/src/protocol/common.rs)
-- [RateLimitSnapshot](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitSnapshot.ts)
-
-## 5. Muse: MSP negotiation вместо догадок по версии
-
-### Официальная поверхность
-
-MSP `initialize` возвращает `experimentalApi` и `grantedCapabilities`; grants фиксированы для жизни connection. Доступность операции определяется grant + schema/response текущего подключения, а не release number.
-
-Текущая публичная схема описывает:
-
-- `turn/start`, `turn/steer`, `turn/interrupt`, `turn/cancel`;
-- `subagent/sendMessage`, `followupTask`, `interrupt`, `stop`, `resume`, `reopen`, `close`, `readResult`;
-- `task/background`, `task/stop`, `task/stopAll`;
-- `goal/set`, `edit`, `clear`, `pause`;
-- `model/list`, `skill/list`;
-- `usage/read`, `usage/changed`.
-
-ELIOT подключает только методы из фактических grants. Отсутствующая grant делает конкретную capability `unavailable`; open/read других частей сессии продолжает работать.
-
-`turn/interrupt` подтверждает admission priority interrupt, а завершение — `turn/completed` с terminal `cancelled`. `turn/cancel` идёт по обычной command lane и имеет другую семантику. `subagent/readResult` — command-plane метод и не используется как безобидный family observer. Для наблюдения применяются session/view events и exact result references.
-
-`usage/read` даёт initial snapshot, `usage/changed` — последующее point-in-time наблюдение. `observedAtMs` остаётся временем host observation; повторный GET не делает его новым. Один subscription account не умножается на число children.
-
-Официальные источники:
-
-- [текущая MSP schema](https://github.com/meta-models/muse-code-sdk/blob/912061bb125b4bff60c9f3089a21cd23b53c6b4f/schema/msp/msp.d.ts)
-- [stable JSON schema](https://github.com/meta-models/muse-code-sdk/blob/912061bb125b4bff60c9f3089a21cd23b53c6b4f/schema/msp/stable/msp.schema.json)
-
-Не писать второй MSP state machine в Rust. Использовать полный публичный SDK на bridge boundary, оставляя Store vendor-neutral.
-
-## 6. OpenCode: HTTP V2 и ACP — разные топологии
-
-### Shared HTTP service
-
-Для уже управляемого background service естественная граница — V2 HTTP API:
-
-- `POST /api/session/{sessionID}/prompt` durably admits input, `delivery=steer|queue`, `resume` управляет запуском цикла;
-- `POST .../background` переводит backgroundable foreground tools в наблюдение и является no-op для idle session;
-- forms/questions имеют отдельные list/state/reply/cancel endpoints;
-- сообщения, context, instructions и experimental durable session log читаются адресно;
-- session records содержат parentID, agent/model, tokens/cost; это не доказательство полного child tree без coverage.
-
-`delivery=steer` — полезный `loop_step_steer`, но не `native_expected_target`: endpoint не принимает expected active-turn identity. Нельзя либо запретить его из-за отсутствия Codex-гарантии, либо назвать atomic exact-turn steer.
-
-Не использовать `opencode run`/`opencode api` как lifecycle probe рабочего сервиса: официальная CLI-документация предупреждает, что API-команда может обнаружить или запустить background service. Adapter должен подключаться к уже выбранному endpoint напрямую. Session warming отправляет реальные model requests и не является healthcheck.
-
-### OpenCode ACP
-
-`opencode acp` запускает private server внутри ACP process; он не подключается к shared background service. Это отдельная topology/capability profile, а не прозрачный новый transport существующего binding. Один ACP process может обслуживать несколько ACP sessions, но его ownership и directory rules отличаются от shared HTTP service.
-
-Официальные источники:
-
-- [V2 HTTP API](https://dev.opencode.ai/v2/docs/api/)
-- [durable prompt admission](https://dev.opencode.ai/v2/docs/api/session/v2-session-prompt/)
-- [background](https://dev.opencode.ai/v2/docs/api/session/v2-session-background/)
-- [ACP support](https://opencode.ai/v2/docs/cli/acp/)
-
-## 7. Claude Agent SDK: permission flow и долговечное ожидание
-
-### Авторизация
-
-Сохранять существующую subscription route. Официальная документация указывает: `ANTHROPIC_API_KEY`, если он присутствует, заменяет Pro/Max/Team/Enterprise subscription, а в non-interactive mode используется всегда. Adapter не должен инъецировать такой ключ или отдельный endpoint, если выбран subscription harness.
-
-### Permissions
-
-Фактический порядок:
-
-1. hooks;
-2. deny rules;
-3. ask rules;
-4. permission mode;
-5. allow rules и auto-approved native calls;
-6. `canUseTool`, только если запрос ещё не разрешён.
-
-Следствия:
-
-- `canUseTool` не является аудитом каждого tool call;
-- для правила, которое обязано исполняться всегда, нужен `PreToolUse` hook;
-- `AskUserQuestion` и user-interaction MCP tools доходят до callback по своим правилам; в `dontAsk` они отклоняются;
-- незаданный permission mode — `inherited`, пока native effective mode не наблюдён;
-- после SDK 0.3.286 отсутствие option не эквивалентно явному `default`.
-
-Официальный callback может ждать неограниченно. Если процесс не должен жить до человеческого ответа, документация рекомендует `PreToolUse` hook с `defer`, чтобы процесс завершился и позднее продолжил persisted session. Поэтому R16 должен поддержать два честных режима:
-
-- live callback: Node owner остаётся жив, один callback resolver получает exact reply;
-- durable defer: hook фиксирует request, native session приостанавливается/сохраняется по официальному механизму, а продолжение выполняется через documented resume — не восстановлением JavaScript Promise из JSON.
-
-`AskUserQuestion` возвращается через original `questions` и `answers`; 1–4 questions, 2–4 options; текущая документация прямо говорит, что он недоступен в subagents, запущенных через Agent tool. Не обещать child question support без отдельного native интерфейса.
-
-Официальные источники:
-
-- [permission evaluation](https://code.claude.com/docs/en/agent-sdk/permissions)
-- [approvals and user input](https://code.claude.com/docs/en/agent-sdk/user-input)
-- [environment variables / subscription override](https://code.claude.com/docs/en/env-vars)
-
-## 8. Command Code: ACP — богатый интерактивный control plane
-
-Официальный `cmd acp` сохраняет инструменты, skills, permission engine и sessions Command Code. Existing `cmd login` переиспользуется; отдельный model API account не требуется. ACP предоставляет streamed replies, tool calls/diffs, permission prompts, questions, modes, model/effort picker, context meter, session list/reopen/close и MCP.
-
-Каждый ACP thread — настоящая Command session. Один `cmd acp` process обслуживает один project directory и множество threads; другую directory он отвергает, пока текущие threads не закрыты. Это хорошо совпадает с manager/worktree ownership ELIOT.
-
-Headless `cmd -p` тоже создаёт настоящую durable session и может продолжаться через `--continue` либо exact `--resume`; он не «без сессии». Но это single-query process boundary: live approval/control между запусками слабее ACP. Выбор topology делается по требуемым capabilities:
-
-- интерактивный manager с approvals/subagents/session controls → ACP;
-- ограниченный batch/CI с exact session resume → headless profile.
-
-Не строить pseudo-steer из нового `-p --resume` prompt. Если ACP не объявляет exact active-turn steer, capability остаётся next-turn/prompt, а не получает более сильное имя.
-
-Официальные источники:
-
-- [Command ACP](https://commandcode.ai/docs/acp)
-- [Sessions and checkpoints](https://commandcode.ai/docs/sessions)
-- [Headless mode](https://commandcode.ai/docs/headless)
-- [Permissions](https://commandcode.ai/docs/permissions)
-
-## 9. Antigravity: stream-json как штатный многоповоротный transport
-
-Официальный headless contract:
-
-- cached subscription credentials;
-- `stream-json` выдаёт `init`, `step_update`, `result`;
-- init содержит cwd/tools/permission mode/model/agent;
-- step updates несут conversation/step state, tool/subagent info, text delta и usage;
-- при `--input-format stream-json` один process обслуживает несколько turns;
-- stdout читается непрерывно, stdin закрывается только когда владелец действительно завершает session;
-- `/model` и `/usage`, посланные в stream-json, ломают JSON flow; они запускаются отдельно как CLI actions.
-
-Session usage/turn/duration в многоповоротном режиме cumulative; не суммировать каждый result. Интерактивная credits panel доказывает subscription quota UI, но не machine-readable field в active stream. Пока официальный transport не выдаёт баланс структурированно, quota report честно `unavailable`, а рабочий runtime остаётся доступным.
-
-Модель, effort, agent и permission mode выбираются route/config и подтверждаются `init`; нельзя держать одну `REQUIRED_MODEL_ID` константу или молча переключать модель.
-
-Официальные источники:
-
-- [Antigravity headless mode](https://www.antigravity.google/docs/cli/headless/)
-- [credits and quotas](https://www.antigravity.google/docs/cli/credits/)
-
-## 10. Доноры: брать механизм только в подходящей границе
-
-| Донор | Применение | Не переносить |
-|---|---|---|
-| `agentclientprotocol/rust-sdk` | ACP Client/Agent/Proxy/Conductor, framing, initialize/capability flow; TCK для Command/OpenCode ACP profile | Не оборачивать MSP, Codex app-server и OpenCode shared HTTP в ACP ради унификации. Conductor process lifetime не заменяет ELIOT Operation ownership. |
-| ACPX | Опциональный owner backend после появления конкретного consumer и повторного source review | Не обязательный runtime для всех harness, не второй Task/Store/workflow authority. |
-| RMCP | MCP frontend ELIOT и schema utilities там, где это уже MCP | Не использовать MCP как control plane Codex app-server или как вторую authority. |
-| CCCC / Paseo | Inbox locality и lifecycle ownership observer subscriptions | Не новый durable ledger и не отмена native Task при disconnect. |
-| Restate / DBOS | Идеи: durable request ID до эффекта, awakeable correlation, step memo | Не новый server/engine; внешняя closure всё равно может исполниться до сохранения результата. |
-| Tokio | Owned channels, cancellation-safe wait, bounded task ownership | Не actor framework, не автоматическая политика kill/restart. |
-| Kingfisher / Atlas | Bounded diagnostic secret detection/redaction после отдельной квалификации | Не permission boundary и не обработка raw unlimited transcript в Store writer. |
-
-Reviewed source SHA донора — evidence coordinate. Runtime dependency выбирается обычным проектным решением и совместимостью, не вечным pin пользователя.
-
-## 11. Рекомендуемая архитектура адаптера
-
-Один адаптерный vertical slice:
+**Нативная граница:** `expectedTurnId` атомарно защищает цель `turn/steer`, но RPC отвечает раньше hooks, rollout persistence и sampling. `clientUserMessageId` связывает наблюдённый input с запросом; его наличие само по себе не гарантирует дедупликацию повторной отправки. Успешный ACK с нужным turnId может предшествовать сохранению user item.
 
 ```text
-official initialize / capability grants
-  → adapter-owned connection and bounded demux
-  → native typed command
-  → persisted ELIOT Operation before effect
-  → native ACK/event/readback
-  → bounded typed observation
-  → Store authority-protected reader/action
+ACK steer → решение принять в указанный turn
+exact persisted user item + correlation/content → доказанная доставка
+terminal этого turn → исход исполнения, не приёмка Task
 ```
 
-Общие transport primitives выносятся в adapter SDK только после двух реальных consumers и без vendor state machine. Каждый новый public method имеет production caller в том же PR. Store не содержит release allowlist и не парсит vendor payload вне зарегистрированного validator.
+В ELIOT `reconcile_send` уже ищет unique exact input и сверяет digest/bytes/turn. Сохранять это; в R03 убрать лишний `active_turns` history-preflight, а не post-send readback. `accepted_after_exact_input` сохраняет различие доставленного input и неизвестного terminal. История, недоступная из-за неподходящего handshake, не является доказательством отсутствующего input. Подробнее [R03](../remediation/2026-10-07/03-codex-steer.md).
 
-## 12. Порядок реализации
+Steer не принимает model/cwd/sandbox/outputSchema overrides нового turn и не создаёт обязательный новый `turn/started`. `turn/interrupt` и `thread/goal/clear` — раздельные намерения. Sandbox/approval policy и текущая подписочная авторизация не меняются ради починки transport.
 
-1. R03: Codex exact steer без history pagination.
-2. R15: Codex/Muse usage по существующим connections и исправление ложного quota recovery.
-3. R16: Claude permission/question flow с live callback и официальным durable defer.
-4. OpenCode parity: forms/questions, loop-step steer, background и log readback из уже существующего V2 runtime; удалить дубли после parity.
-5. Command ACP vertical slice: initialize, one project owner, session open/resume, prompt, permissions/questions, agent/subagent observations, result/readback.
-6. Antigravity: убрать model equality gate; нормализовать init/step/result и cumulative usage, не выдумывать quota RPC.
-7. Затем route availability/admission policy — только после достоверных ProviderCondition/usage facts и отдельного решения владельца.
+**Квоты:** `account/rateLimits/read` — snapshot, `account/rateLimits/updated` — sparse notification. `limitId`/bucket, окна, credits, spend controls и plan metadata не смешивать. Null metadata в rolling update не обязательно стирает прошлое; null в полном read и смена auth context имеют другой смысл. Refetch разрешает неоднозначность без model call. Алгоритм по полям — в [R15](../remediation/2026-10-07/15-native-usage.md).
 
-## 13. Критерии качества
+Источники: [app-server docs](https://learn.chatgpt.com/docs/app-server), [TurnSteerParams](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/app-server-protocol/schema/typescript/v2/TurnSteerParams.ts), [Core boundary](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/core/src/session/turn_input.rs#L1-L13), [rolling notification](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/app-server-protocol/schema/typescript/v2/AccountRateLimitsUpdatedNotification.ts). [#40805](https://github.com/openai/codex/issues/40805) — чужой reproduction, не наш live-прогон.
 
-Для каждого harness проверить записанным официально-совместимым transcript и затем native qualification:
+## 4. Muse: не превращать grantedCapabilities в список RPC
 
-- compatible update без release-number rejection;
-- exact capability absent/present;
-- current auth/account и отсутствие silent backend switch;
-- input intent до эффекта, lost reply и reconnect без replay;
-- target mismatch/late event/old connection generation;
-- pending question и permission reply;
-- child/family partial coverage;
-- interrupt/cancel/background с правильным terminal readback;
-- quota snapshot freshness и sparse update;
-- disconnect observer не прекращает accepted work;
-- никакой status/Doctor read не делает prompt, login, purchase, key mint, restart или model switch.
+**Исправление прежнего AUD-047:** правило «подключать только методы, имена которых есть в grants» неверно. В рассмотренном stable source `CapabilityName` называет `userShell`, `sessionMcp`, `sessionListStream`, `feedback` и допускает расширение. Это именные привилегии, а не перечень всех методов. Отсутствующий объект client capabilities означает defaults.
 
-Исторические скрипты можно превратить в fixtures конкретных ловушек, но они не участвуют в определении expected wire contract. Документ не изменяет runtime, credentials, SDK dependencies или рабочие сервисы.
+Различать четыре оси:
+
+| Ось | Проверка |
+|---|---|
+| Базовый метод и wire-форма | Реальный метод/ответ текущей поверхности; не `method ∈ grantedCapabilities`. |
+| Именная дополнительная привилегия | Запрашивать/проверять именно её там, где официальный контракт метода/поля её требует. |
+| Experimental surface | Отдельный `experimentalApi` и требуемые формы; не выводить opt-in из версии пакета или имени grant. |
+| Возможность клиента показать вопрос | `userInputDialogs`: absent означает capable; это прямо **не** grant. |
+
+Для `usage/read` и обычного `turn/steer` не добавлять придуманные grants с такими именами. Пустой список именных grants сам по себе не делает эти методы unavailable. Сохранение grant snapshot полезно для реально потребляемых privilege-gated extensions, но текущий аудит не доказал, что отсутствие этой проекции ломает базовую квоту или steer. Исходное общее P1-обвинение снято, а не объявлено исправленным кодом.
+
+Полный SDK остаётся владельцем MSP parsing/fold. Existing `launchConnection/onNotification` подключить к initial `usage/read` и `usage/changed`. Одинаковая SubscriptionUsage-форма; absent usage — not_observed; observedAtMs не обновляется повторным чтением; weekly/window раздельны; >100% допустимо. Не создавать child poller, второй SDK или новые auth/model calls.
+
+Документированные controls: exact `turn/steer`, priority `turn/interrupt`, normal-lane `turn/cancel`, goals, адресные `subagent/*`, `task/background|stop`, model/skill catalogs. Native taskId инструмента — не ELIOT Task; parent session + subagentId — не новый control binding ребёнка. `subagent/readResult` — command-plane, не безобидное чтение observer. Решение approval остаётся отдельным от `{}` RequestReceipt.
+
+### SDK как донор завершения, не ещё одна самодельная машина
+
+Публичный `Session.turn(id).completed` возвращает `TurnOutcome`: `completed`, `unqueued`, `terminalUnknown`. У reclaimed queued turn не будет `turn/completed`; ожидание только этого события зависнет. `isLaunchFailure` проверяет native failed/launchError, а не отсутствие замеченного turn/started: клиент мог подключиться позже.
+
+Использовать facade `Session`/`Turn` целиком в подходящем control slice, а не импортировать private `TurnHandle` mutators или копировать его ветки в Store. Correlation с ELIOT Operation остаётся нашим обязательством. В прочитанном SDK `PushStream` имеет растущий buffer без byte cap: один постоянно читающий bridge consumer и bounded downstream fanout лучше iterator на каждого медленного viewer. При завершении наблюдения закрывать iterator (`return()`/выход из for-await); это не отмена native turn. Отмена и retirement очереди не входят в quota PR R15.
+
+Источники: [stable declarations, CapabilityName/ClientCapabilities](https://github.com/meta-models/muse-code-sdk/blob/912061bb125b4bff60c9f3089a21cd23b53c6b4f/schema/msp/msp.d.ts#L238-L255), [TurnOutcome/Turn facade](https://github.com/meta-models/muse-code-sdk/blob/912061bb125b4bff60c9f3089a21cd23b53c6b4f/clients/sdk-ts/src/facade/turn-handle.ts#L1-L230), [официальный queue/steer cookbook](https://meta-models.github.io/muse-code-sdk/next/cookbook/queue-steer-and-reclaim-turns/), [usage/read](https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/usage-read/). Новые `/next` поля отдельно сверять с действующим подключением.
+
+## 5. OpenCode: богатый V2 HTTP, ACP — отдельная топология
+
+Для выбранного shared service использовать прямой HTTP: durable prompt admission с `delivery=steer|queue`, отдельные forms/questions/reply, background, сообщения/context/instructions и адресный log readback. Loop-step steer не имеет Codex expected-turn CAS и не должен его изображать; это не причина запрещать полезную native функцию. Background не cancel, warming с model call не healthcheck.
+
+`opencode acp` поднимает private server внутри ACP process, а не прозрачно подключается к shared service binding. Выбор topology явный. Прямой adapter не вызывает service-discovering CLI как health probe. Forms/background/log primitives уже есть в `runtime/opencode_v2`: переносить проверенный путь в standalone adapter и удалять дубль после переключения callers, не писать третий.
+
+Источники: [V2 API](https://dev.opencode.ai/v2/docs/api/), [prompt](https://dev.opencode.ai/v2/docs/api/session/v2-session-prompt/), [background](https://dev.opencode.ai/v2/docs/api/session/v2-session-background/), [ACP](https://opencode.ai/v2/docs/cli/acp/). Session token/cost — не остаток provider account. Новый machine-readable quota collector здесь не доказан.
+
+## 6. Claude: live callback и persisted defer — разные режимы
+
+Сохранять выбранную подписочную авторизацию. `ANTHROPIC_API_KEY` может переключить её на API billing; subscription route не инъецирует такой override или другой endpoint. Незаданный permission mode отражать как inherited до native effective readback, не присваивать default по памяти о старом SDK.
+
+Официальный permission path различает hooks, deny, ask, mode, allow/native auto-approval и unresolved `canUseTool`. Callback не вызывается для всякого tool; требуемая проверка до инструмента использует соответствующий `PreToolUse` hook, без самовольной смены permission policy.
+
+В [R16](../remediation/2026-10-07/16-claude-interactions.md) live callback хранит resolver в живом Node и разрешается один раз через scoped agent.reply. Official durable defer использует native persisted session/resume, когда поддержан; он не восстанавливает JavaScript Promise. Driver loss, host disconnect и abort различны. AskUserQuestion возвращает original questions + answers, не новый prompt; документированные ограничения subagent support не обходить названием callback. Allow-always меняет политику и не включён в первый reply slice.
+
+Источники: [permissions](https://code.claude.com/docs/en/agent-sdk/permissions), [user input/defer](https://code.claude.com/docs/en/agent-sdk/user-input), [environment](https://code.claude.com/docs/en/env-vars). В этом проходе Claude заново не квалифицирован; сохраняется scope R16.
+
+## 7. Command: интерактивный ACP и headless — разные профили
+
+Official `cmd acp` предоставляет session/tools/skills, permissions/questions, model/effort, streamed events, context meter, reopen/close и использует existing login. Один процесс — один project directory и несколько threads; это не разрешает перемешать разные worktrees. Файловые действия контролирует native permission engine, не воображаемая ACP client sandbox.
+
+`cmd -p` также имеет durable session и continue/resume; не называть его sessionless. Для интерактивного manager выбирать профиль с нужными controls; batch/CI может использовать headless. Новый `-p --resume` input не является exact steer. ACP generic prompt сам по себе также не доказывает expected-turn CAS или replay-safe submission.
+
+Источники: [ACP](https://commandcode.ai/docs/acp), [sessions](https://commandcode.ai/docs/sessions), [headless](https://commandcode.ai/docs/headless), [permissions](https://commandcode.ai/docs/permissions). Это основание будущего whole-backend slice, не требование оборачивать остальные harness в ACP.
+
+## 8. Antigravity: один поток и накопительная usage
+
+Official stream-json даёт init/step_update/result и tool/subagent сведения, при input-format stream-json обслуживает несколько turns. Чтение stdout постоянно; EOF stdin означает выбранное владельцем завершение session, а не probe. Модель/effort/agent/permission поступают из выбора владельца и сверяются с native init; REQUIRED_MODEL_ID нельзя заменить следующей константой.
+
+Usage/turns/duration накопительны: заменять snapshot или вычислять проверенную разность одного поколения, а не суммировать results. Slash `/usage` и `/model` не посылать в рабочий JSON-поток. Interactive credits UI не доказывает machine-readable balance; отсутствие quota поля не отключает runtime и не переводит его на другой SDK/API-account.
+
+Источники: [headless](https://www.antigravity.google/docs/cli/headless/), [credits](https://www.antigravity.google/docs/cli/credits/). Новые API Kilo/Zed и их паритет этим проходом не подтверждены.
+
+## 9. Доноры и границы повторного использования
+
+| Единица | Применить | Ограничение |
+|---|---|---|
+| Muse публичные Session/Turn/fold | Native lifecycle, queued retirement, late attach, unknown host death | Не private mutators; не durable Store и не bounded UI-buffer автоматически. |
+| Codex `merge_rate_limit_fields` | Образец раздельной обработки окон и nullable metadata | Private Core helper: не импортировать весь core. В нём нет ELIOT auth/bucket scope guard; универсальный merge из него не следует. |
+| ACP Rust SDK/Conductor/TCK, ACPX | Целая подходящая ACP-единица для реального consumer | Не обязательный proxy для MSP/app-server/shared HTTP, не новая Task authority; ownership/kill policy проверять отдельно. |
+| RMCP | ELIOT MCP frontend, immutable schema reuse | Не native model control plane; schema cache не authority cache. |
+| CCCC/Paseo | Locality inbox, owner наблюдательной подписки | Не второй ledger и не отмена Task на disconnect. |
+| Restate/DBOS | Correlation до эффекта, memo/readback boundaries | Не новый engine; внешний эффект до записи результата остаётся возможен. |
+| Tokio | Owned channels и cancel-safe wait | Не автоматическая kill/restart policy. |
+| Kingfisher/Atlas | Bounded diagnostic detection/redaction | Не permission boundary; не raw unlimited transcript в Store writer. |
+
+Codex donor source: [set_rate_limits и merge_rate_limit_fields](https://github.com/openai/codex/blob/ea27864f99f0b086cec2f9f0251b7190fb9844f1/codex-rs/core/src/state/session.rs#L350-L462). Остальные подробные source reviews и пределы заимствования — в едином аудите/реестре, не независимые новые требования установки.
+
+## 10. Порядок поставки и критерии
+
+R03: убрать history-preflight и согласовать нужный readback. R15: continuous reader Codex, два quota producers, Store/reader, incident. R16: Claude loader/auth и reply. Далее законченные OpenCode controls и Command ACP slices; Antigravity model/usage correction. Управление маршрутом/кредитами — отдельная policy после достоверных фактов, не побочный эффект чтения.
+
+Каждая функция имеет реального caller в той же поставке и проверяет exact target, generation, missing capability, unknown outcome, late event, retained question и observer disconnect. Свой input хранить до эффекта; не вводить новый model loop, эвристику по приватной БД или универсальный retry.
+
+После целого кода — scoped gate менеджера; broad/native qualification в итоговой фазе. Настоящая редакция меняет документацию, не callbacks, subscriptions, SDK dependencies, credentials, процессы или main.
