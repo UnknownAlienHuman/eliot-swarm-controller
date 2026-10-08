@@ -1,7 +1,7 @@
 # R33 — отзывы пользователей о донорах и ELIOT adoption gates
 
-**Исследованный ELIOT:** `40591a295af94b1541ec2ba30afe8e3247701a71`  
-**Дата внешней проверки:** 2026-10-08  
+**Исследованный ELIOT:** `40591a295af94b1541ec2ba30afe8e3247701a71`
+**Дата внешней проверки:** 2026-10-08
 **Статус:** research/implementation handoff. Production-код не изменён.
 
 ## 1. Метод
@@ -10,13 +10,13 @@
 
 1. какой механизм реально полезен ELIOT;
 2. какой failure boundary надо сначала воспроизвести;
-3. какой продукт/слой нельзя переносить целиком.
+3. какой продукт или слой нельзя переносить целиком.
 
 Вердикты:
 
 - **TAKE** — законченный маленький production slice;
 - **SPIKE** — сначала изолированный прототип и фикстуры;
-- **REFERENCE** — только механизм/корпус отказов;
+- **REFERENCE** — только механизм или корпус отказов;
 - **DO NOT IMPORT** — не переносить движок целиком.
 
 ## 2. Сводка
@@ -69,34 +69,32 @@ route install → restore effect → response/early events → route cleanup
 stored ≠ runtime delivery ≠ read ≠ reply ≠ cancelled obligation ≠ completion
 ```
 
-Это нужно ELIOT mailbox.
-
 Полевые reports:
 
 - [#125](https://github.com/ChesterRa/cccc/issues/125): первый bootstrap каждого MCP bridge сканировал весь ledger; 58 MB ledger дал около 207 MiB PSS на bridge, 35 bridges — 3.80 GiB PSS. Это retained whole-ledger cost, не accumulating leak.
-- [#98](https://github.com/ChesterRa/cccc/issues/98): `enabled=false` терялся после restart/соседних writes, а `@all` считался accepted для disabled actors без процесса.
+- [#98](https://github.com/ChesterRa/cccc/issues/98): `enabled=false` терялся после restart или соседних writes, а `@all` считался accepted для disabled actors без процесса.
 - [#95](https://github.com/ChesterRa/cccc/issues/95): bracketed-paste ошибочно считался prompt readiness; Enter подтвердил Claude startup dialog `No, exit`.
 
-Взять message semantics и cursor-local unread scan. Не брать JSONL ledger/scheduler и PTY escape heuristics.
+Взять message semantics и cursor-local unread scan. Не брать JSONL ledger, scheduler и PTY escape heuristics.
 
 Тесты:
 
-- disabled/paused recipient не входит в broadcast;
+- disabled или paused recipient не входит в broadcast;
 - restart не воскрешает disabled state;
 - unrelated actor update не перезаписывает состояние;
 - inbox summary зависит от unread tail, не всей истории;
-- vendor SessionStart/hook, а не bracketed-paste, допускает delivery.
+- vendor SessionStart или hook, а не bracketed-paste, допускает delivery.
 
 ## 5. ractor
 
-README задаёт правильный lifecycle priority: Kill, Stop, SupervisionEvent, ordinary work. Actor может быть supervisor без отдельного global system. Но `ractor_cluster` прямо не production-ready. Issue [#262](https://github.com/slawlor/ractor/issues/262) фиксирует, что actors первоначально потребляли excessive memory; maintainers удаляли maps/monitors/broadcast sender.
+README задаёт правильный lifecycle priority: Kill, Stop, SupervisionEvent, ordinary work. Actor может быть supervisor без отдельного global system. Но `ractor_cluster` прямо не production-ready. Issue [#262](https://github.com/slawlor/ractor/issues/262) фиксирует, что actors первоначально потребляли excessive memory; maintainers удаляли maps, monitors и broadcast sender.
 
 Переносить сначала семантику и тесты, не dependency:
 
 - kill interrupts current async work;
 - stop ждёт текущую работу и выигрывает перед следующим user message;
 - supervision flood не starve stop;
-- ordinary mailbox bounded/backpressured;
+- ordinary mailbox bounded или backpressured;
 - actor-count memory benchmark на ELIOT масштабе.
 
 Cluster не брать.
@@ -107,15 +105,15 @@ Cluster не брать.
 
 Нужны approved immutable tool snapshot, schema digest, quarantine и progressive `retrieve_tools/describe_tool`.
 
-Собственный benchmark MCPProxy сообщил pure BM25 Top-1 около **14%** при 916 tools; hybrid/reranking лучше. Значит search — usability, не authority. Issue [#873](https://github.com/smart-mcp-proxy/mcpproxy-go/issues/873) показал stale index после approval.
+Собственный benchmark MCPProxy сообщил pure BM25 Top-1 около **14%** при 916 tools; hybrid и reranking лучше. Значит search — usability, не authority. Issue [#873](https://github.com/smart-mcp-proxy/mcpproxy-go/issues/873) показал stale index после approval.
 
 До интеграции нужен ELIOT benchmark:
 
 - exact method name Top-1 = 100%;
 - 100–200 annotated natural-language queries;
-- role/profile/task/cwd filtering **до** ranking;
+- role, profile, task и cwd filtering **до** ranking;
 - approval атомарно обновляет index;
-- schema/auth/catalog revision инвалидирует cache;
+- schema, auth и catalog revision инвалидируют cache;
 - quarantined tool не появляется через другой index.
 
 ### 6.2 AgentGateway
@@ -136,7 +134,7 @@ CEL не заменяет Store object authorization.
 
 ### 6.3 Kingfisher
 
-Брать Rust rules/scanner/fingerprints как второй слой поверх Atlas. Не принимать CLI verdict.
+Брать Rust rules, scanner и fingerprints как второй слой поверх Atlas. Не принимать CLI verdict.
 
 Reports:
 
@@ -148,9 +146,9 @@ Reports:
 
 ### 6.4 Snyk Agent Scan
 
-Брать только taxonomy и adversarial fixtures. README прямо предупреждает: raw CLI output experimental; scan MCP config может запускать команды и network requests. Issue [#392](https://github.com/snyk/agent-scan/issues/392) показывает false positives на обычной repo documentation.
+Брать только taxonomy и adversarial fixtures. README прямо предупреждает: raw CLI output experimental; scan MCP config может запускать команды и network requests. Issue [#392](https://github.com/snyk/agent-scan/issues/392) показывает false positives на обычной repository documentation.
 
-Scanner сам является effect и запускается только в disposable sandbox с consent. ELIOT не парсит нестабильные score/risk names как contract.
+Scanner сам является effect и запускается только в disposable sandbox с consent. ELIOT не парсит нестабильные score или risk names как contract.
 
 ## 7. Observability
 
@@ -166,21 +164,21 @@ Operational reports:
 - [#12371](https://github.com/langfuse/langfuse/issues/12371): duplicated metadata;
 - [#11924](https://github.com/langfuse/langfuse/issues/11924): missing ClickHouse table ломала traces page.
 
-Использовать только secondary sink/UI после Store commit. Sink unavailable не откатывает Operation. Queue bounded, drops counted, query time/row/byte bounded, replay idempotent, PII redacted.
+Использовать только secondary sink или UI после Store commit. Sink unavailable не откатывает Operation. Queue bounded, drops counted, query time/row/byte bounded, replay idempotent, PII redacted.
 
 ### 7.2 OpenTelemetry Rust
 
-Брать `tracing` + explicit bounded OTLP/HTTP exporter. Не тащить global provider/auto-instrumentation в core.
+Брать `tracing` и explicit bounded OTLP/HTTP exporter. Не тащить global provider или auto-instrumentation в core.
 
 Reports: [#3542](https://github.com/open-telemetry/opentelemetry-rust/issues/3542) lifecycle/shutdown umbrella, [#3176](https://github.com/open-telemetry/opentelemetry-rust/issues/3176) current-thread force_flush deadlock, [#2978](https://github.com/open-telemetry/opentelemetry-rust/issues/2978) gRPC span loss, [#2778](https://github.com/open-telemetry/opentelemetry-rust/issues/2778) memory leak report.
 
-Тестировать current-thread/multithread shutdown deadlines, HTTP/gRPC differential counts, short-lived process flush, drop counters и 24h soak. Exporter никогда не работает на Store writer thread.
+Тестировать current-thread и multithread shutdown deadlines, HTTP/gRPC differential counts, short-lived process flush, drop counters и 24h soak. Exporter никогда не работает на Store writer thread.
 
 ## 8. Durable execution
 
 ### 8.1 DBOS
 
-Брать stable nonempty ID, durable intent до offset/dispatch, per-step memo и explicit replay boundary.
+Брать stable nonempty ID, durable intent до offset или dispatch, per-step memo и explicit replay boundary.
 
 Reports:
 
@@ -191,13 +189,13 @@ Reports:
 - [#761](https://github.com/dbos-inc/dbos-transact-py/issues/761): OAOO read outside retry lock;
 - [#767](https://github.com/dbos-inc/dbos-transact-py/issues/767): cancellation race silently lost.
 
-Каждый ELIOT effect должен иметь crash matrix C0…C5: before intent, after intent, effect accepted/reply lost, reply before result commit, result before source cursor, cancel/drain race.
+Каждый ELIOT effect должен иметь crash matrix C0…C5: before intent, after intent, effect accepted или reply lost, reply before result commit, result before source cursor, cancel или drain race.
 
 DBOS runtime не импортировать.
 
 ### 8.2 Restate
 
-Брать awakeable/interaction ID minted before dispatch, attach/readback и ingress outcome taxonomy.
+Брать awakeable или interaction ID minted before dispatch, attach/readback и ingress outcome taxonomy.
 
 Reports:
 
@@ -220,23 +218,23 @@ Reports:
 
 Landlock BestEffort может означать отсутствие sandbox — см. [OpenShell #584](https://github.com/NVIDIA/OpenShell/issues/584). Нужен typed `requested/available/enforced/abi/degradation_reason`; hard-required отказывает start, best-effort пишет explicit degraded fact.
 
-`seccompiler` — Linux/arch-specific second layer. Standalone repo archived и перенесён в rust-vmm monorepo ([#76](https://github.com/rust-vmm/rust-vmm/issues/76)). Тестировать kernel/arch/vDSO/network/file/exec matrix. Windows имеет отдельный Job/ACL/AppContainer path.
+`seccompiler` — Linux или architecture-specific second layer. Standalone repo archived и перенесён в rust-vmm monorepo ([#76](https://github.com/rust-vmm/rust-vmm/issues/76)). Тестировать kernel, architecture, vDSO, network, file и exec matrix. Windows имеет отдельный Job, ACL или AppContainer path.
 
-## 10. Paseo, Goose, Claw
+## 10. Paseo, Goose и Claw
 
 ### Paseo
 
-Брать `SessionDelivery` ownership, detach cleanup и demand tracking. Issues [#2574](https://github.com/getpaseo/paseo/issues/2574) и [#2512](https://github.com/getpaseo/paseo/issues/2512) показывают disappearing sessions и global spinner, когда один provider hang. Тест: one bad provider не блокирует другие; cancel joins children; missing session — tombstone; external answer resolves stale form; startup failure cleans terminal/process/UI.
+Брать `SessionDelivery` ownership, detach cleanup и demand tracking. Issues [#2574](https://github.com/getpaseo/paseo/issues/2574) и [#2512](https://github.com/getpaseo/paseo/issues/2512) показывают disappearing sessions и global spinner, когда один provider завис. Тест: one bad provider не блокирует другие; cancel joins children; missing session — tombstone; external answer resolves stale form; startup failure cleans terminal, process и UI.
 
 ### Goose
 
-Брать `ValidatedScheduleRecipe`: verified bytes + original base dir, передаваемые одним typed object. Не брать scheduler/model loop.
+Брать `ValidatedScheduleRecipe`: verified bytes и original base dir, передаваемые одним typed object. Не брать scheduler или model loop.
 
 Issues [#11051](https://github.com/aaif-goose/goose/issues/11051), [#10765](https://github.com/aaif-goose/goose/issues/10765), [#10784](https://github.com/aaif-goose/goose/issues/10784): mid-stream failure reported success, headless scheduler ждёт client, structured-output tool отсутствовал на local provider path. Нужен headless=interactive contract suite, exact failure propagation, no overlap, provider tool-set parity и explicit unsupported capability.
 
 ### Claw
 
-Брать advisory recommendation+dissent и worktree discipline. Не брать consensus authority/workflow engine.
+Брать advisory recommendation и dissent, а также worktree discipline. Не брать consensus authority или workflow engine.
 
 Issue [#117](https://github.com/Enderfga/claw-orchestrator/issues/117): resume выбирал первый pending node, а не реально running boundary. [CVE-2026-10291](https://github.com/advisories/GHSA-95f6-rfpg-c3w8): ReDoS в regex validation. Тестировать exact resume identity, predecessor fencing, capability discovery и safe search expressions.
 
@@ -245,35 +243,35 @@ Issue [#117](https://github.com/Enderfga/claw-orchestrator/issues/117): resume �
 ### A. Маленькие production slices
 
 1. CCCC message facts.
-2. MCPProxy approval/quarantine.
+2. MCPProxy approval и quarantine.
 3. ACP stable-v1 restore routing.
 4. Goose validated input DTO.
-5. Claw recommendation/dissent separation.
+5. Claw recommendation и dissent separation.
 
 ### B. Isolated spikes
 
 6. Phase-typed CEL.
 7. ractor lifecycle priority.
 8. Bounded OTLP exporter.
-9. Windows PTY/VT harness.
-10. Landlock/seccomp capability matrix.
+9. Windows PTY или VT harness.
+10. Landlock или seccomp capability matrix.
 
-### C. Fixture/reference only
+### C. Fixture или reference only
 
 11. Kingfisher rule corpus.
 12. Snyk threat taxonomy.
-13. DBOS/Restate crash-ordering corpus.
+13. DBOS или Restate crash-ordering corpus.
 14. Langfuse optional trace sink.
 
 ## 12. Общий acceptance rule
 
 Каждый imported mechanism обязан в одной поставке:
 
-1. назвать текущую дублирующую/кривую ответственность ELIOT;
-2. подключить реальный producer→persisted fact→consumer path;
+1. назвать текущую дублирующую или кривую ответственность ELIOT;
+2. подключить реальный producer → persisted fact → consumer path;
 3. добавить donor-derived failure fixture;
-4. удалить прежнюю копию/shortcut;
+4. удалить прежнюю копию или shortcut;
 5. не расширить authority;
-6. пройти scoped format и warnings-denied Clippy после connected code.
+6. пройти scoped formatting и warnings-denied Clippy после connected code.
 
 Запрещены новые framework-first PR, где donor abstraction появляется раньше живого consumer.
