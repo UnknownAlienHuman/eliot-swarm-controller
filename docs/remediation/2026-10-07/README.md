@@ -1,77 +1,95 @@
-# ELIOT — серия PR-заданий от 7 октября 2026 года
+# ELIOT — рабочая карта серии PR #27–#40
 
-**Созданы 14 draft PR: #27–#40. Это задания на реализацию, не заявления об исправленном коде.**
-Каждый PR содержит самостоятельную спецификацию в `docs/remediation/2026-10-07/`; код нужно добавлять в тот же PR. Этот README — навигация, не отдельный этап и не блокер.
+**Срез 7 октября 2026, после уточнения R01/R02/R05.** В серии 14 открытых draft PR: **3 содержат изменения product-кода, 11 пока содержат задания. Ни один не слит и ни один полный блок не объявлен квалифицированным.** Это снимок GitHub, не обещание фонового исполнения агентов.
 
-Исходный main: `40591a295af94b1541ec2ba30afe8e3247701a71`. Все 14 веток созданы непосредственно от него и направлены в main; цепочек PR-на-PR нет. Перед реализацией сверить актуальную базу и уже внесённые изменения.
+Main повторно прочитан: `40591a295af94b1541ec2ba30afe8e3247701a71`. Перед началом перечитать head выбранного PR и его diff: таблица ниже может устареть после чужого commit. Код добавлять в существующую ветку, не создавать новые PR на отдельные DTO/handler/reader. Все ветки серии направлены в main, а не друг в друга.
 
-Основа — единый аудит редакции 3. Сопоставлены 40 его самостоятельных AUD-карточек; это не означает 40 доказанных уязвимостей. Условные риски, source gaps и продуктовые расширения отмечены в заданиях. Исходный «Реестр подозрений» не стал обязательным списком исправлений.
+## 1. Где мы и какое следующее действие
 
-## 1. Задания и результат
+| PR / блок | Состояние | Начать со следующего действия |
+|---|---|---|
+| [#27 / R01](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/27) | Задание уточнено; кода нет | По `01-module-lifecycle.md`: birth constructor → перенос verified prior owner → raw/validated receipt fan-in → same-boot status → installed/source separation. |
+| [#28 / R02](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/28) | Задание `c41a7661bc7d56c4e8a6ad0eede76d4fa05dff39`; кода нет | Один decoder для recovery и hello; затем exact ACK/IPC. Stop исправлять и в NativeOwner, и в вызывающем run_owned. |
+| [#29 / R03](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/29) | Задание; кода нет | Exact current-turn steer вместо запрета из-за page_limited всей истории; оставить native expectedTurnId guard. |
+| [#30 / R04](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/30) | Код `f269b3d4dea2c5e15754feba9971b1f1c1b20c2b`; пакет не готов | Остался module.example.json с bridge.7 при коде bridge.8: прежняя запись заблокирована инструментом. Не обходить блокировку и не активировать несовпадающий пакет. Затем квалифицировать root/child pending races. |
+| [#31 / R05](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/31) | Задание `30b57ced92d4b8088c3a841d27b7b98de6c26722`; кода нет | Передать expected Attempt в Claude helper, использовать существующий sealed origin и добавить 3 outer/inner сравнения receipt. |
+| [#32 / R06](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/32) | Задание; кода нет | Согласовать current_scope/registration/fingerprint и code-scope consumers; затем явную разрешённую relation двух заданий. |
+| [#33 / R07](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/33) | Задание; кода нет | Proposal writer/reader digest и реальный ratify/reject путь; затем согласовать terminal Concilium, не скрывая history/dissent. |
+| [#34 / R08](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/34) | Задание; кода нет | Durable sequence writer/index/reader и migration/resync; subscription cutoff в ACK; deadline отдельно от expiry. |
+| [#35 / R09](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/35) | Задание; кода нет | Exact assignment replacement без выдуманного результата и сброса Attempt state; SQL/scan budget до review_view. |
+| [#36 / R10](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/36) | Код `4c2f3a007acfcc0b418936253ccc6926b918661c`; не квалифицирован | Проверить весь disable → receipt путь на exact IDs и degraded links; завершить минимальный Rust gate, не расширять catch до DB/commit errors. |
+| [#37 / R11](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/37) | Частичный код `8d27b0c2fea5a61ac544b15c29b0d77291049053` | Producer secondary_codes исправлен. Остались общий closed terminal codec, legacy aliases AUD-036 и квалификация; старые cursors не перематывать. |
+| [#38 / R12](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/38) | Задание; кода нет | Source-local outcomes, no-progress backoff и Store-owned issuance cursor. DB failure не выдавать за локальную пропущенную запись. |
+| [#39 / R13](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/39) | Задание; кода нет | Malformed ledger ≠ empty; exact execution terminal и exact lease owner вместо любой queued операции Task. |
+| [#40 / R14](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/40) | Задание `fc34714586713e2b769897afb70b1f4f224e8199`; кода нет | Реальные host→MCP callers, data-only registry/schema extraction. Кэшировать конечные wire-варианты, не права; сохранить digest v1 bytes. |
 
-| Блок | PR | Законченный результат | AUD-карточки |
-|---|---|---|---|
-| R01 | [#27](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/27) | Identity → helper restart → same-boot hello; установленная версия независима от build-cache. | 005, 037, 038, 041 |
-| R02 | [#28](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/28) | Журнал/outbox → IPC reconnect → result paging → stop с сохранённым owner. | 011, 027, 028, 033 |
-| R03 | [#29](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/29) | Exact expected-turn steer независимо от длины истории. | 012 |
-| R04 | [#30](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/30) | Вопросы и approvals не теряются и не воскресают при refresh. | 025 |
-| R05 | [#31](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/31) | Кандидат exact Attempt; outer/inner dispatch identity согласованы. | 004, 023 |
-| R06 | [#32](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/32) | Единый work context; code-scope admission; явная разрешённая связь двух заданий. | 001, 002, 008, 013, 015, 021 |
-| R07 | [#33](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/33) | Proposal digest → manager ratification → terminal thread/Concilium. | 003, 018, 019, 020 |
-| R08 | [#34](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/34) | Durable sequence → inbox cursor → watch → subscription cutoff и resync. | 006, 007, 009, 010, 014 |
-| R09 | [#35](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/35) | Замена exact reviewer, исторические late results, bounded review.list. | 026, 029 |
-| R10 | [#36](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/36) | Точная выборка automation ID; диагностика не откатывает disable. | 039, 040 |
-| R11 | [#37](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/37) | Host failure и runtime aliases проходят соответствующие проверенные codecs. | 035, 036 |
-| R12 | [#38](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/38) | Независимые due sources, no-progress backoff, справедливая issuance очередь. | 030, 032 |
-| R13 | [#39](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/39) | Capacity evidence и exact lease release; корректная область collision report. | 016, 017, 022, 031 |
-| R14 | [#40](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/40) | Удаление production зависимости kernel-host → MCP без потерянных callers. | 034 |
+**Приоритет реализации:** R01, R05, R06 и завершение R10. Независимые R02–R04 можно готовить рядом. Это не требование одновременно запустить определённое число менеджеров.
 
-## 2. Порядок реализации без искусственной общей блокировки
+## 2. Проверка кода — отдельный статус
 
-Существующий [PR #26](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/26) отвечает за compiler baseline. Не копировать его исправления в 14 веток и не считать его body доказательством нового успешного Clippy. Для затронутого пакета взять актуальный исправленный main либо явно фиксировать существующий compiler blocker; незатронутые пакеты не ждут весь backend.
+- [#26](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/26), head `e3d1f6f0f38b81639bc72c3dd84d823c0287135f`, остаётся открытым compiler-baseline PR. Его body содержит отчёт автора, не новое доказательство успешной сборки нашей серии. Не копировать одни compiler fixes во все ветки и не менять owner policy ради красного CI.
+- [#37, CI 37701138311](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37701138311) повторно прочитан: formatting failed на Windows/Linux; Clippy и integration steps skipped. Документация прошла. Пять незатронутых source-файлов из ранее прочитанного Linux log остаются отдельным baseline-formatting долгом, не повод глобально форматировать их из R11.
+- [#30, CI 37697108986](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37697108986): сохранённый результат предыдущего прохода — docs/JS syntax success; SDK import/selftest/native не квалифицированы. Head PR сейчас повторно прочитан; новый запуск CI не выполнялся.
+- Для #36 сохранена проверка diff/плана SQL и неудачная локальная попытка Clippy (`cargo` отсутствовал). Это не passing Store test и не Rust qualification.
 
-**Независимые работы:** R01–R06, R08–R12. Это возможность параллельной подготовки на непересекающихся символах, а не требование запустить одиннадцать менеджеров. По приоритету сначала R01, R05, R06, R10; adapter-local R02–R04 могут идти рядом.
+Практический следующий шаг владельца compiler baseline: закончить #26 и необходимое форматирование его проверяемой базы в одном согласованном участке, затем повторить минимальный gate. **Не сливать автоматически.** Остальные менеджеры продолжают код/документацию; blocker итоговой сборки указывают конкретным package/diagnostic и SHA.
 
-**Действительные связи:** R06 → R07 и R06 → R13. Эти consumers используют итоговый work context; второй context/fingerprint не создавать. R08/R09 готовятся на своих функциях, при интеграции принимают общий тип R06.
+## 3. Что читать новому агенту
 
-**Порядок предотвращения конфликтов, не runtime-зависимость:** R07/R08/R09 → R14. Перенос frontend-границы выполняется после стабилизации их новых методов/схем. Остальные блоки ждать R14 не должны.
+Нужен файл выбранного задания в его PR, а не все аудиты и комментарии. Каждое задание содержит цель, существующие symbols, порядок изменения producer → consumer, constraints, сценарии результата и scoped gate. Для R01/R02/R05 добавлены таблицы пограничных состояний; предлагаемый новый API явно помечен как новый.
 
-R10, R11 и R12 не зависят друг от друга: конфигурация, event projection и scheduler pacing имеют разных владельцев. Нумерация R01–R14 не означает обязательное последовательное выполнение всех четырнадцати.
+Быстрый вход в уже имеющейся рабочей копии (чтение, не создание нового worktree):
 
-## 3. Владение общими участками
+```sh
+git status --short
+git rev-parse HEAD
+git diff --stat origin/main...HEAD
+```
 
-| Общий участок | Единственный владелец конкретного изменения |
+Сверить фактические refs; не доверять локальному origin/main как свежему без обычной синхронизации. Не делать reset/stash/clean поверх чужой работы. Нормы: [owner-decisions](../../owner-decisions.md) §1.2–1.4, [modularity](../../agent-operations/modularity.md) §2–3. Ветка и brief не заменяют Task/Attempt/candidate identity.
+
+После чтения строить одну завершённую функцию продукта, не ещё один общий framework. У каждого нового helper должен быть реальный production caller в том же PR. «Написан тип» или «прошёл docs CI» не равно выполненному заданию.
+
+## 4. Зависимости: реальные и только интеграционные
+
+```text
+R06 (#32) → R07 (#33), R13 (#39): общий work context
+R07/R08/R09 → R14 (#40): порядок переносов frontend, чтобы избежать конфликтов
+```
+
+R08/R09 могут готовиться отдельно и принять общий context при интеграции. R10/R11/R12 независимы друг от друга. R01/R02/R05 не ждут нового context из R06: их проверяемые identity уже доступны. Номер PR не задаёт последовательный конвейер из четырнадцати шагов. Красный чужой package не превращает документальную работу или независимый adapter в BLOCKED.
+
+## 5. Владельцы общих функций
+
+| Участок | Разделение изменений |
 |---|---|
-| `store/coordination.rs` | R06: context/registration/fingerprint/participant listing/normalize_send. R07: proposal/decision. R08: inbox и delivery index. R09: только review-specific pending/bind guards. |
-| `store/code_scopes.rs` | R06: propose/accept identity и expiry-before-override. R13: active/conflict readers, collision domain. R07 использует current-scope projection, не переписывает её. |
-| `store/submissions.rs` | R05: candidate provenance. R09: только review replacement/disposition seam. |
-| `swarm-contracts/src/runtime.rs` | R05: согласованность dispatch receipt. Adapter PR не создаёт вторую версию этого валидатора. |
-| `store/mod.rs` | Только необходимые named dispatch/codec hooks. R11: host terminal event producer. Глобальное форматирование/перестановки запрещены в параллельных ветках. |
-| `swarm-supervisor` / OpenCode owner | R01: общий supervisor/helper. R02: Child и native-owner состояние внутри OpenCode adapter. |
-| MCP/CLI и METHOD_REGISTRY | R07/R08/R09: необходимые additions без переноса файлов. R14: последующий перенос общего data-only seam и удаление фасада. |
+| `store/coordination.rs` | R06: context/registration/fingerprint/participant listing/normalize_send. R07: proposal/decision. R08: inbox/delivery index. R09: review-specific bind/pending guards. |
+| `store/code_scopes.rs` | R06: propose/accept identity и expiry-before-override. R13: active/conflict readers и collision domain. |
+| `store/submissions.rs` | R05: candidate provenance и связанный artifact read. R09: review replacement/disposition seam. |
+| `swarm-contracts/src/runtime.rs` | R05: outer/inner dispatch receipt; остальные adapters используют этот validator. |
+| `store/mod.rs` | Только необходимые named dispatch/codec hooks; R11 — terminal producer. Не глобальный рефакторинг dispatcher из соседней задачи. |
+| Supervisor / OpenCode | R01: общий helper/receipt/status. R02: NativeOwner/Child и его outer run loop внутри adapter. |
+| MCP/CLI/registry | R07/R08/R09 добавляют необходимые формы без перестановки файлов; R14 выполняет последующий data-only перенос. |
 
-Если двум заданиям действительно нужна одна функция, изменения этой функции делает один владелец; второй использует согласованный результат и перебазирует ветку. Совпадение имени файла само по себе не повод объявить весь PR заблокированным. Несовместимые изменения интерфейса нельзя маскировать shim или резервной копией.
+Одну функцию правит один владелец. Второй использует согласованный результат; совпавший filename не требует остановить весь PR. Writer не получает собственный worktree и не запускает Cargo. Manager интегрирует и проверяет весь кандидат.
 
-## 4. Как исполнять и сдавать
+## 6. Доноры: функция, гарантия, ограничение
 
-Один manager — один worktree. Manager может делегировать непересекающиеся внутренние участки; writer не запускает Cargo. Задание включает producer, handler, persisted fact и reader — нельзя сдать отдельно новый DTO без подключённых потребителей.
+| Источник | Применить | Не переносить / ограничение |
+|---|---|---|
+| [Tokio watch 1.53.1](https://docs.rs/tokio/1.53.1/tokio/sync/watch/struct.Sender.html) | In-place `send_modify`/`send_if_modified` для R01 | `false` у send_if_modified не откатывает mutation; status не durable receipt, guard нужен отдельно. |
+| [Tokio Child 1.53.1](https://github.com/tokio-rs/tokio/blob/75fef53d0a8590c2d1dbb63672aa7b7d1ef51155/tokio/src/process/mod.rs#L1334-L1410) | Cancel-safe `wait(&mut self)` и последующий `try_wait` для R02 | Не сохраняет внешний owner при выходе caller; не разрешает kill чужой process family. |
+| [Command journal](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-adapter-command/src/journal.rs#L991-L1061) | Private temp/file sync/directory sync как образец последовательности | private `write_replace_bytes` отвергает different existing bytes; не готовый salvage и не импорт соседнего adapter crate. |
+| [ELIOT sealed Claude origin](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-kernel-host/src/store/results.rs#L206-L410) | Вернуть проверенный origin и сравнить его с expected Attempt в R05 | Ещё один self-consistency hash не доказывает принадлежность ожидаемой работе. |
+| [RMCP schema utilities](https://github.com/modelcontextprotocol/rust-sdk/blob/08e021153ef0530aeb0bb406ebb360a38cfb8ee4/crates/rmcp/src/handler/server/common.rs) | Immutable schema reuse для R14 | Thread-local cache; schema_for_input меняет title/description; не готовый exact-byte cache ELIOT. |
+| CCCC / Paseo | R08: locality чтения и ownership subscription; ссылки в его задании и аудите | Не второй ledger, TS session manager или владение Task со стороны observer. |
 
-В каждом файле указаны документация с адресным разделом/темой, символы, 4–5 шагов, критерии поведения, ограничения и минимальная команда gate. Читать сначала эти источники, не весь архив аудита. Документация с закреплённым SHA фиксирует доказательство, не требует downgrade native runtime.
+SHA/API-версия — источник проверки, не инструкция обновить установленный runtime. В этой поставке donor-код не скопирован и зависимости не изменены.
 
-Сначала код, затем scoped formatting и минимальный warnings-denied Clippy на итоговом кандидате; для чисто JS-изменения Muse — проверка синтаксиса. Полные тесты, native/live и нагрузочные прогоны относятся к итоговой фазе и сейчас автоматически не запускаются. Будущие критерии поведения не отмечать выполненными без фактического доказательства.
+## 7. Готовность поставки
 
-Сдача в том же PR: exact candidate SHA, какие producer/consumer теперь связаны, что удалено как дублирование, реальный вывод gate, оставшаяся неопределённость. Пока в diff только Markdown-задание, сохранять Draft и не сливать его как исправление. Ни один из этих PR не включает автоматическое закрытие старых Issues, изменение labels или merge.
+Сначала законченный код; затем manager выполняет scoped formatting и минимальный warnings-denied Clippy из задания. Для JS-only — соответствующий syntax gate. Полные tests/native/load остаются итоговой фазой; не запускать их от writer и не отмечать будущие сценарии выполненными.
 
-## 5. Что намеренно не включено
+Сдача в том же PR: `candidate SHA → изменённый путь и callers → удалённые дубли → выполненная команда/exit → оставшееся`. Не нужны новый журнал прогресса на каждый агент и дополнительные файлы-сдачи. Обновлять существующую карточку/PR body, а не заставлять исполнителя искать актуальный план среди комментариев.
 
-Не переносить в реализацию опровергнутые обвинения: обычный non-force push не затирает расходящуюся ветку; review assignment уже имеет role/sponsor guard; accepted runtime outcome имеет рабочий direct codec; конечная issuance очередь не доказана как навсегда потерянная.
-
-Не вводить новый workflow engine, broker, IAM, второй Store, массовый `Value`-рефакторинг или автоматические kill/rotation по молчанию. Не удалять authoritative evidence по LRU. Рекомендации расширения recovery/межзадачного сотрудничества обозначены как расширения, а не как якобы уже существующая политика.
-
-Доноры — конкретные механизмы: собственный Command journal для публикации файлов; имеющийся Tokio watch для атомарного status update; CCCC для locality чтения; Paseo для ownership подписки. Перенос их целых runtime/store не требуется.
-
-## 6. Источники и статус публикации
-
-[Owner decisions](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/owner-decisions.md), [модульная архитектура](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/agent-operations/modularity.md) и узкие ссылки внутри заданий определяют границы. Frozen policy text не переписывается ради обхода проверки.
-
-На момент создания серии: опубликованы только спецификации; исправления продукта, Rust-сборка, Clippy, тесты и native-квалификация в этой работе не выполнялись. Main и существующие PR #24/#26 не изменялись. Каждый PR и его ветка возвращены GitHub API; список #27–#40 повторно прочитан после создания.
+В текущем проходе меняются только R01/R02/R05, эта карта и описания PR. Нового product-кода, merge, private config, native processes, credentials, БД и policy-изменений нет. Проверка Markdown не является Clippy или проверкой поведения будущего Rust-кандидата.
