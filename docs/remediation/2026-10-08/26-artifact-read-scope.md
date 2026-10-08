@@ -1,66 +1,67 @@
 # R26. Artifact scope: один grant для metadata, bytes, parts и assembly
 
-**Статус:** implementation handoff. В текущей ветке production-код ещё не изменён.
+**Статус:** implementation handoff. Production-код ещё не изменён.
 
 **База проверки:** `40591a295af94b1541ec2ba30afe8e3247701a71` (`main`, 2026-10-08). Перед реализацией сравнить актуальный `main`; уже исправленное не переписывать.
 
 ## 1. Подтверждённый разрыв
 
-Artifact surface использует четыре разные authorization semantics:
+Artifact surface использует четыре разные semantics:
 
 | Путь | Текущий guard |
 |---|---|
-| `artifact.get` → `results::describe` | только Module deny; script kinds дополнительно `scripts::authorize_artifact_read`; остальные kinds доступны любому non-Module principal |
-| `artifact.read` → `Store::read_artifact` | `reviews::authorize_artifact_read`; но helper сразу `Ok(())` для любого non-Participant; script kinds отдельно защищены |
-| `artifact.parts` → `assembly::parts` | Principal не передаётся; assembled manifest доступен глобально |
-| `artifact.assemble` | только role Manager/Operator; source pages проверяются на existence/integrity, но не на право caller читать их |
+| `artifact.get` | Module deny; script kinds separately scoped; остальные kinds доступны любому non-Module principal |
+| `artifact.read` | review helper ограничивает Participant, но сразу `Ok(())` для любого non-Participant; script kinds separately scoped |
+| `artifact.parts` | Principal не передаётся |
+| `artifact.assemble` | Manager/Operator role; source-page read authority не проверяется |
 
-MCP Observer profile дополнительно выставляет `artifact.get/read/parts`, поэтому разрыв не ограничен direct IPC.
+Следствие: unrelated Manager или Role::Observer может получить metadata/bytes Task/native/check artifacts; Manager может собрать известные page IDs, которыми не владеет.
 
-Следствие:
+Content digest доказывает bytes. Он не доказывает право раскрытия.
 
-- unrelated Manager/Observer может получить metadata и bytes `source_snapshot`, `task_submission`, `check_result`, `check_output`, `native_result_page`, `native_result`;
-- Manager может собрать arbitrary known page IDs в новый `native_result`, даже если не имеет права читать source pages;
-- право assembler Operation фактически становится правом на чужое содержимое;
-- integrity (digest/content-address) смешана с confidentiality/authority.
+## 2. Observer correction
 
-Content digest доказывает, какие bytes сохранены. Он **не** доказывает, кому их разрешено раскрывать.
+`observer` — frontend profile. Default `local-observer` может использовать verified local Operator credential и должен сохранить глобальную read-only диагностику.
 
-## 2. Результат
+Поэтому R26 **не удаляет artifact methods из observer profile** как object-security fix.
 
-Одна функция разрешает exact retained artifact и выдаёт уровень доступа:
+| Same observer profile | Object result |
+|---|---|
+| verified local Operator credential | global bounded Diagnostic artifact access |
+| exact current Manager/Participant/Reviewer relation | scoped access |
+| separate Role::Observer without relation | NOT_FOUND |
+
+R24 checks live method membership before IPC. R26 checks exact artifact object in Store.
+
+## 3. Result
+
+One resolver controls all public artifact operations:
 
 ```text
 Principal + ArtifactRecord + retained provenance
-→ ArtifactReadGrant { Metadata | Bytes | Assemble, basis, scope }
-→ artifact.get / read / parts / assemble
+  -> ArtifactReadGrant { Metadata | Bytes | Assemble, basis, domain }
+  -> artifact.get / read / parts / assemble
 ```
 
-Все четыре paths используют один resolver. `ArtifactFiles` остаётся чистым integrity/file-I/O слоем и не знает principals.
+`ArtifactFiles` remains an integrity/file-I/O layer and never sees Principal.
 
-Assembled artifact наследует authorization источников. Caller, который создал assembly Operation, не становится владельцем чужих source bytes.
+Assembled artifact inherits source-page authority. Assembly caller does not become owner of foreign bytes.
 
-No external CAS service, signed URL framework, ACL table, IAM engine или duplicated artifact registry.
+No external CAS/IAM/signed URL service, ACL table or duplicated artifact registry.
 
-## 3. Scope and dependencies
+## 4. Dependencies and scope
 
-R26 зависит от:
+Reuse:
 
-- R25/#51 `TaskGraphIdentity/TaskReadGrant` для Task-bound artifacts;
-- R23/#49 Operation read scope для exact caller/on-behalf provenance;
+- R25/#51 `TaskGraphIdentity` and Task grants;
+- R23/#49 exact Operation relation;
 - existing script artifact authorization;
 - R05/#31 normalized candidate provenance;
-- R22/#48 CheckRun/acceptance evidence identities.
+- existing result page/command/Claude validators.
 
-R26 не меняет:
+R26 does not change binary formats, CheckRunner execution, native result collection, candidate semantics or object ownership policy.
 
-- artifact integrity/file format;
-- result page production;
-- Task submission/candidate semantics;
-- CheckRunner process execution;
-- object ownership rules themselves.
-
-## 4. One internal artifact identity
+## 5. One internal identity
 
 ```rust
 pub(super) enum ArtifactDomainIdentity {
@@ -80,146 +81,78 @@ pub(super) struct NativeResultIdentity {
 }
 ```
 
-Artifact kind selects one closed decoder. Unknown kind is already rejected by `results::get`/`ArtifactFiles::path`.
+Kind selects one closed decoder. Metadata alone is not authority; every decoder cross-checks retained producer facts.
 
-Do not trust artifact metadata in isolation. Every decoder cross-checks its retained producer:
+## 6. Kind-specific provenance
 
-- source Operation;
-- Task/Attempt/candidate/check/submission row;
-- normalized module receipt/provenance;
-- script registry/run;
-- assembly source pages.
+### task_submission
 
-## 5. Kind-specific provenance
+Cross-check immutable submission document, settled `task.submit` Operation, Task/Attempt/revision/candidate/digest/length. Derive TaskGraphIdentity.
 
-### 5.1 `task_submission`
+### source_snapshot
 
-Use exact current `submissions::document`/Operation checks:
+Cross-check exact `source.capture` Operation/result, metadata Task/Attempt/revision/commit/tree/coverage and current retained artifact identity.
 
-- metadata Task/Attempt/revision/candidate/operation;
-- exact settled `task.submit` result;
-- artifact digest/length match immutable document;
-- derive `TaskGraphIdentity`.
+### check_result / check_output
 
-Participant owner/producer read remains through current exact candidate/submission authorization. Manager/GM requires Task scope. Assigned reviewer requires exact assignment submission/candidate scope.
+Check row, `check.run` Operation, exact Attempt/candidate/profile and artifact metadata agree. Derive TaskGraphIdentity.
 
-### 5.2 `source_snapshot`
+### native_result_page
 
-Require metadata:
+Use current result admission validators:
 
-```text
-task_id
-attempt_id
-task_revision
-commit/tree/file_count/coverage
-```
-
-Cross-check exact source.capture Operation/result, Attempt and candidate relationship. Current Task manager/participant/reviewer rules derive from TaskGraphIdentity. Artifact caller may read its own bounded receipt only if current existing policy permits that source actor.
-
-### 5.3 `check_result` and `check_output`
-
-Derive exact CheckRun:
-
-- check row names artifact as result/output;
-- check.run Operation names exact Attempt/candidate/profile;
-- artifact metadata identity agrees;
-- TaskGraphIdentity from Attempt.
-
-Grant uses R25:
-
-- current manager/GM exact Task;
-- assigned reviewer exact candidate/Attempt;
-- exact check caller bounded evidence;
-- current Participant only if current canonical work/review policy already permits it.
-
-Do not expose inherited environment/raw secrets. Metadata projection stays current public/redacted shape.
-
-### 5.4 `native_result_page`
-
-Validate the same provenance used for result admission/assembly:
-
-- artifact metadata operation ID;
+- operation ID;
 - binding/generation;
-- selector and source identity;
-- normalized origin/producer or adapter-specific exact source;
-- page offset/length/EOF/digest;
-- source Operation and Task/Attempt where available.
+- selector/source identity;
+- normalized producer or adapter-specific exact provenance;
+- offset/length/EOF/digest;
+- Task/Attempt where present.
 
-Use existing validators from `results`, `normalized_result`, `command_results`, Claude/Antigravity status paths. Do not create a weaker generic decoder.
+Do not create a weaker generic decoder.
 
-Grant is inherited from exact source Operation/Task/binding relation. Merely knowing artifact ID is insufficient.
+### native_result
 
-### 5.5 `native_result`
+Validate exact settled assembly Operation and all parts:
 
-Assembled metadata contains:
+1. parts exist and cover exact bytes;
+2. ordered identity/digest/EOF remains valid;
+3. all parts share one semantic source identity;
+4. principal has compatible grant for each source part;
+5. assembled grant is the narrowest/intersection of source grants;
+6. assembly caller does not widen authority.
 
-```text
-assembly_operation_id
-identity
-parts[]
-coverage
-byte_length/sha256
-```
+### script kinds
 
-Validate:
+Reuse `scripts::authorize_artifact_read`. Do not translate script domain into TaskGraphIdentity unless its retained contract actually contains one.
 
-1. exact settled `artifact.assemble` Operation;
-2. every part exists and matches ordered identity/digest/coverage;
-3. all parts resolve to the **same semantic source identity**;
-4. caller has a grant for each part;
-5. assembled grant is intersection/narrowest grant of parts;
-6. assembly caller does not widen the grant.
-
-If one source part becomes damaged/unavailable, metadata/read/parts returns explicit artifact damage/gap; it does not silently authorize via assembly Operation owner.
-
-### 5.6 Script kinds
-
-Keep `scripts::authorize_artifact_read` as the authoritative domain-specific check. Wrap it in the common resolver, do not translate script bundle/run scope into TaskGraphIdentity unless the script contract actually contains one.
-
-## 6. ArtifactReadGrant
+## 7. Grant and authorized record
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ArtifactReadLevel {
     Metadata,
     Bytes,
     Assemble,
 }
 
-pub(super) struct ArtifactReadGrant {
-    pub level: ArtifactReadLevel,
-    pub basis: ArtifactReadBasis,
-    pub domain: ArtifactDomainIdentity,
+pub(super) enum ArtifactReadBasis {
+    LocalOperator,
+    CurrentTaskManager,
+    CurrentGmTaskScope,
+    CurrentParticipantCandidate,
+    AssignedReviewerCandidate,
+    ExactCheckCaller,
+    ExactResultOperationCaller,
+    ValidatedOnBehalfTaskScope,
+    ScriptScope,
+}
+
+pub(super) struct AuthorizedArtifact {
+    pub record: ArtifactRecord,
+    pub grant: ArtifactReadGrant,
 }
 ```
 
-Positive bases:
-
-```text
-LocalOperator
-CurrentTaskManager
-CurrentGmTaskScope
-CurrentParticipantCandidate
-AssignedReviewerCandidate
-ExactCheckCaller
-ExactResultOperationCaller
-ValidatedOnBehalfTaskScope
-ScriptScope
-```
-
-Observer role alone grants nothing.
-
-Exact caller does not automatically get every byte forever. Caller basis must correspond to the producer Operation and current/historical policy of that artifact kind.
-
-## 7. One resolver
-
-Add small module:
-
-```text
-store/artifact_read_scope.rs
-```
-
-API:
+Resolver:
 
 ```rust
 pub(super) fn resolve_artifact_read(
@@ -227,36 +160,20 @@ pub(super) fn resolve_artifact_read(
     principal: &Principal,
     artifact_id: &str,
     requested: ArtifactReadLevel,
-) -> Result<Option<ArtifactReadGrant>>;
+) -> Result<Option<AuthorizedArtifact>>;
 ```
 
-Sequence:
+Load/validate once. get/read/parts do not independently reopen provenance from artifact ID.
 
-1. `current_principal` already applied by caller;
-2. load exact ArtifactRecord once;
-3. decode/cross-check provenance by kind;
-4. resolve domain-specific principal relation;
-5. require `grant.level >= requested`;
-6. return grant + record to avoid second divergent load.
+Observer role alone grants nothing. Exact caller basis still requires producer-specific historical/current policy; it is not unconditional permanent byte access.
 
-Prefer:
+## 8. artifact.get
 
-```rust
-pub(super) struct AuthorizedArtifact {
-    pub record: ArtifactRecord,
-    pub grant: ArtifactReadGrant,
-}
-```
-
-Do not load/validate the same artifact separately in get/read/parts.
-
-## 8. `artifact.get`
-
-Replace `results::describe` public behavior with:
+Replace public raw `results::describe` path:
 
 ```text
 resolve Metadata
-→ closed public artifact projection
+→ closed projection
 ```
 
 Projection:
@@ -270,180 +187,141 @@ bounded public_metadata
 scope summary permitted by grant
 ```
 
-No internal relative_path, raw provenance receipts, tokens or full source frames.
+No relative path, raw module receipts, tokens or full source frame.
 
-`results::get` remains internal loader.
+`results::get` becomes internal loader.
 
-## 9. `artifact.read`
+## 9. artifact.read
 
-Current byte I/O flow is good after authorization:
+Current post-authorization file flow is sound:
 
 ```text
-DB authorization + record
+DB authorization + immutable record
 → off-thread verified range read
 ```
 
-Replace `reviews::authorize_artifact_read` + script special case with one `resolve Bytes` call.
+Replace review/script endpoint-specific checks with one `resolve Bytes`.
 
-Do not reauthorize after file read as if it could undo disclosure. Authorization and immutable record are captured first; file read verifies exact committed bytes. Revocation after authorization affects later calls, not already returned bytes.
+Revocation after authorization affects later calls; it cannot revoke bytes already returned. No retry/model/vendor call.
 
-No retry or model call.
+## 10. artifact.parts
 
-## 10. `artifact.parts`
+Pass Principal and resolve assembled artifact at Bytes level. Validate manifest and source authority before returning part refs.
 
-Pass Principal. Resolve assembled artifact at Metadata or Bytes level (choose Bytes because part IDs expose retrievable content identity). Validate manifest and return only authorized part references.
+Do not trust `metadata.parts` alone. Malformed manifest is `ARTIFACT_DAMAGED`, not client INVALID_PARAMS.
 
-Each part need not repeat a full principal resolver if assembled provenance was verified in one function, but resolver must prove all parts share the same/narrower grant. Do not trust `metadata.parts` array alone.
-
-Cursor/limit remains bounded; malformed part manifest is `ARTIFACT_DAMAGED`, not INVALID_PARAMS.
-
-## 11. `artifact.assemble`
+## 11. artifact.assemble
 
 ### Admission
 
-Before creating Operation:
+Before durable Operation:
 
-1. role/application mutation authority as today;
-2. parse/validate AssemblyRequest;
-3. resolve `Assemble` grant for every page_ref;
-4. require same semantic source identity and compatible grant;
-5. store exact source scope/grant digest in effective request/receipt;
-6. only then durable Operation admission.
+1. application mutation authority;
+2. parse closed AssemblyRequest;
+3. resolve `Assemble` for every page;
+4. require one compatible semantic source identity;
+5. retain admitted source-scope/provenance digest;
+6. only then queue assembly.
 
 Manager role alone is insufficient.
 
 ### Begin/recovery
 
-`assembly::begin` re-resolves exact retained pages and compares current immutable provenance to admitted scope digest. It does not require the manager still owns current Task if historical assembly recovery policy already permits exact caller readback; define this using retained caller/grant semantics, not broad current Manager role.
+Re-resolve exact retained pages and compare provenance with admitted scope digest. Historical exact caller recovery follows retained policy; it does not broaden to generic Manager.
 
-### Result authorization
+### Result
 
-The produced `native_result` stores source-derived domain identity/grant basis (or a derivable sealed scope), not only assembly Operation ID. Future read uses source scope.
+Produced `native_result` stores or can derive source-domain identity. Future reads use source scope, not assembly caller ownership.
 
-Loss/recovery remains deterministic local publication; no native retry behavior changes.
+One denied/damaged page stops before file publication.
 
-## 12. Observer/frontend changes
+## 12. Frontend consistency
 
-Remove from Observer MCP profile:
+- Keep artifact methods in observer profile for local Operator compatibility.
+- Store resolver distinguishes Operator credential from Role::Observer.
+- R24 handles current method membership before IPC.
+- Catalog/help state that artifact ID/method visibility is not read authority.
+- Tests run the same observer profile under local Operator and separate Observer credentials.
 
-```text
-artifact.get
-artifact.read
-artifact.parts
-```
+## 13. Internal callers
 
-until a named safe public artifact summary exists. Observer retains aggregate monitoring.
+Trusted internal integrity/settlement code may continue using raw `results::get` inside its transaction. Every user-facing metadata/bytes/parts path uses resolver.
 
-Manager/GM/Participant/AssignedReviewer exposure may stay where Store can resolve exact object. R24 ensures live membership before IPC; R26 still enforces object scope.
+Automation with retained on-behalf context must validate that context; it must not forge a Principal or bypass through raw loader.
 
-Update catalog docs: `assignment-read` does not grant arbitrary artifacts.
+## 14. Audit corrections
 
-## 13. Direct IPC and other callers
-
-Store resolver is authoritative for all frontends. CLI/MCP profile is not security boundary.
-
-Inventory internal callers of `results::get`:
-
-- internal validation/settlement may continue using raw loader within trusted transaction;
-- any user-facing projection/read must use resolver;
-- background automation with retained on-behalf context must use an explicit internal domain validator, not forge a Principal or bypass via `results::get`.
-
-Do not refactor every internal integrity check through public authorization.
-
-## 14. Audit corrections / bounded claims
-
-- `artifact.read` is not generally protected for Manager/Observer: current review helper returns Ok for every non-Participant.
-- Script artifacts are already separately scoped; do not claim they are globally exposed.
-- Participant work/review candidate paths already have exact checks; preserve them.
-- Content-addressed IDs prevent byte substitution, not unauthorized disclosure.
-- No claim is made that artifact IDs are secret; authority is required even when ID is known.
+- `artifact.read` is not globally protected: review helper permits every non-Participant.
+- Script artifacts already have separate authorization; do not call them globally exposed.
+- Participant candidate/submission and reviewer candidate paths already have exact checks; preserve them.
+- Artifact IDs need not be secret; knowing ID still grants nothing.
 
 ## 15. Donors
 
-Primary donors are internal exact validators:
+Primary donors are internal validators:
 
-- `submissions::authorize_participant_artifact_read`;
-- `reviews::authorize_artifact_read` Participant branch;
-- `scripts::authorize_artifact_read`;
-- `normalized_result`/Claude/command result provenance validators;
-- `ArtifactFiles::assemble` source identity/coverage plan;
-- R25 TaskGraphIdentity and R23 OperationReadGrant.
+- participant artifact authorization;
+- assigned reviewer candidate authorization;
+- script artifact authorization;
+- normalized/command/Claude result provenance;
+- assembly identity/coverage plan;
+- R25 TaskGraphIdentity and R23 Operation relation.
 
-External object stores often use signed URLs/ACL metadata. That would duplicate local Store authority and complicate offline local IPC. No external CAS/IAM dependency.
+External signed URL/ACL systems duplicate local Store authority and are not needed.
 
-Goose verified-bytes pattern still applies: after one authorization/provenance validation, pass exact `AuthorizedArtifact` downstream; do not reopen identity from arbitrary ID in every layer.
+Goose verified-bytes pattern applies: pass one `AuthorizedArtifact` downstream instead of reopening identity in every layer.
 
-## 16. Files/symbols
-
-Primary:
+## 16. Files
 
 - new `store/artifact_read_scope.rs`;
-- `store/results.rs::{get,describe}` internal/public split;
+- `store/results.rs` internal loader/public projection split;
 - `Store::read_artifact`;
 - `store/assembly.rs::{reserve,begin,parts}`;
-- artifact assembly metadata/provenance only where needed;
-- `store/reviews.rs` and `store/submissions.rs` existing participant helpers reused;
-- `store/scripts.rs` existing script helper reused;
-- MCP profiles/catalog/docs/tests.
+- assembly metadata only where source-domain retention is required;
+- existing review/submission/script/result validators reused;
+- MCP docs/tests only where claims/fixtures change.
 
-Coordinate with R25/#51 and R23/#49 before shared frontend edits.
+Coordinate shared types/frontend edits with R23/R24/R25 through one integration owner.
 
 ## 17. Removal list
 
 After migration remove:
 
 - non-Participant `Ok(())` as generic artifact authorization;
-- public raw `results::describe` without domain scope;
+- public unscoped `results::describe`;
 - Principal-free `assembly::parts`;
 - Manager-role-only assembly admission;
-- duplicate script/review special cases in each endpoint;
-- Observer artifact tools;
-- any assembly-result rule that grants access from assembler caller alone.
+- repeated endpoint-specific review/script branches;
+- assembly caller ownership of result bytes.
 
-No compatibility union or hidden unscoped fallback.
+Do **not** remove artifact methods from observer profile solely as object-security fix.
 
 ## 18. Criteria
 
-### Authorization
-
-- [ ] Unrelated Manager/Observer cannot get/read/parts Task/native/check artifacts.
-- [ ] Current Task manager/GM can read exact Task artifacts.
+- [ ] Same observer profile + local Operator reads global bounded artifact diagnostics.
+- [ ] Same profile + unrelated Role::Observer cannot get/read/parts Task/native/check artifacts.
+- [ ] Current Task manager/GM reads exact Task artifacts.
 - [ ] Participant reads exact current candidate/submission only.
-- [ ] Assigned reviewer reads exact assigned candidate/check evidence only.
-- [ ] Script artifacts preserve script-specific authorization.
-- [ ] Local Operator retains diagnostic access.
-- [ ] Direct IPC and MCP return same object decision.
-
-### Assembly
-
+- [ ] Assigned reviewer reads exact candidate/check evidence only.
+- [ ] Script authorization remains exact.
 - [ ] Manager cannot assemble pages it cannot read.
-- [ ] All pages require one semantic source identity and compatible grant.
-- [ ] Assembled result inherits source scope, not assembler ownership.
-- [ ] Recovery revalidates admitted source scope and never broadens it.
-- [ ] `artifact.parts` cannot reveal manifest/IDs without artifact grant.
-- [ ] One unauthorized/damaged page prevents assembly before file publication.
-
-### Integrity/non-regression
-
-- [ ] Existing digest/range/EOF/source identity checks remain.
-- [ ] File I/O stays off Store thread.
-- [ ] Authorization does not invoke model/vendor service.
-- [ ] No new artifact table/service/ACL engine.
-- [ ] Public metadata remains bounded/redacted.
+- [ ] All assembled pages share semantic source identity and compatible grant.
+- [ ] Assembled result inherits source scope, not assembler identity.
+- [ ] Denied assembly publishes no file or Operation effect.
+- [ ] Digest/range/EOF/source checks remain.
+- [ ] Direct IPC and MCP decisions match.
 
 ## 19. Implementation order
 
-One manager/worktree. Writers receive non-overlapping files and do not run Cargo.
+1. Rebase after R23/R25 grant shapes stabilize.
+2. Add kind identity decoder/resolver; wire get/read.
+3. Wire parts.
+4. Wire assembly admission/begin/result inheritance.
+5. Add public-boundary fixtures for local Operator vs Observer role and denied file publication.
+6. Remove old unscoped/duplicated paths.
+7. Scoped formatting and Clippy.
 
-1. Rebase after R25 TaskGraphIdentity/R23 Operation grant shapes stabilize.
-2. Add kind-specific identity decoder and common resolver; wire `artifact.get/read`.
-3. Wire `artifact.parts` and validate manifest through resolver.
-4. Wire `artifact.assemble` admission/begin/result inheritance.
-5. Narrow MCP profile/catalog and add public-boundary denial fixtures.
-6. Remove old endpoint-specific guards/unscoped paths.
-7. Scoped formatting and minimal Clippy.
-
-Do not merge resolver-only code without all four public callers.
+One manager/worktree; writers do not run Cargo. Do not merge resolver-only code without all public callers.
 
 ## 20. Minimal gate
 
@@ -456,16 +334,15 @@ cargo clippy --locked \
   --lib --bins -- -D warnings
 ```
 
-Broad/native tests remain final phase. Focused tests enter public Store/MCP get/read/parts/assemble paths and assert no file publication for denied assembly.
+Broad/native tests remain final phase.
 
 ## 21. Non-goals
 
-- changing artifact binary formats;
-- signed URLs/external object store;
+- artifact format changes;
+- external object store/signed URLs;
 - public artifact inventory;
-- Task/check/review semantic changes;
 - native result collection changes;
-- rewriting historical artifact metadata;
-- automatic artifact deletion/retention;
-- encrypting local artifact files;
-- making artifact IDs confidential.
+- historical metadata rewrite;
+- artifact retention/deletion;
+- encrypting local files;
+- removing observer profile methods as a substitute for Store authorization.
