@@ -1,93 +1,76 @@
-# Claude Agent SDK bridge — native integration (first slice)
+# Claude — subscription integration and implementation status
 
-Uses the complete locked `@anthropic-ai/claude-agent-sdk` **0.3.287** and its matching bundled native binary packages (`@anthropic-ai/claude-agent-sdk-<platform>` **0.3.287**). New bindings use **`claude-agent-sdk-0.3.287-bridge.3`**. The SDK is under Anthropic's Commercial Terms (see [third-party notices](../../THIRD_PARTY_NOTICES.md)); it is not a permissive open-source donor. A direct CLI canary does not qualify this SDK bridge or its host route.
+**Owner correction, 2026-10-08:** use the existing authorized subscription harness. Do not require an API key, a separate inference-billing route, a frozen SDK/CLI release, disabled vendor updates or a downgrade. Record the runtime actually used and validate the required native interfaces. A version found in this repository is evidence about its implementation, not a required version for the user's installation.
 
-## Ownership and setup
+## What this directory currently contains
 
-The bridge owns one Claude session through the SDK's streaming-input `startup()`/one-shot `WarmQuery.query()`. Host IPC exposes `module.hello/next/outcome/observe`; its credential is scoped to the reserved binding/generation and cannot accept Tasks or become GM. Native subscription/auth, tools and the model loop remain in Claude Code. The bridge is a separate process from the host; losing the host connection never closes the query or repeats input.
+This is the legacy JavaScript bridge. The reviewed source uses `@anthropic-ai/claude-agent-sdk` 0.3.287 and identifies itself as `claude-agent-sdk-0.3.287-bridge.3`. The standalone Rust adapter is separate: `crates/swarm-adapter-claude` with its existing Node SDK driver. Neither implementation's capabilities can be inferred from the other's name.
 
-1. Run `npm ci --ignore-scripts` here for the locked local SDK, not global packages or a model login.
-2. Enable a private controller route with the actual workspace and explicit model. The shipped route stays disabled. `workspaceRoot` and `modelId` are required; `modelId = 'sonnet'` is passed verbatim as the SDK's `Options.model` at open. The bridge never accepts the SDK/CLI default as a selected route model. `permissionMode` is optional, validated against the SDK enum, and frozen at open. A route `permissionMode = 'bypassPermissions'` additionally requires `allowDangerouslySkipPermissions = true` in the same route options, or open is rejected.
-3. Run the host and reserve `agent.open` with lane_id/route; retain binding_id/generation.
-4. Register the scoped module credential: `swarm client-create claude-MC --role module --binding-id BINDING --generation 1 --out PRIVATE_FILE`. Use normal host/data-dir arguments and preserve request IDs.
-5. Copy `module.example.json` outside Git; set the actual host endpoint and credential file. An optional `command` field names an explicitly selected installed native executable (absolute path, real `.exe` on Windows, not `.cmd`/`.bat`) for `pathToClaudeCodeExecutable`; when omitted, the SDK launches its own pinned bundled binary from the locked optional package.
-6. Start the module independently with the guarded launcher below, in a dedicated initially empty module-state directory separate from host data:
+These historical package/artifact values describe code that is still present. The dependency manifests and hardcoded version checks have **not** been repaired by this documentation change. In particular, the Rust driver's `prepare` currently rejects an SDK package whose version is not 0.3.287. That is an adapter defect to remove, not a reason to change the user's working runtime.
 
-```powershell
-swarm module-run --state-dir C:\SwarmModules\CC --command 'C:\Program Files\nodejs\node.exe' -- C:\SwarmCode\modules\claude\bridge.mjs --config C:\SwarmConfig\claude.json
-```
+The external SDK is used under the terms recorded in [third-party notices](../../THIRD_PARTY_NOTICES.md); it is not a permissive source-code donor. [R16](../../docs/remediation/2026-10-07/16-claude-interactions.md) defines the next connected implementation: remove the release gate, preserve the subscription route, and implement the pending callback → attention → reply path. The PR remains Draft; those runtime changes are not yet implemented.
 
-```toml
-[[routes]]
-alias = 'claude-manager'
-runtime = 'claude'
-module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.3'
-enabled = true
-[routes.native_options]
-workspaceRoot = 'C:\Projects\YourRepository'
-modelId = 'sonnet'
-```
+## Ownership and connection
 
-`node bridge.mjs --config FILE` remains an unguarded entrypoint with host-reconnect behavior but no recorded process ownership. Only its admitted open starts the native executable. No PATH, UAC or vendor service configuration is changed.
+The existing bridge owns one live SDK query. Host credentials are scoped to its binding/generation; they do not make the module a GM or permit Task acceptance. Native authorization, tools and the model loop remain with Claude Code. Host IPC reconnect must not close the query or repeat native input.
 
-## Capability matrix — this artifact
+Use the owner's current native installation and account. Resolve the executable through the owner's normal installation path for a new launch; do not retain an obsolete versioned installation path as a future launch requirement. Do not silently substitute the SDK's historical bundled executable, a new account or a separately billed API for the working subscription route.
 
-Readiness words follow the module contract: `implemented`, `documented`, `observed`, `unavailable`, `unknown`. The SDK type surface exposes more (a `resume` option, `setModel`, `applyFlagSettings`, an effort option); presence in the SDK is not evidence in this controller and grants nothing — the matrix below is the artifact's contract, and the bridge reports it verbatim in every observation under `describe.capabilities`.
+A launch still needs the actual workspace, host endpoint and binding-scoped credential. The selected model and explicit permission settings come from the current route. No example below prescribes an old model/release or enables a route. A local module credential is an ELIOT IPC credential, **not** a provider API key.
 
-| Operation | State | Boundary |
-| --- | --- | --- |
-| describe | implemented | Entrypoint, SDK version, executor version/permission mode, route-requested model, and separately the model observed in native `system/init` |
-| open | implemented | `startup()` prepares a rootless native executor without submitting a model prompt; the observed SDK session id is adopted only with the first Task input echo |
-| send (`next_turn`) / task.dispatch | implemented | Exact Task text/snapshot and echoed user UUID bind admission to the actual session; the UUID is not a native turn ID or execution completion |
-| snapshot (`agent.state`, `agent.refresh`) | implemented | Compact stream and uniquely correlated terminal-input projection (below); refresh is a read, never a native call |
-| reconcile | implemented | Bridge-local journal readback only; never resends native input |
-| attach | unavailable | No second control owner is created for an existing session |
-| resume | unavailable | The SDK option exists but is not exposed or qualified here |
-| configure (model/effort) | unavailable | No setter is wired; a route cannot claim an applied model/effort |
-| goal | unavailable | No native goal verb is exposed by this artifact |
-| steer | unavailable | Streaming input has no expected-turn correction in this mapping |
-| reply (tool permission answers) | unavailable | See permission behavior below |
-| result pages (`agent.result`) | unavailable | No pinned native item paging in this slice |
-| recover | unavailable | See recovery boundary below |
+The existing `swarm module-run` ownership boundary is preferable to launching an unguarded bridge directly. It records the process owner; it does not prove that every native capability works. Updating documentation neither launches nor changes any running process.
 
-At `agent.open`, SDK 0.3.287 `startup()` prepares an initialized subprocess and returns a one-shot `WarmQuery`; the bridge records a rootless prepared receipt without sending a model prompt. The first exact Task dispatch claims that handle once and submits `Task specification: <canonical Task snapshot>` plus the frozen Task text. Only the later native `system/init.session_id` and a native frame echoing the stamped user UUID bind the session and input to the controller. No requested UUID is promoted into native identity. If startup, first dispatch, or the bridge is lost before that receipt, the outcome stays unresolved and the SDK input is never replayed. The implementation and fixture contract are present; installed-runtime/model qualification remains unknown until observed separately.
+## Capability matrix — legacy bridge only
 
-## Stream mapping
+These are implementation facts for this directory at source 40591a295af94b1541ec2ba30afe8e3247701a71, not limits of current Claude Code.
 
-The mapper (`stream.mjs`) is pure and shared by the live path and the fixture self-test, so they cannot drift:
+| Operation | Current implementation | Boundary |
+|---|---|---|
+| describe | Present | Requested model, observed init model, executor and permission metadata remain separate. |
+| open | Present | `startup()` prepares a rootless executor; first input claims the one-shot WarmQuery. |
+| next-turn send / task.dispatch | Present | Exact Task input and echoed user UUID bind admission to the observed session. UUID is not a native turn ID. |
+| state / refresh | Present | Local compact stream projection; no new model call. |
+| reconcile | Present, bridge-local | Reads retained evidence; never repeats input. |
+| attach / resume / recover | Not exposed here | The SDK's possible resume capability does not implement controller recovery by itself. |
+| configure / goal / exact steer | Not exposed here | No invented setter or expected-turn guarantee. |
+| permission/question reply | Not exposed here | Current callback immediately denies requests that reach it. R16 implements a live round trip in the Rust+Node path. |
+| result paging | Not exposed here | No fabricated native paging contract. |
 
-- One API assistant turn arrives as several assistant frames sharing one `message.id`, each carrying the block it delivers at frame-local index 0. Blocks are appended in arrival order under that id; tool blocks dedupe by native tool id. A frame is never deduplicated as a whole message, so a repeated `message.id` cannot lose a tool block. A replayed frame (same frame `uuid`) is applied once.
-- `stream_event` partials are token deltas: counted as `partial_events_seen`, never inventoried as messages or children.
-- Child linkage comes only from complete frames: a root `Task`/`Agent` tool_use block opens a child record keyed by that tool id; subagent frames carry `parent_tool_use_id` (the bridge opens the query with `forwardSubagentText: true`, so complete child messages are forwarded, not only tool heartbeats). A child is completed/failed only by the root `tool_result` for its tool id (or a native `task_notification`); child activity alone never completes it, and family completeness stays `partial`.
-- A `result` frame closes a turn: `success` → `turn_completed`; `error_during_execution` / `error_max_turns` / `error_max_budget_usd` / `error_max_structured_output_retries` → `turn_failed` with the native subtype retained. An `error_during_execution` result before any `system/init` is an **init failure** — a distinct recorded outcome with the native `errors[]`, never an empty successful start and never an invented session identity.
-- A result contributes a compact `input_executions` receipt only when the SDK reports its actual result-frame UUID, initialized session id, terminal subtype, effective model, and client user-message UUID(s). A single-input result binds that UUID to an output digest and UTF-8 byte count; the transcript itself is not copied into controller state. If the SDK merged several queued inputs into one result, the projection marks them ambiguous and does not complete any one producer. Task/input admission and terminal execution evidence remain separate, and no SDK turn ID is invented.
-- Usage is the SDK's cumulative estimate for the query: each result's `total_cost_usd`/`modelUsage` **replaces** the previous snapshot (basis `sdk_cumulative_estimate`). Results are never summed, and a cumulative conversation cost is not a new charge. No quota is inferred from it.
-- `system/init` also fixes the observed model, permission mode and `claude_code_version` (the actual executor version, reported separately from the SDK package version). A later settings change is not claimed: this artifact exposes no configure verb, and a system-prompt snapshot is never declared updated by anything here.
-- Initial model selection comes only from the binding route's required `native_options.modelId`, passed as SDK `Options.model`. Snapshots report `model_requested` separately from `model_effective`; the latter is `unknown` until native `system/init.model` is observed. An alias such as `sonnet` is not rewritten to the resolved model ID, and an absent route model rejects open before the SDK query starts.
-- Observations are compact: block kinds/tool ids/result flags, not transcript copies. Host state keeps at most the latest 20 message summaries, 100 children and 32 turn records; overflow is counted in `gaps`, not silently dropped.
+Do not delete a real working executor before the replacement covers its required scenarios. Reading old receipts does not require keeping a second executor indefinitely.
+
+## Input and stream evidence
+
+The first Task input claims the prepared handle once. Only the native session initialization and echoed user-message identity bind the input to that session. A lost startup/query response remains unknown; the bridge must not turn uncertainty into another prompt.
+
+The legacy `stream.mjs` mapper is shared with its fixtures:
+
+- Assistant frames may share one message ID while carrying different blocks. Preserve block arrival and native tool IDs; do not deduplicate an entire message by message ID.
+- Partial stream events are token deltas, not independent messages or child inventory.
+- Child links use native tool IDs and parent_tool_use_id. Completion needs an actual tool result/task notification, not parent idle. Family coverage remains partial.
+- Native result subtypes distinguish completion, failure and initialization failure. A correlated terminal-input record requires actual native result/session/user-message evidence. Several merged input UUIDs are ambiguous, not several independently completed Tasks.
+- The legacy mapper replaces its cumulative SDK usage estimate rather than summing every result. This estimate is not remaining subscription quota or a billing invoice. Verify the current native usage contract before extending it.
+- Existing bounded summaries retain recent message, child and turn metadata and report overflow. They do not copy the whole transcript into Store.
+
+Requested model/permission choices are not proof of their effective application. Read the actual native initialization/settings evidence; no model label in a prompt or an old package manifest establishes the current runtime settings.
 
 ## Permission behavior
 
-If the route omits `permissionMode`, this bridge leaves the SDK option unset. That is **not a promise of `default` mode**: the SDK's [permission documentation](https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes) records changed omission behavior starting with TypeScript SDK 0.3.286; this module pins 0.3.287. The native executor selects its starting mode from applicable settings/defaults. Set an explicit route mode when the workflow requires one, and distinguish that request from the mode actually observed in `system/init`. This correction changes documentation, not the running configuration or artifact.
+When no `permissionMode` is supplied, the bridge omits that option. Report this as inherited/requested-unknown until the native effective mode is observed; do not fabricate `default`. Pass an explicit owner-selected mode unchanged. Do not enable bypass or force a different mode to compensate for a missing callback.
 
-`canUseTool` handles only calls that reach that stage of native permission evaluation. Earlier native rules/modes can approve a call without consulting it; `dontAsk` denies calls that would prompt instead of invoking the callback. Consequently the callback is neither a complete tool inventory nor a universal tool firewall. In this artifact, calls that do reach it are recorded in `permission_requests` and immediately denied because `agent.reply` is unavailable. Those records are **historical denials, not live pending requests that a later reply can resolve**. Native denial advisories and result evidence remain distinct from a current callback.
+`canUseTool` is not a universal interception point for every tool. Native permission evaluation can resolve a call before that callback. In this legacy bridge, calls that do reach the callback are recorded and immediately denied because reply is unavailable. Such recorded denials are **history**, not still-live requests that can be answered later.
 
-Native [permission flow](https://code.claude.com/docs/en/agent-sdk/permissions) and [approval/user-input callbacks](https://code.claude.com/docs/en/agent-sdk/user-input) were reviewed on 2026-10-07. The proposed Rust-adapter interaction slice is [R16](../../docs/remediation/2026-10-07/16-claude-interactions.md); its existence does not change this legacy artifact's capability matrix. Do not enable bypass or persistent allow rules as an implicit workaround for an unimplemented reply path.
+The R16 path keeps the real pending callback in the existing Node owner, publishes a scoped request reference, and resolves it once through the current `agent.reply` authority path. Raw input and Promise resolvers remain local. A user answer is not a new prompt; a delivered allow decision is not proof that its tool or Task finished.
 
-## Recovery boundary
+## Recovery and updates
 
-This artifact keeps no checkpoint and implements no resume. A host IPC reconnect to the same live bridge boot can keep a rootless prepared binding ready only before any possibly-sent first Task input; an unknown first dispatch remains reconciling. If the bridge process is lost, the host admits only `agent.recover`/`agent.reconcile`; the bridge answers `agent.recover` with `CAPABILITY_UNAVAILABLE`. The binding is not silently restarted, forked or given a replayed prompt: release the lane and open a new binding. The old native session is neither adopted nor killed by this module. Cross-restart continuation is a later slice and must be qualified on the installed runtime before its capability is advertised.
+A host reconnect to the same live bridge must retain existing ownership and input uncertainty. This legacy bridge has no durable resume/recover implementation; after process loss it cannot recreate a native Promise or prove that an input never ran. Preserve history and the unknown outcome rather than replaying work.
 
-## Fixtures and self-test
+For new native releases, validate the interfaces this adapter actually uses. A missing required function limits that capability; a different release number alone is not a reason to reject a working harness. Correct package loading, descriptors and consumers together, without rewriting old receipts or changing a live session's executable.
 
-`fixtures/` holds stream fixtures authored from the pinned SDK 0.3.287 message types (`sdk.d.ts`) — recorded-shape protocol examples, **not** live captures. After `npm ci --ignore-scripts`:
+[UPDATE.md](UPDATE.md) describes the corrected update boundary. Source review, syntax checks, fixture results and live subscription qualification are separate evidence. No new runtime qualification is claimed here.
 
-```powershell
-node selftest.mjs
-```
+## Verification and remaining work
 
-It asserts the SDK import surface plus the mapping boundaries above: init identity, multi-frame block assembly without loss, replay applied once, partials excluded from inventory, child linkage/completion, distinct init failure, terminal error subtypes and cumulative-usage replacement. CI runs the same check next to the Muse bridge checks.
+After implementation, the manager performs scoped formatting and the minimal Clippy gate for changed Rust packages, plus JavaScript syntax checks. Broad tests and native execution follow in the project's final qualification phase; writers do not run Cargo.
 
-## Implementation and remaining work
-
-First C08 slice for Claude: describe/open/next-turn send/snapshot over the pinned Agent SDK with fixture-verified stream mapping and explicit initial model selection. Remaining, as separate slices: attach/resume qualification on the installed runtime, configure (model/effort) with native readback, goal surface, permission replies, result pages, recorded-session recovery, then the Command and Antigravity adapters. Do not mark C08 complete from this slice.
+The existing `selftest.mjs` and authored SDK-shaped fixtures remain available for that phase. They are not live captures and do not qualify a newer runtime merely because an older fixture passed. R16 must verify subscription-route preservation, compatible updates, pending/reply/abort races, reconnect, driver loss and exact input/decision correlation. Further configure/resume/child parity must be based on actual native interfaces, not assumptions about a frozen SDK.
