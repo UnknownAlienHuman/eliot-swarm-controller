@@ -1,6 +1,6 @@
 # R25. Task graph read scope: Task/Attempt/submission/acceptance/check/family
 
-**Статус:** implementation handoff. В текущей ветке production-код ещё не изменён.
+**Статус:** implementation handoff. Production-код ещё не изменён.
 
 **База проверки:** `40591a295af94b1541ec2ba30afe8e3247701a71` (`main`, 2026-10-08). Перед реализацией сравнить актуальный `main`; уже исправленное не переписывать.
 
@@ -16,28 +16,32 @@ submissions::describe
 acceptance::describe
 checks::describe
 producers::family
-assembly::parts
 ```
 
-`agent.state/list` получает Principal, но для любого non-Operator возвращает public binding projection без Task/Attempt scope. `results::describe` принимает Principal, однако для большинства result kinds применяет authorization только к script artifacts.
+Participant/AssignedReviewer частично перехватываются exact guards до generic read. Manager и Role::Observer идут в principal-free path.
 
-Participant и AssignedReviewer частично перехватываются до generic read:
+Это противоречит documented object boundary: MCP profile задаёт методную поверхность, но не выдаёт Task ownership; `assignment-read` не должен автоматически давать global Task inventory.
 
-- exact current/historical assignment evidence;
-- scoped candidate/submission/check/artifact;
-- current participant context.
+## 2. Важная коррекция: observer frontend сохранить
 
-Manager и Observer идут в generic path. Поэтому session-fixed profile `assignment-read` фактически даёт глобальный Task/Attempt/evidence inventory, хотя документация прямо говорит:
+`observer` — frontend profile. Default `local-observer` может использовать verified local Operator credential, которому глобальная read-only диагностика разрешена.
 
-```text
-A role does not obtain a global Task inventory merely by loading this group.
-```
+Поэтому R25 **не удаляет Task/Attempt/evidence methods из observer profile** как security fix.
 
-Это отдельный object-authorization class от R23 Operation reads. Нельзя исправить его только удалением методов из MCP: direct IPC/other frontend остаётся.
+Один и тот же profile должен вести себя по credential/relation:
 
-## 2. Граница R25
+| Credential | Результат |
+|---|---|
+| verified local Operator | global bounded diagnostic view |
+| current scoped Manager/GM | exact Task graph |
+| current Participant / assigned reviewer | exact assignment graph |
+| separate Role::Observer без relation | NOT_FOUND / filtered page |
 
-R25 исправляет только объекты, которые выводят exact Task graph identity:
+R24 проверяет current method membership до IPC. R25 остаётся object authorization в Store.
+
+## 3. Scope R25
+
+R25 покрывает один coherent graph:
 
 ```text
 Task
@@ -50,25 +54,11 @@ Agent family / producer set
 
 Не входят:
 
-- generic Operation reads — R23/#49;
-- artifact metadata/bytes/pages — отдельный artifact authority slice;
-- fleet-wide binding/route monitoring — отдельный monitoring contract;
-- mutation authorization;
-- Task Prompt/Requirement semantics — R20/#46 и R22/#48.
-
-## 3. Результат
-
-Один resolver определяет current/historical read relation для exact Task graph:
-
-```text
-Principal + TaskGraphIdentity + object kind
-→ TaskReadGrant { Summary | Detail | Evidence, basis }
-→ closed projection
-```
-
-Unknown/malformed relation fail-closed. Local verified Operator retains global diagnostic access. Observer does not gain raw Task inventory by role alone.
-
-No external IAM/ACL table, no duplicate Task store, no public grant tokens.
+- Operation reads — R23/#49;
+- artifact metadata/bytes/parts/assemble — R26/#52;
+- fleet-wide binding/route monitoring;
+- mutation authority;
+- requirement/check semantics — R22/#48.
 
 ## 4. One exact identity
 
@@ -84,30 +74,28 @@ pub(super) struct TaskGraphIdentity {
 }
 ```
 
-Identity is derived from authoritative retained object, not request JSON.
+Identity derives from retained object, not request JSON.
 
-Object-specific loaders:
+Object loaders:
 
 ```rust
-fn identity_for_task(...)
-fn identity_for_attempt(...)
-fn identity_for_submission(...)
-fn identity_for_acceptance(...)
-fn identity_for_check(...)
-fn identity_for_family(...)
+identity_for_task
+identity_for_attempt
+identity_for_submission
+identity_for_acceptance
+identity_for_check
+identity_for_family
 ```
 
-Each validates internal coherence before returning identity:
+Each validates internal coherence:
 
-- Attempt Task/revision exists and matches;
-- submission document and Operation/candidate metadata agree;
-- acceptance decision and Task accepted pointers agree;
+- Attempt points to existing Task/revision;
+- submission document, producer Operation and candidate agree;
+- acceptance decision and accepted Task pointers agree;
 - CheckRun spec/Operation/Attempt/candidate agree;
-- family binding belongs to exact Attempt and producer assignments.
+- binding/family belongs to exact Attempt and producer assignments.
 
-Do not accept caller-provided Task ID as a substitute for object identity.
-
-## 5. Read grants
+## 5. One read resolver
 
 ```rust
 pub(super) enum TaskReadLevel {
@@ -124,222 +112,209 @@ pub(super) enum TaskReadBasis {
     RetainedAssignedReviewer,
     ExactObjectCaller,
 }
+
+pub(super) fn resolve_task_read(
+    db: &Connection,
+    principal: &Principal,
+    identity: &TaskGraphIdentity,
+    requested: TaskReadLevel,
+) -> Result<Option<TaskReadGrant>>;
 ```
 
-### 5.1 Local Operator
+### Local Operator
 
-`require_local_operator` → Evidence/global.
+`require_local_operator` → global Evidence.
 
-### 5.2 Current Task manager/current GM
+### Current Task manager/current GM
 
-Use existing `current_manager_has_task_scope` and exact project identity.
+Use exact Task/project/Attempt coherence plus existing `current_manager_has_task_scope`/Attempt control.
 
-- current Task/Attempt → Detail/Evidence as needed;
-- historical accepted/released Task may remain readable to exact current GM/project only where existing owner policy says successor read is retained;
-- Manager role alone is not sufficient.
+Manager role alone is not sufficient.
 
-### 5.3 Current Participant
+### Current Participant
 
-Use existing `load_current_scope_for_client` / registration/basis:
+Use current registration/basis:
 
-- exact current Task/Attempt only;
-- Task/Attempt Summary/Detail bounded;
-- own candidate/submission/check/family only through exact assignment/producer relation;
-- no full sibling/other Attempt inventory.
+- exact Task/Attempt only;
+- own candidate/submission/check/family through exact producer relation;
+- no sibling/other Attempt inventory.
 
-### 5.4 Assigned reviewer
+### Assigned reviewer
 
-Reuse review assignment scope:
+Reuse exact review assignment scope:
 
-- exact assignment Task/Attempt/submission/candidate;
-- exact linked CheckRuns and family/evidence needed by canonical reviewer contract;
-- retained historical reads remain only where existing assignment contract permits;
-- no unrelated Task list.
+- Task/Attempt/submission/candidate;
+- exact linked CheckRuns/family evidence needed by review;
+- retained history only where assignment contract explicitly permits.
 
-### 5.5 Exact object caller
+### Exact object caller
 
-For readback objects created by an Operation (check, acceptance, submission), exact caller may retain its own bounded receipt/evidence after Task transition. Caller relation does not grant the rest of Task inventory.
+Check/submission/acceptance caller may retain its own bounded receipt. This does not grant the rest of Task graph.
 
 ## 6. Closed projections
 
-### Task Summary
+### Summary
 
 ```text
 task_id
 project_id only when grant permits
 revision/state/phase
-current Attempt ID only when in scope
-accepted status/candidate refs only when in scope
+current Attempt/accepted status only when in scope
 ```
 
-No full owner policy, source index, baseline receipts or dependency evidence for Observer/unscoped caller.
+### Detail
 
-### Task Detail
-
-Exact frozen spec/brief, current Attempt and acceptance pointers for authorized manager/participant/reviewer.
+Exact frozen spec/brief, current Attempt and permitted pointers for authorized manager/participant/reviewer.
 
 ### Evidence
 
-Exact submission/check/acceptance/family receipts needed by authorized role. Still bounded and redacted; not raw internal JSON.
+Exact submission/check/acceptance/family receipts. Still bounded/redacted; never raw internal JSON.
 
-Existing `tasks::get_task`/`get_attempt` become internal loaders. Public projection is separate.
+`tasks::get_task/get_attempt` become internal loaders.
 
-## 7. Method-by-method wiring
+## 7. Method wiring
 
 ### task.get
 
-- derive identity from stored Task;
-- resolve grant;
-- return Summary/Detail.
+Derive identity from stored Task, resolve grant, return Summary/Detail.
 
 ### task.list
 
-- no global `tasks::list` to Manager/Observer;
-- bounded stable scan + exact resolver;
-- filtered rows advance scan cursor with explicit coverage;
-- first authorized-but-not-emitted row is not skipped;
-- current OFFSET pagination over mutable list is replaced by versioned stable cursor.
+Use bounded stable scan and resolver. No OFFSET over mutable list.
 
-Observer profile loses `task.get/list` until a named aggregate/public consumer exists. `swarm.dashboard` remains aggregate monitoring.
+Separate:
+
+- last scanned;
+- last emitted;
+- first authorized-but-not-emitted row.
+
+Filtered rows may advance cursor with explicit coverage. One damaged foreign row must not wedge authorized page or be mislabeled as filtering.
 
 ### attempt.get
 
-- identity from Attempt + Task;
-- exact current manager/participant/reviewer relation;
-- historical own/accepted evidence by explicit policy only.
+Exact Attempt + Task identity, current/historical relation as above.
 
 ### task.submission
 
-`submission_ref` document contains Task/Attempt/candidate identity. Resolve and authorize before pagination/projection. Existing Participant/AssignedReviewer specialized guard remains authoritative.
-
-Manager path uses TaskReadGrant; Observer removed.
+Derive identity from immutable submission document + producing Operation + candidate. Participant/reviewer specialized guard remains; Manager uses Task grant; Observer role without relation receives NOT_FOUND.
 
 ### task.acceptance
 
-Acceptance Operation/decision must bind exact Task/Attempt/candidate and accepted Task pointers. Only exact Task manager/current GM/operator or retained canonical reviewer evidence path sees it. No global observer read.
+Bind exact Task/Attempt/candidate and accepted pointers. Current manager/GM/local Operator or explicit retained evidence relation only.
 
 ### check.get
 
-CheckRun identity derives from check row + check.run Operation + Attempt + candidate. Preserve exact assigned-reviewer evidence read. Manager requires Task scope. Exact check caller may read own receipt. Observer removed.
+Check row + check.run Operation + exact Attempt/candidate/profile. Current Task scope, assigned review evidence or exact caller only.
 
 ### agent.family
 
-Binding/generation → exact Attempt/Task. Current manager/participant producer/reviewer gets bounded family projection according to role. Operator diagnostic remains global. Do not treat family observation as complete if coverage is partial.
+Binding/generation → exact Attempt/Task. Return bounded partial-aware family only to local Operator or exact current manager/participant/reviewer relation.
 
-R25 does not change `agent.state/list`; fleet monitoring needs its own explicit aggregate/scope design.
+R25 does not change `agent.state/list`; fleet monitoring needs separate explicit design.
 
-## 8. Application/frontend consistency
+## 8. Frontend consistency
 
-Update together:
+- Keep observer profile method surface for local Operator diagnostics.
+- Store resolver differentiates Operator credential from Role::Observer.
+- R24 live method membership runs before target IPC but does not replace object authorization.
+- Catalog/help must state that method visibility is not global Task inventory.
+- Direct IPC and MCP use the same Store resolver.
 
-- Store read handlers accept `Principal` or call shared resolver;
-- MCP Observer profile removes Task/Attempt/submission/acceptance/check/family assignment reads;
-- Manager/GM/Participant/AssignedReviewer profile exposure stays only where Store can authorize exact objects;
-- `mcp.authorization.allowed_methods` reflects current role/scope but does not replace object resolver;
-- R24 ensures hidden/revoked methods do not reach target IPC;
-- catalog/docs state exact object scope.
+Tests use the same observer profile with two credentials:
 
-Direct IPC gets same Store checks; MCP is not the security boundary.
+```text
+local Operator → authorized global diagnostic
+separate Observer role → unrelated object NOT_FOUND / filtered
+```
 
-## 9. Pagination and gaps
-
-One invisible object must not fail a whole list or reveal its existence through counts.
+## 9. Pagination/gaps
 
 For list-like methods:
 
 ```text
 stable source position
-→ load bounded candidates
-→ resolve grants
-→ project within item/byte budget
+→ bounded candidates
+→ exact grant
+→ bounded projection
 → explicit filtered/damaged coverage
 ```
 
-Separate filtered/unauthorized from damaged retained object. SQL/storage error remains error; missing current relation returns NOT_FOUND/filtered according to method contract.
-
-Do not use OFFSET over live rows as stable cursor.
+Do not reveal invisible object through total count or cursor side channel beyond bounded filtered coverage. SQL/storage failure remains error.
 
 ## 10. Artifact boundary
 
-R25 intentionally does not “fix” artifact access by assuming every artifact has Task metadata. Artifact kinds include script bundles/results and other scopes.
+Task projections may return artifact refs only when subsequent artifact authorization can derive the same TaskGraphIdentity. R26 owns artifact bytes/metadata and reuses this type.
 
-However Task graph projectors must return only artifact references whose later `artifact.get/read/parts` authority can be proved. Do not leak an artifact ID that generic artifact endpoints expose globally.
+R25 does not infer artifact authority from Task ID alone.
 
-A subsequent artifact-scope PR should reuse `TaskGraphIdentity` where applicable and script-specific authorization for script kinds; it must not duplicate R25.
+## 11. Audit corrections
 
-## 11. Audit corrections / bounded claims
-
-- Participant generic Task/evidence leak is not claimed where Store already intercepts with `reviews::authorize_evidence_read` or coordination scope.
-- `results::describe` is not wholly unauthenticated: script artifact kinds use script authorization. The confirmed gap is that non-script artifacts lack equivalent Task/Attempt scope.
-- `agent.state/list` are not included in R25; they expose public binding projections and require a separate monitoring decision.
-- This PR does not infer confidentiality stronger than documented local credential isolation; it enforces the project’s own object-scope contract.
+- Participant generic leak is not claimed where Store already intercepts exact review/candidate evidence.
+- `agent.state/list` are outside this slice.
+- Observer profile method presence is intentional for local Operator compatibility; global object access for every Observer credential is not.
+- This fix enforces the project’s documented object scope; it does not invent a stronger confidentiality model.
 
 ## 12. Donors
 
-Primary donors are internal:
+Use existing internal exact authorizers:
 
-- review `authorize_evidence_read`;
+- review evidence scope;
 - participant candidate/submission/check authorization;
-- `current_manager_has_task_scope`;
-- Task/Attempt frozen identity validation;
-- CheckRunner exact candidate/Attempt checks.
+- current manager Task scope;
+- frozen Task/Attempt validation;
+- CheckRunner candidate identity.
 
-Paseo/other session managers do not solve Task graph object authorization. External IAM/graph service is unnecessary.
+No external IAM/graph service/table.
 
-## 13. Files/symbols
+## 13. Files
 
-Primary:
-
-- new small `store/task_read_scope.rs`;
+- new `store/task_read_scope.rs`;
 - `store/mod.rs::read` Task/Attempt/evidence/family arms;
-- `store/tasks.rs` internal loaders vs projections/list scan;
+- `store/tasks.rs` internal loaders, projections, stable list scan;
 - `store/submissions.rs::describe`;
 - `store/acceptance.rs::describe`;
 - `store/checks.rs::describe`;
 - `store/producers.rs::family`;
-- `swarm-mcp/src/mcp/profiles.rs`, catalog/docs/tests.
+- MCP docs/tests only where claims/fixtures change.
 
-R23 handles Operation; R24 handles live method membership; coordinate frontend edits to avoid parallel writers in profiles/tests.
+Coordinate with R23/R24/R26 frontend edits through one integration owner.
 
 ## 14. Removal list
 
 After migration remove:
 
-- principal-free public Task/Attempt/evidence handlers;
-- global Observer assignment-read methods;
-- raw `get_task/get_attempt` as public projection;
-- offset pagination for Task list;
-- duplicated participant/reviewer identity derivations replaced by shared TaskGraphIdentity;
-- tests that assert only object shape but not unrelated-principal denial.
+- principal-free public Task graph handlers;
+- raw Task/Attempt projection;
+- OFFSET Task pagination;
+- duplicated Participant/reviewer identity derivation replaced by TaskGraphIdentity;
+- tests that verify only shape, not unrelated-principal denial.
 
-No compatibility union or role-only fallback.
+Do **not** remove observer methods solely as object security.
 
 ## 15. Criteria
 
-- [ ] Unrelated Manager/Observer cannot get/list Task or Attempt by ID.
-- [ ] Current manager/current GM exact project scope can read authorized Task graph.
+- [ ] Same observer profile + local Operator can inspect global bounded Task diagnostics.
+- [ ] Same profile + unrelated Role::Observer cannot get/list exact Task/Attempt/evidence.
+- [ ] Current manager/GM reads exact authorized Task graph.
 - [ ] Participant sees exact current Task/Attempt and own evidence only.
-- [ ] Assigned reviewer sees exact assignment evidence, including permitted retained history.
-- [ ] Exact check/submission/acceptance caller reads own bounded receipt but not Task inventory.
-- [ ] `task.list` filters before projection/pagination and uses stable cursor.
-- [ ] `check.get`, `task.submission`, `task.acceptance`, `agent.family` all use same TaskGraphIdentity derivation.
-- [ ] One damaged foreign object does not leak or wedge healthy authorized page.
-- [ ] Observer profile exposes aggregate monitoring, not raw assignment graph.
-- [ ] Store direct IPC and MCP produce the same authorization outcome.
+- [ ] Assigned reviewer sees exact assignment evidence and permitted history.
+- [ ] Exact object caller reads own bounded receipt, not Task inventory.
+- [ ] Submission/acceptance/check/family share TaskGraphIdentity derivation.
+- [ ] Stable list cursor does not skip authorized rows.
+- [ ] Damaged foreign object does not leak or wedge healthy page.
+- [ ] Direct IPC and MCP decisions match.
 
 ## 16. Implementation order
 
-One manager/worktree. Writers receive non-overlapping files and do not run Cargo.
-
-1. Add TaskGraphIdentity and resolver; wire `task.get/attempt.get`.
-2. Add bounded `task.list` cursor.
+1. Add TaskGraphIdentity/resolver; wire task.get/attempt.get.
+2. Replace task.list pagination.
 3. Wire submission/acceptance/check/family.
-4. Narrow MCP profile/catalog and add public-boundary denial fixtures.
+4. Add Store/MCP fixtures with local Operator vs Observer role under same profile.
 5. Remove raw/principal-free paths.
-6. Rebase R22/R09 consumers and R24 frontend edits.
-7. Scoped formatting and minimal Clippy.
+6. Rebase R22/R09/R26 consumers.
+7. Scoped formatting and Clippy.
 
-Do not merge resolver-only code without all listed production readers.
+One manager/worktree; writers do not run Cargo. Do not merge resolver-only code without all production readers.
 
 ## 17. Minimal gate
 
@@ -352,16 +327,16 @@ cargo clippy --locked \
   --lib --bins -- -D warnings
 ```
 
-Broad tests/native execution remain final phase. Focused tests enter Store/MCP public methods with unrelated/current/historical principals.
+Broad/native tests remain final phase.
 
 ## 18. Non-goals
 
 - Operation authorization;
-- artifact byte authorization;
-- fleet-wide binding monitoring;
+- artifact authorization;
+- fleet monitoring redesign;
 - mutation authority changes;
-- new IAM service/table;
-- public Task summary feature;
-- rewriting historical Task/Attempt/evidence records;
-- changing requirement/check/acceptance semantics;
-- automatic Task acceptance.
+- external IAM;
+- public Task inventory feature;
+- historical data rewriting;
+- requirement/acceptance semantics;
+- removing observer profile methods as a substitute for Store scope.
