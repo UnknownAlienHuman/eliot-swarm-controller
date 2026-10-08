@@ -10,9 +10,9 @@ This registry answers a narrower question than a product comparison: **which ext
 
 | State | Count | Meaning |
 |---|---:|---|
-| Verified donor entries | **30** | Source inspected, license recorded, transferable mechanism and rejection boundary identified |
+| Verified donor entries | **31** | Source inspected, license recorded, transferable mechanism and rejection boundary identified |
 | Previous verified set | 18 | Recorded in `33-donor-field-reviews.md` before this search campaign |
-| Added by this search campaign | **12** | Kandev, OpenHands, Kubernetes controller stack, SWE-agent family, Fabro, Cayu, systemd, Bazel REAPI, Petri, Pebble, sandbox-driver and agentsessions |
+| Added by this search campaign | **13** | Kandev, OpenHands, Kubernetes controller stack, SWE-agent family, Fabro, Cayu, systemd, Bazel REAPI, Petri, Pebble, sandbox-driver, agentsessions and Emdash |
 | Discovery candidates | not counted | Names found by broad search; no adoption claim until source review |
 
 ### One donor entry means
@@ -64,6 +64,7 @@ Searching only for `multi-agent framework` misses most relevant systems and retu
 | Tool plane | `MCP gateway`, `tool router`, `tool registry`, `policy gateway`, `agent gateway` |
 | Observability | `agent observability`, `trajectory store`, `run inspector`, `agent replay` |
 | Session contract | `durable agent sessions`, `bring your own harness`, `session narrow waist`, `replay conformance`, `session fork` |
+| Workspace authority | `workspace registry`, `remote workspace daemon`, `host-owned resources`, `workspace lifecycle`, `worktree cleanup` |
 
 ### Search passes used
 
@@ -75,13 +76,14 @@ Searching only for `multi-agent framework` misses most relevant systems and retu
 6. adjacent proven systems: controller/operator, service supervisor, remote execution/CAS;
 7. negative-evidence pass: repository issues for duplicate starts, orphaned worktrees, missing watchdogs, stale cleanup, silent partial success and accounting loss;
 8. responsibility-split pass: inspect the actual execution, agent-loop and sandbox projects underneath a product shell;
-9. neutral-contract pass: search for vendor-independent session/harness/runtime interfaces and replay conformance.
+9. neutral-contract pass: search for vendor-independent session/harness/runtime interfaces and replay conformance;
+10. direct-ADE source pass: inspect workspace ownership, remote daemon, worktree lifecycle, provider hooks and failure reports rather than only product feature lists.
 
 `kyrolabs/awesome-ade` and similar catalogues were useful discovery indexes. They are **not** donors themselves and do not qualify the projects they list.
 
 ## 3. Verified donor table
 
-The first 18 entries retain additional field evidence in `33-donor-field-reviews.md`. Rows 19–30 were verified during this search campaign.
+The first 18 entries retain additional field evidence in `33-donor-field-reviews.md`. Rows 19–31 were verified during this search campaign.
 
 | ID | Donor | License | Class | Status | Exact useful mechanism | Do not copy |
 |---:|---|---|---|---|---|---|
@@ -115,6 +117,7 @@ The first 18 entries retain additional field evidence in `33-donor-field-reviews
 | D28 | `lithoscomputer/pebble` @ `e90513f4204ff6afed9204de88c4a5a92b897579` | MIT | provider-neutral agent loop | `TAKE` | Durable coding events, continuation without replaying tools, route failover preserving queued input, committed snapshot+event cursor, explicit steering bus | Storage/process isolation, global shared “always allow” permission escalation, parent-only accounting presented as full tree cost |
 | D29 | `lithoscomputer/sandbox-driver` @ `90b0d825767105d4b42e59fdbd116c4d66b87d83` | MIT | sandbox provider protocol | `SPIKE` | One provider trait for in-process and JSON-RPC plugins, capability/conformance tests, output-loss facts, exact workspace ownership, recovery fences and checksum-pinned executables | Host provider as isolation, eventual list result as definitive absence, provider-specific identity leaking into ELIOT contracts |
 | D30 | `aramase/agentsessions` @ `e680ea10d3b420aee0453cf6b54edeaf0c73f5c8` | Apache-2.0 | durable-session narrow waist | `REFERENCE` | Neutral Session/Harness/Runtime contracts, single-writer CAS/fence log, hash-chain provenance, zero-model-call replay conformance, stateless-vs-memory-snapshot capability matching | Pre-1.0 wire as stable ELIOT API, missing auth/authz/TLS, a managed control plane or another authoritative session store |
+| D31 | `generalaction/emdash` @ `3a4406366a273880048ed7477b412a42a6a8254a` | Apache-2.0 | local/remote ADE and workspace authority | `TAKE` | Desktop-vs-host authority split, host registry as observed truth, durable deletion tombstone plus reconcile, one writer per resource, generation-fenced remote daemon and detach-not-stop session semantics | Electron product/UI, CLI detection heuristics, best-effort deletion as proof of cleanup, swallowed credential-proxy failures |
 
 ## 4. New donor evidence and ELIOT use
 
@@ -301,6 +304,41 @@ ELIOT use:
 
 Boundaries: the project is pre-1.0, explicitly has no backward-compatibility promise, and does not yet provide authentication, authorization or transport security. It is a contract/reference donor, not a replacement control plane or Store.
 
+### D31. Emdash: split desktop intent from host resource truth
+
+Emdash documents two durable authorities:
+
+```text
+Desktop SQLite  — projects, tasks, automations, conversations and bindings
+Workspace host  — repositories, worktrees, branches, processes and verb outcomes
+```
+
+A desktop workspace row is not the workspace. For host resources it is a materialized cache plus desktop metadata; the host registry and current observations are authoritative.
+
+Useful mechanisms:
+
+- deletion intent is a durable tombstone on the mirror row, not a second command queue;
+- a reconcile sweep retries the idempotent host delete verb and purges the tombstone only after the mirror observes the host record gone;
+- RPC returns control the loop but are not UI truth; verb outcome is retained on the host record;
+- each resource has one writer, with keyed serialization at the physical ownership boundary;
+- archive timeout bounds the caller's wait, not the lifetime of already-running cleanup;
+- retired host identities cannot publish into replacement state;
+- remote daemon connection, runtime intent, passive observation and readiness wait are separate concepts;
+- explicit operation scopes fence queued and active work on disconnect or identity replacement;
+- closing an output view detaches only that view; explicit stop/delete and workspace teardown own process release;
+- replacement output generations cannot receive late PTY output from a disposed process.
+
+Issue evidence converts these into ELIOT tests:
+
+- #3247: deleting only a worktree directory leaves Git administrative state and permanently blocks recreation until exact prune/reconciliation;
+- #3198: a dangling remote default-branch pointer silently disables Task creation when the failure reason is not projected;
+- #3192: a credential-proxy failure was swallowed and surfaced as an unrelated interactive Git prompt failure;
+- #3262: read-only workspace inspection recursively rescanned worktrees and artifacts, causing sustained CPU;
+- #3293: closing a tab and stopping/archiving an agent are separate lifecycle decisions;
+- #1360: storing a fingerprint as if it were key bytes destroyed SSH host-key verification.
+
+ELIOT use: workspace lease ownership, remote executor generation fencing, deletion reconciliation and detach-not-cancel session semantics. Do not import the Electron product, provider CLI detection or best-effort deletion shortcuts as authority.
+
 ## 5. Discovery pool: found, not yet counted
 
 These names are retained so later searches do not restart from zero. Inclusion below is **not** endorsement.
@@ -308,10 +346,7 @@ These names are retained so later searches do not restart from zero. Inclusion b
 ### Direct ADE/control-plane candidates
 
 - CodeLayer / the current HumanLayer rebuild;
-- Vibe Kanban;
-- Emdash;
 - Aperant;
-- Superset;
 - Crystal;
 - mux;
 - Termic;
@@ -367,13 +402,15 @@ These names are retained so later searches do not restart from zero. Inclusion b
 - fleet CLIs and agent fleet managers;
 - MCP/A2A control-plane routers.
 
-`aramase/agentsessions`, Petri, Pebble and sandbox-driver moved out of this pool after source, license and boundary review.
+`aramase/agentsessions`, Petri, Pebble, sandbox-driver and Emdash moved out of this pool after source, license and boundary review.
 
 ## 6. Not promoted and why
 
 | Candidate | Decision |
 |---|---|
 | `humanlayer/humanlayer` public repository | Not promoted: its README says the published code is deprecated and points to a rebuild outside that source tree |
+| `BloopAI/vibe-kanban` | Not promoted: the canonical README says the product is sunsetting; useful only as historical source unless a unique surviving mechanism is found |
+| `superset-sh/superset` | Not promoted in this pass: ELv2 source-available license and current reviewed mechanisms overlap Kandev/OpenHands/Emdash; keep as product/reference candidate rather than copying code or inflating the count |
 | Fabro mirrors/forks returned by repository search | Not separate donors: same lineage or unverified forks |
 | `awesome-ade`, `awesome-cli-agents` and similar lists | Discovery indexes only; no runtime guarantee |
 | “Kubernetes for agents” repositories with only a README/demo | Candidate until source, storage and failure paths are reviewed |
@@ -385,12 +422,13 @@ These names are retained so later searches do not restart from zero. Inclusion b
 
 | ELIOT block | Primary donors | Required deletion/simplification |
 |---|---|---|
-| R01 module lifecycle | systemd, Ractor, ACP, Kandev, Petri fencing | Remove manual identity reconstruction and stop paths that consume the only child owner before departure proof |
+| R01 module lifecycle | systemd, Ractor, ACP, Kandev, Petri fencing, Emdash generation ownership | Remove manual identity reconstruction and stop paths that consume the only child owner before departure proof |
 | R08 delivery/subscriptions | CCCC, Paseo, OpenHands, Pebble snapshot/cursor | Remove timestamp/UUID ordering and bootstrap-from-zero live subscription path |
 | R12 scheduler fairness | Kubernetes controller stack, Restate, Goose, Petri watchdog | Remove no-delay retry loops and process-global pacing state |
 | R18 Command ACP | ACP, Kandev, OpenHands, Pebble | Keep one session/process owner; do not add a parallel bespoke protocol |
 | R34 poison isolation | Kubernetes controller stack, Restate, Fabro/Petri evidence | Remove cross-domain transaction coupling and string-prefix retry classification |
-| R35 finite processes | systemd, Bazel log/result separation, Ractor, sandbox-driver | Remove unbounded waits, fabricated zero capture and the legacy duplicate ScriptRun executor |
+| R35 finite processes | systemd, Bazel log/result separation, Ractor, sandbox-driver, Emdash detach/cleanup split | Remove unbounded waits, fabricated zero capture and the legacy duplicate ScriptRun executor |
+| Workspace lifecycle | Kandev, Petri leases, sandbox-driver, Emdash host authority | Replace mirror-row/PID guesses with exact owner, durable tombstone, host readback and generation fencing |
 | CheckRunner/artifacts | Bazel REAPI, Petri replay tests, sandbox-driver conformance, SWE-agent evaluation harness | Replace self-referential result identity and mutable-name cache assumptions with exact digest-bound evidence |
 | Adapter/session SDK | Pebble, agentsessions, ACP | Consolidate duplicated adapter journals, session cursors, steering and recovery contracts |
 | Agent/runtime simplification | mini-SWE-agent, Cayu, OpenHands | Require measured benefit for each extra controller state machine and keep runtime/control-surface boundaries explicit |
@@ -418,9 +456,9 @@ No new dependency follows from this registry. A design similarity is not evidenc
 
 Highest-value next source reviews:
 
-1. one mature worktree-oriented ADE from the discovery pool, selected by issue quality rather than stars;
-2. one AgentRouter/policy-control-plane implementation;
-3. one cross-platform local process/sandbox layer not tied to Docker or Linux;
+1. one AgentRouter/policy-control-plane implementation;
+2. one cross-platform local process/sandbox layer not tied to Docker or Linux;
+3. one remote-workspace product with durable multi-client state, not only a desktop-local database;
 4. a mature content-addressed remote-execution implementation only if ELIOT moves beyond local CheckRun execution;
 5. one durable workflow implementation only for cancellation/fencing fixtures, never as a second Store;
 6. one agent fleet/control-tower system with real operator issue history rather than a dashboard demo.
