@@ -1,76 +1,151 @@
-# Claude — subscription integration and implementation status
+# Claude module — official Agent SDK boundary and current implementation status
 
-**Owner correction, 2026-10-08:** use the existing authorized subscription harness. Do not require an API key, a separate inference-billing route, a frozen SDK/CLI release, disabled vendor updates or a downgrade. Record the runtime actually used and validate the required native interfaces. A version found in this repository is evidence about its implementation, not a required version for the user's installation.
+This module integrates the installed Claude Code/Agent SDK harness; it does not define Claude’s permission model, session semantics or provider authentication. The authoritative sources are the [ELIOT module contract](../../docs/agent_swarm.module-contract-v2.md) and Claude’s current official Agent SDK documentation.
 
-## What this directory currently contains
+External release numbers in this repository describe the source that was implemented and tested at a point in time. They are not an allowlist for the user’s installation. A compatible update is admitted by checking the native interfaces actually used; a missing guarantee disables that capability rather than forcing a downgrade.
 
-This is the legacy JavaScript bridge. The reviewed source uses `@anthropic-ai/claude-agent-sdk` 0.3.287 and identifies itself as `claude-agent-sdk-0.3.287-bridge.3`. The standalone Rust adapter is separate: `crates/swarm-adapter-claude` with its existing Node SDK driver. Neither implementation's capabilities can be inferred from the other's name.
+## Authentication boundary
 
-These historical package/artifact values describe code that is still present. The dependency manifests and hardcoded version checks have **not** been repaired by this documentation change. In particular, the Rust driver's `prepare` currently rejects an SDK package whose version is not 0.3.287. That is an adapter defect to remove, not a reason to change the user's working runtime.
+Use the owner-selected native authorization path. For a subscription-backed route:
 
-The external SDK is used under the terms recorded in [third-party notices](../../THIRD_PARTY_NOTICES.md); it is not a permissive source-code donor. [R16](../../docs/remediation/2026-10-07/16-claude-interactions.md) defines the next connected implementation: remove the release gate, preserve the subscription route, and implement the pending callback → attention → reply path. The PR remains Draft; those runtime changes are not yet implemented.
+- do not inject `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`;
+- do not inherit a stray provider key from the controller environment;
+- do not substitute a different endpoint or separately billed API;
+- observe provider/auth mode without exposing credentials;
+- fail before the first model input if the selected route does not match the declared route.
 
-## Ownership and connection
+Claude’s official environment reference states that `ANTHROPIC_API_KEY` overrides Pro, Max, Team or Enterprise subscription use, and in non-interactive mode is always used when present. `CLAUDE_CODE_SIMPLE` also does not read OAuth/keychain credentials. These are connection facts the adapter must handle, not configuration suggestions for the owner.
 
-The existing bridge owns one live SDK query. Host credentials are scoped to its binding/generation; they do not make the module a GM or permit Task acceptance. Native authorization, tools and the model loop remain with Claude Code. Host IPC reconnect must not close the query or repeat native input.
+An ELIOT module credential authenticates local IPC only. It is never a Claude provider credential.
 
-Use the owner's current native installation and account. Resolve the executable through the owner's normal installation path for a new launch; do not retain an obsolete versioned installation path as a future launch requirement. Do not silently substitute the SDK's historical bundled executable, a new account or a separately billed API for the working subscription route.
+Official sources:
 
-A launch still needs the actual workspace, host endpoint and binding-scoped credential. The selected model and explicit permission settings come from the current route. No example below prescribes an old model/release or enables a route. A local module credential is an ELIOT IPC credential, **not** a provider API key.
+- [Environment variables](https://code.claude.com/docs/en/env-vars)
+- [Agent SDK permissions](https://code.claude.com/docs/en/agent-sdk/permissions)
+- [Approvals and user input](https://code.claude.com/docs/en/agent-sdk/user-input)
 
-The existing `swarm module-run` ownership boundary is preferable to launching an unguarded bridge directly. It records the process owner; it does not prove that every native capability works. Updating documentation neither launches nor changes any running process.
+## What exists in this repository
 
-## Capability matrix — legacy bridge only
+There are two distinct implementations:
 
-These are implementation facts for this directory at source 40591a295af94b1541ec2ba30afe8e3247701a71, not limits of current Claude Code.
+1. this directory’s historical JavaScript bridge and stream mapper;
+2. `crates/swarm-adapter-claude`, whose Rust adapter owns a Node SDK driver under `sdk-harness/`.
 
-| Operation | Current implementation | Boundary |
+Capabilities cannot be transferred between them by name. The current Rust driver still contains a hard equality check for SDK package version `0.3.287`; documentation does not remove it. [R16](../../docs/remediation/2026-10-07/16-claude-interactions.md) specifies the connected repair.
+
+Do not develop a third executor. Move required behavior into one selected implementation, qualify it, stop creating new bindings on the superseded executor, then retain only the minimum historical receipt reader needed for old evidence.
+
+## Ownership and session lifecycle
+
+One adapter boot owns one live SDK query/session control boundary. Host credentials are restricted to its binding/generation. IPC reconnect to the same live Node owner must not:
+
+- close the native query;
+- repeat admitted model input;
+- resolve a permission request twice;
+- adopt another session under the old binding;
+- turn missing evidence into no-effect.
+
+A lost Node process cannot recreate an in-memory callback Promise. Live and durable interaction modes are therefore separate:
+
+- **live callback:** the Node owner stays alive until `canUseTool` returns;
+- **durable defer:** an official `PreToolUse` hook returns `defer`, the native session persists, and later work resumes through the documented session mechanism.
+
+JSON checkpoint data may retain request identity and evidence; it does not resurrect JavaScript closures.
+
+## Current capability status
+
+The table describes current ELIOT source behavior, not limits of Claude Code.
+
+| Operation | Current implementation | Required boundary |
 |---|---|---|
-| describe | Present | Requested model, observed init model, executor and permission metadata remain separate. |
-| open | Present | `startup()` prepares a rootless executor; first input claims the one-shot WarmQuery. |
-| next-turn send / task.dispatch | Present | Exact Task input and echoed user UUID bind admission to the observed session. UUID is not a native turn ID. |
-| state / refresh | Present | Local compact stream projection; no new model call. |
-| reconcile | Present, bridge-local | Reads retained evidence; never repeats input. |
-| attach / resume / recover | Not exposed here | The SDK's possible resume capability does not implement controller recovery by itself. |
-| configure / goal / exact steer | Not exposed here | No invented setter or expected-turn guarantee. |
-| permission/question reply | Not exposed here | Current callback immediately denies requests that reach it. R16 implements a live round trip in the Rust+Node path. |
-| result paging | Not exposed here | No fabricated native paging contract. |
+| describe | Present | Report actual executor/package versions, requested configuration and observed capabilities separately. |
+| open | Present | Rootless preparation; first admitted input claims the one-shot prepared handle. |
+| task dispatch / next input | Present | Echoed user identity and native session evidence; lost reply is not replay permission. |
+| state / refresh | Present | Compact local projection; no model call. |
+| reconcile | Present, local evidence only | Never repeats native input. |
+| attach/resume/recover | Not exposed as a qualified controller capability | Native session features do not implement ELIOT recovery without exact ownership/readback. |
+| configure/goal/exact-turn steer | Not exposed | Do not invent setters or target guards. |
+| permission/question reply | Not connected | Current driver denies requests that reach its callback. R16 adds official live/deferred paths. |
+| result paging | Not exposed | Do not fabricate a native page contract. |
 
-Do not delete a real working executor before the replacement covers its required scenarios. Reading old receipts does not require keeping a second executor indefinitely.
+## Permission model
 
-## Input and stream evidence
+Claude’s official evaluation order is:
 
-The first Task input claims the prepared handle once. Only the native session initialization and echoed user-message identity bind the input to that session. A lost startup/query response remains unknown; the bridge must not turn uncertainty into another prompt.
+1. `PreToolUse` hooks;
+2. deny rules;
+3. ask rules;
+4. permission mode;
+5. allow rules and native auto-approved actions;
+6. `canUseTool` for the unresolved remainder.
 
-The legacy `stream.mjs` mapper is shared with its fixtures:
+Therefore:
 
-- Assistant frames may share one message ID while carrying different blocks. Preserve block arrival and native tool IDs; do not deduplicate an entire message by message ID.
-- Partial stream events are token deltas, not independent messages or child inventory.
-- Child links use native tool IDs and parent_tool_use_id. Completion needs an actual tool result/task notification, not parent idle. Family coverage remains partial.
-- Native result subtypes distinguish completion, failure and initialization failure. A correlated terminal-input record requires actual native result/session/user-message evidence. Several merged input UUIDs are ambiguous, not several independently completed Tasks.
-- The legacy mapper replaces its cumulative SDK usage estimate rather than summing every result. This estimate is not remaining subscription quota or a billing invoice. Verify the current native usage contract before extending it.
-- Existing bounded summaries retain recent message, child and turn metadata and report overflow. They do not copy the whole transcript into Store.
+- `canUseTool` is not an audit stream of every tool call;
+- `PreToolUse` is the place for a guard that must run on every call;
+- bare allow rules and auto-approval may shadow the callback;
+- `dontAsk` denies instead of calling the callback;
+- inherited and explicit permission mode are different facts;
+- omitting `permissionMode` is not equivalent to explicitly passing `default` on current SDK behavior.
 
-Requested model/permission choices are not proof of their effective application. Read the actual native initialization/settings evidence; no model label in a prompt or an old package manifest establishes the current runtime settings.
+The adapter should project requested mode, observed/effective mode and callback/hook coverage separately. It must not enable `bypassPermissions`, `default` or another mode merely to make an integration test pass.
 
-## Permission behavior
+## Approvals and questions
 
-When no `permissionMode` is supplied, the bridge omits that option. Report this as inherited/requested-unknown until the native effective mode is observed; do not fabricate `default`. Pass an explicit owner-selected mode unchanged. Do not enable bypass or force a different mode to compensate for a missing callback.
+A live callback receives `toolName`, input and context containing cancellation signal and optional permission suggestions. The Node owner keeps the original input and resolver. ELIOT stores a bounded, redacted request reference and exact fingerprint.
 
-`canUseTool` is not a universal interception point for every tool. Native permission evaluation can resolve a call before that callback. In this legacy bridge, calls that do reach the callback are recorded and immediately denied because reply is unavailable. Such recorded denials are **history**, not still-live requests that can be answered later.
+`agent.reply` must resolve the same current request exactly once. A decision acknowledgement means permission/question handling completed; it does not mean the tool, child or Task finished.
 
-The R16 path keeps the real pending callback in the existing Node owner, publishes a scoped request reference, and resolves it once through the current `agent.reply` authority path. Raw input and Promise resolvers remain local. A user answer is not a new prompt; a delivered allow decision is not proof that its tool or Task finished.
+`AskUserQuestion` uses the official `questions` and `answers` shape. Current documentation limits one call to 1–4 questions with 2–4 options each and states that the tool is not available in subagents spawned via the Agent tool. The controller must not advertise child-question support without another documented native mechanism.
 
-## Recovery and updates
+Persistent “always allow” rules are not an incidental reply field. Applying a permission suggestion changes settings and requires its own ELIOT authority/Operation. The first R16 slice supports allow-once, deny and question answers only.
 
-A host reconnect to the same live bridge must retain existing ownership and input uncertainty. This legacy bridge has no durable resume/recover implementation; after process loss it cannot recreate a native Promise or prove that an input never ran. Preserve history and the unknown outcome rather than replaying work.
+If a human response may outlive the Node process, use the documented hook `defer` path. Keeping a Promise indefinitely is valid only while the owner process is deliberately retained. A lost live callback becomes `callback_lost`; it is not silently converted into deferred state.
 
-For new native releases, validate the interfaces this adapter actually uses. A missing required function limits that capability; a different release number alone is not a reason to reject a working harness. Correct package loading, descriptors and consumers together, without rewriting old receipts or changing a live session's executable.
+## Stream evidence
 
-[UPDATE.md](UPDATE.md) describes the corrected update boundary. Source review, syntax checks, fixture results and live subscription qualification are separate evidence. No new runtime qualification is claimed here.
+The existing mapper must preserve native distinctions:
 
-## Verification and remaining work
+- multiple blocks with one assistant message ID are not duplicate messages;
+- deltas are not independent completed messages;
+- child identity comes from native parent/tool references;
+- parent idle does not prove child completion;
+- initialization failure, turn failure and successful result are different terminals;
+- cumulative SDK usage estimates are not remaining subscription quota or invoices;
+- bounded summaries report overflow and never copy the whole transcript into Store.
 
-After implementation, the manager performs scoped formatting and the minimal Clippy gate for changed Rust packages, plus JavaScript syntax checks. Broad tests and native execution follow in the project's final qualification phase; writers do not run Cargo.
+Requested model and permission values are not evidence of effective application. Use initialization/settings/session observations supplied by the actual runtime.
 
-The existing `selftest.mjs` and authored SDK-shaped fixtures remain available for that phase. They are not live captures and do not qualify a newer runtime merely because an older fixture passed. R16 must verify subscription-route preservation, compatible updates, pending/reply/abort races, reconnect, driver loss and exact input/decision correlation. Further configure/resume/child parity must be based on actual native interfaces, not assumptions about a frozen SDK.
+## Update behavior
+
+For each new launch:
+
+1. resolve the current owner-selected installation;
+2. preserve its selected subscription/provider route;
+3. import the required SDK boundary;
+4. validate required exports, options, callback/hook shapes and stream/session forms;
+5. report actual versions and unavailable capabilities;
+6. start model input only after compatibility and route checks succeed.
+
+A version mismatch alone is not an error. A missing required interface is a capability gap. No status or Doctor read installs packages, updates Claude, logs in, changes permission settings or rewrites live private configuration.
+
+Do not overwrite a live bridge or swap the SDK underneath a running query. New ELIOT bytes receive their own artifact identity; external runtime compatibility remains observed separately.
+
+See [UPDATE.md](UPDATE.md) for the file/activation boundary.
+
+## Verification
+
+After R16 implementation, the manager performs scoped formatting, warnings-denied Clippy for changed Rust packages and JavaScript syntax checks. Final qualification covers:
+
+- subscription route preserved with no provider-key override;
+- compatible update without release-number rejection;
+- explicit/inherited/effective permission modes;
+- auto-approved, ask, deny and `dontAsk` paths;
+- live callback reply/abort races;
+- durable defer/resume when supported;
+- duplicate/conflicting reply and old-boot identity;
+- `AskUserQuestion` multi-select/free-text shapes;
+- reconnect and Node loss without replay;
+- no false Task/tool completion from decision ACK.
+
+Existing fixtures are authored protocol examples, not live qualification of every later runtime. This document does not claim the production gate or reply path is already fixed.
