@@ -1,128 +1,154 @@
 # Нативная интеграция harness: управление, наблюдение и квоты
 
-**Проверено 7 октября 2026.** ELIOT: `40591a295af94b1541ec2ba30afe8e3247701a71`. Это source-based план интеграции, не установленная capability matrix и не отчёт о проверке аккаунтов. Работающий сервис, его точная схема и выбранный artifact должны квалифицироваться отдельно. Старые полевые аудиты дают сценарии, но не заменяют текущую документацию вендора.
+**Обновлено 7 октября 2026.** ELIOT `40591a295af94b1541ec2ba30afe8e3247701a71`. Исследование source/docs, не qualification установленного runtime и не проверка пользовательских аккаунтов. Различать native capability, реализацию выбранного ELIOT artifact и фактически выполненный gate. Версии публичных документов не дают автоматического права менять SDK, auth или работающую сессию.
 
-**Решение:** сохранять нативный model loop, инструменты, историю и управление детьми; ELIOT ведёт собственные Operations, Task/Attempt, authority и доказательства внешнего эффекта. Не сводить все возможности к `send(text)`, но и не открывать произвольный vendor RPC через универсальный passthrough.
+**Решение:** нативный model loop, инструменты, история и делегирование остаются у harness. ELIOT владеет своими Task/Attempt, Operations, полномочиями и evidence внешнего эффекта. Не сводить всё к send(text), не строить второй runtime и не открывать произвольный vendor RPC passthrough.
 
-## 1. Что соединять
+## 1. Как подключаться
 
-| Система | Предпочтительная граница | Что не смешивать |
+| Система | Граница интеграции | Существенное ограничение |
 |---|---|---|
-| Codex | Одна долгоживущая app-server connection с разбором ответов, уведомлений и server requests | `exec` для batch не заменяет управление thread; app-server не равен OpenCodex proxy. |
-| Muse | Существующий SDK/MSP bridge и публичные request/command/view API | Читать child без writer lease; управление child через owner-plane, не через присвоение чужой сессии. |
-| OpenCode V2 | Location-scoped HTTP, общий connection pool/SSE по service namespace; durable session log для точного readback | V1 `/session/...` и V2 `/api/session/...` — разные контракты; agent catalog — определения агентов, не список запущенных детей. |
-| Claude Agent SDK | Долгоживущий query с streaming input/output, штатные permissions/hooks/subagents | Очередной streaming input не даёт сам по себе atomic expected-turn steer. SDK estimated cost не остаток подписки. |
-| OpenCodex | Отдельный Management adapter к явно выбранному внешнему proxy | Сессиями/turns управляет harness. Provider routing, auth и spend — отдельные наблюдаемые факты. |
-| Command / Antigravity / Zed / Kilo | Пока сохранить границы конкретных ELIOT artifacts; сверить их собственные native contracts до расширения | В этом проходе их новые native API не проверены. Resume-флаг или warm stdin не доказывает exact steer. Batch-возможности не объявлять интерактивными. |
+| Codex | Одна долгоживущая app-server connection, RPC replies + notifications + server requests | Batch exec и provider proxy не заменяют владельца thread. |
+| Muse | Имеющийся SDK/MSP bridge | Child read без writer lease; owner-plane control с нативными IDs. |
+| OpenCode V2 | Location-scoped HTTP, общий pool/SSE на service namespace, durable log | V1 и V2 не взаимозаменяемы; agent catalog не runtime roster. |
+| Claude | Существующий Rust adapter + Node SDK driver, один живой streaming Query | SDK heap/Promise остаются в Node; настройки и callback coverage нужно учитывать явно. |
+| Command | Сохранить batch artifact; для интерактивного сценария исследован публичный cmd acp | ACP-путь — кандидат, не уже реализованный ELIOT runtime. См. §5 и gate #19. |
+| Antigravity | Существующий CLI warm stream-json | Не управляющий JSON-RPC; Python SDK с API auth — отдельный продуктовый маршрут. |
+| OpenCodex | Management adapter к явно выбранному proxy | Управляет провайдерами/конфигурацией, не нативными Task/turns. |
+| Zed / Kilo | Пока существующие artifact-контракты | Их новые интерфейсы этим проходом не квалифицированы. |
 
-Исходные ELIOT границы: [Codex UPDATE][e-codex], [OpenCode guide][e-oc], [Muse bridge][e-muse], [OpenCodex guide][e-ocx]. Полный паритет всех harness этим исследованием не заявлен.
+Исходные границы: [Codex][e-codex], [Muse][e-muse], [OpenCode][e-oc], [Claude][e-claude], [Command][e-command], [Antigravity][e-agy], [OpenCodex][e-ocx]. Не удалять старый executor до конкретного parity; возможность читать старые receipts сама по себе не требует сохранять executor навсегда.
 
-## 2. Capability описывает гарантию, а не название кнопки
+## 2. Контроль — это точный эффект, а не похожее имя
 
-В существующем module descriptor/contract для подключаемой возможности фиксировать: native method, target scope/ID, effect boundary, guard, application timing, replay/readback и observed support. Не создавать второй независимый реестр. Server version, schema revision, declared capability и успешная квалификация — разные факты.
+В существующем descriptor/contract для каждого verb нужны native method, target ID/scope, effect boundary, guard, replay/readback и доказанная поддержка. Новый registry не нужен.
 
-| Нужное действие | Нативный контракт | Отображение в ELIOT |
+| Действие | Нативная семантика | Что обязан сохранить адаптер |
 |---|---|---|
-| Точный steer | Codex `turn/steer {threadId, expectedTurnId, input}`; Muse `turn/steer` с его собственной схемой | Только заявленный exact-target класс. Codex steer не принимает model/cwd/sandbox overrides и не создаёт нового turn/started. |
-| Доставка на шаге цикла | OpenCode V2 `session.prompt`, `delivery:"steer"`; pending input можно переводить через inbox update | Отдельная семантика от atomic expected-turn: в проверенной V2 форме такого turn guard нет. Не ослаблять существующий exact-steer и не скрывать полезный native вариант. |
-| Убрать foreground-блокировку | OpenCode `session.background`; Muse `task/background` | Адресное действие под policy. У Muse taskId — itemId нативного toolCall, не ELIOT Task ID. Background не означает отмену. |
-| Остановить сейчас / больше не продолжать | Codex `turn/interrupt` отдельно от `thread/goal/clear` или pause; Muse различает priority interrupt, обычный cancel и goal | Явный запрос владельца: запрет нового продолжения и остановка текущего исполнения — разные эффекты/readback. Disconnect не является stop. |
-| Управлять ребёнком | Muse `subagent/sendMessage`, `followupTask`, `interrupt`, `stop`, `close`, `resume`, `reopen` | Parent sessionId + observed durable subagentId и точная роль owner. Не превращать все verbs в `agent.send`. |
-| Читать ребёнка | Codex scoped thread listing/read; Muse session/read + view/subscribe | Без автоматического resume/load writer. Partial family не пустая family; статический catalog не runtime roster. |
+| Exact steer | Codex turn/steer с expectedTurnId; Muse turn/steer по его схеме | Guard caller target; нельзя выбирать последний ход вместо него. Codex не создаёт новый turn/started и не принимает start-only overrides. |
+| Loop-step delivery | OpenCode V2 session.prompt delivery:steer | Не обещать atomic expected-turn guard, которого проверенная форма не содержит; не выбрасывать сам полезный способ доставки. |
+| Background | OpenCode session.background; Muse task/background | Адресный supported tool/task, не отмена. Muse taskId — native tool item, не ELIOT Task ID. |
+| Stop continuation / interrupt | Codex goal clear/pause отдельно от turn/interrupt; Muse разные cancel/interrupt/goal verbs | Остановка текущей работы и запрет следующей — разные эффекты. Disconnect не stop. |
+| Child control | Muse subagent/sendMessage, followupTask, interrupt, stop, close, resume, reopen | Parent session + observed durable subagentId; не присвоение чужой session writer lease. |
+| Question/permission reply | Muse stage IDs; Claude live callback; Codex исходный server request | Ответ именно ожидающему запросу; представление карточки и принятие решения не одно. |
 
-Источники: [Codex app-server][c-doc], [Muse pinned schema][m-pin], [OpenCode V2 API][o-api]. Native ACK означает соответствующую стадию допуска; terminal, result и Task acceptance подтверждаются отдельно. Не копировать всё руководство в каждый агентский brief: исполнитель получает один выбранный verb и его контракт.
+Источники: [Codex app-server][c-doc], [Muse pin schema][m-pin], [OpenCode V2][o-api], [Claude callback][a-input]. Native ACK не является terminal, result completeness или Task acceptance.
 
-### Практический порядок controls
+Общий порядок: проверить target/authority → записать exact Operation → вызвать поддержанный verb → прочитать адресное evidence. Lost reply не разрешает новый input. Имя «Recommended» не право на автоматический ответ. Native hooks/skills и MCP configuration использовать на штатном уровне; не копировать весь каталог/skill body в каждый prompt. Browser/MCP возможности определяются конкретной средой harness, не только названием модели.
 
-Сначала обнаружить текущие root/child/native task IDs и причины ожидания. Затем выбрать ровно поддержанный control с нужным guard и сохранить Operation до вызова. После ACK читать адресное доказательство; потеря ответа не разрешает второй input. Если API не даёт идемпотентности или точного readback, удержать unknown, не считать generic HTTP 200 доказательством исполнения.
+## 3. Что исправлять в существующих адаптерах
 
-Для approvals хранить исходный request ID и connection/boot, а также native stage guard. В Muse `requirementId`/`choiceId` защищают этап; `terminal:false` у ack допускает следующий этап. `RequestReceipt {}` — представление, не согласие. В Codex JSON-RPC ответ возвращается исходному request ID; его нельзя после reconnect приписать другому запросу. Политика разрешения задаётся владельцем; подпись варианта «Recommended» не даёт authority.
+### Codex: один читатель соединения
 
-Native hooks/skills должны оставаться нативными: Muse `skill/list` + typed skill input, Codex native catalogs/configuration, Claude hooks/permission callback. Не копировать весь skill text в повторный системный prompt и не выполнять неизвестный tool от имени оператора. Доступность browser/MCP зависит от конкретного harness/runtime environment; наличие той же модели не переносит инструменты из local в cloud.
+`NativeClient::receive_response` в standalone Rust читает socket только при ожидаемом RPC и пропускает no-id notifications; account API нет в allowlist. `decline_server_request` отказывает approvals/elicitation и возвращает пустые user answers. Это adapter gap, не предел app-server. [Источник][e-codex-client].
 
-## 3. Что уже теряется в наших адаптерах
+R15 подключает owned continuous reader с demux по request ID, выбранными notifications и отдельным server-request каналом. Control/terminal сообщения не ждут bulk text. Старые unresolved mutations после разрыва остаются unknown; новый connection generation не принимает старый response. Не менять политику approvals одновременно с quota transport.
 
-### Codex standalone Rust — не весь продукт Codex
+`attach` объявляет experimentalApi:false, но вызывает history methods, обозначенные experimental в текущей документации. Проверить выбранную schema; не включать все экспериментальные функции вслепую. R03/#29 устраняет лишнюю зависимость steer от полной истории отдельно. Python bridge.3 и Rust v4 имеют разный parity; замену исполняющего пути завершать по возможностям, не по языку.
 
-`NativeClient::receive_response` читает socket во время ожидаемого RPC. Frames с method без id не обрабатываются и пропускаются; request allowlist не включает account API. Поэтому одно добавление `account/rateLimits/read` не подключает поток обновлений. `decline_server_request` явно отклоняет approvals/elicitation и возвращает пустые ответы на пользовательские вопросы. Это нынешняя политика адаптера, не ограничение app-server. [Client source][e-codex-client].
+### Muse: initial usage на существующей connection
 
-Нужен один непрерывный read-pump: response demultiplexing по request ID; typed notifications; отдельная очередь server requests. Response/control traffic не ждать освобождения очереди bulk text. После разрыва unresolved mutations остаются unknown; новый connection generation не принимает старый pending response. Для quota-среза не менять политику approvals одновременно; для будущего reply-среза нужен полный host attention → native reply путь.
+В pin SDK 1.3.0 уже есть usage/read, usage/changed, background и child controls. Bridge имеет notification callback, но root refresh читает session/pending, не initial usage. Добавить один readback-путь без нового SDK, polling каждого child и inference. Native view/gap/sourceRange сохранять как evidence; не выдумывать raw-log endpoint. subagent/readResult — command-plane, для наблюдения использовать existing view/item result path. [Schema][m-pin], [bridge][e-muse].
 
-`attach` сейчас объявляет `experimentalApi:false`, но вызывает `thread/items/list` и `thread/turns/list`, которые текущая документация помечает experimental. Это проверка совместимости с поддерживаемым server schema, а не указание включить все экспериментальные функции. Старый server может игнорировать незнакомый capability flag; флаг не доказывает наличие метода. R03/#29 исправляет конкретный history-dependent steer отдельно.
+### OpenCode: не писать третий вариант
 
-У Python bridge.3 есть child/history возможности, которых Rust descriptor v4 не заявляет. Удалять Python executor можно после конкретного parity/перехода, а не только из-за языка. Сохранение historical reader не требует сохранения старого executor навсегда. [Artifact split][e-codex].
+Built-in runtime/opencode_v2 уже реализует forms, permissions, background, инструкции, readback выбранного агента/модели и execution log. Standalone adapter — неполный parity. Переносить работающие единицы вне host, не повторять их с нуля. [Реализация][e-oc].
 
-### Muse — не писать второй SDK
+Input ID связывать с durable log; исчезновение inbox entry и foreground idle не доказывают завершение. /api/session/active не полный список background jobs. Session delete и location reload имеют побочные эффекты — это не refresh. Provider quota endpoint в рассмотренной V2 справке не установлен; session tokens не заменяют quota. [V2 API][o-api].
 
-Pinned SDK 1.3.0 уже описывает `usage/read`, `usage/changed`, адресные subagent controls, `task/background` и skill catalog. У существующего bridge есть notification callback и запись usage update, но root refresh читает session и pending approvals, не начальную usage snapshot. Доработать существующие callbacks и readback, не запускать inference для «проверки квоты» и не добавлять отдельный poller на каждого ребёнка. [Pinned usage/controls][m-pin] · [Bridge][e-muse].
+### Claude: реальный default и живой callback
 
-Сохранять MSP view/gap, sourceRange и re-anchor semantics; raw-log API нельзя выдумывать из одного sourceRange. Бounded overview не заменяет постраничный exact result. `subagent/readResult` находится на command-plane и меняет состояние: для наблюдения использовать существующий view/item result path. Условие «нет прочитанных детей» не означает complete empty.
+**AUD-045:** наш pin — 0.3.287. NativeOptions.permission_mode допускает None, оба Node driver опускают незаданный option, а modules/claude/README.md называет это default. Официальные документы указывают изменение с 0.3.286: отсутствие поля допускает native выбор режима, включая settings/auto. Поэтому requested=inherited и observed effective mode различать; не утверждать default по отсутствию параметра. Это code/doc mismatch, не наблюдавшийся обход полномочий. [Код][e-claude-config], [driver][e-claude-driver], [native modes][a-permissions].
 
-### OpenCode — использовать существующий богатый код
+Нынешний canUseTool сразу отказывает; Rust descriptor не заявляет agent.reply, а Node handle знает только prepare/send/stop. Удерживать разрешённый pending Promise у существующего Node-владельца и отвечать через него — естественнее, чем новый prompt или новый permission engine. Но ранее auto-approved инструменты callback минуют, а dontAsk не передаёт ему ожидающие вопросы; callback не универсальный firewall. [Driver][e-claude-driver], [descriptor][e-claude-module], [SDK flow][a-permissions].
 
-Built-in `runtime/opencode_v2` уже реализует forms, permissions, background, инструкции, agent/model readback и execution log. Standalone adapter не является полным паритетом этого пути. Переносить проверенные единицы, не писать третий экземпляр. [ELIOT OpenCode guide][e-oc].
+Выделен [R16 / PR #42][r16]: pending request → scoped attention → exact agent.reply → один callback; AbortSignal, late reply и driver loss имеют явные исходы. AskUserQuestion сохраняет исходные questions и карту answers; это не streaming-message shortcut. Поддержку вопросов subagents от Agent tool текущая документация исключает. Полный sdk.d.ts этого прохода не извлечён, поэтому используемые fields/execution details исполнитель сверяет с pin перед кодом. [Input contract][a-input].
 
-Native V2 prompt может запланировать выполнение; `resume:false` и очередь имеют свой эффект. Inbox исчезновение не доказывает успешный terminal. Связывать exact input ID с durable log; для volatile SSE gap нужен readback. `/api/session/active` описывает foreground execution, не все живые background jobs/descendants. Session delete удаляет детей, location reload отменяет pending interactions — не использовать их как refresh/stop. Полной provider quota endpoint в исследованной V2 ссылке не установлено; локальные session token statistics не подставлять вместо неё. [V2 API][o-api].
+## 4. Квота, расходы и доступность — разные оси
 
-## 4. Квота: хранить разные оси отдельно
-
-| Источник | Чтение и push | Поля / ограничения |
+| Источник | Доступные данные | Что не выводить автоматически |
 |---|---|---|
-| Codex app-server | `account/read` без refreshToken; `account/rateLimits/read`, `account/rateLimits/updated`; `account/usage/read` там, где supported | Bucket limitId, primary/secondary usedPercent/windowDurationMins/resetsAt. `resetsAt` — секунды. Credits hasCredits/unlimited/balance отдельно; balance — строка, не объявлять USD. Новые optional spend controls учитывать как reported/unknown, не как false по умолчанию. |
-| Muse MSP pin 1.3.0 | `usage/read`; `usage/changed` | `{usage?}`: отсутствует → no observation. tier, weekly/window.usedPercent, resetsAtMs, windowDurationMins, observedAtMs. Reset в миллисекундах; процент может быть >100. Это last-observed subscription snapshot, не live token meter. |
-| Claude Agent SDK | result usage/modelUsage/total_cost_usd | Usage main loop и cumulative call/model totals имеют разный scope; resumed call может включать прошлую стоимость. Стоимость SDK — estimate, не billing invoice и не subscription balance. Не суммировать каждый cumulative result плюс дочерние totals. |
-| OpenRouter | `GET /api/v1/key`; отдельно `/api/v1/credits` с management key | Key cap и account funds различны. Проверять limit_source/error metadata и headers. HTTP 429 не доказывает quota exhaustion; 404 не всегда ModelGone. Management credential не выдавать агенту и не извлекать из native auth store. |
-| OpenCodex | Management observations, reported provider quota | Схему и внутренний эффект конкретного read проверить по источнику; quota read может быть refresh/auth action, см. ниже. Routing affinity и auth mode не выводятся из model name. |
+| Codex | account/read без forced refresh; rateLimits/read и updates; optional account/usage при поддержке | limitId buckets отдельно; resetsAt в секундах; credits balance строка без угаданной валюты. Старому server новые поля не обязательны. |
+| Muse | usage/read + usage/changed, weekly/window, native observedAtMs/resetsAtMs | Нет usage ≠ ноль. Процент >100 допустим. Новое чтение старого snapshot не делает его свежим. |
+| Claude | SDK usage/modelUsage/total_cost_usd | Cumulative estimate не invoice и не subscription balance; не суммировать parent/children/cumulative snapshots повторно. |
+| Command | ACP context/cost; CLI /usage показывает лимиты/остатки | Context meter не subscription quota API. См. неоднозначность docs в §5. |
+| Antigravity CLI | Per-step usage и cumulative session result usage | Не сумма всех result + всех step values. CLI /usage не команда рабочего JSON-потока. |
+| OpenRouter | key limits отдельно от account credits с management credential | HTTP 429 не доказательство exhaustion, HTTP 404 не обязательно ModelGone. |
+| OpenCodex | Reported provider observations | Внутренний collector может выполнять auth effect, см. ниже. |
 
-Источники: [Codex current rate-limit type][c-quota], [credits type][c-credits], [official app-server][c-doc], [Muse schema][m-pin], [Claude costs][a-cost], [OpenRouter limits][r-limits]/[credits][r-credits]. Новые поля текущего Codex не объявлены доступными у установленного .159 server; нужны per-capability availability и fallback только к доказанной старой read-форме, без смены auth/model.
+Sources: [Codex types][c-quota]/[credits][c-credits], [Muse][m-pin], [Claude costs][a-cost], [Command][q-usage], [Antigravity stream][g-headless], [OpenRouter limits][r-limits]/[credits][r-credits]. Числа текущего аккаунта этим документом не получены.
 
-### Правила нормализации
+Нормализация: source namespace + проверенный auth context + bucket/window; без доказанного общего account нельзя ни суммировать budgets, ни обещать точную дедупликацию. Update одного bucket не стирает остальные, explicit null не превращается в current zero; auth change делает прежнюю запись исторической. Отдельно native observed time, collected time, completeness и support. Token usage, денежный остаток, throttling, concurrency и spend permission не взаимозаменяемы.
 
-- Не объединять quota buckets по одному названию модели/провайдера. Источник: server/service namespace + наблюдаемый auth/account context + bucket/window. Если общая account identity не доказана, не суммировать такие snapshots и не утверждать точную дедупликацию.
-- Native usedPercent, observedAt и collectedAt — разные данные. Новый GET старой snapshot не делает её свежей. Изменение/reset подтверждать источником, а не только настенными часами.
-- Обновление одного bucket не удаляет остальные; явный null внутри текущей полной формы означает unknown, а не сохранение прежнего якобы актуального значения. После auth change прежние данные исторические.
-- Token usage, цена, остаток денег, subscription window, concurrency slots, throttling и earned reset credits — разные величины. 100% окна не всегда запрещает работу при наличии отдельно разрешённых credits; доступность расходования не означает разрешение ELIOT их тратить.
-- RateLimited, QuotaExhausted, AuthRequired, ModelUnavailable, DataPolicyRequired, Overloaded и Unknown различать по структурированным признакам конкретного вендора. Retry-After — подсказка ожидания, не доказательство no-effect; не повторять unknown prompt.
-- В `capacity::note_outcome` сейчас Accepted/Applied закрывает quota incident независимо от конкретного bucket/новой usage evidence. Исправить этот узкий consumer, не переписать resource ledger и не объявлять локальный успешный read доказательством восстановления лимита. [Source][e-capacity].
+`capacity::note_outcome` сейчас закрывает quota incident от Applied/Accepted без evidence восстановления нужного окна. R15 меняет этот узкий consumer; resource ledger R13 не переписывает. Наступивший reset_at — причина прочитать состояние, не доказательство восстановления. [Source][e-capacity].
 
-## 5. Внешний GET не всегда пассивное наблюдение
+### Внешнее чтение может иметь скрытый эффект
 
-OpenCodex current source `250f17a` связывает `/api/provider-quotas` с provider collectors. Muse collector `fetchMuseKeyQuotaSnapshot` вызывает `mintMuseApiKey`, а force refresh и reset poller обсуждаются как его callers. Код ограничивает успешные/неуспешные mint по времени и объединяет concurrent calls, но это всё равно auth-plane mint, не простой cached GET. **Не подключать этот путь автоматически к read-only report.** Не переносить чужую заявленную «read» классификацию без проверки вызываемого эффекта. [Collector][x-mint] · [Router][x-router].
+OpenCodex `fetchMuseKeyQuotaSnapshot` вызывает mintMuseApiKey; rate limits и объединение concurrent calls не делают mint пассивным. Такой collector не вызывается из read-only Doctor/agent.usage. Предпочтительны MSP last-observed usage или проверенный cached-only endpoint; иначе unavailable/stale. [Router][x-router], [collector][x-mint].
 
-Сначала использовать MSP last-observed usage либо endpoint с проверенной cached-only гарантией; в отсутствие такого endpoint показывать unavailable/stale. Явный auth-refresh, если он действительно нужен продукту, оформляется отдельной разрешённой Operation, не скрытым вызовом из Doctor. GET не даёт общего разрешения читать секреты, менять account pool или обходить лимит другого аккаунта.
+Codex reset-credit consume расходует отдельный credit; add-credits email отправляет письмо. Не включать их как восстановление collector. Provider proxy может менять affinity при failover; requested/wire/served/account — разные evidence, не вечная гарантия pinned account. Не выдавать management credential модели и не читать private auth store ради квоты. [Codex account API][c-doc], [OpenCodex][x-readme].
 
-OpenCodex README также оговаривает исключения из thread/account affinity при failover/исключении/expiry/ошибках. Поэтому ELIOT хранит requested provider отдельно от реально reported account/wire/served-model и не обещает вечную pinned affinity. [Upstream README][x-readme]. Существующий ELIOT Management adapter остаётся detach-only; auto pool rotation и оплату этот план не включает.
+## 5. Command: конкретный ACP-кандидат, не предположение о batch
 
-Codex `account/rateLimitResetCredit/consume` расходует отдельный earned reset credit; `account/sendAddCreditsNudgeEmail` отправляет письмо. Ни то ни другое не quota-read. Не вызывать автоматически для прохождения gate. Claude authentication для интегрируемого SDK должна соответствовать официальной документации и доступному разрешению, не extraction личных credentials. [Codex account API][c-doc] · [Claude SDK overview][a-overview].
+Публично документирован cmd acp: initialize → session/new(cwd) → session/prompt, поток tool updates, permission/questions, model/effort и повторное открытие thread. Процесс обслуживает одну project directory; файл/terminal IO выполняет собственный engine, не услуги editor. Поэтому different manager worktrees нельзя бесконтрольно объединять одним process owner, а клиентские file callbacks не являются sandbox. Эти сведения из live docs, не protocol/runtime qualification ELIOT. [ACP][q-acp].
 
-## 6. Порядок поставки
+**Предложение для выбранного сценария:** Manager ELIOT управляет интерактивной Command-сессией в своём worktree через этот native ACP. Это конкретный кандидат consumer для [issue #19][acp-gate], но gate не снят автоматически: принятой программой требуется проверка полного ACPX v0.19.4 на указанном там SHA. Не подменять её уже исследованным Rust Conductor и не строить второй generic ACP runtime. Наличие native server ещё не подтверждает exact steer или идемпотентный replay prompt.
 
-1. **R03/#29:** исправить exact Codex steer, не ожидая всего нового quota/control слоя.
-2. **R15:** native quota snapshots Codex/Muse → bounded validated projection → авторизованный manager read, плюс прекращение ложного quota recovery. Полное задание: [15-native-usage](../remediation/2026-10-07/15-native-usage.md).
-3. **Адресный control parity:** после source/schema проверок доводить по harness один законченный verbs→attention/receipt→readback блок. Для Muse — owner-plane children/background; для Codex — pending questions и штатные configuration fields; для OpenCode — отдельно заявленный loop-step delivery с existing forms/background/log, не R02 journal repair.
-4. **Quota-aware admission/route change:** отдельное принятое правило владельца после появления достоверных snapshots. До этого не включать billing actions, failover, session rotation или arbitrary manager limits. Старый полевой пример «2 менеджера/7 детей» не native hard limit.
+Batch остаётся полезным для одиночной работы. --resume <id> выбирает exact history, а --continue может выбрать последнюю cwd session или начать новую при отсутствии прежней — не использовать как восстановление неопределённого эффекта. Возобновление через новый процесс не доказывает управление активным ходом. [Headless][q-headless].
 
-Один manager/worktree; source docs → код → минимальный scoped gate, широкие tests/native позже. Приёмка каждого блока проверяет отсутствие input replay, exact target, auth change, stale read, disconnect, gap и mismatch. Данный документ не меняет SDK pins, активные конфигурации, процессы или owner-decisions.
+Quota docs показывают rolling windows, extra credits и UI /usage, но Go table расходится с пояснением: 2/5 против 3/6. **Не зашивать ни один набор чисел в контроллер по этой странице.** Machine-readable account endpoint в рассмотренных страницах не подтверждён. ACP cost/context не принимать за баланс. Не пробовать неизвестные slash commands как harmless quota probe: ACP может передать их модели. [Usage][q-usage], [ACP][q-acp].
 
-## Проверенные источники
+## 6. Antigravity: warm-stream не переносимый control bus
+
+Headless --input-format stream-json исполняет по одному полному ходу на user input. EOF завершает процесс после текущего хода, не немедленно. control_request/control_response и slash commands вроде /usage или /model в этом потоке не поддерживаются и заканчивают сессию ошибкой; их нельзя использовать как probes. Response относится текущему ходу, usage/num_turns/duration — cumulative session. [Native stream][g-headless].
+
+Штатный CLI /usage имеет backend refresh, но это другой интерфейс. Не выводить из его наличия стабильный passive JSON endpoint и не включать CLI-зонд в Store reader. Отдельный native root/step/subagent_info можно наблюдать; нет доказательства, что любой log_uri разрешено открывать или что строка результата — exact native turn ID. [Quota command][g-usage].
+
+Python google-antigravity SDK — новый agent runtime; quickstart использует Gemini API key, Enterprise — GCP/Vertex auth. Это **не** attach к имеющейся subscription CLI conversation. Перевод пользователя на него изменяет auth/execution route и требует отдельного запроса/контракта; ради дополнительных controls такой перевод не выполнять. Сохранять текущий warm CLI там, где он достаточен. [SDK][g-sdk].
+
+## 7. Порядок исполнения и остаток
+
+1. R03/#29: компактное исправление Codex exact steer, не ждёт quota/control parity.
+2. [R15][r15]: Codex/Muse quota producer → Store → scoped readback + точный quota incident. Command/Claude/Antigravity collectors не добавлены в его scope.
+3. [R16/#42][r16]: Claude root permissions/questions через имеющийся SDK callback и truthful mode projection. Shared schema extraction остаётся R14.
+4. Command ACP: named consumer → gate #19/ACPX source review → отдельный согласованный vertical slice. Поддержка cancel/load/model не доказывает все verbs и отсутствие replay.
+5. Muse child/background и OpenCode loop-step parity: отдельные законченные срезы в действующих adapters, не новая глобальная orchestration layer. Zed/Kilo новые surfaces остаются непроверенными.
+
+Один manager/worktree, source → код → минимальный scoped Clippy, broad/native tests в итоговой фазе. Никаких model calls, account reads, key mint, оплаты, автоматической ротации, SDK updates или merge этим исследованием не выполнено. Ошибка получения полного SDK reference не заменена догадками: изучены focused official pages и конкретные ELIOT callers. В документе нет обещания применённых возможностей по одному docs CI.
+
+## Источники
 
 [e-codex]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/codex/UPDATE.md
 [e-codex-client]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-adapter-codex/src/lib.rs#L1598-L1830
-[e-oc]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/opencode/README.md
 [e-muse]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f269b3d4dea2c5e15754feba9971b1f1c1b20c2b/modules/muse/bridge.mjs
+[e-oc]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/opencode/README.md
+[e-claude]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/claude/UPDATE.md
+[e-claude-config]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-adapter-claude/src/config.rs
+[e-claude-driver]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-adapter-claude/sdk-harness/bridge.mjs
+[e-claude-module]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-adapter-claude/src/module_runtime.rs
+[e-command]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/command/UPDATE.md
+[e-agy]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/antigravity/README.md
 [e-ocx]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/opencodex/README.md
 [e-capacity]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-kernel-host/src/store/capacity.rs#L600-L750
 [c-doc]: https://learn.chatgpt.com/docs/app-server
 [c-quota]: https://github.com/openai/codex/blob/82e70121f86bc1f6fea7f2bb7bbc169d259b3c6b/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitSnapshot.ts
 [c-credits]: https://github.com/openai/codex/blob/82e70121f86bc1f6fea7f2bb7bbc169d259b3c6b/codex-rs/app-server-protocol/schema/typescript/v2/CreditsSnapshot.ts
 [m-pin]: https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts
-[m-current]: https://github.com/meta-models/muse-code-sdk/blob/912061bb125b4bff60c9f3089a21cd23b53c6b4f/schema/msp/msp.d.ts
 [o-api]: https://opencode.ai/v2/docs/api
-[a-overview]: https://code.claude.com/docs/en/agent-sdk/overview
-[a-stream]: https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode
+[a-permissions]: https://code.claude.com/docs/en/agent-sdk/permissions
+[a-input]: https://code.claude.com/docs/en/agent-sdk/user-input
 [a-cost]: https://code.claude.com/docs/en/agent-sdk/cost-tracking
+[q-acp]: https://commandcode.ai/docs/acp
+[q-headless]: https://commandcode.ai/docs/headless
+[q-usage]: https://commandcode.ai/docs/resources/usage-limits
+[g-headless]: https://antigravity.google/docs/cli/headless/
+[g-usage]: https://antigravity.google/docs/cli/commands/usage/
+[g-sdk]: https://antigravity.google/docs/sdk/overview/
 [r-limits]: https://openrouter.ai/docs/api_reference/limits
 [r-credits]: https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits
 [x-readme]: https://github.com/lidge-jun/opencodex/blob/250f17afd8ff44c93c620d87c1f346ef56f64fb4/README.md
 [x-router]: https://github.com/lidge-jun/opencodex/blob/250f17afd8ff44c93c620d87c1f346ef56f64fb4/src/server/management/provider-routes.ts
 [x-mint]: https://github.com/lidge-jun/opencodex/blob/250f17afd8ff44c93c620d87c1f346ef56f64fb4/src/providers/muse-key-quota.ts
+[r15]: ../remediation/2026-10-07/15-native-usage.md
+[r16]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/42
+[acp-gate]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/19
