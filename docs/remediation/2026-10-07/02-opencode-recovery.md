@@ -1,52 +1,109 @@
-# R02. OpenCode: целостное восстановление, transport и чтение результата
+# R02. OpenCode: восстановление без повторного эффекта и без потерянного владельца
 
-**Статус: задание на реализацию; текущая поставка содержит только эту спецификацию.**
-Основа: аудит редакции 3, 07.10.2026, код `40591a295af94b1541ec2ba30afe8e3247701a71`. Карточки: AUD-011, AUD-027, AUD-028, AUD-033.
-Перед работой сравнить актуальный main с этим SHA; уже исправленное не переписывать. Аудит — доказательный материал, не новая owner policy.
+**PR #28 · задание уточнено 7 октября 2026; production-код R02 ещё не изменён.**
+Основание: AUD-011/027/028/033, source `40591a295af94b1541ec2ba30afe8e3247701a71`; прочитан head задания `26cfc03da5986bbfde7ed892b15136bc1d8bed67`. Реализацию добавлять в эту же ветку целиком: journal → hello → RPC/outbox → result → stop.
 
-## Результат
+## Начать здесь
 
-OpenCode adapter сохраняет неизвестные эффекты после сбоя, восстанавливает проверяемые записи, завершает многостраничное чтение и удерживает владельца при stop timeout; здоровый IPC link используется без hello на каждом RPC.
+Прочитать `run_owned` в `crates/swarm-adapter-opencode/src/lib.rs`, затем вызываемые функции из таблицы. Цель — восстановить управляемый adapter lifecycle, не переносить встроенный `runtime/opencode_v2` и не расширять native capabilities.
 
-## Читать адресно
+```text
+Journal::open → recover_outbox → native_root_for_hello
+  → HostSession::hello_retry/open_link
+  → module.next → handle_command → flush_outbox
+  → остановка: run_owned → NativeOwnerController::shutdown → NativeOwner::shutdown
+```
 
-- [docs/agent_swarm.module-contract-v2.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/agent_swarm.module-contract-v2.md) — §2–4: HTTP topology, базовые операции, replay policy.
-- [docs/owner-decisions.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/owner-decisions.md) — §1.4 и §2.2: live work и retention.
-- [modules/opencode/UPDATE.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/modules/opencode/UPDATE.md) — действующий native/adapter contract и recovery ограничения.
+## Документация по участкам
 
-Нормы работы: `docs/owner-decisions.md` §1.2–1.4, §2.2; текущие project instructions имеют приоритет. Исторический SHA здесь фиксирует источник, не ограничивает используемые версии.
+- [Module contract](../../agent_swarm.module-contract-v2.md), §2–4: native topology, delivery/replay policy, неизвестный исход.
+- [OpenCode UPDATE](../../../modules/opencode/UPDATE.md): различие native service, JS owner и Rust adapter; artifact/activation/recovery правила.
+- [Modularity](../../agent-operations/modularity.md), §2.1 и §3: один Store, exact handshake; адаптер не зависит от другого адаптера.
+- [Owner decisions](../../owner-decisions.md), §1.2–1.4 и §2.2: manager/worktree, минимальный gate, отсутствие heuristic kill и automatic evidence eviction.
 
-## Участок кода
+## Карта существующих функций
 
-`crates/swarm-adapter-opencode/src/{journal.rs,lib.rs,native.rs,native_owner.rs}`: `load/load_by_path`, `recover_outbox`, `run_owned`, `HostSession::call/open_link`, `flush_outbox`, `read_assistant_result`, обе shutdown-функции. Внутренний донор: `crates/swarm-adapter-command/src/journal.rs::write_replace_bytes` — только примитив публикации.
+Все пути ниже — `crates/swarm-adapter-opencode/src/`, кроме явно названных доноров.
 
-## Что и как сделать
+| Функции | Что исправлять / сохранить |
+|---|---|
+| `journal.rs::Journal::{open,load,load_by_path}` | Одна bounded трактовка существующего journal; отсутствие файла не равно пустому/повреждённому файлу. |
+| `recover_outbox`, `native_root_for_hello`, `checkpoint_root` | Использовать согласованный результат recovery. Починить только первый обход недостаточно: hello снова читает те же journals. |
+| `queue_outcome`, `write_pending`, `acknowledge_outcome`, `acknowledge_result`, `remove_pending` | Exact immutable payload/digest, локальный durable ACK и восстановимая доставка; несовпадение не стирать. |
+| `lib.rs::HostSession::{open_link,hello_retry,call,call_recorded_retry}` | Владение здоровым ModuleLink вместо открытия и hello на каждый вызов. |
+| `flush_outbox`, `remember_root_from_outcome`, `save_store_root`, `set_root_hint` | Разделить обязательное сохранение root/ACK и производный hint. Root inconsistency — не необязательная диагностика. |
+| `native.rs::NativeClient::read_assistant_result` | Отдельно EOF, scan limit и cursor cycle; сохранить exact input/assistant parent проверки. |
+| `native_owner.rs::{NativeOwnerController::shutdown,NativeOwner::shutdown,ensure_started}` и `lib.rs::run_owned` | Удержать Child и owner **во всей цепочке вызова**, пока departure не доказан. |
 
-1. Объединить journal decoding: полная история, подтверждённый префикс с незавершённым хвостом, повреждение внутри истории. Сохранить спорные bytes и unresolved intent. Повреждённый operation journal изолировать по identity; повреждение общей state identity не трактовать как новую пустую установку.
-2. Публиковать отдельные identity/receipt-файлы через private same-directory temporary file, flush и установку final name с нужной no-clobber/directory-sync семантикой. Не копировать весь Command RunStore и не объявлять rename готовым JSONL salvage.
-3. Согласовать journal/outbox/ACK: журнал остаётся authoritative, outbox — восстановимый индекс доставки. ACK не должен блокироваться повторными необязательными действиями. Нормальный Unknown→Applied по readback проверить отдельно: прошлый аудит не доказал безусловный конфликт этого сценария.
-4. Сделать один владеющий IPC link объект; hello только на новый authenticated link. Точные сохранённые outcome/result разрешено передоставлять, но потерянный module.next требует reconciliation: это admission, не безопасное чтение. Не добавлять retry-everything.
-5. Различать EOF, исчерпание scan budget и цикл cursor в read_assistant_result. При shutdown ждать через &mut Child; timeout оставляет StopPending/Unknown, owner identity и handle. Снимать owner только после доказанного выхода/передачи владения.
+## 1. Один decoder, разные решения о восстановлении
 
-## Критерии готовности
+Объединить `load` и `load_by_path` в private decoder с входным optional expected operation ID и проверкой `operation_key(id)` против имени файла. Framing оставлять bounded; v2 operation record и v1 root checkpoint не смешивать в один произвольный schema-less JSON parser.
 
-- [ ] Две и более страницы с final cursor=None дают результат; повторяющийся cursor и реальный лимит дают точную ошибку.
-- [ ] Оборванный последний record не разрешает повтор native POST; неизменяемые ACK/outcome можно восстановить без смены identity.
-- [ ] Один healthy link обслуживает несколько RPC; reconnect не повторяет неясный module.next.
-- [ ] При stop timeout Child/owner остаются отслеживаемыми; чужой/shared service не уничтожается.
+Предлагаемое внутреннее представление, **ещё не существующий API**: проверенная `OperationHistory` + граница полностью разобранных записей + состояние целостности. Парсер сам не удаляет/обрезает исходный файл. Объединить проверку record kinds, digest, ID и последовательности ACK в одном месте.
 
-## Границы и интеграция
+| Состояние | Решение |
+|---|---|
+| Файла нет; нет иных retained intent/effect facts | Обычный путь новой операции по действующему admission. |
+| Существующий файл пуст | Не трактовать как разрешение повторить POST; явно отсутствует доказательство истории. |
+| Полный валидный intent, outcome ещё нет | Unknown/readback, как уже делает `handle_command`; не повтор native input. |
+| Валидный префикс + незавершённый последний record | Сохранить исходные bytes и префикс; удержать неопределённость. Новый report/ACK нельзя append поверх torn bytes. |
+| Повреждение внутри истории, ID/digest conflict | Изолировать идентифицированную операцию и сохранить причину; не пропускать произвольную строку как EOF. |
+| Повреждён state identity или неразрешима общая root identity | Удержать scope/reconciliation; не объявить новую пустую установку/готовый root. |
 
-Не мигрировать встроенный runtime/opencode_v2 целиком и не добавлять forms/goal/steer capabilities. Никакого удаления authoritative истории по LRU. Новые библиотеки не обязательны. Native version из UPDATE — доказательная граница, не повод навязать downgrade.
+Неидентифицируемый файл с хэш-именем нельзя уверенно приписать произвольному operation ID. Recovery summary должен различать operation-local проблему и отсутствие общей identity. Нельзя «продолжить здоровые операции», если нездоровая запись могла определять тот же единственный native root. Согласовать это с `native_root_for_hello`, а не просто добавить `.ok()` в оба обхода.
 
-Самостоятельно; R01 отвечает за внешний helper, R05 — за общий dispatch receipt. В swarm-process не создавать второй общий writer: сначала использовать существующую публикацию или оставить узкий adapter-local helper.
+Для восстановления appendable файла выбрать явный owner-serialized repair с сохранённым оригиналом и доказанным verified prefix; до его безопасной публикации оставить операцию held. Не выдавать обрезанный intent за no-effect. Общая state identity остаётся fail-closed. Новая БД не требуется.
 
-## Проверка и сдача
+## 2. ACK и локальная публикация
 
-Один manager и один его worktree; writers получают непересекающиеся участки и не запускают Cargo. Реализацию добавлять в этот же PR, не плодить отдельные PR для DTO/handler/reader. Форматирование только затронутого кода. Минимальный gate менеджера на итоговом кандидате:
+Сначала проверить pending payload и его связь с journal/сессией. После `recorded:true` сохранить точный ACK. Обязательный root checkpoint должен быть либо записан, либо однозначно восстановим из уже сохранённой authoritative истории до удаления единственной копии. Производный in-memory hint не должен бесконечно блокировать ACK несвязанных записей.
+
+`write_pending` сейчас отвергает разные payload под одним ключом. Не заменить это unconditional overwrite. Переход Unknown → Applied и доставка старого ACK требуют сравнения точных digests и доказательства разрешённого readback-перехода; аудит не доказал, что всякий такой переход сломан.
+
+Отдельные identity/outbox файлы публиковать через собственный private temporary file в той же директории → write → file sync → публикация с нужной no-clobber семантикой → поддержанный directory sync. Сначала сверить имеющиеся primitives; не строить adapter SDK ради этого PR. Temp-файлы не должны попадать в `pending_items` как готовые сообщения.
+
+## 3. Одна здоровая IPC-сессия, не retry-everything
+
+`open_link` уже возвращает `ModuleLink`; `hello_retry` сегодня его теряет, а `call` открывает заново. Сохранить успешный link у одного владельца и вызывать `module_link::call` на нём. Предпочтителен явный mutable transport owner в существующем последовательном цикле; не удерживать синхронный Mutex guard через await. Ошибка транспорта инвалидирует link, не identity операции.
+
+Только сохранённые `module.outcome/result/observe` передоставлять по прежнему ID и неизменным bytes/digest в пределах действующего ACK-контракта. `module.next` — admission, **не чтение**: потеря ответа могла уже перевести работу в sending. Не делать повторный next в новом link как будто ничего не произошло; сохранить существующий reconciliation-only путь до следующего admission.
+
+Нельзя повышать readiness из candidate root hint. `native_root_checkpoint_for_hello` отдельно обозначает подтверждённую Store identity. Не создавать новый writer lease или native prompt при reconnect.
+
+## 4. EOF результата не выводится из старого cursor
+
+В `read_assistant_result` конечная страница сейчас делает `None => break`, оставляя прежний cursor, после чего `cursor.is_some()` ошибочно означает scan limit. Ввести явный флаг достигнутого EOF либо согласованно обновлять cursor перед выходом. Лимит страниц/байтов, повтор cursor и отсутствующий exact input/assistant — разные ошибки. Уже имеющиеся `cursors`/`ids` sets и `validate_assistant_parent` сохранить; «взять последнее сообщение» не является исправлением.
+
+## 5. StopPending должен пережить возврат helper-функции
+
+`NativeOwnerController::shutdown` сейчас делает `active.take()`, а `NativeOwner::shutdown(mut self)` потребляет Child. Изменить ожидание на заимствование; EOF собственного stdin отправляется один раз. Timeout/ошибка wait сохраняют owner, identity, Child и неизвестный исход, но не прежнюю readiness.
+
+**Обязательный второй участок:** `run_owned` сейчас выполняет `native_owner.shutdown().await?; return Ok(())`. Даже исправленный `&mut Child` будет потерян, если этот `?` завершит функцию. На timeout перейти в явное состояние ожидания выхода с сохранённым controller либо передать владение реально существующему подтверждённому owner. Не достаточно сохранить Option внутри функции, из которой сейчас выходят.
+
+В состоянии остановки новые native admissions запрещены; `ensure_started` не возвращает cached ready для StopPending. Не опрашивать завершённый `ctrl_c` future в горячем цикле. Использовать существующий технический backoff/readback, различая живого child, exited child и неподтверждённую process family. External-attach route не останавливает чужой/shared service. Никакой эскалации kill по одному timeout.
+
+## Доноры: точные API и пределы заимствования
+
+- [Tokio 1.53.1, `Child::wait/try_wait`](https://github.com/tokio-rs/tokio/blob/75fef53d0a8590c2d1dbb63672aa7b7d1ef51155/tokio/src/process/mod.rs#L1334-L1410): `wait(&mut self)` cancel-safe и повторно возвращает известный exit. Это позволяет отменить ожидание, сохранив Child; не сохраняет ваш controller, если caller сам его уничтожил. `wait` закрывает оставшийся child stdin; отдельно извлечённым stdin управляет владелец. Kill-пример из документации сюда не переносить.
+- [Собственный Command `write_replace_bytes`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/crates/swarm-adapter-command/src/journal.rs#L991-L1061): useful temporary-file/file-sync/Unix-directory-sync sequence. Несмотря на имя, существующие другие bytes он отвергает; это **не** general replace и **не** JSONL salvage. Проверка exists перед rename сама не гарантирует атомарный no-clobber против другого writer. Не импортировать соседний adapter crate; common primitive переносить только при реальном общем consumer.
+- [tempfile 3.27.0, `NamedTempFile::persist/persist_noclobber`](https://docs.rs/tempfile/3.27.0/tempfile/struct.NamedTempFile.html): изучено как сравнение, не новая зависимость. `persist` не синхронизирует файл/директорию; `persist_noclobber` не обещает атомарность на всех платформах. Название API не заменяет требуемую гарантию.
+
+## Критерии итоговой квалификации — не исполнены этой документацией
+
+| Сценарий | Ожидаемый результат |
+|---|---|
+| Одна повреждённая op-history и независимая проверенная история | Явная изоляция без ложного fresh state; hello не падает от повторного несогласованного decoder. |
+| Сбой после native effect, до ACK; после ACK, до cleanup | Ни одного нового POST; точный исход/страница восстанавливаются из сохранённых фактов. |
+| Несколько обычных RPC на healthy link | Один handshake на link; исходы/rights не берутся из чужого boot. |
+| Потерян ответ module.next | Нет слепого повторного admission на том же boot. |
+| 2+ страницы, EOF на последней; повтор cursor; реальный limit | Успех, cursor-error, limit-error соответственно; exact parent проверен. |
+| Stop timeout, затем поздний exit | Child остаётся у живого владельца через caller; новые старты не разрешены; завершение подтверждается readback. |
+| External-attach shutdown | Detach наблюдения, без остановки чужого сервиса. |
+
+Один manager/worktree, writers без Cargo. После законченного кода — scoped formatting и минимальный gate:
 
 ```sh
 cargo clippy --locked -p swarm-adapter-opencode --lib --bins -- -D warnings
 ```
 
-Полные тесты, native/live и нагрузочные прогоны — отдельная итоговая фаза, не выполнять сейчас автоматически. Сценарии выше — критерии поведения, не утверждение о выполненных тестах. В сдаче указать exact SHA, изменённые producer/consumer, результат gate и оставшуюся неопределённость. Draft не переводить в Ready и не сливать как исправление, пока здесь только задание.
+Tests/native/load — итоговая фаза. Сдать exact SHA, изменения всех названных callers, сохранённые identity/unknown гарантии, реальный gate и остаток. R01/#27 владеет внешним supervisor/helper, R05/#31 — общим dispatch receipt. Их типы не дублировать; не добавлять forms/goal/steer, очистку authoritative истории или второй Store в этот блок.
