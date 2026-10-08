@@ -1,93 +1,89 @@
-# R15. Нативные квоты Codex/Muse: read → event → Store → авторизованная проекция
+# R15. Квоты существующих подписок Codex/Muse: native → Store → manager
 
-**Draft-задание, 7 октября 2026. Production-код этого блока ещё не написан.** Основа ELIOT `40591a295af94b1541ec2ba30afe8e3247701a71`. Не меняет модель, оплату, число агентов или разрешение на автоматические повторы.
+**PR #41 · исправлено 8 октября 2026 · пока задание, не реализация.** Проверенный source ELIOT: 40591a295af94b1541ec2ba30afe8e3247701a71. SHA — источник проверки, не требование установки.
 
-## Результат и границы
+## Результат и обязательная граница
 
-Менеджер видит фактически reported окна и свежесть квоты своего harness, а не догадку по 429. Codex/Muse snapshots поступают без model prompt. Успешный unrelated RPC больше не закрывает quota incident. Не строить новый capacity ledger и не превращать quota observation в policy engine.
+Показать менеджеру фактические окна квоты и их свежесть из уже используемых подписочных harness. Не требовать API key, отдельный inference billing, новый аккаунт, закреплённый SDK/CLI release или отключение обновлений. Нативный harness продолжает пользоваться существующей авторизацией и своим обычным auth refresh.
 
-Только Codex и Muse как producers, один общий consumer/readback. Claude cost, OpenCode provider integrations и OpenCodex quota mint изучены в [нативном integration guide](../../agent-operations/native-harness-integration.md), но **не являются новыми collectors этого PR**. Расширять общий transport только настолько, насколько необходимо постоянно получать выбранные notifications; новый approval/control набор поставляется отдельно.
+Рабочая основа: аудит владельца ELIOT-Swarm-AUDIT-2026-10-06(2).md §§B5.3–B5.4/B6; muse_as.py и codex_as.py там описывают уже работающие MSP/app-server пути. [Integration guide](../../agent-operations/native-harness-integration.md) содержит границы доступа к исходным script-архивам, политику без пинов и точные source-level gates, которые ещё предстоит удалить.
 
-## Читать перед кодом
+Этот PR — только два producers Codex/Muse и один законченный reader. Не включать сюда новый quota collector каждого вендора, model routing, оплату, автоматическую смену аккаунта и полный набор agent controls.
 
-- [Integration guide](../../agent-operations/native-harness-integration.md), §2–5: различия native effects, scope, квот и скрытых действий внешнего GET.
-- `modules/codex/UPDATE.md`: Python bridge.3 и standalone Rust v4 не одна реализация. Работать в Rust; не удалить Python без parity.
-- `modules/muse/UPDATE.md`: SDK 1.3.0 и обязательная новая artifact identity для изменённого bridge.
-- `docs/owner-decisions.md`, §1.2–1.4/2.2: manager/worktree, no heuristic kill, read-only и retention.
-- Первичные native schema/types указаны в integration guide с SHA. Текущая документация не доказывает поддержку старым установленным сервером.
+## Существующие функции и первый шаг
 
-## Существующие точки входа
-
-| Путь / symbols | Что делать |
+| Участок | Изменение |
 |---|---|
-| `crates/swarm-adapter-codex/src/lib.rs::NativeClient::{attach,request,receive_response}`, `decline_server_request` | Один owned native connection/read-pump; отделить ответ RPC, выбранное notification и server request. Сейчас no-id notifications пропускаются. Не потерять нынешнюю refusal policy при transport refactor. |
-| Тот же `lib.rs`: `send_operation`, вызывающие NativeClient::attach пути | Реально подключить общий transport owner вместо дополнительного quota-only socket на каждую операцию. Reconnect не повторяет native mutation. R03 меняет только steer admission, не этот owner. |
-| `modules/muse/bridge.mjs::{launchConnection,onNotification,observation,report}` | Использовать действующий SDK callback; добавить initial/readback usage после успешного initialize и typed handling usage/changed. Не помещать account read в child refresh loop. |
-| `crates/swarm-kernel-host/src/store/runtime.rs` — действующий module.observe path | Найти реального writer observation, сохранить binding/artifact/boot/sequence guards, добавить bounded typed quota projection и источник. Не обходить через произвольный meta writer. |
-| `crates/swarm-kernel-host/src/store/capacity.rs::{quota_code,reset_evidence,note_outcome,open_quota_incident}` | Развести provider condition и quota evidence; убрать unconditional resolution на Applied/Accepted. Не менять reserve/active/release ledger R13. |
-| `crates/swarm-contracts/src/method_policy.rs`, host dispatch, `swarm-mcp`, `swarm-cli` | Один scoped read нового значения, связанные schema/parser/authorization и caller в том же PR. Не глобальный рефакторинг каталога. |
+| `crates/swarm-adapter-codex/src/lib.rs::NativeClient::{attach,request,receive_response}` | Соединение читается постоянно, а не только внутри ожидаемого RPC. Ответы по ID, notifications и server requests разделяются. |
+| `send_operation`, действующие callers NativeClient::attach | Использовать владельца этого соединения, не создавать второй quota-only client на каждую операцию. Не повторять потерянную mutation. |
+| `decline_server_request` | При transport refactor не менять самовольно выбранную policy ответов. Полноценный attention/reply остаётся отдельным блоком, не незаметным auto-allow. |
+| `modules/muse/bridge.mjs::{launchConnection,onNotification,observation,report}` | Initial usage/read и usage/changed на имеющемся SDK/MSP link. Не child poller и не model prompt. |
+| `crates/swarm-kernel-host/src/store/runtime.rs`, действующий module.observe | Принять bounded typed quota fact с текущими binding/boot/sequence проверками. |
+| `store/capacity.rs::{quota_code,reset_evidence,note_outcome,open_quota_incident}` | Не закрывать quota incident от unrelated Applied/Accepted; источник и окно должны соответствовать. Resource ledger не переписывать. |
+| `swarm-contracts` registry, host dispatch, MCP/CLI | Подключить один scoped reader вместе с реальными parser/schema/caller. Новый неподключённый DTO не считается результатом. |
 
-`capacity_report(db,limit,after)` сегодня не получает Principal. **Не дописывать в него account/credit данные и считать их автоматически авторизованными.** Предпочтительный узкий новый read — `agent.usage {binding_id, generation}`; это предлагаемое имя, не существующий API. Проверить отсутствие конфликта имени; реализовать точную область и отдельный typed response вместе с registry. Cash/account-wide детали доступны только при отдельно допустимой роли/области; обычному участнику полный account inventory не выдаётся.
+Начать с receive_response и реального lifetime NativeClient: добавление account endpoint в allowlist без постоянного reader оставит updates потерянными. Общий reader не является новым агентным framework.
 
-## 1. Минимальный typed fact и authority
+## 1. Совместимость без release allowlist
 
-Предлагаемые внутренние `NativeUsageSnapshot` и `ProviderCondition` — новые типы, не готовая библиотека. Snapshot переносит: source runtime/service, проверенный auth context ref или явную неизвестность, bucket ID, native observation time, collection time, completeness/freshness, числовые window fields с единицами, отдельно credits/spend controls и evidence ref.
+Использовать установленный runtime и актуальные определения его интерфейса. Reported version записывается отдельно от подтверждённых capabilities. Старые номера SDK/CLI в UPDATE описывают code snapshot, не ограничивают допустимый release. Не переносить жёсткое сравнение версии в новый collector и не заменять его другим постоянным диапазоном.
 
-Общий тип содержит только общую семантику; native raw error/protocol детали остаются в ограниченной adapter-проекции. Секреты, bearer, raw headers, email и полный account payload в публичный snapshot не включать. Identity нельзя вычислять из модельного текста или бесконтрольно доверять произвольному account ID, присланному модулем: связывать с выбранным native service и разрешённым credential/auth context источника. При неизвестном account не суммировать snapshots разных bindings как независимые бюджеты.
+Проверить конкретные required methods/fields через существующие handshake/schema и обычные readback-запросы. Опциональное неизвестное поле не ломает базовую snapshot; отсутствующая account capability ограничивает quota report, не запрещает уже рабочую подписочную сессию. Нельзя выбирать другой тариф/модель, чтобы получить красивые цифры отчёта. Не устанавливать или обновлять пакеты из status/Doctor.
 
-Snapshot observation и collector support разделены: unsupported / not_observed / stale / fresh / invalid_or_conflicting. Пустой объект, null, timeout, auth error — не нулевая квота. Не заменять старое usable evidence «свежим нулём»; сохранять его как stale и показывать ошибку нового read. При auth change старое значение не current.
+## 2. Codex
 
-## 2. Codex: непрерывное чтение, без второго управляющего клиента
+На той же app-server connection читать поддержанные account/read и account/rateLimits/read; постоянно принимать account/rateLimits/updated. Никакого forced нового login или токена от пользователя. Optional account/usage/read применять только при реальной поддержке, не требовать его у любого сервера.
 
-Владелец connection демультиплексирует RPC IDs, notifications и server requests. Pending RPC ожидание не должно становиться единственным местом чтения socket. Ограничить очереди и размер frames; control replies/terminal/account snapshots не блокировать bulk output. Отбрасывание неподдержанного delta явно не означает потерю terminal/quota evidence.
+Pending RPC по ID и current connection generation; bounded queues. Bulk text не блокирует replies/terminal/request handling. Разрыв не доказывает, что native input не был принят. После reconnect восстановить наблюдение, а не отправлять prompt повторно.
 
-После initialize получить поддержанный account context (`account/read` без forced token refresh) и `account/rateLimits/read`. Optional `account/usage/read` вызывать только при доказанной поддержке; его отсутствие не ломает основную quota snapshot. Новые optional fields не требовать у старого сервера. Аккаунт API может быть недоступен API-key-only backend: вернуть unavailable, не пробовать чужую auth route.
+В изученных нативных формах есть legacy rateLimits и bucket map rateLimitsByLimitId: не считать их двумя независимыми бюджетами. Обновление одного bucket не стирает остальные. Explicit unknown/null не заменяется старым якобы current числом. Использовать единицы именно полученного контракта; в рассмотренной форме resetsAt — секунды. Checked conversion, не молчаливое переполнение.
 
-Слушать `account/rateLimits/updated` постоянно. `rateLimitsByLimitId` при наличии задаёт buckets; legacy `rateLimits` не считать второй независимой квотой. Update одного limitId не стирает другие buckets. Null текущего поля сохраняет unknown по native контракту. Преобразование resetsAt seconds → milliseconds проверяется на переполнение; native units/evidence сохраняются. Credits balance остаётся decimal string/opaque reported unit, не f64-USD по предположению.
+Credits и subscription windows раздельны. Строковый balance не объявлять USD без нативного определения единицы. 100% окна не доказывает прекращение исполнения, если harness использует уже разрешённые владельцем credits; ELIOT сам разрешение расходовать их не выдаёт.
 
-Свежесть read, пришедшего после более нового event, проверять по available native marker/collector generation. Когда native total ordering отсутствует, не придумывать его из client request ID: conservative stale/conflict лучше неверного current. На reconnect получить новый initial snapshot; не сбрасывать usage в ноль и не re-send сохранённый prompt. Installed schema/experimental flag проверяется отдельно; не включать все experimental methods для обхода ошибки.
+Старый initial read, пришедший после нового event, не должен откатывать current snapshot. При отсутствии native total ordering использовать локальное окно чтения/поколение и помечать неопределённость, не придумывать порядок по request ID. Auth change переводит старые account snapshots в исторические.
 
-## 3. Muse: использовать штатный SDK, не переизобретать collection
+## 3. Muse
 
-Сразу после успешного initialize читать `usage/read` на уже существующей connection; `usage/changed` идёт через нынешний onNotification. Отдельный `refreshUsage` может быть private helper; он не требует root model turn и не должен падением прерывать agent.open/ответ на вопрос. No observation в `{usage?}` — штатный unknown.
+Добавить initial usage/read после успешного initialize в существующую connection и объединить с onNotification для usage/changed. Методы присутствовали уже в ранее исследованной схеме; это не инструкция удерживать ту SDK-версию. Не создавать второй SDK и не опрашивать каждую child session.
 
-Сохранять observedAtMs от native host; не заменять его Date.now каждого GET. Проверять типы и nonnegative finite значения, но **не запрещать usedPercent >100**. Weekly и current window раздельны. Новый usage update не считается активностью конкретного writer/child. SDK pin уже имеет этот API — upgrade ради одного read не нужен.
+Отсутствующий usage — no observation. Weekly/current window раздельны; observedAtMs и resetsAtMs сохраняют native units. Нельзя заменять observedAtMs временем повторного GET или запрещать usedPercent >100. Невозможность прочитать quota не должна терять pending question либо провоцировать новый model turn.
 
-PR #30 владеет pending-request race fixes. Принять его актуальную реализацию перед интеграцией, не переписать/отменить её. Там остаётся отдельно отмеченный blocked module.example.json update; не обходить инструментальный запрет. Новую shipped bridge revision, examples/UPDATE и checkpoint compatibility согласовать по правилам модуля; никогда не переименовывать старый checkpoint в новый artifact. Публикация docs не активирует мост.
+Согласовать с актуальной веткой R04/#30, не отменяя pending-generation fixes. Идентичность поставленного ELIOT adapter должна соответствовать его bytes; это не pin пользовательского Muse. Не переименовывать старый checkpoint под новую сборку и не перезаписывать живой bridge.
 
-## 4. Store и reader — один законченный путь
+## 4. Один typed fact и действительная область чтения
 
-Typed snapshot принимается через реальный authenticated module observation. Для standalone Codex проверить, как current adapter сообщает module observations, и подключить producer к этому пути; новый struct без caller не считается поставкой. Хранить последнее проверенное значение с source/evidence в существующем Store, а не ещё одну БД. Не записывать полный многократный snapshot каждого токена; значимые изменения коалесцировать, сохранять отчёт о gaps и last-known evidence.
+Минимальная проекция: source runtime/service; известный native account context либо unknown; bucket/window; native observed time и collected time; fields с единицами; freshness/completeness; evidence ref. Имена NativeUsageSnapshot/ProviderCondition — предлагаемые внутренние типы, не готовые библиотеки. Raw credentials/email/headers не публиковать.
 
-`agent.usage` выполняет current Principal / permitted binding-generation проверку **до** проекции; server calls из этого reader запрещены. Operator может видеть разрешённые account details; обычный Manager — только явно предоставленный ему scope, Participant не получает account-wide баланс через generic agent.state/report.delta. Найти все raw observation readers и не обходить новый guard вложенным исходным payload. Новый метод, schemas, CLI mapping и docs связаны в этом PR.
+Принять fact через реальный authenticated module.observe и хранить в существующем Store. Значимое изменение коалесцировать; не дублировать полный account snapshot на каждый token/child. Не суммировать один лимит за parent, children и несколько bindings. Неизвестное account overlap показывать как unknown.
 
-На один общий account/bucket показывать одну snapshot или явно unknown overlap; не складывать один balance за каждого child. При несовпадающих источниках не выбирать произвольно первый binding. Snapshot cursor/freshness не равны праву исполнить действие.
+`capacity_report(db,limit,after)` не принимает Principal. Не дописывать туда account-wide данные, считая их автоматически авторизованными. Предлагаемый узкий метод `agent.usage {binding_id,generation}` ещё не существует: проверить имя, подключить registry, parser, current ownership, schema и один frontend caller в той же поставке. Повторно проверить raw nested observation readers, чтобы они не обходили scope.
 
-## 5. Не закрывать quota incident случайным успешным исходом
+Reader возвращает уже полученную проекцию. Отдельный native refresh — нативное чтение через adapter, без inference и изменения user settings. Нормальная авторизация транспорта остаётся делом harness; запрет нового платного API не означает запрет его HTTP/MSP/app-server интерфейсов.
 
-В note_outcome убрать правило «всякий Applied/Accepted закрывает quota». OpenCode GET, model configure, late success ранее начатого turn или unrelated reply не доказывают восстановление исчерпанного окна.
+## 5. Исправить ложное восстановление квоты
 
-Разделить как минимум throttling, subscription exhaustion, auth, overload и unknown provider failure, сохраняя typed source. Конкретная HTTP429 без дополнительной информации не доказывает exhaust; HTTP404 без provider/model proof не доказывает исчезновение модели. Старый ambiguous quota incident пометить исторически неоднозначным, не переписать задним числом в точный новый класс.
+`note_outcome` не должен закрывать incident только потому, что пришёл Applied/Accepted на том же binding. Успешный refresh, настройка или позднее окончание прежнего хода не доказывают сброс нужного окна.
 
-Resolution требует новой подтверждённой evidence нужного auth/bucket/window либо отдельного явного операторского решения с записанным основанием. При отсутствии такого доказательства отчёт остаётся unresolved/unknown. Наступление предполагаемого reset_at позволяет запланировать read, не объявить «квота восстановилась». Эта поставка **не** включает новые launch limits, смену модели, recharge, reset-credit consumption, email, mint или account-pool rotation.
+Различать нативные rate limiting, exhausted subscription window, auth problem, overload и неизвестный отказ по структурированным данным. HTTP429 без подробностей не доказывает exhaustion. Resolution — новое доказательство для того же account/bucket/window либо отдельное явное решение с основанием. Предполагаемый reset time позволяет прочитать состояние, но не фабрикует восстановление.
 
-## Итоговые сценарии, пока не выполненные
+Исторический неоднозначный incident не переписывать задним числом в точную новую категорию. Никаких auto purchases, reset-credit consumption, account switching или обхода ограничений. Отдельная quota snapshot не меняет политику запуска и число агентов.
 
-| Вход | Требуемый исход |
+## Итоговые сценарии — ещё не выполнены
+
+| Сценарий | Требуемый исход |
 |---|---|
-| Native quota event, когда нет ожидаемого RPC | Snapshot обновляется; событие не теряется в receive_response. |
-| Старый read завершился после нового event; reconnect; auth changed | Нет регрессии в якобы fresh snapshot и подмены account. |
-| Два limitId; patch одного; explicit null | Другой bucket сохранён; unknown не превращён в старое current/zero. |
-| Muse no usage, weekly/reset ms, percent 105 | Честный unknown либо корректные значения без запрета >100. |
-| 429; quota exhausted; unrelated successful RPC | Разные состояния; успех не закрывает quota без evidence. |
-| Один account обслуживает parent/children/два bindings | Нет умножения денег/процентов на число агентов. |
-| Запрещённый binding / Participant / raw nested observation | Account информация не раскрывается обходным reader. |
-| Reader/Doctor и поток квоты | Ноль prompts, answers, restarts, key mint, recharge и иных billing/auth mutations. |
+| Native update без ожидаемого RPC | Принят reader, доставлен в Store; не потерян. |
+| Нормальное обновление совместимого harness | Подключение не отклонено по старому release number; capabilities перечитаны. |
+| Новый необязательный field / нет quota method | Остальные функции работают; missing quota честно unknown. |
+| Старый read после нового event; reconnect/auth change | Нет ложной свежести и подмены account. |
+| Два buckets; Muse 105%; отсутствующий usage | Раздельные окна, допустимый процент, отсутствие не ноль. |
+| Quota failure, затем unrelated successful RPC | Incident не закрывается без релевантного evidence. |
+| Несколько children на одной подписке | Один бюджет, не сумма копий. |
+| Запрещённый binding/read через raw observation | Нет обхода текущего scope. |
+| Все quota reads | Ноль prompts, новых paid-inference маршрутов, покупок и остановок сессии. |
 
-## Сдача и интеграция
+## Сдача
 
-Один manager/worktree. Внутренние assignments: Codex transport, Muse collection, общий contract/Store/reader — непересекающиеся symbols; общий DTO согласует manager. Writers без Cargo. После целого продукта manager выполняет scoped formatting и минимальный Clippy затронутых Rust packages, плюс `node --check modules/muse/bridge.mjs`; broad tests/native/account qualification — отдельная финальная фаза. Новые dependencies по умолчанию не нужны.
+Один manager/worktree; writers без Cargo. Реализация в этом PR producer → Store → reader целиком; затем scoped formatting и минимальный Clippy затронутых Rust packages, node --check изменённого Muse bridge. Broad tests/native/account qualification — итоговая фаза, не выполнена этой документацией.
 
-R03/#29 использует read/request transport, но владеет exact steer admission; не блокировать его этим PR. R04/#30 владеет pending freshness. R13/#39 — capacity resource ledger и lease, здесь только quota section. R14/#40 позже переносит shared schemas: добавления не начинают его extraction заново. No merge/активация по одному docs CI.
-
-Сдать exact SHA, connected producer → Store → reader, удалённые повторные connections, реальные gates, remaining unavailable capabilities. В этой редакции опубликованы только source-backed guide и исполнимое по объёму задание, не работающий quota collector.
+R03/#29 не ждёт R15 и владеет steer admission; R04/#30 — Muse pending; R13/#39 — resource ledger; R14/#40 — последующий schema extraction. Исторические CI результаты не переносятся на новый код. В сдаче указать candidate SHA, connected callers, удалённые лишние connections, реальный gate и remaining gaps. Production-код и пользовательская конфигурация этим обновлением не менялись.
