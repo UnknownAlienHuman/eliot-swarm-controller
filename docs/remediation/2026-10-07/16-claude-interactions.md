@@ -1,82 +1,258 @@
-# R16. Claude: рабочая подписочная сессия → вопрос → точный ответ
+# R16. Claude: official permission/question flow → attention → exact decision
 
-**PR #42 · исправлено 8 октября 2026 · реализация ещё не завершена.** Source review ELIOT: 40591a295af94b1541ec2ba30afe8e3247701a71. Это координата проверенного кода, не версия, на которой владелец должен оставаться.
+**PR #42 · переработано 8 октября 2026 · production-код ещё не изменён.** Source ELIOT: `40591a295af94b1541ec2ba30afe8e3247701a71`. Release numbers в репозитории описывают существующий код, а не допустимые версии пользовательского harness.
 
-## Результат и границы
+## Результат
 
-Менеджер отвечает через agent.reply исходному живому permission/question callback. Нативная подписочная авторизация, настройки, инструменты и model loop остаются прежними. Не требовать отдельный API key, новый billing route, фиксированный SDK/CLI release или downgrade. Отсутствие нужного интерфейса у одной библиотеки не означает отсутствие работающего подписочного Claude Code.
+Claude-сессия использует текущую subscription authorization и официальный Agent SDK permission flow. Approval или `AskUserQuestion` появляется в scoped attention и получает ровно одно решение через существующую Operation/`agent.reply`. Для долгого ожидания применяется официальный durable `defer + persisted session + resume`, а не попытка восстановить JavaScript Promise из JSON.
 
-Работать в существующем Rust adapter + Node driver, а не создавать второй executor. До расширения driver проверить, что он использует именно текущую авторизованную нативную установку. Если прежняя SDK-граница сама подменяет этот путь, исправить границу подключения к тому же harness; не компенсировать её отдельным inference API. Не выдумывать новый CLI control verb.
+PR не включает новый executor, отдельный inference API, смену аккаунта, universal auto-allow, новый model loop или подмену hooks callback-ом.
 
-## Первый участок и источники
+## Нормативные источники
 
-Открыть `crates/swarm-adapter-claude/sdk-harness/bridge.mjs::prepare`, затем `handle` и реальные Rust consumers. Сегодня prepare отвергает packageInfo.version !== '0.3.287', затем проверяет sdk.startup; canUseTool немедленно отвечает deny, handle поддерживает prepare/send/stop, CAPABILITIES не содержит agent.reply.
+- [Module contract](../../agent_swarm.module-contract-v2.md): ownership, Operation, replay/readback, attention.
+- [Native harness integration](../../agent-operations/native-harness-integration.md): official-doc source hierarchy и capability semantics.
+- [Claude permissions](https://code.claude.com/docs/en/agent-sdk/permissions).
+- [Claude approvals and user input](https://code.claude.com/docs/en/agent-sdk/user-input).
+- [Claude environment variables](https://code.claude.com/docs/en/env-vars).
+- [Owner decisions](../../owner-decisions.md), §1.2–1.4/2.2.
 
-Читать [модульный контракт](../../agent_swarm.module-contract-v2.md) для identity/replay, [owner decisions](../../owner-decisions.md) §1.2–1.4 для manager/worktree, и актуальную [документацию native permissions](https://code.claude.com/docs/en/agent-sdk/permissions)/[user input](https://code.claude.com/docs/en/agent-sdk/user-input) вместе с определениями фактически установленного интерфейса. Старое требование сверять только pin 0.3.287 удалено. Полные SDK types этим аудитом не были извлечены; их поддержку нельзя угадать по имени функции.
+Исторические скрипты/брифы не определяют expected SDK payload. Их инциденты можно добавить в fixtures только после сопоставления с официальной native формой.
 
-Материалы владельца: ELIOT-Swarm-AUDIT-2026-10-06(2).md §§B4.2/B5/B9. В них Claude Code — действующий root, а новый controller adapter имеет отдельный, неполный статус. Не приписывать ему паритет с работающей сессией.
+## Первый участок кода
 
-## Существующая цепочка
+Открыть `crates/swarm-adapter-claude/sdk-harness/bridge.mjs::prepare`, затем `handle`, `pump`, `safeSdkFrame` и Rust consumers.
 
-| Участок | Изменить / сохранить |
+Сегодня:
+
+- `prepare` отвергает всё кроме package version `0.3.287`;
+- `canUseTool` немедленно возвращает deny;
+- Node control поддерживает prepare/send/stop, но не decision reply;
+- CAPABILITIES не объявляет `agent.reply`;
+- Rust adapter сохраняет собственную Operation/journal identity, но не живой callback request.
+
+Устранить весь связанный путь, а не только удалить одну проверку версии.
+
+## Карта существующих функций
+
+| Участок | Изменение и сохранённая гарантия |
 |---|---|
-| `sdk-harness/bridge.mjs::prepare`, `sdkImportEntry` | Убрать единственный release-equality gate. Проверить имя выбранного пакета, реальный export/используемые формы; reported version оставить наблюдением. Не подмена следующей константой. |
-| `prepare.canUseTool`, `handle`, `pump`, `safeSdkFrame` | Живой pending callback и closed pending/reply/cancel frames; reader команд не блокируется ожиданием решения. |
-| `sdk-harness/prepared-query.mjs::prepareQuery` | Сохранить одноразовую семантику native prepared handle, когда этот интерфейс реально предоставлен. Reply не запускает query повторно. |
-| `src/sdk_harness.rs::NativeHarness`, `HarnessFrame` | Новые сообщения по существующему Node/Rust транспорту, без Node-процесса на каждый вопрос. |
-| `src/lib.rs::handle_command`, `CommandInvocation`, `open_link` | Существующий agent.reply, durable Operation и exact request/boot; reconnect не повторяет prompt. |
-| `src/native_state.rs::NativeControl` | Current pending отдельно от historical denial/cancelled; не показывать разрешённый callback как всё ещё ожидающий. |
-| `src/journal.rs::OperationJournal`, `src/receipt.rs` | Повтор неизменной операции читает сохранённый исход; конфликт не разрешает native callback ещё раз. |
-| `src/config.rs::NativeOptions`, `src/module_runtime.rs::CAPABILITIES`/`capabilities_match` | Объявить только действительно подключённый reply; current model/permission из выбранного маршрута, не исторические числа. |
-| Host `store/module_handshake.rs::native_command_capability`, `store/runtime.rs`, `store/capacity.rs` | Подключить observation → scoped attention → admission; необходимые schema/registry/frontend consumers в том же PR. |
+| `sdk-harness/bridge.mjs::{prepare,handle,pump,safeSdkFrame}` | Проверка required exports/options вместо release equality; official permission callback/hook frames. Reader stream не блокируется ожиданием manager decision. |
+| `sdk-harness/prepared-query.mjs::prepareQuery` | One-shot prepared ownership сохраняется. Reply/defer/resume не запускает вторую query для того же admitted input. |
+| `src/sdk_harness.rs::{NativeHarness,HarnessFrame}` | Typed frames pending/deferred/decision/closed; byte/count bounds. |
+| `src/lib.rs::{handle_command,CommandInvocation,open_link}` | Existing Operation, binding/boot и `agent.reply`; reconnect не повторяет prompt или decision. |
+| `src/native_state.rs::NativeControl` | Current live request, deferred request и historical denial/cancelled — разные states. |
+| `src/journal.rs::OperationJournal`, `src/receipt.rs` | Persist intent before decision; same request replay reads result; changed payload conflicts. |
+| `src/config.rs::NativeOptions`, `src/module_runtime.rs::{CAPABILITIES,capabilities_match}` | Объявить только реально подключённые live/deferred reply capabilities; version — observation. |
+| Host `store/module_handshake.rs`, `store/runtime.rs`, `store/capacity.rs` | Authenticated observation → scoped attention → current-authority admission. Не открывать raw tool input другим scopes. |
 
-Готового runtime/claude.rs на этой базе нет. Найти реальные callers через `git grep -n 'agent.reply' -- crates`; новый public endpoint на каждый SDK tool не требуется.
+Новые public types получают реальных callers в этом же PR. Отдельный endpoint на каждый Claude tool не требуется.
 
-## 1. Текущий runtime вместо замороженного номера
+## 1. Сохранить subscription route
 
-Смена совместимого установленного SDK не должна сама давать SDK_VERSION_MISMATCH. Проверять обязательные exports и формы выбранных операций. Неподдержанный метод возвращает точную capability gap; не пытаться запускать старый bundled executable или платный API ради её устранения. Существующее приложение и нормальная авторизация не переключаются.
+Официальная документация: `ANTHROPIC_API_KEY`, если установлен, заменяет Claude Pro/Max/Team/Enterprise subscription; в non-interactive mode он используется всегда. Поэтому adapter обязан:
 
-Одного удаления if недостаточно: проверить package-loading, использованные native options, truthful executor-version projection и callers. Старые 0.3.287 в artifact IDs/отчётах — сведения о той сборке, не подтверждение версии текущего executor. Не подделывать reported version и не изменять работающую сессию на месте. UPDATE/package metadata должны перестать предписывать freeze пользователю; идентичность фактически поставленных bytes ELIOT сохраняется.
+- не инъецировать `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` или другой provider route без явной конфигурации владельца;
+- не наследовать случайный key из управляющего процесса, если route объявлен subscription-backed;
+- наблюдать выбранный auth/provider mode без публикации credentials;
+- при несовпадении fail before model input, а не молча переключаться;
+- не использовать `CLAUDE_CODE_SIMPLE`, если нужен OAuth/keychain subscription: этот режим официально не читает OAuth credentials.
 
-Для незаданного permissionMode показывать requested=inherited, effective — только после native observation. Явную настройку владельца передавать неизменной. Не включать bypass/default ради прохождения теста. canUseTool не обязательно вызывается для каждого native tool; отсутствие callback не является transport failure. История уже выданных deny не превращается в pending.
+ELIOT IPC credential не является provider key. Status/Doctor не выполняет login/logout и не меняет environment работающей сессии.
 
-## 2. Удержать один живой запрос
+## 2. Compatibility определяется требуемыми интерфейсами
 
-Node хранит bounded map callback resolvers. Native toolUseID, локальный callback ID, current boot, подтверждённая session и fingerprint исходного input — разные поля. Локальный ID не объявлять native turn ID. Оригинальный input и Promise остаются у владельца; Store получает разрешённую компактную карточку и reference.
+Удалить `packageInfo.version !== '0.3.287'` и все зависимые ложные проекции. Не заменять его новым release/range allowlist.
 
-Для допустимого интерактивного пути callback ждёт, но reader команд, stream pump и IPC продолжают работать. Не await-ить решение в цикле чтения команд. Усечение карточки не меняет original fingerprint; incomplete/unanswerable явно показывается вместо молчаливого исчезновения вопроса или auto-allow. Budget — техническая граница канала, не новый лимит агентской работы.
+До первого input проверить:
 
-## 3. Провести ответ через всю цепочку
+- импорт выбранного package/entrypoint;
+- query/prepared-query API, который реально использует driver;
+- permission mode option и `canUseTool` signature;
+- hook registration и `defer`, если включён durable mode;
+- required stream message/session identity forms;
+- abort/cancellation signal;
+- observed runtime/package versions для диагностики.
 
-Authenticated module.observe с existing binding/boot/sequence проверками → scoped attention → current-authority agent.reply → OperationJournal intent → Node decision frame → повторная проверка callback identity/state → один resolve. Новый helper без production caller не поставляется.
+Отсутствующий required interface делает **эту capability** unavailable. Read-only describe и независимые функции не отклоняются только из-за нового optional field или другого release number.
 
-Closed reply содержит request reference, fingerprint и allow-once/deny либо ответ исходным вопросам. Разрешение обычного tool использует сохранённый input; произвольное редактирование аргументов и persistent allow-always не включать в этот блок. Осмысленный deny — доставленное решение, не обязательно Rejected ELIOT Operation.
+Не подменять текущую установку historical bundled executable. Идентичность ELIOT artifact bytes сохраняется отдельно от version внешнего harness.
 
-AskUserQuestion отвечать по реально предоставленной native форме questions/answers, не новым prompt. Проверить repeated question keys, free-text/multi-select, усечённые варианты и возможности детей на текущем интерфейсе; не обещать child support по наличию parent callback. Raw input/credentials не раскрываются через generic observation reader.
+## 3. Официальный permission evaluation
 
-## 4. Отмена и неопределённость
+Фактический порядок:
 
-AbortSignal, reply и закрытие native query состязаются за одно pending state. Поздний reply не возрождает callback. Одинаковый повтор возвращает записанный результат; изменённый payload — конфликт. Listener снимается после settle/cancel.
+1. `PreToolUse` hooks;
+2. deny rules;
+3. ask rules;
+4. permission mode;
+5. allow rules и native auto-approved calls;
+6. `canUseTool`, если запрос всё ещё unresolved.
 
-Host IPC disconnect при живом Node не уничтожает pending. После гибели Node старый Promise нельзя восстановить из JSON: отметить потерю живого callback, сохранить известный outcome/unknown и не отправлять решение или prompt заново. ACK callback не означает завершение tool, child или Task.
+Следствия для implementation:
 
-Не смешивать исправление с новым native stop/restart, goal engine или quota collector. Живые сервисы и user credentials не меняются автоматически.
+- `canUseTool` не видит все tool calls;
+- auto-approved call не становится pending attention;
+- правило, обязательное для каждого вызова, реализуется `PreToolUse` hook;
+- `dontAsk` не вызывает callback и отклоняет то, что иначе спросило бы;
+- bare allow rules могут shadow callback; этот факт должен быть виден в describe/diagnostics;
+- `bypassPermissions` не ограничивается `allowedTools`; deny/ask/hooks остаются отдельными слоями;
+- после Agent SDK 0.3.286 отсутствие `permissionMode` не равно явному `default`.
 
-## Итоговые критерии — пока не выполнены
+Хранить:
 
-| Сценарий | Ожидаемый результат |
+```text
+requested_permission_mode: Explicit(mode) | Inherited
+observed/effective_mode: Observed(mode) | Unknown
+callback_coverage: unresolved_only
+hook_coverage: configured matcher/revision
+```
+
+Нельзя объявить effective mode по исходному config без native evidence.
+
+## 4. Два режима ожидания, а не один выдуманный recovery
+
+### 4.1 Live callback
+
+Использовать, когда Node owner остаётся жив до решения:
+
+```text
+canUseTool(toolName,input,{signal,suggestions})
+  → bounded PendingNativeInteraction
+  → module.observe
+  → attention
+  → agent.reply Operation
+  → exact live resolver
+  → PermissionResultAllow/Deny
+```
+
+Pending state содержит разные identities:
+
+- adapter boot/connection generation;
+- native session/root identity;
+- local request ID;
+- native toolUseID, когда предоставлен;
+- tool name;
+- canonical input fingerprint;
+- request kind (`permission`/`ask_user_question`);
+- cancellation signal state;
+- created/observed times.
+
+Original input и Promise/resolver остаются в Node memory. Store получает bounded redacted projection и fingerprint. Reply не редактирует произвольный input в первом slice; allow пропускает original input, deny содержит bounded message.
+
+### 4.2 Durable defer
+
+Официальная документация рекомендует `PreToolUse` hook с `defer`, если человеческий ответ может быть дольше жизни процесса. Реализовать только после проверки точного hook/defer type текущего SDK:
+
+1. Hook фиксирует bounded request identity и возвращает официальное `defer` decision.
+2. Native session сохраняется своим механизмом; процесс может завершиться без живого Promise.
+3. ELIOT attention ссылается на deferred request/session, а не callback resolver.
+4. Решение допускает documented session resume/continuation с точным persisted request contract.
+5. Если установленный interface не предоставляет необходимый resume, capability `durable_reply` unavailable; не симулировать её новым prompt.
+
+Live pending callback не сериализуется как будто resumable. Node loss:
+
+- live request → `callback_lost`, решение не отправляется;
+- deferred request → остаётся answerable только если native persisted-session contract это подтверждает.
+
+## 5. AskUserQuestion
+
+`AskUserQuestion` проходит через `canUseTool` и использует official shape:
+
+```text
+questions[1..4] {
+  question,
+  header,
+  options[2..4] {label, description, preview?},
+  multiSelect
+}
+answers { question_text → label | labels | custom_text }
+```
+
+При allow вернуть original questions и collected answers. Не посылать answer как новый conversation prompt.
+
+Границы:
+
+- если adapter ограничивает tools array, `AskUserQuestion` должен быть в ней;
+- option preview optional; HTML preview проходит native validation, но UI ELIOT всё равно treats it as untrusted/redacted content;
+- duplicate question text делает answer map ambiguous — запрос не auto-answer; manager видит capability gap/invalid request;
+- free text и multi-select сохраняют official form;
+- текущая документация: `AskUserQuestion` недоступен subagents, запущенным через Agent tool. Не объявлять child support;
+- custom multi-step forms, которых native tool не выражает, не встраиваются в этот callback.
+
+## 6. Reply admission и one-shot settlement
+
+`agent.reply` проверяет до эффекта:
+
+- current Principal и binding/generation;
+- current adapter boot/connection;
+- pending kind/state;
+- native/local request identity;
+- input fingerprint;
+- decision shape;
+- Operation request ID/digest.
+
+Allow/Deny или AskUserQuestion answers — разные typed decisions. `allow always`/permission-rule write не входит в первый slice: official suggestions можно наблюдать, но изменение settings требует отдельной authority и отдельной Operation.
+
+Гонки:
+
+- reply выигрывает → resolver settles once, listener снимается;
+- AbortSignal/query close выигрывает → request cancelled, late reply rejected;
+- same reply retry → сохранённый результат, без второго resolve;
+- changed reply → request conflict;
+- reused toolUseID в другом boot/input → отказ;
+- ACK decision ≠ tool completion ≠ Task acceptance.
+
+## 7. Attention и observability
+
+Attention item содержит только необходимое:
+
+- runtime/binding/session reference;
+- request kind и tool name;
+- bounded redacted summary;
+- fingerprint и freshness;
+- mode/coverage diagnostics;
+- supported actions (`allow_once`, `deny`, `answer_questions`, `unavailable`).
+
+Не публиковать raw file content, environment, credentials, полный Bash body без policy/redaction или Promise internals. Generic report reader не обходит scoped authorization.
+
+Historical immediate deny остаётся historical result, не pending. Auto-approved call может отражаться в diagnostics/events, но не требует reply.
+
+## 8. Критерии — ещё не выполнены
+
+| Сценарий | Требуемый исход |
 |---|---|
-| Совместимый runtime обновился | Нет отказа только из-за release number; реальная версия и capabilities наблюдаются заново. |
-| Подписочный запуск через существующую авторизацию | Нет требования отдельного API key/счёта и silent backend switch. |
-| Вопрос/разрешение root | Одна карточка → один ответ → исходный callback без нового model input. |
-| Inherited/explicit permission mode; auto-resolved tool | Requested/effective/history честно разделены. |
-| Reply/abort в обоих порядках, duplicate/conflict | Один settle; новый запрос не затронут. |
-| Тот же toolUseID в другом boot; изменённый input | Guard отвергает до эффекта. |
-| Host reconnect / Node loss | Pending сохранён в первом случае; во втором не фабрикуется и не replay-ится. |
-| ACK allow, инструмент ещё работает | Решение доставлено, завершение Task не заявлено. |
+| Compatible SDK/runtime update | Нет version-number отказа; required capability проверена заново. |
+| Subscription route + случайный API key в parent env | Adapter не переключается молча; fail before prompt либо очищенный documented environment. |
+| Auto-approved tool | Нет ложного pending callback/attention. |
+| Ask/deny rule | Callback вызывается по official order; exact request виден. |
+| `dontAsk` | Нет ожидания несуществующего callback; native deny отражён честно. |
+| Live reply/abort в обоих порядках | Один settlement. |
+| Long human delay | Official defer/persist/resume либо truthful unavailable; не восстановленный Promise. |
+| AskUserQuestion multi-select/free-text | Original questions + правильный answers map; no new prompt. |
+| Subagent AskUserQuestion | Не обещается; отражается native limitation. |
+| Host reconnect / Node loss | Same live Node сохраняет pending; потерянный Node не replay-ит decision/input. |
+| Allow ACK, tool ещё работает | Decision applied, tool/Task terminal не заявлен. |
 
-## Сдача
+## 9. Проверка и сдача
 
-Один manager/worktree, writers без Cargo. Реализацию добавлять в этот PR целиком; scoped formatting, минимальный Clippy затронутых packages и node --check изменённого driver после кода. Broad/native tests — итоговая фаза. Сдать SHA, removed version gates, подтверждённый путь подписки, connected callback→reader→reply и реальный gate.
+Один manager/worktree; writers не запускают Cargo. Порядок:
 
-R05/#31 владеет result provenance, R15/#41 — Codex/Muse quota, R14/#40 — schema extraction. Эта правка меняет задание; literal gate и новые replies ещё не исправлены в production. Прежний docs CI не подтверждает будущую реализацию.
+1. compatibility/auth boundary;
+2. official permission mode/hook wiring;
+3. live pending/reply;
+4. durable defer, только если current interface подтверждён;
+5. Store attention/reader/admission;
+6. fixtures официальных callback/hook shapes;
+7. native qualification current subscription installation.
+
+После законченного vertical slice:
+
+```sh
+cargo clippy --locked -p swarm-adapter-claude -p swarm-contracts -p swarm-kernel-host -p swarm-mcp --lib --bins -- -D warnings
+node --check crates/swarm-adapter-claude/sdk-harness/bridge.mjs
+```
+
+Broad/native tests — итоговая фаза. Сдать exact SHA, current official definitions, removed version gates, auth mode evidence, callback/defer paths и remaining unavailable capabilities. Документация не исправляет runtime сама по себе.
+
+R05/#31 владеет result provenance; R15/#41 — Codex/Muse quota; R14/#40 — schema extraction. Их код не дублировать.
