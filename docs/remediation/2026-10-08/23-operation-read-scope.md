@@ -1,101 +1,78 @@
 # R23. Operation read scope: fail-closed object authorization для get/list/delta
 
-**Статус:** implementation handoff. В текущей ветке production-код ещё не изменён.
+**Статус:** implementation handoff. Production-код ещё не изменён.
 
 **База проверки:** `40591a295af94b1541ec2ba30afe8e3247701a71` (`main`, 2026-10-08). Перед реализацией сравнить актуальный `main`; уже исправленное не переписывать.
 
-## 1. Подтверждённая утечка
+## 1. Подтверждённая проблема
 
-`OPERATION_VISIBILITY_SQL` содержит default-open branch:
+`OPERATION_VISIBILITY_SQL` содержит default-open ветку: любой method, который не попал в перечень исключений и prefixes, виден любому аутентифицированному caller. В неё попадают `swarm.launch`, `agent.*`, `task.dispatch` и будущий новый method, если разработчик не обновил denylist.
 
-```sql
-op.method NOT IN (...)
-AND op.method NOT LIKE 'coordination.%'
-AND op.method NOT LIKE 'concilium.%'
-AND op.method NOT LIKE 'review.%'
-AND op.method NOT LIKE 'automation.%'
-AND op.method NOT LIKE 'script.%'
-AND op.method NOT LIKE 'goal.%'
-AND op.method NOT LIKE 'hook.%'
-AND op.method NOT LIKE 'github.%'
-AND op.caller_id != 'eliot-internal-automation-v1'
-```
-
-Любой аутентифицированный Manager или Observer поэтому видит generic Operations, включая `swarm.launch`, `agent.*`, `task.dispatch` и будущий новый method, если разработчик не добавил его в exclusion list.
-
-`operation.get` затем возвращает полный `operations::get_operation`:
+Generic `operation.get/list` возвращают raw внутреннюю запись:
 
 ```text
 caller_id
 method/state
 Task/Attempt/binding/generation
 operation_contract
-native_mcp parent/phase
-native_refs
+native_mcp/native_refs
 result
 timestamps
 ```
 
-`get_operation_for_current_manager` добавляет native-MCP, workspace-launch и participant issuance diagnostics по слабому `operation_reader`. `current_manager` защищает только manager-action cards. Следовательно, unrelated Manager получает не только факт существования Operation, но и retained native/workspace diagnostics.
+`report.delta` и Operations subscription используют тот же visibility predicate. `get_operation_for_current_manager` защищает current-GM action cards, но native-MCP/workspace/issuance diagnostics добавляет по слабому `operation_reader`, поэтому unrelated Manager получает retained diagnostics.
 
-`operation.list` использует тот же predicate и возвращает full Operations. `report.delta`/Operations subscription используют `timeline_visibility_sql`, внутри которого тот же predicate; linked observation payload также раскрывается.
+Это противоречит проектной границе: MCP profile определяет набор методов, но не выдаёт object authority; high-level manager tools не обходят Task/Attempt/Operation scope.
 
-Это противоречит документации:
+## 2. Важная коррекция: Observer profile не удалять
 
-- MCP profiles narrow tools but do not replace application object authorization;
-- manager high-level tools do not bypass Task/Attempt/Operation authority;
-- Participant gets only exact current/historical assignment projections;
-- global diagnostics reserved to verified local Operator.
+`observer` — session-fixed frontend surface, а не роль/ACL. По умолчанию `local-observer` может быть связан с **локальным Operator credential**. Поэтому нельзя удалять `operation.get/list` или Operations category из observer profile только из-за object leak: это сломает штатную read-only диагностику локального Operator.
 
-## 2. Результат
+Правильная матрица:
 
-Одна provider-neutral функция решает **может ли principal читать exact Operation и на каком уровне**. `operation.get`, `operation.list`, linked `report.delta`/subscriptions и diagnostic decorators используют один resolver.
+| Credential / relation | Observer frontend method visible? | Object result |
+|---|---:|---|
+| verified local Operator | да | global Diagnostic grant |
+| exact caller / current scoped Manager | да | scoped Receipt grant |
+| separate Role::Observer без relation | да | NOT_FOUND / filtered page |
+| hidden method by selected profile/live method policy | нет | rejected before target IPC by R24 |
+
+Следовательно:
+
+- профиль можно оставить неизменным;
+- Store resolver остаётся единственной object-security boundary;
+- `mcp.authorization.allowed_methods` — method membership, не object grant;
+- tests обязаны использовать разные credentials при одном profile, чтобы не спутать local Operator и Observer role.
+
+## 3. Результат
+
+Одна provider-neutral функция решает, может ли principal читать exact Operation и какой projection разрешён:
 
 ```text
 Principal + exact Operation + retained relation
   -> OperationReadGrant
-  -> one closed projection
-  -> get / list / delta
+  -> closed projection
+  -> operation.get / operation.list / report.delta / subscriptions
 ```
 
-Unknown method/relationship is fail-closed. Добавление нового method в registry не делает его автоматически публичным.
+Unknown method/relationship fail-closed. Добавление нового method в registry не делает его публичным.
 
-No external IAM service, CEL/OpenFGA policy engine, ACL table or second authorization DSL.
-
-## 3. Не переписывать Participant path
-
-Current Participant handling уже отделено до generic `read()`:
-
-- Concilium/review/thread/integration Operations проходят свои retained-scope authorizers;
-- current attempt owner/producer получает только bounded candidate-origin projection для `source.capture`/`agent.result`;
-- own coordination Operation требует exact current Task/Attempt/binding/generation;
-- full manager/native caller fields остаются private.
-
-Сохранить эти specialized paths. R23 не должен заменить их generic raw Operation projection.
-
-Однако current participant branch несколько раз возвращает `operations::get_operation` после specialized authorization. Это допустимо только для closed coordination/review receipts whose public fields are explicitly intended. В рамках R23 inventory all such methods and use the same projection level enum; raw full projection is never an accidental default.
+No external IAM/CEL/OpenFGA service, ACL table или второй policy DSL.
 
 ## 4. Один internal resolver
 
-Добавить небольшой module, например:
+Добавить небольшой модуль, например:
 
 ```text
 store/operation_read_scope.rs
 ```
 
-Private types:
-
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum OperationReadLevel {
     Summary,
     Receipt,
     Diagnostic,
-}
-
-pub(super) struct OperationReadGrant {
-    pub level: OperationReadLevel,
-    pub basis: OperationReadBasis,
 }
 
 pub(super) enum OperationReadBasis {
@@ -109,13 +86,12 @@ pub(super) enum OperationReadBasis {
     RetainedCoordinationScope,
     LaunchChildParent,
 }
-```
 
-`basis` is diagnostics/audit metadata returned only where appropriate; it is not a new public grant or persisted authority.
+pub(super) struct OperationReadGrant {
+    pub level: OperationReadLevel,
+    pub basis: OperationReadBasis,
+}
 
-Main API:
-
-```rust
 pub(super) fn resolve_operation_read(
     db: &Connection,
     principal: &Principal,
@@ -123,202 +99,170 @@ pub(super) fn resolve_operation_read(
 ) -> Result<Option<OperationReadGrant>>;
 ```
 
-One exact Operation row is loaded once into a named struct. Helpers consume this row rather than independently re-querying and accepting different shapes.
+Load exact Operation once into a named internal row. Helpers consume this row instead of re-querying and accepting different shapes.
 
-No default branch that returns `Some` based on method absence from a denylist.
+No branch based on `method NOT IN (...)` may return access.
 
-## 5. Positive authorization rules
+## 5. Positive grant rules
 
-Evaluate in deterministic order.
+Evaluate deterministically.
 
-### 5.1 Local Operator
+### 5.1 Verified local Operator
 
-Verified bootstrap local Operator:
+`require_local_operator` succeeds:
 
 ```text
 Diagnostic
 ```
 
-Call `require_local_operator`, not `role == Operator` alone.
+`role == Operator` alone is insufficient.
 
 ### 5.2 Exact caller
 
-Exact `operation.caller_id == principal.client_id`:
+`operation.caller_id == principal.client_id`:
 
 ```text
 Receipt
 ```
 
-Historical own receipt remains readable after Task completion or role handover, subject to current registered/non-disabled principal from `current_principal`.
+Historical own receipt remains readable after Task completion, subject to current registered/non-disabled principal. Exact caller does not automatically receive unrelated host-global diagnostic cards.
 
-Do not automatically expose separate host-global diagnostics merely because the caller owns the Operation. Diagnostic details are added only if the exact method/receipt owns those facts or the principal also has a diagnostic grant.
+### 5.3 Current Task/Attempt manager or current GM scope
 
-### 5.3 Current Task/Attempt manager
+For coherent Task/Attempt tuple:
 
-For an Operation carrying exact Task/Attempt:
+- load Task and Attempt;
+- verify revision/identity;
+- exact current Attempt owner or existing `current_manager_has_task_scope`;
+- result: `Receipt`.
 
-- load Task/project and Attempt;
-- require tuple coherence;
-- current unreleased Attempt owner == principal, or existing `current_manager_has_task_scope` returns true under the exact project;
-- result:
+Task ID without coherent Attempt does not infer authority. Taskless Operation cannot use this branch.
+
+### 5.4 Validated on-behalf link
+
+Reuse:
 
 ```text
-Receipt
+any_on_behalf_operation_link
+on_behalf_visible_to
 ```
 
-For a current GM whose authority covers exact Task/project, `Receipt`; method-specific manager action cards may use `Diagnostic` only when current existing policy explicitly requires current-GM authority.
+Validate method/action/link identity. Preserve historical effective-manager and transfer rules encoded per link kind. Result: `Receipt`.
 
-Task ID without coherent Attempt does not infer scope from Task name alone. Taskless Operation cannot use this branch.
-
-### 5.4 Validated on-behalf operation
-
-Use existing `any_on_behalf_operation_link` + `on_behalf_visible_to`.
-
-- validate method/action/link identity exactly;
-- preserve historical effective-manager behavior encoded per link kind;
-- use `Receipt`;
-- only current GM/project branch provided by existing validated link policy may inherit successor visibility.
-
-Do not duplicate link parsing or add generic `Ok(true)` for Review outside its exact `belongs_to/current GM scope` path.
+Do not create generic `is_manager` fallback.
 
 ### 5.5 Directed mailbox receipt
 
-Keep existing sender/recipient/cancellation resolution:
+Keep exact sender/recipient/cancellation resolution:
 
-- exact sender/canceler;
-- exact original recipient from unique settled delivery + digest;
-- `Receipt` projection limited to directed delivery fields;
-- no native refs/manager diagnostics.
+- sender/canceler;
+- original recipient from unique settled delivery + digest;
+- directed Receipt only;
+- no native refs or manager diagnostics.
 
-### 5.6 Retained review/coordination scopes
+### 5.6 Retained review/coordination scope
 
-Use existing exact authorizers:
+Delegate to existing exact authorizers:
 
-- `reviews::authorize_operation_read`;
-- `coordination_threads::authorize_operation_read`;
-- `concilium::authorize_operation_read`;
-- `integration::authorize_operation_read`;
-- contract/code-scope exact own/historical paths.
+- review;
+- coordination thread/contract;
+- Concilium;
+- integration;
+- exact code-scope/participant paths.
 
-These return a scoped receipt projection, not generic diagnostic access.
+They return scoped Receipt, never Diagnostic.
 
-### 5.7 Launch child inheritance
+### 5.7 Launch child
 
-Current `launch_child_parent` validates exact parent request ID, prerequisite, Task/Attempt/binding, lease, manifest and automation link. Child gets at most the grant resolved for its exact parent, narrowed to `Receipt`; no child broadens parent visibility.
+Validate exact parent request, Task/Attempt/binding, lease, manifest and automation link. Child inherits at most the parent grant and never broadens it.
 
-Malformed retained linkage is `INVALID_RECEIPT`, not invisible public data.
+Malformed linkage is `INVALID_RECEIPT`, not public fallback.
 
-### 5.8 Observer
+## 6. Participant path
 
-Observer has no Task/Attempt ownership or caller relation by role alone. Therefore generic `operation.get/list` does not expose Operations solely because the method is read-only.
+Current Store intercepts Participant `operation.get` before generic read and uses specialized review/coordination/candidate authorization. Preserve it.
 
-First slice:
+Inventory each Participant method that currently returns raw `operations::get_operation`; route it through the same projection level after its exact domain authorizer. Do not replace current exact checks with a generic Participant grant.
 
-- remove `operation.get` and `operation.list` from the Observer MCP allowlist and deferred Observer catalog;
-- remove Operations subscription category from Observer unless another exact scoped requirement grants it;
-- Observer keeps aggregate `swarm.dashboard`, `host.status`, bounded public reports whose projection is independently authorized.
+The audit does **not** claim a generic Participant leak.
 
-Do not create an arbitrary `PublicOperation` method allowlist in this PR. A future public-summary feature needs a named consumer and closed data contract.
-
-## 6. Projection levels
+## 7. Closed projections
 
 ### Summary
-
-For future bounded lists or manager dashboards only:
 
 ```text
 operation_id
 method
 state
-Task/Attempt IDs only when grant basis is task-scoped
-created_at_ms / updated_at_ms
+Task/Attempt IDs only when grant is Task-scoped
+created_at_ms
+updated_at_ms
 ```
 
 No caller ID, binding, contract, native refs, result body or diagnostics.
 
 ### Receipt
 
-Closed method-independent envelope:
-
 ```text
 operation_id
 method
 state
-Task/Attempt/binding tuple allowed by grant
+permitted Task/Attempt/binding tuple
 created/updated
-bounded result receipt
+bounded method-specific result receipt
 ```
 
-The result is method-specific and bounded. Existing raw `get_operation` is an internal fact loader, not the public Receipt projection.
-
-For methods without a closed result projector, `operation.get` returns Summary plus `result_status="not_projected"`, not raw JSON.
+If no closed result projector exists, return Summary plus `result_status="not_projected"`; do not expose raw JSON.
 
 ### Diagnostic
 
-Local Operator global view and explicitly authorized current-manager diagnostics:
+Verified local Operator and explicitly authorized current-manager diagnostic paths may include internal binding/native/readback cards, still bounded/redacted.
 
-- internal caller/binding/contract/native refs;
-- manager action/readback cards;
-- bounded corruption/gap markers.
+Raw `get_operation` becomes an internal fact loader.
 
-Even Diagnostic must respect existing byte bounds and secret redaction; it is not raw DB export.
+## 8. get/list/delta use one resolver
 
-## 7. Replace SQL denylist with candidate query + exact resolver
-
-`OPERATION_VISIBILITY_SQL` currently tries to be both candidate selector and authority. Split responsibilities.
-
-### 7.1 operation.get
+### operation.get
 
 ```text
-load exact operation
-resolve_operation_read
+load exact Operation
+resolve grant
 project by level
 ```
 
-No preliminary default-open SQL.
+No default-open SQL.
 
-### 7.2 operation.list
+### operation.list
 
-Do not materialize all Operations. Use a bounded candidate scan:
+Use a bounded stable scan and exact resolver. Current OFFSET over `(created_at_ms, random operation_id)` is not a stable live cursor.
 
-```text
-scan immutable admission/order position
-  -> resolve exact grant
-  -> project selected rows
-  -> stop on item/byte bound
-```
+Before choosing cursor source, prove one-to-one coverage for queued/rejected/coalesced Operations. Preferred order:
 
-Current OFFSET over `(created_at_ms, random operation_id)` is not a reliable live cursor. Do not silently reinterpret its integer `after` as a new sequence.
-
-For R23 use a versioned cursor over a stable Store position. Preferred options in order:
-
-1. a retained immutable admission observation ID proven one-to-one with Operation;
-2. a small explicit monotone `operation_sequence` assigned inside the same Store transaction;
-3. if neither is true on current schema, add the minimal column/index migration rather than timestamp+UUID or OFFSET.
-
-Before choosing, prove writer coverage for rejected/coalesced/queued Operations. One Operation must have exactly one list position.
+1. immutable admission observation ID;
+2. explicit monotone `operation_sequence` assigned in the same transaction;
+3. minimal schema migration if neither exists.
 
 Separate:
 
 - last scanned;
 - last emitted;
-- first authorized but not emitted due byte/item limit.
+- first authorized-but-not-emitted row.
 
-Unauthorized rows can advance scan cursor with explicit filtered count; an authorized row not emitted cannot be skipped.
+Unauthorized rows may advance the scan cursor with explicit filtered coverage. An authorized row that does not fit the response must not be skipped.
 
-### 7.3 report.delta / Operations subscription
+### report.delta / subscriptions
 
-Observation visibility must call the same resolver for linked `operation_id` before payload projection. SQL may use a safe over-approximation for bounded I/O, but final authority is the resolver.
+For an observation with `operation_id`, call the same resolver before payload projection.
 
-One invisible linked observation is filtered, not a page-wide `NOT_FOUND`. The cursor advances through filtered rows with explicit `filtered_items/coverage`; Store/corruption error remains error/gap.
+- invisible linked fact: filter and advance with explicit coverage;
+- damaged retained relation: gap/error by current policy;
+- one invisible row must not fail the whole page;
+- payload projection cannot exceed the Operation grant level;
+- mailbox addressed projection remains separate and exact.
 
-Do not expose the raw observation payload if its Operation grants only Summary. Add method/family-specific safe projection or an ID-only resync reference.
+## 9. Diagnostic decorators
 
-Mailbox-specific delivery visibility remains its exact addressed projection.
-
-## 8. Current-manager diagnostics
-
-Change `get_operation_for_current_manager` into projection decorators over an already resolved grant:
+Refactor `get_operation_for_current_manager` into a projector over an already resolved grant:
 
 ```rust
 fn project_operation(
@@ -328,140 +272,89 @@ fn project_operation(
 ) -> Result<Value>;
 ```
 
-Rules:
+- module/owned-service cards: current exact policy;
+- native MCP/workspace/issuance details require `Diagnostic`;
+- unrelated Manager gets no diagnostic card;
+- optional card corruption becomes bounded diagnostic gap, not visibility escalation;
+- delete `operation_reader` as a substitute for manager authority.
 
-- `owned_service_*`, module recovery/outcome cards: existing current GM/exact manager policy;
-- native MCP/workspace/participant issuance diagnostics require `Diagnostic`, not generic `Receipt`;
-- unrelated Manager never receives these cards;
-- corrupt optional diagnostic produces bounded diagnostic gap, not visibility escalation;
-- missing linked binding may degrade that card without hiding the base authorized receipt where current policy permits.
+## 10. Frontend consistency
 
-Delete `operation_reader` as a substitute for manager authority.
+- Keep observer/profile method surface unless a separate frontend product decision changes it.
+- R24 intersects profile and live `allowed_methods` before target IPC.
+- R23 performs object authorization after IPC/direct Store call.
+- Same Observer profile with local Operator credential may return global diagnostics; with separate Observer credential it returns no unrelated objects.
+- Catalog/help must say method presence does not imply object inventory.
+- CLI Manager/GM/Operator commands remain; application may return NOT_FOUND/filtered pages.
 
-## 9. Frontend policy
+## 11. Donors
 
-Update together:
+Use internal exact relation validators:
 
-- `swarm-contracts::method_policy` stays method-class only; do not encode object ACL there;
-- `swarm-mcp::profiles` removes Observer Operation tools;
-- MCP catalog audiences and `mcp.authorization` agree;
-- Tasks projection checks the actual profile and application read grant;
-- Operations subscription admission reflects scoped availability;
-- CLI `operation get/list` remains available to Manager/GM/Operator, but application may return NOT_FOUND/filtered page;
-- documentation profile tables updated.
+- Participant candidate projection;
+- review/thread/Concilium/integration authorizers;
+- current manager Task scope;
+- on-behalf links;
+- launch-child parent proof.
 
-No hard-coded duplicate method list in Store and MCP for object semantics. Frontend list only controls method visibility; Store resolver controls objects.
+AgentGateway CEL/OpenFGA/Zanzibar supply the general positive-relation idea but are not dependencies: relations already live transactionally in Store, and an external policy system would not solve projection/cursor correctness.
 
-## 10. Donors and what not to copy
-
-### Internal exact-scope authorizers
-
-Primary donors:
-
-- `participant_operation_get` and its candidate-origin projections;
-- `reviews/coordination_threads/concilium/integration::authorize_operation_read`;
-- `current_manager_has_task_scope`;
-- `any_on_behalf_operation_link/on_behalf_visible_to`;
-- `launch_child_parent`.
-
-Use their exact retained identities; do not create a broad common `is_manager=true` shortcut.
-
-### AgentGateway CEL / OpenFGA / Zanzibar-style systems
-
-Useful concept: positive relation-based authorization and deny-by-default. Not useful as dependency here:
-
-- all required relations already live transactionally in SQLite Store;
-- an external policy language would duplicate Task/Attempt/link semantics;
-- list/report still needs exact bounded projection and cursor logic;
-- no multi-service authorization consumer has been named.
-
-R23 therefore uses a typed local resolver. No external service/crate.
-
-### MCP profiles
-
-Profile allowlist is defense-in-depth only. It does not prove object scope and must not be used to compensate for Store default-open behavior.
-
-## 11. Audit corrections / bounded claims
-
-- Participant generic leak is **not** claimed: Store routes Participant `operation.get` through specialized authorization before generic read.
-- `on_behalf_visible_to` is not globally `Ok(true)`: Review returns true only after exact link `belongs_to(principal)`; non-owner paths use current GM scope and link-kind checks.
-- Message sender/recipient visibility is already intentionally addressed and should remain.
-- The confirmed leak is generic Manager/Observer default-open plus diagnostic decoration, not every specialized family.
-
-## 12. Files/symbols
+## 12. Files
 
 Primary:
 
-- new small `store/operation_read_scope.rs`;
+- new `store/operation_read_scope.rs`;
 - `store/mod.rs::{OPERATION_VISIBILITY_SQL,operation_visible_to,timeline_visibility_sql,read}`;
-- `store/operations.rs::{get_operation,get_operation_for_current_manager}` refactored into internal load + closed projector;
-- existing authorizers in automation/reviews/coordination families reused, not duplicated;
-- `swarm-mcp/src/mcp/profiles.rs`, catalog/docs/subscription admission;
-- focused Store/MCP public-entry tests.
+- `store/operations.rs` internal loader and closed projections;
+- existing domain authorizers reused;
+- MCP docs/tests only where claims/fixtures need correction.
 
-R14/#40 later moves common method/schema data. Do not block the security fix on frontend crate extraction, and do not rebuild R14 inside R23.
+R14 later moves schema/catalog data; do not block R23 on it or implement R14 here.
 
 ## 13. Removal list
 
 After migration remove:
 
 - default-open negative method predicate;
-- `operation_visible_to` duplicate SQL/Rust semantics;
-- raw public `get_operation` projection;
+- duplicated SQL/Rust visibility semantics;
+- raw public Operation projection;
 - `operation_reader` diagnostic gate;
-- Observer Operation tools/category without object scope;
-- page-wide NOT_FOUND on a filtered report row;
-- OFFSET/timestamp+UUID list cursor once versioned position is active;
-- duplicated family visibility clauses that the resolver now delegates to exact authorizers.
+- page-wide NOT_FOUND caused by a filtered row;
+- unstable OFFSET cursor;
+- duplicate domain clauses replaced by exact authorizers.
 
-No compatibility union or hidden fallback to old visibility.
+Do **not** remove Observer tools solely as an object-security fix.
 
 ## 14. Criteria
 
-### Security
-
-- [ ] Unrelated Manager cannot read/list/delta a direct `swarm.launch`, `agent.send`, `task.dispatch` or future new method.
-- [ ] Observer cannot call generic Operation methods/category in restricted profile or direct application role.
-- [ ] Exact caller retains own receipt after Task completion.
-- [ ] Current Task manager/current GM sees only authorized Task-scoped receipts.
-- [ ] Automation effective manager sees validated on-behalf receipt; another manager does not.
+- [ ] Unrelated Manager/Observer cannot read/list/delta direct `swarm.launch`, `agent.send`, `task.dispatch` or unknown future methods.
+- [ ] Same observer profile + verified local Operator retains global Diagnostic view.
+- [ ] Exact caller retains bounded receipt.
+- [ ] Current Task manager/current GM sees exact scoped receipts.
+- [ ] Validated on-behalf actor sees its receipt; another manager does not.
 - [ ] Directed sender/recipient visibility remains exact.
-- [ ] Participant candidate/review/thread/concilium paths retain bounded specialized projections.
-- [ ] Local verified Operator retains global diagnostic view.
-- [ ] Unknown new method is invisible except exact caller/operator/current explicit relation.
-
-### Projection
-
-- [ ] Receipt never contains diagnostic-only fields.
-- [ ] List and delta use same resolver as get.
+- [ ] Participant review/coordination/candidate paths preserve specialized scope.
+- [ ] Receipt never contains Diagnostic-only fields.
+- [ ] get/list/delta use one resolver.
 - [ ] Invisible row is filtered without page failure or cursor leak.
-- [ ] Byte/item bound does not skip first authorized unreturned row.
-- [ ] Corrupt link/operation is an explicit bounded gap/error, not public fallback.
-
-### Simplification
-
-- [ ] One object resolver, no default-open denylist.
+- [ ] Unknown new method is fail-closed except explicit positive relation.
 - [ ] No external ACL engine/table.
-- [ ] No raw Operation JSON exposed by generic frontend.
-- [ ] No duplicate object policy in MCP profile.
 
 ## 15. Implementation order
 
-One manager/worktree. Writers receive non-overlapping files and do not run Cargo.
+One manager/worktree. Writers do not run Cargo.
 
-1. Add `OperationRow`, grant enum and exact get resolver; wire `operation.get`.
-2. Refactor closed projections and diagnostic decorators.
-3. Replace list candidate/pagination with versioned stable cursor and same resolver.
+1. Add internal Operation row, grant enum and exact get resolver.
+2. Wire closed projectors and diagnostic decorators.
+3. Replace list pagination and visibility.
 4. Replace delta/subscription linked-event visibility.
-5. Narrow Observer profile/catalog/admission.
-6. Remove old SQL/raw projection paths.
-7. Scoped formatting and minimal Clippy.
+5. Add public-boundary fixtures for local Operator, Observer role, exact caller and unrelated Manager using the same profile.
+6. Remove old SQL/raw paths.
+7. Scoped formatting and Clippy.
 
-Do not merge a resolver type without get/list/delta callers.
+Do not merge resolver-only code without get/list/delta callers.
 
 ## 16. Minimal gate
-
-After complete code:
 
 ```sh
 cargo clippy --locked \
@@ -472,18 +365,15 @@ cargo clippy --locked \
   --lib --bins -- -D warnings
 ```
 
-Broad tests/native execution remain final phase. Focused security tests should enter through Store/MCP public methods and verify absence of leaked fields, not only helper booleans.
-
-PR report names base/head SHA, exact grant rules, removed default-open branches/raw projectors, stable cursor choice, Clippy result and unrun live qualification.
+Broad/native tests remain final phase.
 
 ## 17. Non-goals
 
-- new global Observer inventory;
-- external policy service/DSL;
-- changing Task/Attempt ownership;
-- changing mutation authorization;
-- hiding directed mailbox receipts from legitimate recipient;
+- changing mutation authority;
+- new public global Observer inventory;
+- external policy service;
+- raw DB export;
 - rewriting historical Operations;
-- exposing raw DB rows to simplify debugging;
-- implementing R14 frontend extraction;
-- changing native adapter protocols.
+- implementing frontend extraction;
+- changing native adapters;
+- removing methods from observer profile as a substitute for Store authorization.
