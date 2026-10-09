@@ -1,0 +1,59 @@
+name: Temporary code-scope expiry patch
+
+on:
+  push:
+    branches:
+      - fix/code-scope-expiry-before-override
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/code-scope-expiry-before-override
+          fetch-depth: 0
+      - name: Install pinned rustfmt
+        shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
+      - name: Apply pre-mutation expiry validation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/swarm-kernel-host/src/store/code_scopes.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '''    coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;
+    let accepted_mode = request
+'''
+          new = '''    coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;
+    if request
+        .expires_at_ms
+        .is_some_and(|expires_at_ms| expires_at_ms <= now)
+    {
+        return Err(Error::invalid(
+            "expires_at_ms must be later than the acceptance time",
+        ));
+    }
+    let accepted_mode = request
+'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected one accept boundary, found {count}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          rustfmt +1.98.1 --edition 2024 crates/swarm-kernel-host/src/store/code_scopes.rs
+      - name: Commit patch and remove temporary workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/temp-code-scope-expiry.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/swarm-kernel-host/src/store/code_scopes.rs
+          git diff --cached --check
+          git commit -m "fix: reject expired code-scope replacements before override"
+          git push origin HEAD:fix/code-scope-expiry-before-override
