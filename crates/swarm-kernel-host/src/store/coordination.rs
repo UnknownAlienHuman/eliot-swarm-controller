@@ -2233,6 +2233,13 @@ fn list_participant_page(
         }
     }
     let partial = more_active || has_unscanned || stale > 0;
+    let gaps = [
+        (stale > 0).then(|| json!({"kind":"stale_participant_index_entries","count":stale})),
+        has_unscanned.then(|| json!({"kind":"participant_page_scan_bound","count":null})),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     Ok(json!({
         "items": items,
         "task_id": scope.task["task_id"],
@@ -2240,10 +2247,7 @@ fn list_participant_page(
         "attempt_id": scope.attempt["attempt_id"],
         "next_after": if partial { last_scanned } else { None },
         "coverage": if partial { "partial" } else { "complete" },
-        "gaps": [
-            (stale > 0).then(|| json!({"kind":"stale_participant_index_entries","count":stale})),
-            has_unscanned.then(|| json!({"kind":"participant_page_scan_bound","count":null})),
-        ].into_iter().flatten().collect::<Vec<_>>(),
+        "gaps": gaps,
     }))
 }
 
