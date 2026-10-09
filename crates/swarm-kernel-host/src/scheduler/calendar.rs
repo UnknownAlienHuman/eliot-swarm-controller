@@ -8,7 +8,7 @@ use crate::{
     error::{Error, Result},
     model,
 };
-use chrono::{TimeZone, Timelike, Utc};
+use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use serde::{Deserialize, Serialize};
@@ -129,13 +129,15 @@ pub(crate) fn occurrence_id(
 }
 
 fn local_second_at(parsed: &ParsedCalendar, epoch_ms: i64) -> Result<chrono::DateTime<Tz>> {
+    let second_ms = epoch_ms
+        .div_euclid(1_000)
+        .checked_mul(1_000)
+        .ok_or_else(|| Error::invalid("calendar timestamp is outside the supported date range"))?;
     let utc = Utc
-        .timestamp_millis_opt(epoch_ms)
+        .timestamp_millis_opt(second_ms)
         .single()
         .ok_or_else(|| Error::invalid("calendar timestamp is outside the supported date range"))?;
-    utc.with_timezone(&parsed.timezone)
-        .with_nanosecond(0)
-        .ok_or_else(|| Error::invalid("calendar timestamp could not be rounded to a second"))
+    Ok(utc.with_timezone(&parsed.timezone))
 }
 
 fn occurrence_epoch_ms(occurrence: &chrono::DateTime<Tz>) -> i64 {
