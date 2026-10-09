@@ -33,7 +33,7 @@ $comparer = if ($IsWindows) {
     [StringComparer]::Ordinal
 }
 $changedRust = [Collections.Generic.HashSet[string]]::new($comparer)
-foreach ($path in Read-PathArray $ChangedPathsJson 'ChangedPathsJson') {
+foreach ($path in (Read-PathArray $ChangedPathsJson 'ChangedPathsJson')) {
     if ($path -match '\.rs$' -and $path -notmatch '^vendor/atlas/') {
         [void]$changedRust.Add($path)
     }
