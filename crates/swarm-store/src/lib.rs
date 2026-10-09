@@ -338,8 +338,7 @@ fn verify_writer_connection(
     db: &Connection,
     expected: WriterPragmaExpectation,
 ) -> Result<(), Error> {
-    let busy_timeout_ms: i64 =
-        db.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    let busy_timeout_ms: i64 = db.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     let foreign_keys: i64 = db.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     let journal_mode: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     let synchronous: i64 = db.pragma_query_value(None, "synchronous", |row| row.get(0))?;
