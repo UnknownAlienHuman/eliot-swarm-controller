@@ -739,9 +739,10 @@ fn operation_impacts(
          ORDER BY op.created_at_ms,op.operation_id LIMIT ?3",
     )?;
     let rows = statement
-        .query_map(params![prefix, upper_bound, MAX_IMPACT_OPERATIONS + 1], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![prefix, upper_bound, MAX_IMPACT_OPERATIONS + 1],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let truncated = rows.len() > MAX_IMPACT_OPERATIONS as usize;
     let mut unstarted = Vec::new();
