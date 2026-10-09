@@ -115,6 +115,20 @@ function sessionChanged(sessionId, reason = 'native_event_after_read') {
   sessionVersions.set(sessionId, (sessionVersions.get(sessionId)??0)+1);
   invalidateChildSnapshot(sessionId, reason);
 }
+function pendingRequestKey(sessionId, kind, requestId) {
+  if (typeof sessionId !== 'string' || !sessionId) throw new Error('PENDING_REQUEST_SESSION_REQUIRED');
+  if (!['approval','input'].includes(kind)) throw new Error('PENDING_REQUEST_KIND_INVALID');
+  if (typeof requestId !== 'string' || !requestId) throw new Error('PENDING_REQUEST_ID_REQUIRED');
+  // Native request IDs are scoped by their session on every reply/read API.
+  // Do not let a root and child overwrite one another in the bridge inventory.
+  return JSON.stringify([sessionId,kind,requestId]);
+}
+function recordPendingRequestGap(gap) {
+  const retained=Array.isArray(latest.pending_request_gaps)?latest.pending_request_gaps:[];
+  latest.pending_request_gaps=[...retained.slice(-31),gap];
+  latest.gaps++;
+  changed();
+}
 function replacePendingInventory(sessionId, inventory, expectedVersion) {
   if (!Array.isArray(inventory?.approvals) || !Array.isArray(inventory?.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
   // Validate the entire point-in-time inventory before removing live facts.
@@ -126,7 +140,7 @@ function replacePendingInventory(sessionId, inventory, expectedVersion) {
   ]) {
     for (const params of items) {
       if (params?.sessionId !== sessionId) throw new Error('PENDING_INVENTORY_IDENTITY_MISMATCH');
-      const key = `${prefix}:${required(params,idField)}`;
+      const key = pendingRequestKey(sessionId, prefix, required(params,idField));
       if (replacement.has(key)) throw new Error('PENDING_INVENTORY_DUPLICATE_ID');
       replacement.set(key, {view:{method,params}});
     }
@@ -223,18 +237,30 @@ function onNotification(n) {
     for (const entry of nativePending.values()) acceptModel(entry, p, {method:n.method,viewCursor:p.viewCursor,sourceRange:p.sourceRange});
   }
   if (n.method === 'approval/requested' || n.method === 'approval/updated' || n.method === 'userInput/requested') {
-    const key = p.approvalId ? `approval:${p.approvalId}` : `input:${p.userInputId}`;
-    const previous = pendingRequests.get(key)?.view.params;
-    // approval/updated changes the stage, not the original tool/request identity.
-    const params = n.method === 'approval/updated' && previous && previous.sessionId === p.sessionId
-      ? {...previous, ...p} : p;
-    if (params !== p && p.subagentOrigin === undefined) delete params.subagentOrigin;
-    pendingRequests.set(key, {view:{method:n.method,params}});
+    const sessionId=required(p,'sessionId');
+    const kind=n.method.startsWith('approval/')?'approval':'input';
+    const requestId=kind==='approval'?required(p,'approvalId'):required(p,'userInputId');
+    const key=pendingRequestKey(sessionId,kind,requestId);
+    let params=p;
+    if (n.method === 'approval/updated') {
+      const previous=pendingRequests.get(key)?.view.params;
+      // An update contains stage fields, not the original actionable request.
+      // Preserve the gap rather than fabricating tool/request identity.
+      if (!previous || previous.sessionId !== sessionId) {
+        recordPendingRequestGap({code:'PENDING_APPROVAL_UPDATE_WITHOUT_REQUEST',session_id:sessionId,
+          approval_id:requestId,current_requirement_id:p.currentRequirementId??null,view_cursor:p.viewCursor??null});
+        return;
+      }
+      params={...previous,...p};
+      if (p.subagentOrigin === undefined) delete params.subagentOrigin;
+    }
+    pendingRequests.set(key,{view:{method:n.method,params}});
   }
   if (n.method === 'approval/resolved' || n.method === 'userInput/settled') {
-    for (const [key,entry] of pendingRequests) {
-      if (entry.view.params?.approvalId === p.approvalId && p.approvalId || entry.view.params?.userInputId === p.userInputId && p.userInputId) pendingRequests.delete(key);
-    }
+    const sessionId=required(p,'sessionId');
+    const kind=n.method==='approval/resolved'?'approval':'input';
+    const requestId=kind==='approval'?required(p,'approvalId'):required(p,'userInputId');
+    pendingRequests.delete(pendingRequestKey(sessionId,kind,requestId));
   }
   changed();
 }
@@ -419,7 +445,8 @@ async function launchConnection(options) {
     }
     const p=request.params ?? {};
     const sessionId=required(p,'sessionId');
-    const key=request.method==='approval/request'?`approval:${required(p,'approvalId')}`:`input:${required(p,'userInputId')}`;
+    const kind=request.method==='approval/request'?'approval':'input';
+    const key=pendingRequestKey(sessionId,kind,kind==='approval'?required(p,'approvalId'):required(p,'userInputId'));
     // Server requests and notifications invalidate the same read window.
     sessionChanged(sessionId, 'native_request_after_read');
     pendingRequests.set(key,{view:{method:request.method,params:p}}); changed();

@@ -1,6 +1,6 @@
 # R04. Muse: вопросы и approvals не теряются при refresh
 
-**Статус: код bridge.8 добавлен в PR #30; поведенческая и native-квалификация ещё не выполнены. Draft.**
+**Статус: код bridge.8 дополнен точной session-scoped identity pending requests; syntax gate выполняется в PR #30. Поведенческая и native-квалификация остаются итоговой фазой.**
 Основа: аудит редакции 3, 07.10.2026, код `40591a295af94b1541ec2ba30afe8e3247701a71`. Карточка: AUD-025.
 Перед работой сравнить актуальный main с этим SHA; уже исправленное не переписывать. Аудит — доказательный материал, не новая owner policy.
 
@@ -32,6 +32,8 @@ Root/child attention сохраняет новый вопрос и не воск
 - [ ] Вопрос, пришедший между началом listPending и его старым ответом, остаётся в attention.
 - [ ] Разрешённый в том же окне вопрос не возвращается из старого inventory.
 - [ ] Одинаковое поведение для root/child и повторных событий.
+- [ ] Одинаковые native request ID в разных sessions не перезаписывают и не закрывают друг друга.
+- [ ] Orphan `approval/updated` сохраняется как bounded gap, а не становится actionable request с выдуманной identity.
 - [ ] Наблюдение не вызывает approval decision, reply или новый model turn.
 
 ## Границы и интеграция
@@ -65,12 +67,17 @@ identity и заменяет поля этапа; отсутствующий opt
 использовано разделение исходного вопроса и обновления этапа, не сам router
 автоматических решений. Новых зависимостей, polling-циклов или хранилищ нет.
 
-По UPDATE.md новый код имеет ID `muse-sdk-1.3.0-bridge.8`; пример маршрута,
-текущие README и два ID в существующем selftest согласованы. Публикация правки
-`modules/muse/module.example.json` заблокирована инструментом; в PR этот файл
-пока сохраняет bridge.7. До согласования примера PR нельзя активировать или
-считать готовым. Исторический checkpoint fixture не переписан. Старые binding/checkpoint не мигрируются,
+По UPDATE.md новый код имеет ID `muse-sdk-1.3.0-bridge.8`; controller example,
+module example, README и два ID в существующем selftest согласованы. Исторический
+checkpoint fixture не переписан. Старые binding/checkpoint не мигрируются,
 действующие сервисы не активировались и не останавливались.
+
+Дополнительный audit pass установил, что `pendingRequests` нельзя ключевать
+только native approval/user-input ID: все native read/reply методы также требуют
+`sessionId`, а root и child inventories живут одновременно. Bridge использует
+одну exact tuple `(sessionId, kind, requestId)` для request, inventory, update и
+terminal removal. Частичный `approval/updated` без сохранённого original request
+не становится полноценным вопросом; публикуется bounded gap без model/reply effect.
 
 Выполнено на локальном source-кандидате: `node --check` для `bridge.mjs` и
 `selftest.mjs` (Node 22.16.0), `git diff --check`, синтаксический разбор JSON/TOML
