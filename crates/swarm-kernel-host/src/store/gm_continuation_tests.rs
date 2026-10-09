@@ -153,7 +153,60 @@ fn successor_gm_continues_exact_attempt_without_restarting_dispatch() {
     )
     .unwrap();
     assert_eq!(coalesced["coalesced"], true);
-    assert_eq!(coalesced["operation_id"], start_operation_id);
+    assert_eq!(coalesced["semantic_reuse"], true);
+    assert_eq!(coalesced["start_operation_id"], start_operation_id);
+    assert_eq!(coalesced["start_operation_state_at_receipt"], "queued");
+    assert_eq!(coalesced["native_effect"], "not_repeated");
+    let reuse_operation_id = coalesced["operation_id"].as_str().unwrap().to_owned();
+    assert_ne!(reuse_operation_id, start_operation_id);
+
+    let reuse_raw: String = db
+        .query_row(
+            r#"SELECT json_object(
+                'state',state,
+                'task_id',task_id,
+                'attempt_id',attempt_id,
+                'binding_id',binding_id,
+                'binding_generation',binding_generation,
+                'effective',json(effective_request_json),
+                'result',json(result_json)
+            )
+            FROM operations
+            WHERE operation_id=?1"#,
+            [&reuse_operation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reuse: Value = serde_json::from_str(&reuse_raw).unwrap();
+    assert_eq!(reuse["state"], "settled");
+    assert_eq!(reuse["task_id"], TASK_ID);
+    assert_eq!(reuse["attempt_id"], ATTEMPT_ID);
+    assert!(reuse["binding_id"].is_null());
+    assert!(reuse["binding_generation"].is_null());
+    assert_eq!(
+        reuse["effective"]["semantic_reuse"]["start_operation_id"],
+        start_operation_id
+    );
+    assert_eq!(
+        reuse["effective"]["semantic_reuse"]["native_effect"],
+        "not_repeated"
+    );
+    assert!(reuse["effective"].get("route").is_none());
+    assert!(reuse["effective"].get("input").is_none());
+    assert!(reuse["effective"].get("task_snapshot").is_none());
+    assert!(reuse["effective"].get("launch_dispatch_packet").is_none());
+    assert_eq!(reuse["result"]["operation_id"], reuse_operation_id);
+    assert_eq!(reuse["result"]["start_operation_id"], start_operation_id);
+    let observation_payload: String = db
+        .query_row(
+            "SELECT payload_json FROM observations              WHERE operation_id=?1 AND kind='task.dispatch'",
+            [&reuse_operation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let observation: Value = serde_json::from_str(&observation_payload).unwrap();
+    assert_eq!(observation["operation_id"], reuse_operation_id);
+    assert_eq!(observation["start_operation_id"], start_operation_id);
 
     let successor_reply = mutate(
         &mut db,

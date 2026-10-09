@@ -2503,6 +2503,219 @@ fn reserve_open_route(
         json!({"operation_id":id,"binding_id":binding,"generation":1,"state":"queued","native_admission":"not_observed","waiting_for":"runtime_adapter"}),
     )
 }
+
+#[derive(Debug)]
+struct ExistingTaskDispatch {
+    operation_id: String,
+    state: String,
+    task_id: String,
+    attempt_id: String,
+    prerequisite_operation_id: Option<String>,
+}
+
+fn load_existing_task_dispatch(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    request: &Value,
+    attempt: &Value,
+) -> Result<ExistingTaskDispatch> {
+    let raw: Option<String> = tx
+        .query_row(
+            r#"SELECT json_object(
+                'method',method,
+                'state',state,
+                'task_id',task_id,
+                'attempt_id',attempt_id,
+                'binding_id',binding_id,
+                'binding_generation',binding_generation,
+                'prerequisite_operation_id',prerequisite_operation_id,
+                'original_request',json(original_request_json)
+            )
+            FROM operations
+            WHERE operation_id=?1"#,
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let retained: Value = serde_json::from_str(&raw.ok_or_else(|| {
+        Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "Attempt start pointer names a missing Operation",
+        )
+    })?)?;
+    if retained["method"] != "task.dispatch" {
+        return Err(Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "Attempt start pointer is not a task.dispatch Operation",
+        ));
+    }
+    let state = retained["state"].as_str().ok_or_else(|| {
+        Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "retained task.dispatch Operation has no state",
+        )
+    })?;
+    match state {
+        "queued" | "sending" | "native_accepted" | "outcome_unknown" | "settled" | "rejected" => {}
+        "cancelled" => {
+            return Err(Error::new(
+                "ATTEMPT_DISPATCH_CONFLICT",
+                "cancelled initial dispatch occupies this Attempt; release it and claim a new Attempt",
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                "ATTEMPT_START_CORRUPT",
+                "retained task.dispatch Operation has an unsupported state",
+            ));
+        }
+    }
+
+    let task_id = model::text(attempt, "task_id")?;
+    let attempt_id = model::text(attempt, "attempt_id")?;
+    let binding_id = attempt["binding_id"].as_str().ok_or_else(|| {
+        Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "started controller Attempt has no retained binding",
+        )
+    })?;
+    let binding_generation = attempt["binding_generation"]
+        .as_i64()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "ATTEMPT_START_CORRUPT",
+                "started controller Attempt has no retained binding generation",
+            )
+        })?;
+    if retained["task_id"] != task_id
+        || retained["attempt_id"] != attempt_id
+        || retained["binding_id"] != binding_id
+        || retained["binding_generation"].as_i64() != Some(binding_generation)
+    {
+        return Err(Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "Attempt start pointer and retained task.dispatch scope disagree",
+        ));
+    }
+
+    let original = retained
+        .get("original_request")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "ATTEMPT_START_CORRUPT",
+                "retained task.dispatch request is not an object",
+            )
+        })?;
+    let retained_prerequisite = retained["prerequisite_operation_id"]
+        .as_str()
+        .map(str::to_owned);
+    let original_prerequisite = match original.get("prerequisite_operation_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return Err(Error::new(
+                "ATTEMPT_START_CORRUPT",
+                "retained task.dispatch request has an invalid prerequisite",
+            ));
+        }
+    };
+    if retained_prerequisite.as_deref() != original_prerequisite {
+        return Err(Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "retained task.dispatch prerequisite column disagrees with its request",
+        ));
+    }
+    let requested_prerequisite = match request.get("prerequisite_operation_id") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(model::text(request, "prerequisite_operation_id")?),
+    };
+    if original_prerequisite != requested_prerequisite {
+        return Err(Error::new(
+            "ATTEMPT_DISPATCH_CONFLICT",
+            "initial delivery already exists with a different setup prerequisite",
+        ));
+    }
+    if original["attempt_id"] != attempt_id {
+        return Err(Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "retained task.dispatch request names another Attempt",
+        ));
+    }
+    if original.get("text") != request.get("text")
+        || original.get("prerequisite_operation_id") != request.get("prerequisite_operation_id")
+        || original.get("launch_operation_id") != request.get("launch_operation_id")
+    {
+        return Err(Error::new(
+            "ATTEMPT_DISPATCH_CONFLICT",
+            "initial delivery already exists with different input or setup prerequisite; use correction, not dispatch",
+        ));
+    }
+    launcher_dispatch::validate_coalesced_dispatch(tx, operation_id, request, attempt)?;
+
+    Ok(ExistingTaskDispatch {
+        operation_id: operation_id.to_owned(),
+        state: state.to_owned(),
+        task_id: task_id.to_owned(),
+        attempt_id: attempt_id.to_owned(),
+        prerequisite_operation_id: retained["prerequisite_operation_id"]
+            .as_str()
+            .map(str::to_owned),
+    })
+}
+
+fn retain_task_dispatch_reuse(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    existing: &ExistingTaskDispatch,
+    now: i64,
+) -> Result<()> {
+    let semantic_reuse = json!({
+        "schema_version":1,
+        "kind":"task_dispatch_start_slot",
+        "start_operation_id":existing.operation_id,
+        "start_operation_state_at_receipt":existing.state,
+        "native_effect":"not_repeated",
+        "current_state_read_method":"operation.get",
+    });
+    let changed = tx.execute(
+        r#"UPDATE operations
+        SET task_id=?2,
+            attempt_id=?3,
+            prerequisite_operation_id=?4,
+            effective_request_json=json_set(
+                effective_request_json,
+                '$.semantic_reuse',
+                json(?5)
+            ),
+            updated_at_ms=?6
+        WHERE operation_id=?1
+          AND method='task.dispatch'
+          AND state='queued'
+          AND task_id IS NULL
+          AND attempt_id IS NULL
+          AND binding_id IS NULL
+          AND binding_generation IS NULL
+          AND json_type(effective_request_json,'$.semantic_reuse') IS NULL"#,
+        params![
+            operation_id,
+            existing.task_id,
+            existing.attempt_id,
+            existing.prerequisite_operation_id,
+            model::canonical(&semantic_reuse)?,
+            now,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::new(
+            "TASK_OPERATION_SCOPE_CONFLICT",
+            "semantic task.dispatch receipt changed before reuse was retained",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn dispatch(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -2531,34 +2744,32 @@ pub(super) fn dispatch(
             "native-manager claim never receives a second controller start",
         ));
     }
+    if !a["released_at_ms"].is_null() {
+        return Err(Error::new(
+            "ATTEMPT_DISPATCH_CONFLICT",
+            "released Attempt cannot issue another initial-dispatch receipt; claim a new Attempt",
+        ));
+    }
     if let Some(start) = a["start_operation_id"].as_str() {
-        let (prior_method, prior_raw): (String, String) = tx.query_row(
-            "SELECT method,original_request_json FROM operations WHERE operation_id=?1",
-            [start],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if prior_method != "task.dispatch" {
-            return Err(Error::new(
-                "ATTEMPT_START_CORRUPT",
-                "Attempt start pointer is not a task.dispatch Operation",
-            ));
-        }
-        launcher_dispatch::validate_coalesced_dispatch(tx, start, v, &a)?;
-        let prior: Value = serde_json::from_str(&prior_raw)?;
-        if prior["text"] != body
-            || prior.get("prerequisite_operation_id") != v.get("prerequisite_operation_id")
-            || prior.get("launch_operation_id") != v.get("launch_operation_id")
-        {
-            return Err(Error::conflict(
-                "initial delivery already exists with different input or setup prerequisite; use correction, not dispatch",
-            ));
-        }
+        let existing = load_existing_task_dispatch(tx, start, v, &a)?;
+        retain_task_dispatch_reuse(tx, id, &existing, now)?;
         return Ok((
-            json!({"operation_id":start,"attempt_id":attempt,"coalesced":true}),
+            json!({
+                "operation_id":id,
+                "task_id":existing.task_id,
+                "attempt_id":existing.attempt_id,
+                "coalesced":true,
+                "semantic_reuse":true,
+                "start_operation_id":existing.operation_id,
+                "start_operation_state_at_receipt":existing.state,
+                "native_effect":"not_repeated",
+                "current_state_read_method":"operation.get",
+                "prerequisite_operation_id":existing.prerequisite_operation_id,
+            }),
             false,
         ));
     }
-    if a["state"] != "reserved" || !a["released_at_ms"].is_null() {
+    if a["state"] != "reserved" {
         return Err(Error::conflict(
             "initial dispatch requires an unreleased reserved Attempt",
         ));
