@@ -2311,9 +2311,7 @@ fn prompt_for(
         {
             return Err("TASK_PROMPT_SELECTION_REQUIRED");
         }
-        if input.get("task_snapshot").is_some()
-            || input.get("task_snapshot_canonical").is_some()
-        {
+        if input.get("task_snapshot").is_some() || input.get("task_snapshot_canonical").is_some() {
             return Err("TASK_PROMPT_LEGACY_PAYLOAD_FORBIDDEN");
         }
         let envelope: swarm_contracts::task_prompt::TaskPromptEnvelopeV1 =
@@ -2325,7 +2323,9 @@ fn prompt_for(
         let context: TaskDispatchContext =
             serde_json::from_value(input["task_dispatch_context"].clone())
                 .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
-        context.validate().map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
+        context
+            .validate()
+            .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
         let text = input["text"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
