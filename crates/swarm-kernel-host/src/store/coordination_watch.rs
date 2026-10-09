@@ -219,6 +219,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
         };
         let scope = scope_from_record(&record)?;
         let creator_id = model::text(&record["creator"], "client_id")?;
+        let creator_role = model::text(&record["creator"], "role")?;
         let watch_kind = model::text(&record, "watch_kind")?;
         let notification = if watch_kind == "operation_terminal" {
             // Preserve the original O1 notification envelope for existing
@@ -243,27 +244,34 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
                 "matched_at_ms":now,
             })
         };
-        let notice_key = notice_key(&scope.id, creator_id, now, watch_id);
-        set_meta(
-            tx,
-            &notice_key,
-            &json!({"watch_id":watch_id,"notification_id":watch_id}),
-        )?;
-        set_meta(
-            tx,
-            &owner_notice_key(creator_id, now, watch_id),
-            &json!({
-                "watch_id":watch_id,
-                "scope_id":scope.id,
-                "notice_index_key":notice_key,
-            }),
-        )?;
+        let notice_index_key = match creator_role {
+            "participant" => {
+                let notice_key = notice_key(&scope.id, creator_id, now, watch_id);
+                set_meta(
+                    tx,
+                    &notice_key,
+                    &json!({"watch_id":watch_id,"notification_id":watch_id}),
+                )?;
+                set_meta(
+                    tx,
+                    &owner_notice_key(creator_id, now, watch_id),
+                    &json!({
+                        "watch_id":watch_id,
+                        "scope_id":scope.id,
+                        "notice_index_key":notice_key,
+                    }),
+                )?;
+                json!(notice_key)
+            }
+            "manager" | "operator" => Value::Null,
+            _ => return Err(damaged("watch creator role is unsupported")),
+        };
         record["cursor"] = cursor;
         record["notification"] = notification;
         record["state"] = json!("matched");
         record["updated_at_ms"] = json!(now);
         record["settled_at_ms"] = json!(now);
-        record["notice_index_key"] = json!(notice_key);
+        record["notice_index_key"] = notice_index_key;
         set_meta(tx, &record_key(watch_id), &record)?;
         tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
         matched += 1;
