@@ -2049,7 +2049,7 @@ fn slot_index_by_id(record: &Value, slot_id: &str) -> Result<usize> {
         .ok_or_else(|| Error::new("NOT_FOUND", "Concilium slot was not found"))
 }
 
-fn slot_by_id(record: &Value, slot_id: &str) -> Result<&Value> {
+fn slot_by_id<'a>(record: &'a Value, slot_id: &str) -> Result<&'a Value> {
     let index = slot_index_by_id(record, slot_id)?;
     record["slots"]
         .as_array()

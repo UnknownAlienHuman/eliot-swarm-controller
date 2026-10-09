@@ -6,7 +6,10 @@
 
 use super::{Store, capacity, current_principal, gm, mutate, operations};
 use crate::{
-    automation::{authorization::GithubProjectionContext, config::AutomationEntry},
+    automation::{
+        authorization::{self, GithubProjectionContext},
+        config::AutomationEntry,
+    },
     error::{Error, Result},
     github::{
         client::{GhCli, GitHubLabelApi, IssueLabelSnapshot, RepositoryRef},

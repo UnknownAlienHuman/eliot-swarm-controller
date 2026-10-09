@@ -346,15 +346,11 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let cron = super::automation_cron::state(db, &entry)?;
     let goal_progression = super::automation_goal_progression::state(db, &entry)?;
     let github_projection = automation_github_projection::state(db, &entry)?;
-    let work = match operation_impacts(db, &owner_manager_id, project, automation_id) {
-        Ok(work) => work,
-        Err(error) if error.code == "AUTOMATION_LINK_CORRUPT" => closed_operation_impacts(),
-        Err(error) => return Err(error),
-    };
+    let work = operation_impacts(db, &owner_manager_id, project, automation_id)?;
     let operation_history =
         match linked_operation_history(db, &owner_manager_id, project, automation_id) {
             Ok(history) => history,
-            Err(error) if error.code == "AUTOMATION_LINK_CORRUPT" => closed_operation_history(),
+            Err(error) if link_integrity_error(&error) => closed_operation_history(),
             Err(error) => return Err(error),
         };
     let transfer_lineage = config::transfer_lineage(db, &owner_manager_id, project, automation_id)?;
@@ -375,6 +371,15 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))
+}
+
+// These codes describe unreadable retained linkage, not a failed database
+// operation. They may close a diagnostic collection, never authorize an effect.
+fn link_integrity_error(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "AUTOMATION_LINK_CORRUPT" | "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_VERSION"
+    )
 }
 
 fn closed_operation_impacts() -> Value {
@@ -713,6 +718,9 @@ fn observation_cut(db: &Connection) -> Result<i64> {
     )?)
 }
 
+// A derived report must not veto a valid configuration change. Withhold the
+// entire collection if its retained links cannot be verified; SQLite failures
+// still propagate to the caller and the enclosing transaction.
 fn operation_impacts(
     db: &Connection,
     owner: &str,
@@ -720,37 +728,38 @@ fn operation_impacts(
     automation_id: &str,
 ) -> Result<Value> {
     let prefix = config::entry_operation_prefix(owner, project, automation_id)?;
-    let pattern = format!("{prefix}%");
+    // The key format ends this prefix with ':'. Its binary successor ';'
+    // bounds every operation suffix without LIKE wildcards or case folding.
+    let upper_bound = format!("{};", prefix.trim_end_matches(':'));
     let mut statement = db.prepare(
         "SELECT substr(link.key,length(?1)+1),op.state FROM meta AS link \
          JOIN operations AS op ON op.operation_id=substr(link.key,length(?1)+1) \
-         WHERE link.key LIKE ?2 AND op.state IN ('queued','sending','native_accepted','outcome_unknown') \
+         WHERE link.key >= ?1 AND link.key < ?2 \
+           AND op.state IN ('queued','sending','native_accepted','outcome_unknown') \
          ORDER BY op.created_at_ms,op.operation_id LIMIT ?3",
     )?;
     let rows = statement
-        .query_map(params![prefix, pattern, MAX_IMPACT_OPERATIONS + 1], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![prefix, upper_bound, MAX_IMPACT_OPERATIONS + 1],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let truncated = rows.len() > MAX_IMPACT_OPERATIONS as usize;
     let mut unstarted = Vec::new();
     let mut in_flight = Vec::new();
     let mut uncertain = Vec::new();
     for (operation_id, state) in rows.into_iter().take(MAX_IMPACT_OPERATIONS as usize) {
-        let link = authorization::operation_link(db, &operation_id)?.ok_or_else(|| {
-            Error::new(
-                "AUTOMATION_LINK_CORRUPT",
-                "operation impact has no valid on-behalf link",
-            )
-        })?;
+        let link = match authorization::operation_link(db, &operation_id) {
+            Ok(Some(link)) => link,
+            Ok(None) => return Ok(closed_operation_impacts()),
+            Err(error) if link_integrity_error(&error) => return Ok(closed_operation_impacts()),
+            Err(error) => return Err(error),
+        };
         if link.effective_manager_id != owner
             || link.project_id != project
             || link.automation_id != automation_id
         {
-            return Err(Error::new(
-                "AUTOMATION_LINK_CORRUPT",
-                "operation impact scope mismatch",
-            ));
+            return Ok(closed_operation_impacts());
         }
         let reference = json!({
             "operation_id":operation_id,

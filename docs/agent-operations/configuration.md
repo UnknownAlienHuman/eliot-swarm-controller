@@ -31,14 +31,27 @@ readable. Affected `linked_operations` or `linked_operation_history` collections
 are withheld with `truncated: true` and a `closed` marker containing
 `status: degraded`, `error_code: AUTOMATION_LINK_CORRUPT` and
 `category: automation_link_corrupt`. The held ScriptRun reason remains readable.
-An empty degraded collection is incomplete history. Apply and execution still
-require valid links, and unrelated Store failures remain errors.
+An empty degraded collection is incomplete history. A missing link, invalid
+link identity, or corrupt/unsupported sealed link record closes only that
+diagnostic collection; it never supplies authority for an effect.
+
+The `affected_work[].work` projection returned by `automation.config.apply`
+uses the same closed representation. A link-integrity failure in this derived
+report does not roll back an otherwise valid disable or narrowing change.
+Manager authority, expected revisions, configuration validation and any
+include-existing action admission remain mandatory. Action execution still
+requires its valid retained links. SQLite, transaction and commit failures
+remain errors rather than successful applies with degraded diagnostics.
 
 The discarded `automation.control.*` proposal has no compatibility aliases. `runtime.profile.get/list/preview/apply` edits model/executor preferences; owned profile changes may be included in one configuration transaction without a separate call per field.
 
 ### 2.1 Patch rules
 
 Use `expected_revision=0` only to create an absent entry. For an existing entry match the returned revision. A manager-local `automation_id` is stable within project/owner; edits do not create a new identity.
+
+Automation IDs are case-sensitive. Operation-impact reads use an exact binary
+key-prefix range: `audit_one`, `auditXone` and `Audit_one` remain separate
+identities. An underscore in an ID is literal, not a search wildcard.
 
 Known object fields are patched recursively; explicitly supplied arrays replace the whole array. Missing fields remain unchanged. `steps=[]` therefore removes all selected steps, while omitting `steps` does not. Missing `enabled` is false on creation and unchanged on update. Reject unknown fields, duplicates and null values except where the field schema explicitly permits null. Do not infer a toggle from a preset name.
 

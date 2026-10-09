@@ -294,10 +294,7 @@ fn resync_reads(categories: &[Category]) -> Vec<&'static str> {
     }) {
         reads.extend(CONCILIUM_RESYNC_READS);
     }
-    if categories
-        .iter()
-        .any(|category| *category == Category::Coordination)
-    {
+    if categories.contains(&Category::Coordination) {
         reads.extend(COORDINATION_RESYNC_READS);
     }
     reads
@@ -340,11 +337,6 @@ pub fn committed_notification(
             "frame": frame,
         })),
     )
-}
-
-/// The single lagged marker for one overflow episode.
-pub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNotification {
-    lagged_notification_with_reads(subscription_id, gap, &RESYNC_READS)
 }
 
 fn lagged_notification_for_categories(
