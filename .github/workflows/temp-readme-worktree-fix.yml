@@ -1,0 +1,41 @@
+name: Temporary README worktree policy fix
+
+on:
+  push:
+    branches:
+      - docs/one-worktree-per-manager
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: docs/one-worktree-per-manager
+      - name: Update current development policy
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('README.md')
+          text = path.read_text(encoding='utf-8')
+          old = 'This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices.'
+          new = 'This README records current readiness. Use one dedicated worktree per manager; integrate reviewed slices through pull requests into `main`. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices.'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected one stale policy sentence, found {count}')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+          rm .github/workflows/temp-readme-worktree-fix.yml
+          git diff --check
+      - name: Commit and push
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: require one worktree per manager"
+          git push origin HEAD:docs/one-worktree-per-manager
