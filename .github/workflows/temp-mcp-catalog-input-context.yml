@@ -47,6 +47,16 @@ jobs:
           path.write_text(text.replace(old, new), encoding='utf-8')
           PY
           python tools/ci/temp_mcp_catalog_input_context.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('crates/swarm-mcp/src/mcp/catalog.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '        "{} {} {} {} {} {}",\n'
+          new = '        "{} {} {} {} {} {} {}",\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'catalog search format anchor count={text.count(old)}')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          PY
           rustfmt +1.98.1 --edition 2024 \
             crates/swarm-mcp/src/mcp/catalog.rs \
             crates/swarm-mcp/src/mcp/catalog_tests.rs
