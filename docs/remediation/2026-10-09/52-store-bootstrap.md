@@ -1,88 +1,81 @@
-# R52. SQLite writer bootstrap: options before I/O, verification before commit
+# R52. SQLite writer bootstrap: caller timeout from the first query, verification before commit
 
-**Status:** implementation handoff. Production code is unchanged in this branch.
+**Status:** production slice implemented on this branch; qualification is blocked by the repository-wide formatting gate tracked in #76. Tests remain in the final product phase.
 
 **Source baseline:** `40591a295af94b1541ec2ba30afe8e3247701a71`. Primary path: `crates/swarm-store/src/lib.rs::open_writer_inner`.
 
 ## 1. Result
 
-Opening a writer has one exact success boundary:
+Opening a writer now has one truthful success boundary:
 
 ```text
-open connection
-→ install caller WriterOptions before any schema/pragma operation
-→ inspect database identity
-→ apply and verify writer pragmas
-→ begin IMMEDIATE transaction
-→ initialize schema/kernel state
-→ re-verify required connection postconditions
-→ commit
-→ return success with no fallible post-commit validation
+validate identity, SQLite version and timeout range without touching the file
+→ open connection
+→ install caller busy_timeout before the first SQLite query
+→ inspect application/user/schema identity
+→ only for an accepted ELIOT or allowed empty database:
+     apply foreign_keys=ON, journal_mode=WAL, synchronous=FULL
+     verify timeout + required pragmas
+→ BEGIN IMMEDIATE
+→ initialize/verify schema and run the kernel callback
+→ verify required connection postconditions through the Transaction
+→ COMMIT
+→ return with no fallible post-commit work
 ```
 
-If any required postcondition fails, base schema, tags, schema digest and kernel bootstrap callback writes are not committed.
+The implementation adds no Store, pool, migration framework, retry loop or dependency.
 
-No new Store, migration framework, connection pool or retry loop is introduced.
+## 2. Confirmed defects on `main`
 
-## 2. Audit correction
+The original order was:
 
-The initial suspicion said the writer always reaches `PRAGMA journal_mode=WAL` with no busy timeout. That statement is too broad:
-
-- rusqlite currently installs a 5000 ms busy timeout on a newly opened connection;
-- all current kernel callers use `WriterOptions::default()`, also five seconds.
-
-Therefore a current default startup does not necessarily fail immediately on the first lock.
-
-Two real contract defects remain.
-
-### 2.1. Custom `WriterOptions.busy_timeout` is applied late
-
-Current order:
-
-```rust
-Connection::open(...)
-pragma_query user_version
-pragma_query application_id
-SELECT sqlite_schema
-PRAGMA foreign_keys=ON
-PRAGMA journal_mode=WAL
-PRAGMA synchronous=FULL
-busy_timeout(options.busy_timeout)
+```text
+open
+→ user_version / application_id / sqlite_schema queries
+→ foreign_keys / WAL / FULL
+→ caller busy_timeout
+→ BEGIN IMMEDIATE
+→ initialize
+→ COMMIT
+→ verify pragmas
 ```
 
-The public option does not govern the identity queries or the potentially locking WAL transition. A caller asking for zero, short or long wait receives rusqlite's default behavior during part of the open path.
+Two defects followed.
 
-### 2.2. Bootstrap commits before its own postcondition check
+### 2.1. `WriterOptions.busy_timeout` did not govern the whole open path
 
-Current order:
+The first identity queries and WAL transition used rusqlite's connection default rather than the caller's value. A zero or custom timeout therefore described only the later part of startup.
 
-```rust
-initialize(&tx)
-tx.commit()
-verify_writer_pragmas(&db)
+The branch now validates the `Duration` before opening and applies `Connection::busy_timeout` immediately after open, before any query.
+
+### 2.2. Startup could return failure after durable bootstrap
+
+`verify_writer_pragmas(&db)` ran after `tx.commit()`. A verification/query failure therefore produced a startup error after schema tags, digest and initializer writes had become durable.
+
+The branch now verifies through the live `Transaction` before commit. After a successful commit, `open_writer_inner` returns directly.
+
+## 3. Audit correction discovered during implementation
+
+The first handoff proposed applying all pragmas before identity inspection. That is unsafe.
+
+`PRAGMA journal_mode=WAL` is a persistent database effect. Applying it before checking `application_id`, `user_version` and schema emptiness could mutate a foreign SQLite file and only then return `SchemaMismatch`.
+
+Therefore the exact order is deliberately split:
+
+```text
+before identity:
+  busy_timeout only
+
+after identity accepts this database:
+  foreign_keys
+  journal_mode=WAL
+  synchronous=FULL
+  full postcondition verification
 ```
 
-If verification or its query fails, `open_writer` returns an error after schema/bootstrap writes are already durable. The caller observes startup failure, but the next process sees an initialized database.
+The public timeout controls every SQLite operation, while durable/database-specific configuration is never applied to a rejected foreign database.
 
-That is not a data-overwrite bug; it is a false transaction boundary and ambiguous startup receipt.
-
-## 3. Existing APIs to use
-
-Use only current rusqlite/SQLite primitives:
-
-- `Connection::busy_timeout`;
-- `Connection::pragma_update` / `pragma_query_value`;
-- `TransactionBehavior::Immediate`;
-- rollback-on-drop `Transaction`;
-- `Transaction::commit`.
-
-No dependency addition is needed.
-
-`Transaction` dereferences to the connection for read-only pragma verification. Do not issue manual SQL `BEGIN/COMMIT/ROLLBACK` strings.
-
-## 4. One connection configuration helper
-
-Extract one private helper:
+## 4. Implemented private types and helpers
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,48 +83,17 @@ struct WriterPragmaExpectation {
     busy_timeout_ms: i32,
 }
 
-fn configure_writer_connection(
-    db: &Connection,
-    options: WriterOptions,
-) -> Result<WriterPragmaExpectation, Error>;
-
+fn checked_timeout_ms(timeout: Duration) -> Result<i32, Error>;
+fn configure_writer_connection(db: &Connection) -> Result<(), Error>;
 fn verify_writer_connection(
     db: &Connection,
     expected: WriterPragmaExpectation,
 ) -> Result<(), Error>;
 ```
 
-### 4.1. Timeout conversion
+`checked_timeout_ms` mirrors the millisecond range accepted by rusqlite's `busy_timeout` before calling the panic-prone conversion. `Error::InvalidBusyTimeout` maps to the existing stable `STORE_CONFIGURATION` code.
 
-Convert before calling rusqlite:
-
-```rust
-let milliseconds = i32::try_from(options.busy_timeout.as_millis())
-    .map_err(|_| Error::InvalidBusyTimeout)?;
-```
-
-Zero is valid and means no waiting. Avoid `Connection::busy_timeout` panic on an unrepresentable `Duration`.
-
-Add one precise error variant if needed:
-
-```rust
-InvalidBusyTimeout
-```
-
-It maps to existing stable code `STORE_CONFIGURATION`. Do not add a general options DSL.
-
-### 4.2. Apply order
-
-Immediately after `Connection::open*`:
-
-```text
-busy_timeout
-foreign_keys=ON
-journal_mode=WAL
-synchronous=FULL
-```
-
-Then verify:
+`verify_writer_connection` checks:
 
 ```text
 PRAGMA busy_timeout == requested milliseconds
@@ -140,171 +102,103 @@ PRAGMA journal_mode equals wal case-insensitively
 PRAGMA synchronous == 2
 ```
 
-Only after this configuration/verification read `user_version`, `application_id` and `sqlite_schema`.
+There is no public options framework or test callback in the product API.
 
-Applying busy timeout first ensures every later SQLite operation follows the caller's requested lock policy.
+## 5. Transaction boundary
 
-## 5. Correct transaction boundary
-
-Refactor `open_writer_inner` to:
+Current branch flow:
 
 ```rust
+identity.validate()?;
+validate SQLite minimum;
+let expected = checked timeout expectation;
+
 let mut db = open(...)?;
-let expected = configure_writer_connection(&db, options)?;
+db.busy_timeout(options.busy_timeout)?;
+inspect exact database identity;
+
+configure_writer_connection(&db)?;
 verify_writer_connection(&db, expected)?;
 
-let identity_state = inspect_identity(&db, identity)?;
 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-initialize base schema / tags / digest or verify digest;
+initialize or verify schema/digest;
 let initialized = initialize(&tx, is_new)?;
-
 verify_writer_connection(&tx, expected)?;
 tx.commit()?;
 Ok((db, initialized))
 ```
 
-After successful commit there must be no fallible Store/SQLite call before return.
+Any initializer or precommit verification error drops the transaction and uses rusqlite rollback-on-drop. No manual `BEGIN`, `COMMIT` or `ROLLBACK` SQL was added.
 
-### Why verify twice
+The WAL transition remains outside the transaction because it is database configuration and may require its own lock transition. It occurs only after identity acceptance.
 
-- first verification proves the connection is safe before the initialization transaction;
-- second verification ensures the kernel initializer did not leave required connection settings in a different state;
-- any second-verification failure drops/rolls back the transaction.
+## 6. Reader boundary
 
-Do not move `journal_mode=WAL` into the transaction. The mode transition is connection/database configuration and may require locking before `BEGIN IMMEDIATE`.
-
-## 6. Identity inspection remains separate
-
-Optionally extract the current identity queries as one private typed function:
-
-```rust
-enum DatabaseIdentityState {
-    New,
-    Existing,
-}
-
-fn inspect_database_identity(
-    db: &Connection,
-    identity: SchemaIdentity<'_>,
-    create: bool,
-) -> Result<DatabaseIdentityState, Error>;
-```
-
-This is useful only if it shortens `open_writer_inner`; do not create another public abstraction.
-
-Preserve exact current semantics:
-
-- missing file allowed only through `open_writer`;
-- `open_existing_writer` never creates/initializes a new database;
-- untagged empty or exact pre-tagged empty may initialize only in create mode;
-- wrong application/user version rejects;
-- schema digest remains exact.
-
-## 7. Read-only connection
-
-`open_reader` already sets `busy_timeout` before its pragma/identity queries. Do not rewrite it into the writer helper because its required settings differ:
+`open_reader` remains a separate read-only contract:
 
 ```text
-read-only flags
-busy timeout
-query_only=ON
-exact application/user version
-digest
+validate identity and timeout range
+→ open read-only
+→ apply busy timeout
+→ query_only=ON
+→ exact application/user version
+→ exact schema digest
 ```
 
-A small shared `checked_timeout_ms` conversion may be reused by reader and writer so neither path can panic on oversized duration. Keep writer and reader postcondition functions separate.
+The branch reuses only `checked_timeout_ms`; it does not force writer pragmas onto the reader.
 
-## 8. Failure semantics
+## 7. Failure semantics
 
-| Stage | Failure result | Durable bootstrap state |
+| Stage | Returned result | Durable effect from this call |
 |---|---|---|
-| open / option conversion / pragma setup | Store error | no schema initialization by this call |
-| identity inspection | exact schema/config error | unchanged |
-| `BEGIN IMMEDIATE` | SQLite busy/error | unchanged |
-| base schema / digest / initializer | Store or initializer error | rolled back |
-| precommit postcondition verification | Store configuration error | rolled back |
-| commit | SQLite commit error / outcome uncertain under SQLite semantics | no later code claims success |
-| after commit | no fallible operations | success returned |
+| identity/options/version validation | typed configuration/version error | none; file not opened/created |
+| open | SQLite error | no ELIOT schema initialization |
+| caller timeout installation / identity queries | SQLite or schema error | no WAL/config mutation by ELIOT |
+| accepted database pragma setup | SQLite/configuration error | WAL may already be selected for the accepted database; no schema callback writes |
+| `BEGIN IMMEDIATE` | SQLite busy/error | no schema callback writes |
+| schema/digest/initializer | Store or initializer error | transaction rolled back |
+| precommit postcondition verification | Store configuration error | transaction rolled back |
+| commit | SQLite commit result | no later validation can turn a committed success path into a startup error |
+| after commit | direct return | success |
 
-Do not catch `SQLITE_BUSY` and loop outside the configured SQLite busy handler. Do not translate all SQLite errors to schema mismatch.
+Do not add an outer retry loop for `SQLITE_BUSY`. The configured SQLite busy handler remains the one waiting policy.
 
-## 9. Tests
+## 8. Remaining qualification scenarios
 
-### 9.1. Custom timeout applies before first database query
+Tests are intentionally deferred to the final product phase, but the implementation must eventually prove:
 
-Create/tag a database, hold it under a second connection's exclusive lock, then call `open_existing_writer` with `busy_timeout=Duration::ZERO` on another thread.
+1. **Caller timeout from the first query.** An exact existing database under another connection's exclusive lock returns promptly with `Duration::ZERO`, without waiting rusqlite's default timeout.
+2. **Foreign database preservation.** A mismatched application/user identity is rejected without changing its journal mode.
+3. **Initializer rollback.** A sentinel written by an initializer that returns an error is absent after the call.
+4. **Precommit verification rollback.** An injected private verifier failure after sentinel creation leaves no committed sentinel/schema tags/digest.
+5. **Create/reopen.** `is_new` is true exactly once; reopen verifies digest and reports the configured pragmas.
+6. **Oversized timeout.** Returns `InvalidBusyTimeout`, creates no file and does not panic.
+7. **Reader.** Remains read-only/query-only with its exact identity checks.
 
-Expected:
+A future private fault-injection helper may be added only inside tests. It must not become public runtime API.
 
-- call returns `SQLITE_BUSY` before blocker is released;
-- it does not wait rusqlite's default five seconds;
-- after releasing blocker and joining the thread, database identity is unchanged.
+## 9. Removed old behavior
 
-Use channels and bounded test deadlines; do not rely only on a fragile exact elapsed-millisecond assertion.
-
-### 9.2. Initializer rollback
-
-Initializer writes a sentinel then returns its own error.
-
-Expected:
-
-- open returns `OpenError::Initializer`;
-- sentinel/base initialization is absent or the database remains in the exact allowed pre-initialized state;
-- retry with successful initializer works.
-
-### 9.3. Postcondition-before-commit fault injection
-
-Use one private test seam for the postcondition function, not a product feature:
-
-```rust
-open_writer_inner_with_verifier(..., verify: impl Fn(&Connection) -> Result<(), Error>)
-```
-
-Production passes `verify_writer_connection`. Test verifier returns `DurabilityConfiguration` after initializer writes a sentinel.
-
-Expected:
-
-- function returns Store error;
-- sentinel/schema tags/digest are not committed;
-- no postcommit error path exists.
-
-Keep this helper private and single-purpose. Do not expose callbacks in public `open_writer`.
-
-### 9.4. Successful create/reopen
-
-- create initializes exactly once;
-- reopen calls initializer with `is_new=false`;
-- exact schema digest preserved;
-- writer reports requested busy timeout and required pragmas;
-- read-only connection remains query-only.
-
-### 9.5. Oversized timeout
-
-An unrepresentable duration returns `InvalidBusyTimeout`; no panic and no database mutation.
-
-## 10. Remove after migration
-
-- late `db.busy_timeout(...)` call;
+- caller timeout applied after identity/WAL work;
 - post-commit `verify_writer_pragmas(&db)`;
-- verifier that ignores expected busy timeout;
-- any test-only public API;
-- duplicate timeout conversion in reader/writer, if a single private helper is added.
+- verifier that ignored the requested timeout;
+- panic-prone unvalidated timeout path in writer/reader;
+- the unsafe handoff instruction to set WAL before database identity.
 
-No compatibility branch or old ordering remains.
+No compatibility branch preserves the old ordering.
 
-## 11. Cross-PR ownership
+## 10. Cross-PR ownership
 
-- #26 compiler baseline may change unrelated compilation errors; do not copy fixes into R52.
-- #63 owns DataRoot/state marker, not SQLite connection configuration.
+- #76 owns the CI separation needed to obtain strict Clippy even while unrelated rustfmt debt exists.
+- #63 owns DataRoot/state markers, not SQLite connection configuration.
 - #71 owns optional supervisors, not Store bootstrap.
-- #60 automation savepoints use the connection after successful open; no per-domain workaround for writer configuration belongs there.
+- #60 owns automation-domain savepoints after a successful Store open.
 
-This PR owns only `swarm-store` open/verification and the minimal kernel-host call-site tests needed to prove it.
+R52 owns only `swarm-store` opening/configuration and its eventual narrow integration tests.
 
-## 12. Gate
+## 11. Gate and current evidence
 
-After implementation:
+Required minimal code gate:
 
 ```sh
 cargo clippy --locked \
@@ -313,6 +207,6 @@ cargo clippy --locked \
   --lib --bins -- -D warnings
 ```
 
-Then the exact locked-database, rollback and reopen tests. Broad workspace tests remain final phase.
+Current GitHub workflow reaches package classification and documentation validation, then fails package-wide rustfmt on unrelated historical `swarm-kernel-host` files before Clippy. The one rustfmt change reported in this branch's `swarm-store/src/lib.rs` was corrected in the next commit. Do not report Clippy as passed or failed until #76 makes that stage independent.
 
-Handoff must report base/head SHA, reordered symbols, deleted postcommit path, test results and any remaining platform-specific lock qualification. This document does not change the database, pragmas or runtime behavior.
+Broad tests, locked-database behavior and cross-platform lock qualification remain the final phase.
