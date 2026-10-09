@@ -2829,6 +2829,17 @@ pub(super) fn dispatch(
             "replay_policy":"same_parent_and_packet_only_no_mutation_replay",
         });
     }
+    if super::task_prompt::selected(tx, &b)? {
+        let envelope = super::task_prompt::build(
+            &a,
+            body,
+            launch_dispatch.as_ref().map(|admission| &admission.packet),
+        )?;
+        effective["task_prompt"] = serde_json::to_value(&envelope)?;
+        effective["operation_contract"]["task_prompt"] = json!({
+            "contract_revision":swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION,
+        });
+    }
     if let Some(prerequisite_id) = &prerequisite_id {
         effective["prerequisite"] = json!({
             "operation_id":prerequisite_id,
