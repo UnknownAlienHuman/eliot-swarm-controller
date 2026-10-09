@@ -1,8 +1,10 @@
 # Observability — Adjustable Logs and Live Agent Monitoring
 
-Source status (2026-10-05): Section 2 describes the implemented recorder and
+Source status (2026-10-07): Section 2 describes the implemented recorder and
 Manager policy path. Sections 1 and 3–6 retain architecture, target, or
 acceptance guidance; they do not claim every listed projection or metric exists.
+The host-terminal subsection records the source correction in PR #37; its
+behavioral qualification and the remaining runtime-alias work are pending.
 Use the module/process boundaries in [Modular Runtime](modularity.md).
 Existing receipts, `report.delta`, attention/capacity, family observations and
 Doctor remain useful foundations; this document does not claim they are absent.
@@ -20,6 +22,32 @@ store in the logging module. Derived indexes/files are rebuildable or explicitly
 partial; they do not become a competing truth for who owns work or whether it
 passed. No model is queried to discover its heartbeat, health or resource usage.
 
+### Host terminal events and retained diagnostics
+
+`store/host_lifecycle.rs::retain_exit` retains the validated `Exit` receipt under
+`host:last-exit:v1` and, for a failure, `host:latest-failure:v1`. The receipt
+contains the primary error and up to two validated `secondary_codes`; these
+fields remain available through the existing lifecycle status readback. A later
+graceful exit does not acknowledge or erase the latest retained failure.
+
+The normalized terminal `host.exit` and `host.failed` observations are different
+views of one occurrence, not two independent failures. Both use
+`host-terminal-exit:<host_epoch>` and the same phase, timestamp and canonical safe
+payload: `schema_version`, `phase`, `status`, `occurrence_id`, `host_epoch`, and
+only the applicable `failure_category` and `failed_supervisor`. Diagnostic codes
+are not part of that payload. The reader's closed-field and paired-payload
+checks remain intact; adding detail to a receipt must not silently expand the
+ScriptRun input contract or make the two views unequal.
+
+This correction changes new terminal observations only. It neither rewrites old
+observations nor rewinds an automation cursor to replay previously skipped work.
+A historical pair containing `secondary_codes` in only one view still requires
+explicitly designed recovery; do not claim it was repaired by a producer change.
+Host interruption between epochs and epoch-less malformed-state recovery keep
+their existing separate forms. An event identifies evidence for current scoped
+admission; its ID alone never grants permission to run a script or repeat a
+native effect.
+
 ## 2. Configurable depth without a restart
 
 Log **level** and captured **content** are separate settings. Levels are
@@ -34,7 +62,7 @@ The current observer source supports metadata by default and bounded
 Atlas-redacted text for selected module-supervisor lifecycle diagnostics. Live
 config schema 3 adds `content: "metadata" | "redacted_text"` and optional
 scoped content overrides; schema 1 and 2 remain metadata-only. Redacted native
-frames are explicitly unsupported until a real bounded frame source exists.
+frames are explicitly unsupported until a real bounded native-frame source exists.
 
 Managers can use `logging.get` and `logging.set` to inspect and save their own
 diagnostic scope policy without a GM session. The API accepts metadata or
