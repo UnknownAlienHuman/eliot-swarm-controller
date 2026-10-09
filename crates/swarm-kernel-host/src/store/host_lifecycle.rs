@@ -191,9 +191,8 @@ fn retain_exit(
             "occurrence_id":occurrence_id,
             "host_epoch":host_epoch
         });
-        if !receipt.secondary_codes.is_empty() {
-            observation["secondary_codes"] = json!(receipt.secondary_codes);
-        }
+        // Detailed codes remain in LAST_EXIT/LATEST_FAILURE. The paired
+        // terminal events must share the closed, diagnostic-free payload.
         if let Some(category) = receipt.failure_category {
             observation["failure_category"] = json!(category.as_str());
         }
