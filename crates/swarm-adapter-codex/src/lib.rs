@@ -2297,29 +2297,61 @@ fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), 
     Ok((provider.to_owned(), model.to_owned(), workspace.to_owned()))
 }
 
-fn prompt_for(command: &RuntimeCommand) -> Result<String, &'static str> {
+fn prompt_for(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+) -> Result<String, &'static str> {
     let input = &command.input;
-    let prompt = if command.method == "task.dispatch" {
-        let canonical = input["task_snapshot_canonical"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("TASK_SNAPSHOT_CANONICAL_REQUIRED")?;
+    if command.method == "task.dispatch" {
+        // A v5 descriptor can only submit the exact Store-owned envelope.
+        // An unknown/missing selected schema is not a license to render the
+        // legacy Task snapshot (which contains internal policy/receipts).
+        if module_contract::task_prompt_selected(claim)
+            .map_err(|_| "TASK_PROMPT_SCHEMA_UNSUPPORTED")?
+            != true
+        {
+            return Err("TASK_PROMPT_SELECTION_REQUIRED");
+        }
+        if input.get("task_snapshot").is_some()
+            || input.get("task_snapshot_canonical").is_some()
+        {
+            return Err("TASK_PROMPT_LEGACY_PAYLOAD_FORBIDDEN");
+        }
+        let envelope: swarm_contracts::task_prompt::TaskPromptEnvelopeV1 =
+            serde_json::from_value(input["task_prompt"].clone())
+                .map_err(|_| "TASK_PROMPT_ENVELOPE_INVALID")?;
+        envelope
+            .validate_shape()
+            .map_err(|_| "TASK_PROMPT_ENVELOPE_INVALID")?;
+        let context: TaskDispatchContext =
+            serde_json::from_value(input["task_dispatch_context"].clone())
+                .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
+        context.validate().map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
         let text = input["text"]
             .as_str()
-            .filter(|s| !s.trim().is_empty())
+            .filter(|value| !value.trim().is_empty())
             .ok_or("PROMPT_REQUIRED")?;
-        format!("Task specification: {canonical}\n\n{text}")
+        if envelope.task_id != context.task_id
+            || envelope.attempt_id != context.attempt_id
+            || envelope.task_revision != context.task_revision
+            || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
+            || context.operation_id != command.operation_id
+            || context.binding_id != command.binding_id
+            || context.binding_generation != command.generation
+            || context.source_text_sha256 != digest_hex(text.as_bytes())
+            || context.source_text_bytes != text.len() as u64
+            || envelope.prompt_sha256 != digest_hex(envelope.prompt.as_bytes())
+        {
+            return Err("TASK_PROMPT_IDENTITY_MISMATCH");
+        }
+        Ok(envelope.prompt)
     } else {
         input["text"]
             .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or("PROMPT_REQUIRED")?
-            .to_owned()
-    };
-    if prompt.trim().is_empty() {
-        return Err("PROMPT_REQUIRED");
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("PROMPT_REQUIRED")
+            .map(str::to_owned)
     }
-    Ok(prompt)
 }
 
 fn native_send_payload(
@@ -3530,7 +3562,7 @@ async fn send_operation(
     {
         return rejected(command, "ROUTE_CONFIGURATION_MISMATCH", &journal.state);
     }
-    let prompt = match prompt_for(command) {
+    let prompt = match prompt_for(command, claim) {
         Ok(prompt) => prompt,
         Err(code) => return rejected(command, code, &journal.state),
     };
