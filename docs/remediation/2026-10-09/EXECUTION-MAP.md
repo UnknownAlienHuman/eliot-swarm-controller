@@ -4,6 +4,12 @@
 **Status:** actionable research and implementation plan; NOT a claim of release readiness.
 **Source of evidence:** full Master Audit v26, accepted owner decisions, existing R01–R51 handoffs, and GitHub PR/Issue status checked on 2026-10-09.
 
+## Required source input: HIGH appendix (not checked into this repository)
+
+The phrase **"full HIGH appendix"** in the master audit refers to **section 8, "Приложение: полный реестр доказанных дефектов, не вошедших в §1–§4"**, of the owner's source document **"Что чинить + полный реестр.md"** (historical source baseline `40591a2`). That section contains 61 source-labelled **[HIGH]** entries, 136 [MED], 82 [LOW] and 128 ungraded entries. **This original source file is in the owner's ChatGPT Library, not this GitHub repository.** The owner must attach/provide it separately to agents assigned exhaustive HIGH disposition. The companion **"Реестр подозрений.md"** is a different, explicitly **НЕ доказано** hypothesis inventory, also outside this repository. The audit v26/v27 and this map are **not** replacements for those original sources.
+
+If source access is unavailable: proceed with well-scoped implementation PRs using exact code and their existing handoffs, but **do not claim the complete HIGH appendix was checked**. When it is supplied, classify each entry against current `main` as `fixed(commit/PR)`, `refuted(verified guard)`, `outstanding(one owner)` or `needs-evidence`. Some historical HIGH entries were already fixed in merged #75–#104. Preserve source text separately from revised verdicts, and do not reimplement merged fixes.
+
 ## 0. Ground truth before any code
 
 On this base: **37 open PRs, all documentation-only; 8 open Issues.** No open PR contains production code. A docs-only branch is a specification, not a fix.
