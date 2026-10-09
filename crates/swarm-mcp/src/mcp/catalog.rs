@@ -2972,7 +2972,6 @@ pub struct CatalogMatch {
     pub purpose: &'static str,
     pub when_to_use: &'static str,
     pub search_terms: &'static [&'static str],
-    pub required_input_fields: &'static [&'static str],
     pub required_context: &'static [&'static str],
     pub result_policy: &'static str,
     pub activation: ActivationDisposition,
@@ -3258,7 +3257,6 @@ where
                 purpose: metadata.purpose,
                 when_to_use: metadata.when_to_use,
                 search_terms: metadata.search_terms,
-                required_input_fields: metadata.required_input_fields,
                 required_context: metadata.required_context,
                 result_policy: metadata.result_policy,
                 activation: if is_loaded {
@@ -3383,9 +3381,6 @@ fn digest_metadata(hasher: &mut Sha256, metadata: &ToolMetadata) {
     for term in metadata.search_terms {
         update_field(hasher, term.as_bytes());
     }
-    for field in metadata.required_input_fields {
-        update_field(hasher, field.as_bytes());
-    }
     for context in metadata.required_context {
         update_field(hasher, context.as_bytes());
     }
@@ -3424,12 +3419,11 @@ fn search_score(metadata: &ToolMetadata, query: &str, purpose: &str, exact_selec
     let method = normalize(metadata.method);
     let tool = normalize(&tool_name(metadata.method));
     let searchable = normalize(&format!(
-        "{} {} {} {} {} {} {}",
+        "{} {} {} {} {} {}",
         metadata.group.as_str(),
         metadata.purpose,
         metadata.when_to_use,
         metadata.search_terms.join(" "),
-        metadata.required_input_fields.join(" "),
         metadata.required_context.join(" "),
         metadata.result_policy
     ));
