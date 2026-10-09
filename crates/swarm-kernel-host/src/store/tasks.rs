@@ -71,6 +71,64 @@ fn task_validation_error(error: swarm_kernel::tasks::ValidationError) -> Error {
     Error::new(error.code(), error.message())
 }
 
+/// Attach the current semantic receipt to the exact Task object it confirms.
+/// A new logical request owns its own Operation even when no Task state changes.
+fn attach_operation_scope(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    task_id: &str,
+    attempt_id: Option<&str>,
+) -> Result<()> {
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT json_object('method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id)              FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let operation: Value = serde_json::from_str(&raw.ok_or_else(|| {
+        Error::new(
+            "STORE_INVARIANT",
+            "Task mutation Operation disappeared before scope attachment",
+        )
+    })?)?;
+    if !matches!(
+        operation["method"].as_str(),
+        Some("task.create" | "task.claim" | "task.release")
+    ) || operation["state"] != "queued"
+    {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "Task Operation scope can be attached only to its queued mutation receipt",
+        ));
+    }
+    let task_conflict = operation["task_id"]
+        .as_str()
+        .is_some_and(|retained| retained != task_id);
+    let attempt_conflict = match (operation["attempt_id"].as_str(), attempt_id) {
+        (Some(retained), Some(expected)) => retained != expected,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if task_conflict || attempt_conflict {
+        return Err(Error::new(
+            "TASK_OPERATION_SCOPE_CONFLICT",
+            "Task mutation Operation is already attached to another object",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1 AND state='queued'",
+        params![operation_id, task_id, attempt_id],
+    )?;
+    if changed != 1 {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "Task mutation Operation scope update did not affect exactly one queued row",
+        ));
+    }
+    Ok(())
+}
+
 /// Task creation and revision are local planning rights shared by Managers
 /// and the pinned local Operator. Do not use `require_writer`: it is a broad
 /// role filter, not this positive method policy.
@@ -175,6 +233,7 @@ fn create_validated(
             )
             .optional()?;
         if let Some(task_id) = prior {
+            attach_operation_scope(tx, id, &task_id, None)?;
             return Ok(
                 json!({"operation_id":id,"task_id":task_id,"created":false,"reason":"origin_already_exists"}),
             );
@@ -182,10 +241,7 @@ fn create_validated(
     }
     let task_id = model::new_id();
     tx.execute("INSERT INTO tasks(task_id,project_id,origin_key,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,1,'open',?4,?5,?5)",params![task_id,project,origin,model::canonical(&json!(s))?,now])?;
-    tx.execute(
-        "UPDATE operations SET task_id=?2 WHERE operation_id=?1",
-        params![id, task_id],
-    )?;
+    attach_operation_scope(tx, id, &task_id, None)?;
     Ok(json!({"operation_id":id,"task_id":task_id,"revision":1,"created":true}))
 }
 pub(super) fn revise(
@@ -326,6 +382,19 @@ fn claim_with_authority(
     };
     swarm_kernel::tasks::validate_claim_start(start.as_str(), launch_claim)
         .map_err(task_validation_error)?;
+    swarm_kernel::tasks::validate_claim_binding_pair(
+        v.get("binding_id"),
+        v.get("binding_generation"),
+    )
+    .map_err(task_validation_error)?;
+    let requested_binding = match (v.get("binding_id"), v.get("binding_generation")) {
+        (None, None) | (Some(Value::Null), Some(Value::Null)) => None,
+        (Some(_), Some(_)) => Some((
+            model::text(v, "binding_id")?.to_owned(),
+            model::positive(v, "binding_generation")?,
+        )),
+        _ => unreachable!("claim binding pair was validated by swarm-kernel"),
+    };
     let task = get_task(tx, task_id)?;
     swarm_kernel::tasks::validate_claim_task_state(
         task["revision"].as_i64().unwrap_or_default(),
@@ -335,13 +404,19 @@ fn claim_with_authority(
     .map_err(task_validation_error)?;
     if let Some(existing) = task["current_attempt_id"].as_str() {
         let a = get_attempt(tx, existing)?;
+        let binding_matches = match &requested_binding {
+            None => a["binding_id"].is_null() && a["binding_generation"].is_null(),
+            Some((binding_id, generation)) => {
+                a["binding_id"].as_str() == Some(binding_id.as_str())
+                    && a["binding_generation"].as_i64() == Some(*generation)
+            }
+        };
         if a["owner_id"] == owner
             && a["task_revision"] == revision
             && a["start_owner"] == start.as_str()
-            && a.get("binding_id") == Some(v.get("binding_id").unwrap_or(&Value::Null))
-            && a.get("binding_generation")
-                == Some(v.get("binding_generation").unwrap_or(&Value::Null))
+            && binding_matches
         {
+            attach_operation_scope(tx, id, task_id, Some(existing))?;
             return Ok(
                 json!({"operation_id":id,"attempt_id":existing,"task_id":task_id,"created":false}),
             );
@@ -367,26 +442,18 @@ fn claim_with_authority(
         let accepted = acceptance::resolve_dependency(tx, d)?;
         dependency_receipts.push(json!({"task_id":d.task_id,"acceptance_operation_id":accepted}));
     }
-    swarm_kernel::tasks::validate_claim_binding_pair(
-        v.get("binding_id"),
-        v.get("binding_generation"),
-    )
-    .map_err(task_validation_error)?;
-    let (binding, generation) = match (v.get("binding_id"), v.get("binding_generation")) {
-        (None, None) | (Some(Value::Null), Some(Value::Null)) => (None, None),
-        (Some(_), Some(_)) => {
-            let binding = model::text(v, "binding_id")?;
-            let generation = model::positive(v, "binding_generation")?;
-            let b = operations::get_binding(tx, binding, generation)?;
-            if b["state"] != "ready" {
+    let (binding, generation) = match requested_binding.as_ref() {
+        None => (None, None),
+        Some((binding, generation)) => {
+            let retained = operations::get_binding(tx, binding, *generation)?;
+            if retained["state"] != "ready" {
                 return Err(Error::new(
                     "BINDING_NOT_READY",
                     "native binding is not ready",
                 ));
             }
-            (Some(binding), Some(generation))
+            (Some(binding.as_str()), Some(*generation))
         }
-        _ => unreachable!("claim binding pair was validated by swarm-kernel"),
     };
     let attempt = model::new_id();
     let snapshot = task_snapshot(
@@ -397,10 +464,7 @@ fn claim_with_authority(
         baseline_candidate,
     );
     tx.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'reserved',?9,?9)",params![attempt,task_id,revision,model::canonical(&snapshot)?,owner,start.as_str(),binding,generation,now])?;
-    tx.execute(
-        "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
-        params![id, task_id, attempt],
-    )?;
+    attach_operation_scope(tx, id, task_id, Some(&attempt))?;
     Ok(
         json!({"operation_id":id,"attempt_id":attempt,"task_id":task_id,"start_owner":start,"state":"reserved","created":true,"native_admission":"not_observed"}),
     )
@@ -430,10 +494,23 @@ pub(super) fn release(
     let a = get_attempt(tx, attempt_id)?;
     super::gm::require_attempt_control(tx, p, &a)?;
     if !a["released_at_ms"].is_null() {
-        operations::prepare_owned_service_attempt_release(tx, &a, id, now)?;
-        return Ok(
-            json!({"operation_id":id,"attempt_id":attempt_id,"released":true,"changed":false}),
-        );
+        let retained_outcome = model::text(&a, "state")?;
+        if retained_outcome != outcome {
+            return Err(Error::new(
+                "ATTEMPT_RELEASE_CONFLICT",
+                "released Attempt outcome differs from this semantic replay",
+            ));
+        }
+        let task_id = model::text(&a, "task_id")?;
+        attach_operation_scope(tx, id, task_id, Some(attempt_id))?;
+        return Ok(json!({
+            "operation_id":id,
+            "attempt_id":attempt_id,
+            "task_id":task_id,
+            "released":true,
+            "changed":false,
+            "outcome":retained_outcome,
+        }));
     }
     let accepted = a["state"] == "accepted" && acceptance::accepted_attempt(tx, &a)?;
     let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1 AND resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL)", [attempt_id], |r| r.get(0))?;
@@ -463,10 +540,7 @@ pub(super) fn release(
         "UPDATE attempts SET state=?2,released_at_ms=?3,updated_at_ms=?3 WHERE attempt_id=?1",
         params![attempt_id, outcome, now],
     )?;
-    tx.execute(
-        "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
-        params![id, a["task_id"].as_str(), attempt_id],
-    )?;
+    attach_operation_scope(tx, id, model::text(&a, "task_id")?, Some(attempt_id))?;
     super::capacity::sync_attempt(tx, attempt_id, now)?;
     Ok(
         json!({"operation_id":id,"attempt_id":attempt_id,"released":true,"outcome":outcome,"reason":reason,"evidence_kind":"caller_attested_assignment_closed","native_processes_stopped":false}),

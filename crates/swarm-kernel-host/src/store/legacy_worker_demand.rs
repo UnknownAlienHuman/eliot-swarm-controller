@@ -55,7 +55,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
         "SELECT EXISTS(SELECT 1 FROM check_runs AS c JOIN operations AS o \
          ON o.operation_id=c.operation_id \
          WHERE c.state IN ('running','reconciling') \
-            OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) ",
+            OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) \
+            OR (c.state='queued' AND o.state='queued' \
+                AND json_extract(c.spec_json,'$.cancel_requested') IS NOT NULL)) ",
     )?;
     demand.scripts = exists(
         db,
