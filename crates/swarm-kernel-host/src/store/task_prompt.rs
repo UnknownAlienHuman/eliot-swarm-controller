@@ -53,14 +53,29 @@ pub(super) fn build(
     source_text: &str,
     launch_packet: Option<&Value>,
 ) -> Result<TaskPromptEnvelopeV1> {
-    let snapshot = attempt.get("task_snapshot").filter(|value| value.is_object()).ok_or_else(|| {
-        Error::new("TASK_PROMPT_INVALID", "retained Attempt has no frozen Task snapshot")
-    })?;
-    let brief = snapshot.get("brief").filter(|value| value.is_object()).ok_or_else(|| {
-        Error::new("TASK_PROMPT_INVALID", "retained frozen Task brief is missing")
-    })?;
+    let snapshot = attempt
+        .get("task_snapshot")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "TASK_PROMPT_INVALID",
+                "retained Attempt has no frozen Task snapshot",
+            )
+        })?;
+    let brief = snapshot
+        .get("brief")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "TASK_PROMPT_INVALID",
+                "retained frozen Task brief is missing",
+            )
+        })?;
     if source_text.trim().is_empty() {
-        return Err(Error::new("TASK_PROMPT_INVALID", "source task text is empty"));
+        return Err(Error::new(
+            "TASK_PROMPT_INVALID",
+            "source task text is empty",
+        ));
     }
     let task_id = model::text(attempt, "task_id")?.to_owned();
     let attempt_id = model::text(attempt, "attempt_id")?.to_owned();
@@ -79,7 +94,10 @@ pub(super) fn build(
     );
     if let Some(packet) = launch_packet {
         if !packet.is_object() {
-            return Err(Error::new("TASK_PROMPT_INVALID", "launch packet must be an object"));
+            return Err(Error::new(
+                "TASK_PROMPT_INVALID",
+                "launch packet must be an object",
+            ));
         }
         prompt.push_str("\n\nELIOT Launch dispatch packet v1:\n");
         prompt.push_str(&model::canonical(packet)?);
@@ -97,7 +115,10 @@ pub(super) fn build(
         prompt,
     };
     envelope.validate_shape().map_err(|_| {
-        Error::new("TASK_PROMPT_INVALID", "constructed TaskPrompt envelope is invalid")
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "constructed TaskPrompt envelope is invalid",
+        )
     })?;
     Ok(envelope)
 }
@@ -117,17 +138,25 @@ pub(super) fn load(
             "selected TaskPrompt operation contract is absent or changed",
         ));
     }
-    let saved: TaskPromptEnvelopeV1 =
-        serde_json::from_value(effective["task_prompt"].clone()).map_err(|_| {
-            Error::new("TASK_PROMPT_INVALID", "selected TaskPrompt envelope is missing or malformed")
+    let saved: TaskPromptEnvelopeV1 = serde_json::from_value(effective["task_prompt"].clone())
+        .map_err(|_| {
+            Error::new(
+                "TASK_PROMPT_INVALID",
+                "selected TaskPrompt envelope is missing or malformed",
+            )
         })?;
     saved.validate_shape().map_err(|_| {
-        Error::new("TASK_PROMPT_INVALID", "selected TaskPrompt envelope fails shape validation")
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "selected TaskPrompt envelope fails shape validation",
+        )
     })?;
     let expected = build(
         attempt,
         source_text,
-        effective.get("launch_dispatch_packet").filter(|value| !value.is_null()),
+        effective
+            .get("launch_dispatch_packet")
+            .filter(|value| !value.is_null()),
     )?;
     if saved != expected {
         return Err(Error::new(
