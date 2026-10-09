@@ -149,6 +149,10 @@ pub struct ToolMetadata {
     pub purpose: &'static str,
     pub when_to_use: &'static str,
     pub search_terms: &'static [&'static str],
+    /// Exact request fields required by the executable ToolSpec. Empty means
+    /// this legacy metadata row has not yet opted into the checked contract.
+    pub required_input_fields: &'static [&'static str],
+    /// Semantic prerequisites which are not request-field names.
     pub required_context: &'static [&'static str],
     pub result_policy: &'static str,
 }
@@ -282,6 +286,27 @@ macro_rules! entry {
             purpose: $purpose,
             when_to_use: $when,
             search_terms: $terms,
+            required_input_fields: &[],
+            required_context: $context,
+            result_policy: $result,
+        }
+    };
+}
+
+/// Opt one metadata row into an exact, machine-checked relationship with the
+/// executable ToolSpec. The declared input fields must equal ToolSpec.required;
+/// semantic prerequisites stay separate and cannot masquerade as arguments.
+macro_rules! entry_with_inputs {
+    ($method:literal, $group:ident, $aud:ident, $tier:ident, $purpose:literal, $when:literal, $terms:expr, $inputs:expr, $context:expr, $result:literal) => {
+        ToolMetadata {
+            method: $method,
+            group: ToolGroup::$group,
+            audiences: $aud,
+            load_tier: LoadTier::$tier,
+            purpose: $purpose,
+            when_to_use: $when,
+            search_terms: $terms,
+            required_input_fields: $inputs,
             required_context: $context,
             result_policy: $result,
         }
@@ -818,21 +843,33 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["attempt_id", "expected_revision"],
         "One revision-checked release."
     ),
-    entry!(
+    entry_with_inputs!(
         "attempt.bind_producer",
         TaskManagement,
         MANAGER_AUDIENCES,
         ManualOnly,
-        "Bind an attempt to an exact producer binding generation.",
-        "Use only when explicitly binding the producer identity for an attempt.",
-        &["attempt", "producer", "binding", "generation"],
+        "Associate an already observed native producer run with one exact Attempt.",
+        "Use only after retaining the exact assignment, native session/run and observation evidence; this starts no worker and consumes no result.",
+        &[
+            "attempt",
+            "producer",
+            "assignment",
+            "native session",
+            "native run",
+            "observation"
+        ],
         &[
             "attempt_id",
-            "expected_revision",
-            "binding_id",
-            "binding_generation"
+            "assignment_id",
+            "native_session_id",
+            "native_run_id",
+            "observation_id"
         ],
-        "One revision-checked producer binding."
+        &[
+            "current Attempt manager authority",
+            "already observed exact producer evidence"
+        ],
+        "One evidence-bound producer association; no native effect or Task acceptance."
     ),
     entry!(
         "agent.open",
@@ -967,16 +1004,27 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["operation_id", "reason"],
         "Durable cancellation request with explicit eligibility."
     ),
-    entry!(
+    entry_with_inputs!(
         "gm.handover",
         Administration,
         GM_AUDIENCES,
         ManualOnly,
-        "Transfer the local manager lease through the guarded handover path.",
-        "Use only for an explicit operator handover to a named eligible client.",
-        &["manager", "handover", "lease", "operator"],
-        &["target_client_id", "expected_revision"],
-        "One guarded manager handover."
+        "Designate one registered eligible client as the current GM under the application epoch rules.",
+        "Use only for an explicit guarded handover; optional binding identity is part of the request but not required.",
+        &[
+            "manager",
+            "GM",
+            "handover",
+            "designation",
+            "epoch",
+            "operator"
+        ],
+        &["client_id"],
+        &[
+            "local Operator or exact current GM authority",
+            "registered eligible target client"
+        ],
+        "One guarded GM designation with retained epoch identity."
     ),
     entry!(
         "agent.background",
@@ -2989,7 +3037,10 @@ pub fn validate_registry_metadata() -> Result<(), CatalogError> {
     }
     let mut seen = BTreeSet::new();
     for metadata in TOOL_METADATA {
-        if !seen.insert(metadata.method) || find_spec(metadata.method).is_none() {
+        let Some((_, spec)) = find_spec(metadata.method) else {
+            return Err(CatalogError::IncompleteRegistry);
+        };
+        if !seen.insert(metadata.method) || !metadata_input_contract_matches(metadata, spec) {
             return Err(CatalogError::IncompleteRegistry);
         }
     }
@@ -3002,6 +3053,19 @@ pub fn validate_registry_metadata() -> Result<(), CatalogError> {
         return Err(CatalogError::IncompleteRegistry);
     }
     Ok(())
+}
+
+fn metadata_input_contract_matches(metadata: &ToolMetadata, spec: &ToolSpec) -> bool {
+    if metadata.required_input_fields.is_empty() {
+        return true;
+    }
+    let declared: BTreeSet<_> = metadata.required_input_fields.iter().copied().collect();
+    let required: BTreeSet<_> = spec.required.iter().copied().collect();
+    declared.len() == metadata.required_input_fields.len()
+        && declared == required
+        && declared
+            .iter()
+            .all(|field| spec.fields.iter().any(|candidate| candidate.name == *field))
 }
 
 pub fn metadata_for(method: &str) -> Option<&'static ToolMetadata> {
