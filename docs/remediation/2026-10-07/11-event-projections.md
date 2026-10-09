@@ -25,7 +25,7 @@ phase
 status
 occurrence_id
 host_epoch
-failure_category? 
+failure_category?
 failed_supervisor?
 ```
 
