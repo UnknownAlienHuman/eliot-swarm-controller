@@ -4510,6 +4510,46 @@ impl ProfiledFacade {
             .map_err(|_| catalog_authorization_error())?;
         parse_catalog_authorization(&value, task_id).ok_or_else(catalog_authorization_error)
     }
+
+    async fn require_live_methods(
+        &self,
+        required: &[&str],
+        exposed_method: &str,
+    ) -> std::result::Result<(), McpError> {
+        let authorization = self.catalog_authorization(None).await?;
+        if required
+            .iter()
+            .all(|method| authorization.allowed_methods.contains(*method))
+        {
+            Ok(())
+        } else {
+            Err(method_not_found(exposed_method))
+        }
+    }
+
+    async fn require_live_subscription_categories(
+        &self,
+        categories: &[subscriptions::Category],
+    ) -> std::result::Result<(), McpError> {
+        let authorization = self.catalog_authorization(None).await?;
+        let allowed = categories.iter().all(|category| {
+            let requirement = profiles::subscription_method_requirement(*category);
+            requirement
+                .all
+                .iter()
+                .all(|method| authorization.allowed_methods.contains(*method))
+                && (requirement.any.is_empty()
+                    || requirement
+                        .any
+                        .iter()
+                        .any(|method| authorization.allowed_methods.contains(*method)))
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(method_not_found(subscriptions::SUBSCRIBE_METHOD))
+        }
+    }
 }
 
 struct CatalogAuthorization {
@@ -4866,6 +4906,9 @@ impl ServerHandler for ProfiledFacade {
             };
             return Ok(CallToolResult::structured(Value::Object(result)).into());
         }
+        let required_methods = [spec.method];
+        self.require_live_methods(&required_methods, spec.method)
+            .await?;
         if mutation_requires_caller_request_id(self.profile, spec.method, *read_only) {
             let arguments = request
                 .arguments
@@ -4885,6 +4928,8 @@ impl ServerHandler for ProfiledFacade {
         if !profiles::allows_task_get(self.profile) {
             return Err(method_not_found("tasks/get"));
         }
+        self.require_live_methods(profiles::task_get_required_methods(), "tasks/get")
+            .await?;
         self.inner.get_task(request, context).await
     }
 
@@ -4896,6 +4941,8 @@ impl ServerHandler for ProfiledFacade {
         if !profiles::allows_task_cancel(self.profile) {
             return Err(method_not_found("tasks/cancel"));
         }
+        self.require_live_methods(profiles::task_cancel_required_methods(), "tasks/cancel")
+            .await?;
         if self.profile != McpToolProfile::Full
             && context
                 .meta
@@ -4930,6 +4977,8 @@ impl ServerHandler for ProfiledFacade {
             {
                 return Err(method_not_found(subscriptions::SUBSCRIBE_METHOD));
             }
+            self.require_live_subscription_categories(&categories)
+                .await?;
         }
         self.inner.on_custom_request(request, context).await
     }
