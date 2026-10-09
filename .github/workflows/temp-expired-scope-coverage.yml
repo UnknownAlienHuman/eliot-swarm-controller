@@ -1,0 +1,47 @@
+name: Temporary expired active scope coverage
+
+on:
+  push:
+    branches:
+      - fix/expired-active-scope-coverage
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/expired-active-scope-coverage
+          fetch-depth: 0
+      - name: Install pinned Rust tools
+        shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+      - name: Apply coverage repair
+        shell: bash
+        run: |
+          python tools/ci/temp_expired_scope_coverage.py
+          rustfmt +1.98.1 --edition 2024 crates/swarm-kernel-host/src/store/code_scopes.rs
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git rm .github/workflows/temp-expired-scope-coverage.yml tools/ci/temp_expired_scope_coverage.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/swarm-kernel-host/src/store/code_scopes.rs
+          git diff --cached --check
+          git commit -m "fix: expose expired active scope coverage gaps"
+      - name: Minimal changed-line Clippy
+        shell: bash
+        run: |
+          target_dir="$RUNNER_TEMP/eliot-expired-scope-target"
+          python tools/ci/clippy-attribution.py \
+            --base 251d9b570d1f0cfdb83807d014bda90882c5006e \
+            --head HEAD \
+            --target-dir "$target_dir" \
+            --packages-json '["swarm-kernel-host@0.1.0"]'
+      - name: Push qualified commit
+        shell: bash
+        run: git push origin HEAD:fix/expired-active-scope-coverage
