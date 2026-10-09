@@ -767,23 +767,14 @@ fn apply_resolve(
                     "contract Thread resolution requires the exact ratified proposal revision",
                 )
             })?;
-        let proposal = load_proposal_revision(tx, &context, proposal_revision_id)?;
-        let proposal_pointer = meta(
+        let proposal = coordination_store::load_current_contract_proposal_revision(
             tx,
-            &format!("coordination:proposal-revision:{proposal_revision_id}"),
-        )?
-        .ok_or_else(|| Error::new("NOT_FOUND", "selected proposal revision is absent"))?;
-        let proposal_id = model::text(&proposal_pointer, "proposal_id")?;
-        let header = meta(tx, &format!("coordination:proposal:{proposal_id}"))?
-            .ok_or_else(|| Error::new("NOT_FOUND", "proposal header is absent"))?;
-        if header["latest_revision_id"] != proposal_revision_id
-            || header["latest_digest"] != proposal["digest"]
-        {
-            return Err(Error::new(
-                "STALE_REVISION",
-                "contract resolution must select the current exact proposal revision",
-            ));
-        }
+            &context.thread_id,
+            &context.task_id,
+            context.task_revision,
+            &context.attempt_id,
+            proposal_revision_id,
+        )?;
         let ratification = request
             .manager_ratification_operation_id
             .as_deref()
@@ -798,7 +789,7 @@ fn apply_resolve(
             &context,
             ratification,
             proposal_revision_id,
-            model::text(&proposal, "digest")?,
+            model::text(&proposal, "proposal_digest")?,
         )?;
     }
     if request.manager_ratification_operation_id.is_some()
@@ -1590,47 +1581,15 @@ fn validate_proposal_revision(
     context: &ThreadContext,
     proposal_revision_id: &str,
 ) -> Result<()> {
-    load_proposal_revision(db, context, proposal_revision_id).map(|_| ())
-}
-
-fn load_proposal_revision(
-    db: &Connection,
-    context: &ThreadContext,
-    proposal_revision_id: &str,
-) -> Result<Value> {
-    let pointer = meta(
+    coordination_store::load_contract_proposal_revision(
         db,
-        &format!("coordination:proposal-revision:{proposal_revision_id}"),
-    )?
-    .ok_or_else(|| Error::new("NOT_FOUND", "selected proposal revision is absent"))?;
-    let proposal_id = model::text(&pointer, "proposal_id")?;
-    let proposal = meta(
-        db,
-        &format!("coordination:proposal:{proposal_id}:revision:{proposal_revision_id}"),
-    )?
-    .ok_or_else(|| Error::new("NOT_FOUND", "selected proposal revision is absent"))?;
-    if proposal["thread_id"] != context.thread_id
-        || proposal["task_id"] != context.task_id
-        || proposal["task_revision"] != context.task_revision
-        || proposal["attempt_id"] != context.attempt_id
-        || pointer["thread_id"] != context.thread_id
-    {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "selected proposal revision is outside this exact Thread scope",
-        ));
-    }
-    let digest = model::text(&proposal, "digest")?;
-    if digest.len() != 71
-        || !digest.starts_with("sha256:")
-        || !digest[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(Error::new(
-            "PROPOSAL_DAMAGED",
-            "proposal revision digest is invalid",
-        ));
-    }
-    Ok(proposal)
+        &context.thread_id,
+        &context.task_id,
+        context.task_revision,
+        &context.attempt_id,
+        proposal_revision_id,
+    )
+    .map(|_| ())
 }
 
 fn participant_has_own_question(
