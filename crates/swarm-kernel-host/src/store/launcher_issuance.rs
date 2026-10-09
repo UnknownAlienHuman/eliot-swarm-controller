@@ -39,6 +39,11 @@ struct Backoff {
     touched: Instant,
 }
 
+struct IssuanceSelection {
+    operation_ids: Vec<String>,
+    deferred: usize,
+}
+
 impl IssuanceRuntime {
     pub(super) fn new() -> Self {
         Self {
@@ -58,19 +63,54 @@ impl IssuanceRuntime {
         self.state.lock().await.cursor = None;
     }
 
-    async fn mark_considered(&self, operation_id: &str) {
-        self.state.lock().await.cursor = Some(operation_id.to_owned());
-    }
-
-    async fn retry_due(&self, operation_id: &str) -> bool {
+    async fn select_attempts(&self, discovered: &[String]) -> IssuanceSelection {
         let now = Instant::now();
         let mut state = self.state.lock().await;
-        match state.backoffs.get_mut(operation_id) {
-            Some(entry) => {
-                entry.touched = now;
-                entry.next_attempt <= now
+        let mut due_retries = state
+            .backoffs
+            .iter()
+            .filter(|(_, entry)| entry.next_attempt <= now)
+            .map(|(operation_id, entry)| (entry.next_attempt, operation_id.clone()))
+            .collect::<Vec<_>>();
+        due_retries.sort_by(|(left_at, left_id), (right_at, right_id)| {
+            left_at.cmp(right_at).then_with(|| left_id.cmp(right_id))
+        });
+
+        // When both lanes have work, reserve one of the two effect slots for each.
+        let fresh_budget = if due_retries.is_empty() {
+            MAX_ISSUANCE_PER_TICK
+        } else {
+            1
+        };
+        let mut fresh = Vec::with_capacity(fresh_budget);
+        let mut deferred = 0usize;
+        for operation_id in discovered {
+            if fresh.len() >= fresh_budget {
+                break;
             }
-            None => true,
+            state.cursor = Some(operation_id.clone());
+            match state.backoffs.get(operation_id) {
+                Some(entry) => {
+                    if entry.next_attempt > now {
+                        deferred += 1;
+                    }
+                }
+                None => fresh.push(operation_id.clone()),
+            }
+        }
+
+        let retry_budget = MAX_ISSUANCE_PER_TICK.saturating_sub(fresh.len());
+        let mut operation_ids = Vec::with_capacity(MAX_ISSUANCE_PER_TICK);
+        for (_, operation_id) in due_retries.into_iter().take(retry_budget) {
+            if let Some(entry) = state.backoffs.get_mut(&operation_id) {
+                entry.touched = now;
+            }
+            operation_ids.push(operation_id);
+        }
+        operation_ids.extend(fresh);
+        IssuanceSelection {
+            operation_ids,
+            deferred,
         }
     }
 
@@ -160,8 +200,9 @@ fn safe_gap(error: &Error) -> &'static str {
 /// Drive at most two queued assignment credential issuances per call. One
 /// Store-local runtime coalesces overlapping host ticks and owns transient
 /// cursor/backoff state; separate Store instances never share scheduling state.
-/// Backoff is capped and retried indefinitely, so it is pacing rather than an
-/// attempt quota. No launch is dispatched by this worker.
+/// Discovery and due retries are selected independently. When both lanes have
+/// work, each receives one of the two effect slots; backoff is pacing rather
+/// than an attempt quota. No launch is dispatched by this worker.
 impl super::Store {
     pub(crate) async fn reconcile_launch_issuance_once(&self) -> Result<Value> {
         let Ok(_tick) = self.launch_issuance.tick.try_lock() else {
@@ -182,22 +223,15 @@ impl super::Store {
         if ids.is_empty() {
             self.launch_issuance.reset_cursor().await;
         }
-        let selected = ids.len();
+        let selection = self.launch_issuance.select_attempts(&ids).await;
+        let selected = selection.operation_ids.len();
         let mut attempted = 0usize;
         let mut committed = 0usize;
         let mut unknown = 0usize;
-        let mut deferred = 0usize;
+        let mut deferred = selection.deferred;
         let mut gaps = Vec::new();
 
-        for operation_id in ids {
-            if attempted >= MAX_ISSUANCE_PER_TICK {
-                break;
-            }
-            self.launch_issuance.mark_considered(&operation_id).await;
-            if !self.launch_issuance.retry_due(&operation_id).await {
-                deferred += 1;
-                continue;
-            }
+        for operation_id in selection.operation_ids {
             attempted += 1;
 
             let prepare_id = operation_id.clone();
@@ -206,6 +240,18 @@ impl super::Store {
                 .run(move |db| {
                     let tx =
                         db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let effective_request_json: Option<String> = tx
+                        .query_row(
+                            "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch' AND state='queued' \
+                             AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential'",
+                            [&prepare_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(effective_request_json) = effective_request_json else {
+                        tx.commit()?;
+                        return Ok(None);
+                    };
                     let actor = launcher::launch_actor(&tx, &prepare_id)?;
                     let request = launcher_participant::prepare_launch_issuance(
                         &tx,
@@ -213,18 +259,16 @@ impl super::Store {
                         &prepare_id,
                         &prepare_config,
                     )?;
-                    let effective_request_json: String = tx.query_row(
-                        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch' AND state='queued' \
-                         AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential'",
-                        [&prepare_id],
-                        |row| row.get(0),
-                    )?;
                     tx.commit()?;
-                    Ok((actor, request, effective_request_json))
+                    Ok(Some((actor, request, effective_request_json)))
                 })
                 .await;
             let (actor, request, effective_request_json) = match prepared {
-                Ok(value) => value,
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    self.launch_issuance.clear_backoff(&operation_id).await;
+                    continue;
+                }
                 Err(error) => {
                     let gap = safe_gap(&error);
                     if let Err(secondary) = self
