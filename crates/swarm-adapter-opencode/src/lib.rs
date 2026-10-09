@@ -27,7 +27,13 @@ use native::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
@@ -39,11 +45,12 @@ use swarm_contracts::{
     task_prompt::TaskPromptEnvelopeV1,
 };
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::sleep;
+use tokio::time::{Instant as TokioInstant, sleep};
 
 const ACK_ATTEMPTS: usize = 4;
 const ACK_BACKOFF_MS: [u64; ACK_ATTEMPTS] = [100, 250, 500, 1000];
 const IDLE_POLL_MS: u64 = 500;
+const JOURNAL_RETENTION_RETRY_MS: u64 = 10_000;
 
 struct HostSession<'a> {
     config: &'a AdapterConfig,
@@ -54,6 +61,8 @@ struct HostSession<'a> {
     hello_base: Value,
     root_hint: Mutex<Option<String>>,
     ipc_link: AsyncMutex<Option<swarm_client::ModuleLink>>,
+    // A partial batch or transient sweep error is retried from the main loop.
+    retention_retry_pending: AtomicBool,
 }
 
 pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
@@ -105,6 +114,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         hello_base,
         root_hint: Mutex::new(root_hint),
         ipc_link: AsyncMutex::new(None),
+        retention_retry_pending: AtomicBool::new(false),
     };
     let run_result = async {
         host.hello_retry().await?;
@@ -157,6 +167,8 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
 
         flush_outbox(&host).await?;
         attempt_journal_retention(&host);
+        let mut next_retention_retry = TokioInstant::now()
+            + Duration::from_millis(JOURNAL_RETENTION_RETRY_MS);
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
@@ -186,6 +198,15 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                 flush_outbox(&host).await?;
             } else {
                 sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+            }
+            // Check only after module.next returns; never cancel an in-flight RPC
+            // to run maintenance while the adapter is waiting for work.
+            if host.retention_retry_pending.load(Ordering::Acquire)
+                && TokioInstant::now() >= next_retention_retry
+            {
+                attempt_journal_retention(&host);
+                next_retention_retry =
+                    TokioInstant::now() + Duration::from_millis(JOURNAL_RETENTION_RETRY_MS);
             }
             // A failed module.next may have admitted work before its response was
             // lost. It is intentionally not retried on this boot; startup recovery
@@ -1313,20 +1334,20 @@ fn task_prompt_for(
         ));
     }
     let expected_snapshot_digest = format!("sha256:{}", context.task_snapshot_sha256);
-    if let Some(packet) = command.input.get("launch_dispatch_packet") {
-        if packet["task"]["task_id"].as_str() != Some(context.task_id.as_str())
+    if let Some(packet) = command.input.get("launch_dispatch_packet")
+        && (packet["task"]["task_id"].as_str() != Some(context.task_id.as_str())
             || packet["task"]["revision"].as_i64() != Some(context.task_revision)
             || packet["task"]["attempt_id"].as_str() != Some(context.attempt_id.as_str())
-            || packet["task"]["snapshot_digest"].as_str() != Some(expected_snapshot_digest.as_str())
+            || packet["task"]["snapshot_digest"].as_str()
+                != Some(expected_snapshot_digest.as_str())
             || packet["selection"]["provider"].as_str() != Some(options.model.provider_id.as_str())
             || packet["selection"]["model"].as_str() != Some(options.model.id.as_str())
-            || packet["selection"]["variant"].as_str() != Some(options.model.variant.as_str())
-        {
-            return Err(Error::new(
-                "TASK_PROMPT_LAUNCH_PACKET_MISMATCH",
-                "launch packet differs from the frozen dispatch or pinned native model",
-            ));
-        }
+            || packet["selection"]["variant"].as_str() != Some(options.model.variant.as_str()))
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_LAUNCH_PACKET_MISMATCH",
+            "launch packet differs from the frozen dispatch or pinned native model",
+        ));
     }
     Ok(Some(envelope.prompt))
 }
@@ -2429,21 +2450,33 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
 }
 
 fn attempt_journal_retention(host: &HostSession<'_>) {
-    match host.journal.reclaim_acknowledged(
+    let complete = match host.journal.reclaim_acknowledged(
         &host.config.binding_id,
         host.config.generation,
         &host.config.native_options.scope_key(),
     ) {
-        Ok(summary) if summary.reclaimed > 0 => eprintln!(
-            "OpenCode acknowledged journal retention reclaimed {} operation(s)",
-            summary.reclaimed
-        ),
-        Ok(summary) if !summary.complete => {
-            eprintln!("OpenCode journal retention deferred at its bounded delete batch")
+        Ok(summary) => {
+            if summary.reclaimed > 0 {
+                eprintln!(
+                    "OpenCode acknowledged journal retention reclaimed {} operation(s)",
+                    summary.reclaimed
+                );
+            }
+            if !summary.complete {
+                eprintln!("OpenCode journal retention deferred at its bounded delete batch");
+            }
+            summary.complete
         }
-        Ok(_) => {}
-        Err(error) => eprintln!("OpenCode journal retention deferred after {}", error.code),
-    }
+        Err(error) => {
+            eprintln!(
+                "OpenCode journal retention did not complete: {}",
+                error.code
+            );
+            false
+        }
+    };
+    host.retention_retry_pending
+        .store(!complete, Ordering::Release);
 }
 
 fn remember_root_from_outcome(

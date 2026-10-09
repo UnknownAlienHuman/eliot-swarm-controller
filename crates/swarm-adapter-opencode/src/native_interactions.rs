@@ -958,12 +958,12 @@ fn project_question(item: &Value, session_id: &str) -> Result<Value> {
         "fingerprint":native_fingerprint(item)?,
         "questions":questions,
     });
-    if let Some(tool) = item.get("tool") {
-        if !tool.is_null() {
-            let message_id = text(tool, "messageID", 256)?;
-            let call_id = text(tool, "callID", 256)?;
-            result["tool"] = json!({"message_id":message_id,"call_id":call_id});
-        }
+    if let Some(tool) = item.get("tool")
+        && !tool.is_null()
+    {
+        let message_id = text(tool, "messageID", 256)?;
+        let call_id = text(tool, "callID", 256)?;
+        result["tool"] = json!({"message_id":message_id,"call_id":call_id});
     }
     enforce_interaction_size(&result)?;
     Ok(result)

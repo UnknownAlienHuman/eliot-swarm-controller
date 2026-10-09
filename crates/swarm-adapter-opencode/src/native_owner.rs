@@ -374,8 +374,6 @@ impl NativeOwner {
 
 impl OwnerPlan {
     fn prepare(config: &OwnedNativeOptions, options: &NativeOptions) -> Result<Self> {
-        let plugin_config = mcp_plugin::prepare_plugin_config(options)?;
-        let plugin_identity = plugin_config.identity().clone();
         let bun = canonical_regular_file(&config.bun_executable, MAX_FILE_BYTES)?;
         let server = canonical_regular_file(&config.server_program, SERVER_FILE_BYTES)?;
         verify_server_dependency_closure(&server)?;
@@ -387,6 +385,14 @@ impl OwnerPlan {
                 "configured Bun or serve.mjs bytes differ from the descriptor pin",
             ));
         }
+        let plugin_source_root = server.parent().ok_or_else(|| {
+            Error::new(
+                "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+                "verified OpenCode server has no resource directory",
+            )
+        })?;
+        let plugin_config = mcp_plugin::prepare_plugin_config(options, plugin_source_root)?;
+        let plugin_identity = plugin_config.identity().clone();
         let workspace = canonical_directory(&options.directory)?;
         ensure_private_state_root(&config.state_root)?;
         let password_parent = config
@@ -418,8 +424,27 @@ impl OwnerPlan {
         fs::create_dir(&config_dir)?;
         private_permissions(&config_dir, true)?;
         let config_path = config_dir.join("opencode.json");
+        let prepared_plugin_value: Value =
+            serde_json::from_slice(plugin_config.bytes()).map_err(|_| {
+                Error::new(
+                    "NATIVE_MCP_PLUGIN_SOURCE",
+                    "prepared plugin config is invalid",
+                )
+            })?;
+        let verified_before_write = mcp_plugin::verify_plugin_config_value(
+            &prepared_plugin_value,
+            options,
+            plugin_source_root,
+        )?;
+        if &verified_before_write != plugin_config.identity() {
+            return Err(Error::new(
+                "NATIVE_MCP_PLUGIN_SOURCE",
+                "native MCP plugin source changed before config write",
+            ));
+        }
         write_private_new(&config_path, plugin_config.bytes())?;
-        let verified_plugin = mcp_plugin::verify_plugin_config_file(&config_path, options)?;
+        let verified_plugin =
+            mcp_plugin::verify_plugin_config_file(&config_path, options, plugin_source_root)?;
         if &verified_plugin != plugin_config.identity() {
             return Err(Error::new(
                 "NATIVE_MCP_PLUGIN_SOURCE",

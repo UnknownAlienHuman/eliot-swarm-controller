@@ -689,8 +689,7 @@ impl Journal {
         self.acknowledgements_since_retention
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
-            % RETENTION_ACK_INTERVAL
-            == 0
+            .is_multiple_of(RETENTION_ACK_INTERVAL)
     }
 
     /// Reclaim only acknowledged terminal journals whose local evidence has no
@@ -753,13 +752,26 @@ impl Journal {
                 ));
             }
             match remove_private_durable(&operation.path) {
-                Ok(_) => summary.reclaimed += 1,
-                Err(_) => {
-                    let _ = replace_private_durable(&operation.path, &current_bytes);
+                Ok(true) => summary.reclaimed += 1,
+                Ok(false) => {
                     return Err(Error::new(
                         "ADAPTER_JOURNAL",
-                        "acknowledged operation journal could not be durably removed",
+                        "acknowledged operation journal disappeared during retention",
                     ));
+                }
+                Err(remove_error) => {
+                    if let Err(restore_error) =
+                        replace_private_durable(&operation.path, &current_bytes)
+                    {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL_RESTORE",
+                            format!(
+                                "journal removal failed ({}) and exact restoration failed ({})",
+                                remove_error.code, restore_error.code
+                            ),
+                        ));
+                    }
+                    return Err(remove_error);
                 }
             }
         }
@@ -1155,7 +1167,7 @@ fn read_operation_history_bytes(
     let mut observed_operation_id: Option<String> = None;
     // File I/O is complete before this pure, in-memory domain decoder runs;
     // scanner validation failures therefore cannot hide read or Store errors.
-    let verdict = scan_jsonl(&bytes, RECORD_LIMIT, |_, frame| {
+    let verdict = scan_jsonl(bytes, RECORD_LIMIT, |_, frame| {
         let record: JournalRecord = serde_json::from_slice(&frame[..frame.len() - 1])
             .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation journal record is invalid"))?;
         apply_operation_record(

@@ -2372,20 +2372,23 @@ fn selected_task_prompt(
     first_dispatch: bool,
     claim: &ModuleContractClaim,
 ) -> Result<Option<TaskPromptEnvelopeV1>> {
-    let revision_value = command
+    let prompt_value = command
         .input
-        .get("task_prompt_contract_revision")
+        .get("task_prompt")
         .filter(|value| !value.is_null());
-    let revision = revision_value.and_then(Value::as_str);
-    let envelope_value = command
-        .input
-        .get("task_prompt_envelope")
-        .filter(|value| !value.is_null());
-    let task_prompt_declared = claim
-        .command_schemas
-        .contains(&swarm_contracts::module_contract::task_prompt_schema());
+    let task_prompt_declared = swarm_contracts::module_contract::task_prompt_selected(
+        claim.command_schemas.iter(),
+        claim.event_schemas.iter(),
+        claim.capabilities.iter(),
+    )
+    .map_err(|_| {
+        Error::new(
+            "MODULE_CONTRACT_MISMATCH",
+            "selected TaskPrompt descriptor is malformed or unsupported",
+        )
+    })?;
     if !first_dispatch {
-        if revision_value.is_some() || envelope_value.is_some() {
+        if prompt_value.is_some() {
             return Err(Error::new(
                 "TASK_PROMPT_UNEXPECTED",
                 "TaskPrompt envelopes are valid only on the initial task.dispatch",
@@ -2394,7 +2397,7 @@ fn selected_task_prompt(
         return Ok(None);
     }
     if !task_prompt_declared {
-        if revision_value.is_some() || envelope_value.is_some() {
+        if prompt_value.is_some() {
             return Err(Error::new(
                 "TASK_PROMPT_NOT_DECLARED",
                 "selected TaskPrompt is absent from the retained adapter descriptor",
@@ -2402,23 +2405,8 @@ fn selected_task_prompt(
         }
         return Ok(None);
     }
-    match revision {
-        None => {
-            return Err(Error::new(
-                "TASK_PROMPT_SELECTOR_MISSING",
-                "artifact-declared TaskPrompt v1 requires its exact contract selector",
-            ));
-        }
-        Some(value) if value != TASK_PROMPT_CONTRACT_REVISION => {
-            return Err(Error::new(
-                "TASK_PROMPT_SELECTOR_UNSUPPORTED",
-                "selected TaskPrompt contract revision is unsupported",
-            ));
-        }
-        Some(_) => {}
-    }
 
-    let envelope_value = envelope_value.ok_or_else(|| {
+    let envelope_value = prompt_value.ok_or_else(|| {
         Error::new(
             "TASK_PROMPT_ENVELOPE_MISSING",
             "selected TaskPrompt v1 dispatch has no envelope",

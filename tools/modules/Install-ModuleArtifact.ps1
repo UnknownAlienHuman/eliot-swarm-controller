@@ -293,16 +293,16 @@ function Assert-PreInputOpen {
     }
 }
 
-function Assert-AntigravityV4DescriptorContract {
+function Assert-AntigravityV5DescriptorContract {
     param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $Descriptor)
 
     # The generic descriptor validator remains shared by every module. This
-    # narrow check pins the final Antigravity .1 descriptor to the v4 claim
+    # narrow check pins the exact Antigravity .1 v5 coordinate to the claim
     # consumed by the adapter and Store; it does not add a productive-body
     # promise to the descriptor's agent.result capability.
     if ($Descriptor.module_id -ne 'antigravity' -or
         $Descriptor.artifact.artifact_id -ne 'eliot-antigravity.rust-headless.1' -or
-        $Descriptor.artifact.version -ne '4') {
+        $Descriptor.artifact.version -ne '5') {
         return
     }
 
@@ -316,6 +316,7 @@ function Assert-AntigravityV4DescriptorContract {
         'swarm.normalized_result_context@1'
         'swarm.runtime_command@1'
         'swarm.task_dispatch_context@1'
+        'swarm.task_prompt@1'
     )
     $expectedEvents = @(
         'swarm.normalized_result_page@1'
@@ -324,11 +325,11 @@ function Assert-AntigravityV4DescriptorContract {
     )
     if (($commands -join ',') -ne ($expectedCommands -join ',') -or
         ($events -join ',') -ne ($expectedEvents -join ',')) {
-        throw 'Antigravity artifact version 4 requires the exact normalized result and dispatch schema sets.'
+        throw 'Antigravity artifact version 5 requires the exact normalized result, dispatch, and TaskPrompt schema sets.'
     }
     $schemas = @($Descriptor.command_schemas) + @($Descriptor.event_schemas)
     if ($schemas | Where-Object { $_.Contains('sha256') -and $null -ne $_.sha256 }) {
-        throw 'Antigravity artifact version 4 uses the unkeyed shared schema descriptors.'
+        throw 'Antigravity artifact version 5 uses the unkeyed shared schema descriptors.'
     }
 
     $capabilities = @($Descriptor.capabilities | ForEach-Object { [string]$_ } | Sort-Object)
@@ -341,7 +342,7 @@ function Assert-AntigravityV4DescriptorContract {
         'task.dispatch'
     )
     if (($capabilities -join ',') -ne ($expectedCapabilities -join ',')) {
-        throw 'Antigravity artifact version 4 capability set is not aligned with its adapter claim.'
+        throw 'Antigravity artifact version 5 capability set is not aligned with its adapter claim.'
     }
 }
 
@@ -598,7 +599,7 @@ try {
 }
 catch { throw "DescriptorTemplate is not valid JSON: $($_.Exception.Message)" }
 Assert-DescriptorTemplate -Descriptor $descriptor
-Assert-AntigravityV4DescriptorContract -Descriptor $descriptor
+Assert-AntigravityV5DescriptorContract -Descriptor $descriptor
 
 $coordinate = [ordered]@{
     module_id = [string] $descriptor.module_id

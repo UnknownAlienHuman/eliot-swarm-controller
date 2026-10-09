@@ -19,6 +19,8 @@ const MAX_PLUGIN_SOURCE_BYTES: u64 = 512 * 1024;
 const MAX_PLUGIN_ENTRY_BYTES: usize = 4096;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const PLUGIN_ENTRY_BYTES: &[u8] = b"export { default } from './native-mcp-proof.mjs';\n";
+const EMBEDDED_PLUGIN_SOURCE: &[u8] =
+    include_bytes!("../../../modules/opencode/native-mcp-proof.mjs");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PluginSourceIdentity {
@@ -44,9 +46,12 @@ impl PreparedPluginConfig {
 
 /// Prepare the exact OpenCode 2.0.7 file-schema tuple from bounded local
 /// source. The package path is kept local and is never written to user config.
-pub(crate) fn prepare_plugin_config(options: &NativeOptions) -> Result<PreparedPluginConfig> {
+pub(crate) fn prepare_plugin_config(
+    options: &NativeOptions,
+    source_root: &Path,
+) -> Result<PreparedPluginConfig> {
     validate_options(options)?;
-    let (module_path, module_sha256) = module_source()?;
+    let (module_path, module_sha256) = module_source(source_root)?;
     let entrypoint_path = plugin_entry_path(&module_path)?;
     let entrypoint_bytes = read_bounded_regular(&entrypoint_path, MAX_PLUGIN_ENTRY_BYTES as u64)?;
     let entrypoint_sha256 = digest(&entrypoint_bytes);
@@ -61,13 +66,13 @@ pub(crate) fn prepare_plugin_config(options: &NativeOptions) -> Result<PreparedP
             "moduleSha256": module_sha256.as_str(),
         }]]
     });
-    let bytes = serialize_bounded(&value)?;
-    let identity = verify_plugin_config_value(&value, options)?;
+    let identity = verify_plugin_config_value(&value, options, source_root)?;
     if identity.module_sha256 != module_sha256 || identity.entrypoint_sha256 != entrypoint_sha256 {
         return Err(source_error(
             "native MCP plugin source changed during preparation",
         ));
     }
+    let bytes = serialize_bounded(&value)?;
     Ok(PreparedPluginConfig { bytes, identity })
 }
 
@@ -75,9 +80,10 @@ pub(crate) fn prepare_plugin_config(options: &NativeOptions) -> Result<PreparedP
 pub(crate) fn verify_plugin_config_value(
     value: &Value,
     options: &NativeOptions,
+    source_root: &Path,
 ) -> Result<PluginSourceIdentity> {
     validate_options(options)?;
-    let (module_path, module_sha256) = module_source()?;
+    let (module_path, module_sha256) = module_source(source_root)?;
     let entrypoint_path = plugin_entry_path(&module_path)?;
     let entrypoint_bytes = read_bounded_regular(&entrypoint_path, MAX_PLUGIN_ENTRY_BYTES as u64)?;
     let entrypoint_sha256 = digest(&entrypoint_bytes);
@@ -126,16 +132,18 @@ pub(crate) fn verify_plugin_config_value(
 pub(crate) fn verify_plugin_config_file(
     path: &Path,
     options: &NativeOptions,
+    source_root: &Path,
 ) -> Result<PluginSourceIdentity> {
     let bytes = read_bounded_regular(path, MAX_CONFIG_BYTES as u64)?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| source_error("private OpenCode plugin config is invalid JSON"))?;
+    let identity = verify_plugin_config_value(&value, options, source_root)?;
     if serialize_bounded(&value)? != bytes {
         return Err(source_error(
             "private OpenCode plugin config is not in the prepared bounded encoding",
         ));
     }
-    verify_plugin_config_value(&value, options)
+    Ok(identity)
 }
 
 fn validate_options(options: &NativeOptions) -> Result<()> {
@@ -153,30 +161,33 @@ fn validate_options(options: &NativeOptions) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the adapter workspace's exact local source file and return its
-/// digest. The source is never copied, modified, downloaded, or executed here.
-fn module_source() -> Result<(PathBuf, String)> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| source_error("adapter workspace root is unavailable"))?;
-    let package_dir = workspace_root.join("modules").join("opencode");
-    verify_directory(&package_dir)?;
-    let path = package_dir.join("native-mcp-proof.mjs");
+/// Resolve the plugin beside the already verified native server and compare
+/// its exact bytes with the copy embedded in this adapter artifact. The source
+/// is never copied, modified, downloaded, or executed here.
+fn module_source(source_root: &Path) -> Result<(PathBuf, String)> {
+    verify_directory(source_root)?;
+    let path = source_root.join("native-mcp-proof.mjs");
     let bytes = read_bounded_regular(&path, MAX_PLUGIN_SOURCE_BYTES)?;
     if bytes.is_empty() {
         return Err(source_error("native MCP plugin source is empty"));
     }
+    if bytes.as_slice() != EMBEDDED_PLUGIN_SOURCE {
+        return Err(source_error(
+            "installed native MCP plugin source differs from the adapter-embedded bytes",
+        ));
+    }
     let canonical = path
         .canonicalize()
         .map_err(|_| source_error("native MCP plugin source path is invalid"))?;
-    if canonical.to_str().is_none() || !same_lexical_path(&canonical, &path) {
+    if canonical.to_str().is_none()
+        || canonical.parent() != Some(source_root)
+        || !same_lexical_path(&canonical, &path)
+    {
         return Err(source_error(
             "native MCP plugin source path is redirected or not valid Unicode",
         ));
     }
-    Ok((canonical, digest(&bytes)))
+    Ok((canonical, digest(EMBEDDED_PLUGIN_SOURCE)))
 }
 
 /// OpenCode's directory plugin resolver enters through this exact transparent
