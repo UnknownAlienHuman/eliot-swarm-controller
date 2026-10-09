@@ -220,8 +220,7 @@ fn open_writer_inner<T, E>(
     } else {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
     };
-    configure_writer_connection(&db, options.busy_timeout)?;
-    verify_writer_connection(&db, expected)?;
+    db.busy_timeout(options.busy_timeout)?;
 
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let application_id: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
@@ -240,6 +239,9 @@ fn open_writer_inner<T, E>(
     if !is_new && (application_id != identity.application_id || version != identity.user_version) {
         return Err(Error::SchemaMismatch.into());
     }
+
+    configure_writer_connection(&db)?;
+    verify_writer_connection(&db, expected)?;
 
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let digest = identity.digest();
@@ -325,8 +327,7 @@ fn checked_timeout_ms(timeout: Duration) -> Result<i32, Error> {
     i32::try_from(timeout.as_millis()).map_err(|_| Error::InvalidBusyTimeout)
 }
 
-fn configure_writer_connection(db: &Connection, busy_timeout: Duration) -> Result<(), Error> {
-    db.busy_timeout(busy_timeout)?;
+fn configure_writer_connection(db: &Connection) -> Result<(), Error> {
     db.pragma_update(None, "foreign_keys", "ON")?;
     db.pragma_update(None, "journal_mode", "WAL")?;
     db.pragma_update(None, "synchronous", "FULL")?;
