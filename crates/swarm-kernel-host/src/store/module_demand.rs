@@ -11,28 +11,17 @@ use crate::{
     config::Config,
     error::{Error, Result},
 };
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use swarm_contracts::module_catalog::ModuleDescriptor;
+use swarm_contracts::{
+    module_catalog::ModuleDescriptor,
+    module_command::{MODULE_DEMAND_METHODS, capability_satisfies, classify_runtime_command},
+};
 
 const MAX_DEMAND_OPERATIONS: usize = 4096;
 const MAX_SCOPE_OPERATIONS: usize = 4096;
-
-const MODULE_METHODS: &[&str] = &[
-    "agent.open",
-    "task.dispatch",
-    "agent.send",
-    "agent.reply",
-    "agent.configure",
-    "agent.goal",
-    "agent.background",
-    "agent.refresh",
-    "agent.reconcile",
-    "agent.result",
-    "agent.recover",
-];
 
 /// Exact status-only Operation data used for scoped recovery readback. Inputs,
 /// results, identities of callers, and native payloads are deliberately absent.
@@ -111,6 +100,22 @@ struct OperationRow {
     binding_id: String,
     generation: i64,
     created_at_ms: i64,
+    input: Value,
+}
+
+fn operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
+    let raw_input: String = row.get(5)?;
+    let input = serde_json::from_str(&raw_input).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
+    })?;
+    Ok(OperationRow {
+        operation_id: row.get(0)?,
+        method: row.get(1)?,
+        binding_id: row.get(2)?,
+        generation: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        input,
+    })
 }
 
 fn operation_candidates(
@@ -119,34 +124,27 @@ fn operation_candidates(
 ) -> Result<(Vec<OperationRow>, bool, Option<ModuleDemandCursor>)> {
     let cursor_created_at = cursor.map_or(i64::MIN, |value| value.created_at_ms);
     let cursor_operation_id = cursor.map_or("", |value| value.operation_id.as_str());
+    let methods_json = serde_json::to_string(&MODULE_DEMAND_METHODS)?;
     let mut statement = db.prepare(
-        "SELECT o.operation_id,o.method,o.binding_id,o.binding_generation,o.created_at_ms \
+        "SELECT o.operation_id,o.method,o.binding_id,o.binding_generation,o.created_at_ms, \
+                o.original_request_json \
          FROM operations AS o JOIN bindings AS b \
            ON b.binding_id=o.binding_id AND b.generation=o.binding_generation \
          WHERE b.released_at_ms IS NULL \
            AND (o.created_at_ms>?1 OR (o.created_at_ms=?1 AND o.operation_id>?2)) \
            AND o.state IN ('queued','sending','native_accepted','outcome_unknown') \
-           AND o.method IN ('agent.open','task.dispatch','agent.send','agent.reply', \
-                            'agent.configure','agent.goal','agent.background', \
-                            'agent.refresh','agent.reconcile','agent.result','agent.recover') \
-         ORDER BY o.created_at_ms,o.operation_id LIMIT ?3",
+           AND o.method IN (SELECT value FROM json_each(?3)) \
+         ORDER BY o.created_at_ms,o.operation_id LIMIT ?4",
     )?;
     let mut rows = statement
         .query_map(
             params![
                 cursor_created_at,
                 cursor_operation_id,
+                methods_json,
                 MAX_DEMAND_OPERATIONS as i64 + 1
             ],
-            |row| {
-                Ok(OperationRow {
-                    operation_id: row.get(0)?,
-                    method: row.get(1)?,
-                    binding_id: row.get(2)?,
-                    generation: row.get(3)?,
-                    created_at_ms: row.get(4)?,
-                })
-            },
+            operation_row,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let pending_truncated = rows.len() > MAX_DEMAND_OPERATIONS;
@@ -156,7 +154,8 @@ fn operation_candidates(
     // between turns. Anchor its adapter demand to the original admitted
     // agent.open Operation; this starts only the adapter and never replays it.
     let mut statement = db.prepare(
-        "SELECT o.operation_id,o.method,o.binding_id,o.binding_generation,o.created_at_ms \
+        "SELECT o.operation_id,o.method,o.binding_id,o.binding_generation,o.created_at_ms, \
+                o.original_request_json \
          FROM operations AS o JOIN bindings AS b \
            ON b.binding_id=o.binding_id AND b.generation=o.binding_generation \
          WHERE b.released_at_ms IS NULL AND b.native_root_id IS NOT NULL \
@@ -172,15 +171,7 @@ fn operation_candidates(
                 cursor_operation_id,
                 MAX_DEMAND_OPERATIONS as i64 + 1
             ],
-            |row| {
-                Ok(OperationRow {
-                    operation_id: row.get(0)?,
-                    method: row.get(1)?,
-                    binding_id: row.get(2)?,
-                    generation: row.get(3)?,
-                    created_at_ms: row.get(4)?,
-                })
-            },
+            operation_row,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let native_truncated = native_rows.len() > MAX_DEMAND_OPERATIONS;
@@ -389,7 +380,8 @@ pub(super) fn pending(
     let mut readbacks = BTreeMap::<(String, i64), Vec<StoredOperation>>::new();
 
     for operation in candidates {
-        if operation.generation <= 0 || !MODULE_METHODS.contains(&operation.method.as_str()) {
+        if operation.generation <= 0 || !MODULE_DEMAND_METHODS.contains(&operation.method.as_str())
+        {
             continue;
         }
         let generation = match u64::try_from(operation.generation) {
@@ -435,22 +427,25 @@ pub(super) fn pending(
                 continue;
             }
         };
-        let required = descriptor
+        let command = match classify_runtime_command(&operation.method, &operation.input) {
+            Ok(command) => command,
+            Err(error) => {
+                output.blocked.push(ModuleDemandBlock {
+                    binding_id: operation.binding_id,
+                    generation,
+                    operation_id: operation.operation_id,
+                    error_code: error.code().to_owned(),
+                    descriptor: Some(descriptor.clone()),
+                });
+                continue;
+            }
+        };
+        let required = command.capability();
+        if !descriptor
             .capabilities
             .iter()
-            .find(|capability| capability.as_str() == operation.method.as_str())
-            .or_else(|| {
-                (operation.method == "agent.send")
-                    .then(|| {
-                        descriptor
-                            .capabilities
-                            .iter()
-                            .find(|capability| capability.as_str() == "agent.send/next_turn")
-                    })
-                    .flatten()
-            })
-            .map(|capability| capability.as_str().to_owned());
-        let Some(required) = required else {
+            .any(|capability| capability_satisfies(capability.as_str(), required))
+        {
             output.blocked.push(ModuleDemandBlock {
                 binding_id: operation.binding_id,
                 generation,
@@ -459,7 +454,7 @@ pub(super) fn pending(
                 descriptor: Some(descriptor.clone()),
             });
             continue;
-        };
+        }
         if descriptor.launch.credential_ref.is_none() {
             output.blocked.push(ModuleDemandBlock {
                 binding_id: operation.binding_id,
@@ -530,7 +525,7 @@ pub(super) fn pending(
             descriptor,
             descriptor_revision: retained.descriptor_revision,
             operation_id: operation.operation_id,
-            required_capability: required,
+            required_capability: required.to_owned(),
             binding_id: operation.binding_id,
             generation,
             module_client_id: binding["observation"]["module_client_id"]

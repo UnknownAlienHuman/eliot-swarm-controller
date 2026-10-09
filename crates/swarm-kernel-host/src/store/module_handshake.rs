@@ -19,6 +19,7 @@ use swarm_contracts::module_catalog::{
     ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
     PreInputOpenContract, ProtocolVersion, SchemaDescriptor, WorkspaceOptionContract,
 };
+use swarm_contracts::module_command::{capability_satisfies, classify_runtime_command};
 use swarm_contracts::module_contract::{
     MODULE_PROTOCOL_V1, ModuleContractClaim, native_mcp_command_schema,
 };
@@ -770,16 +771,16 @@ pub(super) fn selected_native_command_supported(
     method: &str,
     input: &Value,
 ) -> Result<Option<bool>> {
-    let Some(required) = native_command_capability(method, input) else {
-        return Ok(Some(true));
-    };
-    let native_mcp = is_native_mcp_method(method);
+    let command = classify_runtime_command(method, input)
+        .map_err(|error| Error::new(error.code(), error.message()))?;
+    let native_mcp = command.is_native_mcp();
     let Some(retained) = retained_contract_identity(db, binding_artifact_id, selector)? else {
         // Native MCP phase Operations are meaningful only under the exact
         // retained descriptor that authorizes their command schema. Preserve
-        // legacy behavior for the pre-existing agent.* runtime contract.
+        // legacy behavior only for known pre-existing agent.* commands.
         return Ok(if native_mcp { Some(false) } else { None });
     };
+    let required = command.capability();
     let capability_supported = retained
         .capabilities
         .iter()
@@ -789,42 +790,6 @@ pub(super) fn selected_native_command_supported(
             .command_schemas
             .contains(&native_mcp_command_schema());
     Ok(Some(capability_supported && schema_supported))
-}
-
-fn is_native_mcp_method(method: &str) -> bool {
-    swarm_contracts::native_mcp::NATIVE_MCP_METHODS.contains(&method)
-}
-
-fn native_command_capability(method: &str, input: &Value) -> Option<&'static str> {
-    if let Some(capability) = swarm_contracts::native_mcp::NATIVE_MCP_METHODS
-        .iter()
-        .copied()
-        .find(|candidate| *candidate == method)
-    {
-        return Some(capability);
-    }
-    Some(match method {
-        "agent.open" => "agent.open",
-        "task.dispatch" => "task.dispatch",
-        "agent.send" => match input.get("delivery").and_then(Value::as_str) {
-            Some("next_turn") => "agent.send/next_turn",
-            Some("steer") => "agent.send/steer",
-            _ => "agent.send",
-        },
-        "agent.reply" => "agent.reply",
-        "agent.configure" => "agent.configure",
-        "agent.goal" => "agent.goal",
-        "agent.background" => "agent.background",
-        "agent.refresh" => "agent.refresh",
-        "agent.reconcile" => "agent.reconcile",
-        "agent.result" => "agent.result",
-        "agent.recover" => "agent.recover",
-        _ => return None,
-    })
-}
-
-fn capability_satisfies(advertised: &str, required: &str) -> bool {
-    advertised == required || (required.starts_with("agent.send/") && advertised == "agent.send")
 }
 
 pub(super) fn retained_descriptor(
