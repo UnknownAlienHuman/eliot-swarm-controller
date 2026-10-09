@@ -776,6 +776,16 @@ fn load_current_scope(db: &Connection, principal: &Principal) -> Result<ScopeDat
     load_current_scope_for_client(db, &principal.client_id)
 }
 
+fn participant_scope_lookup_error(error: Error, missing_message: &'static str) -> Error {
+    if error.code == "NOT_FOUND" {
+        Error::new("STALE_PARTICIPANT", missing_message)
+    } else {
+        // Database, decoding and invariant failures are not evidence that the
+        // participant merely became stale. Preserve the original failure.
+        error
+    }
+}
+
 fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<ScopeData> {
     let registration = participant_registration(db, client_id)?;
     if registration["disabled"] == true {
@@ -795,8 +805,9 @@ fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<Sco
                 "participant has no valid Task revision",
             )
         })?;
-    let task = tasks::get_task(db, task_id)
-        .map_err(|_| Error::new("STALE_PARTICIPANT", "participant Task no longer exists"))?;
+    let task = tasks::get_task(db, task_id).map_err(|error| {
+        participant_scope_lookup_error(error, "participant Task no longer exists")
+    })?;
     if task["revision"] != task_revision
         || task["current_attempt_id"] != attempt_id
         || task["state"] != "open"
@@ -806,8 +817,9 @@ fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<Sco
             "participant Task revision or current Attempt changed",
         ));
     }
-    let attempt = tasks::get_attempt(db, attempt_id)
-        .map_err(|_| Error::new("STALE_PARTICIPANT", "participant Attempt no longer exists"))?;
+    let attempt = tasks::get_attempt(db, attempt_id).map_err(|error| {
+        participant_scope_lookup_error(error, "participant Attempt no longer exists")
+    })?;
     validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
     validate_registration_binding(&registration, &attempt)?;
     validate_participation_basis(db, client_id, &registration, &task, &attempt, false)?;
