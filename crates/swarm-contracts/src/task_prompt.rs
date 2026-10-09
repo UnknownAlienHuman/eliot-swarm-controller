@@ -26,9 +26,7 @@ impl TaskPromptEnvelopeV1 {
     /// prompt.as_bytes() before submitting the exact text to a native harness.
     pub fn validate_shape(&self) -> Result<(), &'static str> {
         fn atom(value: &str) -> bool {
-            !value.is_empty()
-                && value.len() <= 256
-                && !value.chars().any(char::is_control)
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
         }
         fn lower_sha256(value: &str) -> bool {
             value.len() == 64
