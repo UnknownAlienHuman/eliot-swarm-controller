@@ -35,99 +35,103 @@ jobs:
                   raise SystemExit(f'expected one replacement, found {count}: {old[:80]!r}')
               text = text.replace(old, new)
 
-          replace_once(
-              '''    if request.expires_at_ms <= now || request.expires_at_ms > max_expiry {
-        return Err(Error::invalid(format!(
-            "expires_at_ms must be after now and no more than {} days ahead",
-            watch::MAX_WATCH_TTL_MS / (24 * 60 * 60 * 1000)
-        )));
-    }
-    let subject_key = subject_key(
-''',
-              '''    if request.expires_at_ms <= now || request.expires_at_ms > max_expiry {
-        return Err(Error::invalid(format!(
-            "expires_at_ms must be after now and no more than {} days ahead",
-            watch::MAX_WATCH_TTL_MS / (24 * 60 * 60 * 1000)
-        )));
-    }
-    let exact_deadline_ms = if request.watch_kind == "exact_deadline_reached" {
-        let deadline = request.address["expected_deadline_ms"]
-            .as_i64()
-            .ok_or_else(|| Error::invalid("exact deadline watch has no numeric deadline"))?;
-        if request.expires_at_ms < deadline {
-            return Err(Error::invalid(
-                "exact deadline watch cannot expire before its retained deadline",
-            ));
-        }
-        Some(deadline)
-    } else {
-        None
-    };
-    let subject_key = subject_key(
-''',
+          old = (
+              '    if request.expires_at_ms <= now || request.expires_at_ms > max_expiry {\n'
+              '        return Err(Error::invalid(format!(\n'
+              '            "expires_at_ms must be after now and no more than {} days ahead",\n'
+              '            watch::MAX_WATCH_TTL_MS / (24 * 60 * 60 * 1000)\n'
+              '        )));\n'
+              '    }\n'
+              '    let subject_key = subject_key(\n'
           )
+          new = (
+              '    if request.expires_at_ms <= now || request.expires_at_ms > max_expiry {\n'
+              '        return Err(Error::invalid(format!(\n'
+              '            "expires_at_ms must be after now and no more than {} days ahead",\n'
+              '            watch::MAX_WATCH_TTL_MS / (24 * 60 * 60 * 1000)\n'
+              '        )));\n'
+              '    }\n'
+              '    let exact_deadline_ms = if request.watch_kind == "exact_deadline_reached" {\n'
+              '        let deadline = request.address["expected_deadline_ms"]\n'
+              '            .as_i64()\n'
+              '            .ok_or_else(|| Error::invalid("exact deadline watch has no numeric deadline"))?;\n'
+              '        if request.expires_at_ms < deadline {\n'
+              '            return Err(Error::invalid(\n'
+              '                "exact deadline watch cannot expire before its retained deadline",\n'
+              '            ));\n'
+              '        }\n'
+              '        Some(deadline)\n'
+              '    } else {\n'
+              '        None\n'
+              '    };\n'
+              '    let subject_key = subject_key(\n'
+          )
+          replace_once(old, new)
 
-          replace_once(
-              '''        if existing["state"] == "active"
-            && existing["expires_at_ms"].as_i64().unwrap_or_default() > now
-        {
-            return Ok(create_receipt(&existing, operation_id, true));
-        }
-''',
-              '''        let existing_expires_at_ms =
-            existing["expires_at_ms"].as_i64().unwrap_or_default();
-        let invalid_deadline_boundary = exact_deadline_ms
-            .is_some_and(|deadline| existing_expires_at_ms < deadline);
-        if existing["state"] == "active"
-            && existing_expires_at_ms > now
-            && !invalid_deadline_boundary
-        {
-            return Ok(create_receipt(&existing, operation_id, true));
-        }
-''',
+          old = (
+              '        if existing["state"] == "active"\n'
+              '            && existing["expires_at_ms"].as_i64().unwrap_or_default() > now\n'
+              '        {\n'
+              '            return Ok(create_receipt(&existing, operation_id, true));\n'
+              '        }\n'
           )
+          new = (
+              '        let existing_expires_at_ms =\n'
+              '            existing["expires_at_ms"].as_i64().unwrap_or_default();\n'
+              '        let invalid_deadline_boundary = exact_deadline_ms\n'
+              '            .is_some_and(|deadline| existing_expires_at_ms < deadline);\n'
+              '        if existing["state"] == "active"\n'
+              '            && existing_expires_at_ms > now\n'
+              '            && !invalid_deadline_boundary\n'
+              '        {\n'
+              '            return Ok(create_receipt(&existing, operation_id, true));\n'
+              '        }\n'
+          )
+          replace_once(old, new)
 
-          replace_once(
-              '''        if record["state"] != "active" {
-            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-            continue;
-        }
-        if record["expires_at_ms"].as_i64().unwrap_or_default() <= now {
-            settle_record(tx, &mut record, "expired", now)?;
-            expired += 1;
-            continue;
-        }
-        let creator_is_current = if record["watch_kind"] == "operation_terminal" {
-''',
-              '''        if record["state"] != "active" {
-            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-            continue;
-        }
-        let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
-        let deadline_boundary = record["watch_kind"] == "exact_deadline_reached";
-        if !deadline_boundary && expires_at_ms <= now {
-            settle_record(tx, &mut record, "expired", now)?;
-            expired += 1;
-            continue;
-        }
-        let creator_is_current = if record["watch_kind"] == "operation_terminal" {
-''',
+          old = (
+              '        if record["state"] != "active" {\n'
+              '            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;\n'
+              '            continue;\n'
+              '        }\n'
+              '        if record["expires_at_ms"].as_i64().unwrap_or_default() <= now {\n'
+              '            settle_record(tx, &mut record, "expired", now)?;\n'
+              '            expired += 1;\n'
+              '            continue;\n'
+              '        }\n'
+              '        let creator_is_current = if record["watch_kind"] == "operation_terminal" {\n'
           )
+          new = (
+              '        if record["state"] != "active" {\n'
+              '            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;\n'
+              '            continue;\n'
+              '        }\n'
+              '        let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();\n'
+              '        let deadline_boundary = record["watch_kind"] == "exact_deadline_reached";\n'
+              '        if !deadline_boundary && expires_at_ms <= now {\n'
+              '            settle_record(tx, &mut record, "expired", now)?;\n'
+              '            expired += 1;\n'
+              '            continue;\n'
+              '        }\n'
+              '        let creator_is_current = if record["watch_kind"] == "operation_terminal" {\n'
+          )
+          replace_once(old, new)
 
-          replace_once(
-              '''        let cursor = match event_cursor(tx, &record, now)? {
-            EventCursor::Pending => continue,
-''',
-              '''        let cursor = match event_cursor(tx, &record, now)? {
-            EventCursor::Pending => {
-                if expires_at_ms <= now {
-                    settle_record(tx, &mut record, "expired", now)?;
-                    expired += 1;
-                }
-                continue;
-            }
-''',
+          old = (
+              '        let cursor = match event_cursor(tx, &record, now)? {\n'
+              '            EventCursor::Pending => continue,\n'
           )
+          new = (
+              '        let cursor = match event_cursor(tx, &record, now)? {\n'
+              '            EventCursor::Pending => {\n'
+              '                if expires_at_ms <= now {\n'
+              '                    settle_record(tx, &mut record, "expired", now)?;\n'
+              '                    expired += 1;\n'
+              '                }\n'
+              '                continue;\n'
+              '            }\n'
+          )
+          replace_once(old, new)
 
           path.write_text(text, encoding='utf-8')
           PY
