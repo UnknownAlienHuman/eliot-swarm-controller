@@ -7,6 +7,8 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde_json::{Value, json};
 
+const DELIVERY_ID_ALLOCATION_ATTEMPTS: usize = 16;
+
 /// A single authenticated coordination sender and exactly one recipient.
 pub(super) struct DeliveryRequest<'a> {
     pub(super) sender: &'a Principal,
@@ -14,7 +16,6 @@ pub(super) struct DeliveryRequest<'a> {
     pub(super) payload_kind: &'static str,
     pub(super) payload_version: u32,
     pub(super) payload: Value,
-    pub(super) payload_digest: String,
     pub(super) message_id: String,
     pub(super) reply_to: Value,
     pub(super) admission_deadline_ms: Value,
@@ -22,8 +23,8 @@ pub(super) struct DeliveryRequest<'a> {
     pub(super) reply_deadline_ms: Value,
 }
 
-/// Admit a typed, versioned payload without changing or reinterpreting its digest.
-/// Callers validate thread membership and the thread-local reply target first.
+/// Admit one typed payload and derive its digest at the mailbox authority boundary.
+/// Callers validate Thread membership; mailbox revalidates reply identity and direction.
 pub(super) fn admit_delivery(
     tx: &Transaction<'_>,
     operation_id: &str,
@@ -58,9 +59,6 @@ pub(super) fn admit_delivery(
         ));
     }
     model::text(&request.payload, "thread_id")?;
-    validate_sha256_digest(&request.payload_digest)?;
-    validate_typed_reply(tx, &request)?;
-
     let facts = delivery_facts(tx, &request.sender.client_id, request.recipient_id)?;
     if request.payload["sender_actor"] != facts.actor
         || request.payload["recipient_actor"] != facts.recipient_actor
@@ -69,6 +67,11 @@ pub(super) fn admit_delivery(
             "typed payload actors must match the authenticated parties",
         ));
     }
+    validate_typed_reply(tx, &request)?;
+    let payload_digest = format!(
+        "sha256:{}",
+        model::digest(model::canonical(&request.payload)?.as_bytes())
+    );
 
     admit_delivery_core(
         tx,
@@ -81,7 +84,7 @@ pub(super) fn admit_delivery(
                 payload_kind: request.payload_kind,
                 payload_version: request.payload_version,
                 payload: request.payload,
-                payload_digest: request.payload_digest,
+                payload_digest,
                 reply_to: request.reply_to,
                 admission_deadline_ms: request.admission_deadline_ms,
                 delivery_deadline_ms: request.delivery_deadline_ms,
@@ -162,22 +165,27 @@ pub(super) fn apply_message_send(
 /// Legacy coordination wrappers remain addressable where their settled receipt
 /// contains that identity; feedback and check facts have no admitted path here.
 pub(super) fn find_delivery(db: &Connection, delivery_id: &str) -> Result<Option<Value>> {
-    let operation_id: Option<String> = db
-        .query_row(
-            "SELECT operation_id FROM operations \
-             WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') \
-               AND state='settled' \
-               AND json_type(result_json,'$.delivery_id')='text' \
-               AND length(json_extract(result_json,'$.delivery_id'))>0 \
-               AND json_extract(result_json,'$.delivery_id')=?1",
-            [delivery_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match operation_id {
-        Some(id) => Ok(Some(operations::get_operation(db, &id)?)),
-        None => Ok(None),
+    let mut statement = db.prepare(
+        "SELECT operation_id FROM operations \
+         WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') \
+           AND state='settled' \
+           AND json_type(result_json,'$.delivery_id')='text' \
+           AND length(json_extract(result_json,'$.delivery_id'))>0 \
+           AND json_extract(result_json,'$.delivery_id')=?1 \
+         ORDER BY operation_id LIMIT 2",
+    )?;
+    let mut rows = statement.query([delivery_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let operation_id: String = row.get(0)?;
+    if rows.next()?.is_some() {
+        return Err(Error::new(
+            "MAILBOX_DELIVERY_AMBIGUOUS",
+            "delivery identity resolves to more than one immutable Operation",
+        ));
     }
+    Ok(Some(operations::get_operation(db, &operation_id)?))
 }
 
 /// Cancellation is a separate immutable Operation bound to the exact delivery
@@ -264,7 +272,7 @@ enum DeliveryBody {
 }
 
 fn admit_delivery_core(
-    _tx: &Transaction<'_>,
+    tx: &Transaction<'_>,
     operation_id: &str,
     request: DeliveryCoreRequest,
     facts: DeliveryFacts,
@@ -273,7 +281,7 @@ fn admit_delivery_core(
         DeliveryBody::LegacyText { .. } => operation_id,
         DeliveryBody::Typed { message_id, .. } => message_id,
     };
-    let delivery_id = new_delivery_id(operation_id, distinct_message_id);
+    let delivery_id = allocate_delivery_id(tx, operation_id, distinct_message_id)?;
     match request.body {
         DeliveryBody::LegacyText {
             text,
@@ -359,23 +367,37 @@ fn delivery_facts(
     })
 }
 
-fn new_delivery_id(operation_id: &str, message_id: &str) -> String {
-    loop {
+fn allocate_delivery_id(db: &Connection, operation_id: &str, message_id: &str) -> Result<String> {
+    for _ in 0..DELIVERY_ID_ALLOCATION_ATTEMPTS {
         let delivery_id = model::new_id();
-        if delivery_id != operation_id && delivery_id != message_id {
-            return delivery_id;
+        if delivery_id != operation_id
+            && delivery_id != message_id
+            && !mailbox_identity_exists(db, &delivery_id)?
+        {
+            return Ok(delivery_id);
         }
     }
+    Err(Error::new(
+        "MAILBOX_DELIVERY_ID_EXHAUSTED",
+        "could not allocate a distinct mailbox delivery identity",
+    ))
 }
 
-fn validate_sha256_digest(digest: &str) -> Result<()> {
-    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(Error::invalid(
-            "typed mailbox payload_digest must be a SHA-256 digest",
-        ));
-    }
-    Ok(())
+fn mailbox_identity_exists(db: &Connection, identity: &str) -> Result<bool> {
+    let found: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM operations \
+             WHERE operation_id=?1 \
+                OR (method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') \
+                    AND state='settled' \
+                    AND (json_extract(result_json,'$.delivery_id')=?1 \
+                         OR json_extract(result_json,'$.message_id')=?1)) \
+             LIMIT 1",
+            [identity],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 fn validate_typed_reply(tx: &Transaction<'_>, request: &DeliveryRequest<'_>) -> Result<()> {
@@ -405,6 +427,8 @@ fn validate_typed_reply(tx: &Transaction<'_>, request: &DeliveryRequest<'_>) -> 
             if prior["method"] != "coordination.message.send"
                 || prior["result"]["message_id"] != message_id
                 || prior["result"]["payload"]["thread_id"] != request.payload["thread_id"]
+                || prior["result"]["sender"].as_str() != Some(request.recipient_id)
+                || prior["result"]["recipient"].as_str() != Some(request.sender.client_id.as_str())
             {
                 return Err(Error::invalid(
                     "reply target does not identify a message in the same coordination thread",

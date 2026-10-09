@@ -683,10 +683,6 @@ fn apply_send(
         "proposal_revision_id":request.proposal_revision_id,
         "in_reply_to":in_reply_to,
     });
-    let digest = format!(
-        "sha256:{}",
-        model::digest(model::canonical(&payload)?.as_bytes())
-    );
     let delivery = mailbox::admit_delivery(
         tx,
         operation_id,
@@ -696,7 +692,6 @@ fn apply_send(
             payload_kind: "eliot-coordination-message-v1",
             payload_version: 1,
             payload,
-            payload_digest: digest,
             message_id: message_id.clone(),
             reply_to,
             admission_deadline_ms: Value::Null,
