@@ -18,6 +18,7 @@ pub mod native_usage;
 pub mod provider_condition;
 pub mod rpc;
 pub mod runtime;
+/// Exact Store-owned prompt text projection selected by an immutable descriptor.
 pub mod task_prompt;
 
 pub use credential::Credential;
@@ -31,3 +32,4 @@ pub use runtime::{
     NormalizedResultOriginContext, NormalizedResultPageSource, NormalizedResultProducerOrigin,
     RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt, TaskDispatchContext,
 };
+pub use task_prompt::{TASK_PROMPT_CONTRACT_REVISION, TaskPromptEnvelopeV1};

@@ -1,4 +1,5 @@
-//! Versioned, data-only envelope for the exact prompt admitted for a Task.
+//! Immutable, Store-produced text prompt for a descriptor-selected task.dispatch.
+//! Legacy descriptors do not use or implicitly decode this schema.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +7,6 @@ pub const TASK_PROMPT_SCHEMA_ID: &str = "swarm.task_prompt";
 pub const TASK_PROMPT_SCHEMA_VERSION: u16 = 1;
 pub const TASK_PROMPT_CONTRACT_REVISION: &str = "task-prompt-v1";
 
-/// Store-produced immutable prompt bytes and their frozen Task identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskPromptEnvelopeV1 {
@@ -22,35 +22,33 @@ pub struct TaskPromptEnvelopeV1 {
 }
 
 impl TaskPromptEnvelopeV1 {
-    /// Validate the shared data shape; digest contents are checked by the
-    /// producer and again by each adapter at the native effect boundary.
+    /// Data-only shape validation. The effect boundary recomputes SHA-256 over
+    /// prompt.as_bytes() before submitting the exact text to a native harness.
     pub fn validate_shape(&self) -> Result<(), &'static str> {
-        let prompt_bytes = u64::try_from(self.prompt.len())
-            .map_err(|_| "task prompt byte count is outside the supported range")?;
+        fn atom(value: &str) -> bool {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        }
+        fn lower_sha256(value: &str) -> bool {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+
         if self.schema_id != TASK_PROMPT_SCHEMA_ID
             || self.schema_version != TASK_PROMPT_SCHEMA_VERSION
-            || !valid_bounded_identity(&self.task_id, 512)
+            || !atom(&self.task_id)
+            || !atom(&self.attempt_id)
             || self.task_revision <= 0
-            || !valid_bounded_identity(&self.attempt_id, 512)
-            || !is_lower_sha256(&self.task_snapshot_sha256)
-            || !is_lower_sha256(&self.prompt_sha256)
+            || !lower_sha256(&self.task_snapshot_sha256)
+            || !lower_sha256(&self.prompt_sha256)
             || self.prompt.trim().is_empty()
-            || prompt_bytes > i64::MAX as u64
-            || self.prompt_bytes != prompt_bytes
+            || self.prompt_bytes == 0
+            || self.prompt_bytes > i64::MAX as u64
+            || self.prompt_bytes != self.prompt.len() as u64
         {
-            return Err("task prompt envelope is invalid");
+            return Err("TaskPrompt v1 envelope has invalid shape");
         }
         Ok(())
     }
-}
-
-fn valid_bounded_identity(value: &str, maximum: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
-}
-
-fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

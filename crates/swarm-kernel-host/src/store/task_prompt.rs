@@ -7,11 +7,15 @@ use crate::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use swarm_contracts::task_prompt::{
-    TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION, TaskPromptEnvelopeV1,
+use swarm_contracts::{
+    module_contract,
+    task_prompt::{
+        TASK_PROMPT_CONTRACT_REVISION, TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION,
+        TaskPromptEnvelopeV1,
+    },
 };
 
-pub(super) fn selected_task_prompt_v1(db: &Connection, binding: &Value) -> Result<bool> {
+pub(super) fn selected(db: &Connection, binding: &Value) -> Result<bool> {
     if binding["route"]["runtime"] == "zed"
         && binding["module_artifact_id"] == "eliot-zed.eval-cli.2"
     {
@@ -31,37 +35,17 @@ pub(super) fn selected_task_prompt_v1(db: &Connection, binding: &Value) -> Resul
             "TaskPrompt selector has no retained descriptor",
         )
     })?;
-    let prompt = swarm_contracts::module_contract::task_prompt_schema();
-    if identity
-        .command_schemas
-        .iter()
-        .any(|schema| schema.schema_id == prompt.schema_id && schema != &prompt)
-    {
-        return Err(Error::new(
+    module_contract::task_prompt_selected(
+        identity.command_schemas.iter(),
+        identity.event_schemas.iter(),
+        identity.capabilities.iter(),
+    )
+    .map_err(|_| {
+        Error::new(
             "MODULE_CONTRACT_INCOMPATIBLE",
-            "unsupported TaskPrompt schema",
-        ));
-    }
-    if !identity.command_schemas.contains(&prompt) {
-        return Ok(false);
-    }
-    if !identity
-        .capabilities
-        .iter()
-        .any(|capability| capability.as_str() == "task.dispatch")
-        || !identity
-            .command_schemas
-            .contains(&swarm_contracts::module_contract::task_dispatch_context_schema())
-        || !identity
-            .event_schemas
-            .contains(&swarm_contracts::module_contract::task_dispatch_admission_schema())
-    {
-        return Err(Error::new(
-            "MODULE_CONTRACT_INCOMPATIBLE",
-            "TaskPrompt requires exact dispatch capability and admission schemas",
-        ));
-    }
-    Ok(true)
+            "selected TaskPrompt schema is unknown or lacks its dispatch admission contract",
+        )
+    })
 }
 
 /// Old executors remain readable for retained bindings. New roots use the
@@ -107,22 +91,45 @@ pub(super) fn require_new_binding(
     Ok(())
 }
 
-pub(super) fn retained_prompt(effective: &Value, attempt: &Value) -> Result<TaskPromptEnvelopeV1> {
+pub(super) fn load(
+    effective: &Value,
+    attempt: &Value,
+    source_text: &str,
+) -> Result<TaskPromptEnvelopeV1> {
+    if effective["operation_contract"]["task_prompt"]["contract_revision"]
+        != TASK_PROMPT_CONTRACT_REVISION
+    {
+        return Err(invalid_prompt(
+            "retained TaskPrompt operation contract is absent or changed",
+        ));
+    }
     let envelope: TaskPromptEnvelopeV1 =
         serde_json::from_value(effective["task_prompt"].clone())
             .map_err(|_| invalid_prompt("retained TaskPrompt is missing or malformed"))?;
     envelope
         .validate_shape()
         .map_err(|_| invalid_prompt("retained TaskPrompt shape is invalid"))?;
-    if envelope.task_id != model::text(attempt, "task_id")?
-        || envelope.attempt_id != model::text(attempt, "attempt_id")?
-        || envelope.task_revision != model::positive(attempt, "task_revision")?
-        || envelope.task_snapshot_sha256
-            != model::digest(model::canonical(&attempt["task_snapshot"])?.as_bytes())
-        || envelope.prompt_sha256 != model::digest(envelope.prompt.as_bytes())
-    {
+    let packet = effective
+        .get("launch_dispatch_packet")
+        .filter(|value| !value.is_null());
+    let contract = effective["operation_contract"]
+        .get("launch_dispatch")
+        .filter(|value| !value.is_null());
+    let launch_dispatch = match (packet, contract) {
+        (None, None) => None,
+        (Some(packet), Some(contract)) if contract["contract_revision"] == "launch-dispatch-v1" => {
+            Some(LaunchDispatchAdmission {
+                launch_operation_id: model::text(contract, "launch_operation_id")?.to_owned(),
+                packet_digest: model::text(contract, "packet_digest")?.to_owned(),
+                packet: packet.clone(),
+            })
+        }
+        _ => return Err(invalid_prompt("retained launch packet and contract differ")),
+    };
+    let expected = build(attempt, source_text, launch_dispatch.as_ref())?;
+    if envelope != expected {
         return Err(invalid_prompt(
-            "retained TaskPrompt identity or digest differs",
+            "retained TaskPrompt differs from the frozen Task, source text or launch packet",
         ));
     }
     Ok(envelope)
@@ -131,7 +138,7 @@ pub(super) fn retained_prompt(effective: &Value, attempt: &Value) -> Result<Task
 /// Build the one immutable prompt envelope for a newly admitted Task dispatch.
 /// `launch_dispatch` must be the exact admission produced in the same Store
 /// transaction; no request-supplied packet or Task snapshot is accepted here.
-pub(super) fn build_task_prompt_v1(
+pub(super) fn build(
     attempt: &Value,
     source_text: &str,
     launch_dispatch: Option<&LaunchDispatchAdmission>,

@@ -1,6 +1,6 @@
 //! Module admission and facts, scoped by a credential to one reserved native root.
 //! Network I/O is never performed inside these transactions.
-use super::{Store, meta, operations, prerequisites, producers, set_meta, tasks};
+use super::{Store, meta, operations, prerequisites, producers, set_meta, task_prompt, tasks};
 use crate::{
     artifacts::ArtifactRecord,
     error::{Error, Result},
@@ -276,20 +276,14 @@ fn validate_task_dispatch_admission(
             "normalized dispatch receipt differs from the original text or immutable Task snapshot",
         ));
     }
-    if super::task_prompt::selected_task_prompt_v1(db, binding)? {
-        let raw: String = db.query_row(
-            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-            [&outcome.operation_id],
-            |row| row.get(0),
-        )?;
-        let effective: Value = serde_json::from_str(&raw)?;
-        let prompt = super::task_prompt::retained_prompt(&effective, &attempt)?;
-        if receipt.native_payload_sha256 != prompt.prompt_sha256
-            || receipt.native_payload_bytes != prompt.prompt_bytes
+    if task_prompt::selected(db, binding)? {
+        let envelope = task_prompt::load(&effective, &attempt, model::text(&request, "text")?)?;
+        if receipt.native_payload_sha256 != envelope.prompt_sha256
+            || receipt.native_payload_bytes != envelope.prompt_bytes
         {
             return Err(Error::new(
                 "TASK_DISPATCH_ADMISSION_INVALID",
-                "native admission differs from the exact retained TaskPrompt bytes",
+                "selected TaskPrompt receipt must digest the exact UTF-8 prompt text bytes",
             ));
         }
     }
@@ -539,9 +533,10 @@ fn batch_original(
                 [operation_id],
                 |row| row.get(0),
             )?;
-            input["task_prompt"] = serde_json::to_value(super::task_prompt::retained_prompt(
+            input["task_prompt"] = serde_json::to_value(task_prompt::load(
                 &serde_json::from_str::<Value>(&effective)?,
                 &attempt,
+                model::text(&input, "text")?,
             )?)?;
             input["task_dispatch_context"] =
                 serde_json::to_value(retained_task_dispatch_context(&serde_json::from_str::<
@@ -1513,30 +1508,19 @@ fn next_internal(
     }
     if method == "task.dispatch" {
         let a = tasks::get_attempt(&tx, model::text(&input, "attempt_id")?)?;
-        let prompt_selected = super::task_prompt::selected_task_prompt_v1(&tx, &b)?;
-        if prompt_selected {
-            if effective["operation_contract"]["task_prompt"]["contract_revision"]
-                != swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION
-            {
-                return Err(Error::new(
-                    "TASK_PROMPT_INVALID",
-                    "selected prompt contract was not admitted with this Operation",
-                ));
-            }
-            input["task_prompt"] =
-                serde_json::to_value(super::task_prompt::retained_prompt(&effective, &a)?)?;
-            input
+        let uses_task_prompt = task_prompt::selected(&tx, &b)?;
+        if uses_task_prompt {
+            let envelope = task_prompt::load(&effective, &a, model::text(&input, "text")?)?;
+            input["task_prompt"] = serde_json::to_value(envelope)?;
+            let object = input
                 .as_object_mut()
-                .ok_or_else(|| Error::invalid("dispatch input is not an object"))?
-                .remove("task_snapshot");
-            input
-                .as_object_mut()
-                .ok_or_else(|| Error::invalid("dispatch input is not an object"))?
-                .remove("task_snapshot_canonical");
+                .ok_or_else(|| Error::invalid("dispatch input is not an object"))?;
+            object.remove("task_snapshot");
+            object.remove("task_snapshot_canonical");
         } else {
             input["task_snapshot"] = a["task_snapshot"].clone();
         }
-        if prompt_selected || selected_task_dispatch_admission(&tx, &b)? {
+        if uses_task_prompt || selected_task_dispatch_admission(&tx, &b)? {
             input["task_dispatch_context"] =
                 serde_json::to_value(task_dispatch_context(&op, &id, generation, &b, &input, &a)?)?;
             tx.execute(
@@ -1544,7 +1528,7 @@ fn next_internal(
                 params![op, model::canonical(&input["task_dispatch_context"])?],
             )?;
         }
-        if !prompt_selected
+        if !uses_task_prompt
             && (crate::runtime::codex::is_controller_route(&b["route"])
                 || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
                 || pre_input_open.is_some()
@@ -1553,7 +1537,7 @@ fn next_internal(
             input["task_snapshot_canonical"] = json!(model::canonical(&a["task_snapshot"])?);
         }
         if crate::runtime::batch::is_command_route(&b["route"]) {
-            let instruction = if prompt_selected {
+            let instruction = if uses_task_prompt {
                 model::text(&input["task_prompt"], "prompt")?.to_owned()
             } else {
                 crate::runtime::batch::instruction(&input)?
@@ -1895,9 +1879,10 @@ fn expected_command_dispatch_identity(
             [operation_id],
             |row| row.get(0),
         )?;
-        frozen_input["task_prompt"] = serde_json::to_value(super::task_prompt::retained_prompt(
+        frozen_input["task_prompt"] = serde_json::to_value(task_prompt::load(
             &serde_json::from_str::<Value>(&effective)?,
             &attempt,
+            model::text(request, "text")?,
         )?)?;
     } else {
         frozen_input["task_snapshot"] = attempt["task_snapshot"].clone();

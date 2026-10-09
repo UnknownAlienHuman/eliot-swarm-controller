@@ -3092,15 +3092,12 @@ pub(super) fn dispatch(
     )?;
     let prerequisite = prerequisites::validate_request(tx, &b, v, id)?;
     let launch_dispatch = launcher_dispatch::prepare_admission(tx, config, p, v, &a, &task, &b)?;
-    let task_prompt = super::task_prompt::build_task_prompt_v1(&a, body, launch_dispatch.as_ref())?;
-    let prompt_selected = super::task_prompt::selected_task_prompt_v1(tx, &b)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
     let prerequisite_contract_revision = prerequisite.contract_revision().map(str::to_owned);
     let mut effective = json!({
         "route":b["route"],
         "input":body,
-        "task_snapshot":a["task_snapshot"],
-        "task_prompt":task_prompt
+        "task_snapshot":a["task_snapshot"]
     });
     if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
         effective["operation_contract"] = json!({
@@ -3122,16 +3119,18 @@ pub(super) fn dispatch(
             "replay_policy":"same_parent_and_packet_only_no_mutation_replay",
         });
     }
+    if super::task_prompt::selected(tx, &b)? {
+        let envelope = super::task_prompt::build(&a, body, launch_dispatch.as_ref())?;
+        effective["task_prompt"] = serde_json::to_value(&envelope)?;
+        effective["operation_contract"]["task_prompt"] = json!({
+            "contract_revision":swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION,
+        });
+    }
     if let Some(prerequisite_id) = &prerequisite_id {
         effective["prerequisite"] = json!({
             "operation_id":prerequisite_id,
             "required_completion_condition":"native_configuration_applied",
             "required_contract_revision":prerequisite_contract_revision
-        });
-    }
-    if prompt_selected {
-        effective["operation_contract"]["task_prompt"] = json!({
-            "contract_revision":swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION
         });
     }
     let operation_changed = tx.execute(

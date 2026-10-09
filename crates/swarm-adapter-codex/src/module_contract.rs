@@ -124,7 +124,41 @@ fn optional_env(name: &str) -> Result<Option<String>, AdapterError> {
 }
 
 fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
-    normalized_result_enabled(claim)
+    fn schema(id: &str) -> SchemaDescriptor {
+        SchemaDescriptor {
+            schema_id: id.to_owned(),
+            version: "1".to_owned(),
+            sha256: None,
+        }
+    }
+    task_prompt_selected(claim).is_ok_and(|enabled| enabled)
+        && exact_schemas(
+            &claim.command_schemas,
+            &[
+                schema("swarm.runtime_command"),
+                schema("swarm.task_dispatch_context"),
+                schema("swarm.normalized_result_context"),
+                swarm_contracts::module_contract::task_prompt_schema(),
+            ],
+        )
+        && exact_schemas(
+            &claim.event_schemas,
+            &[
+                schema("swarm.runtime_outcome"),
+                schema("swarm.task_dispatch_admission"),
+                schema("swarm.normalized_result_page"),
+            ],
+        )
+}
+
+/// A v5 executable never accepts an unselected or unknown prompt schema.
+pub(crate) fn task_prompt_selected(claim: &ModuleContractClaim) -> Result<bool, AdapterError> {
+    swarm_contracts::module_contract::task_prompt_selected(
+        claim.command_schemas.iter(),
+        claim.event_schemas.iter(),
+        claim.capabilities.iter(),
+    )
+    .map_err(|_| AdapterError::HostProtocol)
 }
 
 fn exact_schemas(actual: &[SchemaDescriptor], expected: &[SchemaDescriptor]) -> bool {

@@ -3308,51 +3308,59 @@ fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), 
     Ok((provider.to_owned(), model.to_owned(), workspace.to_owned()))
 }
 
-fn prompt_for(command: &RuntimeCommand) -> Result<String, &'static str> {
+fn prompt_for(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+) -> Result<String, &'static str> {
     let input = &command.input;
-    let prompt = if command.method == "task.dispatch" {
-        if let Some(value) = input.get("task_prompt") {
-            let envelope: TaskPromptEnvelopeV1 =
-                serde_json::from_value(value.clone()).map_err(|_| "TASK_PROMPT_INVALID")?;
-            envelope
-                .validate_shape()
-                .map_err(|_| "TASK_PROMPT_INVALID")?;
-            let context: TaskDispatchContext = serde_json::from_value(
-                input
-                    .get("task_dispatch_context")
-                    .cloned()
-                    .ok_or("TASK_PROMPT_CONTEXT_REQUIRED")?,
-            )
-            .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
-            context
-                .validate()
-                .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
-            if context.operation_id != command.operation_id
-                || context.binding_id != command.binding_id
-                || context.binding_generation != command.generation
-                || envelope.attempt_id != context.attempt_id
-                || envelope.task_id != context.task_id
-                || envelope.task_revision != context.task_revision
-                || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
-                || envelope.prompt_sha256 != digest_hex(envelope.prompt.as_bytes())
-            {
-                return Err("TASK_PROMPT_IDENTITY_MISMATCH");
-            }
-            envelope.prompt
-        } else {
-            return Err("TASK_PROMPT_REQUIRED");
+    if command.method == "task.dispatch" {
+        // A v5 descriptor can only submit the exact Store-owned envelope.
+        // An unknown/missing selected schema is not a license to render the
+        // legacy Task snapshot (which contains internal policy/receipts).
+        if !module_contract::task_prompt_selected(claim)
+            .map_err(|_| "TASK_PROMPT_SCHEMA_UNSUPPORTED")?
+        {
+            return Err("TASK_PROMPT_SELECTION_REQUIRED");
         }
+        if input.get("task_snapshot").is_some() || input.get("task_snapshot_canonical").is_some() {
+            return Err("TASK_PROMPT_LEGACY_PAYLOAD_FORBIDDEN");
+        }
+        let envelope: TaskPromptEnvelopeV1 = serde_json::from_value(input["task_prompt"].clone())
+            .map_err(|_| "TASK_PROMPT_ENVELOPE_INVALID")?;
+        envelope
+            .validate_shape()
+            .map_err(|_| "TASK_PROMPT_ENVELOPE_INVALID")?;
+        let context: TaskDispatchContext =
+            serde_json::from_value(input["task_dispatch_context"].clone())
+                .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
+        context
+            .validate()
+            .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
+        let text = input["text"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("PROMPT_REQUIRED")?;
+        if envelope.task_id != context.task_id
+            || envelope.attempt_id != context.attempt_id
+            || envelope.task_revision != context.task_revision
+            || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
+            || context.operation_id != command.operation_id
+            || context.binding_id != command.binding_id
+            || context.binding_generation != command.generation
+            || context.source_text_sha256 != digest_hex(text.as_bytes())
+            || context.source_text_bytes != text.len() as u64
+            || envelope.prompt_sha256 != digest_hex(envelope.prompt.as_bytes())
+        {
+            return Err("TASK_PROMPT_IDENTITY_MISMATCH");
+        }
+        Ok(envelope.prompt)
     } else {
         input["text"]
             .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or("PROMPT_REQUIRED")?
-            .to_owned()
-    };
-    if prompt.trim().is_empty() {
-        return Err("PROMPT_REQUIRED");
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("PROMPT_REQUIRED")
+            .map(str::to_owned)
     }
-    Ok(prompt)
 }
 
 fn native_send_payload(
@@ -3422,11 +3430,23 @@ fn normalized_dispatch_admission(
         &command.operation_id,
         input_sha256,
     )?;
-    let prompt = prompt_for(command).map_err(|_| AdapterError::HostProtocol)?;
-    if payload["input"][0]["text"].as_str() != Some(prompt.as_str()) {
-        return Err(AdapterError::HostProtocol);
-    }
-    let native_payload = prompt.as_bytes();
+    // For a TaskPrompt v1 consumer the receipt is about the exact UTF-8
+    // prompt submitted as a native text item, NOT the enclosing RPC JSON.
+    let native_payload = if module_contract::task_prompt_selected(claim)? {
+        let prompt = prompt_for(command, claim).map_err(|_| AdapterError::HostProtocol)?;
+        let native_items = payload["input"]
+            .as_array()
+            .filter(|items| items.len() == 1)
+            .ok_or(AdapterError::HostProtocol)?;
+        if native_items[0]["type"] != "text"
+            || native_items[0]["text"].as_str() != Some(prompt.as_str())
+        {
+            return Err(AdapterError::HostProtocol);
+        }
+        prompt.into_bytes()
+    } else {
+        serde_json::to_vec(payload).map_err(|_| AdapterError::HostProtocol)?
+    };
     let receipt = TaskDispatchAdmissionReceipt {
         schema_version: 1,
         module_receipt,
@@ -3440,7 +3460,7 @@ fn normalized_dispatch_admission(
         task_snapshot_sha256: context.task_snapshot_sha256,
         source_text_sha256: context.source_text_sha256,
         source_text_bytes: context.source_text_bytes,
-        native_payload_sha256: digest_hex(native_payload),
+        native_payload_sha256: digest_hex(&native_payload),
         native_payload_bytes: native_payload.len() as u64,
         native_input_id: Some(command.operation_id.clone()),
     };
@@ -3713,6 +3733,14 @@ fn validate_saved_dispatch_admission(
                 || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
             {
                 return Err(AdapterError::Checkpoint);
+            }
+            if module_contract::task_prompt_selected(claim)? {
+                let prompt = prompt_for(command, claim).map_err(|_| AdapterError::Checkpoint)?;
+                if receipt.native_payload_sha256 != digest_hex(prompt.as_bytes())
+                    || receipt.native_payload_bytes != prompt.len() as u64
+                {
+                    return Err(AdapterError::Checkpoint);
+                }
             }
         }
         EffectOutcome::Rejected | EffectOutcome::Unknown => {
@@ -4705,7 +4733,7 @@ async fn send_operation(
     {
         return rejected(command, "ROUTE_CONFIGURATION_MISMATCH", &journal.state);
     }
-    let prompt = match prompt_for(command) {
+    let prompt = match prompt_for(command, claim) {
         Ok(prompt) => prompt,
         Err(code) => return rejected(command, code, &journal.state),
     };
