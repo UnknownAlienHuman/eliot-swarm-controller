@@ -2421,7 +2421,23 @@ fn normalized_dispatch_admission(
         &command.operation_id,
         input_sha256,
     )?;
-    let native_payload = serde_json::to_vec(payload).map_err(|_| AdapterError::HostProtocol)?;
+    // For a TaskPrompt v1 consumer the receipt is about the exact UTF-8
+    // prompt submitted as a native text item, NOT the enclosing RPC JSON.
+    let native_payload = if module_contract::task_prompt_selected(claim)? {
+        let prompt = prompt_for(command, claim).map_err(|_| AdapterError::HostProtocol)?;
+        let native_items = payload["input"]
+            .as_array()
+            .filter(|items| items.len() == 1)
+            .ok_or(AdapterError::HostProtocol)?;
+        if native_items[0]["type"] != "text"
+            || native_items[0]["text"].as_str() != Some(prompt.as_str())
+        {
+            return Err(AdapterError::HostProtocol);
+        }
+        prompt.into_bytes()
+    } else {
+        serde_json::to_vec(payload).map_err(|_| AdapterError::HostProtocol)?
+    };
     let receipt = TaskDispatchAdmissionReceipt {
         schema_version: 1,
         module_receipt,
@@ -2683,6 +2699,14 @@ fn validate_saved_dispatch_admission(
                 || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
             {
                 return Err(AdapterError::Checkpoint);
+            }
+            if module_contract::task_prompt_selected(claim)? {
+                let prompt = prompt_for(command, claim).map_err(|_| AdapterError::Checkpoint)?;
+                if receipt.native_payload_sha256 != digest_hex(prompt.as_bytes())
+                    || receipt.native_payload_bytes != prompt.len() as u64
+                {
+                    return Err(AdapterError::Checkpoint);
+                }
             }
         }
         EffectOutcome::Rejected | EffectOutcome::Unknown => {
