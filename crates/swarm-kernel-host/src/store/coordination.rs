@@ -2096,6 +2096,54 @@ fn participant_list(db: &Connection, principal: &Principal, value: &Value) -> Re
     list_participant_page(db, &scope, limit, after.as_deref())
 }
 
+fn lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn participant_client_id_from_index_key(prefix: &str, key: &str) -> Result<String> {
+    let encoded = key
+        .strip_prefix(prefix)
+        .filter(|encoded| !encoded.is_empty() && encoded.len() % 2 == 0)
+        .ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "participant index key is outside its exact scope prefix",
+            )
+        })?;
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = lower_hex_nibble(pair[0]).ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "participant index key has a non-canonical client component",
+            )
+        })?;
+        let low = lower_hex_nibble(pair[1]).ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "participant index key has a non-canonical client component",
+            )
+        })?;
+        bytes.push((high << 4) | low);
+    }
+    let client_id = String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "participant index key does not encode a UTF-8 client identity",
+        )
+    })?;
+    if keys::key_component(&client_id) != encoded {
+        return Err(Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "participant index key is not canonical",
+        ));
+    }
+    Ok(client_id)
+}
 fn list_participant_page(
     db: &Connection,
     scope: &ScopeData,
@@ -2132,19 +2180,24 @@ fn list_participant_page(
     let mut cursor_before_extra: Option<String> = None;
     let mut more_active = false;
     for (key, raw) in rows.iter().take(scan_limit as usize) {
+        let indexed_client_id = participant_client_id_from_index_key(&prefix, key)?;
+        if let Some(before) = last_scanned.as_ref() {
+            cursor_before_extra = Some(before.clone());
+        }
+        last_scanned = Some(indexed_client_id.clone());
         let record: Value = serde_json::from_str(raw)?;
         let Some(client_id) = record.get("client_id").and_then(Value::as_str) else {
             stale = stale.saturating_add(1);
             continue;
         };
-        if let Some(before) = last_scanned.as_ref() {
-            cursor_before_extra = Some(before.clone());
+        if client_id != indexed_client_id {
+            stale = stale.saturating_add(1);
+            continue;
         }
-        last_scanned = Some(client_id.to_owned());
-        match load_current_scope_for_client(db, client_id) {
+        match load_current_scope_for_client(db, &indexed_client_id) {
             Ok(candidate) if candidate.scope_id == scope.scope_id => {
                 let item = json!({
-                    "client_id": client_id,
+                    "client_id": indexed_client_id,
                     "participant": public_registration(&candidate.registration),
                 });
                 if items.len() < limit as usize {
@@ -2156,9 +2209,22 @@ fn list_participant_page(
                     break;
                 }
             }
-            _ => stale = stale.saturating_add(1),
+            Ok(_) => stale = stale.saturating_add(1),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "NOT_FOUND"
+                        | "FORBIDDEN"
+                        | "UNAUTHORIZED"
+                        | "STALE_PARTICIPANT"
+                        | "STALE_REVISION"
+                        | "PARTICIPANT_NOT_ASSIGNED"
+                ) =>
+            {
+                stale = stale.saturating_add(1);
+            }
+            Err(error) => return Err(error),
         }
-        let _ = key;
     }
     let partial = more_active || has_unscanned || stale > 0;
     Ok(json!({
@@ -2168,7 +2234,10 @@ fn list_participant_page(
         "attempt_id": scope.attempt["attempt_id"],
         "next_after": if partial { last_scanned } else { None },
         "coverage": if partial { "partial" } else { "complete" },
-        "gaps": if stale > 0 { json!([{"kind":"stale_participant_index_entries","count":stale}]) } else if has_unscanned { json!([{"kind":"participant_page_scan_bound","count":null}]) } else { json!([]) },
+        "gaps": [
+            (stale > 0).then(|| json!({"kind":"stale_participant_index_entries","count":stale})),
+            has_unscanned.then(|| json!({"kind":"participant_page_scan_bound","count":null})),
+        ].into_iter().flatten().collect::<Vec<_>>(),
     }))
 }
 
