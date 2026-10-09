@@ -152,6 +152,10 @@ jobs:
             throw 'rustfmt attribution did not fail for an owned changed path'
           }
 
+      - name: Clippy attribution classifier self-test
+        shell: bash
+        run: python tools/ci/clippy-attribution.py --self-test
+
   module-syntax:
     name: Changed JavaScript module syntax
     needs: scope
@@ -249,7 +253,7 @@ jobs:
           }
 
   scoped-rust:
-    name: Changed Rust packages (strict Clippy, changed integration targets)
+    name: Changed Rust packages (changed-line Clippy, changed integration targets)
     needs: scope
     if: (github.event_name == 'pull_request' || github.event_name == 'push') && (needs.scope.outputs.clippy_packages != '[]' || needs.scope.outputs.test_targets != '[]')
     strategy:
@@ -261,6 +265,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - name: Pinned toolchain
         shell: bash
         run: |
@@ -273,20 +278,20 @@ jobs:
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
           & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Strict Clippy (selected library/binary packages only)
+      - name: Clippy compiler errors and changed-line warnings
         shell: pwsh
         env:
           PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
-          if ($packages.Count -gt 0) {
-            $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
-            $arguments = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $sharedTargetDir)
-            foreach ($package in $packages) { $arguments += @('--package', [string]$package) }
-            $arguments += @('--', '-D', 'warnings')
-            & cargo @arguments
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & python tools/ci/clippy-attribution.py `
+            --base $env:BASE_SHA `
+            --head $env:HEAD_SHA `
+            --target-dir $sharedTargetDir `
+            --packages-json $env:PACKAGE_SPECS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run changed integration targets only
         if: needs.scope.outputs.tests_changed == 'true'
         shell: pwsh

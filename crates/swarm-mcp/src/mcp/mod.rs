@@ -3124,6 +3124,12 @@ fn refine_coordination_input_schema(method: &str, schema: &mut Value) {
                 properties[field] =
                     coordination_string_array_schema(coordination_limits::MAX_REFERENCE_BYTES);
             }
+            properties["baseline_candidate_ref"] =
+                coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES, 1);
+            properties["reason"] =
+                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
+            properties["suggested_expires_at_ms"] =
+                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
             append_all_of(
                 schema,
                 json!({"anyOf":[
@@ -3132,12 +3138,6 @@ fn refine_coordination_input_schema(method: &str, schema: &mut Value) {
                     {"required":["interfaces"],"properties":{"interfaces":{"minItems":1}}}
                 ]}),
             );
-            properties["baseline_candidate_ref"] =
-                coordination_text_schema(coordination_limits::MAX_REFERENCE_BYTES, 1);
-            properties["reason"] =
-                coordination_text_schema(coordination_limits::MAX_REASON_BYTES, 1);
-            properties["suggested_expires_at_ms"] =
-                json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
         }
         "code.scope.accept" => {
             properties["scope_intent_id"] = code_scope_id_schema();
