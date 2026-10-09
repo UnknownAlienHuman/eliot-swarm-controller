@@ -22,6 +22,7 @@ jobs:
           git show d9bfe17289122802b70516b2f8300d8d7b8b6c0f:.github/workflows/rust.yml > .github/workflows/rust.yml
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('.github/workflows/rust.yml')
           text = path.read_text(encoding='utf-8')
@@ -30,7 +31,7 @@ jobs:
               global text
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f'expected one workflow replacement, found {count}')
+                  raise SystemExit(f'expected one workflow replacement, found {count}: {old[:60]!r}')
               text = text.replace(old, new)
 
           replace_once(
@@ -46,38 +47,30 @@ jobs:
               "  scoped-rust:\n"
               "    name: Changed Rust packages (changed-line Clippy, changed integration targets)\n",
           )
-          replace_once(
-              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
-              "        with:\n"
-              "          ref: ${{ github.event.pull_request.head.sha || github.sha }}\n"
-              "      - name: Pinned toolchain\n",
-              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
-              "        with:\n"
-              "          ref: ${{ github.event.pull_request.head.sha || github.sha }}\n"
-              "          fetch-depth: 0\n"
-              "      - name: Pinned toolchain\n",
+
+          start = text.index("  scoped-rust:\n")
+          end = text.index("\n  atlas-integrity:\n", start)
+          section = text[start:end]
+          checkout_pattern = re.compile(
+              r"(      - uses: actions/checkout@[^\n]+\n"
+              r"        with:\n"
+              r"          ref: [^\n]+\n)"
           )
-          replace_once(
-              "      - name: Strict Clippy (selected library/binary packages only)\n"
-              "        shell: pwsh\n"
-              "        env:\n"
-              "          PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}\n"
-              "        run: |\n"
-              "          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)\n"
-              "          if ($packages.Count -gt 0) {\n"
-              "            $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'\n"
-              "            $arguments = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $sharedTargetDir)\n"
-              "            foreach ($package in $packages) { $arguments += @('--package', [string]$package) }\n"
-              "            $arguments += @('--', '-D', 'warnings')\n"
-              "            & cargo @arguments\n"
-              "            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
-              "          }\n",
+          section, count = checkout_pattern.subn(r"\1          fetch-depth: 0\n", section, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one scoped-rust checkout, found {count}')
+
+          dollar = '$'
+          package_expr = dollar + '{{ needs.scope.outputs.clippy_packages }}'
+          base_expr = dollar + '{{ github.event.pull_request.base.sha || github.event.before }}'
+          head_expr = dollar + '{{ github.event.pull_request.head.sha || github.sha }}'
+          replacement = (
               "      - name: Clippy compiler errors and changed-line warnings\n"
               "        shell: pwsh\n"
               "        env:\n"
-              "          PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}\n"
-              "          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}\n"
-              "          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+              f"          PACKAGE_SPECS: {package_expr}\n"
+              f"          BASE_SHA: {base_expr}\n"
+              f"          HEAD_SHA: {head_expr}\n"
               "        run: |\n"
               "          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'\n"
               "          & python tools/ci/clippy-attribution.py `\n"
@@ -85,8 +78,18 @@ jobs:
               "            --head $env:HEAD_SHA `\n"
               "            --target-dir $sharedTargetDir `\n"
               "            --packages-json $env:PACKAGE_SPECS\n"
-              "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n",
+              "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
           )
+          clippy_pattern = re.compile(
+              r"      - name: Strict Clippy \(selected library/binary packages only\)\n"
+              r".*?"
+              r"(?=      - name: Run changed integration targets only\n)",
+              re.DOTALL,
+          )
+          section, count = clippy_pattern.subn(replacement, section, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one strict Clippy step, found {count}')
+          text = text[:start] + section + text[end:]
           path.write_text(text, encoding='utf-8')
           PY
       - name: Commit the normal gate
