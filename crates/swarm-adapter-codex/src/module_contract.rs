@@ -152,9 +152,7 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
 }
 
 /// A v5 executable never accepts an unselected or unknown prompt schema.
-pub(crate) fn task_prompt_selected(
-    claim: &ModuleContractClaim,
-) -> Result<bool, AdapterError> {
+pub(crate) fn task_prompt_selected(claim: &ModuleContractClaim) -> Result<bool, AdapterError> {
     swarm_contracts::module_contract::task_prompt_selected(
         claim.command_schemas.iter(),
         claim.event_schemas.iter(),
