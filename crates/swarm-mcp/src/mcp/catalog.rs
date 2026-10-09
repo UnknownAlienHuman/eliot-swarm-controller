@@ -6,7 +6,10 @@
 //! `tools/list` pages, and a catalog-only search result that never dispatches
 //! an application method.
 
-use super::{TOOLS, ToolSpec, input_schema, output_schema, profiles, tool_from_spec, tool_name};
+use super::{
+    TOOLS, ToolSpec, input_schema, mutation_requires_caller_request_id, output_schema, profiles,
+    tool_from_spec, tool_name,
+};
 use crate::config::McpToolProfile;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rmcp::model::Tool;
@@ -3051,7 +3054,11 @@ where
         let metadata = view.visible[end];
         let (read_only, spec) =
             find_spec(metadata.method).ok_or(CatalogError::IncompleteRegistry)?;
-        let tool = tool_from_spec(*read_only, spec, profile != McpToolProfile::Full);
+        let tool = tool_from_spec(
+            *read_only,
+            spec,
+            mutation_requires_caller_request_id(profile, spec.method, *read_only),
+        );
         let byte_len = serde_json::to_vec(&tool)
             .map_err(|error| CatalogError::Serialization(error.to_string()))?
             .len();
@@ -3323,7 +3330,11 @@ fn digest_tool_schema(
     let (read_only, spec) = find_spec(method).ok_or(CatalogError::IncompleteRegistry)?;
     update_field(hasher, tool_name(method).as_bytes());
     update_field(hasher, spec.description.as_bytes());
-    let schema = input_schema(spec, *read_only, profile != McpToolProfile::Full);
+    let schema = input_schema(
+        spec,
+        *read_only,
+        mutation_requires_caller_request_id(profile, spec.method, *read_only),
+    );
     let bytes = serde_json::to_vec(schema.as_ref())
         .map_err(|error| CatalogError::Serialization(error.to_string()))?;
     update_field(hasher, &bytes);
