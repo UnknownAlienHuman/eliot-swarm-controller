@@ -179,7 +179,12 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
             tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
             continue;
         }
-        if record["expires_at_ms"].as_i64().unwrap_or_default() <= now {
+        let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
+        let deadline_boundary = record["watch_kind"] == "exact_deadline_reached"
+            && record["address"]["expected_deadline_ms"]
+                .as_i64()
+                .is_some_and(|deadline| expires_at_ms >= deadline);
+        if !deadline_boundary && expires_at_ms <= now {
             settle_record(tx, &mut record, "expired", now)?;
             expired += 1;
             continue;
@@ -195,7 +200,13 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
             continue;
         }
         let cursor = match event_cursor(tx, &record, now)? {
-            EventCursor::Pending => continue,
+            EventCursor::Pending => {
+                if expires_at_ms <= now {
+                    settle_record(tx, &mut record, "expired", now)?;
+                    expired += 1;
+                }
+                continue;
+            }
             EventCursor::StaleSubject => {
                 // Exact historical subjects are readable only as bounded
                 // transition facts. Missing or mismatched identities settle
@@ -418,6 +429,19 @@ fn create(
             watch::MAX_WATCH_TTL_MS / (24 * 60 * 60 * 1000)
         )));
     }
+    let exact_deadline_ms = if request.watch_kind == "exact_deadline_reached" {
+        let deadline = request.address["expected_deadline_ms"]
+            .as_i64()
+            .ok_or_else(|| Error::invalid("exact deadline watch has no numeric deadline"))?;
+        if request.expires_at_ms < deadline {
+            return Err(Error::invalid(
+                "exact deadline watch cannot expire before its retained deadline",
+            ));
+        }
+        Some(deadline)
+    } else {
+        None
+    };
     let subject_key = subject_key(
         &scope,
         &principal.client_id,
@@ -437,8 +461,12 @@ fn create(
         if existing["state"] == "matched" {
             return Ok(create_receipt(&existing, operation_id, true));
         }
+        let existing_expires_at_ms = existing["expires_at_ms"].as_i64().unwrap_or_default();
+        let invalid_deadline_boundary =
+            exact_deadline_ms.is_some_and(|deadline| existing_expires_at_ms < deadline);
         if existing["state"] == "active"
-            && existing["expires_at_ms"].as_i64().unwrap_or_default() > now
+            && existing_expires_at_ms > now
+            && !invalid_deadline_boundary
         {
             return Ok(create_receipt(&existing, operation_id, true));
         }
