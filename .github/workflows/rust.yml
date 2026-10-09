@@ -1,128 +1,482 @@
-name: Temporary stage Clippy attribution workflow
-
+name: Rust
 on:
   push:
-    branches:
-      - fix/ci-independent-clippy
-
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'migrations/**'
+      - 'modules/**'
+      - 'vendor/**'
+      - 'config/**'
+      - 'tests/**'
+      - 'tools/**'
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - 'Justfile'
+      - 'README.md'
+      - 'docs/**'
+      - 'THIRD_PARTY_NOTICES.md'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '**/build.rs'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/npm-shrinkwrap.json'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Intentionally no path filter: the scoped classifier must see tests/**,
+    # tools/**, Justfile, workflow changes, documentation, and newly added paths.
+  workflow_dispatch:
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  stage:
+  scope:
+    name: Classify changed paths and package ownership
+    runs-on: ubuntu-latest
+    outputs:
+      docs_changed: ${{ steps.classify.outputs.docs_changed }}
+      rust_changed: ${{ steps.classify.outputs.rust_changed }}
+      metadata_needed: ${{ steps.classify.outputs.metadata_needed }}
+      tests_changed: ${{ steps.classify.outputs.tests_changed }}
+      tooling_changed: ${{ steps.classify.outputs.tooling_changed }}
+      atlas_changed: ${{ steps.classify.outputs.atlas_changed }}
+      product_changed: ${{ steps.classify.outputs.product_changed }}
+      changed_paths: ${{ steps.classify.outputs.changed_paths }}
+      module_js_files: ${{ steps.classify.outputs.module_js_files }}
+      packages: ${{ steps.resolve.outputs.packages_json || '[]' }}
+      clippy_packages: ${{ steps.resolve.outputs.clippy_packages_json || '[]' }}
+      test_targets: ${{ steps.resolve.outputs.test_targets_json || '[]' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Classify changed paths without Cargo
+        id: classify
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Classify -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Pinned toolchain for metadata only
+        if: steps.classify.outputs.metadata_needed == 'true'
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Resolve changed packages and real local reverse dependencies
+        id: resolve
+        if: steps.classify.outputs.metadata_needed == 'true'
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Resolve -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  docs-only:
+    name: Documentation validation
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.docs_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: fix/ci-independent-clippy
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
-      - name: Build and publish the final workflow blob
+      - name: Validate changed Markdown and diff whitespace
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateDocs -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  tooling-scope:
+    name: Build-recipe and tooling path checks
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.tooling_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Check whitespace and changed tooling syntax/metadata
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTooling -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Rustfmt attribution classifier self-test
+        shell: pwsh
+        run: |
+          $pass = & ./tools/ci/rustfmt-attribution.ps1 `
+            -ChangedPathsJson '["crates/example/src/changed.rs"]' `
+            -FormattedPathsJson '["crates/example/src/old.rs"]' | ConvertFrom-Json
+          if (@($pass.owned).Count -ne 0 -or @($pass.historical).Count -ne 1) {
+            throw 'rustfmt attribution did not isolate historical debt'
+          }
+
+          $mixed = & ./tools/ci/rustfmt-attribution.ps1 `
+            -ChangedPathsJson '["crates/example/src/changed.rs"]' `
+            -FormattedPathsJson '["crates/example/src/changed.rs","crates/example/src/old.rs"]' | ConvertFrom-Json
+          if (@($mixed.owned).Count -ne 1 `
+              -or $mixed.owned[0] -ne 'crates/example/src/changed.rs' `
+              -or @($mixed.historical).Count -ne 1 `
+              -or $mixed.historical[0] -ne 'crates/example/src/old.rs') {
+            throw 'rustfmt attribution did not classify owned and historical paths'
+          }
+
+          $failed = $false
+          try {
+            & ./tools/ci/rustfmt-attribution.ps1 `
+              -ChangedPathsJson '["crates/example/src/changed.rs"]' `
+              -FormattedPathsJson '["crates/example/src/changed.rs"]' `
+              -FailOnOwned | Out-Null
+          } catch {
+            $failed = $true
+          }
+          if (-not $failed) {
+            throw 'rustfmt attribution did not fail for an owned changed path'
+          }
+
+      - name: Clippy attribution classifier self-test
+        shell: bash
+        run: python tools/ci/clippy-attribution.py --self-test
+
+  module-syntax:
+    name: Changed JavaScript module syntax
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.module_js_files != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Parse only changed module files
+        shell: pwsh
+        env:
+          MODULE_JS_FILES: ${{ needs.scope.outputs.module_js_files }}
+        run: |
+          $files = @($env:MODULE_JS_FILES | ConvertFrom-Json)
+          foreach ($file in $files) {
+            node --check $file
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  rust-format:
+    name: Changed Rust files are rustfmt-clean
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Pinned rustfmt
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
+          rustfmt --version
+          cargo --version
+      - name: Attribute rustfmt output to changed files
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.packages }}
+          CHANGED_PATHS: ${{ needs.scope.outputs.changed_paths }}
+        run: |
+          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
+          if ($packages.Count -eq 0) {
+            exit 0
+          }
+
+          $arguments = @('fmt')
+          foreach ($package in $packages) { $arguments += @('--package', [string]$package) }
+          $arguments += '--'
+          & cargo @arguments
+          $formatExit = $LASTEXITCODE
+
+          $formattedPaths = @(& git diff --name-only --)
+          if ($LASTEXITCODE -ne 0) {
+            throw 'git diff could not inspect rustfmt output'
+          }
+          $formattedPaths = @(
+            $formattedPaths | ForEach-Object { $_.Trim().Replace('\', '/') } | Where-Object {
+              -not [string]::IsNullOrWhiteSpace($_)
+            } | Sort-Object -Unique
+          )
+
+          $formattedJson = ConvertTo-Json -InputObject @($formattedPaths) -Compress
+          $attribution = & ./tools/ci/rustfmt-attribution.ps1 `
+            -ChangedPathsJson $env:CHANGED_PATHS `
+            -FormattedPathsJson $formattedJson | ConvertFrom-Json
+
+          $owned = @($attribution.owned)
+          $historical = @($attribution.historical)
+          if ($historical.Count -gt 0) {
+            Write-Warning ('Existing rustfmt debt outside this diff: ' + ($historical -join ', '))
+            if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Existing rustfmt debt outside this diff'
+              foreach ($path in $historical) {
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- ``$path``"
+              }
+            }
+          }
+
+          if ($owned.Count -gt 0) {
+            foreach ($path in $owned) {
+              & git diff -- $path
+            }
+          }
+
+          & git reset --hard HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw 'could not restore the ephemeral checkout after rustfmt'
+          }
+          if ($formatExit -ne 0) {
+            exit $formatExit
+          }
+          if ($owned.Count -gt 0) {
+            throw ('rustfmt would change owned diff paths: ' + ($owned -join ', '))
+          }
+
+  scoped-rust:
+    name: Changed Rust packages (changed-line Clippy, changed integration targets)
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && (needs.scope.outputs.clippy_packages != '[]' || needs.scope.outputs.test_targets != '[]')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Prepare one external target for scoped Cargo jobs
+        shell: pwsh
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Clippy compiler errors and changed-line warnings
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & python tools/ci/clippy-attribution.py `
+            --base $env:BASE_SHA `
+            --head $env:HEAD_SHA `
+            --target-dir $sharedTargetDir `
+            --packages-json $env:PACKAGE_SPECS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run changed integration targets only
+        if: needs.scope.outputs.tests_changed == 'true'
+        shell: pwsh
+        env:
+          TEST_TARGETS: ${{ needs.scope.outputs.test_targets }}
+        run: |
+          $targets = @($env:TEST_TARGETS | ConvertFrom-Json)
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          foreach ($target in $targets) {
+            & cargo test --locked --package $target.package --test $target.target --target-dir $sharedTargetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  atlas-integrity:
+    name: Preserve Atlas donor snapshot
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.atlas_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact donor file set and hashes
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          root = Path('vendor/atlas')
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert name not in expected, name
+              path = root / name
+              assert not path.is_symlink() and path.is_file(), name
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
+              expected[name] = digest
+          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
+
+  build:
+    name: Full existing qualification (manual only)
+    needs: scope
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Format, lint, and test all owned workspace packages from metadata
+        shell: pwsh
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-full-rust-shared-target'
+          if (-not (Test-Path -LiteralPath $sharedTargetDir -PathType Container)) {
+            [void][IO.Directory]::CreateDirectory($sharedTargetDir)
+          }
+          & cargo build --locked --package swarm-kernel-host --bin swarm-kernel-host --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --package swarm-supervisor --bin swarm-supervisor --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify Atlas donor snapshot
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          root = Path('vendor/atlas')
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert name not in expected, name
+              path = root / name
+              assert not path.is_symlink() and path.is_file(), name
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
+              expected[name] = digest
+          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
+      - name: Muse bridge syntax and pinned SDK import
+        shell: bash
+        run: |
+          node --version
+          for file in modules/muse/*.mjs; do node --check "$file"; done
+          cd modules/muse
+          npm ci --ignore-scripts --no-audit --no-fund
+          node --input-type=module -e 'import { spawnMspConnection, Connection } from "@muse-code/sdk"; if (typeof spawnMspConnection !== "function" || typeof Connection !== "function") throw new Error("SDK export mismatch");'
+      - name: Claude bridge syntax, pinned SDK import and fixture self-test
+        shell: bash
+        run: |
+          node --version
+          for file in modules/claude/*.mjs; do node --check "$file"; done
+          cd modules/claude
+          npm ci --ignore-scripts --no-audit --no-fund
+          node selftest.mjs
+      - name: Remaining native module fixture tests (no accounts or model calls)
+        shell: bash
+        run: |
+          node modules/muse/selftest.mjs
+          node modules/antigravity/selftest.mjs
+          node modules/command/test-glue.mjs
+          node modules/command/test-bridge.mjs
+          node modules/opencodex/selftest.mjs
+      - name: Codex SDK provenance and attach protocol fixtures
+        shell: bash
+        run: |
+          python --version
+          python -m pip install --disable-pip-version-check -r modules/codex/requirements.txt
+          python modules/codex/verify_vendor.py
+          python modules/codex/test_bridge.py
+      - name: Pinned OpenCode owner runtime
+        id: opencode-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.0'
+      - name: OpenCode durable owner smoke (offline, no model calls)
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          ELIOT_OPENCODE_BUN_EXE: ${{ steps.opencode-bun.outputs.bun-path }}
         run: |
-          set -euo pipefail
-          if [[ -f docs/.clippy-workflow-blob ]]; then
-            echo "workflow blob is already staged"
-            exit 0
-          fi
-
-          git show d9bfe17289122802b70516b2f8300d8d7b8b6c0f:.github/workflows/rust.yml > /tmp/rust-final.yml
-          python - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path('/tmp/rust-final.yml')
-          text = path.read_text(encoding='utf-8')
-
-          def replace_once(old: str, new: str) -> None:
-              global text
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'expected one workflow replacement, found {count}: {old[:60]!r}')
-              text = text.replace(old, new)
-
-          replace_once(
-              "  module-syntax:\n",
-              "      - name: Clippy attribution classifier self-test\n"
-              "        shell: bash\n"
-              "        run: python tools/ci/clippy-attribution.py --self-test\n\n"
-              "  module-syntax:\n",
-          )
-          replace_once(
-              "  scoped-rust:\n"
-              "    name: Changed Rust packages (strict Clippy, changed integration targets)\n",
-              "  scoped-rust:\n"
-              "    name: Changed Rust packages (changed-line Clippy, changed integration targets)\n",
-          )
-
-          start = text.index("  scoped-rust:\n")
-          end = text.index("\n  atlas-integrity:\n", start)
-          section = text[start:end]
-          checkout_pattern = re.compile(
-              r"(      - uses: actions/checkout@[^\n]+\n"
-              r"        with:\n"
-              r"          ref: [^\n]+\n)"
-          )
-          section, count = checkout_pattern.subn(r"\1          fetch-depth: 0\n", section, count=1)
-          if count != 1:
-              raise SystemExit(f'expected one scoped-rust checkout, found {count}')
-
-          dollar = '$'
-          package_expr = dollar + '{{ needs.scope.outputs.clippy_packages }}'
-          base_expr = dollar + '{{ github.event.pull_request.base.sha || github.event.before }}'
-          head_expr = dollar + '{{ github.event.pull_request.head.sha || github.sha }}'
-          replacement = (
-              "      - name: Clippy compiler errors and changed-line warnings\n"
-              "        shell: pwsh\n"
-              "        env:\n"
-              f"          PACKAGE_SPECS: {package_expr}\n"
-              f"          BASE_SHA: {base_expr}\n"
-              f"          HEAD_SHA: {head_expr}\n"
-              "        run: |\n"
-              "          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'\n"
-              "          & python tools/ci/clippy-attribution.py `\n"
-              "            --base $env:BASE_SHA `\n"
-              "            --head $env:HEAD_SHA `\n"
-              "            --target-dir $sharedTargetDir `\n"
-              "            --packages-json $env:PACKAGE_SPECS\n"
-              "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
-          )
-          clippy_pattern = re.compile(
-              r"      - name: Strict Clippy \(selected library/binary packages only\)\n"
-              r".*?"
-              r"(?=      - name: Run changed integration targets only\n)",
-              re.DOTALL,
-          )
-          section, count = clippy_pattern.subn(replacement, section, count=1)
-          if count != 1:
-              raise SystemExit(f'expected one strict Clippy step, found {count}')
-          text = text[:start] + section + text[end:]
-          path.write_text(text, encoding='utf-8')
-          PY
-
-          python tools/ci/clippy-attribution.py --self-test
-          payload=$(python - <<'PY'
-          import base64
-          import json
-          from pathlib import Path
-          content = base64.b64encode(Path('/tmp/rust-final.yml').read_bytes()).decode('ascii')
-          print(json.dumps({'content': content, 'encoding': 'base64'}))
-          PY
-          )
-          blob_sha=$(curl --fail --silent --show-error \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/blobs" \
-            -d "${payload}" | python -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
-          test -n "${blob_sha}"
-          printf '%s\n' "${blob_sha}" > docs/.clippy-workflow-blob
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/.clippy-workflow-blob
-          git diff --cached --check
-          git commit -m "ci: stage final Clippy workflow blob"
-          git push origin HEAD:fix/ci-independent-clippy
+          cd modules/opencode
+          npm ci --ignore-scripts --no-audit --no-fund
+          bun test native-mcp-proof.test.mjs
+          node selftest.mjs
+      - name: Build
+        shell: pwsh
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-full-rust-shared-target'
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package swarm-cli --bin swarm --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package swarm-kernel-host --bin swarm-kernel-host --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package swarm-supervisor --bin swarm-supervisor --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record build inputs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build-info
+          printf '%s\n' "$GITHUB_SHA" > build-info/source-commit.txt
+          git rev-parse HEAD^{tree} > build-info/source-tree.txt
+          rustc --version > build-info/rustc.txt
+          cargo --version > build-info/cargo.txt
+          node --version > build-info/node.txt
+          git archive --format=tar HEAD > build-info/source.tar
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success()
+        with:
+          name: swarm-${{ matrix.os }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            Cargo.lock
+            config/
+            README.md
+            THIRD_PARTY_NOTICES.md
+            modules/muse/*.mjs
+            modules/muse/*.json
+            modules/muse/README.md
+            modules/claude/*.mjs
+            modules/claude/*.json
+            modules/claude/README.md
+            modules/*/UPDATE.md
+            modules/claude/fixtures/
+            modules/opencode/README.md
+            modules/opencode/*.mjs
+            modules/opencode/package*.json
+            vendor/atlas/
+            build-info/
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-host
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-host.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-kernel-host
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-kernel-host.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor.exe
