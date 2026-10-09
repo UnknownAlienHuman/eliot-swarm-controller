@@ -2153,7 +2153,29 @@ fn concilium_position_schema() -> Value {
     })
 }
 
-fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> Arc<JsonObject> {
+const PREKNOWN_REQUEST_ID_MESSAGE: &str =
+    "caller-owned client_request_id is required before dispatch";
+
+fn caller_request_id_present(params: &Value) -> bool {
+    params
+        .get("client_request_id")
+        .and_then(Value::as_str)
+        .is_some_and(|request_id| !request_id.trim().is_empty())
+}
+
+fn effect_requires_preknown_request_id(method: &str) -> bool {
+    matches!(method, "swarm.launch" | "schedule.run_now")
+}
+
+fn mutation_requires_caller_request_id(
+    profile: McpToolProfile,
+    method: &str,
+    read_only: bool,
+) -> bool {
+    !read_only && (profile != McpToolProfile::Full || effect_requires_preknown_request_id(method))
+}
+
+fn input_schema(spec: &ToolSpec, read_only: bool, request_id_required: bool) -> Arc<JsonObject> {
     let mut properties = JsonObject::new();
     for field in spec.fields {
         properties.insert(field.name.to_string(), field_schema(field.kind));
@@ -2163,14 +2185,14 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
             "client_request_id".to_string(),
             json!({
                 "type": "string",
-                "description": if require_request_id || spec.method == "swarm.launch" || spec.method == "schedule.run_now" {
+                "description": if request_id_required {
                     "Caller-owned stable logical request ID. Choose it before dispatch and reuse it to reconcile a lost reply; the server does not retry mutations."
                 } else {
                     "Caller-owned stable logical request ID. Reuse it to reconcile a lost reply; the local full compatibility profile generates one only when omitted and a result arrives."
                 }
             }),
         );
-        if spec.method == "swarm.launch" {
+        if effect_requires_preknown_request_id(spec.method) {
             properties["client_request_id"]["minLength"] = json!(1);
             properties["client_request_id"]["maxLength"] = json!(128);
         }
@@ -2181,11 +2203,7 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
         "additionalProperties": false,
     });
     let mut required = spec.required.to_vec();
-    if !read_only
-        && (require_request_id
-            || spec.method == "swarm.launch"
-            || spec.method == "schedule.run_now")
-    {
+    if !read_only && request_id_required {
         required.push("client_request_id");
     }
     if !required.is_empty() {
@@ -3915,6 +3933,9 @@ impl McpFacade {
             if !params.is_object() {
                 return tool_error(Error::invalid("tool arguments must be an object"));
             }
+            if effect_requires_preknown_request_id(method) && !caller_request_id_present(&params) {
+                return tool_error(Error::invalid(PREKNOWN_REQUEST_ID_MESSAGE));
+            }
             if params.get("client_request_id").is_none() {
                 let id = Uuid::new_v4().to_string();
                 params["client_request_id"] = json!(id);
@@ -4311,7 +4332,17 @@ impl ServerHandler for McpFacade {
     ) -> std::result::Result<ListToolsResult, McpError> {
         let tools = TOOLS
             .iter()
-            .map(|(read_only, spec)| tool_from_spec(*read_only, spec, false))
+            .map(|(read_only, spec)| {
+                tool_from_spec(
+                    *read_only,
+                    spec,
+                    mutation_requires_caller_request_id(
+                        McpToolProfile::Full,
+                        spec.method,
+                        *read_only,
+                    ),
+                )
+            })
             .collect();
         Ok(ListToolsResult {
             tools,
@@ -4604,7 +4635,16 @@ pub fn participant_core_tool_contracts() -> Result<Vec<Value>> {
             Ok(json!({
                 "method": method,
                 "name": tool_name(method),
-                "input_schema": input_schema(spec, *read_only, true).as_ref(),
+                "input_schema": input_schema(
+                    spec,
+                    *read_only,
+                    mutation_requires_caller_request_id(
+                        McpToolProfile::Participant,
+                        spec.method,
+                        *read_only,
+                    ),
+                )
+                .as_ref(),
             }))
         })
         .collect()
@@ -4640,15 +4680,8 @@ fn method_not_found(method: &str) -> McpError {
 }
 
 fn require_caller_request_id(params: &Value) -> std::result::Result<(), McpError> {
-    if params
-        .get("client_request_id")
-        .and_then(Value::as_str)
-        .is_none_or(|request_id| request_id.trim().is_empty())
-    {
-        return Err(McpError::invalid_params(
-            "restricted-profile mutations require a caller-owned client_request_id before dispatch",
-            None,
-        ));
+    if !caller_request_id_present(params) {
+        return Err(McpError::invalid_params(PREKNOWN_REQUEST_ID_MESSAGE, None));
     }
     Ok(())
 }
@@ -4833,7 +4866,7 @@ impl ServerHandler for ProfiledFacade {
             };
             return Ok(CallToolResult::structured(Value::Object(result)).into());
         }
-        if (self.profile != McpToolProfile::Full || spec.method == "swarm.launch") && !*read_only {
+        if mutation_requires_caller_request_id(self.profile, spec.method, *read_only) {
             let arguments = request
                 .arguments
                 .as_ref()
@@ -4993,7 +5026,11 @@ mod tests {
     #[test]
     fn schemas_are_closed_objects() {
         for (read_only, spec) in TOOLS {
-            let schema = input_schema(spec, *read_only, false);
+            let schema = input_schema(
+                spec,
+                *read_only,
+                mutation_requires_caller_request_id(McpToolProfile::Full, spec.method, *read_only),
+            );
             assert_eq!(schema["type"], json!("object"));
             assert_eq!(schema["additionalProperties"], json!(false));
             if !read_only {
@@ -5001,7 +5038,11 @@ mod tests {
             }
         }
         let run_now = find_tool("schedule_run_now").unwrap();
-        let schema = input_schema(&run_now.1, run_now.0, false);
+        let schema = input_schema(
+            &run_now.1,
+            run_now.0,
+            mutation_requires_caller_request_id(McpToolProfile::Full, run_now.1.method, run_now.0),
+        );
         assert_eq!(
             schema["required"],
             json!(["project_id", "automation_id", "client_request_id"])
@@ -5009,7 +5050,11 @@ mod tests {
         assert_eq!(schema["properties"]["client_request_id"]["minLength"], 1);
         assert_eq!(schema["properties"]["client_request_id"]["maxLength"], 128);
         let send = find_tool("message_send").unwrap();
-        let schema = input_schema(&send.1, send.0, false);
+        let schema = input_schema(
+            &send.1,
+            send.0,
+            mutation_requires_caller_request_id(McpToolProfile::Full, send.1.method, send.0),
+        );
         for field in [
             "in_reply_to",
             "in_reply_to_digest",
