@@ -1,15 +1,16 @@
 name: Temporary PR 26 baseline cleanup
 
 on:
+  workflow_dispatch:
   push:
-    branches: [fix/compile-head-40591a2]
+    branches:
+      - "fix/compile-head-40591a2"
 
 permissions:
   contents: write
 
 jobs:
   fix:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -17,11 +18,10 @@ jobs:
           ref: fix/compile-head-40591a2
           fetch-depth: 0
       - name: Install pinned rustfmt
-        shell: bash
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
       - name: Apply exact baseline fixes
-        shell: python
         run: |
+          python - <<'PY'
           from pathlib import Path
 
           def replace_exact(path: str, old: str, new: str) -> None:
@@ -50,10 +50,10 @@ jobs:
           replace_exact(
               "crates/swarm-mcp/src/mcp/subscriptions.rs",
               '''    if categories
-        .iter()
-        .any(|category| *category == Category::Coordination)
-    {''',
-              '''    if categories.contains(&Category::Coordination) {''',
+                  .iter()
+                  .any(|category| *category == Category::Coordination)
+              {'''.replace('              ', ''),
+              '    if categories.contains(&Category::Coordination) {',
           )
           replace_exact(
               "crates/swarm-mcp/src/mcp/subscriptions.rs",
@@ -70,8 +70,8 @@ pub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNoti
               '    let mut identity = identity.clone();',
               '    let identity = identity.clone();',
           )
+          PY
       - name: Format only touched files
-        shell: bash
         run: |
           rustfmt +1.98.1 --edition 2024 \
             crates/swarm-adapter-codex/src/module_contract.rs \
@@ -80,7 +80,6 @@ pub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNoti
             crates/swarm-mcp/src/mcp/subscriptions.rs \
             crates/swarm-automation/src/lib.rs
       - name: Commit cleanup and remove this workflow
-        shell: bash
         run: |
           rm .github/workflows/temp-fix-pr26.yml
           git config user.name "github-actions[bot]"
