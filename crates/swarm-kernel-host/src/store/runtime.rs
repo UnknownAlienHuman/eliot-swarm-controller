@@ -1,6 +1,6 @@
 //! Module admission and facts, scoped by a credential to one reserved native root.
 //! Network I/O is never performed inside these transactions.
-use super::{Store, meta, operations, prerequisites, producers, set_meta, tasks};
+use super::{Store, meta, operations, prerequisites, producers, set_meta, task_prompt, tasks};
 use crate::{
     artifacts::ArtifactRecord,
     error::{Error, Result},
@@ -243,6 +243,23 @@ fn validate_task_dispatch_admission(
             "TASK_DISPATCH_ADMISSION_INVALID",
             "normalized dispatch receipt differs from the original text or immutable Task snapshot",
         ));
+    }
+    if task_prompt::selected(db, binding)? {
+        let effective_raw: String = db.query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [&outcome.operation_id],
+            |row| row.get(0),
+        )?;
+        let effective: Value = serde_json::from_str(&effective_raw)?;
+        let envelope = task_prompt::load(&effective, &attempt, model::text(&request, "text")?)?;
+        if receipt.native_payload_sha256 != envelope.prompt_sha256
+            || receipt.native_payload_bytes != envelope.prompt_bytes
+        {
+            return Err(Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "selected TaskPrompt receipt must digest the exact UTF-8 prompt text bytes",
+            ));
+        }
     }
     Ok(receipt)
 }
@@ -1327,15 +1344,22 @@ fn next_internal(
     }
     if method == "task.dispatch" {
         let a = tasks::get_attempt(&tx, model::text(&input, "attempt_id")?)?;
-        input["task_snapshot"] = a["task_snapshot"].clone();
+        let uses_task_prompt = task_prompt::selected(&tx, &b)?;
+        if uses_task_prompt {
+            let envelope = task_prompt::load(&effective, &a, model::text(&input, "text")?)?;
+            input["task_prompt"] = serde_json::to_value(envelope)?;
+        } else {
+            input["task_snapshot"] = a["task_snapshot"].clone();
+        }
         if selected_task_dispatch_admission(&tx, &b)? {
             input["task_dispatch_context"] =
                 serde_json::to_value(task_dispatch_context(&op, &id, generation, &b, &input, &a)?)?;
         }
-        if crate::runtime::codex::is_controller_route(&b["route"])
+        if !uses_task_prompt
+            && (crate::runtime::codex::is_controller_route(&b["route"])
             || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
             || pre_input_open.is_some()
-            || crate::runtime::batch::is_command_route(&b["route"])
+            || crate::runtime::batch::is_command_route(&b["route"]))
         {
             input["task_snapshot_canonical"] = json!(model::canonical(&a["task_snapshot"])?);
         }
