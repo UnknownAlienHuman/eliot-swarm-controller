@@ -59,7 +59,7 @@ The intended simplification is one effective method policy with explicit profile
 narrowing, not multiple contradictory tables or extra approvals. Do not silently
 broaden a remote profile while fixing a local manager's application rights.
 
-Every `tools/list` result is filtered by the selected profile. The `tools/call` pre-dispatch check independently rejects hidden methods before opening or writing local IPC, including a tool name sent manually. Tool annotations mark only read methods as read-only.
+Every `tools/list` result is filtered by the selected profile and current Store `allowed_methods`. Every ordinary `tools/call` repeats that current membership read after the session-fixed profile check and rejects a live-hidden method before target application IPC; the authorization read itself remains one bounded authenticated Store call. Tool annotations mark only read methods as read-only.
 
 The MCP Tasks projection follows the same boundary: `tasks/get` requires the profile's `operation.get` and `report.attention` reads; `tasks/cancel` requires both `operation.get` and `operation.cancel`. A profile without those methods receives method-not-found before IPC. Restricted profiles also require a caller-owned `client_request_id` in `tasks/cancel` request `_meta`; the full profile alone preserves optional generated-ID compatibility. Custom `eliot/subscribe` requests are also checked before the subscription pump starts: every category requires `report.delta`, mailbox requires `message.read`, and operations requires `operation.get`. `eliot/unsubscribe` only closes session-local subscription state.
 
