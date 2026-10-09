@@ -822,7 +822,7 @@ fn verified_goal_terminal_evidence(
         ));
     }
     if operation["method"] == "agent.send" {
-        validate_retained_goal_continuation_admission(db, operation_id, operation, evidence)?;
+        validate_retained_goal_continuation_admission(db, operation_id, operation, &evidence)?;
     }
     Ok(json!({
         "observation_id":observation_id,
@@ -920,7 +920,7 @@ fn validate_retained_goal_continuation_admission(
 /// can be consumed; the DTO must never turn a partial input receipt into a
 /// terminal source by itself.
 fn validate_opencode_execution_proof(operation: &Value, proof: &Value) -> Result<()> {
-    if operation["native_refs"]["input_execution"] != proof
+    if operation["native_refs"]["input_execution"] != *proof
         || proof["reader_revision"] != "opencode-execution-log-v1"
         || proof["correlation"] != "durable_serialized_execution"
         || proof["disposition"] != "completed"

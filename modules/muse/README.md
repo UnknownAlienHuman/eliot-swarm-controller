@@ -1,6 +1,10 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.7`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and fixture results do not attest model execution.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.8`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and fixture results do not attest model execution.
+
+**Draft activation blocker:** `module.example.json` still names bridge.7 because
+its version-only publication was blocked by the write tool. This PR is not ready
+for activation until that example is aligned with bridge.8.
 
 ## Ownership and setup
 
@@ -16,7 +20,7 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.7'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.8'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -35,6 +39,28 @@ Use a dedicated initially empty module-state directory, separate from host data.
 `node bridge.mjs --config FILE` remains an unguarded legacy entrypoint: it has host-reconnect behavior, but no recorded process ownership/checkpoint for automatic bridge-loss recovery. Do not retrofit proof into a running bridge.4 or overwrite its executable/scripts in place. Use a new artifact/binding for changed module code. The managed path uses the SDK's public Connection with a non-detached child transport so ownership follows the launcher; MSP framing and routing remain in the SDK.
 
 Inspect `agent.state`, then claim a controller-start Task with binding-id/generation and send `task.dispatch`. Native-manager claims can delegate children without receiving a second controller prompt. Requested effort, applied defaults and actual inference evidence remain distinct. Max is explicit on turns; no silent alternate provider or reduced effort.
+
+## Pending-request refresh — bridge.8
+
+Server requests and notifications now invalidate the same per-session read
+window. Root and child refresh share one inventory replacement path: every
+returned request must have the requested session ID and a nonempty unique native
+ID before any current entry is removed. A native event during the read keeps the
+newer local inventory; a malformed inventory leaves it unchanged. Refresh records
+`pending_inventory_applied` separately from `metadata_applied`.
+
+An `approval/updated` frame is a stage update, not a replacement for the original
+tool/request identity. The retained request supplies omitted identity fields;
+the update supplies the current stage fields, including optional-origin removal.
+This follows the pinned SDK's [approval update field ownership](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/facade/approval.ts).
+No SDK approval handler or automatic decision is installed. Presentation still
+returns `{}`; an answer remains an explicit addressed `agent.reply` Operation.
+
+This code requires artifact `muse-sdk-1.3.0-bridge.8` and refuses to announce a
+previous artifact ID. Stage it for new bindings only. Existing bridge.7 bindings
+and checkpoints retain their original code and identity; they are not migrated.
+The SDK pin is unchanged. Syntax checks are not behavioral qualification; refresh
+race fixtures, SDK import and native qualification remain pending for bridge.8.
 
 ## Recorded-session recovery — bridge.5
 
