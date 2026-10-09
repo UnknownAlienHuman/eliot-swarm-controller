@@ -23,10 +23,10 @@ pub use declared_service_scope::{DeclaredServicePurpose, DeclaredServiceScope};
 pub use error::{Error, NativeRpcRejectionClass, Result};
 pub use native_mcp::{NativeMcpCommand, NativeMcpPhase, ProtectedArtifactRef};
 pub use rpc::Request;
-pub use task_prompt::{TaskPromptEnvelopeV1, TASK_PROMPT_CONTRACT_REVISION};
 pub use runtime::{
     EffectOutcome, GoalContinuationAdmissionContext, GoalContinuationAdmissionReceipt,
     GoalContinuationLink, GoalTerminalEventRef, GoalTerminalEvidence, ModuleReceiptIdentity,
     NormalizedResultOriginContext, NormalizedResultPageSource, NormalizedResultProducerOrigin,
     RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt, TaskDispatchContext,
 };
+pub use task_prompt::{TASK_PROMPT_CONTRACT_REVISION, TaskPromptEnvelopeV1};
