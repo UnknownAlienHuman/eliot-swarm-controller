@@ -1,7 +1,7 @@
 # ELIOT Swarm Controller — execution map, 2026-10-09
 
-**Verified base:** main c82c54a72f3bed39f45078ffb12d97ed4b9a454b (PR #104 merged).  
-**Status:** actionable research and implementation plan; NOT a claim of release readiness.  
+**Verified base:** main c82c54a72f3bed39f45078ffb12d97ed4b9a454b (PR #104 merged).
+**Status:** actionable research and implementation plan; NOT a claim of release readiness.
 **Source of evidence:** full Master Audit v26, accepted owner decisions, existing R01–R51 handoffs, and GitHub PR/Issue status checked on 2026-10-09.
 
 ## 0. Ground truth before any code
@@ -163,11 +163,11 @@ New donor API: record exact upstream code/semantics, licensing+native dependency
 
 ## 6. All 37 open PRs — one authoritative owner list
 
-A: #56 #49 #51 #52 #48.  
-B: #65 #61 #27 #71 #62 #72.  
-C: #34 #58 #33 #35 #47.  
-D: #60 #68 #74 #64 #39 #67.  
-E: #29 #41 #66 #28 #43 #42 #44 #70 #45 #73 #69.  
+A: #56 #49 #51 #52 #48.
+B: #65 #61 #27 #71 #62 #72.
+C: #34 #58 #33 #35 #47.
+D: #60 #68 #74 #64 #39 #67.
+E: #29 #41 #66 #28 #43 #42 #44 #70 #45 #73 #69.
 F: #46 #40 #59 #24.
 
 Every item above is currently **docs-only**. Use that PR's handoff as task context, then submit a narrow code PR from latest main. Do not merge outdated Markdown branches as product implementation.
