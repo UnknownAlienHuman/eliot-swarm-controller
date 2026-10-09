@@ -1,62 +1,55 @@
-# R12. Планировщик: изоляция источников и честное продвижение очереди
+# R12 remainder. Scheduler progress, source isolation and issuance fairness
 
-**Статус: задание на реализацию; текущая поставка содержит только спецификацию.**
-Основа: аудит редакции 3, код `40591a295af94b1541ec2ba30afe8e3247701a71`. Карточки AUD-030/AUD-032 и подтверждённый DST-boundary defect.
-Перед работой сравнить актуальный main с этим SHA; уже исправленное не переписывать. Аудит — доказательный материал, не новая owner policy.
+**Статус: не входит в PR #38. Точный оставшийся implementation owner — Issue #79.**
 
-## Результат
+Основа исследования: `main` `40591a295af94b1541ec2ba30afe8e3247701a71`, AUD-030/AUD-032. Исторические SHA и версии — координаты доказательства, не требования закрепить runtime.
 
-Ошибка одного due-source не блокирует обработку независимых источников; stale/no-progress ответы не вызывают горячий retry. Выдача credentials продвигает cursor по рассмотренной работе и не делит pacing между Stores. Valid calendar instant внутри DST overlap не превращается в ошибку собственной ELIOT-предобработкой.
+## Разделение ответственности
 
-## Читать адресно
+PR #38 исправляет только доказанную calendar input boundary:
 
-- [docs/agent-operations/modularity.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/agent-operations/modularity.md) — §2.1 и optional automation: один due worker, атомарный cursor/action.
-- [docs/owner-decisions.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/owner-decisions.md) — §4: stable schedule slots, coalesce_latest, admission и drain.
-- [docs/swarm-launcher-assignment-context.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/40591a295af94b1541ec2ba30afe8e3247701a71/docs/swarm-launcher-assignment-context.md) — participant credential issuance и retained launch context.
-- [DST companion](../2026-10-08/12-calendar-dst.md) — точная Chrono/Croner boundary, минимальный код и fold fixtures.
+```text
+absolute UTC milliseconds
+→ floor to whole UTC second
+→ timezone conversion preserving the exact instant/fold offset
+→ Croner
+```
 
-Нормы работы: `docs/owner-decisions.md` §1.2–1.4, §2.2; текущие project instructions имеют приоритет. Исторические SHA/версии фиксируют источник, но не ограничивают используемые updates.
+Остальная scheduler-работа не должна удерживать этот независимый fix в Draft.
 
-## Участок кода
+[Issue #79](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/79) владеет:
 
-`crates/swarm-kernel-host/src/store/automation_scheduler.rs::call`; `crates/swarm-automation/src/bin/worker.rs::run_worker/call_once`; `store/launcher_issuance.rs` page/cursor/backoff/tick ownership; `scheduler/calendar.rs::local_second_at` и его четыре callers. Вложенные goal/check reconcilers — только нужные error/result seams, без рефакторинга всего домена.
+- независимыми bounded outcomes для due sources;
+- no-progress backoff для read/admit/stale paths;
+- authoritative readback перед повтором uncertain admission;
+- launcher issuance cursor/fairness;
+- Store/worker-local transient pacing вместо process-global state;
+- сохранением primary error при отказе secondary diagnostics.
 
-## Что и как сделать
+R34/#60 отдельно владеет poison-fact isolation внутри automation domains и per-domain transactions. Adapter IPC/reconnect остаётся R02.
 
-1. Отделить предметную ошибку источника/записи от неисправности Store. Независимые due sources обрабатывать с отдельными bounded outcomes; использовать существующие transaction/savepoint boundaries там, где они требуются. DB/commit failure не скрывать.
-2. Для read и admit ввести единый no-progress backoff. Сбрасывать его по реальному продвижению cursor/state, не по любому Ok. page_stale/already_observed без прогресса не образуют tight loop.
-3. Повтор после uncertain admission начинается с authoritative readback; не повторять прежний effect. Reconnect/IPC ownership упорядочить внутри имеющегося worker, не заводить таймер/процесс на правило.
-4. Выдачу credentials ограничивать бюджетом реально рассмотренных элементов: cursor не перескакивает хвост выбранной страницы. Wrap явно определён. Unknown регистрации остаются readback-only; не создавать новые credentials вместо неизвестного результата.
-5. Убрать process-global OnceLock cursor/backoff из этого workflow в worker/Store-owned transient state. Сохранить первоначальную ошибку даже при отказе записи diagnostics. В конечной очереди старый алгоритм всё же завершает работу — не оформлять это как доказанную вечную потерю.
-6. В calendar helper округлять миллисекунды на UTC timeline **до** timezone conversion. Удалить post-timezone `DateTime<Tz>::with_nanosecond(0)`, которое remap-ит local wall time и возвращает None в DST fold. Не менять Croner semantics, occurrence identity, Store cursor или dependency version ради этой правки.
+## Нормативные ограничения
 
-## Критерии готовности
+- SQLite/connection/commit uncertainty остаётся hard failure.
+- Unknown external effect не повторяется по timeout или reconnect.
+- Не добавляются второй scheduler, broker, workflow engine, model-task deadline или произвольный лимит попыток.
+- Конечная успешная очередь старого issuance algorithm не объявляется доказанной вечной потерей; исправляется fairness/state ownership, а не выдуманный failure mode.
 
-- [ ] Ошибка одного calendar/source оставляет достижимым независимый goal reminder; DB failure не рисует success.
-- [ ] Повтор stale/no-progress приводит к bounded retry, а реальный прогресс снимает pacing.
-- [ ] Очередь больше tick budget обслуживается с явным wrap; новые поступления и повторяющийся failure не скрывают хвост.
-- [ ] Два экземпляра Store в одном процессе не используют общий cursor/backoff; unsure credential issuance не выполняется заново.
-- [ ] `latest_due`, `next_due_at_ms` и preview, вызванные в обеих сторонах New York/Berlin fold, не ошибаются и выдают строго возрастающие UTC instants.
-- [ ] Fixed-time one-shot и wildcard real-instant semantics совпадают с документированным Croner contract; spring-gap regression остаётся зелёным.
+## Итоговая проверка Issue #79
 
-## Границы и интеграция
+```text
+independent malformed source does not starve unrelated due work
+repeated no-progress receives bounded pacing
+real durable progress resets pacing
+tail remains reachable under arrivals and repeated failures
+two Stores do not share cursor/backoff state
+unknown issuance is readback-only
+```
 
-Не добавлять deadlines для model task, лимит «две попытки работы», новый scheduler или storage. Native unknown отличается от безопасной повторной доставки сохранённого receipt. DST fix не является своим cron engine, timezone policy или dependency pin.
-
-R34/#60 владеет inner automation poison-fact isolation и per-domain transactions. R12 владеет независимыми due sources, worker pacing, issuance fairness и calendar input boundary. R02 меняет adapter IPC — это другой владелец.
-
-## Проверка и сдача
-
-Один manager и один worktree; writers получают непересекающиеся участки и не запускают Cargo. Реализацию добавлять в этот же PR, не плодить отдельные PR для helper/tests/calendar. Форматирование только затронутого кода. Минимальный gate менеджера на итоговом кандидате:
+Минимальный gate после реализации Issue #79:
 
 ```sh
 cargo clippy --locked -p swarm-kernel-host -p swarm-automation --lib --bins -- -D warnings
 ```
 
-Предметный календарный test target на итоговой фазе:
-
-```sh
-cargo test --locked -p swarm-kernel-host scheduler::calendar
-```
-
-Полные tests, native/live и нагрузочные прогоны — отдельная итоговая фаза. Сценарии выше — критерии поведения, не утверждение о выполненных тестах. В сдаче указать exact SHA, изменённые producer/consumer, удалённую неверную local-time boundary, результат gate и оставшуюся неопределённость. Draft не переводить в Ready, пока здесь только задание.
+Tests, native/live and load qualification remain the final product phase under the project rule.
