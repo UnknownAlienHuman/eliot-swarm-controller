@@ -13,7 +13,6 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::OnceLock,
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -24,9 +23,15 @@ const MAX_TRACKED_BACKOFFS: usize = 256;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-static LAUNCH_ISSUANCE_TICK: OnceLock<Mutex<()>> = OnceLock::new();
-static LAUNCH_ISSUANCE_CURSOR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static LAUNCH_ISSUANCE_BACKOFF: OnceLock<Mutex<HashMap<String, Backoff>>> = OnceLock::new();
+pub(super) struct IssuanceRuntime {
+    tick: Mutex<()>,
+    state: Mutex<IssuanceRuntimeState>,
+}
+
+struct IssuanceRuntimeState {
+    cursor: Option<String>,
+    backoffs: HashMap<String, Backoff>,
+}
 
 struct Backoff {
     delay: Duration,
@@ -34,60 +39,76 @@ struct Backoff {
     touched: Instant,
 }
 
-fn tick_lock() -> &'static Mutex<()> {
-    LAUNCH_ISSUANCE_TICK.get_or_init(|| Mutex::new(()))
-}
-
-fn backoff_map() -> &'static Mutex<HashMap<String, Backoff>> {
-    LAUNCH_ISSUANCE_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn issuance_cursor() -> &'static Mutex<Option<String>> {
-    LAUNCH_ISSUANCE_CURSOR.get_or_init(|| Mutex::new(None))
-}
-
-async fn retry_due(operation_id: &str) -> bool {
-    let now = Instant::now();
-    let mut entries = backoff_map().lock().await;
-    match entries.get_mut(operation_id) {
-        Some(entry) => {
-            entry.touched = now;
-            entry.next_attempt <= now
+impl IssuanceRuntime {
+    pub(super) fn new() -> Self {
+        Self {
+            tick: Mutex::new(()),
+            state: Mutex::new(IssuanceRuntimeState {
+                cursor: None,
+                backoffs: HashMap::new(),
+            }),
         }
-        None => true,
     }
-}
 
-async fn defer(operation_id: &str) {
-    let now = Instant::now();
-    let mut entries = backoff_map().lock().await;
-    let delay = entries
-        .get(operation_id)
-        .map(|entry| entry.delay.saturating_mul(2).min(MAX_BACKOFF))
-        .unwrap_or(INITIAL_BACKOFF);
-    let oldest = if !entries.contains_key(operation_id) && entries.len() >= MAX_TRACKED_BACKOFFS {
-        entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.touched)
-            .map(|(key, _)| key.clone())
-    } else {
-        None
-    };
-    if let Some(oldest) = oldest {
-        entries.remove(&oldest);
+    async fn cursor(&self) -> Option<String> {
+        self.state.lock().await.cursor.clone()
     }
-    entries.insert(
-        operation_id.to_owned(),
-        Backoff {
-            delay,
-            next_attempt: now + delay,
-            touched: now,
-        },
-    );
-}
 
-async fn clear_backoff(operation_id: &str) {
-    backoff_map().lock().await.remove(operation_id);
+    async fn reset_cursor(&self) {
+        self.state.lock().await.cursor = None;
+    }
+
+    async fn mark_considered(&self, operation_id: &str) {
+        self.state.lock().await.cursor = Some(operation_id.to_owned());
+    }
+
+    async fn retry_due(&self, operation_id: &str) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        match state.backoffs.get_mut(operation_id) {
+            Some(entry) => {
+                entry.touched = now;
+                entry.next_attempt <= now
+            }
+            None => true,
+        }
+    }
+
+    async fn defer(&self, operation_id: &str) {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let delay = state
+            .backoffs
+            .get(operation_id)
+            .map(|entry| entry.delay.saturating_mul(2).min(MAX_BACKOFF))
+            .unwrap_or(INITIAL_BACKOFF);
+        let oldest = if !state.backoffs.contains_key(operation_id)
+            && state.backoffs.len() >= MAX_TRACKED_BACKOFFS
+        {
+            state
+                .backoffs
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        if let Some(oldest) = oldest {
+            state.backoffs.remove(&oldest);
+        }
+        state.backoffs.insert(
+            operation_id.to_owned(),
+            Backoff {
+                delay,
+                next_attempt: now + delay,
+                touched: now,
+            },
+        );
+    }
+
+    async fn clear_backoff(&self, operation_id: &str) {
+        self.state.lock().await.backoffs.remove(operation_id);
+    }
 }
 
 fn pending_launch_issuance_page(
@@ -136,13 +157,14 @@ fn safe_gap(error: &Error) -> &'static str {
     }
 }
 
-/// Drive at most two queued assignment credential issuances per call. A
-/// process-local lock coalesces overlapping host ticks; per-launch backoff is
-/// capped and retried indefinitely, so it is pacing rather than an attempt
-/// quota. No launch is dispatched by this worker.
+/// Drive at most two queued assignment credential issuances per call. One
+/// Store-local runtime coalesces overlapping host ticks and owns transient
+/// cursor/backoff state; separate Store instances never share scheduling state.
+/// Backoff is capped and retried indefinitely, so it is pacing rather than an
+/// attempt quota. No launch is dispatched by this worker.
 impl super::Store {
     pub(crate) async fn reconcile_launch_issuance_once(&self) -> Result<Value> {
-        let Ok(_tick) = tick_lock().try_lock() else {
+        let Ok(_tick) = self.launch_issuance.tick.try_lock() else {
             return Ok(json!({
                 "coalesced":true,
                 "selected":0,
@@ -153,14 +175,12 @@ impl super::Store {
             }));
         };
 
-        let after = issuance_cursor().lock().await.clone();
+        let after = self.launch_issuance.cursor().await;
         let ids = self
             .run(move |db| pending_launch_issuance(db, after.as_deref()))
             .await?;
-        if let Some(last) = ids.last() {
-            *issuance_cursor().lock().await = Some(last.clone());
-        } else {
-            *issuance_cursor().lock().await = None;
+        if ids.is_empty() {
+            self.launch_issuance.reset_cursor().await;
         }
         let selected = ids.len();
         let mut attempted = 0usize;
@@ -173,7 +193,8 @@ impl super::Store {
             if attempted >= MAX_ISSUANCE_PER_TICK {
                 break;
             }
-            if !retry_due(&operation_id).await {
+            self.launch_issuance.mark_considered(&operation_id).await;
+            if !self.launch_issuance.retry_due(&operation_id).await {
                 deferred += 1;
                 continue;
             }
@@ -205,14 +226,18 @@ impl super::Store {
             let (actor, request, effective_request_json) = match prepared {
                 Ok(value) => value,
                 Err(error) => {
-                    self.record_participant_issuance_failure(
-                        operation_id.clone(),
-                        None,
-                        IssuanceFailureStage::Preparation,
-                        &error,
-                    )
-                    .await?;
                     let gap = safe_gap(&error);
+                    if let Err(secondary) = self
+                        .record_participant_issuance_failure(
+                            operation_id.clone(),
+                            None,
+                            IssuanceFailureStage::Preparation,
+                            &error,
+                        )
+                        .await
+                    {
+                        return Err(error.with_secondary_error(secondary));
+                    }
                     if gap == "participant_registration_effect_unknown_readback_only" {
                         unknown += 1;
                     } else {
@@ -221,7 +246,7 @@ impl super::Store {
                     if !gaps.contains(&gap) {
                         gaps.push(gap);
                     }
-                    defer(&operation_id).await;
+                    self.launch_issuance.defer(&operation_id).await;
                     continue;
                 }
             };
@@ -231,14 +256,18 @@ impl super::Store {
             let issued = match issued {
                 Ok(issued) => issued,
                 Err(error) => {
-                    self.record_participant_issuance_failure(
-                        operation_id.clone(),
-                        Some(effective_request_json.clone()),
-                        IssuanceFailureStage::CredentialIssue,
-                        &error,
-                    )
-                    .await?;
                     let gap = safe_gap(&error);
+                    if let Err(secondary) = self
+                        .record_participant_issuance_failure(
+                            operation_id.clone(),
+                            Some(effective_request_json.clone()),
+                            IssuanceFailureStage::CredentialIssue,
+                            &error,
+                        )
+                        .await
+                    {
+                        return Err(error.with_secondary_error(secondary));
+                    }
                     if gap == "participant_registration_effect_unknown_readback_only" {
                         unknown += 1;
                     } else {
@@ -247,7 +276,7 @@ impl super::Store {
                     if !gaps.contains(&gap) {
                         gaps.push(gap);
                     }
-                    defer(&operation_id).await;
+                    self.launch_issuance.defer(&operation_id).await;
                     continue;
                 }
             };
@@ -274,17 +303,21 @@ impl super::Store {
             match result {
                 Ok(_) => {
                     committed += 1;
-                    clear_backoff(&operation_id).await;
+                    self.launch_issuance.clear_backoff(&operation_id).await;
                 }
                 Err(error) => {
-                    self.record_participant_issuance_failure(
-                        operation_id.clone(),
-                        Some(effective_request_json.clone()),
-                        IssuanceFailureStage::Commit,
-                        &error,
-                    )
-                    .await?;
                     let gap = safe_gap(&error);
+                    if let Err(secondary) = self
+                        .record_participant_issuance_failure(
+                            operation_id.clone(),
+                            Some(effective_request_json.clone()),
+                            IssuanceFailureStage::Commit,
+                            &error,
+                        )
+                        .await
+                    {
+                        return Err(error.with_secondary_error(secondary));
+                    }
                     if gap == "participant_registration_effect_unknown_readback_only" {
                         unknown += 1;
                     } else {
@@ -293,7 +326,7 @@ impl super::Store {
                     if !gaps.contains(&gap) {
                         gaps.push(gap);
                     }
-                    defer(&operation_id).await;
+                    self.launch_issuance.defer(&operation_id).await;
                 }
             }
         }

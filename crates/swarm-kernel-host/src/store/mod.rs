@@ -134,6 +134,7 @@ pub struct Store {
     artifact_io: Arc<Semaphore>,
     data_dir: std::path::PathBuf,
     automation_scheduler_owner_token: Option<Arc<String>>,
+    launch_issuance: Arc<launcher_issuance::IssuanceRuntime>,
     telemetry: swarm_telemetry::Producer,
 }
 pub struct StoreOwner {
@@ -362,6 +363,7 @@ impl StoreOwner {
             artifacts,
             data_dir: data_dir.clone(),
             automation_scheduler_owner_token: scheduler_owner_token.clone().map(Arc::new),
+            launch_issuance: Arc::new(launcher_issuance::IssuanceRuntime::new()),
             artifact_io: Arc::new(Semaphore::new(4)),
             telemetry: swarm_telemetry::Producer::with_line_observer(
                 telemetry_config,
