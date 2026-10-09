@@ -162,7 +162,17 @@ fn successor_gm_continues_exact_attempt_without_restarting_dispatch() {
 
     let reuse_raw: String = db
         .query_row(
-            "SELECT json_object(                'state',state,                'task_id',task_id,                'attempt_id',attempt_id,                'binding_id',binding_id,                'binding_generation',binding_generation,                'effective',json(effective_request_json),                'result',json(result_json))              FROM operations WHERE operation_id=?1",
+            r#"SELECT json_object(
+                'state',state,
+                'task_id',task_id,
+                'attempt_id',attempt_id,
+                'binding_id',binding_id,
+                'binding_generation',binding_generation,
+                'effective',json(effective_request_json),
+                'result',json(result_json)
+            )
+            FROM operations
+            WHERE operation_id=?1"#,
             [&reuse_operation_id],
             |row| row.get(0),
         )

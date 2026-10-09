@@ -2521,7 +2521,18 @@ fn load_existing_task_dispatch(
 ) -> Result<ExistingTaskDispatch> {
     let raw: Option<String> = tx
         .query_row(
-            "SELECT json_object(                'method',method,                'state',state,                'task_id',task_id,                'attempt_id',attempt_id,                'binding_id',binding_id,                'binding_generation',binding_generation,                'prerequisite_operation_id',prerequisite_operation_id,                'original_request',json(original_request_json))              FROM operations WHERE operation_id=?1",
+            r#"SELECT json_object(
+                'method',method,
+                'state',state,
+                'task_id',task_id,
+                'attempt_id',attempt_id,
+                'binding_id',binding_id,
+                'binding_generation',binding_generation,
+                'prerequisite_operation_id',prerequisite_operation_id,
+                'original_request',json(original_request_json)
+            )
+            FROM operations
+            WHERE operation_id=?1"#,
             [operation_id],
             |row| row.get(0),
         )
@@ -2597,14 +2608,33 @@ fn load_existing_task_dispatch(
                 "retained task.dispatch request is not an object",
             )
         })?;
+    let retained_prerequisite = retained["prerequisite_operation_id"]
+        .as_str()
+        .map(str::to_owned);
+    let original_prerequisite = match original.get("prerequisite_operation_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return Err(Error::new(
+                "ATTEMPT_START_CORRUPT",
+                "retained task.dispatch request has an invalid prerequisite",
+            ));
+        }
+    };
+    if retained_prerequisite.as_deref() != original_prerequisite {
+        return Err(Error::new(
+            "ATTEMPT_START_CORRUPT",
+            "retained task.dispatch prerequisite column disagrees with its request",
+        ));
+    }
     let requested_prerequisite = match request.get("prerequisite_operation_id") {
         None | Some(Value::Null) => None,
         Some(_) => Some(model::text(request, "prerequisite_operation_id")?),
     };
-    if retained["prerequisite_operation_id"].as_str() != requested_prerequisite {
+    if original_prerequisite != requested_prerequisite {
         return Err(Error::new(
-            "ATTEMPT_START_CORRUPT",
-            "retained task.dispatch prerequisite column disagrees with its request",
+            "ATTEMPT_DISPATCH_CONFLICT",
+            "initial delivery already exists with a different setup prerequisite",
         ));
     }
     if original["attempt_id"] != attempt_id {
@@ -2650,7 +2680,24 @@ fn retain_task_dispatch_reuse(
         "current_state_read_method":"operation.get",
     });
     let changed = tx.execute(
-        "UPDATE operations          SET task_id=?2,attempt_id=?3,prerequisite_operation_id=?4,             effective_request_json=json_set(effective_request_json,'$.semantic_reuse',json(?5)),             updated_at_ms=?6          WHERE operation_id=?1 AND method='task.dispatch' AND state='queued'            AND task_id IS NULL AND attempt_id IS NULL            AND binding_id IS NULL AND binding_generation IS NULL            AND json_type(effective_request_json,'$.semantic_reuse') IS NULL",
+        r#"UPDATE operations
+        SET task_id=?2,
+            attempt_id=?3,
+            prerequisite_operation_id=?4,
+            effective_request_json=json_set(
+                effective_request_json,
+                '$.semantic_reuse',
+                json(?5)
+            ),
+            updated_at_ms=?6
+        WHERE operation_id=?1
+          AND method='task.dispatch'
+          AND state='queued'
+          AND task_id IS NULL
+          AND attempt_id IS NULL
+          AND binding_id IS NULL
+          AND binding_generation IS NULL
+          AND json_type(effective_request_json,'$.semantic_reuse') IS NULL"#,
         params![
             operation_id,
             existing.task_id,
@@ -2722,7 +2769,7 @@ pub(super) fn dispatch(
             false,
         ));
     }
-    if a["state"] != "reserved" || !a["released_at_ms"].is_null() {
+    if a["state"] != "reserved" {
         return Err(Error::conflict(
             "initial dispatch requires an unreleased reserved Attempt",
         ));
