@@ -360,7 +360,7 @@ pub fn service_owner_family_empty(
         identity["job_name"] = serde_json::json!(format!(
             "Global\\EliotSwarmService-AutomationScheduler-{service_owner_token}"
         ));
-        return swarm_process::departed_empty(&identity, service_owner_token);
+        swarm_process::departed_empty(&identity, service_owner_token)
     }
     #[cfg(not(windows))]
     {
