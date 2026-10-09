@@ -328,15 +328,7 @@ fn authorize_participant_candidate(
             page.metadata["native_output"].as_str()
         };
         if claude_result {
-            authorize_claude_result_candidate(
-                db,
-                &page,
-                &page.metadata["source"],
-                result_operation_id,
-                operation_id,
-                &dispatch,
-                &page_id,
-            )?;
+            authorize_claude_result_candidate(db, attempt, &page, &dispatch)?;
             continue;
         }
         if dispatch["method"] != "task.dispatch"
@@ -422,13 +414,14 @@ fn authorize_participant_candidate(
 
 fn authorize_claude_result_candidate(
     db: &Connection,
+    expected_attempt: &Value,
     page: &ArtifactRecord,
-    source: &Value,
-    result_operation_id: &str,
-    dispatch_operation_id: &str,
     dispatch: &Value,
-    page_id: &str,
 ) -> Result<()> {
+    let source = &page.metadata["source"];
+    let result_operation_id = model::text(&page.metadata, "operation_id")?;
+    let dispatch_operation_id = model::text(source, "input_operation_id")?;
+    let page_id = page.artifact_id.as_str();
     model::fields(
         source,
         &[
@@ -472,6 +465,20 @@ fn authorize_claude_result_candidate(
         dispatch_operation_id,
         dispatch,
     )?;
+    let expected_task_id = model::text(expected_attempt, "task_id")?;
+    let expected_attempt_id = model::text(expected_attempt, "attempt_id")?;
+    let expected_task_revision = model::positive(expected_attempt, "task_revision")?;
+    if dispatch["task_id"].as_str() != Some(expected_task_id)
+        || dispatch["attempt_id"].as_str() != Some(expected_attempt_id)
+        || origin["target_task_id"].as_str() != Some(expected_task_id)
+        || origin["target_attempt_id"].as_str() != Some(expected_attempt_id)
+        || origin["target_task_revision"].as_i64() != Some(expected_task_revision)
+    {
+        return Err(Error::new(
+            "CANDIDATE_SCOPE",
+            "Claude result candidate belongs to another Task Attempt or revision",
+        ));
+    }
     let context = json!({
         "operation_id":result_operation_id,
         "result_input_sha256":origin["result_input_sha256"],

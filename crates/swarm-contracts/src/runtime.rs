@@ -194,6 +194,9 @@ impl TaskDispatchAdmissionReceipt {
         if self.schema_version != 1
             || context.validate().is_err()
             || self.module_receipt.validate().is_err()
+            || self.module_receipt.operation_id != self.operation_id
+            || self.module_receipt.binding_id != self.binding_id
+            || self.module_receipt.binding_generation != self.binding_generation
             || !is_lower_sha256(&self.native_payload_sha256)
             || self.native_payload_bytes == 0
             || self
