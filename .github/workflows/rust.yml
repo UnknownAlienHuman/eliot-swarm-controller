@@ -50,20 +50,12 @@ jobs:
           )
           replace_exact(
               "crates/swarm-mcp/src/mcp/subscriptions.rs",
-              '''    if categories
-                  .iter()
-                  .any(|category| *category == Category::Coordination)
-              {'''.replace('              ', ''),
+              '    if categories\n        .iter()\n        .any(|category| *category == Category::Coordination)\n    {',
               '    if categories.contains(&Category::Coordination) {',
           )
           replace_exact(
               "crates/swarm-mcp/src/mcp/subscriptions.rs",
-              '''/// The single lagged marker for one overflow episode.
-pub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNotification {
-    lagged_notification_with_reads(subscription_id, gap, &RESYNC_READS)
-}
-
-''',
+              '/// The single lagged marker for one overflow episode.\npub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNotification {\n    lagged_notification_with_reads(subscription_id, gap, &RESYNC_READS)\n}\n\n',
               '',
           )
           replace_exact(
