@@ -2306,9 +2306,8 @@ fn prompt_for(
         // A v5 descriptor can only submit the exact Store-owned envelope.
         // An unknown/missing selected schema is not a license to render the
         // legacy Task snapshot (which contains internal policy/receipts).
-        if module_contract::task_prompt_selected(claim)
+        if !module_contract::task_prompt_selected(claim)
             .map_err(|_| "TASK_PROMPT_SCHEMA_UNSUPPORTED")?
-            != true
         {
             return Err("TASK_PROMPT_SELECTION_REQUIRED");
         }
