@@ -1424,17 +1424,19 @@ fn script_event_projections_with_alias(
     if direct.occurrence_phase.is_some() && direct.occurrence_id.is_some() {
         return Ok(vec![direct]);
     }
-    if event.source_id.starts_with("module:") {
-        // An arbitrary Module kind is routable only through the common
-        // descriptor-admitted metadata envelope. Never fall back to an empty
-        // observation-only projection for an unadmitted or malformed Module.
+    let raw_runtime_outcome = raw_runtime_outcome_kind(db, event)?;
+    if event.source_id.starts_with("module:") && raw_runtime_outcome.is_none() {
+        // Custom Module kinds are routable only through the common
+        // descriptor-admitted metadata envelope. Reserved legacy runtime
+        // kinds stay on their provenance-validated codecs and never receive
+        // an observation-only fallback.
         return Ok(
             automation_intake::module_event_metadata_projection(db, event)?
                 .into_iter()
                 .collect(),
         );
     }
-    let aliases = match raw_runtime_outcome_kind(db, event)? {
+    let aliases = match raw_runtime_outcome {
         Some(RawRuntimeOutcomeKind::Applied | RawRuntimeOutcomeKind::Rejected) => {
             raw_safe_event_aliases(event)
         }

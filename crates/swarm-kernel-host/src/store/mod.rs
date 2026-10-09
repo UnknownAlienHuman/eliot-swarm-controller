@@ -5606,54 +5606,6 @@ pub(super) fn record_operation_failure_event(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn insert_safe_host_terminal_failure_event(
-    tx: &Transaction<'_>,
-    host_epoch: i64,
-    failure_category: &str,
-    failed_supervisor: Option<&str>,
-    recorded_at_ms: i64,
-) -> Result<()> {
-    let category_valid = match failure_category {
-        "startup_failure" | "runtime_failure" => failed_supervisor.is_none(),
-        "supervisor_stopped" | "supervisor_failed" => true,
-        _ => false,
-    };
-    if host_epoch <= 0
-        || recorded_at_ms < 0
-        || !category_valid
-        || failed_supervisor.is_some_and(|name| !host_lifecycle::is_known_supervisor(name))
-    {
-        return Err(Error::new(
-            "SYSTEM_EVENT_INVALID",
-            "host terminal failure identity or category is invalid",
-        ));
-    }
-    let phase = "host_terminal_exit_observed";
-    let occurrence_id = format!("host-terminal-exit:{host_epoch}");
-    let mut payload = json!({
-        "schema_version":1,
-        "phase":phase,
-        "status":"failed",
-        "occurrence_id":occurrence_id,
-        "host_epoch":host_epoch,
-        "failure_category":failure_category
-    });
-    if let Some(name) = failed_supervisor {
-        payload["failed_supervisor"] = json!(name);
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
-         VALUES('controller:host-lifecycle',?1,NULL,'host.failed',?2,?3)",
-        rusqlite::params![
-            format!("failed:{host_epoch}"),
-            model::canonical(&payload)?,
-            recorded_at_ms
-        ],
-    )?;
-    Ok(())
-}
-
 pub(super) fn is_safe_native_result_error_code(value: &str) -> bool {
     matches!(
         value,
