@@ -1,6 +1,8 @@
 //! Module admission and facts, scoped by a credential to one reserved native root.
 //! Network I/O is never performed inside these transactions.
-use super::{Store, meta, operations, prerequisites, producers, set_meta, task_prompt, tasks};
+use super::{
+    Store, meta, operations, prerequisites, producers, results, set_meta, task_prompt, tasks,
+};
 use crate::{
     artifacts::ArtifactRecord,
     error::{Error, Result},

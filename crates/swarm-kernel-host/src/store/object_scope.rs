@@ -55,8 +55,6 @@ pub(crate) struct TaskEvidenceIdentity {
 /// Projection ceilings for Task graph reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TaskReadLevel {
-    /// Identity plus revision/state/phase only.
-    Summary,
     /// Frozen spec/brief and permitted pointers.
     Detail,
     /// Exact submission/check/acceptance/family receipts, still bounded.
@@ -82,19 +80,8 @@ pub(crate) struct TaskReadGrant {
 /// Projection ceilings for Operation reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum OperationReadLevel {
-    Summary,
     Receipt,
     Diagnostic,
-}
-
-impl OperationReadLevel {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Summary => "summary",
-            Self::Receipt => "receipt",
-            Self::Diagnostic => "diagnostic",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,20 +93,6 @@ pub(crate) enum OperationReadBasis {
     CurrentGmTaskScope,
     OnBehalfLink,
     DirectedOrRetainedRelation,
-}
-
-impl OperationReadBasis {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::LocalOperator => "local_operator",
-            Self::ExactCaller => "exact_caller",
-            Self::RetainedAttemptOwner => "retained_attempt_owner",
-            Self::CurrentTaskManager => "current_task_manager",
-            Self::CurrentGmTaskScope => "current_gm_task_scope",
-            Self::OnBehalfLink => "validated_on_behalf_link",
-            Self::DirectedOrRetainedRelation => "directed_or_retained_relation",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,19 +252,16 @@ pub(crate) fn identity_for_task(
 }
 
 /// Identity for an exact retained Attempt, including its binding pair when set.
+struct RetainedAttemptIdentity {
+    identity: TaskGraphIdentity,
+    snapshot_json: String,
+}
+
 pub(crate) fn identity_for_attempt(
     db: &Connection,
     attempt_id: &str,
 ) -> Result<Option<TaskGraphIdentity>> {
-    let row: Option<(
-        String,
-        String,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        String,
-    )> = db
+    let row = db
         .query_row(
             "SELECT t.project_id,a.task_id,a.task_revision,a.attempt_id,a.binding_id, \
                     a.binding_generation,a.task_snapshot_json
@@ -299,66 +269,36 @@ pub(crate) fn identity_for_attempt(
              WHERE a.attempt_id=?1",
             [attempt_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
+                Ok(RetainedAttemptIdentity {
+                    identity: TaskGraphIdentity {
+                        project_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        task_revision: Some(row.get(2)?),
+                        attempt_id: row.get(3)?,
+                        binding_id: row.get(4)?,
+                        binding_generation: row.get(5)?,
+                    },
+                    snapshot_json: row.get(6)?,
+                })
             },
         )
         .optional()?;
-    let Some((
-        project_id,
-        task_id,
-        task_revision,
-        attempt_id,
-        binding_id,
-        binding_generation,
-        snapshot_json,
-    )) = row
-    else {
+    let Some(retained) = row else {
         return Ok(None);
     };
     let snapshot = retained_json(
-        &snapshot_json,
+        &retained.snapshot_json,
         "Attempt snapshot is not valid retained JSON",
     )?;
-    if snapshot.get("revision").and_then(Value::as_i64) != Some(task_revision)
-        || (binding_id.is_some() != binding_generation.is_some())
+    if snapshot.get("revision").and_then(Value::as_i64) != retained.identity.task_revision
+        || (retained.identity.binding_id.is_some()
+            != retained.identity.binding_generation.is_some())
     {
         return Err(identity_damaged(
             "Attempt revision or binding identity differs from its frozen snapshot",
         ));
     }
-    Ok(Some(TaskGraphIdentity {
-        project_id,
-        task_id,
-        task_revision: Some(task_revision),
-        attempt_id,
-        binding_id,
-        binding_generation,
-    }))
-}
-
-/// The current unreleased Attempt of a retained Task, derived from the actual
-/// `attempts` producer rows. There is no `tasks.current_attempt_id` column.
-pub(crate) fn identity_for_current_task_attempt(
-    db: &Connection,
-    task_id: &str,
-) -> Result<Option<String>> {
-    let attempt_id: Option<String> = db
-        .query_row(
-            "SELECT attempt_id FROM attempts WHERE task_id=?1 AND released_at_ms IS NULL \
-             ORDER BY created_at_ms DESC,attempt_id DESC LIMIT 1",
-            [task_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(attempt_id)
+    Ok(Some(retained.identity))
 }
 
 /// Internal coherence check. Every identity is revalidated against retained rows so
@@ -433,7 +373,7 @@ fn verified_local_operator(db: &Connection, principal: &Principal) -> Result<boo
 /// Current GM designation, or `None` while designation is damaged. Genuine Store
 /// failures propagate instead of silently removing a grant.
 fn current_gm_for_read(db: &Connection) -> Result<Option<gm::CurrentGm>> {
-    Ok(gm::read_current(db)?)
+    gm::read_current(db)
 }
 
 fn known_scope_denial(error: &Error) -> bool {
@@ -612,68 +552,30 @@ pub(crate) fn resolve_task_read(
 
 /// Load one Operation row once. Callers must not re-query operations.
 pub(crate) fn load_operation(db: &Connection, operation_id: &str) -> Result<Option<OperationRow>> {
-    let row: Option<(
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        String,
-        String,
-        Option<String>,
-    )> = db
+    db
         .query_row(
             "SELECT operation_id,caller_id,method,state,task_id,attempt_id, \
                     binding_id,binding_generation,original_request_json,effective_request_json,result_json
              FROM operations WHERE operation_id=?1",
             [operation_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                ))
+                Ok(OperationRow {
+                    operation_id: row.get(0)?,
+                    caller_id: row.get(1)?,
+                    method: row.get(2)?,
+                    state: row.get(3)?,
+                    task_id: row.get(4)?,
+                    attempt_id: row.get(5)?,
+                    binding_id: row.get(6)?,
+                    binding_generation: row.get(7)?,
+                    original_request_json: row.get(8)?,
+                    effective_request_json: row.get(9)?,
+                    result_json: row.get(10)?,
+                })
             },
         )
-        .optional()?;
-    Ok(row.map(
-        |(
-            operation_id,
-            caller_id,
-            method,
-            state,
-            task_id,
-            attempt_id,
-            binding_id,
-            binding_generation,
-            original_request_json,
-            effective_request_json,
-            result_json,
-        )| OperationRow {
-            operation_id,
-            caller_id,
-            method,
-            state,
-            task_id,
-            attempt_id,
-            binding_id,
-            binding_generation,
-            original_request_json,
-            effective_request_json,
-            result_json,
-        },
-    ))
+        .optional()
+        .map_err(Into::into)
 }
 
 /// Positive Task relation for one Operation row, when retained columns form a
@@ -964,14 +866,6 @@ pub(crate) fn resolve_operation_read(
 // Task evidence identities
 // ---------------------------------------------------------------------------
 
-fn artifact_if_present(db: &Connection, artifact_id: &str) -> Result<Option<ArtifactRecord>> {
-    match super::results::get(db, artifact_id) {
-        Ok(record) => Ok(Some(record)),
-        Err(error) if error.code == "NOT_FOUND" => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 fn operation_result(operation: &OperationRow) -> Result<Value> {
     operation
         .result_json
@@ -1077,20 +971,6 @@ fn submission_artifact_identity(
     })
 }
 
-/// Public exact submission identity for the Store evidence wrapper.
-pub(crate) fn identity_for_submission(
-    db: &Connection,
-    submission_ref: &str,
-) -> Result<Option<TaskEvidenceIdentity>> {
-    let Some(record) = artifact_if_present(db, submission_ref)? else {
-        return Ok(None);
-    };
-    if record.kind != "task_submission" {
-        return Ok(None);
-    }
-    submission_artifact_identity(db, &record).map(Some)
-}
-
 /// `source_snapshot` metadata intentionally has no Operation id. The producer
 /// uses a deterministic artifact id and settles `source.capture` with
 /// `candidate_ref`; resolve exactly one retained match and verify its Attempt,
@@ -1163,77 +1043,6 @@ fn source_snapshot_identity(
     })
 }
 
-fn acceptance_identity(db: &Connection, operation_id: &str) -> Result<TaskEvidenceIdentity> {
-    let operation = load_operation(db, operation_id)?
-        .ok_or_else(|| identity_damaged("acceptance Operation is not retained"))?;
-    let result = operation_result(&operation)?;
-    if operation.method != "task.accept"
-        || operation.state != "settled"
-        || result["outcome"] != "applied"
-        || result["acceptance_operation_id"] != operation_id
-        || result["task_id"].as_str() != operation.task_id.as_deref()
-        || result["attempt_id"].as_str() != operation.attempt_id.as_deref()
-    {
-        return Err(identity_damaged(
-            "acceptance is not the exact settled task.accept decision",
-        ));
-    }
-    let attempt_id = model::text(&result, "attempt_id")?;
-    let identity = attempt_identity_or_damaged(db, attempt_id)?;
-    if identity.task_id != result["task_id"].as_str().unwrap_or_default()
-        || identity.task_revision != result["task_revision"].as_i64()
-    {
-        return Err(identity_damaged(
-            "acceptance decision differs from its frozen Attempt revision",
-        ));
-    }
-    let submission = super::results::get(db, model::text(&result, "submission_ref")?)?;
-    let submission_identity = submission_artifact_identity(db, &submission)?;
-    if submission_identity.identity != identity
-        || submission.metadata["candidate_ref"] != result["candidate_ref"]
-    {
-        return Err(identity_damaged(
-            "acceptance does not retain its exact submission and candidate",
-        ));
-    }
-    let current: Option<(Option<String>, Option<String>, Option<i64>, Option<String>)> = db
-        .query_row(
-            "SELECT accepted_operation_id,accepted_attempt_id,accepted_revision,accepted_candidate_ref \
-             FROM tasks WHERE task_id=?1",
-            [&identity.task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    if let Some((Some(current_operation), attempt, revision, candidate)) = current
-        && current_operation == operation_id
-        && (attempt.as_deref() != Some(attempt_id)
-            || revision != identity.task_revision
-            || candidate.as_deref() != result["candidate_ref"].as_str())
-    {
-        return Err(identity_damaged(
-            "current accepted Task pointers differ from their retained decision",
-        ));
-    }
-    Ok(TaskEvidenceIdentity {
-        identity,
-        operation_id: operation.operation_id,
-    })
-}
-
-/// Public exact acceptance identity for the Store evidence wrapper.
-pub(crate) fn identity_for_acceptance(
-    db: &Connection,
-    acceptance_operation_id: &str,
-) -> Result<Option<TaskEvidenceIdentity>> {
-    let Some(operation) = load_operation(db, acceptance_operation_id)? else {
-        return Ok(None);
-    };
-    if operation.method != "task.accept" {
-        return Ok(None);
-    }
-    acceptance_identity(db, acceptance_operation_id).map(Some)
-}
-
 type CheckRow = (String, String, String, String, Option<String>);
 
 fn check_row(db: &Connection, check_id: &str) -> Result<Option<CheckRow>> {
@@ -1285,50 +1094,6 @@ fn check_run_identity(db: &Connection, check_id: &str) -> Result<Option<TaskEvid
         identity,
         operation_id,
     }))
-}
-
-/// Public CheckRun identity for the Store evidence wrapper.
-pub(crate) fn identity_for_check(
-    db: &Connection,
-    check_id: &str,
-) -> Result<Option<TaskEvidenceIdentity>> {
-    check_run_identity(db, check_id)
-}
-
-/// Binding/generation is usable for family scope only when it names exactly one
-/// retained Attempt. Ambiguous bindings never fall back to a generic Task.
-pub(crate) fn identity_for_family(
-    db: &Connection,
-    binding_id: &str,
-    generation: i64,
-) -> Result<Option<TaskGraphIdentity>> {
-    let mut statement = db.prepare(
-        "SELECT attempt_id FROM attempts WHERE binding_id=?1 AND binding_generation=?2 \
-         ORDER BY created_at_ms,attempt_id LIMIT 2",
-    )?;
-    let ids = statement
-        .query_map(params![binding_id, generation], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    match ids.as_slice() {
-        [] => Ok(None),
-        [attempt_id] => {
-            let identity = attempt_identity_or_damaged(db, attempt_id)?;
-            if identity.binding_id.as_deref() != Some(binding_id)
-                || identity.binding_generation != Some(generation)
-            {
-                return Err(identity_damaged(
-                    "family binding differs from its exact retained Attempt",
-                ));
-            }
-            Ok(Some(identity))
-        }
-        _ => Err(Error::new(
-            "OBJECT_SCOPE_AMBIGUOUS",
-            "binding generation maps to more than one retained Attempt",
-        )),
-    }
 }
 
 // ---------------------------------------------------------------------------

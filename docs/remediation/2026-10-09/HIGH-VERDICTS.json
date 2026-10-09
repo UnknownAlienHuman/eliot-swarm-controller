@@ -253,8 +253,8 @@
       "verdict": "CONFIRMED",
       "evidence": "store/workspace.rs::pending_leases and pending_lease_for_operation only select preparing/outcome_unknown; release_lease is uncalled and only accepts held. store/workspace_lifecycle.rs::candidates and transition_for only release stale leases whose retained prior state was held. A stale preparing/outcome_unknown reservation has no reachable positive-effect/no-effect reconciliation consumer. Holding genuinely unknown resources is intended; clearing stale by age or Attempt release would violate the contract.",
       "owner": "Manager, PR #39 resource-fence recovery",
-      "remaining_gap": "Add exact retained-reservation readback/recovery for stale preparation and release only from positive no-effect or exact departure evidence. This is an unreachable recovery seam, not permission to remove stale from scope conflicts. Native unknown state remains fenced.",
-      "implementation_status": "pending"
+      "remaining_gap": "Candidate lifecycle releases a historical stale preparing reservation only from exact closed launch and retained WORKSPACE_GIT_PATH_TOO_LONG no-effect proof; pinned Attempts must be terminal/released and exact linked effects absent. Unknown effects remain fenced. Execute positive, damaged-proof and exact-effect negatives.",
+      "implementation_status": "source_candidate_pending_qualification"
     },
     {
       "id": "HIGH-0321",
@@ -265,8 +265,8 @@
       "verdict": "CONFIRMED",
       "evidence": "store/workspace_lifecycle.rs::has_unresolved_native_work includes all unresolved operations with task_id=lease.task_id and all their live bindings, independently of lease.operation_id and attempt.attempt_id. store/workspace.rs::reject_scope_conflicts includes stale leases. Thus a successor queued swarm.launch on the same Task can prevent departure-based release of its predecessor's stale lease before its own reservation is admitted.",
       "owner": "Manager, PR #39 exact lease/Attempt/effect scope",
-      "remaining_gap": "Remove Task-wide substitutes; retain exact lease operation, exact Attempt/start, binding generation, held CheckRun, producer and owned_service_starts lease/Attempt fences. Prove unrelated successor work does not hold predecessor while genuinely unknown exact effects still do.",
-      "implementation_status": "pending"
+      "remaining_gap": "Candidate workspace_resource_use follows exact lease/Attempt/start/binding/check/producer/service links instead of Task-wide substitutes. Host production strict Clippy passed. Execute unrelated successor versus genuinely unknown exact-effects cases.",
+      "implementation_status": "source_candidate_pending_qualification"
     },
     {
       "id": "HIGH-0322",
@@ -673,8 +673,8 @@
       "verdict": "CONFIRMED",
       "evidence": "Producer crates/swarm-adapter-opencode/src/native_owner.rs NativeOwnerController::shutdown (114-123): `let Some(owner) = self.active.take() else { self.ready = None; return Ok(()) }; self.ready = None; owner.shutdown().await`. NativeOwner::shutdown (336-357) consumes self: takes stdin, then timeout(STOP_TIMEOUT, self.child.wait()) and on timeout returns NATIVE_OWNER_STOP_UNKNOWN. Because self was moved, the Child is dropped with the child possibly still alive. Caller run_owned (lib.rs:130-136) propagates with `native_owner.shutdown().await?`, so the controller is destroyed too. The only stop signal is stdin EOF; no kill is issued and STOP_TIMEOUT expiry never escalates.",
       "owner": "#28 owner (crates/swarm-adapter-opencode/src/native_owner.rs)",
-      "remaining_gap": "Confirmed and open: needs a bounded wait on &mut Child plus a surviving StopPending/Unknown owner state, so a child ignoring stdin EOF remains observable and its OS receipts can be read later. Direct exit must stay distinguished from family departure; no kill policy is proposed here.",
-      "implementation_status": "pending"
+      "remaining_gap": "Candidate native_owner shutdown waits on &mut Child with a 30-second bound, retains active owner on timeout, and adapter loop remains alive for later waits. Direct exit remains distinct from family departure. Execute ignored-EOF, later-exit, shutdown/custody and restart cases; no native qualification claimed.",
+      "implementation_status": "source_candidate_pending_qualification"
     },
     {
       "id": "HIGH-0465",

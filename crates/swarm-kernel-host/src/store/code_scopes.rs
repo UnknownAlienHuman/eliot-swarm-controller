@@ -1098,7 +1098,7 @@ fn path_overlap(left: &str, right: &str) -> (Option<bool>, &'static str) {
     let right_prefix = terminal_glob_prefix(right);
     if let Some(prefix) = left_prefix
         && (right_prefix.is_some_and(|other| prefixes_overlap(prefix, other))
-            || (right_prefix.is_none() && right.starts_with(&format!("{prefix}/")))
+            || (right_prefix.is_none() && right.starts_with(&format!("{prefix}/"))))
     {
         return (Some(true), "prefix_glob");
     }

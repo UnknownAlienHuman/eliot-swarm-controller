@@ -283,13 +283,6 @@ impl StoredCondition {
     }
 }
 
-/// Build the route's one collision key through R13's canonical helper. A
-/// binding identity is required only for the helper's binding-scoped fallback.
-pub(super) fn resource_scope(route: &Route, binding: Option<&Value>) -> Result<ResourceScope> {
-    let route_value = serde_json::to_value(route)?;
-    resource_scope_value(&route_value, binding)
-}
-
 fn resource_scope_value(route: &Value, binding: Option<&Value>) -> Result<ResourceScope> {
     let binding_id = binding
         .and_then(|value| value.get("binding_id"))
@@ -632,11 +625,13 @@ pub(super) fn retain_fact(
                     update_retained(
                         tx,
                         scope,
-                        fact,
-                        module_sequence,
-                        source_epoch,
-                        observation_id,
-                        &details_digest,
+                        RetainedConditionCandidate {
+                            fact,
+                            module_sequence,
+                            source_epoch,
+                            observation_id,
+                            details_digest: &details_digest,
+                        },
                         &previous,
                     )?;
                     return Ok(ConditionWrite::Updated);
@@ -649,11 +644,13 @@ pub(super) fn retain_fact(
         update_retained(
             tx,
             scope,
-            fact,
-            module_sequence,
-            source_epoch,
-            observation_id,
-            &details_digest,
+            RetainedConditionCandidate {
+                fact,
+                module_sequence,
+                source_epoch,
+                observation_id,
+                details_digest: &details_digest,
+            },
             &previous,
         )?;
         return Ok(ConditionWrite::Updated);
@@ -1465,16 +1462,27 @@ fn insert_retained(
     Ok(())
 }
 
+struct RetainedConditionCandidate<'a> {
+    fact: &'a ProviderConditionFact,
+    module_sequence: i64,
+    source_epoch: &'a str,
+    observation_id: i64,
+    details_digest: &'a str,
+}
+
 fn update_retained(
     tx: &Transaction<'_>,
     scope: &ResourceScope,
-    fact: &ProviderConditionFact,
-    module_sequence: i64,
-    source_epoch: &str,
-    observation_id: i64,
-    details_digest: &str,
+    candidate: RetainedConditionCandidate<'_>,
     previous: &RetainedCondition,
 ) -> Result<()> {
+    let RetainedConditionCandidate {
+        fact,
+        module_sequence,
+        source_epoch,
+        observation_id,
+        details_digest,
+    } = candidate;
     let (kind, retry, reset, unknown) = condition_columns(fact);
     let service_id = scope.service_id.as_deref();
     let provider_id = fact.provider_id.as_deref();

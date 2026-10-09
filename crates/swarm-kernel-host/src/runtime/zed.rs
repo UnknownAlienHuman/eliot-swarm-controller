@@ -18,10 +18,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use swarm_contracts::{
-    runtime::TaskDispatchContext,
-    task_prompt::{TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION, TaskPromptEnvelopeV1},
-};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -29,6 +25,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
+};
+use swarm_contracts::{
+    runtime::TaskDispatchContext,
+    task_prompt::{TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION, TaskPromptEnvelopeV1},
 };
 
 /// Current built-in route. The artifact identity is immutable across prompt
@@ -669,15 +669,13 @@ pub fn validate_task_prompt_dispatch(command: &RuntimeCommand) -> Result<TaskPro
                 "Store TaskPrompt v1 envelope is missing or malformed",
             )
         })?;
-    let context: TaskDispatchContext = serde_json::from_value(
-        command.input["task_dispatch_context"].clone(),
-    )
-    .map_err(|_| {
-        Error::new(
-            "TASK_DISPATCH_CONTEXT_INVALID",
-            "Store task dispatch context is missing or malformed",
-        )
-    })?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(command.input["task_dispatch_context"].clone()).map_err(|_| {
+            Error::new(
+                "TASK_DISPATCH_CONTEXT_INVALID",
+                "Store task dispatch context is missing or malformed",
+            )
+        })?;
     let source_text = model::text(&command.input, "text")?;
     validate_task_prompt_parts(
         &command.operation_id,
@@ -1372,7 +1370,7 @@ fn validate_worker_snapshot(
         || owner
             .worker_group_identity
             .as_ref()
-            .map_or(true, |identity| snapshot["worker_identity"] != *identity)
+            .is_none_or(|identity| snapshot["worker_identity"] != *identity)
     {
         return Err(Error::new(
             "BATCH_WORKER_RESULT_MISMATCH",

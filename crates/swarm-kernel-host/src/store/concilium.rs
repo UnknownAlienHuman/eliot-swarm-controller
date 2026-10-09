@@ -166,108 +166,6 @@ pub(super) fn apply(
     Ok((receipt, false))
 }
 
-/// Operation readback is limited to the authenticated Participant's own
-/// Concilium proposal and position Operations. It remains available after an
-/// Attempt transition and never authorizes a peer's original request.
-pub(super) fn authorize_operation_read(
-    db: &Connection,
-    principal: &Principal,
-    operation_id: &str,
-) -> Result<()> {
-    let principal = super::current_principal(db, principal.clone())?;
-    principal.require_participant()?;
-    let (caller_id, method): (String, String) = db
-        .query_row(
-            "SELECT caller_id,method FROM operations WHERE operation_id=?1",
-            [operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| Error::new("NOT_FOUND", "Concilium Operation was not found"))?;
-    if caller_id != principal.client_id
-        || !matches!(
-            method.as_str(),
-            "concilium.propose" | "concilium.position.submit"
-        )
-    {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "Participant Operation readback is limited to the caller's own proposal or position",
-        ));
-    }
-    if let Some(link) = meta(db, &operation_key(operation_id))? {
-        let record = record_for_operation(db, operation_id)?;
-        if link["concilium_id"] != record["concilium_id"]
-            || link["proposal_operation_id"] != record["proposal_operation_id"]
-        {
-            return Err(damaged(
-                "Concilium Operation link differs from its projection",
-            ));
-        }
-        if method == "concilium.propose" {
-            if !value_text_is(
-                &record["proposal"]["proposer"]["client_id"],
-                &principal.client_id,
-            ) {
-                return Err(Error::new(
-                    "FORBIDDEN",
-                    "linked proposal Operation belongs to a different Participant",
-                ));
-            }
-            let snapshot = participant_snapshot(&record, &principal.client_id)
-                .ok_or_else(|| damaged("linked proposal has no retained proposer identity"))?;
-            verify_retained_registration(db, &principal.client_id, &record["scope"], &snapshot)?;
-            let raw_request: String = db.query_row(
-                "SELECT original_request_json FROM operations WHERE operation_id=?1",
-                [operation_id],
-                |row| row.get(0),
-            )?;
-            let mut request: Value = serde_json::from_str(&raw_request)?;
-            request
-                .as_object_mut()
-                .ok_or_else(|| damaged("retained proposal Operation request is not an object"))?
-                .remove("client_request_id");
-            if request != record["proposal"]["request_source"]["request"] {
-                return Err(damaged(
-                    "proposal Operation request differs from the canonical proposal source",
-                ));
-            }
-        } else {
-            let raw_request: String = db.query_row(
-                "SELECT original_request_json FROM operations WHERE operation_id=?1",
-                [operation_id],
-                |row| row.get(0),
-            )?;
-            let request: Value = serde_json::from_str(&raw_request)?;
-            let parsed =
-                crate::coordination::concilium::parse("concilium.position.submit", &request)?;
-            let ConciliumRequest::PositionSubmit(request) = parsed else {
-                return Err(damaged("position Operation parsed as a different request"));
-            };
-            let position = position_to_value(&request.position);
-            let slot = slot_by_id(&record, &request.slot_id)?;
-            if record["concilium_id"].as_str() != Some(request.concilium_id.as_str())
-                || !value_text_is(
-                    &slot["participant_actor"]["client_id"],
-                    &principal.client_id,
-                )
-                || slot["packet_digest"].as_str() != Some(request.packet_digest.as_str())
-                || slot["position"] != position
-            {
-                return Err(damaged(
-                    "linked position Operation does not match its exact submitted slot content",
-                ));
-            }
-            verify_retained_registration(db, &principal.client_id, &record["scope"], slot)?;
-        }
-    } else {
-        verify_registered_participant(db, &principal.client_id)?;
-    }
-    // A rejected mutation rolls back its projection/link savepoint. Caller
-    // ownership above is sufficient for recovery of that caller's own ACK.
-    Ok(())
-}
-
 fn propose(
     tx: &Transaction<'_>,
     principal: &Principal,
@@ -922,7 +820,7 @@ fn build_next_round_packets(
         let own_id = model::text(&own["participant_actor"], "client_id")?;
         let peer_summaries: Vec<Value> = prior
             .iter()
-            .filter(|peer| !value_text_is(&peer["participant_actor"]["client_id"], &own_id))
+            .filter(|peer| !value_text_is(&peer["participant_actor"]["client_id"], own_id))
             .map(|peer| position_summary(peer))
             .collect();
         let packet = json!({
@@ -1169,10 +1067,10 @@ fn latest_position_slots(record: &Value) -> Result<Vec<&Value>> {
                 "Participant has multiple submitted slots in one Concilium round",
             ));
         }
-        if let Some((latest_round, _)) = latest.get(&participant_id) {
-            if *latest_round > round {
-                continue;
-            }
+        if let Some((latest_round, _)) = latest.get(&participant_id)
+            && *latest_round > round
+        {
+            continue;
         }
         latest.insert(participant_id, (round, slot));
     }
@@ -1543,7 +1441,6 @@ fn list(db: &Connection, principal: &Principal, request: &ListRequest) -> Result
         viewer_index_prefix(&principal.client_id)
     };
     let lower = after
-        .as_deref()
         .map(|id| format!("{prefix}{id}"))
         .unwrap_or_else(|| prefix.clone());
     let compare = if after.is_some() { ">" } else { ">=" };
@@ -1570,9 +1467,7 @@ fn list(db: &Connection, principal: &Principal, request: &ListRequest) -> Result
         if !value_text_is(&record["scope"]["task_id"], task_id)
             || effective_attempt
                 .is_some_and(|attempt| !value_text_is(&record["scope"]["attempt_id"], attempt))
-            || state
-                .as_deref()
-                .is_some_and(|expected| !value_text_is(&record["status"], expected))
+            || state.is_some_and(|expected| !value_text_is(&record["status"], expected))
         {
             continue;
         }
@@ -1617,15 +1512,14 @@ fn project_page(
             if !value_text_is(
                 &slot["participant_actor"]["client_id"],
                 &principal.client_id,
-            ) {
-                if let Some(object) = slot.as_object_mut() {
-                    object.remove("position");
-                    object.remove("packet");
-                    object.remove("source_result_ref");
-                    object.remove("participant_scope");
-                    object.remove("participation_basis");
-                    object.remove("registration_fingerprint");
-                }
+            ) && let Some(object) = slot.as_object_mut()
+            {
+                object.remove("position");
+                object.remove("packet");
+                object.remove("source_result_ref");
+                object.remove("participant_scope");
+                object.remove("participation_basis");
+                object.remove("registration_fingerprint");
             }
         }
     }
@@ -1814,7 +1708,7 @@ fn participant_snapshot(record: &Value, client_id: &str) -> Option<Value> {
                 .into_iter()
                 .flatten()
                 .find(|participant| value_text_is(&participant["actor"]["client_id"], client_id))
-                .map(|participant| participant.clone())
+                .cloned()
         })
 }
 
@@ -1939,25 +1833,25 @@ fn validate_evidence_refs(
             let id = reference
                 .strip_prefix("artifact-")
                 .or_else(|| reference.strip_prefix("artifact:"))
-                .unwrap_or(&reference);
+                .unwrap_or(reference);
             validate_artifact_ref(db, id, task, attempt_id, None)?;
         } else if reference.starts_with("submission-") || reference.starts_with("submission:") {
             let id = reference
                 .strip_prefix("submission-")
                 .or_else(|| reference.strip_prefix("submission:"))
-                .unwrap_or(&reference);
+                .unwrap_or(reference);
             validate_artifact_ref(db, id, task, attempt_id, Some("task_submission"))?;
         } else if reference.starts_with("operation-") || reference.starts_with("operation:") {
             let id = reference
                 .strip_prefix("operation-")
                 .or_else(|| reference.strip_prefix("operation:"))
-                .unwrap_or(&reference);
+                .unwrap_or(reference);
             validate_operation_ref(db, id, task, attempt_id)?;
         } else if reference.starts_with("observation-") || reference.starts_with("observation:") {
             let raw = reference
                 .strip_prefix("observation-")
                 .or_else(|| reference.strip_prefix("observation:"))
-                .unwrap_or(&reference);
+                .unwrap_or(reference);
             let observation_id = raw
                 .parse::<i64>()
                 .ok()
@@ -1970,7 +1864,7 @@ fn validate_evidence_refs(
             let id = reference
                 .strip_prefix("source-")
                 .or_else(|| reference.strip_prefix("source:"))
-                .unwrap_or(&reference);
+                .unwrap_or(reference);
             if !task_has_source(task, id) {
                 return Err(Error::new(
                     "EVIDENCE_NOT_FOUND",
@@ -1980,8 +1874,8 @@ fn validate_evidence_refs(
         } else {
             // A plain exact ID is accepted only when it resolves to an
             // in-scope Operation or artifact; it is never treated as a path.
-            if validate_operation_ref(db, &reference, task, attempt_id).is_err()
-                && validate_artifact_ref(db, &reference, task, attempt_id, None).is_err()
+            if validate_operation_ref(db, reference, task, attempt_id).is_err()
+                && validate_artifact_ref(db, reference, task, attempt_id, None).is_err()
             {
                 return Err(Error::new(
                     "EVIDENCE_NOT_FOUND",
@@ -1999,7 +1893,13 @@ fn validate_operation_ref(
     task: &Value,
     attempt_id: &str,
 ) -> Result<()> {
-    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = db
+    type OperationEvidenceRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<OperationEvidenceRow> = db
         .query_row(
             "SELECT task_id,attempt_id,json_extract(original_request_json,'$.task_id'),json_extract(original_request_json,'$.attempt_id') \
              FROM operations WHERE operation_id=?1",

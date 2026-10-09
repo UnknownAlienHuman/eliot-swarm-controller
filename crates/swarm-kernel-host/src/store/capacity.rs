@@ -767,16 +767,6 @@ enum DerivedPhase {
     Released,
 }
 
-impl DerivedPhase {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Reserved => "reserved",
-            Self::Active => "active",
-            Self::Released => "released",
-        }
-    }
-}
-
 fn damage_for_value(code: &str, value: &Value) -> Result<CapacityLedgerDamage> {
     let raw = serde_json::to_vec(value)?;
     let size = raw.len();
@@ -1225,10 +1215,10 @@ fn exact_native_turn(state: &Value, session_id: &str, run_id: &str) -> Option<Va
         }
         true
     };
-    if let Some(turns) = state["turns"].as_array() {
-        if turns.len() > MAX_ROSTER_ROWS || !turns.iter().all(&mut consider) {
-            return None;
-        }
+    if let Some(turns) = state["turns"].as_array()
+        && (turns.len() > MAX_ROSTER_ROWS || !turns.iter().all(&mut consider))
+    {
+        return None;
     }
     if let Some(children) = state["observed_children"].as_array() {
         if children.len() > MAX_ROSTER_ROWS {
@@ -1319,35 +1309,43 @@ fn operation_evidence(
     })
 }
 
-fn producer_evidence(
-    attempt_id: &str,
-    assignment_id: &str,
-    task_id: &str,
-    binding_id: &str,
+struct ProducerEvidenceContext<'a> {
+    attempt_id: &'a str,
+    assignment_id: &'a str,
+    task_id: &'a str,
+    binding_id: &'a str,
     binding_generation: i64,
     admitted_at_ms: i64,
+}
+
+struct ProducerEvidenceState {
     phase: DerivedPhase,
     identity: Option<ExecutionIdentity>,
     start_ref: Value,
     release_reason: Option<String>,
     unknown_since_ms: Option<i64>,
+}
+
+fn producer_evidence(
+    context: &ProducerEvidenceContext<'_>,
+    state: ProducerEvidenceState,
 ) -> ResourceEvidence {
     ResourceEvidence {
-        entry_id: format!("producer:{attempt_id}:{assignment_id}"),
+        entry_id: format!("producer:{}:{}", context.attempt_id, context.assignment_id),
         kind: ResourceEntryKind::Producer,
         operation_id: None,
-        attempt_id: Some(attempt_id.to_owned()),
-        assignment_id: Some(assignment_id.to_owned()),
+        attempt_id: Some(context.attempt_id.to_owned()),
+        assignment_id: Some(context.assignment_id.to_owned()),
         method: None,
-        task_id: Some(task_id.to_owned()),
-        binding_id: binding_id.to_owned(),
-        binding_generation,
-        admitted_at_ms,
-        phase,
-        execution_identity: identity,
-        execution_start_ref: start_ref,
-        release_reason,
-        unknown_since_ms,
+        task_id: Some(context.task_id.to_owned()),
+        binding_id: context.binding_id.to_owned(),
+        binding_generation: context.binding_generation,
+        admitted_at_ms: context.admitted_at_ms,
+        phase: state.phase,
+        execution_identity: state.identity,
+        execution_start_ref: state.start_ref,
+        release_reason: state.release_reason,
+        unknown_since_ms: state.unknown_since_ms,
     }
 }
 
@@ -1400,6 +1398,14 @@ fn derive_producer_evidence(
     else {
         return damaged_evidence("attempt_admission_time_missing", attempt);
     };
+    let evidence_context = ProducerEvidenceContext {
+        attempt_id: &attempt_id,
+        assignment_id,
+        task_id: &task_id,
+        binding_id: &binding_id,
+        binding_generation: generation,
+        admitted_at_ms,
+    };
     let disposition = terminal_disposition(&producer["disposition"])
         .or_else(|| terminal_disposition(&producer["execution_disposition"]));
     let unknown = matches!(
@@ -1412,20 +1418,17 @@ fn derive_producer_evidence(
     if attempt_resolved(attempt) {
         return Ok(EvidenceDerivation {
             evidence: Some(producer_evidence(
-                &attempt_id,
-                assignment_id,
-                &task_id,
-                &binding_id,
-                generation,
-                admitted_at_ms,
-                DerivedPhase::Released,
-                None,
-                Value::Null,
-                Some(format!(
-                    "attempt_resolved:{}",
-                    attempt["state"].as_str().unwrap_or("released")
-                )),
-                None,
+                &evidence_context,
+                ProducerEvidenceState {
+                    phase: DerivedPhase::Released,
+                    identity: None,
+                    start_ref: Value::Null,
+                    release_reason: Some(format!(
+                        "attempt_resolved:{}",
+                        attempt["state"].as_str().unwrap_or("released")
+                    )),
+                    unknown_since_ms: None,
+                },
             )),
             damage: None,
         });
@@ -1492,30 +1495,27 @@ fn derive_producer_evidence(
             }
             return Ok(EvidenceDerivation {
                 evidence: Some(producer_evidence(
-                    &attempt_id,
-                    assignment_id,
-                    &task_id,
-                    &binding_id,
-                    generation,
-                    admitted_at_ms,
-                    DerivedPhase::Released,
-                    Some(ExecutionIdentity {
-                        operation_id: Some(dispatch_id.to_owned()),
-                        native_session_id,
-                        native_input_id: None,
-                        native_run_id: producer["batch_run_id"].as_str().map(str::to_owned),
-                        source_observation_id: None,
-                        source_stream_id: None,
-                        source_event_key: None,
-                        admission_event_ref: None,
-                        delivery_event_ref: None,
-                        execution_start_event_ref: None,
-                        terminal_event_ref: None,
-                        terminal_disposition: Some(terminal.to_owned()),
-                    }),
-                    Value::Null,
-                    Some(format!("execution_terminal:{terminal}")),
-                    None,
+                    &evidence_context,
+                    ProducerEvidenceState {
+                        phase: DerivedPhase::Released,
+                        identity: Some(ExecutionIdentity {
+                            operation_id: Some(dispatch_id.to_owned()),
+                            native_session_id,
+                            native_input_id: None,
+                            native_run_id: producer["batch_run_id"].as_str().map(str::to_owned),
+                            source_observation_id: None,
+                            source_stream_id: None,
+                            source_event_key: None,
+                            admission_event_ref: None,
+                            delivery_event_ref: None,
+                            execution_start_event_ref: None,
+                            terminal_event_ref: None,
+                            terminal_disposition: Some(terminal.to_owned()),
+                        }),
+                        start_ref: Value::Null,
+                        release_reason: Some(format!("execution_terminal:{terminal}")),
+                        unknown_since_ms: None,
+                    },
                 )),
                 damage: None,
             });
@@ -1542,19 +1542,16 @@ fn derive_producer_evidence(
                 }
                 return Ok(EvidenceDerivation {
                     evidence: Some(producer_evidence(
-                        &attempt_id,
-                        assignment_id,
-                        &task_id,
-                        &binding_id,
-                        generation,
-                        admitted_at_ms,
-                        DerivedPhase::Released,
-                        Some(identity),
-                        json!({"kind":"execution_started_event",
-                            "event":proof["execution_started"],
-                            "native_run_id":proof["native_run_id"]}),
-                        Some(format!("execution_terminal:{terminal}")),
-                        None,
+                        &evidence_context,
+                        ProducerEvidenceState {
+                            phase: DerivedPhase::Released,
+                            identity: Some(identity),
+                            start_ref: json!({"kind":"execution_started_event",
+                                "event":proof["execution_started"],
+                                "native_run_id":proof["native_run_id"]}),
+                            release_reason: Some(format!("execution_terminal:{terminal}")),
+                            unknown_since_ms: None,
+                        },
                     )),
                     damage: None,
                 });
@@ -1568,36 +1565,32 @@ fn derive_producer_evidence(
                 }
                 return Ok(EvidenceDerivation {
                     evidence: Some(producer_evidence(
-                        &attempt_id,
-                        assignment_id,
-                        &task_id,
-                        &binding_id,
-                        generation,
-                        admitted_at_ms,
-                        DerivedPhase::Active,
-                        Some(identity.clone()),
-                        json!({"kind":"execution_started_event",
-                            "event":proof["execution_started"],
-                            "native_run_id":run_id}),
-                        None,
-                        unknown.then_some(dispatch["updated_at_ms"].as_i64().unwrap_or(0)),
+                        &evidence_context,
+                        ProducerEvidenceState {
+                            phase: DerivedPhase::Active,
+                            identity: Some(identity.clone()),
+                            start_ref: json!({"kind":"execution_started_event",
+                                "event":proof["execution_started"],
+                                "native_run_id":run_id}),
+                            release_reason: None,
+                            unknown_since_ms: unknown
+                                .then_some(dispatch["updated_at_ms"].as_i64().unwrap_or(0)),
+                        },
                     )),
                     damage: None,
                 });
             }
             return Ok(EvidenceDerivation {
                 evidence: Some(producer_evidence(
-                    &attempt_id,
-                    assignment_id,
-                    &task_id,
-                    &binding_id,
-                    generation,
-                    admitted_at_ms,
-                    DerivedPhase::Reserved,
-                    Some(identity),
-                    Value::Null,
-                    None,
-                    unknown.then_some(dispatch["updated_at_ms"].as_i64().unwrap_or(0)),
+                    &evidence_context,
+                    ProducerEvidenceState {
+                        phase: DerivedPhase::Reserved,
+                        identity: Some(identity),
+                        start_ref: Value::Null,
+                        release_reason: None,
+                        unknown_since_ms: unknown
+                            .then_some(dispatch["updated_at_ms"].as_i64().unwrap_or(0)),
+                    },
                 )),
                 damage: None,
             });
@@ -1640,37 +1633,34 @@ fn derive_producer_evidence(
         else {
             return damaged_evidence("producer_start_observation_invalid", producer);
         };
-        if exact_native_turn(&start_state, session_id, run_id).is_none() {
+        let Some(start_turn) = exact_native_turn(&start_state, session_id, run_id) else {
             return damaged_evidence("producer_start_run_unmatched", producer);
-        }
+        };
         return Ok(EvidenceDerivation {
             evidence: Some(producer_evidence(
-                &attempt_id,
-                assignment_id,
-                &task_id,
-                &binding_id,
-                generation,
-                admitted_at_ms,
-                DerivedPhase::Released,
-                Some(ExecutionIdentity {
-                    operation_id: None,
-                    native_session_id: Some(session_id.to_owned()),
-                    native_input_id: producer["native_input_id"].as_str().map(str::to_owned),
-                    native_run_id: Some(run_id.to_owned()),
-                    source_observation_id: Some(start_observation_id),
-                    source_stream_id: Some(start_stream.clone()),
-                    source_event_key: Some(start_key.clone()),
-                    admission_event_ref: None,
-                    delivery_event_ref: None,
-                    execution_start_event_ref: exact_event_ref(&turn["event"]),
-                    terminal_event_ref: terminal_ref,
-                    terminal_disposition: Some(terminal.to_owned()),
-                }),
-                json!({"kind":"native_turn","turn_id":run_id,
-                    "native_session_id":session_id,"observation_id":start_observation_id,
-                    "source_stream_id":start_stream,"source_event_key":start_key}),
-                Some(format!("execution_terminal:{terminal}")),
-                None,
+                &evidence_context,
+                ProducerEvidenceState {
+                    phase: DerivedPhase::Released,
+                    identity: Some(ExecutionIdentity {
+                        operation_id: dispatch_id.map(str::to_owned),
+                        native_session_id: Some(session_id.to_owned()),
+                        native_input_id: producer["native_input_id"].as_str().map(str::to_owned),
+                        native_run_id: Some(run_id.to_owned()),
+                        source_observation_id: Some(start_observation_id),
+                        source_stream_id: Some(start_stream.clone()),
+                        source_event_key: Some(start_key.clone()),
+                        admission_event_ref: None,
+                        delivery_event_ref: None,
+                        execution_start_event_ref: exact_event_ref(&start_turn["event"]),
+                        terminal_event_ref: terminal_ref,
+                        terminal_disposition: Some(terminal.to_owned()),
+                    }),
+                    start_ref: json!({"kind":"native_turn","turn_id":run_id,
+                        "native_session_id":session_id,"observation_id":start_observation_id,
+                        "source_stream_id":start_stream,"source_event_key":start_key}),
+                    release_reason: Some(format!("execution_terminal:{terminal}")),
+                    unknown_since_ms: None,
+                },
             )),
             damage: None,
         });
@@ -1711,19 +1701,16 @@ fn derive_producer_evidence(
         };
         return Ok(EvidenceDerivation {
             evidence: Some(producer_evidence(
-                &attempt_id,
-                assignment_id,
-                &task_id,
-                &binding_id,
-                generation,
-                admitted_at_ms,
-                DerivedPhase::Active,
-                Some(identity),
-                json!({"kind":"native_turn","turn_id":run_id,
-                    "native_session_id":session_id,"observation_id":observation_id,
-                    "source_stream_id":stream,"source_event_key":key}),
-                None,
-                unknown.then_some(0),
+                &evidence_context,
+                ProducerEvidenceState {
+                    phase: DerivedPhase::Active,
+                    identity: Some(identity),
+                    start_ref: json!({"kind":"native_turn","turn_id":run_id,
+                        "native_session_id":session_id,"observation_id":observation_id,
+                        "source_stream_id":stream,"source_event_key":key}),
+                    release_reason: None,
+                    unknown_since_ms: unknown.then_some(0),
+                },
             )),
             damage: None,
         });
@@ -1740,17 +1727,14 @@ fn derive_producer_evidence(
     }
     Ok(EvidenceDerivation {
         evidence: Some(producer_evidence(
-            &attempt_id,
-            assignment_id,
-            &task_id,
-            &binding_id,
-            generation,
-            admitted_at_ms,
-            DerivedPhase::Reserved,
-            None,
-            Value::Null,
-            None,
-            unknown.then_some(0),
+            &evidence_context,
+            ProducerEvidenceState {
+                phase: DerivedPhase::Reserved,
+                identity: None,
+                start_ref: Value::Null,
+                release_reason: None,
+                unknown_since_ms: unknown.then_some(0),
+            },
         )),
         damage: None,
     })
