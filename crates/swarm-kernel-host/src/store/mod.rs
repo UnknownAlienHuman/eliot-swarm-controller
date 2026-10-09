@@ -91,6 +91,7 @@ mod script_event_schema_fixture;
 mod scripts;
 mod status_reader;
 mod submissions;
+mod task_prompt;
 mod tasks;
 #[cfg(test)]
 mod work_dispatch_regression;

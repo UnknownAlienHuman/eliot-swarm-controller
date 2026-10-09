@@ -15,6 +15,8 @@ pub mod module_contract;
 pub mod native_mcp;
 pub mod rpc;
 pub mod runtime;
+/// Exact Store-owned prompt text projection selected by an immutable descriptor.
+pub mod task_prompt;
 
 pub use credential::Credential;
 pub use declared_service_scope::{DeclaredServicePurpose, DeclaredServiceScope};
@@ -27,3 +29,4 @@ pub use runtime::{
     NormalizedResultOriginContext, NormalizedResultPageSource, NormalizedResultProducerOrigin,
     RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt, TaskDispatchContext,
 };
+pub use task_prompt::{TASK_PROMPT_CONTRACT_REVISION, TaskPromptEnvelopeV1};

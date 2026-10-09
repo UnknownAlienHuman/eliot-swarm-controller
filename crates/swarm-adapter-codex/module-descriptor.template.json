@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "4",
+    "version": "5",
     "build_id": null
   },
   "launch": {
@@ -41,6 +41,10 @@
       "schema_id": "swarm.normalized_result_context",
       "version": "1",
       "sha256": null
+    },
+    {
+      "schema_id": "swarm.task_prompt",
+      "version": "1"
     }
   ],
   "event_schemas": [

@@ -18,6 +18,7 @@ pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
 pub const TASK_DISPATCH_ADMISSION_SCHEMA_ID: &str = "swarm.task_dispatch_admission";
+pub const TASK_PROMPT_SCHEMA_ID: &str = crate::task_prompt::TASK_PROMPT_SCHEMA_ID;
 pub const NORMALIZED_RESULT_CONTEXT_SCHEMA_ID: &str = "swarm.normalized_result_context";
 pub const NORMALIZED_RESULT_PAGE_SCHEMA_ID: &str = "swarm.normalized_result_page";
 pub const GOAL_CONTINUATION_SCHEMA_ID: &str = "swarm.goal_continuation";
@@ -80,6 +81,55 @@ pub fn task_dispatch_context_schema() -> SchemaDescriptor {
         version: RUNTIME_SCHEMA_VERSION.to_owned(),
         sha256: None,
     }
+}
+
+/// Versioned opt-in for Store-produced exact native task prompt bytes.
+pub fn task_prompt_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: TASK_PROMPT_SCHEMA_ID.to_owned(),
+        version: crate::task_prompt::TASK_PROMPT_SCHEMA_VERSION.to_string(),
+        sha256: None,
+    }
+}
+
+/// Fail closed for malformed/unknown task-prompt declarations, but retain
+/// historical rendering for descriptors that never selected this schema.
+/// Uses the same immutable registered-descriptor fields in Store and adapters.
+pub fn task_prompt_selected<'a>(
+    command_schemas: impl Iterator<Item = &'a SchemaDescriptor>,
+    event_schemas: impl Iterator<Item = &'a SchemaDescriptor>,
+    capabilities: impl Iterator<Item = &'a CapabilityId>,
+) -> Result<bool, &'static str> {
+    let expected = task_prompt_schema();
+    let runtime = runtime_command_schema();
+    let context = task_dispatch_context_schema();
+    let admission = task_dispatch_admission_schema();
+    let mut selected = false;
+    let mut has_runtime = false;
+    let mut has_context = false;
+    for schema in command_schemas {
+        if schema.schema_id == TASK_PROMPT_SCHEMA_ID {
+            if selected || *schema != expected {
+                return Err("unsupported or duplicated selected TaskPrompt schema");
+            }
+            selected = true;
+        }
+        has_runtime |= *schema == runtime;
+        has_context |= *schema == context;
+    }
+    if !selected {
+        return Ok(false);
+    }
+    if !has_runtime
+        || !has_context
+        || !event_schemas.into_iter().any(|schema| *schema == admission)
+        || !capabilities
+            .into_iter()
+            .any(|cap| cap.as_str() == "task.dispatch")
+    {
+        return Err("selected TaskPrompt requires task.dispatch and normalized admission pair");
+    }
+    Ok(true)
 }
 
 /// Descriptor declaration for the typed normalized dispatch receipt returned
@@ -248,6 +298,15 @@ impl ModuleContractTemplate {
             task_dispatch_admission_schema(),
             normalized_result_page_schema(),
         ]);
+        Ok(template)
+    }
+
+    /// TaskPrompt v1 is an additive command contract on Codex artifact v5.
+    /// Existing v1–v4 descriptor versions retain their immutable semantics.
+    pub fn codex_rust_controller_v5() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v4()?;
+        template.artifact.version = ArtifactVersion::new("5")?;
+        template.command_schemas.insert(task_prompt_schema());
         Ok(template)
     }
 

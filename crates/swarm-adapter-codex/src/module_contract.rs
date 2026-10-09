@@ -124,37 +124,41 @@ fn optional_env(name: &str) -> Result<Option<String>, AdapterError> {
 }
 
 fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
-    fn schema(id: &str, version: &str) -> SchemaDescriptor {
+    fn schema(id: &str) -> SchemaDescriptor {
         SchemaDescriptor {
             schema_id: id.to_owned(),
-            version: version.to_owned(),
+            version: "1".to_owned(),
             sha256: None,
         }
     }
-    let runtime_command = schema("swarm.runtime_command", "1");
-    let runtime_outcome = schema("swarm.runtime_outcome", "1");
-    let dispatch_context = schema("swarm.task_dispatch_context", "1");
-    let dispatch_admission = schema("swarm.task_dispatch_admission", "1");
-    let result_context = schema("swarm.normalized_result_context", "1");
-    let result_page = schema("swarm.normalized_result_page", "1");
-    (exact_schemas(
-        &claim.command_schemas,
-        std::slice::from_ref(&runtime_command),
-    ) && exact_schemas(&claim.event_schemas, std::slice::from_ref(&runtime_outcome)))
-        || (exact_schemas(
+    task_prompt_selected(claim).is_ok_and(|enabled| enabled)
+        && exact_schemas(
             &claim.command_schemas,
-            &[runtime_command.clone(), dispatch_context.clone()],
-        ) && exact_schemas(
+            &[
+                schema("swarm.runtime_command"),
+                schema("swarm.task_dispatch_context"),
+                schema("swarm.normalized_result_context"),
+                swarm_contracts::module_contract::task_prompt_schema(),
+            ],
+        )
+        && exact_schemas(
             &claim.event_schemas,
-            &[runtime_outcome.clone(), dispatch_admission.clone()],
-        ))
-        || (exact_schemas(
-            &claim.command_schemas,
-            &[runtime_command, dispatch_context, result_context],
-        ) && exact_schemas(
-            &claim.event_schemas,
-            &[runtime_outcome, dispatch_admission, result_page],
-        ))
+            &[
+                schema("swarm.runtime_outcome"),
+                schema("swarm.task_dispatch_admission"),
+                schema("swarm.normalized_result_page"),
+            ],
+        )
+}
+
+/// A v5 executable never accepts an unselected or unknown prompt schema.
+pub(crate) fn task_prompt_selected(claim: &ModuleContractClaim) -> Result<bool, AdapterError> {
+    swarm_contracts::module_contract::task_prompt_selected(
+        claim.command_schemas.iter(),
+        claim.event_schemas.iter(),
+        claim.capabilities.iter(),
+    )
+    .map_err(|_| AdapterError::HostProtocol)
 }
 
 fn exact_schemas(actual: &[SchemaDescriptor], expected: &[SchemaDescriptor]) -> bool {
@@ -193,7 +197,12 @@ pub(crate) fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
     let result_page = schema("swarm.normalized_result_page", "1");
     exact_schemas(
         &claim.command_schemas,
-        &[runtime_command, dispatch_context, result_context],
+        &[
+            runtime_command,
+            dispatch_context,
+            result_context,
+            swarm_contracts::module_contract::task_prompt_schema(),
+        ],
     ) && exact_schemas(
         &claim.event_schemas,
         &[runtime_outcome, dispatch_admission, result_page],

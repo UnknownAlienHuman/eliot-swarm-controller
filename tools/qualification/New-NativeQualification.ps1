@@ -653,10 +653,10 @@ function Get-AdapterContract {
         }
         'Codex' {
             return [pscustomobject]@{
-                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '4'; runtime = 'codex';
+                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '5'; runtime = 'codex';
                 build_package = 'swarm-adapter-codex'; build_target = 'swarm-codex-adapter';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send', 'task.dispatch');
-                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = 'modelProvider'; model_field = 'model'; effort_field = $null;
