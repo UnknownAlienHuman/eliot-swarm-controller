@@ -1,6 +1,6 @@
 # R52. SQLite writer bootstrap: caller timeout from the first query, verification before commit
 
-**Status:** production slice implemented on this branch; qualification is blocked by the repository-wide formatting gate tracked in #76. Tests remain in the final product phase.
+**Status:** production slice implemented and qualified by rustfmt plus changed-line Clippy on Ubuntu and Windows. Tests remain in the final product phase.
 
 **Source baseline:** `40591a295af94b1541ec2ba30afe8e3247701a71`. Primary path: `crates/swarm-store/src/lib.rs::open_writer_inner`.
 
@@ -189,7 +189,7 @@ No compatibility branch preserves the old ordering.
 
 ## 10. Cross-PR ownership
 
-- #76 owns the CI separation needed to obtain strict Clippy even while unrelated rustfmt debt exists.
+- #76 landed the independent rustfmt/Clippy attribution gate used for this qualification; it is no longer an implementation dependency.
 - #63 owns DataRoot/state markers, not SQLite connection configuration.
 - #71 owns optional supervisors, not Store bootstrap.
 - #60 owns automation-domain savepoints after a successful Store open.
@@ -198,15 +198,13 @@ R52 owns only `swarm-store` opening/configuration and its eventual narrow integr
 
 ## 11. Gate and current evidence
 
-Required minimal code gate:
+Exact head `f9cf53687335e3ea5962a44680738e8227ddafd0`, workflow run `37881420236`:
 
-```sh
-cargo clippy --locked \
-  -p swarm-store \
-  -p swarm-kernel-host \
-  --lib --bins -- -D warnings
-```
+- changed-path/package classification passed;
+- documentation and changed-file rustfmt validation passed;
+- the selected package plus its real local reverse-dependency closure compiled and completed Clippy on Ubuntu;
+- the same scoped compiler/Clippy gate passed on Windows;
+- no compiler error or warning owned by a changed Rust line remained;
+- unrelated historical warnings, if any, were reported separately rather than attributed to this slice.
 
-Current GitHub workflow reaches package classification and documentation validation, then fails package-wide rustfmt on unrelated historical `swarm-kernel-host` files before Clippy. The one rustfmt change reported in this branch's `swarm-store/src/lib.rs` was corrected in the next commit. Do not report Clippy as passed or failed until #76 makes that stage independent.
-
-Broad tests, locked-database behavior and cross-platform lock qualification remain the final phase.
+Changed integration tests were correctly skipped because this slice changes no integration test target. Broad tests, locked-database behavior and cross-platform lock qualification remain the final product phase.
