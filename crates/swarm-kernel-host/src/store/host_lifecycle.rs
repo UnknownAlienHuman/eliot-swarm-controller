@@ -111,6 +111,63 @@ struct Exit {
     retry_authorized: bool,
 }
 
+/// One closed serialization authority for the paired host terminal events.
+/// Detailed error codes remain only in the retained Exit receipt.
+#[derive(Debug, Serialize)]
+struct HostTerminalFact {
+    schema_version: u8,
+    phase: &'static str,
+    status: &'static str,
+    occurrence_id: String,
+    host_epoch: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_category: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_supervisor: Option<String>,
+}
+
+impl HostTerminalFact {
+    fn from_exit(receipt: &Exit, host_epoch: i64) -> Result<Self> {
+        let status = if receipt.error_code.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        let failed_supervisor = receipt.failed_supervisor.clone();
+        let category_valid = receipt.failure_category.is_none_or(|category| {
+            category.valid_for(receipt.error_code.as_deref(), failed_supervisor.is_some())
+        });
+        let supervisor_valid = failed_supervisor.as_deref().is_none_or(is_known_supervisor);
+        if host_epoch <= 0
+            || !category_valid
+            || !supervisor_valid
+            || (status == "failed") != receipt.failure_category.is_some()
+        {
+            return Err(Error::new(
+                "SYSTEM_EVENT_INVALID",
+                "host terminal fact identity or category is invalid",
+            ));
+        }
+        Ok(Self {
+            schema_version: 1,
+            phase: "host_terminal_exit_observed",
+            status,
+            occurrence_id: format!("host-terminal-exit:{host_epoch}"),
+            host_epoch,
+            failure_category: receipt.failure_category.map(FailureCategory::as_str),
+            failed_supervisor,
+        })
+    }
+
+    fn payload_json(&self) -> Result<String> {
+        model::canonical(&serde_json::to_value(self)?)
+    }
+
+    fn is_failure(&self) -> bool {
+        self.status == "failed"
+    }
+}
+
 pub(super) fn is_known_supervisor(name: &str) -> bool {
     SUPERVISORS.contains(&name)
 }
@@ -177,38 +234,27 @@ fn retain_exit(
             format!("interrupted:{previous_epoch}:{current_epoch}"),
         )
     } else if let Some(host_epoch) = receipt.host_epoch {
-        let phase = "host_terminal_exit_observed";
-        let occurrence_id = format!("host-terminal-exit:{host_epoch}");
-        let status = if receipt.error_code.is_some() {
-            "failed"
-        } else {
-            "completed"
-        };
-        let mut observation = json!({
-            "schema_version":1,
-            "phase":phase,
-            "status":status,
-            "occurrence_id":occurrence_id,
-            "host_epoch":host_epoch
-        });
-        // Detailed codes remain in LAST_EXIT/LATEST_FAILURE. The paired
-        // terminal events must share the closed, diagnostic-free payload.
-        if let Some(category) = receipt.failure_category {
-            observation["failure_category"] = json!(category.as_str());
-        }
-        if let Some(name) = receipt.failed_supervisor.as_deref() {
-            observation["failed_supervisor"] = json!(name);
-        }
-        if let Some(category) = receipt.failure_category {
-            super::insert_safe_host_terminal_failure_event(
-                tx,
-                host_epoch,
-                category.as_str(),
-                receipt.failed_supervisor.as_deref(),
-                receipt.observed_at_ms,
+        let fact = HostTerminalFact::from_exit(receipt, host_epoch)?;
+        let payload_json = fact.payload_json()?;
+        if fact.is_failure() {
+            tx.execute(
+                "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:host-lifecycle',?1,NULL,'host.failed',?2,?3)",
+                params![
+                    format!("failed:{host_epoch}"),
+                    &payload_json,
+                    receipt.observed_at_ms
+                ],
             )?;
         }
-        (observation, format!("terminal:{host_epoch}"))
+        tx.execute(
+            "INSERT INTO observations(source_stream_id,source_event_key,kind,payload_json,recorded_at_ms) VALUES('controller:host-lifecycle',?1,'host.exit',?2,?3)",
+            params![
+                format!("terminal:{host_epoch}"),
+                &payload_json,
+                receipt.observed_at_ms
+            ],
+        )?;
+        return Ok(());
     } else {
         (
             value.clone(),
