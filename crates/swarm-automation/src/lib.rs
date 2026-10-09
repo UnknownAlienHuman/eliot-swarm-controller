@@ -354,14 +354,18 @@ pub fn service_owner_family_empty(
             "scheduler owner family identity is invalid",
         ));
     }
-    let identity = identity.clone();
     #[cfg(windows)]
     {
+        let mut identity = identity.clone();
         identity["job_name"] = serde_json::json!(format!(
             "Global\\EliotSwarmService-AutomationScheduler-{service_owner_token}"
         ));
+        return swarm_process::departed_empty(&identity, service_owner_token);
     }
-    swarm_process::departed_empty(&identity, service_owner_token)
+    #[cfg(not(windows))]
+    {
+        swarm_process::departed_empty(identity, service_owner_token)
+    }
 }
 
 fn service_owner_group_identity_shape(identity: &serde_json::Value) -> bool {

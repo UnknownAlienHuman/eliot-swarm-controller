@@ -382,9 +382,9 @@ fn propose(
             "assignment_id differs from the authenticated Attempt participation basis",
         ));
     }
-    let attempt = tasks::get_attempt(tx, &attempt_id)?;
+    tasks::get_attempt(tx, attempt_id)?;
     let scope_intent_id = format!("cscope-{}", model::new_id());
-    let sequence = next_task_sequence(tx, &task_id)?;
+    let sequence = next_task_sequence(tx, task_id)?;
     let proposal = json!({
         "mode":request.mode.as_str(),
         "paths":request.paths,
@@ -423,7 +423,7 @@ fn propose(
     set_meta(tx, &record_key(&scope_intent_id)?, &record)?;
     set_meta(
         tx,
-        &task_page_key(&task_id, sequence)?,
+        &task_page_key(task_id, sequence)?,
         &json!({"task_id":task_id,"scope_intent_id":scope_intent_id,"sequence":sequence}),
     )?;
     Ok(json!({
