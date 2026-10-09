@@ -354,7 +354,7 @@ pub fn service_owner_family_empty(
             "scheduler owner family identity is invalid",
         ));
     }
-    let mut identity = identity.clone();
+    let identity = identity.clone();
     #[cfg(windows)]
     {
         identity["job_name"] = serde_json::json!(format!(
