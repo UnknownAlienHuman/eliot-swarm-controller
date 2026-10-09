@@ -24,14 +24,12 @@ croner = { version = "4", features = ["chrono"] }
 eventsource-stream = "=0.2.3"
 futures-util = { version = "0.3", features = ["sink"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
-rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 swarm-client = { path = "../swarm-client" }
 swarm-bus = { path = "../swarm-bus" }
 swarm-automation = { path = "../swarm-automation" }
 swarm-contracts = { path = "../swarm-contracts" }
 swarm-kernel = { path = "../swarm-kernel" }
-swarm-mcp = { path = "../swarm-mcp" }
 swarm-process = { path = "../swarm-process" }
 swarm-script-worker = { path = "../swarm-script-worker" }
 swarm-scripts = { path = "../swarm-scripts" }
@@ -48,6 +46,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
+swarm-mcp = { path = "../swarm-mcp" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_Pipes", "Win32_Storage_FileSystem"] }

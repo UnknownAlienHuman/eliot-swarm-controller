@@ -254,7 +254,7 @@ pub(crate) fn watch_creator_authorized_for_subject(
             Err(error) => Err(error),
         },
         "manager" => Ok(attempt["owner_id"] == creator_id
-            || gm::record(db)?.is_some_and(|record| record["client_id"] == creator_id)),
+            || gm::read_current(db)?.is_some_and(|current| current.client_id == creator_id)),
         "participant" => {
             if registration["task_id"] != task_id
                 || registration["task_revision"] != task_revision
@@ -415,8 +415,8 @@ pub(crate) fn watch_scope_for_creator(
                 }
             } else {
                 let is_attempt_owner = attempt["owner_id"] == creator_id;
-                let is_current_gm = gm::record(db)?
-                    .is_some_and(|designation| designation["client_id"] == creator_id);
+                let is_current_gm =
+                    gm::read_current(db)?.is_some_and(|current| current.client_id == creator_id);
                 is_attempt_owner || is_current_gm
             };
             if !authorized {
@@ -747,6 +747,17 @@ pub(super) fn apply(
         }
         "coordination.contract.respond" => {
             respond_contract(tx, principal, value, operation_id, now).map(|value| (value, false))
+        }
+        "coordination.contract.ratify" | "coordination.contract.reject" => {
+            super::coordination_threads::apply_contract_decision(
+                tx,
+                principal,
+                method,
+                value,
+                operation_id,
+                now,
+            )
+            .map(|value| (value, false))
         }
         "coordination.send" => {
             send(tx, principal, value, config, operation_id, now).map(|value| (value, false))
@@ -3270,46 +3281,17 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             "gaps":[],
         }));
     }
-    let after_key = if let Some(operation_id) = after.as_deref() {
-        let row: Option<(i64, String)> = db
-            .query_row(
-                "SELECT created_at_ms,result_json FROM operations \
-                 WHERE operation_id=?1 AND caller_id<>?2 \
-                   AND method IN ('coordination.send','coordination.consult') \
-                   AND state='settled' AND json_extract(result_json,'$.recipient')=?2",
-                params![operation_id, principal.client_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (created_at_ms, result_json) = row.ok_or_else(|| {
-            Error::invalid(
-                "after_operation_id must identify a retained delivery to this participant",
-            )
-        })?;
-        let result: Value = serde_json::from_str(&result_json)?;
-        if !delivery_matches_scope(&result, &scope, &principal.client_id)? {
-            return Err(Error::invalid(
-                "after_operation_id is not a delivery in the authenticated exact scope",
-            ));
-        }
-        let key = keys::mailbox_key(
-            &scope.scope_id,
-            &principal.client_id,
-            created_at_ms,
-            operation_id,
-        );
-        if meta(db, &key)?.is_none() {
-            return Err(Error::invalid(
-                "after_operation_id has no retained scoped inbox index",
-            ));
-        }
-        Some(key)
-    } else {
-        None
-    };
+    // Cursors stay Operation IDs. Resolve them through the immutable position
+    // marker and exact scoped index keys; never scan the mailbox to reconstruct
+    // a cursor left by a stale-filtered page.
+    let after_key = after
+        .as_deref()
+        .map(|operation_id| inbox_cursor_key(db, &scope, &principal.client_id, operation_id))
+        .transpose()?;
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
     let prefix = keys::mailbox_prefix(&scope.scope_id, &principal.client_id);
-    let upper = format!("{prefix}g");
+    // Legacy timestamp keys and v2 read-position keys both sort below `z`.
+    let upper = format!("{prefix}z");
     let (lower, comparison) = match after_key {
         Some(key) => (key, ">"),
         None => (prefix, ">="),
@@ -3326,14 +3308,57 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
     let scan_more = rows.len() as i64 > scan_limit;
     let mut messages = Vec::new();
     let mut stale = 0usize;
-    let mut last_operation = None;
+    // Advance only through rows actually examined. In particular, a valid
+    // item excluded by the item budget remains the first row on the next page.
+    let mut last_examined_operation: Option<String> = None;
     let mut more = false;
-    for (_, raw_index) in rows.iter().take(scan_limit as usize) {
+    for (key, raw_index) in rows.iter().take(scan_limit as usize) {
         let index: Value = serde_json::from_str(raw_index)?;
         let Some(operation_id) = index.get("operation_id").and_then(Value::as_str) else {
-            stale = stale.saturating_add(1);
-            continue;
+            return Err(Error::new(
+                "INBOX_INDEX_DAMAGED",
+                "scoped inbox index has no Operation ID",
+            ));
         };
+        let Some((position, indexed_at_ms)) = operation_read_position(db, operation_id)? else {
+            return Err(Error::new(
+                "INBOX_INDEX_DAMAGED",
+                "scoped inbox index has no Operation read-position marker",
+            ));
+        };
+        let position_key = mailbox_position_key(
+            &scope.scope_id,
+            &principal.client_id,
+            position,
+            operation_id,
+        );
+        let legacy_key = keys::mailbox_key(
+            &scope.scope_id,
+            &principal.client_id,
+            indexed_at_ms,
+            operation_id,
+        );
+        if position <= 0
+            || (key != &position_key && key != &legacy_key)
+            || index["created_at_ms"].as_i64() != Some(indexed_at_ms)
+            || (key == &position_key && index["read_position"].as_i64() != Some(position))
+        {
+            return Err(Error::new(
+                "INBOX_INDEX_DAMAGED",
+                "scoped inbox index key differs from its Operation position",
+            ));
+        }
+        let alternate_key = if key == &position_key {
+            &legacy_key
+        } else {
+            &position_key
+        };
+        if meta(db, alternate_key)?.is_some() {
+            return Err(Error::new(
+                "INBOX_INDEX_DAMAGED",
+                "Operation has duplicate legacy and read-position inbox indexes",
+            ));
+        }
         let operation: Option<(String, String, i64, String, String)> = db
             .query_row(
                 "SELECT method,caller_id,created_at_ms,original_request_json,result_json \
@@ -3354,6 +3379,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             .optional()?;
         let Some((method, sender, created_at, request_json, result_json)) = operation else {
             stale = stale.saturating_add(1);
+            last_examined_operation = Some(operation_id.to_owned());
             continue;
         };
         let result: Value = serde_json::from_str(&result_json)?;
@@ -3369,11 +3395,8 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             || (method == "coordination.send" && request["recipient"] != principal.client_id)
         {
             stale = stale.saturating_add(1);
+            last_examined_operation = Some(operation_id.to_owned());
             continue;
-        }
-        if messages.len() == limit as usize {
-            more = true;
-            break;
         }
         let envelope: Value = serde_json::from_str(model::text(&result, "text")?)?;
         let body_matches = if method == "coordination.send" {
@@ -3391,7 +3414,12 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
         };
         if !body_matches {
             stale = stale.saturating_add(1);
+            last_examined_operation = Some(operation_id.to_owned());
             continue;
+        }
+        if messages.len() == limit as usize {
+            more = true;
+            break;
         }
         messages.push(json!({
             "operation_id":operation_id,
@@ -3403,25 +3431,96 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             "kind":if method == "coordination.consult" { "consult" } else { "message" },
             "body":envelope["body"],
         }));
-        last_operation = Some(operation_id.to_owned());
+        last_examined_operation = Some(operation_id.to_owned());
     }
     let partial = scan_more || stale > 0 || more;
-    let next_after = if more || (scan_more && !messages.is_empty()) {
-        last_operation
-    } else {
-        None
-    };
+    let mut gaps = Vec::new();
+    if stale > 0 {
+        gaps.push(json!({"kind":"stale_mailbox_records","count":stale}));
+    }
+    if scan_more {
+        gaps.push(json!({"kind":"inbox_scan_bound","count":null}));
+    }
     Ok(json!({
         "items":messages,
         "task_id":scope.task["task_id"],
         "task_revision":scope.task["revision"],
         "attempt_id":scope.attempt["attempt_id"],
         "inbound_policy":scope.registration["inbound_policy"],
-        "next_after":next_after,
+        "next_after":last_examined_operation,
         "watch_notifications":watch_notifications,
         "coverage":if partial { "partial" } else { "complete" },
-        "gaps":if stale > 0 { json!([{"kind":"stale_mailbox_records","count":stale}]) } else if scan_more { json!([{"kind":"inbox_scan_bound","count":null}]) } else { json!([]) },
+        "gaps":gaps,
     }))
+}
+
+fn inbox_cursor_key(
+    db: &Connection,
+    scope: &ScopeData,
+    client_id: &str,
+    operation_id: &str,
+) -> Result<String> {
+    let Some((position, created_at_ms)) = operation_read_position(db, operation_id)? else {
+        return Err(Error::invalid(
+            "after_operation_id must identify a retained scoped inbox index",
+        ));
+    };
+    if position <= 0 {
+        return Err(Error::new(
+            "INBOX_INDEX_DAMAGED",
+            "Operation read-position marker is not positive",
+        ));
+    }
+    let position_key = mailbox_position_key(&scope.scope_id, client_id, position, operation_id);
+    let legacy_key = keys::mailbox_key(&scope.scope_id, client_id, created_at_ms, operation_id);
+    let position_index = meta(db, &position_key)?;
+    let legacy_index = meta(db, &legacy_key)?;
+    let (key, index, position_keyed) = match (position_index, legacy_index) {
+        (Some(_), Some(_)) => {
+            return Err(Error::new(
+                "INBOX_INDEX_DAMAGED",
+                "Operation has duplicate legacy and read-position inbox indexes",
+            ));
+        }
+        (Some(index), None) => (position_key, index, true),
+        (None, Some(index)) => (legacy_key, index, false),
+        (None, None) => {
+            return Err(Error::invalid(
+                "after_operation_id has no retained scoped inbox index",
+            ));
+        }
+    };
+    // The key prefix is already bound to this authenticated scope. Keep stale
+    // rows cursorable even when their copied scope fields are what made them
+    // stale; only the row identity and key position must still agree.
+    if index["operation_id"] != operation_id
+        || index["created_at_ms"].as_i64() != Some(created_at_ms)
+        || (position_keyed && index["read_position"].as_i64() != Some(position))
+    {
+        return Err(Error::invalid(
+            "after_operation_id is not an index row in the authenticated exact scope",
+        ));
+    }
+    Ok(key)
+}
+
+fn operation_read_position(db: &Connection, operation_id: &str) -> Result<Option<(i64, i64)>> {
+    Ok(db
+        .query_row(
+            "SELECT observation_id,recorded_at_ms FROM observations \
+             WHERE source_stream_id='controller:read-position:operation' AND source_event_key=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn mailbox_position_key(scope: &str, recipient: &str, position: i64, operation_id: &str) -> String {
+    format!(
+        "{}v2:{position:020}:{}",
+        keys::mailbox_prefix(scope, recipient),
+        keys::key_component(operation_id),
+    )
 }
 
 fn delivery_matches_scope(result: &Value, scope: &ScopeData, recipient: &str) -> Result<bool> {
@@ -3792,12 +3891,25 @@ fn send(
         ));
     }
     let recipient = model::text(&mailbox_result, "recipient")?;
-    let index_key = keys::mailbox_key(&sender.scope_id, recipient, now, operation_id);
+    let Some((read_position, _)) = operation_read_position(tx, operation_id)? else {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "admitted coordination Operation has no read-position marker",
+        ));
+    };
+    if read_position <= 0 {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "admitted coordination Operation has an invalid read-position marker",
+        ));
+    }
+    let index_key = mailbox_position_key(&sender.scope_id, recipient, read_position, operation_id);
     set_meta(
         tx,
         &index_key,
         &json!({
             "operation_id":operation_id,
+            "read_position":read_position,
             "sender":principal.client_id,
             "recipient":recipient,
             "task_id":sender.task["task_id"],
@@ -4297,10 +4409,195 @@ fn scoped_consult_result(
 }
 
 fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::coordination::contract::is_canonical_sha256(value)
+}
+
+pub(super) fn contract_decision_key(proposal_id: &str, revision_id: &str) -> String {
+    format!("coordination:contract-decision:{proposal_id}:{revision_id}")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ContractDecisionIdentity<'a> {
+    pub(super) thread_id: &'a str,
+    pub(super) task_id: &'a str,
+    pub(super) task_revision: i64,
+    pub(super) attempt_id: &'a str,
+    pub(super) proposal_id: &'a str,
+    pub(super) proposal_revision_id: &'a str,
+    pub(super) proposal_digest: &'a str,
+}
+
+pub(super) fn load_contract_decision(
+    db: &Connection,
+    identity: ContractDecisionIdentity<'_>,
+) -> Result<Option<Value>> {
+    let ContractDecisionIdentity {
+        thread_id,
+        task_id,
+        task_revision,
+        attempt_id,
+        proposal_id,
+        proposal_revision_id,
+        proposal_digest,
+    } = identity;
+    let Some(decision) = meta(
+        db,
+        &contract_decision_key(proposal_id, proposal_revision_id),
+    )?
+    else {
+        return Ok(None);
+    };
+    let decision_kind = match decision.get("decision").and_then(Value::as_str) {
+        Some("ratified") => "ratified",
+        Some("rejected") => "rejected",
+        _ => {
+            return Err(Error::new(
+                "CONTRACT_DECISION_DAMAGED",
+                "retained contract decision has an invalid decision kind",
+            ));
+        }
+    };
+    let expected_method = match decision_kind {
+        "ratified" => "coordination.contract.ratify",
+        "rejected" => "coordination.contract.reject",
+        _ => unreachable!(),
+    };
+    let observation_id = decision["observation_id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "CONTRACT_DECISION_DAMAGED",
+                "retained contract decision has no exact Observation",
+            )
+        })?;
+    let operation_id = model::text(&decision, "decision_operation_id")?;
+    struct ContractDecisionObservationRow {
+        source_stream_id: String,
+        source_event_key: Option<String>,
+        operation_id: Option<String>,
+        kind: String,
+        payload_json: String,
+        recorded_at_ms: i64,
+    }
+    let observation: Option<ContractDecisionObservationRow> = db
+        .query_row(
+            "SELECT source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms FROM observations WHERE observation_id=?1",
+            [observation_id],
+            |row| {
+                Ok(ContractDecisionObservationRow {
+                    source_stream_id: row.get(0)?,
+                    source_event_key: row.get(1)?,
+                    operation_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    recorded_at_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(observation) = observation else {
+        return Err(Error::new(
+            "CONTRACT_DECISION_DAMAGED",
+            "retained contract decision Observation is missing",
+        ));
+    };
+    let payload: Value = serde_json::from_str(&observation.payload_json)?;
+    let expected_observation_kind = match decision_kind {
+        "ratified" => "coordination.contract_ratified",
+        "rejected" => "coordination.contract_rejected",
+        _ => unreachable!(),
+    };
+    let expected_payload = json!({
+        "thread_id":thread_id,
+        "proposal_id":proposal_id,
+        "proposal_revision_id":proposal_revision_id,
+        "decision_operation_id":operation_id,
+    });
+    if observation.source_stream_id != format!("coordination:proposal:{proposal_id}")
+        || observation.source_event_key.as_deref()
+            != Some(&format!("decision:{proposal_revision_id}"))
+        || observation.operation_id.as_deref() != Some(operation_id)
+        || observation.kind != expected_observation_kind
+        || payload != expected_payload
+        || decision["created_at_ms"].as_i64() != Some(observation.recorded_at_ms)
+    {
+        return Err(Error::new(
+            "CONTRACT_DECISION_DAMAGED",
+            "retained contract decision Observation identity is inconsistent",
+        ));
+    }
+    let authority_kind = decision["authority_basis"]["kind"].as_str();
+    let authority_valid = match authority_kind {
+        Some("local_operator") => {
+            decision["actor"]["role"] == "operator"
+                && decision["authority_basis"]["gm_epoch"].is_null()
+        }
+        Some("attempt_owner") => {
+            decision["actor"]["role"] == "manager"
+                && decision["actor"]["client_id"] == decision["attempt_owner_id"]
+                && decision["authority_basis"]["gm_epoch"].is_null()
+        }
+        Some("current_gm") => {
+            decision["actor"]["role"] == "manager"
+                && decision["authority_basis"]["gm_epoch"]
+                    .as_i64()
+                    .is_some_and(|epoch| epoch > 0)
+        }
+        _ => false,
+    };
+    if decision["schema_version"] != 1
+        || decision["record_type"] != "contract_decision"
+        || decision["thread_id"] != thread_id
+        || decision["task_id"] != task_id
+        || decision["task_revision"] != task_revision
+        || decision["attempt_id"] != attempt_id
+        || decision["proposal_id"] != proposal_id
+        || decision["proposal_revision_id"] != proposal_revision_id
+        || decision["proposal_revision"]
+            .as_i64()
+            .is_none_or(|revision| revision <= 0)
+        || decision["proposal_digest"] != proposal_digest
+        || decision["thread_state_revision"]
+            .as_i64()
+            .is_none_or(|revision| revision <= 0)
+        || decision["scope_coverage"] != "complete"
+        || !decision["affected_scope_revisions"].is_array()
+        || decision["created_at_ms"]
+            .as_i64()
+            .is_none_or(|created| created <= 0)
+        || !authority_valid
+        || decision["model_work_started"] != false
+        || decision["native_execution"] != false
+    {
+        return Err(Error::new(
+            "CONTRACT_DECISION_DAMAGED",
+            "retained contract decision identity or scope is inconsistent",
+        ));
+    }
+    let operation = operations::get_operation(db, operation_id)?;
+    let result = &operation["result"];
+    if operation["method"] != expected_method
+        || operation["state"] != "settled"
+        || operation["task_id"] != task_id
+        || operation["attempt_id"] != attempt_id
+        || result["operation_id"] != operation_id
+        || result["decision"] != decision_kind
+        || result["thread_id"] != thread_id
+        || result["task_id"] != task_id
+        || result["task_revision"] != task_revision
+        || result["attempt_id"] != attempt_id
+        || result["proposal_id"] != proposal_id
+        || result["proposal_revision_id"] != proposal_revision_id
+        || result["proposal_digest"] != proposal_digest
+        || result["decision_observation_id"] != observation_id
+    {
+        return Err(Error::new(
+            "CONTRACT_DECISION_DAMAGED",
+            "contract decision does not match its settled producer Operation",
+        ));
+    }
+    Ok(Some(decision))
 }
 
 fn load_contract_proposal_revision_with_head(
@@ -4828,6 +5125,18 @@ fn contract_get(db: &Connection, principal: &Principal, value: &Value) -> Result
             "proposal revision is outside this proposal identity",
         ));
     }
+    let decision = load_contract_decision(
+        db,
+        ContractDecisionIdentity {
+            thread_id: &context.thread_id,
+            task_id: &context.task_id,
+            task_revision: context.task_revision,
+            attempt_id: &context.attempt_id,
+            proposal_id: &request.proposal_id,
+            proposal_revision_id: &request.proposal_revision_id,
+            proposal_digest: model::text(&revision, "proposal_digest")?,
+        },
+    )?;
     let prefix = proposal_response_page_prefix(&request.proposal_id, &request.proposal_revision_id);
     let upper = format!("{prefix}g");
     let (lower, comparison) = match request.after_observation_id {
@@ -4876,6 +5185,8 @@ fn contract_get(db: &Connection, principal: &Principal, value: &Value) -> Result
         "proposal_digest": revision["proposal_digest"],
         "proposal": revision["proposal"],
         "revision_metadata": revision,
+        "decision": decision,
+        "decision_coverage": "complete_for_revision",
         "responses": responses,
         "next_after_observation_id": next_after_observation_id,
         "coverage": if has_more { "partial" } else { "complete" },
@@ -4944,6 +5255,27 @@ fn contract_list(db: &Connection, principal: &Principal, value: &Value) -> Resul
                 "proposal header differs from its current canonical revision",
             ));
         }
+        let decision = load_contract_decision(
+            db,
+            ContractDecisionIdentity {
+                thread_id: &context.thread_id,
+                task_id: &context.task_id,
+                task_revision: context.task_revision,
+                attempt_id: &context.attempt_id,
+                proposal_id,
+                proposal_revision_id: latest_revision_id,
+                proposal_digest: model::text(&latest, "proposal_digest")?,
+            },
+        )?;
+        let latest_decision = match decision {
+            Some(decision) => json!({
+                "kind":decision["decision"],
+                "proposal_revision_id":decision["proposal_revision_id"],
+                "decision_operation_id":decision["decision_operation_id"],
+                "created_at_ms":decision["created_at_ms"],
+            }),
+            None => Value::Null,
+        };
         last_sequence = page["proposal_sequence"].as_i64();
         items.push(json!({
             "proposal_id": header["proposal_id"],
@@ -4955,6 +5287,7 @@ fn contract_list(db: &Connection, principal: &Principal, value: &Value) -> Resul
             "proposal_sequence": header["proposal_sequence"],
             "sponsor_owner_id": header["sponsor_owner_id"],
             "updated_at_ms": header["updated_at_ms"],
+            "latest_decision": latest_decision,
         }));
     }
     Ok(json!({
@@ -4970,12 +5303,39 @@ fn authorize_contract_operation_read(
     principal: &Principal,
     operation_id: &str,
 ) -> Result<Option<Value>> {
-    let raw: Option<(String, String, String, Option<String>, Option<String>, Option<String>, Option<i64>, String, Option<String>)> = db.query_row(
-        "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,original_request_json,result_json FROM operations WHERE operation_id=?1",
-        [operation_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
-    ).optional()?;
-    let Some((
+    struct ContractOperationReadRow {
+        caller_id: String,
+        method: String,
+        state: String,
+        task_id: Option<String>,
+        attempt_id: Option<String>,
+        binding_id: Option<String>,
+        binding_generation: Option<i64>,
+        original_request_json: String,
+        result_json: Option<String>,
+        effective_request_json: String,
+    }
+    let raw: Option<ContractOperationReadRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,original_request_json,result_json,effective_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok(ContractOperationReadRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    state: row.get(2)?,
+                    task_id: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    binding_id: row.get(5)?,
+                    binding_generation: row.get(6)?,
+                    original_request_json: row.get(7)?,
+                    result_json: row.get(8)?,
+                    effective_request_json: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(ContractOperationReadRow {
         caller_id,
         method,
         state,
@@ -4983,15 +5343,19 @@ fn authorize_contract_operation_read(
         attempt_id,
         binding_id,
         binding_generation,
-        original_request,
+        original_request_json: original_request,
         result_json,
-    )) = raw
+        effective_request_json: effective_request,
+    }) = raw
     else {
         return Ok(None);
     };
     if !matches!(
         method.as_str(),
-        "coordination.contract.propose" | "coordination.contract.respond"
+        "coordination.contract.propose"
+            | "coordination.contract.respond"
+            | "coordination.contract.ratify"
+            | "coordination.contract.reject"
     ) {
         return Ok(None);
     }
@@ -5044,6 +5408,88 @@ fn authorize_contract_operation_read(
             "Operation is outside the retained Thread scope",
         ));
     }
+    let result: Value = serde_json::from_str(result_json.as_deref().ok_or_else(|| {
+        Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "settled contract Operation has no result",
+        )
+    })?)?;
+    if matches!(
+        method.as_str(),
+        "coordination.contract.ratify" | "coordination.contract.reject"
+    ) {
+        let decision_request =
+            crate::coordination::contract::parse_decision_request(&method, &request)?;
+        if decision_request.thread_id != context.thread_id
+            || decision_request.task_id != context.task_id
+            || decision_request.task_revision != context.task_revision
+            || decision_request.attempt_id != context.attempt_id
+        {
+            return Err(Error::new(
+                "NOT_FOUND",
+                "contract decision Operation is outside the retained Thread scope",
+            ));
+        }
+        let effective: Value = serde_json::from_str(&effective_request)?;
+        let expected_scope = json!({
+            "kind":"contract_thread",
+            "thread_id":context.thread_id,
+            "task_id":context.task_id,
+            "task_revision":context.task_revision,
+            "attempt_id":context.attempt_id,
+        });
+        if effective.get("coordination_scope") != Some(&expected_scope) {
+            return Err(Error::new(
+                "NOT_FOUND",
+                "contract decision Operation lacks its exact retained contract Thread scope",
+            ));
+        }
+        let revision = load_contract_proposal_revision(
+            db,
+            &context.thread_id,
+            &context.task_id,
+            context.task_revision,
+            &context.attempt_id,
+            &decision_request.proposal_revision_id,
+        )?;
+        let decision = load_contract_decision(
+            db,
+            ContractDecisionIdentity {
+                thread_id: &context.thread_id,
+                task_id: &context.task_id,
+                task_revision: context.task_revision,
+                attempt_id: &context.attempt_id,
+                proposal_id: &decision_request.proposal_id,
+                proposal_revision_id: &decision_request.proposal_revision_id,
+                proposal_digest: &decision_request.proposal_digest,
+            },
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "NOT_FOUND",
+                "contract decision Operation has no retained decision record",
+            )
+        })?;
+        if revision["proposal_id"] != decision_request.proposal_id
+            || revision["proposal_digest"] != decision_request.proposal_digest
+            || decision["decision_operation_id"] != operation_id
+            || decision["decision"] != decision_request.kind.as_str()
+            || decision["thread_state_revision"] != decision_request.expected_state_revision
+            || decision["actor"]["client_id"] != caller_id
+            || decision["reason"] != decision_request.reason
+            || decision["conditions"] != json!(decision_request.conditions)
+            || decision["caveats"] != json!(decision_request.caveats)
+            || decision["affected_scope_revisions"]
+                != json!(decision_request.affected_scope_revisions)
+            || result["decision"] != decision_request.kind.as_str()
+        {
+            return Err(Error::new(
+                "NOT_FOUND",
+                "contract decision Operation differs from its retained decision record",
+            ));
+        }
+        return Ok(Some(operations::get_operation(db, operation_id)?));
+    }
     super::coordination_threads::require_thread_participant(&context, principal).map_err(|_| {
         Error::new(
             "NOT_FOUND",
@@ -5069,12 +5515,6 @@ fn authorize_contract_operation_read(
                 "Operation author is outside the retained Thread roster",
             )
         })?;
-    let result: Value = serde_json::from_str(result_json.as_deref().ok_or_else(|| {
-        Error::new(
-            "COORDINATION_INDEX_CORRUPT",
-            "settled contract Operation has no result",
-        )
-    })?)?;
     match method.as_str() {
         "coordination.contract.propose" => {
             let proposal_id = model::text(&result, "proposal_id")?;

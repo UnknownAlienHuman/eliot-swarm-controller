@@ -4,7 +4,6 @@
 
 use super::{coordination, meta, set_meta, tasks};
 use crate::{
-    coordination as keys,
     coordination::concilium::{
         CloseRequest, ConciliumRequest, ListRequest, OpenRequest, ParticipantPosition,
         ParticipantRef, PositionSubmitRequest, ProposeRequest, RoundAdvanceRequest,
@@ -14,7 +13,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::concilium_limits as limits;
 
 const SCHEMA: &str = "eliot.concilium.v1";
@@ -646,12 +645,7 @@ fn close(
     let result = request.result.as_str();
     let recommendation = &request.recommendation;
     let manager_reason = &request.manager_reason;
-    let valid_slots: Vec<&Value> = record["slots"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|slot| slot["state"] == "submitted" && slot["position"].is_object())
-        .collect();
+    let valid_slots = latest_position_slots(&record)?;
     if matches!(result, "recommended" | "minority_report") && valid_slots.is_empty() {
         return Err(Error::invalid(
             "a completed advisory result requires at least one valid position",
@@ -667,6 +661,7 @@ fn close(
         .filter_map(|slot| slot.get("slot_id").cloned())
         .collect();
     let unresolved_questions = collect_unresolved_questions(&valid_slots);
+    let valid_position_count = valid_slots.len();
     let rounds_used = record["current_round"].as_i64().unwrap_or(0);
     let state = match result {
         "recommended" | "minority_report" => "completed",
@@ -675,6 +670,8 @@ fn close(
         "failed" => "failed",
         _ => unreachable!(),
     };
+    drop(valid_slots);
+    close_open_rounds_and_pending_slots(&mut record, now)?;
     record["manager_result"] = json!({
         "class":result,
         "recommendation":recommendation,
@@ -682,7 +679,7 @@ fn close(
         "position_operation_ids":position_operation_ids,
         "dissent_slot_ids":dissent_slot_ids,
         "unresolved_questions":unresolved_questions,
-        "valid_position_count":valid_slots.len(),
+        "valid_position_count":valid_position_count,
         "rounds_used":rounds_used,
         "closed_by":{"client_id":principal.client_id,"role":role_name(&principal.role)},
         "manager_reason":manager_reason,
@@ -1060,6 +1057,11 @@ fn require_exact_live_slot(
     packet_digest: &str,
 ) -> Result<()> {
     principal.require_participant()?;
+    if is_terminal(&record["status"]) {
+        return Err(Error::conflict(
+            "a terminal Concilium cannot accept another position",
+        ));
+    }
     if !value_text_is(
         &slot["participant_actor"]["client_id"],
         &principal.client_id,
@@ -1121,6 +1123,81 @@ fn seal_round(record: &mut Value, round: i64, now: i64) -> Result<()> {
         entry["closed_at_ms"] = json!(now);
     }
     Ok(())
+}
+
+fn close_open_rounds_and_pending_slots(record: &mut Value, now: i64) -> Result<()> {
+    let rounds = record["rounds"]
+        .as_array_mut()
+        .ok_or_else(|| damaged("Concilium round history is missing"))?;
+    for round in rounds {
+        if round["status"] == "open" {
+            round["status"] = json!("closed");
+            round["closed_at_ms"] = json!(now);
+        }
+    }
+    let slots = record["slots"]
+        .as_array_mut()
+        .ok_or_else(|| damaged("Concilium slot history is missing"))?;
+    for slot in slots {
+        if slot["state"] == "pending" {
+            slot["state"] = json!("cancelled");
+            slot["closed_at_ms"] = json!(now);
+        }
+    }
+    Ok(())
+}
+
+fn latest_position_slots(record: &Value) -> Result<Vec<&Value>> {
+    let slots = record["slots"]
+        .as_array()
+        .ok_or_else(|| damaged("Concilium slot history is missing"))?;
+    let mut latest = BTreeMap::<String, (i64, &Value)>::new();
+    let mut seen_rounds = BTreeSet::new();
+    for slot in slots {
+        if slot["state"] != "submitted" {
+            continue;
+        }
+        if !slot["position"].is_object() {
+            return Err(damaged("submitted Concilium slot has no retained position"));
+        }
+        let participant_id = model::text(&slot["participant_actor"], "client_id")?.to_owned();
+        let round = model::positive(slot, "round")?;
+        model::text(slot, "response_operation_id")?;
+        model::text(slot, "slot_id")?;
+        if !seen_rounds.insert((participant_id.clone(), round)) {
+            return Err(damaged(
+                "Participant has multiple submitted slots in one Concilium round",
+            ));
+        }
+        if let Some((latest_round, _)) = latest.get(&participant_id) {
+            if *latest_round > round {
+                continue;
+            }
+        }
+        latest.insert(participant_id, (round, slot));
+    }
+    Ok(latest.into_values().map(|(_, slot)| slot).collect())
+}
+
+fn latest_positions_view(record: &Value, only_client_id: Option<&str>) -> Result<Vec<Value>> {
+    latest_position_slots(record)?
+        .into_iter()
+        .filter(|slot| {
+            only_client_id.is_none_or(|client_id| {
+                value_text_is(&slot["participant_actor"]["client_id"], client_id)
+            })
+        })
+        .map(|slot| {
+            Ok(json!({
+                "participant_actor":slot["participant_actor"],
+                "round":slot["round"],
+                "slot_id":model::text(slot, "slot_id")?,
+                "response_operation_id":model::text(slot, "response_operation_id")?,
+                "packet_digest":slot["packet_digest"],
+                "position":slot["position"],
+            }))
+        })
+        .collect()
 }
 
 fn next_state_revision(record: &Value) -> Result<i64> {
@@ -1518,6 +1595,10 @@ fn project_page(
     after_slot_id: Option<&str>,
 ) -> Result<Value> {
     let manager_view = is_manager_reader(db, principal, record)?;
+    let latest_positions = latest_positions_view(
+        record,
+        (!manager_view).then_some(principal.client_id.as_str()),
+    )?;
     let all_slots = record["slots"]
         .as_array()
         .ok_or_else(|| damaged("Concilium slots are missing"))?;
@@ -1559,6 +1640,7 @@ fn project_page(
     };
     let mut projection = record.clone();
     projection["slots"] = json!(slots);
+    projection["latest_positions"] = json!(latest_positions);
     projection["next_after_slot_id"] = next_after;
     projection["coverage"] = json!(if has_more { "partial" } else { "complete" });
     if !manager_view {

@@ -14,17 +14,9 @@ pub(crate) const MAX_PROPOSAL_BYTES: usize = limits::MAX_COORDINATION_REQUEST_BY
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProposalRequest {
-    pub client_request_id: String,
     pub thread_id: String,
     pub supersedes_revision_id: Option<String>,
     pub topic: String,
-    pub affected: Value,
-    pub statement: Value,
-    pub acceptance_conditions: Vec<String>,
-    /// Tool Contracts v1 does not define claim item semantics. Preserve bounded
-    /// JSON exactly; do not infer authority or interpret claims as decisions.
-    pub claims: Vec<Value>,
-    pub open_questions: Vec<String>,
     pub canonical_body: Value,
     pub digest: String,
 }
@@ -50,7 +42,6 @@ impl ResponseAct {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseRequest {
-    pub client_request_id: String,
     pub thread_id: String,
     pub proposal_id: String,
     pub proposal_revision_id: String,
@@ -82,6 +73,196 @@ pub(crate) struct ListRequest {
     pub limit: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionKind {
+    Ratified,
+    Rejected,
+}
+
+impl DecisionKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ratified => "ratified",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub(crate) fn observation_kind(self) -> &'static str {
+        match self {
+            Self::Ratified => "coordination.contract_ratified",
+            Self::Rejected => "coordination.contract_rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DecisionRequest {
+    pub kind: DecisionKind,
+    pub thread_id: String,
+    pub expected_state_revision: i64,
+    pub proposal_id: String,
+    pub proposal_revision_id: String,
+    pub proposal_digest: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub affected_scope_revisions: Vec<Value>,
+    pub reason: String,
+    pub conditions: Vec<String>,
+    pub caveats: Vec<String>,
+}
+
+const SCOPE_REVISION_FIELDS: &[&str] = &[
+    "scope_intent_id",
+    "state_revision",
+    "digest",
+    "state",
+    "owner_client_id",
+    "actor",
+    "assignment_id",
+    "participation_basis",
+    "mode",
+    "paths",
+    "symbols",
+    "interfaces",
+    "expires_at_ms",
+    "override_scope_intent_ids",
+];
+
+pub(crate) fn parse_decision_request(method: &str, value: &Value) -> Result<DecisionRequest> {
+    let kind = match method {
+        "coordination.contract.ratify" => DecisionKind::Ratified,
+        "coordination.contract.reject" => DecisionKind::Rejected,
+        _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
+    };
+    model::fields(
+        value,
+        &[
+            "client_request_id",
+            "thread_id",
+            "expected_state_revision",
+            "proposal_id",
+            "proposal_revision_id",
+            "proposal_digest",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "affected_scope_revisions",
+            "reason",
+            "conditions",
+            "caveats",
+        ],
+    )?;
+    bounded_id(
+        model::text(value, "client_request_id")?,
+        "client_request_id",
+        limits::MAX_CLIENT_REQUEST_ID_BYTES,
+    )?;
+    let thread_id = prefixed_uuid(model::text(value, "thread_id")?, "coord-", "thread_id")?;
+    let expected_state_revision = model::positive(value, "expected_state_revision")?;
+    let proposal_id = prefixed_uuid(model::text(value, "proposal_id")?, "cprop-", "proposal_id")?;
+    let proposal_revision_id = prefixed_uuid(
+        model::text(value, "proposal_revision_id")?,
+        "cprev-",
+        "proposal_revision_id",
+    )?;
+    let proposal_digest = parse_proposal_digest(model::text(value, "proposal_digest")?)?;
+    let task_id = bounded_id(model::text(value, "task_id")?, "task_id", 256)?;
+    let task_revision = model::positive(value, "task_revision")?;
+    let attempt_id = bounded_id(model::text(value, "attempt_id")?, "attempt_id", 256)?;
+    let affected_scope_revisions = parse_scope_revision_refs(value)?;
+    let reason = bounded_text(value, "reason", limits::MAX_REASON_BYTES)?;
+    if reason.trim().is_empty() {
+        return Err(Error::invalid("reason must be nonempty text"));
+    }
+    let conditions = text_array(value, "conditions", 64, limits::MAX_SUMMARY_BYTES)?;
+    let caveats = text_array(value, "caveats", 64, limits::MAX_SUMMARY_BYTES)?;
+    if model::canonical(value)?.len() > MAX_PROPOSAL_BYTES {
+        return Err(Error::invalid(
+            "canonical contract decision request exceeds 65536 bytes",
+        ));
+    }
+    Ok(DecisionRequest {
+        kind,
+        thread_id,
+        expected_state_revision,
+        proposal_id,
+        proposal_revision_id,
+        proposal_digest,
+        task_id,
+        task_revision,
+        attempt_id,
+        affected_scope_revisions,
+        reason,
+        conditions,
+        caveats,
+    })
+}
+
+fn parse_scope_revision_refs(value: &Value) -> Result<Vec<Value>> {
+    let items = value
+        .get("affected_scope_revisions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::invalid("affected_scope_revisions must be an array"))?;
+    if items.len() > MAX_PAGE_SIZE as usize {
+        return Err(Error::invalid(format!(
+            "affected_scope_revisions may contain at most {MAX_PAGE_SIZE} items"
+        )));
+    }
+    let mut previous_id: Option<String> = None;
+    for item in items {
+        model::fields(item, SCOPE_REVISION_FIELDS)?;
+        let object = item
+            .as_object()
+            .ok_or_else(|| Error::invalid("scope revision entries must be objects"))?;
+        if object.len() != SCOPE_REVISION_FIELDS.len()
+            || SCOPE_REVISION_FIELDS
+                .iter()
+                .any(|field| !object.contains_key(*field))
+        {
+            return Err(Error::invalid(
+                "scope revision entries must contain the complete current scope reference",
+            ));
+        }
+        let scope_intent_id = prefixed_uuid(
+            model::text(item, "scope_intent_id")?,
+            "cscope-",
+            "scope_intent_id",
+        )?;
+        model::positive(item, "state_revision")?;
+        let digest = model::text(item, "digest")?;
+        if !is_canonical_sha256(digest) {
+            return Err(Error::invalid(
+                "scope revision digest must be lowercase SHA-256 hex",
+            ));
+        }
+        if previous_id
+            .as_deref()
+            .is_some_and(|previous| previous >= scope_intent_id.as_str())
+        {
+            return Err(Error::invalid(
+                "affected_scope_revisions must be unique and sorted by scope_intent_id",
+            ));
+        }
+        previous_id = Some(scope_intent_id);
+    }
+    Ok(items.clone())
+}
+
+pub(crate) fn parse_proposal_digest(value: &str) -> Result<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::invalid("proposal_digest must be SHA-256 hex"));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+pub(crate) fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn parse_proposal_request(value: &Value) -> Result<ProposalRequest> {
     model::fields(
         value,
@@ -97,7 +278,7 @@ pub(crate) fn parse_proposal_request(value: &Value) -> Result<ProposalRequest> {
             "open_questions",
         ],
     )?;
-    let client_request_id = bounded_id(
+    bounded_id(
         model::text(value, "client_request_id")?,
         "client_request_id",
         limits::MAX_CLIENT_REQUEST_ID_BYTES,
@@ -152,15 +333,9 @@ pub(crate) fn parse_proposal_request(value: &Value) -> Result<ProposalRequest> {
     }
     let digest = model::digest(encoded.as_bytes());
     Ok(ProposalRequest {
-        client_request_id,
         thread_id,
         supersedes_revision_id,
         topic,
-        affected,
-        statement,
-        acceptance_conditions,
-        claims,
-        open_questions,
         canonical_body,
         digest,
     })
@@ -181,7 +356,7 @@ pub(crate) fn parse_response_request(value: &Value) -> Result<ResponseRequest> {
             "evidence_refs",
         ],
     )?;
-    let client_request_id = bounded_id(
+    bounded_id(
         model::text(value, "client_request_id")?,
         "client_request_id",
         limits::MAX_CLIENT_REQUEST_ID_BYTES,
@@ -193,11 +368,7 @@ pub(crate) fn parse_response_request(value: &Value) -> Result<ResponseRequest> {
         "cprev-",
         "proposal_revision_id",
     )?;
-    let proposal_digest = model::text(value, "proposal_digest")?;
-    if proposal_digest.len() != 64 || !proposal_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(Error::invalid("proposal_digest must be SHA-256 hex"));
-    }
+    let proposal_digest = parse_proposal_digest(model::text(value, "proposal_digest")?)?;
     let act = match model::text(value, "act")? {
         "counterproposal" => ResponseAct::Counterproposal,
         "object" => ResponseAct::Object,
@@ -246,11 +417,10 @@ pub(crate) fn parse_response_request(value: &Value) -> Result<ResponseRequest> {
         && normalized_objection_basis.is_some()
         && !reason.trim().is_empty();
     Ok(ResponseRequest {
-        client_request_id,
         thread_id,
         proposal_id,
         proposal_revision_id,
-        proposal_digest: proposal_digest.to_ascii_lowercase(),
+        proposal_digest,
         act,
         objection_basis,
         normalized_objection_basis,

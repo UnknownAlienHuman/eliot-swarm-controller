@@ -94,6 +94,8 @@ struct ExecutionEvidence {
     process: Value,
     child_pid: Option<u32>,
     termination: String,
+    direct_exit: DirectExitEvidence,
+    family_departure: FamilyDepartureEvidence,
     exit_code: Option<i32>,
     termination_requests: u64,
     stdout: StreamEvidence,
@@ -108,8 +110,27 @@ struct ExecutionEvidence {
 struct StreamEvidence {
     path: PathBuf,
     bytes_written: u64,
+    bytes_observed: u64,
     truncated: bool,
     capture_complete: bool,
+    capture_disposition: String,
+    capture_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectExitEvidence {
+    state: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyDepartureEvidence {
+    state: String,
+    #[serde(default)]
+    process: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +139,7 @@ enum TerminationKind {
     Cancelled,
     TimedOut,
     CancelledBeforeStart,
+    StartGateTimedOut,
     ControlReadUnknownBeforeStart,
     ProcessObservationUnknown,
 }
@@ -503,9 +525,7 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
         Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
         Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
-    if !departed_empty(&identity["process"], &work.token)? {
-        return Ok(None);
-    }
+    let family_departed = matches!(departed_empty(&identity["process"], &work.token), Ok(true));
 
     if execution_path.try_exists()? {
         let receipt: ExecutionReceipt =
@@ -535,7 +555,26 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
                 "execution without a plan contains plan-dependent evidence",
             ));
         }
-        return build_completion(work, files, &directory, &identity, receipt).map(Some);
+        if directory.join("completion.json").try_exists()? {
+            let Some(completion) = worker::completion(work, files)? else {
+                return Ok(None);
+            };
+            if completion.process_facts.as_ref()
+                != Some(&execution_process_facts(&receipt.execution))
+                || completion.exit_code != receipt.execution.exit_code
+            {
+                return Err(Error::conflict(
+                    "retained completion differs from the standalone execution receipt",
+                ));
+            }
+            return Ok(Some(completion));
+        }
+        return build_completion(work, files, &directory, &identity, receipt, family_departed)
+            .map(Some);
+    }
+
+    if !family_departed {
+        return Ok(None);
     }
 
     let failure_path = plan_failure_path;
@@ -623,6 +662,7 @@ fn build_completion(
     directory: &Path,
     identity: &Value,
     receipt: ExecutionReceipt,
+    family_departed: bool,
 ) -> Result<Completion> {
     let evidence = receipt.execution;
     let termination = parse_termination(&evidence.termination)?;
@@ -686,18 +726,18 @@ fn build_completion(
                     "the checks executor timed out without an admitted timeout policy",
                 ));
             }
+            TerminationKind::StartGateTimedOut => {
+                return Err(Error::new(
+                    "CHECK_START_GATE_TIMEOUT",
+                    "Store Go did not arrive before the bounded check start gate expired",
+                ));
+            }
             TerminationKind::Exited | TerminationKind::Cancelled => {}
         }
         if evidence.control_read_unknown {
             return Err(Error::new(
                 "CHECK_CONTROL_READ_UNKNOWN",
                 "the CheckRun cancellation receipt could not be read while the process was active",
-            ));
-        }
-        if !evidence.resource_released {
-            return Err(Error::new(
-                "CHECK_RESOURCE_RELEASE_UNKNOWN",
-                "the standalone executor did not confirm release of its process Group",
             ));
         }
         if evidence.child_pid.is_none() {
@@ -754,8 +794,11 @@ fn build_completion(
                     "check_id":work.check_id,
                     "stream":name,
                     "bytes_written":stream.bytes_written,
+                    "bytes_observed":stream.bytes_observed,
                     "truncated":stream.truncated,
-                    "capture_complete":stream.capture_complete
+                    "capture_complete":stream.capture_complete,
+                    "capture_disposition":stream.capture_disposition,
+                    "capture_error":stream.capture_error
                 }),
             )?);
         }
@@ -781,7 +824,9 @@ fn build_completion(
         coverage_gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
         coverage_gaps.dedup();
     }
-    let state = if cancellation_applied {
+    let state = if !evidence.resource_released {
+        "incomplete"
+    } else if cancellation_applied {
         "cancelled"
     } else if error.is_some() {
         "error"
@@ -797,6 +842,17 @@ fn build_completion(
     } else {
         "passed"
     };
+    let process_facts = execution_process_facts(&evidence);
+    let release_evidence = if !evidence.resource_released && family_departed {
+        Some(worker::release_evidence(
+            work,
+            directory,
+            &identity["process"],
+        )?)
+    } else {
+        None
+    };
+    let resource_released = evidence.resource_released || release_evidence.is_some();
     let report = json!({
         "version":1,
         "check_id":work.check_id,
@@ -811,9 +867,12 @@ fn build_completion(
         "cancellation":cancellation,
         "worker_version":env!("CARGO_PKG_VERSION"),
         "process":identity["process"],
+        "process_facts":process_facts,
         "state":state,
         "exit_code":evidence.exit_code,
-        "resource_released":evidence.resource_released,
+        "resource_released":resource_released,
+        "cleanup_pending":!resource_released,
+        "release_evidence":release_evidence,
         "source_checkout_verified":source_verified,
         "coverage":coverage,
         "error":error,
@@ -823,13 +882,23 @@ fn build_completion(
             "sha256":record.content_digest,
             "length":record.byte_length,
             "bytes_written":record.metadata["bytes_written"],
+            "bytes_observed":record.metadata["bytes_observed"],
             "truncated":record.metadata["truncated"],
-            "capture_complete":record.metadata["capture_complete"]
+            "capture_complete":record.metadata["capture_complete"],
+            "capture_disposition":record.metadata["capture_disposition"],
+            "capture_error":record.metadata["capture_error"]
         })).collect::<Vec<_>>(),
         "started_at_ms":receipt.started_at_ms.unwrap_or(now_ms()?),
         "finished_at_ms":receipt.finished_at_ms
     });
-    let result_id = format!("check-{}", digest(work.operation_id.as_bytes()));
+    let result_id = if release_evidence.is_some() {
+        format!(
+            "check-release-{}",
+            digest(format!("{}:{}", work.operation_id, work.token).as_bytes())
+        )
+    } else {
+        format!("check-{}", digest(work.operation_id.as_bytes()))
+    };
     let (result, bytes) = ArtifactFiles::document(
         "check_result",
         &result_id,
@@ -847,15 +916,63 @@ fn build_completion(
         token: work.token.clone(),
         state: state.into(),
         exit_code: evidence.exit_code,
-        resource_released: evidence.resource_released,
+        resource_released,
         coverage,
         result,
         outputs,
         cancellation,
+        process_facts: Some(process_facts),
+        release_evidence,
     };
     worker::write_once(&directory.join("terminal.json"), &json!(completion))?;
     worker::write_once(&directory.join("completion.json"), &json!(completion))?;
     Ok(completion)
+}
+
+fn execution_process_facts(execution: &ExecutionEvidence) -> Value {
+    let direct_exit = match execution.direct_exit.state.as_str() {
+        "not_started" => json!({"state":"not_started"}),
+        "observed" => json!({
+            "state":"observed",
+            "exit_code":execution.direct_exit.exit_code
+        }),
+        _ => json!({"state":"observation_unknown"}),
+    };
+    let family_process = if execution.family_departure.state == "confirmed" {
+        execution.process.clone()
+    } else {
+        execution.family_departure.process.clone()
+    };
+    json!({
+        "schema_version":1,
+        "termination":execution.termination,
+        "direct_exit":direct_exit,
+        "family_departure":{
+            "state":execution.family_departure.state,
+            "process":family_process
+        },
+        "stdout_capture":{
+            "bytes_written":execution.stdout.bytes_written,
+            "bytes_observed":execution.stdout.bytes_observed,
+            "truncated":execution.stdout.truncated,
+            "capture_complete":execution.stdout.capture_complete,
+            "capture_disposition":execution.stdout.capture_disposition,
+            "capture_error":execution.stdout.capture_error
+        },
+        "stderr_capture":{
+            "bytes_written":execution.stderr.bytes_written,
+            "bytes_observed":execution.stderr.bytes_observed,
+            "truncated":execution.stderr.truncated,
+            "capture_complete":execution.stderr.capture_complete,
+            "capture_disposition":execution.stderr.capture_disposition,
+            "capture_error":execution.stderr.capture_error
+        },
+        "resource_released":execution.resource_released,
+        "cleanup_pending":!execution.resource_released,
+        "termination_requests":execution.termination_requests,
+        "control_read_unknown":execution.control_read_unknown,
+        "termination_request_unconfirmed":execution.termination_request_unconfirmed
+    })
 }
 
 fn expected_context(
@@ -928,7 +1045,6 @@ fn validate_execution_receipt(
         || execution.check_id != work.check_id
         || execution.operation_id != work.operation_id
         || execution.process != identity["process"]
-        || !execution.resource_released
     {
         return Err(Error::conflict(
             "executor receipt differs from the accepted CheckRun owner",
@@ -954,8 +1070,46 @@ fn validate_execution_receipt(
     let has_plan = receipt.plan_sha256.is_some();
     let has_context = receipt.context.is_some();
     let termination = parse_termination(&execution.termination)?;
+    let family_state = execution.family_departure.state.as_str();
+    let valid_family = match family_state {
+        "confirmed" => true,
+        "cleanup_pending" | "observation_unknown" => {
+            execution.family_departure.process == execution.process
+        }
+        _ => false,
+    };
+    let valid_direct_exit = match execution.direct_exit.state.as_str() {
+        "not_started" => execution.child_pid.is_none(),
+        "observed" => {
+            execution.child_pid.is_some() && execution.direct_exit.exit_code == execution.exit_code
+        }
+        "observation_unknown" => execution.child_pid.is_some(),
+        _ => false,
+    };
+    let valid_start_gate_timeout = !matches!(termination, TerminationKind::StartGateTimedOut)
+        || (!has_plan
+            && execution.child_pid.is_none()
+            && execution.direct_exit.state == "not_started"
+            && family_state == "confirmed"
+            && execution.resource_released);
     if execution.stdout.bytes_written > MAX_CAPTURE_BYTES_PER_STREAM
         || execution.stderr.bytes_written > MAX_CAPTURE_BYTES_PER_STREAM
+        || execution.stdout.bytes_observed < execution.stdout.bytes_written
+        || execution.stderr.bytes_observed < execution.stderr.bytes_written
+        || !matches!(
+            execution.stdout.capture_disposition.as_str(),
+            "not_started" | "complete" | "incomplete"
+        )
+        || !matches!(
+            execution.stderr.capture_disposition.as_str(),
+            "not_started" | "complete" | "incomplete"
+        )
+        || execution.stdout.capture_complete != (execution.stdout.capture_disposition == "complete")
+        || execution.stderr.capture_complete != (execution.stderr.capture_disposition == "complete")
+        || !valid_family
+        || !valid_direct_exit
+        || !valid_start_gate_timeout
+        || (execution.resource_released && family_state != "confirmed")
         || has_plan != has_context
         || has_plan != receipt.started_at_ms.is_some()
         || (execution.child_pid.is_some() && !has_plan)
@@ -967,7 +1121,9 @@ fn validate_execution_receipt(
     if !has_plan
         && !matches!(
             termination,
-            TerminationKind::CancelledBeforeStart | TerminationKind::ControlReadUnknownBeforeStart
+            TerminationKind::CancelledBeforeStart
+                | TerminationKind::StartGateTimedOut
+                | TerminationKind::ControlReadUnknownBeforeStart
         )
     {
         return Err(Error::invalid(
@@ -988,6 +1144,9 @@ fn add_stream_gaps(coverage: &mut Value, execution: &ExecutionEvidence) -> Resul
         if !stream.capture_complete {
             gaps.push(json!(format!("{name}_capture_incomplete")));
         }
+    }
+    if !execution.resource_released {
+        gaps.push(json!("process_family_departure_pending"));
     }
     gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
     gaps.dedup();
@@ -1042,6 +1201,7 @@ fn parse_termination(value: &str) -> Result<TerminationKind> {
         "cancelled" => Ok(TerminationKind::Cancelled),
         "timed_out" => Ok(TerminationKind::TimedOut),
         "cancelled_before_start" => Ok(TerminationKind::CancelledBeforeStart),
+        "start_gate_timed_out" => Ok(TerminationKind::StartGateTimedOut),
         "control_read_unknown_before_start" => Ok(TerminationKind::ControlReadUnknownBeforeStart),
         "process_observation_unknown" => Ok(TerminationKind::ProcessObservationUnknown),
         _ => Err(Error::invalid("unknown standalone termination disposition")),

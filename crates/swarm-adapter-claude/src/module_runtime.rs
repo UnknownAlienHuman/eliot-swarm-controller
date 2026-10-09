@@ -14,9 +14,10 @@ use swarm_contracts::{
 };
 use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_from_env};
 
-const CAPABILITIES: [&str; 6] = [
+const CAPABILITIES: [&str; 7] = [
     "agent.open",
     "agent.reconcile",
+    "agent.reply",
     "agent.result",
     "agent.refresh",
     "agent.send/next_turn",
@@ -125,23 +126,31 @@ fn config_schema_matches(claim: &ModuleContractClaim) -> bool {
 }
 
 fn command_event_schemas_match(claim: &ModuleContractClaim) -> bool {
-    fn is_schema(schema: &SchemaDescriptor, id: &str) -> bool {
-        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
+    let commands = [
+        swarm_contracts::module_contract::runtime_command_schema(),
+        swarm_contracts::module_contract::task_dispatch_context_schema(),
+        swarm_contracts::module_contract::task_prompt_schema(),
+    ];
+    let events = [
+        swarm_contracts::module_contract::runtime_outcome_schema(),
+        swarm_contracts::module_contract::task_dispatch_admission_schema(),
+    ];
+    fn declares(schemas: &[SchemaDescriptor], expected: &SchemaDescriptor) -> bool {
+        schemas.contains(expected)
+            && schemas
+                .iter()
+                .filter(|schema| schema.schema_id == expected.schema_id)
+                .count()
+                == 1
     }
-    let has =
-        |schemas: &[SchemaDescriptor], id: &str| schemas.iter().any(|schema| is_schema(schema, id));
-    // The normalized dispatch pair is additive. Existing retained Claude
-    // artifacts with only the runtime codec continue to authenticate here.
-    (claim.command_schemas.len() == 1
-        && has(&claim.command_schemas, "swarm.runtime_command")
-        && claim.event_schemas.len() == 1
-        && has(&claim.event_schemas, "swarm.runtime_outcome"))
-        || (claim.command_schemas.len() >= 2
-            && has(&claim.command_schemas, "swarm.runtime_command")
-            && has(&claim.command_schemas, "swarm.task_dispatch_context")
-            && claim.event_schemas.len() >= 2
-            && has(&claim.event_schemas, "swarm.runtime_outcome")
-            && has(&claim.event_schemas, "swarm.task_dispatch_admission"))
+    claim.command_schemas.len() >= commands.len()
+        && commands
+            .iter()
+            .all(|expected| declares(&claim.command_schemas, expected))
+        && claim.event_schemas.len() >= events.len()
+        && events
+            .iter()
+            .all(|expected| declares(&claim.event_schemas, expected))
 }
 
 fn parse_protocol(value: &str) -> Result<ProtocolVersion> {

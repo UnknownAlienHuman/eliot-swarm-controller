@@ -154,6 +154,15 @@ struct AcceptedAttemptRow {
     task_snapshot_json: String,
 }
 
+struct CurrentAcceptedAttemptRow {
+    task_id: String,
+    task_revision: i64,
+    state: String,
+    released_at_ms: Option<i64>,
+    submission_ref: Option<String>,
+    candidate_ref: Option<String>,
+}
+
 struct SubmissionOperationRow {
     method: String,
     state: String,
@@ -1031,27 +1040,16 @@ fn validate_entry_authority(db: &Connection, entry: &config::AutomationEntry) ->
 }
 
 fn current_gm_epoch_for(db: &Connection, manager_id: &str) -> Result<i64> {
-    let gm: Option<(String, i64)> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') \
-             FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (gm_id, epoch) = gm.ok_or_else(|| {
-        Error::new(
-            "AUTOMATION_CURRENT_GM_REQUIRED",
-            "automatic publication requires a designated current GM",
-        )
-    })?;
-    if epoch <= 0 || gm_id != manager_id {
-        return Err(Error::new(
-            "AUTOMATION_CURRENT_GM_REQUIRED",
-            "automatic publication requires the entry owner to be current GM",
-        ));
-    }
-    Ok(epoch)
+    crate::store::gm::require_current_manager(db, manager_id).map_err(|error| {
+        if error.code == "FORBIDDEN" {
+            Error::new(
+                "AUTOMATION_CURRENT_GM_REQUIRED",
+                "automatic publication requires the entry owner to be current GM",
+            )
+        } else {
+            error
+        }
+    })
 }
 
 pub(crate) fn accepted_candidate_from_observation(
@@ -1216,18 +1214,37 @@ pub(crate) fn validate_current_accepted_candidate_for_projection(
     candidate: &AcceptedCandidate,
     expected_project_id: &str,
 ) -> Result<()> {
-    let task: Option<(String, i64, String, Option<String>, Option<String>, Option<i64>, Option<String>)> = db
+    let task: Option<AcceptedTaskRow> = db
         .query_row(
             "SELECT project_id,revision,state,accepted_attempt_id,accepted_operation_id,accepted_revision,accepted_candidate_ref FROM tasks WHERE task_id=?1",
             [&candidate.task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| {
+                Ok(AcceptedTaskRow {
+                    project_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    state: row.get(2)?,
+                    accepted_attempt_id: row.get(3)?,
+                    accepted_operation_id: row.get(4)?,
+                    accepted_revision: row.get(5)?,
+                    accepted_candidate_ref: row.get(6)?,
+                })
+            },
         )
         .optional()?;
-    let attempt: Option<(String, i64, String, Option<i64>, Option<String>, Option<String>)> = db
+    let attempt: Option<CurrentAcceptedAttemptRow> = db
         .query_row(
             "SELECT task_id,task_revision,state,released_at_ms,submission_ref,candidate_ref FROM attempts WHERE attempt_id=?1",
             [&candidate.attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok(CurrentAcceptedAttemptRow {
+                    task_id: row.get(0)?,
+                    task_revision: row.get(1)?,
+                    state: row.get(2)?,
+                    released_at_ms: row.get(3)?,
+                    submission_ref: row.get(4)?,
+                    candidate_ref: row.get(5)?,
+                })
+            },
         )
         .optional()?;
     let invalidated: bool = db.query_row(
@@ -1235,36 +1252,25 @@ pub(crate) fn validate_current_accepted_candidate_for_projection(
         [format!("invalidate:{}", candidate.accepted_operation_id)],
         |row| row.get(0),
     )?;
-    let current = task.is_some_and(
-        |(
-            project_id,
-            revision,
-            state,
-            accepted_attempt,
-            accepted_operation,
-            accepted_revision,
-            accepted_candidate,
-        )| {
-            project_id == expected_project_id
-                && candidate.project_id == expected_project_id
-                && revision == candidate.task_revision
-                && state == "accepted"
-                && accepted_attempt.as_deref() == Some(candidate.attempt_id.as_str())
-                && accepted_operation.as_deref() == Some(candidate.accepted_operation_id.as_str())
-                && accepted_revision == Some(candidate.task_revision)
-                && accepted_candidate.as_deref() == Some(candidate.candidate_ref.as_str())
-        },
-    );
-    let attempt_matches = attempt.is_some_and(
-        |(task_id, revision, state, released_at, submission_ref, candidate_ref)| {
-            task_id == candidate.task_id
-                && revision == candidate.task_revision
-                && state == "accepted"
-                && released_at.is_none()
-                && submission_ref.as_deref() == Some(candidate.submission_ref.as_str())
-                && candidate_ref.as_deref() == Some(candidate.candidate_ref.as_str())
-        },
-    );
+    let current = task.is_some_and(|task| {
+        task.project_id == expected_project_id
+            && candidate.project_id == expected_project_id
+            && task.revision == candidate.task_revision
+            && task.state == "accepted"
+            && task.accepted_attempt_id.as_deref() == Some(candidate.attempt_id.as_str())
+            && task.accepted_operation_id.as_deref()
+                == Some(candidate.accepted_operation_id.as_str())
+            && task.accepted_revision == Some(candidate.task_revision)
+            && task.accepted_candidate_ref.as_deref() == Some(candidate.candidate_ref.as_str())
+    });
+    let attempt_matches = attempt.is_some_and(|attempt| {
+        attempt.task_id == candidate.task_id
+            && attempt.task_revision == candidate.task_revision
+            && attempt.state == "accepted"
+            && attempt.released_at_ms.is_none()
+            && attempt.submission_ref.as_deref() == Some(candidate.submission_ref.as_str())
+            && attempt.candidate_ref.as_deref() == Some(candidate.candidate_ref.as_str())
+    });
     if invalidated || !current || !attempt_matches {
         return Err(Error::new(
             "FORGE_ACCEPTANCE_STALE",

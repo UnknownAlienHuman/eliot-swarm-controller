@@ -18,7 +18,7 @@ use swarm_antigravity_adapter::{
     config::AdapterConfig,
     controller::{Controller, PromptWrite},
     ipc::{ManagerLink, VerifiedModuleHello},
-    launch::build_launch_spec,
+    launch::{build_launch_spec, selected_model_id},
     process::{
         CandidateManagedOwner, NativeExit, NativeMembershipGuard, OwnedNativeChild,
         OwnedNativeSpawner,
@@ -26,7 +26,7 @@ use swarm_antigravity_adapter::{
     result_page,
     stderr::{self, StderrSummary},
     stream::NativeLineReader,
-    wire::{ARTIFACT_ID, REQUIRED_MODEL_ID},
+    wire::ARTIFACT_ID,
 };
 
 const MAX_HOST_ATTEMPTS: usize = 5;
@@ -655,12 +655,12 @@ impl HostSession {
                 "manager route is not registered for the Rust headless artifact",
             ));
         }
-        if route["native_options"]["modelId"] != REQUIRED_MODEL_ID {
-            return Err(Error::new(
-                "UNSUPPORTED_MODEL_ID",
-                "manager route does not select the exact documented Antigravity model ID",
-            ));
-        }
+        selected_model_id(&route).map_err(|code| {
+            Error::new(
+                code,
+                "manager route must select a bounded native Antigravity model ID",
+            )
+        })?;
         if self
             .binding_id
             .as_deref()

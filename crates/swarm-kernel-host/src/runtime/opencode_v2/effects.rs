@@ -45,7 +45,41 @@ pub(super) fn failed(
     )
 }
 pub(super) fn marker(command: &RuntimeCommand) -> Value {
-    json!({"binding":command.binding_id,"generation":command.generation,"operation":command.operation_id})
+    let mut marker = json!({"binding":command.binding_id,"generation":command.generation,"operation":command.operation_id});
+    if let Some(delivery) = native_delivery_for_method(&command.method) {
+        marker["native_delivery"] = json!(delivery);
+    }
+    marker
+}
+
+fn native_delivery_for_method(method: &str) -> Option<&'static str> {
+    match method {
+        "task.dispatch" | "agent.send" => Some("queue"),
+        "native.opencode.loop_step" => Some("steer"),
+        _ => None,
+    }
+}
+
+fn validate_loop_step(command: &RuntimeCommand) -> Result<()> {
+    let input = command
+        .input
+        .as_object()
+        .filter(|input| input.len() == 4)
+        .ok_or_else(|| Error::invalid("loop-step input has an unsupported shape"))?;
+    let client_request_id = model::text(&command.input, "client_request_id")?;
+    if input.keys().any(|key| {
+        !["client_request_id", "binding_id", "generation", "text"].contains(&key.as_str())
+    }) || client_request_id.len() > 256
+        || client_request_id.chars().any(char::is_control)
+        || model::text(&command.input, "binding_id")? != command.binding_id
+        || command.input["generation"].as_i64() != Some(command.generation)
+        || model::text(&command.input, "text")?.len() > 65_536
+    {
+        return Err(Error::invalid(
+            "loop-step input must bind caller request id, exact binding generation and nonempty text",
+        ));
+    }
+    Ok(())
 }
 pub(super) fn prompt(command: &RuntimeCommand) -> Result<String> {
     let text = model::text(&command.input, "text")?;
@@ -348,7 +382,9 @@ impl Service {
         }
         match command.method.as_str() {
             "agent.open" => self.open(command, options).await,
-            "task.dispatch" | "agent.send" => self.send(command, options).await,
+            "task.dispatch" | "agent.send" | "native.opencode.loop_step" => {
+                self.send(command, options).await
+            }
             "agent.reply" => self.reply(command, options).await,
             "agent.configure" => self.configure(command, options).await,
             "agent.goal" => self.execute_goal(command, options).await,
@@ -424,8 +460,13 @@ impl Service {
     async fn send(&self, command: &RuntimeCommand, options: &Options) -> RuntimeOutcome {
         let prepare=async{
             let root=command.native_root_id.as_deref().ok_or_else(||Error::invalid("native root is missing"))?;
+            let delivery = native_delivery_for_method(&command.method)
+                .ok_or_else(|| Error::new("UNSUPPORTED_CAPABILITY", "OpenCode input method is unsupported"))?;
             if command.method=="agent.send" && command.input["delivery"]!="next_turn" {
                 return Err(Error::new("UNSUPPORTED_EXACT_TURN_STEER","V2 inbox steering has no atomic expected-turn guard; it must not emulate exact-turn steering"));
+            }
+            if command.method == "native.opencode.loop_step" {
+                validate_loop_step(command)?;
             }
             self.verify_binding(root,options,&command.binding_id,command.generation).await?;
             self.require_durable_root_creation(
@@ -435,14 +476,14 @@ impl Service {
                 options,
             )
             .await?;
-            Ok((root,prompt(command)?))
+            Ok((root,prompt(command)?,delivery))
         }.await;
-        let (root, text) = match prepare {
+        let (root, text, delivery) = match prepare {
             Ok(v) => v,
             Err(e) => return failed(command, options, &e, false),
         };
         let id = input_id(&command.operation_id);
-        let body = json!({"id":id,"text":text,"metadata":{"eliot":marker(command)},"delivery":"queue","resume":true});
+        let body = json!({"id":id,"text":text,"metadata":{"eliot":marker(command)},"delivery":delivery,"resume":true});
         let reply = self
             .post(&format!("/api/session/{root}/prompt"), body)
             .await;
@@ -451,7 +492,7 @@ impl Service {
                 command,
                 EffectOutcome::Applied,
                 options,
-                json!({"completion_condition":"native_input_admitted","delivery":"queue","evidence":"prompt_response","assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}),
+                json!({"completion_condition":"native_input_admitted","delivery":delivery,"execution_boundary":if delivery == "steer" { "native_safe_next_loop_step" } else { "queued_next_turn" },"evidence":"prompt_response","assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}),
             ),
             Ok(_) => failed(
                 command,
@@ -599,10 +640,11 @@ impl Service {
                 self.require_durable_root_creation(&id,&original.binding_id,original.generation,options).await?;
                 let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_session_created","evidence":"exact_session_readback"}));r.native_root_id=Some(id);return Ok(r);
             }
-            if !matches!(original.method.as_str(),"agent.send"|"task.dispatch") {return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","no exact readback contract for this operation"));}
+            if !matches!(original.method.as_str(),"agent.send"|"task.dispatch"|"native.opencode.loop_step") {return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","no exact readback contract for this operation"));}
             let root=original.native_root_id.as_deref().ok_or_else(||Error::invalid("missing root"))?;
             self.verify_binding(root,options,&original.binding_id,original.generation).await?;
             let id=input_id(&original.operation_id);let text=prompt(original)?;
+            let delivery=native_delivery_for_method(&original.method).ok_or_else(||Error::new("NATIVE_EVIDENCE_UNAVAILABLE","saved input has no native delivery"))?;
             let inbox:Data<Vec<Value>>=decode(self.get(&format!("/api/session/{root}/inbox"),&[]).await?)?;
             let queued=inbox.data.iter().any(|item|inbox_matches(item,root,&id,&text,original));
             if !queued {
@@ -611,13 +653,16 @@ impl Service {
                     return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","exact delivered input was not observed"));
                 }
             }
-            let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_input_admitted","delivery":"queue","evidence":if queued{"inbox_readback"}else{"projected_message_readback"},"assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}));r.native_input_id=Some(id);Ok(r)
+            let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_input_admitted","delivery":delivery,"evidence":if queued{"inbox_readback"}else{"projected_message_readback"},"assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}));r.native_input_id=Some(id);Ok(r)
         }.await;
         match readback {
             Ok(r) => r,
             Err(e) => {
                 let mut r = outcome(original, EffectOutcome::Unknown, options, diagnostic(&e));
-                if matches!(original.method.as_str(), "agent.send" | "task.dispatch") {
+                if matches!(
+                    original.method.as_str(),
+                    "agent.send" | "task.dispatch" | "native.opencode.loop_step"
+                ) {
                     r.details["assistant_result_correlation"] = json!("not_exposed");
                     r.details["assistant_result_correlation_reason"] =
                         json!("assistant_message_has_no_input_parent_in_public_projection");
@@ -636,7 +681,7 @@ fn inbox_matches(item: &Value, root: &str, id: &str, text: &str, command: &Runti
     item["id"] == id
         && item["sessionID"] == root
         && item["type"] == "user"
-        && item["delivery"] == "queue"
+        && item["delivery"].as_str() == native_delivery_for_method(&command.method)
         && item["payload"]["text"] == text
         && item["payload"]["metadata"]["eliot"] == marker(command)
         && no_attachments(&item["payload"])
@@ -658,6 +703,7 @@ pub(super) fn delivered_matches(message: &Value, command: &RuntimeCommand) -> Re
             .get("sessionID")
             .is_none_or(|id| id.as_str() == command.native_root_id.as_deref())
         && message["text"] == prompt(command)?
+        && message["delivery"].as_str() == native_delivery_for_method(&command.method)
         && message["metadata"]["eliot"] == marker(command)
         && no_attachments(message))
 }

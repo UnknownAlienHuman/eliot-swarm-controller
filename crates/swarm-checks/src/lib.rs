@@ -13,7 +13,11 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -29,6 +33,11 @@ pub use status::read_check_status;
 pub const MAX_CAPTURE_BYTES_PER_STREAM: u64 = 64 * 1024 * 1024;
 const CHECK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LONG_DRAIN_DIAGNOSTIC_AFTER: Duration = Duration::from_secs(30);
+const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+const CAPTURE_STOP_GRACE: Duration = Duration::from_millis(250);
+const TERMINATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_TERMINATION_ATTEMPTS: u8 = 3;
 
 /// The exact operation identity reserved by the kernel before a check worker
 /// is launched. IDs are checked again at the process boundary.
@@ -74,11 +83,15 @@ pub enum StartDecision {
     Start,
     /// A durable cancellation request arrived before native command spawn.
     CancelBeforeStart,
+    /// The admitted owner received no Go before the bounded start gate expired.
+    StartGateTimedOut,
 }
 
 /// Narrow adapter to the existing CheckRun supervisor. `wait_for_start` must
 /// persist/read the existing identity and go/cancel receipts; it is not a new
-/// RPC method. A transport or persistence error returns before command spawn.
+/// RPC method. The adapter must bound its start gate and return
+/// [`StartDecision::StartGateTimedOut`] when no Go arrives. A transport or
+/// persistence error returns before command spawn.
 pub trait CheckControl {
     fn wait_for_start(&mut self, owner: &OwnedCheckProcess) -> Result<StartDecision>;
 
@@ -87,9 +100,9 @@ pub trait CheckControl {
     /// until the process group is proven empty.
     fn cancellation_requested(&mut self, owner: &OwnedCheckProcess) -> Result<bool>;
 
-    /// Publish a one-shot, non-terminal process/control diagnostic through the
-    /// host's existing CheckRun status path. Returning an error keeps the owned
-    /// Group retained and causes the adapter to retry publication.
+    /// Publish a non-terminal process/control diagnostic through the host's
+    /// existing CheckRun status path. Diagnostic failure does not change the
+    /// family fact returned with the exact owner identity.
     fn process_group_drain_pending(
         &mut self,
         owner: &OwnedCheckProcess,
@@ -122,16 +135,44 @@ pub enum Termination {
     Cancelled,
     TimedOut,
     CancelledBeforeStart,
+    StartGateTimedOut,
     ControlReadUnknownBeforeStart,
     ProcessObservationUnknown,
+}
+
+/// Evidence about the direct child, independent of its process family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectExit {
+    NotStarted,
+    Observed { exit_code: Option<i32> },
+    ObservationUnknown,
+}
+
+/// Evidence about the exact owned process group. Pending/unknown results carry
+/// the identity needed by the host reaper; neither is resource release.
+#[derive(Debug, Clone)]
+pub enum FamilyDeparture {
+    Confirmed,
+    CleanupPending { process: Value },
+    ObservationUnknown { process: Value },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDisposition {
+    NotStarted,
+    Complete,
+    Incomplete,
 }
 
 #[derive(Debug, Clone)]
 pub struct CapturedStream {
     pub path: PathBuf,
     pub bytes_written: u64,
+    pub bytes_observed: u64,
     pub truncated: bool,
     pub capture_complete: bool,
+    pub capture_disposition: CaptureDisposition,
+    pub capture_error: Option<String>,
 }
 
 /// Process-level evidence for the kernel's existing receipt validators. This
@@ -144,6 +185,8 @@ pub struct CheckExecution {
     pub process: Value,
     pub child_pid: Option<u32>,
     pub termination: Termination,
+    pub direct_exit: DirectExit,
+    pub family_departure: FamilyDeparture,
     pub exit_code: Option<i32>,
     /// Exact sum returned by the owned Group's cancellation primitive.
     pub termination_requests: u64,
@@ -159,19 +202,30 @@ pub struct CheckExecution {
     pub termination_request_unconfirmed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CaptureStats {
-    bytes_written: u64,
+    bytes: Vec<u8>,
+    bytes_observed: u64,
     truncated: bool,
+    capture_complete: bool,
+    capture_error: Option<String>,
 }
 
-struct DrainState<'a> {
-    cancel_observed: &'a mut bool,
-    timed_out: &'a mut bool,
-    control_read_unknown: &'a mut bool,
-    process_observation_unknown: &'a mut bool,
-    termination_request_unconfirmed: &'a mut bool,
-    termination_requests: &'a mut u64,
+struct CaptureTask {
+    path: PathBuf,
+    file: File,
+    reader: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<CaptureStats>>,
+}
+
+#[derive(Default)]
+struct TerminationState {
+    started: Option<Instant>,
+    last_request: Option<Instant>,
+    attempts: u8,
+    requests: u64,
+    request_unconfirmed: bool,
 }
 
 /// Executes exactly one kernel-resolved command, after the host adapter has
@@ -217,6 +271,16 @@ pub fn execute_with_plan(
                 &output_directory,
                 owner,
                 Termination::CancelledBeforeStart,
+                false,
+            ));
+        }
+        StartDecision::StartGateTimedOut => {
+            group.disarm()?;
+            return Ok(not_started(
+                &identity,
+                &output_directory,
+                owner,
+                Termination::StartGateTimedOut,
                 false,
             ));
         }
@@ -319,80 +383,53 @@ pub fn execute_with_plan(
     };
     let child_pid = Some(child.id());
 
-    let Some(stdout_pipe) = child.stdout.take() else {
-        abort_owned_child(&group, &mut child, control, &owner);
-        group.disarm()?;
-        return Err(capture_setup_error());
-    };
-    let Some(stderr_pipe) = child.stderr.take() else {
-        abort_owned_child(&group, &mut child, control, &owner);
-        group.disarm()?;
-        return Err(capture_setup_error());
-    };
-    let stdout_reader = match capture_thread(
-        "swarm-check-stdout",
-        stdout_pipe,
-        stdout_file,
-        plan.output_limit_bytes_per_stream,
-    ) {
-        Ok(reader) => reader,
-        Err(_) => {
-            abort_owned_child(&group, &mut child, control, &owner);
-            group.disarm()?;
-            return Err(capture_setup_error());
-        }
-    };
-    let stderr_reader = match capture_thread(
-        "swarm-check-stderr",
-        stderr_pipe,
-        stderr_file,
-        plan.output_limit_bytes_per_stream,
-    ) {
-        Ok(reader) => reader,
-        Err(_) => {
-            abort_owned_child(&group, &mut child, control, &owner);
-            let _ = stdout_reader.join();
-            group.disarm()?;
-            return Err(capture_setup_error());
-        }
-    };
+    let stdout_reader = child.stdout.take().and_then(|pipe| {
+        capture_thread(
+            "swarm-check-stdout",
+            stdout_path.clone(),
+            pipe,
+            stdout_file,
+            plan.output_limit_bytes_per_stream,
+        )
+        .ok()
+    });
+    let stderr_reader = child.stderr.take().and_then(|pipe| {
+        capture_thread(
+            "swarm-check-stderr",
+            stderr_path.clone(),
+            pipe,
+            stderr_file,
+            plan.output_limit_bytes_per_stream,
+        )
+        .ok()
+    });
 
     let mut exit_code = None;
     let mut process_observation_unknown = false;
+    let mut direct_exit = None;
     let mut cancel_observed = false;
     let mut timed_out = false;
     let mut control_read_unknown = false;
     let mut control_read_unknown_since = None;
     let mut control_diagnostic_published = false;
     let mut last_control_diagnostic_attempt = None;
-    let command_started = Instant::now();
-    let mut termination_request_unconfirmed = false;
-    let mut termination_requests = 0u64;
+    let mut termination = TerminationState::default();
+    if stdout_reader.is_none() || stderr_reader.is_none() {
+        request_termination(&group, &mut termination);
+    }
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_code = status.code();
+                direct_exit = Some(DirectExit::Observed { exit_code });
                 break;
             }
             Ok(None) => {}
             Err(_) => {
                 process_observation_unknown = true;
-                let _ = control.process_group_drain_pending(
-                    &owner,
-                    command_started.elapsed(),
-                    true,
-                    control_read_unknown,
-                );
-                let _ = child.kill(); // This exact Child was spawned by this check.
-                request_termination(
-                    &group,
-                    &mut termination_requests,
-                    &mut termination_request_unconfirmed,
-                );
-                if let Ok(status) = child.wait() {
-                    exit_code = status.code();
-                }
+                direct_exit = Some(DirectExit::ObservationUnknown);
+                request_termination(&group, &mut termination);
                 break;
             }
         }
@@ -431,43 +468,53 @@ pub fn execute_with_plan(
             timed_out = true;
         }
         if cancel_observed || timed_out {
-            request_termination(
-                &group,
-                &mut termination_requests,
-                &mut termination_request_unconfirmed,
-            );
+            if termination.started.is_none() {
+                request_termination(&group, &mut termination);
+            } else {
+                retry_termination(&group, &mut termination);
+            }
+        } else {
+            retry_termination(&group, &mut termination);
+        }
+        if termination
+            .started
+            .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
+        {
+            break;
         }
         thread::sleep(CHECK_POLL_INTERVAL);
     }
 
-    // Release the direct process handle before checking exact Job membership
-    // on Windows. Descendants still belong to this check Group.
+    // Dropping Child does not prove family departure. The exact Group remains
+    // the sole source of that proof.
     drop(child);
-    wait_until_empty(
+    let family_departure = wait_until_empty(
         &group,
-        deadline,
         control,
         &owner,
-        &mut DrainState {
-            cancel_observed: &mut cancel_observed,
-            timed_out: &mut timed_out,
-            control_read_unknown: &mut control_read_unknown,
-            process_observation_unknown: &mut process_observation_unknown,
-            termination_request_unconfirmed: &mut termination_request_unconfirmed,
-            termination_requests: &mut termination_requests,
-        },
+        &mut termination,
+        &mut cancel_observed,
+        &mut control_read_unknown,
     );
-
-    let (stdout, stderr) = finish_captures_after_group_empty(
-        (stdout_path, stdout_reader),
-        (stderr_path, stderr_reader),
+    let resource_released = if matches!(family_departure, FamilyDeparture::Confirmed) {
+        group.disarm().is_ok()
+    } else {
+        false
+    };
+    // On Windows this closes the exact Job owner (and may request kill-on-close);
+    // on every platform the serialized identity remains available for readback.
+    drop(group);
+    let (stdout, stderr) = finish_captures_bounded(
+        stdout_reader,
+        stderr_reader,
+        stdout_path,
+        stderr_path,
         control,
         &owner,
         &mut control_read_unknown,
     );
-    group.disarm()?;
 
-    let termination = if process_observation_unknown {
+    let termination_reason = if process_observation_unknown {
         Termination::ProcessObservationUnknown
     } else if cancel_observed {
         Termination::Cancelled
@@ -482,95 +529,87 @@ pub fn execute_with_plan(
         operation_id: plan.identity.operation_id.clone(),
         process: owner.process,
         child_pid,
-        termination,
+        termination: termination_reason,
+        direct_exit: direct_exit.unwrap_or(DirectExit::ObservationUnknown),
+        family_departure,
         exit_code,
-        termination_requests,
+        termination_requests: termination.requests,
         stdout,
         stderr,
-        resource_released: true,
+        resource_released,
         control_read_unknown,
-        termination_request_unconfirmed,
+        termination_request_unconfirmed: termination.request_unconfirmed,
     })
 }
 
 fn wait_until_empty(
     group: &Group,
-    deadline: Option<Instant>,
     control: &mut impl CheckControl,
     owner: &OwnedCheckProcess,
-    state: &mut DrainState<'_>,
-) {
-    let drain_started = Instant::now();
-    let mut drain_diagnostic_published = false;
-    let mut observation_diagnostic_published = false;
-    let mut control_diagnostic_published = false;
-    let mut last_diagnostic_attempt = None;
+    termination: &mut TerminationState,
+    cancel_observed: &mut bool,
+    control_read_unknown: &mut bool,
+) -> FamilyDeparture {
+    let drain_started = termination.started.unwrap_or_else(Instant::now);
     loop {
-        match group.children_empty() {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(_) => *state.process_observation_unknown = true,
+        let last_observation_unknown = match group.children_empty() {
+            Ok(true) => return FamilyDeparture::Confirmed,
+            Ok(false) => false,
+            Err(_) => true,
+        };
+        if termination.started.is_none() {
+            request_termination(group, termination);
+        } else {
+            retry_termination(group, termination);
         }
-        let needs_diagnostic = (*state.process_observation_unknown
-            && !observation_diagnostic_published)
-            || (*state.control_read_unknown && !control_diagnostic_published)
-            || (!*state.process_observation_unknown
-                && !*state.control_read_unknown
-                && !drain_diagnostic_published);
-        if needs_diagnostic
-            && drain_started.elapsed() >= LONG_DRAIN_DIAGNOSTIC_AFTER
-            && last_diagnostic_attempt
-                .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1))
+        if !*control_read_unknown {
+            match control.cancellation_requested(owner) {
+                Ok(true) => *cancel_observed = true,
+                Ok(false) => {}
+                Err(_) => *control_read_unknown = true,
+            }
+        }
+        if termination
+            .started
+            .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
         {
-            last_diagnostic_attempt = Some(Instant::now());
-            if let Ok(()) = control.process_group_drain_pending(
+            let _ = control.process_group_drain_pending(
                 owner,
                 drain_started.elapsed(),
-                *state.process_observation_unknown,
-                *state.control_read_unknown,
-            ) {
-                if *state.process_observation_unknown {
-                    observation_diagnostic_published = true;
-                }
-                if *state.control_read_unknown {
-                    control_diagnostic_published = true;
-                }
-                if !*state.process_observation_unknown && !*state.control_read_unknown {
-                    drain_diagnostic_published = true;
-                }
-            }
-        }
-        if !*state.control_read_unknown {
-            match control.cancellation_requested(owner) {
-                Ok(true) => *state.cancel_observed = true,
-                Ok(false) => {}
-                Err(_) => *state.control_read_unknown = true,
-            }
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            *state.timed_out = true;
-        }
-        if *state.cancel_observed || *state.timed_out {
-            request_termination(
-                group,
-                state.termination_requests,
-                state.termination_request_unconfirmed,
+                last_observation_unknown,
+                *control_read_unknown,
             );
+            let process = owner.process.clone();
+            return if last_observation_unknown {
+                FamilyDeparture::ObservationUnknown { process }
+            } else {
+                FamilyDeparture::CleanupPending { process }
+            };
         }
         thread::sleep(CHECK_POLL_INTERVAL);
     }
 }
 
-fn request_termination(
-    group: &Group,
-    termination_requests: &mut u64,
-    termination_request_unconfirmed: &mut bool,
-) {
+fn request_termination(group: &Group, state: &mut TerminationState) {
+    state.started.get_or_insert_with(Instant::now);
+    if state.attempts >= MAX_TERMINATION_ATTEMPTS {
+        return;
+    }
+    state.attempts += 1;
+    state.last_request = Some(Instant::now());
     match group.cancel_children() {
-        Ok(sent) => {
-            *termination_requests = (*termination_requests).saturating_add(sent);
-        }
-        Err(_) => *termination_request_unconfirmed = true,
+        Ok(sent) => state.requests = state.requests.saturating_add(sent),
+        Err(_) => state.request_unconfirmed = true,
+    }
+}
+
+fn retry_termination(group: &Group, state: &mut TerminationState) {
+    if state.attempts < MAX_TERMINATION_ATTEMPTS
+        && state
+            .last_request
+            .is_some_and(|last| last.elapsed() >= TERMINATION_RETRY_INTERVAL)
+    {
+        request_termination(group, state);
     }
 }
 
@@ -640,181 +679,322 @@ fn create_output(path: &Path) -> Result<File> {
         })
 }
 
-fn capture_setup_error() -> Error {
-    Error::new(
-        "CHECK_CAPTURE_SETUP_FAILED",
-        "could not prepare bounded check output capture",
-    )
-}
-
-fn capture_thread<R: Read + Send + 'static>(
+fn capture_thread<R: PollableRead + Send + 'static>(
     name: &str,
+    path: PathBuf,
     mut reader: R,
-    mut file: File,
+    file: File,
     limit: u64,
-) -> io::Result<JoinHandle<io::Result<CaptureStats>>> {
-    thread::Builder::new().name(name.into()).spawn(move || {
-        let mut stats = CaptureStats::default();
+) -> io::Result<CaptureTask> {
+    reader.make_nonblocking()?;
+    let capacity = usize::try_from(limit)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "capture limit overflow"))?;
+    let stats = Arc::new(Mutex::new(CaptureStats {
+        bytes: Vec::with_capacity(capacity.min(64 * 1024)),
+        ..CaptureStats::default()
+    }));
+    let thread_stats = Arc::clone(&stats);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let reader = thread::Builder::new().name(name.into()).spawn(move || {
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
+            if thread_stop.load(Ordering::Acquire) {
                 break;
             }
-            let remaining = limit.saturating_sub(stats.bytes_written);
-            let keep = usize::try_from(remaining.min(read as u64)).unwrap_or(read);
-            if keep > 0 {
-                file.write_all(&buffer[..keep])?;
-                stats.bytes_written = stats.bytes_written.saturating_add(keep as u64);
-            }
-            if keep < read {
-                stats.truncated = true;
+            match reader.read_available(&mut buffer) {
+                Ok(PipeRead::Pending) => thread::sleep(CHECK_POLL_INTERVAL),
+                Ok(PipeRead::Eof) => {
+                    capture_stats_lock(&thread_stats).capture_complete = true;
+                    return;
+                }
+                Ok(PipeRead::Data(read)) => {
+                    let mut current = capture_stats_lock(&thread_stats);
+                    current.bytes_observed = current.bytes_observed.saturating_add(read as u64);
+                    let remaining = capacity.saturating_sub(current.bytes.len());
+                    let keep = remaining.min(read);
+                    current.bytes.extend_from_slice(&buffer[..keep]);
+                    if keep < read {
+                        current.truncated = true;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    capture_error(&thread_stats, "capture_read_failed");
+                    return;
+                }
             }
         }
-        file.sync_all()?;
-        Ok(stats)
+        capture_error(&thread_stats, "capture_drain_timeout");
+    })?;
+    Ok(CaptureTask {
+        path,
+        file,
+        reader,
+        stop,
+        stats,
     })
 }
 
-fn finish_capture(path: PathBuf, reader: JoinHandle<io::Result<CaptureStats>>) -> CapturedStream {
-    match reader.join() {
-        Ok(Ok(stats)) => CapturedStream {
-            path,
-            bytes_written: stats.bytes_written,
-            truncated: stats.truncated,
-            capture_complete: true,
-        },
-        Ok(Err(_)) | Err(_) => CapturedStream {
-            path,
-            bytes_written: 0,
-            truncated: false,
-            capture_complete: false,
-        },
+fn capture_stats_lock(stats: &Mutex<CaptureStats>) -> std::sync::MutexGuard<'_, CaptureStats> {
+    stats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn capture_error(stats: &Mutex<CaptureStats>, code: &str) {
+    let mut current = capture_stats_lock(stats);
+    if current.capture_error.is_none() {
+        current.capture_error = Some(code.to_owned());
     }
 }
 
-fn finish_captures_after_group_empty(
-    stdout: (PathBuf, JoinHandle<io::Result<CaptureStats>>),
-    stderr: (PathBuf, JoinHandle<io::Result<CaptureStats>>),
+fn finish_capture_task(mut task: CaptureTask, drain_grace: Duration) -> CapturedStream {
+    let deadline = Instant::now() + drain_grace;
+    while !task.reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(CHECK_POLL_INTERVAL);
+    }
+    let mut stopped = !task.reader.is_finished();
+    if stopped {
+        task.stop.store(true, Ordering::Release);
+        let stop_deadline = Instant::now() + CAPTURE_STOP_GRACE;
+        while !task.reader.is_finished() && Instant::now() < stop_deadline {
+            thread::sleep(CHECK_POLL_INTERVAL);
+        }
+        stopped = !task.reader.is_finished();
+    }
+    let join_panicked = if task.reader.is_finished() {
+        task.reader.join().is_err()
+    } else {
+        false
+    };
+    let mut stats = if stopped {
+        capture_stats_lock(&task.stats).clone()
+    } else {
+        let mut current = capture_stats_lock(&task.stats);
+        std::mem::take(&mut *current)
+    };
+    if join_panicked && stats.capture_error.is_none() {
+        stats.capture_error = Some("capture_reader_panicked".to_owned());
+    }
+    if stopped && stats.capture_error.is_none() {
+        stats.capture_error = Some("capture_reader_stop_pending".to_owned());
+    }
+    let mut bytes_written = 0u64;
+    while bytes_written < stats.bytes.len() as u64 {
+        let start = usize::try_from(bytes_written).unwrap_or(stats.bytes.len());
+        match task.file.write(&stats.bytes[start..]) {
+            Ok(0) => {
+                if stats.capture_error.is_none() {
+                    stats.capture_error = Some("capture_write_failed".to_owned());
+                }
+                break;
+            }
+            Ok(count) => bytes_written = bytes_written.saturating_add(count as u64),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                if stats.capture_error.is_none() {
+                    stats.capture_error = Some("capture_write_failed".to_owned());
+                }
+                break;
+            }
+        }
+    }
+    if task.file.sync_all().is_err() && stats.capture_error.is_none() {
+        stats.capture_error = Some("capture_sync_failed".to_owned());
+    }
+    let complete = stats.capture_complete
+        && stats.capture_error.is_none()
+        && !stopped
+        && bytes_written == stats.bytes.len() as u64;
+    CapturedStream {
+        path: task.path,
+        bytes_written,
+        bytes_observed: stats.bytes_observed,
+        truncated: stats.truncated,
+        capture_complete: complete,
+        capture_disposition: if complete {
+            CaptureDisposition::Complete
+        } else {
+            CaptureDisposition::Incomplete
+        },
+        capture_error: stats.capture_error,
+    }
+}
+
+fn capture_setup_failed(path: PathBuf) -> CapturedStream {
+    CapturedStream {
+        path,
+        bytes_written: 0,
+        bytes_observed: 0,
+        truncated: false,
+        capture_complete: false,
+        capture_disposition: CaptureDisposition::Incomplete,
+        capture_error: Some("capture_setup_failed".to_owned()),
+    }
+}
+
+fn finish_captures_bounded(
+    stdout: Option<CaptureTask>,
+    stderr: Option<CaptureTask>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
     control: &mut impl CheckControl,
     owner: &OwnedCheckProcess,
     control_read_unknown: &mut bool,
 ) -> (CapturedStream, CapturedStream) {
-    let (stdout_path, stdout_reader) = stdout;
-    let (stderr_path, stderr_reader) = stderr;
     let drain_started = Instant::now();
-    let mut diagnostic_published = false;
-    let mut last_diagnostic_attempt = None;
-    loop {
-        let stdout_pending = !stdout_reader.is_finished();
-        let stderr_pending = !stderr_reader.is_finished();
-        if !stdout_pending && !stderr_pending {
-            break;
-        }
-
+    let deadline = drain_started + CAPTURE_DRAIN_GRACE;
+    while Instant::now() < deadline
+        && (stdout
+            .as_ref()
+            .is_some_and(|task| !task.reader.is_finished())
+            || stderr
+                .as_ref()
+                .is_some_and(|task| !task.reader.is_finished()))
+    {
         if control
             .cancellation_requested_after_group_empty(owner)
             .is_err()
         {
             *control_read_unknown = true;
         }
-
-        if !diagnostic_published
-            && drain_started.elapsed() >= LONG_DRAIN_DIAGNOSTIC_AFTER
-            && last_diagnostic_attempt
-                .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1))
-        {
-            last_diagnostic_attempt = Some(Instant::now());
-            if control
-                .output_capture_drain_pending(
-                    owner,
-                    drain_started.elapsed(),
-                    stdout_pending,
-                    stderr_pending,
-                )
-                .is_ok()
-            {
-                diagnostic_published = true;
-            }
-        }
         thread::sleep(CHECK_POLL_INTERVAL);
     }
-
-    // Each join is now nonblocking because its reader thread has finished.
+    let stdout_pending = stdout
+        .as_ref()
+        .is_some_and(|task| !task.reader.is_finished());
+    let stderr_pending = stderr
+        .as_ref()
+        .is_some_and(|task| !task.reader.is_finished());
+    if stdout_pending || stderr_pending {
+        let _ = control.output_capture_drain_pending(
+            owner,
+            drain_started.elapsed(),
+            stdout_pending,
+            stderr_pending,
+        );
+    }
     (
-        finish_capture(stdout_path, stdout_reader),
-        finish_capture(stderr_path, stderr_reader),
+        stdout.map_or_else(
+            || capture_setup_failed(stdout_path),
+            |task| finish_capture_task(task, Duration::ZERO),
+        ),
+        stderr.map_or_else(
+            || capture_setup_failed(stderr_path),
+            |task| finish_capture_task(task, Duration::ZERO),
+        ),
     )
 }
 
-fn abort_owned_child(
-    group: &Group,
-    child: &mut Child,
-    control: &mut impl CheckControl,
-    owner: &OwnedCheckProcess,
-) {
-    let _ = child.kill();
-    let mut child_reaped = false;
-    let abort_started = Instant::now();
-    let mut process_observation_unknown = false;
-    let mut drain_diagnostic_published = false;
-    let mut observation_diagnostic_published = false;
-    let mut last_diagnostic_attempt = None;
-    loop {
-        if !child_reaped {
-            match child.try_wait() {
-                Ok(Some(_)) => child_reaped = true,
-                Ok(None) => {
-                    let _ = child.kill();
-                }
-                Err(_) => {
-                    process_observation_unknown = true;
-                    let _ = child.kill();
-                    observation_diagnostic_published = control
-                        .process_group_drain_pending(owner, abort_started.elapsed(), true, false)
-                        .is_ok();
-                }
-            }
+trait PollableRead: Read {
+    fn make_nonblocking(&self) -> io::Result<()>;
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead>;
+}
+
+enum PipeRead {
+    Data(usize),
+    Pending,
+    Eof,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: Read + std::os::fd::AsRawFd> PollableRead for T {
+    fn make_nonblocking(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+        const O_NONBLOCK: i32 = 0x800;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
         }
-        match group.children_empty() {
-            Ok(true) => {
-                if !child_reaped {
-                    let _ = child.wait();
-                }
-                break;
-            }
-            Ok(false) => {}
-            Err(_) => process_observation_unknown = true,
+        // SAFETY: fcntl reads and updates flags on this live pipe descriptor.
+        let flags = unsafe { fcntl(self.as_raw_fd(), F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
         }
-        let needs_diagnostic = if process_observation_unknown {
-            !observation_diagnostic_published
-        } else {
-            !drain_diagnostic_published
+        // SAFETY: F_SETFL accepts the current flags plus O_NONBLOCK.
+        if unsafe { fcntl(self.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
+        match self.read(buffer) {
+            Ok(0) => Ok(PipeRead::Eof),
+            Ok(read) => Ok(PipeRead::Data(read)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle> PollableRead for T {
+    fn make_nonblocking(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
+        use std::ffi::c_void;
+        unsafe extern "system" {
+            fn PeekNamedPipe(
+                pipe: *mut c_void,
+                buffer: *mut c_void,
+                buffer_size: u32,
+                bytes_read: *mut u32,
+                total_available: *mut u32,
+                bytes_left: *mut u32,
+            ) -> i32;
+            fn GetLastError() -> u32;
+        }
+        let mut available = 0u32;
+        // SAFETY: the handle is a live child pipe and output points to local storage.
+        let ok = unsafe {
+            PeekNamedPipe(
+                self.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
         };
-        if needs_diagnostic
-            && abort_started.elapsed() >= LONG_DRAIN_DIAGNOSTIC_AFTER
-            && last_diagnostic_attempt
-                .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1))
-        {
-            last_diagnostic_attempt = Some(Instant::now());
-            if control
-                .process_group_drain_pending(
-                    owner,
-                    abort_started.elapsed(),
-                    process_observation_unknown,
-                    false,
-                )
-                .is_ok()
-            {
-                if process_observation_unknown {
-                    observation_diagnostic_published = true;
-                } else {
-                    drain_diagnostic_published = true;
-                }
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            if code == 109 {
+                return Ok(PipeRead::Eof);
             }
+            return Err(io::Error::from_raw_os_error(code as i32));
         }
-        let _ = group.cancel_children();
-        thread::sleep(CHECK_POLL_INTERVAL);
+        if available == 0 {
+            return Ok(PipeRead::Pending);
+        }
+        let bound = buffer.len().min(available as usize);
+        match self.read(&mut buffer[..bound]) {
+            Ok(0) => Ok(PipeRead::Eof),
+            Ok(read) => Ok(PipeRead::Data(read)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+impl<T: Read> PollableRead for T {
+    fn make_nonblocking(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded pipe capture is unsupported on this platform",
+        ))
+    }
+
+    fn read_available(&mut self, _buffer: &mut [u8]) -> io::Result<PipeRead> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded pipe capture is unsupported on this platform",
+        ))
     }
 }
 
@@ -831,19 +1011,27 @@ fn not_started(
         process: owner.process,
         child_pid: None,
         termination,
+        direct_exit: DirectExit::NotStarted,
+        family_departure: FamilyDeparture::Confirmed,
         exit_code: None,
         termination_requests: 0,
         stdout: CapturedStream {
             path: output_directory.join("stdout"),
             bytes_written: 0,
+            bytes_observed: 0,
             truncated: false,
             capture_complete: false,
+            capture_disposition: CaptureDisposition::NotStarted,
+            capture_error: Some("capture_not_started".to_owned()),
         },
         stderr: CapturedStream {
             path: output_directory.join("stderr"),
             bytes_written: 0,
+            bytes_observed: 0,
             truncated: false,
             capture_complete: false,
+            capture_disposition: CaptureDisposition::NotStarted,
+            capture_error: Some("capture_not_started".to_owned()),
         },
         resource_released: true,
         control_read_unknown,

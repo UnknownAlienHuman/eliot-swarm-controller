@@ -1,6 +1,7 @@
 //! Typed manager-on-behalf authority for an exact Task acceptance decision.
 
 use super::{actions::AutomationStep, authorization, config};
+use crate::store::gm::current as current_gm;
 use crate::{
     acceptance::AcceptRequest,
     error::{Error, Result},
@@ -884,26 +885,6 @@ fn validate_assignment_submission_cause(
         return Err(damaged());
     }
     Ok(())
-}
-
-struct CurrentGm {
-    client_id: String,
-    epoch: i64,
-}
-
-fn current_gm(db: &Connection) -> Result<Option<CurrentGm>> {
-    let raw: Option<String> = db
-        .query_row("SELECT value_json FROM meta WHERE key='gm'", [], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    raw.map(|raw| {
-        let value: Value = serde_json::from_str(&raw)?;
-        let client_id = model::text(&value, "client_id")?.to_owned();
-        let epoch = model::positive(&value, "epoch")?;
-        Ok(CurrentGm { client_id, epoch })
-    })
-    .transpose()
 }
 
 fn sorted_check_ids(mut check_ids: Vec<String>) -> Vec<String> {

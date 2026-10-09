@@ -507,10 +507,8 @@ fn read_owner_manager_id(db: &Connection, p: &Principal, value: &Value) -> Resul
     // registered current GM. Never construct or substitute another Principal:
     // the requested owner selects a provenance-preserving metadata scope only.
     authorization::require_registered_manager(db, &p.client_id)?;
-    let is_current_gm = gm::record(db)?.is_some_and(|designation| {
-        designation["client_id"] == p.client_id
-            && designation["epoch"].as_i64().is_some_and(|epoch| epoch > 0)
-    });
+    let is_current_gm =
+        gm::read_current(db)?.is_some_and(|designation| designation.client_id == p.client_id);
     if !is_current_gm {
         return Err(Error::new(
             "FORBIDDEN",

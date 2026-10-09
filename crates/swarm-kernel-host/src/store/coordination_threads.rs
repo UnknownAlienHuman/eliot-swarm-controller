@@ -5,7 +5,7 @@
 //! message bodies live once in the typed mailbox Operation result.
 
 use super::{
-    coordination as coordination_store, mailbox, meta, operations, results, set_meta, tasks,
+    coordination as coordination_store, gm, mailbox, meta, operations, results, set_meta, tasks,
 };
 use crate::{
     artifacts::MAX_PAGE_BYTES,
@@ -39,7 +39,6 @@ pub(crate) struct ThreadParticipant {
     pub generation: Option<i64>,
     pub participation_basis: Value,
     pub registration_fingerprint: String,
-    pub reason: String,
     pub actor: Value,
     pub scope: Value,
 }
@@ -53,10 +52,7 @@ pub(crate) struct ThreadContext {
     /// Attempt owner at Thread creation; immutable provenance only, never
     /// durable read or mutation authority after Task ownership changes.
     pub sponsor_owner_id: String,
-    pub creator_actor: Value,
-    pub creator_scope: Value,
     pub topic_kind: String,
-    pub subject: String,
     pub state: String,
     pub state_revision: i64,
     pub next_message_seq: i64,
@@ -263,24 +259,40 @@ pub(crate) fn authorize_operation_read(
     principal: &Principal,
     operation_id: &str,
 ) -> Result<()> {
-    let row: Option<(String, String, Option<String>, Option<String>, String, String)> = db
+    struct ThreadOperationReadRow {
+        caller_id: String,
+        method: String,
+        task_id: Option<String>,
+        attempt_id: Option<String>,
+        original_request_json: String,
+        result_json: String,
+    }
+    let row: Option<ThreadOperationReadRow> = db
         .query_row(
             "SELECT caller_id,method,task_id,attempt_id,original_request_json,COALESCE(result_json,'null') \
              FROM operations WHERE operation_id=?1",
             [operation_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
+                Ok(ThreadOperationReadRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    original_request_json: row.get(4)?,
+                    result_json: row.get(5)?,
+                })
             },
         )
         .optional()?;
-    let Some((caller_id, method, task_id, attempt_id, request_raw, result_raw)) = row else {
+    let Some(ThreadOperationReadRow {
+        caller_id,
+        method,
+        task_id,
+        attempt_id,
+        original_request_json: request_raw,
+        result_json: result_raw,
+    }) = row
+    else {
         return Err(Error::new("NOT_FOUND", format!("Operation {operation_id}")));
     };
     if !thread_operation_method(&method) {
@@ -362,6 +374,218 @@ pub(super) fn apply(
             apply_supersede(tx, principal, request, method, operation_id, now)
         }
     }
+}
+
+pub(crate) fn apply_contract_decision(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    method: &str,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let request = crate::coordination::contract::parse_decision_request(method, value)?;
+    if !matches!(principal.role, Role::Manager | Role::Operator) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "contract decisions require the exact Attempt owner, current GM, or local Operator",
+        ));
+    }
+    let context = authorize_current_thread_mutation(tx, principal, &request.thread_id)?;
+    if context.topic_kind != "contract" {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "contract decision requires a contract Thread",
+        ));
+    }
+    require_expected_revision(&context, request.expected_state_revision)?;
+    if request.task_id != context.task_id
+        || request.task_revision != context.task_revision
+        || request.attempt_id != context.attempt_id
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "contract decision must name the exact Thread Task revision and Attempt",
+        ));
+    }
+
+    let scope = coordination_store::watch_scope(
+        tx,
+        principal,
+        Some(&context.task_id),
+        Some(context.task_revision),
+        Some(&context.attempt_id),
+    )?;
+    if scope["task"]["task_id"] != context.task_id
+        || scope["task"]["revision"] != context.task_revision
+        || scope["attempt"]["attempt_id"] != context.attempt_id
+        || scope["task"]["state"] != "open"
+        || !scope["attempt"]["released_at_ms"].is_null()
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "contract decision requires the current open Task and unreleased Attempt",
+        ));
+    }
+    let attempt_owner_id = model::text(&scope["attempt"], "owner_id")?.to_owned();
+    let (authority_basis, gm_epoch) = match principal.role {
+        Role::Operator => ("local_operator", None),
+        Role::Manager if attempt_owner_id == principal.client_id => ("attempt_owner", None),
+        Role::Manager => (
+            "current_gm",
+            Some(gm::require_current_manager(tx, &principal.client_id)?),
+        ),
+        _ => unreachable!("decision role checked above"),
+    };
+
+    let proposal = coordination_store::load_current_contract_proposal_revision(
+        tx,
+        &context.thread_id,
+        &context.task_id,
+        context.task_revision,
+        &context.attempt_id,
+        &request.proposal_revision_id,
+    )?;
+    if proposal["proposal_id"] != request.proposal_id
+        || proposal["proposal_digest"] != request.proposal_digest
+    {
+        return Err(Error::new(
+            "STALE_CONTRACT_REVISION",
+            "contract decision must name the exact current proposal identity and digest",
+        ));
+    }
+
+    let current_scopes = super::code_scopes::affected_scope_revisions(
+        tx,
+        &context.task_id,
+        context.task_revision,
+        &context.attempt_id,
+        &proposal["proposal"]["affected"],
+    )?;
+    if current_scopes["coverage"] != "complete" {
+        return Err(Error::new(
+            "SCOPE_COVERAGE_INCOMPLETE",
+            "contract decision requires complete coverage of proposal-relevant current scopes",
+        ));
+    }
+    let mut current_scope_refs = current_scopes["items"].as_array().cloned().ok_or_else(|| {
+        Error::new(
+            "SCOPE_COVERAGE_INCOMPLETE",
+            "current affected-scope snapshot has no item list",
+        )
+    })?;
+    current_scope_refs.sort_by(|left, right| {
+        left["scope_intent_id"]
+            .as_str()
+            .cmp(&right["scope_intent_id"].as_str())
+    });
+    if current_scope_refs != request.affected_scope_revisions {
+        return Err(Error::new(
+            "STALE_SCOPE_REVISION",
+            "contract decision scope references differ from the exact current affected-scope snapshot",
+        ));
+    }
+
+    if coordination_store::load_contract_decision(
+        tx,
+        coordination_store::ContractDecisionIdentity {
+            thread_id: &context.thread_id,
+            task_id: &context.task_id,
+            task_revision: context.task_revision,
+            attempt_id: &context.attempt_id,
+            proposal_id: &request.proposal_id,
+            proposal_revision_id: &request.proposal_revision_id,
+            proposal_digest: &request.proposal_digest,
+        },
+    )?
+    .is_some()
+    {
+        return Err(Error::new(
+            "CONTRACT_DECISION_ALREADY_RECORDED",
+            "this immutable proposal revision already has a terminal contract decision",
+        ));
+    }
+
+    let observation_payload = json!({
+        "thread_id":context.thread_id,
+        "proposal_id":request.proposal_id,
+        "proposal_revision_id":request.proposal_revision_id,
+        "decision_operation_id":operation_id,
+    });
+    let source_stream_id = format!("coordination:proposal:{}", request.proposal_id);
+    let source_event_key = format!("decision:{}", request.proposal_revision_id);
+    let observation_kind = request.kind.observation_kind();
+    let observation_id = tx.query_row(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,?6) RETURNING observation_id",
+        params![
+            source_stream_id,
+            source_event_key,
+            operation_id,
+            observation_kind,
+            model::canonical(&observation_payload)?,
+            now,
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if observation_id <= 0 {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "contract decision Observation has no positive retained identity",
+        ));
+    }
+    let decision = json!({
+        "schema_version":1,
+        "record_type":"contract_decision",
+        "decision":request.kind.as_str(),
+        "decision_operation_id":operation_id,
+        "observation_id":observation_id,
+        "thread_id":context.thread_id,
+        "thread_state_revision":context.state_revision,
+        "proposal_id":request.proposal_id,
+        "proposal_revision_id":request.proposal_revision_id,
+        "proposal_revision":proposal["revision"],
+        "proposal_digest":request.proposal_digest,
+        "task_id":context.task_id,
+        "task_revision":context.task_revision,
+        "attempt_id":context.attempt_id,
+        "attempt_owner_id":attempt_owner_id,
+        "actor":{"client_id":principal.client_id,"role":role_name(&principal.role)},
+        "authority_basis":{"kind":authority_basis,"gm_epoch":gm_epoch},
+        "affected_scope_revisions":current_scope_refs,
+        "scope_coverage":"complete",
+        "reason":request.reason,
+        "conditions":request.conditions,
+        "caveats":request.caveats,
+        "created_at_ms":now,
+        "model_work_started":false,
+        "native_execution":false,
+    });
+    let decision_key = coordination_store::contract_decision_key(
+        &request.proposal_id,
+        &request.proposal_revision_id,
+    );
+    if meta(tx, &decision_key)?.is_some() {
+        return Err(Error::new(
+            "CONTRACT_DECISION_ALREADY_RECORDED",
+            "this immutable proposal revision already has a terminal contract decision",
+        ));
+    }
+    set_meta(tx, &decision_key, &decision)?;
+    Ok(json!({
+        "operation_id":operation_id,
+        "decision":request.kind.as_str(),
+        "thread_id":context.thread_id,
+        "task_id":context.task_id,
+        "task_revision":context.task_revision,
+        "attempt_id":context.attempt_id,
+        "proposal_id":request.proposal_id,
+        "proposal_revision_id":request.proposal_revision_id,
+        "proposal_digest":request.proposal_digest,
+        "decision_observation_id":observation_id,
+        "changed":true,
+        "model_work_started":false,
+        "native_execution":false,
+    }))
 }
 
 fn apply_open(
@@ -783,6 +1007,7 @@ fn apply_resolve(
             tx,
             &context,
             ratification,
+            model::text(&proposal, "proposal_id")?,
             proposal_revision_id,
             model::text(&proposal, "proposal_digest")?,
         )?;
@@ -1548,24 +1773,32 @@ fn validate_contract_ratification(
     db: &Connection,
     context: &ThreadContext,
     operation_id: &str,
+    proposal_id: &str,
     proposal_revision_id: &str,
     proposal_digest: &str,
 ) -> Result<()> {
-    let operation = operations::get_operation(db, operation_id)?;
-    let result = &operation["result"];
-    if operation["method"] != "coordination.contract.ratify"
-        || operation["state"] != "settled"
-        || operation["task_id"] != context.task_id
-        || operation["attempt_id"] != context.attempt_id
-        || result["thread_id"] != context.thread_id
-        || result["task_id"] != context.task_id
-        || result["attempt_id"] != context.attempt_id
-        || result["proposal_revision_id"] != proposal_revision_id
-        || result["proposal_digest"] != proposal_digest
-    {
+    let decision = coordination_store::load_contract_decision(
+        db,
+        coordination_store::ContractDecisionIdentity {
+            thread_id: &context.thread_id,
+            task_id: &context.task_id,
+            task_revision: context.task_revision,
+            attempt_id: &context.attempt_id,
+            proposal_id,
+            proposal_revision_id,
+            proposal_digest,
+        },
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "RATIFICATION_REQUIRED",
+            "contract resolution requires the exact retained ratification decision",
+        )
+    })?;
+    if decision["decision"] != "ratified" || decision["decision_operation_id"] != operation_id {
         return Err(Error::new(
             "RATIFICATION_INVALID",
-            "ratification Operation does not prove this exact Thread, Task and Attempt",
+            "contract resolution requires the ratification Operation for this exact current proposal revision",
         ));
     }
     Ok(())
@@ -2062,6 +2295,7 @@ fn context_from_projection(value: Value, requested_id: &str) -> Result<ThreadCon
                 "Thread roster contains duplicate identities",
             ));
         }
+        model::text(raw, "reason")?;
         participants.push(ThreadParticipant {
             client_id,
             role,
@@ -2071,7 +2305,6 @@ fn context_from_projection(value: Value, requested_id: &str) -> Result<ThreadCon
                 .cloned()
                 .unwrap_or(Value::Null),
             registration_fingerprint: model::text(raw, "registration_fingerprint")?.to_owned(),
-            reason: model::text(raw, "reason")?.to_owned(),
             actor: raw.get("actor").cloned().unwrap_or(Value::Null),
             scope: raw.get("scope").cloned().unwrap_or(Value::Null),
         });
@@ -2080,6 +2313,8 @@ fn context_from_projection(value: Value, requested_id: &str) -> Result<ThreadCon
     if !THREAD_STATES.contains(&state.as_str()) {
         return Err(Error::new("THREAD_DAMAGED", "Thread state is invalid"));
     }
+    let topic_kind = model::text(&value, "topic_kind")?.to_owned();
+    model::text(&value, "subject")?;
     Ok(ThreadContext {
         thread_id: model::text(&value, "thread_id")?.to_owned(),
         task_id: model::text(&value, "task_id")?.to_owned(),
@@ -2089,10 +2324,7 @@ fn context_from_projection(value: Value, requested_id: &str) -> Result<ThreadCon
             .ok_or_else(|| Error::new("THREAD_DAMAGED", "Thread Task revision is invalid"))?,
         attempt_id: model::text(&value, "attempt_id")?.to_owned(),
         sponsor_owner_id: model::text(&value, "sponsor_owner_id")?.to_owned(),
-        creator_actor: value.get("creator_actor").cloned().unwrap_or(Value::Null),
-        creator_scope: value.get("creator_scope").cloned().unwrap_or(Value::Null),
-        topic_kind: model::text(&value, "topic_kind")?.to_owned(),
-        subject: model::text(&value, "subject")?.to_owned(),
+        topic_kind,
         state,
         state_revision: value["state_revision"]
             .as_i64()

@@ -2,7 +2,7 @@
 //! capacity and attention authorities, plus digest-bound launch admission.
 //! Workspace and runtime effects remain outside Store transactions.
 
-use super::{acceptance, capacity, meta, projection, tasks::task_sources};
+use super::{acceptance, capacity, meta, projection, provider_conditions, tasks::task_sources};
 use crate::{
     config::{Config, McpToolProfile},
     error::{Error, Result},
@@ -10,6 +10,7 @@ use crate::{
     model::{self, Dependency, Principal, Role, TaskSpec},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
@@ -31,6 +32,130 @@ const MAX_DECISION_CARD_OBJECTIVE_BYTES: usize = 4_096;
 const MAX_DECISION_CARD_TEXT_BYTES: usize = 512;
 const MAX_DECISION_CARD_LIST_ITEMS: usize = 16;
 const MAX_DECISION_CARD_OVERLAP_ITEMS: usize = 8;
+const MAX_LAUNCH_MANIFEST_BYTES: usize = 1_048_576;
+
+/// Constructed only from one Store snapshot. Display detachment cannot change
+/// these effect facts or their digest; clients never supply this value.
+#[derive(Serialize)]
+struct LaunchPlanAuthority {
+    schema_version: u32,
+    task: Value,
+    task_spec_sha256: String,
+    attempt_action: String,
+    current_attempt: Value,
+    candidate_scope: Value,
+    workspace: Value,
+    baseline: Value,
+    route: Value,
+    selected_route_sha256: Option<String>,
+    mcp: Value,
+    selected_mcp_profile_sha256: Option<String>,
+    requested_plan_facts: Value,
+    hard_blocks: Vec<String>,
+    gaps: Vec<String>,
+    preview_readiness: String,
+    coverage: String,
+}
+
+struct PlannedLaunch {
+    authority: LaunchPlanAuthority,
+    projection: Value,
+    plan_digest: String,
+}
+
+/// Count only other root claims when an already reserved root is rechecked.
+/// Provider evidence and the explicit policy use the same predicate at every
+/// admission boundary; read-only views do not create a reservation.
+pub(super) fn route_admission(
+    db: &Connection,
+    route: &crate::config::Route,
+    binding: Option<&Value>,
+    exclude_operation_id: Option<&str>,
+) -> Result<provider_conditions::RouteAdmissionProjection> {
+    let exclude_binding = binding
+        .map(|binding| {
+            Ok::<_, Error>((
+                model::text(binding, "binding_id")?,
+                model::positive(binding, "generation")?,
+            ))
+        })
+        .transpose()?;
+    let root_claims = if route.admission_policy.is_some() {
+        capacity::root_claims_for_route(db, route, exclude_operation_id, exclude_binding)?
+    } else {
+        Some(0)
+    };
+    provider_conditions::check_route(db, route, binding, root_claims, model::now_ms()?)
+}
+
+pub(super) fn require_route_admission(
+    admission: &provider_conditions::RouteAdmissionProjection,
+) -> Result<()> {
+    use provider_conditions::RouteAdmissionDecision;
+    match &admission.decision {
+        RouteAdmissionDecision::Admit => Ok(()),
+        RouteAdmissionDecision::Hold { code, .. } => {
+            Err(Error::new("ROUTE_ADMISSION_HELD", code.clone()))
+        }
+        RouteAdmissionDecision::Unavailable { code } => {
+            Err(Error::new("ROUTE_ADMISSION_UNAVAILABLE", code.clone()))
+        }
+    }
+}
+
+pub(super) fn current_launch_admission(
+    db: &Connection,
+    operation_id: &str,
+    config: &Config,
+) -> Result<provider_conditions::RouteAdmissionProjection> {
+    let manifest = retained_launch_manifest(db, operation_id)?;
+    let route = config.route(model::text(&manifest["request"], "route")?)?;
+    let operation = super::operations::get_operation(db, operation_id)?;
+    let binding = operation["binding_id"]
+        .as_str()
+        .zip(operation["binding_generation"].as_i64())
+        .map(|(id, generation)| super::operations::get_binding(db, id, generation))
+        .transpose()?;
+    if binding
+        .as_ref()
+        .is_some_and(|binding| binding["route"]["alias"] != route.alias)
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "launch binding belongs to another route",
+        ));
+    }
+    route_admission(db, &route, binding.as_ref(), Some(operation_id))
+}
+
+pub(super) fn retain_launch_admission(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    admission: &provider_conditions::RouteAdmissionProjection,
+    now: i64,
+) -> Result<()> {
+    let details = model::canonical(&serde_json::to_value(admission)?)?;
+    let changed = tx.execute(
+        "UPDATE operations SET effective_request_json=json_set(effective_request_json,'$.launch_manifest.current_route_admission',json(?2)), \
+         result_json=json_set(result_json,'$.current_route_admission',json(?2)),updated_at_ms=?3 \
+         WHERE operation_id=?1 AND method='swarm.launch' AND state='queued'",
+        params![operation_id, details, now],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "launch changed before route admission was retained",
+        ));
+    }
+    Ok(())
+}
+
+impl PlannedLaunch {
+    fn effect_facts(&self) -> Result<Value> {
+        let mut facts = serde_json::to_value(&self.authority)?;
+        facts["plan_digest"] = json!(self.plan_digest);
+        Ok(facts)
+    }
+}
 
 type OpeningChildRow = (
     String,
@@ -169,10 +294,8 @@ impl LaunchActor {
             Self::OnBehalf(context) => {
                 context.require_action_object(db, action, task_id, task_revision, attempt_id)?;
                 if attempt_id.is_none()
-                    && super::gm::record(db)?
-                        .as_ref()
-                        .and_then(|record| record["client_id"].as_str())
-                        != Some(context.effective_manager_id())
+                    && super::gm::current(db)?
+                        .is_none_or(|current| current.client_id != context.effective_manager_id())
                     && !context.is_workspace_readback_authorized(db)?
                 {
                     return Err(Error::new(
@@ -2148,7 +2271,12 @@ fn policy_state(policy_id: Option<&str>) -> Result<Value> {
     }
 }
 
-fn task_queue_item(db: &Connection, row: &TaskRow, brief_limit: usize) -> Result<Value> {
+fn task_queue_item(
+    db: &Connection,
+    row: &TaskRow,
+    brief_limit: usize,
+    config: &Config,
+) -> Result<Value> {
     let attempt = row
         .current_attempt_id
         .as_deref()
@@ -2254,6 +2382,7 @@ fn task_queue_item(db: &Connection, row: &TaskRow, brief_limit: usize) -> Result
         "current_attempt":attempt_value,
         "readiness":ready,
         "capacity":attempt_capacity,
+        "route_admission":exact_attempt_admission(db, attempt.as_ref(), config)?,
         "task_brief":brief,
         "work_scope":work_scope,
         "ordering":{"created_at_ms":row.created_at_ms,"tie_breaker":"task_id"},
@@ -2397,6 +2526,25 @@ fn binding_summary(db: &Connection, binding_id: &str, generation: i64) -> Result
     }))
 }
 
+fn exact_attempt_admission(
+    db: &Connection,
+    attempt: Option<&AttemptRow>,
+    config: &Config,
+) -> Result<Value> {
+    let Some((id, generation)) = attempt.and_then(|attempt| {
+        attempt
+            .binding_id
+            .as_deref()
+            .zip(attempt.binding_generation)
+    }) else {
+        return Ok(json!({"status":"route_not_selected"}));
+    };
+    let binding = super::operations::get_binding(db, id, generation)?;
+    Ok(serde_json::to_value(
+        super::runtime::binding_route_admission(db, &binding, Some(config), None)?,
+    )?)
+}
+
 fn exact_attempt_capacity(db: &Connection, attempt: &AttemptRow) -> Result<Value> {
     let (Some(binding_id), Some(generation)) =
         (attempt.binding_id.as_deref(), attempt.binding_generation)
@@ -2424,40 +2572,21 @@ fn exact_attempt_capacity(db: &Connection, attempt: &AttemptRow) -> Result<Value
     };
     let route: Value = serde_json::from_str(&route_json)?;
     let scope = capacity::scope_facts(&route, native_scope_key.as_deref(), binding_id);
-    let scope_key = scope["scope_key"].as_str().unwrap_or_default();
-    let ledger = meta(db, &format!("capacity:{scope_key}"))?.unwrap_or(Value::Null);
-    let entries: Vec<&Value> = ledger["entries"]
-        .as_object()
-        .into_iter()
-        .flat_map(|entries| entries.values())
-        .filter(|entry| entry["attempt_id"] == attempt.attempt_id)
-        .collect();
-    let reserved = entries
-        .iter()
-        .filter(|entry| entry["phase"] == "reserved")
-        .count();
-    let active = entries
-        .iter()
-        .filter(|entry| entry["phase"] == "active")
-        .count();
-    let unknown = entries
-        .iter()
-        .filter(|entry| !entry["outcome_unknown_since_ms"].is_null())
-        .count();
-    Ok(json!({
-        "status":"recorded_attempt_entries",
-        "scope":{
-            "scope_key":scope["scope_key"],
-            "runtime":scope["runtime"],
-            "provider":scope["provider"],
-            "service":scope["service"],
-            "identity":scope["identity"],
-        },
-        "attempt_entries":{"reserved":reserved,"active":active,"outcome_unknown":unknown,"count":entries.len()},
-        "ledger_updated_at_ms":ledger["updated_at_ms"],
-        "scope_capacity_available":null,
-        "capacity_reason":"single-binding projection does not revalidate the full scope roster",
-    }))
+    let mut accounting = capacity::attempt_accounting(db, &scope, &attempt.attempt_id)?;
+    accounting["scope"] = json!({
+        "scope_key":scope["scope_key"],
+        "runtime":scope["runtime"],
+        "provider":scope["provider"],
+        "service":scope["service"],
+        "identity":scope["identity"],
+    });
+    accounting["scope_capacity_available"] = Value::Null;
+    accounting["capacity_reason"] = if accounting["status"] == "recorded_attempt_entries" {
+        json!("single-binding projection does not revalidate the full scope roster")
+    } else {
+        accounting["status"].clone()
+    };
+    Ok(accounting)
 }
 
 fn authorize_launch_project(
@@ -2904,7 +3033,7 @@ fn launch_mcp_profile_projection(
                 "surface":request.mcp_surface,
             })
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     Ok(json!({
         "status":if surface["surface_id"].is_string() {"validated_against_static_catalog"} else {"invalid_for_profile"},
@@ -3108,8 +3237,8 @@ pub(crate) fn admit_work_dispatch(
     }
 
     let preview_params = launch_preview_value(preview_request);
-    let preview = match launch_preview_for_actor(tx, &actor, &preview_params, config) {
-        Ok(preview) => preview,
+    let planned = match launch_preview_inner(tx, &actor, &preview_params, config, None) {
+        Ok(planned) => planned,
         Err(error) if error.code == "WORK_DISPATCH_GM_REQUIRED" => {
             return Ok(WorkDispatchOutcome::Pending {
                 reason: "current_gm_required".to_owned(),
@@ -3118,10 +3247,17 @@ pub(crate) fn admit_work_dispatch(
         }
         Err(error) => return Err(error),
     };
+    let preview = planned.effect_facts()?;
     let hard_blocks = preview["hard_blocks"]
         .as_array()
         .cloned()
         .unwrap_or_default();
+    if preview["route"]["admission"]["decision"] == "hold" {
+        return Ok(WorkDispatchOutcome::Pending {
+            reason: model::text(&preview["route"]["admission"], "code")?.to_owned(),
+            wake_when: vec!["launch_readiness_changed".to_owned()],
+        });
+    }
     if let Some(reason) = hard_blocks.first().and_then(Value::as_str) {
         return Ok(WorkDispatchOutcome::Pending {
             reason: reason.chars().take(128).collect(),
@@ -3225,8 +3361,8 @@ pub(crate) fn launch_for_actor(
     let request = launcher::LaunchRequest::parse(params_value)?;
     actor.require_current(tx)?;
     let preview_params = request.preview_params();
-    let preview =
-        launch_preview_for_operation_actor(tx, actor, &preview_params, config, operation_id)?;
+    let planned = launch_preview_inner(tx, actor, &preview_params, config, Some(operation_id))?;
+    let preview = planned.effect_facts()?;
     if preview["plan_digest"] != request.plan_digest {
         return Err(Error::new(
             "STALE_LAUNCH_PLAN",
@@ -3299,6 +3435,7 @@ pub(crate) fn launch_for_actor(
         },
         "effects":"none_until_verified_workspace_lease",
     });
+    validate_launch_manifest_precommit(&manifest, &planned, &request)?;
     let effective = json!({
         "operation_contract":{
             "effect_scope":"one_exact_launch_plan",
@@ -3307,7 +3444,15 @@ pub(crate) fn launch_for_actor(
             "contract_revision":"swarm-launch-v1",
         },
         "launch_manifest":manifest,
+        "launch_plan_authority":planned.authority,
     });
+    let effective_json = model::canonical(&effective)?;
+    if effective_json.len() > MAX_LAUNCH_MANIFEST_BYTES {
+        return Err(Error::new(
+            "PAYLOAD_TOO_LARGE",
+            "complete launch manifest exceeds its retained byte boundary",
+        ));
+    }
     let original_request = model::canonical(params_value)?;
     let changed = tx.execute(
         "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4
@@ -3317,7 +3462,7 @@ pub(crate) fn launch_for_actor(
             operation_id,
             task_id,
             attempt_id,
-            model::canonical(&effective)?,
+            effective_json,
             actor.technical_requester_id(),
             request.client_request_id,
             original_request,
@@ -3672,7 +3817,9 @@ pub(super) fn fail_launch(
 ) -> Result<Value> {
     let (launch_state, operation_state, native_effect) = match safe_code {
         "workspace_stale_before_effect" => ("stale", "settled", "not_attempted"),
-        "workspace_admission_rejected" => ("blocked", "settled", "not_attempted"),
+        "workspace_admission_rejected" | "route_admission_unavailable" => {
+            ("blocked", "settled", "not_attempted")
+        }
         "workspace_effect_unknown" | "binding_effect_unknown" => {
             ("outcome_unknown", "outcome_unknown", "unknown")
         }
@@ -3756,6 +3903,7 @@ fn launch_workspace_plan_inner(
     config: &Config,
 ) -> Result<crate::workspace::WorkspaceLeasePlan> {
     actor.require_current(db)?;
+    require_route_admission(&current_launch_admission(db, operation_id, config)?)?;
     let operation = super::operations::get_operation(db, operation_id)?;
     let pending = operation["state"] == "queued"
         && operation["result"]["launch_state"] == "pending_workspace";
@@ -3786,13 +3934,14 @@ fn launch_workspace_plan_inner(
             "retained launch request identity changed",
         ));
     }
-    let preview = launch_preview_for_operation_actor(
+    let planned = launch_preview_inner(
         db,
         actor,
         &request.preview_params(),
         config,
-        operation_id,
+        Some(operation_id),
     )?;
+    let preview = planned.effect_facts()?;
     if preview["plan_digest"] != request.plan_digest
         || operation["task_id"] != preview["task"]["task_id"]
         || operation["attempt_id"] != preview["current_attempt"]["attempt_id"]
@@ -4275,6 +4424,17 @@ pub(super) fn launch_after_workspace_held(
             "launch Operation is no longer queued",
         ));
     }
+    let admission = current_launch_admission(tx, operation_id, config)?;
+    retain_launch_admission(tx, operation_id, &admission, now)?;
+    match admission.decision {
+        provider_conditions::RouteAdmissionDecision::Admit => {}
+        provider_conditions::RouteAdmissionDecision::Hold { .. } => {
+            return Ok(super::operations::get_operation(tx, operation_id)?["result"].clone());
+        }
+        provider_conditions::RouteAdmissionDecision::Unavailable { .. } => {
+            return fail_launch(tx, operation_id, "route_admission_unavailable", now);
+        }
+    }
     let plan = launch_workspace_plan_inner(tx, actor, operation_id, config)?;
     if lease.state != "held"
         || lease.operation_id != operation_id
@@ -4298,13 +4458,14 @@ pub(super) fn launch_after_workspace_held(
     )?;
     let launch_request =
         launcher::LaunchRequest::parse(&serde_json::from_str::<Value>(&request_raw)?)?;
-    let preview = launch_preview_for_operation_actor(
+    let planned = launch_preview_inner(
         tx,
         actor,
         &launch_request.preview_params(),
         config,
-        operation_id,
+        Some(operation_id),
     )?;
+    let preview = planned.effect_facts()?;
     if preview["plan_digest"] != launch_request.plan_digest {
         return Err(Error::new(
             "STALE_LAUNCH",
@@ -4825,17 +4986,7 @@ pub(crate) fn launch_preview_for_actor(
     params_value: &Value,
     config: &Config,
 ) -> Result<Value> {
-    launch_preview_inner(db, actor, params_value, config, None)
-}
-
-pub(crate) fn launch_preview_for_operation_actor(
-    db: &Connection,
-    actor: &LaunchActor,
-    params_value: &Value,
-    config: &Config,
-    operation_id: &str,
-) -> Result<Value> {
-    launch_preview_inner(db, actor, params_value, config, Some(operation_id))
+    Ok(launch_preview_inner(db, actor, params_value, config, None)?.projection)
 }
 
 fn launch_preview_inner(
@@ -4844,7 +4995,7 @@ fn launch_preview_inner(
     params_value: &Value,
     config: &Config,
     exclude_operation_id: Option<&str>,
-) -> Result<Value> {
+) -> Result<PlannedLaunch> {
     let request = launcher::LaunchPreviewRequest::parse(params_value)?;
 
     let row = query_task(db, &request.task_id)?;
@@ -4934,7 +5085,86 @@ fn launch_preview_inner(
         gaps.push("manager_owned_worktree_not_provisioned_by_preview");
     }
 
-    let route = launch_route_projection(config, &request, &mut hard_blocks, &mut gaps);
+    let mut route = launch_route_projection(config, &request, &mut hard_blocks, &mut gaps);
+    if let Some(selected) = config
+        .routes
+        .iter()
+        .find(|route| route.alias == request.route)
+    {
+        let selector = match super::module_handshake::selection_for_new_binding(
+            db,
+            actor.effective_manager_id(),
+            &selected.alias,
+            &selected.runtime,
+            &selected.module_artifact_id,
+        ) {
+            Ok(selector) => selector,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "TASK_PROMPT_CONTRACT_REQUIRED"
+                        | "MODULE_ROUTE_STALE"
+                        | "MODULE_DESCRIPTOR_MISSING"
+                ) =>
+            {
+                hard_blocks.push("selected_module_contract_unavailable");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = super::task_prompt::require_new_binding(selected, selector.as_ref()) {
+            match error.code.as_str() {
+                "ARTIFACT_RETIRED" => hard_blocks.push("route_artifact_retired"),
+                "MODULE_CONTRACT_REQUIRED" => {
+                    hard_blocks.push("current_module_contract_not_selected")
+                }
+                _ => return Err(error),
+            }
+        }
+        route["module_contract_selector"] = json!(selector);
+        let binding = exact_current_attempt
+            .and_then(|attempt| {
+                attempt
+                    .binding_id
+                    .as_deref()
+                    .zip(attempt.binding_generation)
+            })
+            .map(|(id, generation)| super::operations::get_binding(db, id, generation))
+            .transpose()?;
+        let current = route_admission(db, selected, binding.as_ref(), exclude_operation_id)?;
+        let mut admission = serde_json::to_value(&current)?;
+        if let Some(operation_id) = exclude_operation_id {
+            let retained: Option<String> = db.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+                [operation_id],
+                |row| row.get(0),
+            ).optional()?;
+            if let Some(raw) = retained {
+                let retained: Value = serde_json::from_str(&raw)?;
+                if let Some(original) = retained["launch_plan_authority"]["route"].get("admission")
+                {
+                    // Keep immutable preview evidence in the plan digest.
+                    // Current admission is checked separately before workspace
+                    // reservation and before every new native effect.
+                    let _: provider_conditions::RouteAdmissionProjection =
+                        serde_json::from_value(original.clone())?;
+                    admission = original.clone();
+                }
+            }
+        }
+        match admission["decision"].as_str() {
+            Some("admit") => {}
+            Some("hold") => hard_blocks.push("route_admission_held"),
+            Some("unavailable") => hard_blocks.push("route_admission_unavailable"),
+            _ => {
+                return Err(Error::new(
+                    "STORE_CORRUPT",
+                    "route admission decision is invalid",
+                ));
+            }
+        }
+        route["admission"] = admission;
+    }
     let mcp_profile = launch_mcp_profile_projection(db, config, actor, &request, &mut hard_blocks)?;
     let baseline = workspace_baseline_projection(db, &row, spec.as_ref())?;
     if baseline["status"] == "unverifiable" {
@@ -5155,24 +5385,95 @@ fn launch_preview_inner(
         "coverage":if gaps.is_empty() {"complete"} else {"partial"},
         "gaps":gaps,
     });
-    let canonical = model::canonical(&plan)?;
-    let plan_digest = format!("sha256:{}", model::digest(canonical.as_bytes()));
+    let current_attempt = match exact_current_attempt {
+        Some(attempt) => json!({
+            "attempt_id":attempt.attempt_id,
+            "task_revision":attempt.task_revision,
+            "owner_id":attempt.owner_id,
+            "state":attempt.state,
+            "start_owner":attempt.start_owner,
+            "start_operation_id":attempt.start_operation_id,
+            "binding_id":attempt.binding_id,
+            "binding_generation":attempt.binding_generation,
+            "snapshot_sha256":model::digest(model::canonical(&attempt.snapshot)?.as_bytes()),
+        }),
+        None => json!({"attempt_id":row.current_attempt_id}),
+    };
+    let selected_route_sha256 = config
+        .routes
+        .iter()
+        .find(|route| route.alias == request.route)
+        .map(|route| {
+            model::canonical(&serde_json::to_value(route)?)
+                .map(|bytes| model::digest(bytes.as_bytes()))
+        })
+        .transpose()?;
+    let selected_mcp_profile_sha256 = config
+        .mcp
+        .profiles
+        .get(&request.mcp_profile)
+        .map(|profile| {
+            model::canonical(&serde_json::to_value(profile)?)
+                .map(|bytes| model::digest(bytes.as_bytes()))
+        })
+        .transpose()?;
+    let authority = LaunchPlanAuthority {
+        schema_version: 1,
+        task: json!({
+            "task_id":row.task_id,"project_id":row.project_id,"revision":row.revision,
+            "expected_revision":request.expected_task_revision,"state":row.state,
+            "accepted_attempt_id":row.accepted_attempt_id,
+            "accepted_operation_id":row.accepted_operation_id,
+            "accepted_candidate_ref":row.accepted_candidate_ref,
+        }),
+        task_spec_sha256: model::digest(model::canonical(&row.spec)?.as_bytes()),
+        attempt_action: action.to_owned(),
+        current_attempt,
+        candidate_scope,
+        workspace,
+        baseline,
+        route,
+        selected_route_sha256,
+        mcp: mcp_profile,
+        selected_mcp_profile_sha256,
+        requested_plan_facts: launch_preview_value(&request),
+        hard_blocks: hard_blocks.iter().map(|code| (*code).to_owned()).collect(),
+        gaps: gaps.iter().map(|code| (*code).to_owned()).collect(),
+        preview_readiness: readiness.to_owned(),
+        coverage: if gaps.is_empty() {
+            "complete"
+        } else {
+            "partial"
+        }
+        .to_owned(),
+    };
+    validate_launch_plan_authority(&authority, &request)?;
+    let plan_digest = format!(
+        "sha256:{}",
+        model::digest(model::canonical(&serde_json::to_value(&authority)?)?.as_bytes())
+    );
     plan["plan_digest"] = json!(plan_digest);
+    plan["authority_projection"] = json!("complete");
     let canonical = model::canonical(&plan)?;
     if canonical.len() <= projection::MAX_SERIALIZED_BYTES {
-        return Ok(plan);
+        return Ok(PlannedLaunch {
+            authority,
+            projection: plan,
+            plan_digest,
+        });
     }
 
     let fallback = json!({
         "plan_digest":plan_digest,
+        "authority_projection":"detached",
         "preview_only":true,
         "effects":"none",
         "launch_mutation":"durable_intent_pending_workspace",
         "launch_execution":"awaits_verified_workspace_lease",
         "preview_readiness":readiness,
         "task":{
-            "task_id":bounded_decision_value(&json!(row.task_id), MAX_DECISION_CARD_TEXT_BYTES).0,
-            "project_id":bounded_decision_value(&json!(row.project_id), MAX_DECISION_CARD_TEXT_BYTES).0,
+            "task_id":row.task_id,
+            "project_id":row.project_id,
             "revision":row.revision,
             "expected_revision":request.expected_task_revision,
             "state":row.state,
@@ -5180,7 +5481,7 @@ fn launch_preview_inner(
         "attempt_action":action,
         "current_attempt":{
             "status":attempt_projection["status"],
-            "attempt_id":bounded_decision_value(&attempt_projection["attempt_id"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "attempt_id":attempt_projection["attempt_id"],
         },
         "decision_card":decision_card.clone(),
         "context_detached":{
@@ -5195,19 +5496,24 @@ fn launch_preview_inner(
     });
     let fallback_canonical = model::canonical(&fallback)?;
     if fallback_canonical.len() <= projection::MAX_SERIALIZED_BYTES {
-        return Ok(fallback);
+        return Ok(PlannedLaunch {
+            authority,
+            projection: fallback,
+            plan_digest,
+        });
     }
 
     let terminal_fallback = json!({
         "plan_digest":plan_digest,
+        "authority_projection":"detached",
         "preview_only":true,
         "effects":"none",
         "launch_mutation":"durable_intent_pending_workspace",
         "launch_execution":"awaits_verified_workspace_lease",
         "preview_readiness":readiness,
         "task":{
-            "task_id":bounded_decision_value(&json!(row.task_id), MAX_DECISION_CARD_TEXT_BYTES).0,
-            "project_id":bounded_decision_value(&json!(row.project_id), MAX_DECISION_CARD_TEXT_BYTES).0,
+            "task_id":row.task_id,
+            "project_id":row.project_id,
             "revision":row.revision,
             "expected_revision":request.expected_task_revision,
             "state":bounded_decision_value(&json!(row.state), MAX_DECISION_CARD_TEXT_BYTES).0,
@@ -5215,7 +5521,7 @@ fn launch_preview_inner(
         "attempt_action":action,
         "current_attempt":{
             "status":attempt_projection["status"],
-            "attempt_id":bounded_decision_value(&attempt_projection["attempt_id"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "attempt_id":attempt_projection["attempt_id"],
         },
         "decision_card":{
             "schema_version":1,
@@ -5233,8 +5539,78 @@ fn launch_preview_inner(
         "coverage":"partial",
         "gaps":["combined_launch_preview_exceeded_serialized_budget; use the exact linked read projections"],
     });
-    debug_assert!(model::canonical(&terminal_fallback)?.len() <= projection::MAX_SERIALIZED_BYTES);
-    Ok(terminal_fallback)
+    if model::canonical(&terminal_fallback)?.len() > projection::MAX_SERIALIZED_BYTES {
+        return Err(Error::new(
+            "PAYLOAD_TOO_LARGE",
+            "minimum exact launch projection exceeds its response byte boundary",
+        ));
+    }
+    Ok(PlannedLaunch {
+        authority,
+        projection: terminal_fallback,
+        plan_digest,
+    })
+}
+
+fn validate_launch_plan_authority(
+    authority: &LaunchPlanAuthority,
+    request: &launcher::LaunchPreviewRequest,
+) -> Result<()> {
+    if authority.schema_version != 1
+        || authority.task["task_id"] != request.task_id
+        || !authority.task["project_id"].is_string()
+        || authority.task["revision"]
+            .as_i64()
+            .is_none_or(|revision| revision <= 0)
+        || !matches!(
+            authority.attempt_action.as_str(),
+            "claim_new" | "use_existing" | "forbidden"
+        )
+        || authority.route["alias"] != request.route
+        || authority.mcp["profile_name"] != request.mcp_profile
+        || authority.mcp["surface"] != request.mcp_surface
+        || authority.workspace["policy"] != request.workspace_policy
+        || !authority.candidate_scope.is_object()
+        || !authority.baseline.is_object()
+        || authority.requested_plan_facts != launch_preview_value(request)
+        || (authority.attempt_action == "use_existing"
+            && !authority.current_attempt["attempt_id"].is_string())
+    {
+        return Err(Error::new(
+            "LAUNCH_PLAN_AUTHORITY_DAMAGED",
+            "private launch authority is incomplete or inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_launch_manifest_precommit(
+    manifest: &Value,
+    planned: &PlannedLaunch,
+    request: &launcher::LaunchRequest,
+) -> Result<()> {
+    let authority = &planned.authority;
+    validate_launch_plan_authority(authority, &request.preview)?;
+    if manifest["manifest_version"] != "eliot-launch-manifest-v1"
+        || manifest["plan_digest"] != planned.plan_digest
+        || planned.plan_digest != request.plan_digest
+        || manifest["request"] != authority.requested_plan_facts
+        || manifest["runtime"]["route"] != authority.route
+        || manifest["mcp"] != authority.mcp
+        || manifest["task"]["candidate_scope"] != authority.candidate_scope
+        || manifest["task"]["task_id"] != authority.task["task_id"]
+        || manifest["task"]["project_id"] != authority.task["project_id"]
+        || manifest["task"]["observed_revision"] != authority.task["revision"]
+        || manifest["task"]["attempt_action"] != authority.attempt_action
+        || manifest["task"]["attempt_id"] != authority.current_attempt["attempt_id"]
+        || manifest["preflight"]["hard_blocks"] != json!(authority.hard_blocks)
+    {
+        return Err(Error::new(
+            "LAUNCH_MANIFEST_CORRUPT",
+            "manifest differs from its complete private launch authority",
+        ));
+    }
+    Ok(())
 }
 
 struct LaunchDecisionCardInput<'a> {
@@ -5398,6 +5774,7 @@ fn launch_decision_card(input: LaunchDecisionCardInput<'_>) -> Value {
         },
         "selection":{
             "route":bounded_decision_value(&route["alias"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "route_admission":route["admission"],
             "agent_profile":compact_agent_profile(&route["agent_profile"]),
             "mcp_profile":bounded_decision_value(&mcp["profile_name"], MAX_DECISION_CARD_TEXT_BYTES).0,
             "mcp_surface":bounded_decision_value(&mcp["surface"], MAX_DECISION_CARD_TEXT_BYTES).0,
@@ -5680,7 +6057,12 @@ fn compact_baseline_projection(baseline: &Value) -> Value {
     })
 }
 
-fn queue_page(db: &Connection, params_value: &Value, brief_limit: usize) -> Result<Value> {
+fn queue_page(
+    db: &Connection,
+    params_value: &Value,
+    brief_limit: usize,
+    config: &Config,
+) -> Result<Value> {
     model::fields(
         params_value,
         &["after", "limit", "project_id", "task_state"],
@@ -5718,7 +6100,7 @@ fn queue_page(db: &Connection, params_value: &Value, brief_limit: usize) -> Resu
     let after = page.after.min(total);
     let items = rows
         .iter()
-        .map(|row| task_queue_item(db, row, brief_limit))
+        .map(|row| task_queue_item(db, row, brief_limit, config))
         .collect::<Result<Vec<_>>>()?;
     bounded_page("task_queue", after, page.limit, total, items)
 }
@@ -6045,9 +6427,8 @@ fn sanitize_capacity_item(item: &Value) -> Value {
         "counts":item["counts"],
         "roster":item["roster"],
         "roster_reason":item["roster_reason"],
-        "quota_incident_open":!item["quota_incident"].is_null(),
-        "capacity_available":item["capacity_available"],
-        "capacity_reason":item["capacity_reason"],
+        "historical_quota_incident_recorded":!item["historical_quota_incident"].is_null(),
+        "pending_admission_recorded":item["pending_admission_recorded"],
         "new_work_enabled":item["new_work_enabled"],
         "ledger_updated_at_ms":item["ledger_updated_at_ms"],
     })
@@ -6077,6 +6458,7 @@ fn dashboard_summary(
     include_manager_details: bool,
     limit: i64,
     p: &Principal,
+    config: &Config,
 ) -> Result<Value> {
     let task_summary = task_counts(db)?;
     let attempts = attempt_counts(db)?;
@@ -6098,7 +6480,7 @@ fn dashboard_summary(
         }));
     }
     let queue_params = json!({"after":0,"limit":limit});
-    let queue = queue_page(db, &queue_params, 4_096)?;
+    let queue = queue_page(db, &queue_params, 4_096, config)?;
     let capacity = dashboard_capacity(db)?;
     let include_current_gm_actions = super::gm::require_authority(db, p).is_ok();
     let exception = manager_exceptions_page(
@@ -6168,7 +6550,12 @@ fn dashboard_summary(
 }
 
 /// Manager and Observer dashboard over current retained Store facts.
-pub(super) fn dashboard(db: &Connection, p: &Principal, params_value: &Value) -> Result<Value> {
+pub(super) fn dashboard(
+    db: &Connection,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+) -> Result<Value> {
     require_dashboard_reader(db, p)?;
     model::fields(params_value, &["limit"])?;
     let limit = params_value
@@ -6186,20 +6573,30 @@ pub(super) fn dashboard(db: &Connection, p: &Principal, params_value: &Value) ->
         })
         .transpose()?
         .unwrap_or(DASHBOARD_PAGE_LIMIT);
-    dashboard_summary(db, p.role != Role::Observer, limit, p)
+    dashboard_summary(db, p.role != Role::Observer, limit, p, config)
 }
 
 /// Bounded manager queue read. SQL filters are applied before offset paging;
 /// readiness is then derived from each returned Task/Attempt and acceptance
 /// receipt without treating route configuration as runtime capacity.
-pub(super) fn queue_get(db: &Connection, p: &Principal, params_value: &Value) -> Result<Value> {
+pub(super) fn queue_get(
+    db: &Connection,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+) -> Result<Value> {
     require_manager(db, p)?;
-    queue_page(db, params_value, launcher::MAX_INLINE_BRIEF_BYTES)
+    queue_page(db, params_value, launcher::MAX_INLINE_BRIEF_BYTES, config)
 }
 
 /// Inspect one exact Attempt and its current binding/operation neighborhood.
 /// A Manager sees only its own Attempt; the local Operator may inspect any.
-pub(super) fn agent_inspect(db: &Connection, p: &Principal, params_value: &Value) -> Result<Value> {
+pub(super) fn agent_inspect(
+    db: &Connection,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+) -> Result<Value> {
     require_manager(db, p)?;
     model::fields(
         params_value,
@@ -6453,6 +6850,7 @@ pub(super) fn agent_inspect(db: &Connection, p: &Principal, params_value: &Value
             "operation_state_counts":operation_counts,
             "checks":check_runs,
             "capacity":capacity,
+            "route_admission":exact_attempt_admission(db, Some(&attempt), config)?,
             "attention":attention,
         },
         "coordination":{

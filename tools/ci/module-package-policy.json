@@ -5,27 +5,67 @@
     {
       "package_name": "swarm-adapter-codex",
       "manifest": "crates/swarm-adapter-codex/Cargo.toml",
-      "binary_target": "swarm-codex-adapter"
+      "binary_target": "swarm-codex-adapter",
+      "qualification_artifacts": [
+        {
+          "adapter": "Codex",
+          "module_id": "codex",
+          "artifact_id": "codex-rust-controller.1",
+          "version": "5"
+        }
+      ]
     },
     {
       "package_name": "swarm-adapter-command",
       "manifest": "crates/swarm-adapter-command/Cargo.toml",
-      "binary_target": "swarm-adapter-command"
+      "binary_target": "swarm-adapter-command",
+      "qualification_artifacts": [
+        {
+          "adapter": "Command",
+          "module_id": "runtime.command",
+          "artifact_id": "eliot-command.rust-headless.1",
+          "version": "4"
+        }
+      ]
     },
     {
       "package_name": "swarm-adapter-claude",
       "manifest": "crates/swarm-adapter-claude/Cargo.toml",
-      "binary_target": "swarm-adapter-claude"
+      "binary_target": "swarm-adapter-claude",
+      "qualification_artifacts": [
+        {
+          "adapter": "Claude",
+          "module_id": "claude",
+          "artifact_id": "claude-agent-sdk-rust-controller.5",
+          "version": "5"
+        }
+      ]
     },
     {
       "package_name": "swarm-antigravity-adapter",
       "manifest": "modules/antigravity-rust/Cargo.toml",
-      "binary_target": "swarm-antigravity"
+      "binary_target": "swarm-antigravity",
+      "qualification_artifacts": [
+        {
+          "adapter": "Antigravity",
+          "module_id": "antigravity",
+          "artifact_id": "eliot-antigravity.rust-headless.1",
+          "version": "5"
+        }
+      ]
     },
     {
       "package_name": "swarm-adapter-opencode",
       "manifest": "crates/swarm-adapter-opencode/Cargo.toml",
-      "binary_target": "swarm-adapter-opencode"
+      "binary_target": "swarm-adapter-opencode",
+      "qualification_artifacts": [
+        {
+          "adapter": "OpenCode",
+          "module_id": "eliot.opencode.v2",
+          "artifact_id": "eliot-opencode-v2.rust-http.1",
+          "version": "0.5.0"
+        }
+      ]
     },
     {
       "package_name": "swarm-process",

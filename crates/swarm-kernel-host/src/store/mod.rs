@@ -10,6 +10,7 @@ mod automation_github_projection;
 pub(crate) mod automation_goal_progression;
 mod automation_intake;
 mod automation_publication;
+mod automation_reconcile;
 pub(crate) mod automation_repair;
 mod automation_scheduler;
 mod automation_transfer;
@@ -33,7 +34,7 @@ mod github;
 mod github_effect_tests;
 mod github_effects;
 mod github_pr_effects;
-mod gm;
+pub(crate) mod gm;
 mod goals;
 mod hooks;
 mod host_lifecycle;
@@ -62,9 +63,12 @@ mod module_handshake;
 mod module_supervisor_observation;
 mod monitor;
 mod native_mcp;
+mod native_usage;
 mod normalized_result;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
+mod object_reads;
+pub(crate) mod object_scope;
 mod opencode;
 mod operation_cancel_event_schema;
 #[cfg(test)]
@@ -77,6 +81,7 @@ pub(crate) mod participant_credentials;
 mod prerequisites;
 mod producers;
 mod projection;
+mod provider_conditions;
 mod results;
 mod review_disposition;
 mod reviews;
@@ -91,6 +96,7 @@ mod script_event_schema_fixture;
 mod scripts;
 mod status_reader;
 mod submissions;
+mod task_prompt;
 mod tasks;
 #[cfg(test)]
 mod work_dispatch_regression;
@@ -117,6 +123,10 @@ const SCRIPT_SCHEMA: &str = include_str!("../../migrations/004_scripts.sql");
 const GITHUB_SCHEMA: &str = include_str!("../../migrations/006_github.sql");
 const GITHUB_EFFECTS_SCHEMA: &str = include_str!("../../migrations/007_github_label_effects.sql");
 const GITHUB_PR_EFFECTS_SCHEMA: &str = include_str!("../../migrations/008_github_pr_effects.sql");
+const GM_FENCING_SCHEMA: &str = include_str!("../../migrations/012_gm_fencing.sql");
+const READ_POSITION_SCHEMA: &str = include_str!("../../migrations/013_read_positions.sql");
+const PROVIDER_CONDITION_SCHEMA: &str =
+    include_str!("../../migrations/014_provider_conditions.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 pub(crate) const MANAGER_EVENT_SOURCE_STREAM: &str = "controller:manager-events";
@@ -159,6 +169,50 @@ struct LaunchWorkspaceWork {
     registration: crate::workspace::WorkspaceRegistration,
     reservation: crate::workspace::LeaseReservation,
     readback_only: bool,
+}
+
+/// A domain decides which of its semantic failures can be reported without
+/// stopping unrelated consumers. Transaction uncertainty is always fatal.
+fn reconcile_automation_domain(
+    db: &mut Connection,
+    domain: &str,
+    run: impl FnOnce(&Transaction<'_>) -> Result<Value>,
+    classify: impl FnOnce(Error) -> automation_reconcile::DomainErrorDisposition,
+) -> Result<Value> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match run(&tx) {
+        Ok(value) => {
+            tx.commit()?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().map_err(|rollback| {
+                Error::new(
+                    "AUTOMATION_DOMAIN_ROLLBACK_UNCERTAIN",
+                    "automation domain rollback failed",
+                )
+                .with_secondary_error(error.clone())
+                .with_secondary_error(rollback.into())
+            })?;
+            automation_domain_failure(domain, classify(error))
+        }
+    }
+}
+
+fn automation_domain_failure(
+    domain: &str,
+    disposition: automation_reconcile::DomainErrorDisposition,
+) -> Result<Value> {
+    match disposition {
+        automation_reconcile::DomainErrorDisposition::Degraded { code } => Ok(json!({
+            "domain":domain,
+            "status":"degraded",
+            "code":code,
+            "coverage":"partial",
+            "cursor_advanced":false,
+        })),
+        automation_reconcile::DomainErrorDisposition::Fatal(error) => Err(error),
+    }
 }
 
 impl StoreOwner {
@@ -1125,6 +1179,22 @@ impl Store {
                     tx.commit()?;
                     return Ok(None);
                 }
+                if !unknown_workspace {
+                    let admission = launcher::current_launch_admission(&tx, &intent, &config)?;
+                    launcher::retain_launch_admission(&tx, &intent, &admission, model::now_ms()?)?;
+                    match admission.decision {
+                        provider_conditions::RouteAdmissionDecision::Admit => {}
+                        provider_conditions::RouteAdmissionDecision::Hold { .. } => {
+                            tx.commit()?;
+                            return Ok(None);
+                        }
+                        provider_conditions::RouteAdmissionDecision::Unavailable { .. } => {
+                            launcher::fail_launch(&tx, &intent, "route_admission_unavailable", model::now_ms()?)?;
+                            tx.commit()?;
+                            return Ok(None);
+                        }
+                    }
+                }
                 if let Some(held) = workspace::held_lease_for_operation(&tx, &intent)? {
                     launcher::launch_after_workspace_held(&tx, &actor, &config, &intent, &held, model::now_ms()?)?;
                     tx.commit()?;
@@ -1250,6 +1320,11 @@ impl Store {
                             model::now_ms()?,
                         )?
                     };
+                    // Filesystem proof survives a later admission failure.
+                    // Native reservations use a fresh transaction and recheck
+                    // current authority and route immediately before admission.
+                    tx.commit()?;
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let result = launcher::launch_after_workspace_held(
                         &tx,
                         &actor,
@@ -1323,10 +1398,17 @@ impl Store {
                 [&operation_id],
                 |row| row.get(0),
             )?;
+            let has_proved_lease: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspace_leases WHERE operation_id=?1 AND state='held')",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
             let failure = if closed_admission {
                 "workspace_admission_rejected"
             } else if !operation["binding_id"].is_null() {
                 "binding_effect_unknown"
+            } else if has_proved_lease {
+                "workspace_admission_rejected"
             } else if has_lease {
                 "workspace_effect_unknown"
             } else if safe_code.starts_with("STALE") {
@@ -1377,52 +1459,96 @@ impl Store {
 
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
         let config = self.config.clone();
+        let dispatch_config = config.clone();
+        // Dispatch commits before publication's executable preflight. Damage
+        // in publication state cannot prevent unrelated dispatch progress.
+        let mut result = self
+            .run(move |db| {
+                let now = model::now_ms()?;
+                let review_dispatch = reconcile_automation_domain(
+                    db,
+                    "review_dispatch",
+                    |tx| automation_dispatch::reconcile(tx, &dispatch_config, 16, 64, now),
+                    automation_dispatch::classify_domain_error,
+                )?;
+                let work_dispatch = reconcile_automation_domain(
+                    db,
+                    "work_dispatch",
+                    |tx| automation_work_dispatch::reconcile(tx, &dispatch_config, 16, 64, now),
+                    automation_work_dispatch::classify_domain_error,
+                )?;
+                Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch}))
+            })
+            .await?;
+        let mut publication_preflight_failure = None;
         let forge_preparation = if config.forge.enabled {
             let preflight_now = model::now_ms()?;
             let demand = self
                 .run(move |db| {
                     automation_publication::forge_preparation_demand(db, 16, 64, preflight_now)
                 })
-                .await?;
-            if demand {
-                self.prepare_forge_execution(config.clone()).await
-            } else {
-                forge::ForgeExecutionPreparation::Skipped
+                .await;
+            match demand {
+                Ok(true) => self.prepare_forge_execution(config.clone()).await,
+                Ok(false) => forge::ForgeExecutionPreparation::Skipped,
+                Err(error) => {
+                    publication_preflight_failure = Some(automation_domain_failure(
+                        "publication",
+                        automation_publication::classify_domain_error(error),
+                    )?);
+                    forge::ForgeExecutionPreparation::Skipped
+                }
             }
         } else {
             forge::ForgeExecutionPreparation::Skipped
         };
-        let mut result = self
+        let remaining = self
             .run(move |db| {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let now = model::now_ms()?;
-                let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
-                let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
-                let publication = automation_publication::reconcile(
-                    &tx,
-                    &config,
-                    16,
-                    64,
-                    now,
-                    &forge_preparation,
+                let publication = match publication_preflight_failure {
+                    Some(failure) => failure,
+                    None => reconcile_automation_domain(
+                        db,
+                        "publication",
+                        |tx| {
+                            automation_publication::reconcile(
+                                tx,
+                                &config,
+                                16,
+                                64,
+                                now,
+                                &forge_preparation,
+                            )
+                        },
+                        automation_publication::classify_domain_error,
+                    )?,
+                };
+                let goal_progression = reconcile_automation_domain(
+                    db,
+                    "goal_progression",
+                    |tx| {
+                        automation_goal_progression::reconcile(tx, 16, 64, now, |tx, admission| {
+                            admit_goal_progression_operation(tx, admission, &config, now)
+                        })
+                    },
+                    automation_goal_progression::classify_domain_error,
                 )?;
-                let goal_progression =
-                    automation_goal_progression::reconcile(&tx, 16, 64, now, |tx, admission| {
-                        admit_goal_progression_operation(tx, admission, &config, now)
-                    })?;
-                let github_projection = automation_github_projection::reconcile(&tx, 16, 16, now)?;
-                // The cursor, pending reasons, semantic slot and Operation are
-                // durable before the host can observe an admitted action.
-                tx.commit()?;
+                let github_projection = reconcile_automation_domain(
+                    db,
+                    "github_projection",
+                    |tx| automation_github_projection::reconcile(tx, 16, 16, now),
+                    automation_github_projection::classify_domain_error,
+                )?;
                 Ok(json!({
-                    "review_dispatch":review_dispatch,
-                    "work_dispatch":work_dispatch,
                     "publication":publication,
                     "goal_progression":goal_progression,
                     "github_projection":github_projection
                 }))
             })
             .await?;
+        for domain in ["publication", "goal_progression", "github_projection"] {
+            result[domain] = remaining[domain].clone();
+        }
         // Projection effects are invoked only after their cursor and Operations commit.
         result["github_projection_effects"] =
             automation_github_projection::reconcile_effects_once(self, 16).await?;
@@ -1448,10 +1574,13 @@ impl Store {
         let config = self.config.clone();
         let result = self
             .run(move |db| {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let result = review_disposition::reconcile(&tx, &config, 16, 64, model::now_ms()?)?;
-                tx.commit()?;
-                Ok(result)
+                let now = model::now_ms()?;
+                reconcile_automation_domain(
+                    db,
+                    "review_disposition",
+                    |tx| review_disposition::reconcile(tx, &config, 16, 64, now),
+                    review_disposition::classify_domain_error,
+                )
             })
             .await?;
         let decisions = self.verify_automation_acceptances_once().await?;
@@ -1806,6 +1935,9 @@ impl Store {
                 | "task.dispatch"
                 | "agent.send"
                 | "agent.reply"
+                | "native.opencode.loop_step"
+                | "native.command.cancel_turn"
+                | "native.command.close_session"
                 | "agent.configure"
                 | "agent.goal"
                 | "agent.background"
@@ -1815,6 +1947,7 @@ impl Store {
                 | "agent.recover"
                 | "host.mode"
                 | "module.outcome"
+                | "module.observe"
                 | "module.event"
                 | "bus.consumer.admit"
                 | "swarm.launch"
@@ -1889,42 +2022,12 @@ impl Store {
                             return coordination_watch::read(db, &principal, &params);
                         }
                         if method == "operation.get" {
-                            let id = model::text(&params, "operation_id")?;
-                            if concilium::authorize_operation_read(db, &principal, id).is_ok() {
-                                model::fields(&params, &["operation_id"])?;
-                                return operations::get_operation(db, id);
-                            }
-                            if reviews::authorize_operation_read(db, &principal, id).is_ok() {
-                                model::fields(&params, &["operation_id"])?;
-                                return operations::get_operation(db, id);
-                            }
-                            let is_thread_operation: bool = db.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND method IN ('coordination.thread.open','coordination.message.send','coordination.thread.resolve','coordination.thread.withdraw','coordination.thread.supersede'))",
-                                [id],
-                                |row| row.get(0),
-                            )?;
-                            if is_thread_operation
-                                && coordination_threads::authorize_operation_read(
-                                    db, &principal, id,
-                                )
-                                .is_ok()
-                            {
-                                model::fields(&params, &["operation_id"])?;
-                                return operations::get_operation(db, id);
-                            }
-                            if integration::authorize_operation_read(db, &principal, id).is_ok() {
-                                model::fields(&params, &["operation_id"])?;
-                                return operations::get_operation(db, id);
-                            }
-                            let own_code_scope_receipt: bool = db.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND caller_id=?2 AND method IN ('code.scope.propose','code.scope.release'))",
-                                params![id, principal.client_id],
-                                |row| row.get(0),
-                            )?;
-                            if own_code_scope_receipt {
-                                model::fields(&params, &["operation_id"])?;
-                                return operations::get_operation(db, id);
-                            }
+                            model::fields(&params, &["operation_id"])?;
+                            return object_reads::operation(
+                                db,
+                                &principal,
+                                model::text(&params, "operation_id")?,
+                            );
                         }
                         return coordination::read(db, &principal, &method, &params);
                     }
@@ -2628,19 +2731,26 @@ impl Store {
                         "module cannot inspect other results",
                     ));
                 }
-                reviews::authorize_artifact_read(db, &p, &id)?;
                 let artifact = results::get(db, &id)?;
-                if matches!(
-                    artifact.kind.as_str(),
-                    "script_bundle" | "script_result" | "script_output"
-                ) {
-                    scripts::authorize_artifact_read(db, &p, &artifact)?;
-                }
-                Ok(artifact)
+                let grant = object_scope::resolve_artifact_read(
+                    db,
+                    &p,
+                    &artifact,
+                    object_scope::ArtifactReadLevel::Bytes,
+                )?
+                .ok_or_else(object_scope::unauthorized_artifact)?;
+                Ok(object_scope::AuthorizedArtifact {
+                    record: artifact,
+                    grant,
+                })
             })
             .await?;
-        self.file_io(move |files| files.read(&record, offset, length as usize))
-            .await
+        self.file_io(move |files| {
+            let mut response = files.read(&record.record, offset, length as usize)?;
+            response["metadata"] = results::project_metadata(&record.record);
+            Ok(response)
+        })
+        .await
     }
     pub async fn disconnected(&self, principal: Principal) -> Result<()> {
         let client_id = principal.client_id.clone();
@@ -2933,6 +3043,29 @@ fn initialize_database(
         GITHUB_PR_EFFECTS_SCHEMA,
         &["github_pr_effect_slots"],
     )?;
+    install_schema_extension(
+        tx,
+        "schema_extension:gm_fencing:v1",
+        GM_FENCING_SCHEMA,
+        &["gm_handover_history"],
+    )?;
+    install_schema_extension(
+        tx,
+        "schema_extension:read_positions:v1",
+        READ_POSITION_SCHEMA,
+        &[
+            "operation_read_position",
+            "task_read_position",
+            "operation_read_positions",
+            "task_read_positions",
+        ],
+    )?;
+    install_schema_extension(
+        tx,
+        "schema_extension:provider_conditions:v1",
+        PROVIDER_CONDITION_SCHEMA,
+        &["provider_conditions", "provider_conditions_binding"],
+    )?;
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
     match meta(tx, &scheduler_key)? {
         None => set_meta(
@@ -3164,19 +3297,6 @@ fn page(params: &Value) -> Result<(i64, i64)> {
 // local operator receives the global diagnostic view.
 const OPERATION_VISIBILITY_SQL: &str = r#"(
     :operator = 1
-    OR (
-        op.method NOT IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send',
-            'task.request_changes', 'check.run', 'check.cancel', 'event.emit')
-        AND op.method NOT LIKE 'coordination.%'
-        AND op.method NOT LIKE 'concilium.%'
-        AND op.method NOT LIKE 'review.%'
-        AND op.method NOT LIKE 'automation.%'
-        AND op.method NOT LIKE 'script.%'
-        AND op.method NOT LIKE 'goal.%'
-        AND op.method NOT LIKE 'hook.%'
-        AND op.method NOT LIKE 'github.%'
-        AND op.caller_id != 'eliot-internal-automation-v1'
-    )
     OR op.caller_id = :client
     OR (
         op.method LIKE 'concilium.%'
@@ -3191,11 +3311,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
               AND (
                   json_extract(link.value_json,'$.manager_id')=:client
-                  OR EXISTS (
-                      SELECT 1 FROM meta AS current_gm
-                      WHERE current_gm.key='gm'
-                        AND json_extract(current_gm.value_json,'$.client_id')=:client
-                  )
+                  OR :current_gm = 1
                   OR EXISTS (
                       SELECT 1 FROM tasks AS target
                       JOIN attempts AS current_attempt ON current_attempt.task_id=target.task_id
@@ -3212,11 +3328,11 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         ((op.method LIKE 'script.%' AND op.method != 'script.run') OR op.method LIKE 'goal.%'
          OR op.method LIKE 'hook.%' OR op.method LIKE 'github.%')
         AND EXISTS (
-            SELECT 1 FROM meta AS manager JOIN meta AS current_gm ON current_gm.key='gm'
+            SELECT 1 FROM meta AS manager
             WHERE manager.key='client:' || :client
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
-              AND json_extract(current_gm.value_json,'$.client_id')=:client
+              AND :current_gm = 1
         )
     )
     OR (
@@ -3226,11 +3342,10 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
             JOIN attempts AS target_attempt ON target_attempt.attempt_id=run.attempt_id
             JOIN tasks AS target ON target.task_id=run.task_id AND target.task_id=target_attempt.task_id
             JOIN meta AS manager ON manager.key='client:' || :client
-            JOIN meta AS current_gm ON current_gm.key='gm'
             WHERE run.operation_id=op.operation_id AND run.task_id=op.task_id AND run.attempt_id=op.attempt_id
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
-              AND json_extract(current_gm.value_json,'$.client_id')=:client
+              AND :current_gm = 1
         )
     )
     OR (
@@ -3296,7 +3411,6 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               ON target_attempt.attempt_id = check_run.attempt_id
             JOIN tasks AS target ON target.task_id = target_attempt.task_id
             JOIN meta AS manager ON manager.key = 'client:' || :client
-            JOIN meta AS current_gm ON current_gm.key = 'gm'
             WHERE target_attempt.attempt_id = op.attempt_id
               AND target_attempt.task_id = op.task_id
               AND target_attempt.released_at_ms IS NULL
@@ -3307,7 +3421,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                    OR check_run.check_id = json_extract(op.original_request_json, '$.check_id'))
               AND json_extract(manager.value_json, '$.role') = 'manager'
               AND COALESCE(json_extract(manager.value_json, '$.disabled'), 0) = 0
-              AND json_extract(current_gm.value_json, '$.client_id') = :client
+              AND :current_gm = 1
         )
     )
     OR (
@@ -3331,12 +3445,12 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND (
                   json_extract(link.value_json, '$.record.effective_manager_id') = :client
                   OR EXISTS (
-                      SELECT 1 FROM meta AS successor_manager JOIN meta AS current_gm ON current_gm.key='gm'
+                      SELECT 1 FROM meta AS successor_manager
                       JOIN tasks AS target ON target.task_id=op.task_id
                       WHERE successor_manager.key='client:' || :client
                         AND json_extract(successor_manager.value_json,'$.role')='manager'
                         AND COALESCE(json_extract(successor_manager.value_json,'$.disabled'),0)=0
-                        AND json_extract(current_gm.value_json,'$.client_id')=:client
+                        AND :current_gm = 1
                         AND target.project_id=json_extract(link.value_json,'$.record.project_id')
                   )
               )
@@ -3348,7 +3462,6 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         AND EXISTS (
             SELECT 1 FROM meta AS link
             JOIN meta AS manager ON manager.key='client:' || :client
-            LEFT JOIN meta AS current_gm ON current_gm.key='gm'
             JOIN tasks AS target
               ON target.task_id=json_extract(link.value_json,'$.record.cause.task_id')
             JOIN attempts AS subject
@@ -3360,7 +3473,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json,'$.record.action')='message.send'
               AND json_extract(link.value_json,'$.record.cause.kind')='script_controller_effect'
               AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
-                   OR json_extract(current_gm.value_json,'$.client_id')=:client)
+                   OR :current_gm = 1)
               AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')
                   =json_extract(link.value_json,'$.record.effective_manager_id')
               AND json_extract(op.effective_request_json,'$.script_invocation.grant')='task_owner_message'
@@ -3405,7 +3518,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_type(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = 'text'
               AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = json_extract(link.value_json, '$.record.effective_manager_id')
               AND (json_extract(link.value_json, '$.record.effective_manager_id') = :client
-                   OR json_extract((SELECT value_json FROM meta WHERE key='gm'), '$.client_id') = :client)
+                   OR :current_gm = 1)
               AND json_type(link.value_json, '$.record.automation_id') = 'text'
               AND length(json_extract(link.value_json, '$.record.automation_id')) > 0
               AND json_type(link.value_json, '$.record.automation_revision') = 'integer'
@@ -3524,10 +3637,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                   (SELECT owned.owner_id FROM attempts AS owned
                    WHERE owned.task_id = target.task_id AND owned.released_at_ms IS NULL
                    ORDER BY owned.created_at_ms DESC, owned.attempt_id DESC LIMIT 1) = :client
-                  OR EXISTS (
-                      SELECT 1 FROM meta AS gm
-                      WHERE gm.key = 'gm' AND json_extract(gm.value_json, '$.client_id') = :client
-                  )
+                  OR :current_gm = 1
               )
         )
     )
@@ -3543,7 +3653,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
               AND json_extract(link.value_json,'$.record.effective_manager_id')=json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')
               AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
-                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
+                   OR (:current_gm = 1))
               AND json_extract(link.value_json,'$.record.project_id')=target.project_id
               AND json_extract(link.value_json,'$.record.cause.kind')='review_result'
               AND json_extract(link.value_json,'$.record.cause.identity.task_id')=op.task_id
@@ -3556,7 +3666,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
               AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
-                   OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
+                   OR (:current_gm = 1))
         )
     )
     OR (
@@ -3570,7 +3680,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
               AND json_extract(link.value_json, '$.record.effective_manager_id') = json_extract(op.effective_request_json, '$.launch_manifest.actor.effective_manager_id')
               AND (json_extract(link.value_json, '$.record.effective_manager_id') = :client
-                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
+                   OR (:current_gm = 1))
               AND json_extract(link.value_json, '$.record.automation_id') = json_extract(op.effective_request_json, '$.launch_manifest.actor.automation_id')
               AND json_extract(link.value_json, '$.record.automation_revision') = json_extract(op.effective_request_json, '$.launch_manifest.actor.automation_revision')
               AND json_extract(link.value_json, '$.record.semantic_slot_id') = json_extract(op.effective_request_json, '$.launch_manifest.actor.semantic_slot_id')
@@ -3582,7 +3692,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                     AND json_extract(manager.value_json, '$.role') = 'manager'
                     AND COALESCE(json_extract(manager.value_json, '$.disabled'),0) = 0
                     AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
-                         OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
+                         OR (:current_gm = 1))
               )
         )
     )
@@ -3598,7 +3708,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
               AND json_extract(link.value_json,'$.record.effective_manager_id')=json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')
               AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
-                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
+                   OR (:current_gm = 1))
               AND json_extract(link.value_json,'$.record.project_id')=target.project_id
               AND json_extract(link.value_json,'$.record.task_id')=op.task_id
               AND json_extract(link.value_json,'$.record.attempt_id')=op.attempt_id
@@ -3614,7 +3724,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND ((SELECT owned.owner_id FROM attempts AS owned
                     WHERE owned.task_id=target.task_id AND owned.released_at_ms IS NULL
                     ORDER BY owned.created_at_ms DESC,owned.attempt_id DESC LIMIT 1)=:client
-                   OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
+                   OR (:current_gm = 1))
         )
     )
     OR (
@@ -3631,7 +3741,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json,'$.record.operation_id')=parent.operation_id
               AND json_extract(link.value_json,'$.record.effective_manager_id')=json_extract(parent.effective_request_json,'$.launch_manifest.actor.effective_manager_id')
               AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
-                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
+                   OR (:current_gm = 1))
               AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
               AND parent.task_id=json_extract(link.value_json,'$.record.task_id')
               AND json_extract(parent.effective_request_json,'$.launch_manifest.task.task_id')=parent.task_id
@@ -3740,7 +3850,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                     AND json_extract(manager.value_json,'$.role')='manager'
                     AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
                     AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
-                         OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
+                         OR (:current_gm = 1))
               )
         )
     )
@@ -3766,11 +3876,11 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                       AND json_extract(assignment.payload_json, '$.on_behalf.effective_manager_id') = json_extract(assignment.payload_json, '$.sponsor_client_id')
                       AND json_extract(assignment.payload_json, '$.on_behalf.project_id') = target.project_id
                       AND EXISTS (
-                          SELECT 1 FROM meta AS manager JOIN meta AS current_gm ON current_gm.key='gm'
+                          SELECT 1 FROM meta AS manager
                           WHERE manager.key='client:' || :client
                             AND json_extract(manager.value_json, '$.role')='manager'
                             AND COALESCE(json_extract(manager.value_json, '$.disabled'), 0)=0
-                            AND json_extract(current_gm.value_json, '$.client_id')=:client
+                            AND :current_gm = 1
                       )
                   )
               )
@@ -3815,63 +3925,13 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     )
 )"#;
 
-fn timeline_visibility_sql() -> String {
-    format!(
-        r#"(
-            -- Normalized message lifecycle facts feed the automation bus;
-            -- the public timeline retains one raw mailbox delivery per send.
-            o.source_stream_id != 'controller:messages'
-            AND (
-                o.operation_id IS NULL
-                OR EXISTS (
-                    SELECT 1 FROM operations AS op
-                    WHERE op.operation_id = o.operation_id
-                      AND {OPERATION_VISIBILITY_SQL}
-                )
-            )
-            AND (
-            (
-                :mailbox_only = 1
-                AND o.kind IN ('message.send', 'coordination.message.send', 'task.feedback', 'check.completed')
-                AND json_extract(o.payload_json, '$.recipient') = :client
-            )
-            OR (
-                :mailbox_only = 0
-                AND (
-                    (
-                        o.kind NOT IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send',
-                            'task.request_changes', 'task.feedback', 'task.review_stale',
-                            'check.run', 'check.cancel', 'check.completed')
-                        AND o.kind NOT LIKE 'coordination.%'
-                        AND o.kind NOT LIKE 'review.%'
-                        AND o.kind NOT LIKE 'automation.%'
-                        AND NOT EXISTS (SELECT 1 FROM operations AS automatic WHERE automatic.operation_id=o.operation_id AND automatic.caller_id='eliot-internal-automation-v1')
-                    )
-                    OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send'))
-                    OR (
-                        (
-                            o.kind IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send',
-                                'task.request_changes', 'task.feedback', 'task.review_stale',
-                                'check.run', 'check.cancel', 'check.completed')
-                            OR o.kind LIKE 'coordination.%'
-                            OR o.kind LIKE 'review.%'
-                            OR o.kind LIKE 'automation.%'
-                            OR EXISTS (SELECT 1 FROM operations AS automatic WHERE automatic.operation_id=o.operation_id AND automatic.caller_id='eliot-internal-automation-v1')
-                        )
-                        AND EXISTS (
-                            SELECT 1 FROM operations AS op
-                            WHERE op.operation_id = o.operation_id
-                              AND {OPERATION_VISIBILITY_SQL}
-                        )
-                    )
-                )
-            )
-            )
-        )"#
-    )
+fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool> {
+    Ok(object_scope::resolve_operation_read(db, p, id)?.is_some())
 }
 
-fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool> {
+/// Retained domain relations reused by the shared resolver. This predicate
+/// never supplies default authority for a new method.
+fn operation_relation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool> {
     let caller: Option<String> = db
         .query_row(
             "SELECT caller_id FROM operations WHERE operation_id=?1",
@@ -3910,6 +3970,7 @@ fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool
             ":operation_id": id,
             ":operator": p.role == Role::Operator,
             ":client": &p.client_id,
+            ":current_gm": p.role == Role::Manager && gm::read_current(db)?.is_some_and(|gm| gm.client_id == p.client_id),
         },
         |row| row.get(0),
     )?)
@@ -4268,7 +4329,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
         None | Some(Value::Null) => None,
         Some(_) => Some(model::text(value, "task_id")?),
     };
-    let mut revision_context = json!({"client_id":p.client_id,"role":p.role,"gm":gm::record(db)?});
+    let mut revision_context = json!({"client_id":p.client_id,"role":p.role,"gm":gm::status(db)?});
     let mut allowed = vec!["swarm.tools.search"];
     let methods = crate::mcp::registered_application_methods();
     match p.role {
@@ -4355,7 +4416,8 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
             }));
         }
         Role::Manager => {
-            let gm_authority = gm::require_authority(db, p).is_ok();
+            let gm_authority =
+                gm::read_current(db)?.is_some_and(|current| current.client_id == p.client_id);
             revision_context["current_gm_authority"] = json!(gm_authority);
             allowed.extend(methods.into_iter().filter(|method| {
                 !participant_only_mutation(method)
@@ -4477,15 +4539,15 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             )?;
             logging::get(db, p, v)
         }
-        "swarm.dashboard" => launcher::dashboard(db, p, v),
+        "swarm.dashboard" => launcher::dashboard(db, p, v, config),
         "monitor.snapshot" => monitor::snapshot(db, p, v, config),
         "monitor.follow" => monitor::follow(db, p, v, config),
-        "swarm.queue.get" => launcher::queue_get(db, p, v),
-        "swarm.agent.inspect" => launcher::agent_inspect(db, p, v),
+        "swarm.queue.get" => launcher::queue_get(db, p, v, config),
+        "swarm.agent.inspect" => launcher::agent_inspect(db, p, v, config),
         "swarm.exceptions.get" => launcher::exceptions_get(db, p, v),
         "swarm.launch.preview" => launcher::launch_preview(db, p, v, config),
         "swarm.overlap.check" => integration::read(db, p, method, v),
-        "check.get" => checks::describe(db, v),
+        "check.get" => object_reads::check(db, p, v),
         "check.profiles" => {
             model::fields(v, &[])?;
             let profiles = config
@@ -4514,8 +4576,8 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         }
 
         "artifact.get" => results::describe(db, p, v),
-        "artifact.parts" => assembly::parts(db, v),
-        "task.acceptance" => acceptance::describe(db, v),
+        "artifact.parts" => assembly::parts(db, p, v),
+        "task.acceptance" => object_reads::acceptance(db, p, v),
         "host.status" => {
             model::fields(v, &[])?;
             let tasks: i64 = db.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
@@ -4530,44 +4592,26 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 |r| r.get(0),
             )?;
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"host_lifecycle":host_lifecycle::status(db)?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?,"managed_bus_services":bus_kernel::managed_health_projection(db)?}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"host_lifecycle":host_lifecycle::status(db)?,"gm":gm::status(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?,"managed_bus_services":bus_kernel::managed_health_projection(db)?}),
             )
         }
-        "agent.family" => producers::family(db, v),
-        "task.submission" => submissions::describe(db, v),
+        "agent.family" => object_reads::family(db, p, v),
+        "task.submission" => object_reads::submission(db, p, v),
         "task.get" => {
             model::fields(v, &["task_id"])?;
-            tasks::get_task(db, model::text(v, "task_id")?)
+            object_reads::task(db, p, model::text(v, "task_id")?)
         }
         "attempt.get" => {
             model::fields(v, &["attempt_id"])?;
-            tasks::get_attempt(db, model::text(v, "attempt_id")?)
+            object_reads::attempt(db, p, model::text(v, "attempt_id")?)
         }
-        "task.list" => {
-            model::fields(v, &["after", "limit"])?;
-            let (limit, after) = page(v)?;
-            let mut s = db.prepare(
-                "SELECT task_id FROM tasks ORDER BY created_at_ms,task_id LIMIT ?1 OFFSET ?2",
-            )?;
-            let ids = s
-                .query_map(params![limit, after], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let values = ids
-                .iter()
-                .map(|id| tasks::get_task(db, id))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(
-                json!({"items":values,"next_after":after+ids.len() as i64,"pagination":"offset_snapshot_not_inventory_proof"}),
-            )
-        }
+        "task.list" => object_reads::list(db, p, object_reads::ObjectKind::Task, v),
         "operation.get" => {
             model::fields(v, &["operation_id"])?;
             let id = model::text(v, "operation_id")?;
-            if !operation_visible_to(db, p, id)? {
-                return Err(Error::new("NOT_FOUND", format!("Operation {id}")));
-            }
-            operations::get_operation_for_current_manager(db, p, id)
+            object_reads::operation(db, p, id)
         }
+        "agent.usage" => native_usage::read(db, p, v),
         "agent.state" => {
             model::fields(v, &["binding_id", "generation"])?;
             let binding_id = model::text(v, "binding_id")?;
@@ -4626,37 +4670,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 .collect::<Result<Vec<_>>>()?;
             Ok(json!({"items":items,"next_after":after+ids.len() as i64}))
         }
-        "operation.list" => {
-            model::fields(v, &["after", "limit", "state"])?;
-            let (limit, after) = page(v)?;
-            let state = v.get("state").and_then(Value::as_str);
-            let sql = format!(
-                "SELECT op.operation_id FROM operations AS op WHERE (:state IS NULL OR op.state=:state) AND {OPERATION_VISIBILITY_SQL} ORDER BY op.created_at_ms,op.operation_id LIMIT :limit OFFSET :after"
-            );
-            let mut s = db.prepare(&sql)?;
-            let ids = s
-                .query_map(
-                    named_params! {
-                        ":state": state,
-                        ":limit": limit,
-                        ":after": after,
-                        ":operator": p.role == Role::Operator,
-                        ":client": &p.client_id,
-                    },
-                    |r| r.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let items = ids
-                .iter()
-                .map(|id| {
-                    if !operation_visible_to(db, p, id)? {
-                        return Err(Error::new("NOT_FOUND", format!("Operation {id}")));
-                    }
-                    operations::get_operation(db, id)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(json!({"items":items,"next_after":after+ids.len() as i64}))
-        }
+        "operation.list" => object_reads::list(db, p, object_reads::ObjectKind::Operation, v),
         "report.capacity" => {
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
@@ -4668,110 +4682,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             capacity::attention_report(db, limit, after)
         }
         "report.delta" | "message.read" => {
-            model::fields(v, &["after", "limit"])?;
-            let (limit, after) = page(v)?;
-            let mailbox_only = method == "message.read";
-            // Reports subscriptions read this same scoped cursor, so hidden
-            // mail cannot leak through either payloads or pagination flags.
-            let visibility = timeline_visibility_sql();
-            let mut s = db.prepare(&format!(
-                "SELECT o.observation_id,o.kind,o.payload_json,o.recorded_at_ms,o.operation_id FROM observations AS o WHERE o.observation_id>:after AND {visibility} ORDER BY o.observation_id LIMIT :limit"
-            ))?;
-            let rows = s
-                .query_map(
-                    named_params! {
-                        ":after": after,
-                        ":mailbox_only": mailbox_only,
-                        ":operator": p.role == Role::Operator,
-                        ":client": &p.client_id,
-                        ":limit": limit,
-                    },
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                            r.get::<_, Option<String>>(4)?,
-                        ))
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // Projection first, limits after projection (§8.1): an
-            // oversized item becomes an explicit gap reference at its
-            // own cursor; the cursor below advances only over entries
-            // actually returned, so a limited page never replays or
-            // silently skips a source row.
-            let mut projected = Vec::with_capacity(rows.len());
-            for (id, kind, raw, time, operation_id) in rows {
-                // The SQL predicate scopes every linked fact before paging;
-                // verify retained internal admission links before projecting it.
-                if let Some(operation_id) = operation_id.as_deref()
-                    && !operation_visible_to(db, p, operation_id)?
-                {
-                    return Err(Error::new(
-                        "NOT_FOUND",
-                        "scoped observation is not visible to this client",
-                    ));
-                }
-                projected.push(json!({"cursor":id,"kind":kind,"payload":serde_json::from_str::<Value>(&raw)?,"recorded_at_ms":time,"operation_id":operation_id}));
-            }
-            let limited = projection::limit_items(projected, projection::timeline_gap_reference)?;
-            let next = limited
-                .items
-                .last()
-                .and_then(|item| item["cursor"].as_i64())
-                .unwrap_or(after);
-            // Newer source rows exist when a budget stopped this page
-            // early (fetched rows were left unemitted) or when the
-            // source itself continues past the last returned cursor.
-            let has_newer: bool = limited.stopped_early
-                || db.query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM observations AS o WHERE o.observation_id>:after AND {visibility})"
-                    ),
-                    named_params! {
-                        ":after": next,
-                        ":mailbox_only": mailbox_only,
-                        ":operator": p.role == Role::Operator,
-                        ":client": &p.client_id,
-                    },
-                    |r| r.get::<_, bool>(0),
-                )?;
-            let has_older: bool = db.query_row(
-                &format!(
-                    "SELECT EXISTS(SELECT 1 FROM observations AS o WHERE o.observation_id<=:after AND {visibility})"
-                ),
-                named_params! {
-                    ":after": after,
-                    ":mailbox_only": mailbox_only,
-                    ":operator": p.role == Role::Operator,
-                    ":client": &p.client_id,
-                },
-                |r| r.get(0),
-            )?;
-            let frame = projection::frame(
-                if mailbox_only {
-                    "mailbox"
-                } else {
-                    "observation_timeline"
-                },
-                json!({"after": after, "next_cursor": next}),
-                &limited,
-                limit,
-                has_older,
-                has_newer,
-                limited.gap_count == 0,
-                Vec::new(),
-            )?;
-            let goal_reminders = if mailbox_only {
-                goals::notifications(db, p, limit)?
-            } else {
-                Value::Null
-            };
-            Ok(
-                json!({"items":limited.items,"next_cursor":next,"projection":frame,"goal_reminders":goal_reminders}),
-            )
+            object_reads::timeline(db, p, method == "message.read", v)
         }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
@@ -4928,12 +4839,13 @@ fn admit_goal_progression_operation(
     );
     let value = match receipt {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
+        Ok(Err(error)) if goal_progression_admission_conflict(&error.code) => {
             return Ok(automation_goal_progression::AdmissionResult::Conflict {
                 code: error.code,
                 reason: error.message,
             });
         }
+        Ok(Err(error)) => return Err(error),
         Err(error) if goal_progression_admission_conflict(&error.code) => {
             return Ok(automation_goal_progression::AdmissionResult::Conflict {
                 code: error.code,
@@ -4965,11 +4877,23 @@ fn admit_goal_progression_operation(
 }
 
 fn goal_progression_admission_conflict(code: &str) -> bool {
-    code.contains("CONFLICT")
-        || code == "FORBIDDEN"
-        || code == "AUTOMATION_ACTION_CHANGED"
-        || code.starts_with("GOAL_")
-        || code.starts_with("BINDING_")
+    matches!(
+        code,
+        "CONFLICT"
+            | "FORBIDDEN"
+            | "UNAUTHORIZED"
+            | "AUTOMATION_ACTION_CHANGED"
+            | "AUTOMATION_ACTION_UNAVAILABLE"
+            | "GOAL_SCOPE_STALE"
+            | "GOAL_REVISION_CONFLICT"
+            | "GOAL_ALREADY_EXISTS"
+            | "BINDING_CLOSED"
+            | "BINDING_NOT_READY"
+            | "NATIVE_GOAL_CONFLICT"
+            | "GOAL_UNSUPPORTED_RUNTIME"
+            | "TASK_NOT_CURRENT"
+            | "STALE_REVISION"
+    )
 }
 
 fn mutate_in_transaction_with_check_plan(
@@ -5346,13 +5270,18 @@ fn mutate_in_transaction_with_authority(
                 | "coordination.thread.supersede"
                 | "coordination.contract.propose"
                 | "coordination.contract.respond"
+                | "coordination.contract.ratify"
+                | "coordination.contract.reject"
         )
         && let Some((task_id, task_revision, attempt_id)) =
             coordination_threads::admitted_thread_operation_scope(tx, principal, method, v)?
     {
         let changed = if matches!(
             method,
-            "coordination.contract.propose" | "coordination.contract.respond"
+            "coordination.contract.propose"
+                | "coordination.contract.respond"
+                | "coordination.contract.ratify"
+                | "coordination.contract.reject"
         ) {
             let thread_id = model::text(v, "thread_id")?;
             let retained_scope = json!({
@@ -6355,6 +6284,10 @@ fn apply(
         "bus.consumer.register" | "bus.consumer.revoke" | "bus.consumer.admit" => {
             bus_kernel::apply(tx, p, method, v, id, config, now)
         }
+        "coordination.contract.ratify" | "coordination.contract.reject" => {
+            coordination_threads::apply_contract_decision(tx, p, method, v, id, now)
+                .map(|value| (value, false))
+        }
         "coordination.participant.register"
         | "coordination.participant.disable"
         | "coordination.work_card.publish"
@@ -6411,8 +6344,18 @@ fn apply(
         "attempt.bind_producer" => producers::bind(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now, config),
-        "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.background"
-        | "agent.refresh" | "agent.reconcile" | "agent.result" | "agent.recover" => {
+        "agent.send"
+        | "agent.reply"
+        | "agent.configure"
+        | "agent.goal"
+        | "agent.background"
+        | "agent.refresh"
+        | "agent.reconcile"
+        | "agent.result"
+        | "agent.recover"
+        | "native.opencode.loop_step"
+        | "native.command.cancel_turn"
+        | "native.command.close_session" => {
             runtime::user_command(tx, p, method, v, id, config).map(|v| (v, true))
         }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),

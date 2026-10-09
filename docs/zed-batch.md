@@ -17,3 +17,11 @@ The installed `eval-cli` binary has not been qualified by this adapter. Prefligh
 5. If a dispatch is Unknown, reconcile that exact Operation. Already-authorized exact readback and reconciliation may continue autonomously. Reconciliation can settle a saved terminal receipt; if the receipt is absent or invalid, it returns unresolved and preserves the capacity hold. Never replay the same Operation. Start another native effect only when the current Task/Attempt authorization covers it and the prior Unknown has been resolved; a change of route or scope needs a new explicit decision.
 
 The adapter intentionally does not emulate persistent control, resume, send/steer, goals, replies, or session families. A future capability needs a native contract and its own explicit runtime boundary.
+
+## Artifact and prompt contract cutover
+
+New bindings use the immutable built-in artifact `eliot-zed.eval-cli.2` and contract revision `zed-eval-cli-v2`. Its `task.dispatch` input carries the Store-produced `swarm.task_prompt` v1 envelope and the matching `TaskDispatchContext`; it does not carry `task_snapshot` or `task_snapshot_canonical`. The executor passes the envelope's exact `prompt` bytes to `eval-cli`, and checks its schema, digest, byte count, Task identity, snapshot digest, source-text identity, Operation, binding generation, and dispatch context before launch.
+
+The durable v2 batch intent records the TaskPrompt schema and identity plus the full dispatch context. The private worker plan contains the exact prompt string, and its digest is retained in the same-run process-owner record before the worker gate can authorize native execution. The existing worker still enters its process Group before spawning `eval-cli`; output pages remain bound to the exact Operation, binding generation, and run.
+
+`eliot-zed.eval-cli.1` / `zed-eval-cli-v1` is historical. Existing v1 intents and terminal receipts continue through the snapshot-based decoder and same-run ownership checks. It is not a TaskPrompt fallback, and new-binding admission is restricted to v2 by the Store route guard. Recovery of a v1 Operation must use its original retained snapshot and receipt contract; v2 recovery must use its retained TaskPrompt envelope and dispatch context.

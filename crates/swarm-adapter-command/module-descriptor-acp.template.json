@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "module_id": "runtime.command",
+  "artifact": {
+    "artifact_id": "eliot-command.acp-rust.1",
+    "version": "1",
+    "build_id": null
+  },
+  "launch": {
+    "executable": "<INSTALLER_ABSOLUTE_ADAPTER_PATH>",
+    "argv": [
+      { "kind": "literal", "value": "--module-host-config" },
+      { "kind": "module_host_config_path", "value": { "schema_version": 1 } },
+      { "kind": "literal", "value": "--config" },
+      { "kind": "literal", "value": "<INSTALLER_ABSOLUTE_ADAPTER_CONFIG_PATH>" }
+    ],
+    "environment": [],
+    "credential_ref": "<INSTALLER_CREDENTIAL_FILE_REF>",
+    "working_directory": null,
+    "inherited_environment_allowlist": [],
+    "executable_sha256": null
+  },
+  "config_schema": null,
+  "workspace_option": {
+    "schema_version": 1,
+    "native_options_pointer": "/workspaceRoot",
+    "semantics": "replace_with_admitted_absolute_workspace"
+  },
+  "command_schemas": [
+    { "schema_id": "swarm.normalized_result_context", "version": "1", "sha256": null },
+    { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_dispatch_context", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_prompt", "version": "1", "sha256": null }
+  ],
+  "event_schemas": [
+    { "schema_id": "swarm.normalized_result_page", "version": "1", "sha256": null },
+    { "schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_dispatch_admission", "version": "1", "sha256": null }
+  ],
+  "protocol": {
+    "minimum": { "major": 1, "minor": 0 },
+    "maximum": { "major": 1, "minor": 0 }
+  },
+  "capabilities": [
+    "agent.configure",
+    "agent.open",
+    "agent.reconcile",
+    "agent.refresh",
+    "agent.send/next_turn",
+    "native.command.cancel_turn",
+    "native.command.close_session",
+    "task.dispatch"
+  ],
+  "lifecycle": "owned_service",
+  "activation": "on_demand",
+  "enabled": false,
+  "restart": {
+    "max_starts": 5,
+    "window_ms": 60000,
+    "initial_backoff_ms": 250,
+    "max_backoff_ms": 30000,
+    "reset_after_healthy_ms": 60000,
+    "jitter": true
+  }
+}

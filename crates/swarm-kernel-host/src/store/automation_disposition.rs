@@ -8,8 +8,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
     model,
-    review::ReviewSlotIdentity,
-    submission::ChangeRequest,
+    review::{ReviewFinding, ReviewFindingsPackage, ReviewSlotIdentity},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -381,46 +380,44 @@ fn consume_selected_disposition(
             "changes_requested result has no findings array",
         )
     })?;
-    match findings.len() {
-        0 => {
-            return Err(Error::new(
-                "REVIEW_RESULT_DAMAGED",
-                "changes_requested result has no actionable finding",
-            ));
-        }
-        1 => {}
-        count => {
-            return Ok(json!({
-                "status":"capability_gap",
-                "code":"manual_finding_selection_required",
-                "reason":"the current Task feedback handler accepts one finding per decision; the automation will not choose among multiple reviewer findings",
-                "review_assignment_id":review_assignment_id,
-                "review_result_operation_id":review_result_operation_id,
-                "actionable_finding_count":count,
-                "disposition_applied":false
-            }));
-        }
-    }
-
-    let finding_id = model::text(&findings[0], "finding_id")?;
-    let provenance = reviews::actionable_finding(
-        tx,
-        &review.identity.task_id,
-        &review.identity.attempt_id,
-        review.identity.task_revision,
-        &review.identity.submission_ref,
-        &review.identity.candidate_ref,
-        finding_id,
-    )?;
-    if provenance["review_assignment_id"] != review_assignment_id
-        || provenance["review_operation_id"] != review_result_operation_id
-        || provenance["identity"] != json!(review.identity)
-        || provenance["finding"] != findings[0]
-    {
+    if findings.is_empty() {
         return Err(Error::new(
             "REVIEW_RESULT_DAMAGED",
-            "actionable finding differs from the committed review result",
+            "changes_requested result has no actionable finding",
         ));
+    }
+
+    let ordered_findings = findings
+        .iter()
+        .map(|finding| {
+            serde_json::from_value::<ReviewFinding>(finding.clone()).map_err(|_| {
+                Error::new(
+                    "REVIEW_RESULT_DAMAGED",
+                    "committed review finding fields are invalid",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (finding_value, finding) in findings.iter().zip(&ordered_findings) {
+        let provenance = reviews::actionable_finding(
+            tx,
+            &review.identity.task_id,
+            &review.identity.attempt_id,
+            review.identity.task_revision,
+            &review.identity.submission_ref,
+            &review.identity.candidate_ref,
+            &finding.finding_id,
+        )?;
+        if provenance["review_assignment_id"] != review_assignment_id
+            || provenance["review_operation_id"] != review_result_operation_id
+            || provenance["identity"] != json!(review.identity)
+            || provenance["finding"] != *finding_value
+        {
+            return Err(Error::new(
+                "REVIEW_RESULT_DAMAGED",
+                "actionable finding differs from the committed review result",
+            ));
+        }
     }
 
     if entry.scope.work_pool_id.is_some() {
@@ -457,10 +454,27 @@ fn consume_selected_disposition(
         Err(error) => return Err(error),
     };
 
-    let request = change_request(&context, &review.identity, &provenance["finding"])?;
-    let request_value = serde_json::to_value(&request)?;
-    let (operation_id, value, coalesced) =
-        reserve_feedback_operation(tx, entry, &context, &request, &request_value, now_ms)?;
+    let package = ReviewFindingsPackage::new(
+        review.identity.clone(),
+        review_assignment_id.to_owned(),
+        review_result_operation_id.to_owned(),
+        ordered_findings,
+    )?;
+    let client_request_id =
+        context.semantic_request_id(&review.identity.submission_ref, &package.findings_digest)?;
+    let request_value = json!({
+        "client_request_id":client_request_id,
+        "package":package
+    });
+    let (operation_id, value, coalesced) = reserve_feedback_operation(
+        tx,
+        entry,
+        &context,
+        &client_request_id,
+        &request_value,
+        &package,
+        now_ms,
+    )?;
     Ok(json!({
         "status":if value["code"] == "semantic_duplicate_requires_current_disposition" {"semantic_duplicate_requires_current_disposition"} else if coalesced {"coalesced"} else if value["applied"] == true {"applied"} else {"settled_without_application"},
         "code":value.get("code").cloned().unwrap_or(Value::Null),
@@ -470,6 +484,8 @@ fn consume_selected_disposition(
         "applied":value["applied"] == true,
         "review_assignment_id":review_assignment_id,
         "review_result_operation_id":review_result_operation_id,
+        "findings_digest":package.findings_digest,
+        "finding_count":package.findings.len(),
         "feedback":value,
         "disposition_applied":value["applied"] == true,
         "current_disposition_recorded":value.get("current_disposition_recorded").and_then(Value::as_bool).unwrap_or(value["applied"] == true)
@@ -608,52 +624,13 @@ fn current_subject(
     Ok(current.then_some((task, attempt)))
 }
 
-fn change_request(
-    context: &ReviewDispositionContext,
-    identity: &ReviewSlotIdentity,
-    finding: &Value,
-) -> Result<ChangeRequest> {
-    let finding_id = model::text(finding, "finding_id")?.to_owned();
-    let requirements = finding["requirement_ids"]
-        .as_array()
-        .ok_or_else(|| Error::new("REVIEW_RESULT_DAMAGED", "finding requirements are missing"))?
-        .iter()
-        .map(|value| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                Error::new("REVIEW_RESULT_DAMAGED", "finding requirement is invalid")
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let evidence = finding["evidence_refs"]
-        .as_array()
-        .ok_or_else(|| Error::new("REVIEW_RESULT_DAMAGED", "finding evidence is missing"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| Error::new("REVIEW_RESULT_DAMAGED", "finding evidence is invalid"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(ChangeRequest {
-        client_request_id: context.semantic_request_id(&identity.submission_ref, &finding_id)?,
-        attempt_id: identity.attempt_id.clone(),
-        expected_revision: identity.task_revision,
-        submission_ref: identity.submission_ref.clone(),
-        candidate_ref: identity.candidate_ref.clone(),
-        finding_id,
-        reason: model::text(finding, "reason")?.to_owned(),
-        requirement_ids: requirements,
-        evidence,
-    })
-}
-
 fn reserve_feedback_operation(
     tx: &Transaction<'_>,
     entry: &config::AutomationEntry,
     context: &ReviewDispositionContext,
-    request: &ChangeRequest,
+    client_request_id: &str,
     request_value: &Value,
+    package: &ReviewFindingsPackage,
     now_ms: i64,
 ) -> Result<(String, Value, bool)> {
     let caller_id = context.technical_requester_id();
@@ -662,7 +639,7 @@ fn reserve_feedback_operation(
         .query_row(
             "SELECT operation_id,method,original_request_json,state,result_json FROM operations \
              WHERE caller_id=?1 AND client_request_id=?2",
-            params![caller_id, request.client_request_id],
+            params![caller_id, client_request_id],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -678,7 +655,7 @@ fn reserve_feedback_operation(
         if method != "task.request_changes" || original != original_json {
             return Err(Error::new(
                 "REVIEW_DISPOSITION_CONFLICT",
-                "the manager/submission/finding request ID is already used for another action",
+                "the manager/submission/findings-package request ID is already used for another action",
             ));
         }
         if state != "settled" {
@@ -763,7 +740,7 @@ fn reserve_feedback_operation(
         params![
             operation_id,
             caller_id,
-            request.client_request_id,
+            client_request_id,
             original_json,
             model::canonical(&effective)?,
             now_ms
@@ -773,7 +750,7 @@ fn reserve_feedback_operation(
 
     tx.execute_batch("SAVEPOINT automation_review_disposition")?;
     let feedback =
-        submissions::request_changes_on_behalf(tx, context, request, &operation_id, now_ms);
+        submissions::request_changes_package_on_behalf(tx, context, package, &operation_id, now_ms);
     let value = match feedback {
         Ok(value) => {
             tx.execute_batch("RELEASE SAVEPOINT automation_review_disposition")?;

@@ -4,6 +4,10 @@
 //! This module only reserves the Operation. Native Git execution and every
 //! uncertain-effect readback remain in `store::forge`.
 
+use super::automation_reconcile::{
+    self, DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
+    SubjectErrorDisposition,
+};
 use super::capacity;
 use crate::{
     automation::{
@@ -22,6 +26,7 @@ use serde_json::{Value, json};
 const STATE_SCHEMA_VERSION: u32 = 1;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:publication:global-cursor";
 const STATE_PREFIX: &str = "automation:v1:publication:state:";
+const QUARANTINE_PREFIX: &str = "automation:v1:publication:quarantine:";
 const ACCEPTANCE_STREAM: &str = "controller:acceptance";
 const MAX_ENTRIES_PER_PASS: usize = 16;
 const MAX_FACTS_PER_ENTRY: usize = 16;
@@ -30,6 +35,21 @@ const MAX_PENDING_RECHECKS: usize = 4;
 const MAX_RECENT: usize = 32;
 const BASE_RETRY_DELAY_MS: i64 = 1_000;
 const MAX_RETRY_DELAY_MS: i64 = 60_000;
+
+/// Root may continue after these exact publication-state failures only after
+/// rolling back the publication domain transaction. All other errors stop.
+pub(super) fn classify_domain_error(error: Error) -> DomainErrorDisposition {
+    if matches!(
+        error.code.as_str(),
+        "AUTOMATION_PUBLICATION_CURSOR_CORRUPT"
+            | "AUTOMATION_PUBLICATION_CURSOR_MISMATCH"
+            | "AUTOMATION_PUBLICATION_STATE_CORRUPT"
+    ) {
+        DomainErrorDisposition::Degraded { code: error.code }
+    } else {
+        DomainErrorDisposition::Fatal(error)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,7 +85,7 @@ struct PendingAcceptance {
     next_retry_at_ms: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AcceptanceEvent {
     observation_id: i64,
     source_event_key: Option<String>,
@@ -73,18 +93,12 @@ struct AcceptanceEvent {
     payload_json: String,
 }
 
-struct AcceptanceReservation<'a> {
-    event: &'a AcceptanceEvent,
-    accepted_operation_id: &'a str,
-    activation_cut: i64,
-    historical_replay_authorized: bool,
-}
-
-#[derive(Debug)]
-enum ReserveDisposition {
-    Reserved(Value),
-    Pending { code: String, reason: &'static str },
-    Skipped { code: String, reason: &'static str },
+struct PublicationInvocation<'a, 'db> {
+    tx: &'a Transaction<'db>,
+    launcher_config: &'a Config,
+    entry: &'a AutomationEntry,
+    now_ms: i64,
+    forge_preparation: &'a super::forge::ForgeExecutionPreparation,
 }
 
 /// Atomically updates the per-entry activation watermark with the revisioned
@@ -176,9 +190,13 @@ pub(crate) fn reconcile(
         }));
     }
 
-    let (entries, last_entry_key) = enabled_entry_page(tx, entry_budget)?;
+    let (entries, last_entry_key, malformed_entries) = enabled_entry_page(tx, entry_budget)?;
+    for malformed in &malformed_entries {
+        persist_malformed_entry(tx, malformed, now_ms)?;
+    }
     let mut results = Vec::with_capacity(entries.len());
     let mut total_processed = 0usize;
+    let mut total_quarantined = malformed_entries.len();
     for entry in &entries {
         let result = reconcile_entry(
             tx,
@@ -190,6 +208,12 @@ pub(crate) fn reconcile(
         )?;
         total_processed = total_processed.saturating_add(
             result["processed"]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default(),
+        );
+        total_quarantined = total_quarantined.saturating_add(
+            result["quarantined"]
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or_default(),
@@ -206,6 +230,14 @@ pub(crate) fn reconcile(
     Ok(json!({
         "entries":results,
         "processed":total_processed,
+        "quarantined":total_quarantined,
+        "status":if total_quarantined > 0 {
+            "degraded"
+        } else if total_processed == 0 {
+            "idle"
+        } else {
+            "progressed"
+        },
         "entry_budget":entry_budget,
         "fact_budget_per_entry":fact_budget,
         "cursor":last_entry_key
@@ -230,7 +262,9 @@ pub(crate) fn forge_preparation_demand(
     if entry_budget == 0 || fact_budget == 0 {
         return Ok(false);
     }
-    let (entries, _) = enabled_entry_page(db, entry_budget)?;
+    // A damaged immutable entry cannot demand executable hashing. Reconciliation
+    // records its exact key and payload digest in the publication transaction.
+    let (entries, _, _) = enabled_entry_page(db, entry_budget)?;
     let high_water = acceptance_high_water(db)?;
     entries.iter().try_fold(false, |demand, entry| {
         if demand {
@@ -339,7 +373,7 @@ fn reconcile_entry(
                 }),
             );
             save_state(tx, &key, &state)?;
-            return Ok(state_projection_with_processed(&state, 0, high_water));
+            return Ok(state_projection_with_processed(&state, 0, 0, high_water));
         }
     };
     if state.configured_revision != entry.revision {
@@ -348,25 +382,38 @@ fn reconcile_entry(
             "publication activation cursor does not match the current automation revision",
         ));
     }
+    let mut quarantined = 0usize;
     if budget == 0 {
-        return Ok(state_projection_with_processed(&state, 0, high_water));
+        return Ok(state_projection_with_processed(
+            &state,
+            0,
+            quarantined,
+            high_water,
+        ));
     }
 
-    let mut processed = recheck_pending(
+    let invocation = PublicationInvocation {
         tx,
         launcher_config,
         entry,
-        &mut state,
-        budget.min(MAX_PENDING_RECHECKS),
         now_ms,
         forge_preparation,
+    };
+    let mut processed = recheck_pending(
+        &invocation,
+        &mut state,
+        budget.min(MAX_PENDING_RECHECKS),
+        &mut quarantined,
     )?;
     let remaining_budget = budget.saturating_sub(processed);
     if remaining_budget == 0 {
         state.updated_at_ms = now_ms;
         save_state(tx, &key, &state)?;
         return Ok(state_projection_with_processed(
-            &state, processed, high_water,
+            &state,
+            processed,
+            quarantined,
+            high_water,
         ));
     }
     if state.pending.len() >= MAX_PENDING {
@@ -374,7 +421,10 @@ fn reconcile_entry(
         state.updated_at_ms = now_ms;
         save_state(tx, &key, &state)?;
         return Ok(state_projection_with_processed(
-            &state, processed, high_water,
+            &state,
+            processed,
+            quarantined,
+            high_water,
         ));
     }
 
@@ -388,7 +438,10 @@ fn reconcile_entry(
         state.updated_at_ms = now_ms;
         save_state(tx, &key, &state)?;
         return Ok(state_projection_with_processed(
-            &state, processed, high_water,
+            &state,
+            processed,
+            quarantined,
+            high_water,
         ));
     }
 
@@ -417,73 +470,92 @@ fn reconcile_entry(
     let has_more = events.len() > remaining_budget;
     let mut blocked_on_pending_capacity = false;
     for event in events.iter().take(remaining_budget) {
-        let Some(accepted_operation_id) = event_identity(event)? else {
-            remember_recent(
-                &mut state,
-                json!({
-                    "observation_id":event.observation_id,
-                    "status":"skipped",
-                    "code":"acceptance_fact_not_applied",
-                    "publication_started":false
-                }),
-            );
-            state.cursor = event.observation_id;
-            processed += 1;
-            continue;
-        };
-        if state.pending.iter().any(|pending| {
-            pending.observation_id == event.observation_id
-                && pending.accepted_operation_id == accepted_operation_id
-        }) {
-            remember_recent(
-                &mut state,
-                event_projection(
-                    event.observation_id,
-                    &accepted_operation_id,
-                    "pending",
-                    "acceptance_already_waiting",
-                    None,
-                ),
-            );
-            state.cursor = event.observation_id;
-            processed += 1;
-            continue;
-        }
-        if state.pending.len() >= MAX_PENDING {
-            remember_capacity_gap(&mut state, Some(event.observation_id), now_ms);
-            blocked_on_pending_capacity = true;
-            break;
-        }
         let replay = event.observation_id <= state.activation_cut
             && state.catch_up_until == Some(state.activation_cut);
-        let disposition = consume_event_isolated(
-            tx,
-            launcher_config,
-            entry,
-            AcceptanceReservation {
-                event,
-                accepted_operation_id: &accepted_operation_id,
-                activation_cut: state.activation_cut,
-                historical_replay_authorized: replay,
-            },
-            now_ms,
-            forge_preparation,
-        )?;
-        if let ReserveDisposition::Pending { .. } = disposition {
-            state.pending.push(PendingAcceptance {
-                observation_id: event.observation_id,
-                accepted_operation_id: accepted_operation_id.clone(),
-                historical_replay_authorized: replay,
-                retries: 0,
-                next_retry_at_ms: now_ms.saturating_add(BASE_RETRY_DELAY_MS),
-            });
+        let disposition =
+            consume_event_isolated(&invocation, Some(event), None, state.activation_cut, replay)?;
+        match disposition {
+            SubjectDisposition::Applied((subject, accepted_operation_id, result)) => {
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":subject.observation_id,
+                        "accepted_operation_id":accepted_operation_id,
+                        "status":result["status"],
+                        "code":result.get("code").cloned().unwrap_or(Value::Null),
+                        "operation_id":result.get("operation_id").cloned().unwrap_or(Value::Null),
+                        "operation_state":result.get("operation_state").cloned().unwrap_or(Value::Null),
+                        "publication_started":result["publication_started"] == true,
+                        "coalesced":result["coalesced"] == true
+                    }),
+                );
+                state.cursor = subject.observation_id;
+                processed += 1;
+            }
+            SubjectDisposition::Pending { code, reason } => {
+                if state.pending.len() >= MAX_PENDING {
+                    remember_capacity_gap(&mut state, Some(event.observation_id), now_ms);
+                    blocked_on_pending_capacity = true;
+                    break;
+                }
+                let accepted_operation_id = event.operation_id.as_deref().ok_or_else(|| {
+                    Error::new(
+                        "AUTOMATION_PUBLICATION_DISPOSITION_INVALID",
+                        "pending publication subject has no validated Operation identity",
+                    )
+                })?;
+                state.pending.push(PendingAcceptance {
+                    observation_id: event.observation_id,
+                    accepted_operation_id: accepted_operation_id.to_owned(),
+                    historical_replay_authorized: replay,
+                    retries: 0,
+                    next_retry_at_ms: now_ms.saturating_add(BASE_RETRY_DELAY_MS),
+                });
+                remember_recent(
+                    &mut state,
+                    event_projection(
+                        event.observation_id,
+                        accepted_operation_id,
+                        "pending",
+                        &code,
+                        Some(&reason),
+                    ),
+                );
+                state.cursor = event.observation_id;
+                processed += 1;
+            }
+            SubjectDisposition::Skipped { code, reason } => {
+                let accepted_operation_id = event.operation_id.as_deref().unwrap_or_default();
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "accepted_operation_id":accepted_operation_id,
+                        "status":"skipped",
+                        "code":code,
+                        "reason":reason,
+                        "publication_started":false
+                    }),
+                );
+                state.cursor = event.observation_id;
+                processed += 1;
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_subject_quarantine(tx, &code, evidence, now_ms)?;
+                quarantined = quarantined.saturating_add(1);
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "status":"quarantined",
+                        "code":code,
+                        "recorded_at_ms":now_ms
+                    }),
+                );
+                state.cursor = event.observation_id;
+                processed += 1;
+            }
         }
-        remember_recent(
-            &mut state,
-            disposition_projection(event.observation_id, &accepted_operation_id, disposition),
-        );
-        state.cursor = event.observation_id;
-        processed += 1;
     }
     if !has_more && !blocked_on_pending_capacity {
         state.cursor = target;
@@ -494,87 +566,93 @@ fn reconcile_entry(
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)?;
     Ok(state_projection_with_processed(
-        &state, processed, high_water,
+        &state,
+        processed,
+        quarantined,
+        high_water,
     ))
 }
 
 fn consume_event_isolated(
-    tx: &Transaction<'_>,
-    launcher_config: &Config,
-    entry: &AutomationEntry,
-    reservation: AcceptanceReservation<'_>,
-    now_ms: i64,
-    forge_preparation: &super::forge::ForgeExecutionPreparation,
-) -> Result<ReserveDisposition> {
-    let AcceptanceReservation {
-        event,
-        accepted_operation_id,
-        activation_cut,
-        historical_replay_authorized,
-    } = reservation;
-    let context = match PublicationContext::from_acceptance_observation(
-        tx,
-        entry,
-        event.observation_id,
-        accepted_operation_id,
-        activation_cut,
-        historical_replay_authorized,
-        launcher_config,
-    ) {
-        Ok(context) => context,
-        Err(error) if pending_context_error(&error) => {
-            return Ok(ReserveDisposition::Pending {
-                code: "publication_prerequisite_waiting".to_owned(),
-                reason: "current manager or Forge reservation prerequisite is temporarily unavailable",
-            });
+    invocation: &PublicationInvocation<'_, '_>,
+    event: Option<&AcceptanceEvent>,
+    pending: Option<&PendingAcceptance>,
+    activation_cut: i64,
+    historical_replay_authorized: bool,
+) -> Result<SubjectDisposition<(AcceptanceEvent, String, Value)>> {
+    let evidence = match (event, pending) {
+        (Some(event), None) => acceptance_event_evidence(event),
+        (None, Some(pending)) => pending_acceptance_evidence(pending),
+        _ => {
+            return Err(Error::new(
+                "AUTOMATION_PUBLICATION_SUBJECT_INVALID",
+                "publication subject must be exactly one new or pending acceptance",
+            ));
         }
-        Err(error) if skip_context_error(&error) => {
-            return Ok(ReserveDisposition::Skipped {
-                code: error.code,
-                reason: "acceptance is no longer eligible for this exact selected publication action",
-            });
-        }
-        Err(error) => return Err(error),
     };
-    let request_value = context.request_value()?;
-    tx.execute_batch("SAVEPOINT automation_publication_reserve")?;
-    match reserve_automatic_publication(
-        tx,
-        launcher_config,
-        &context,
-        &request_value,
-        now_ms,
-        forge_preparation,
-    ) {
-        Ok(result) => {
-            tx.execute_batch("RELEASE automation_publication_reserve")?;
-            Ok(ReserveDisposition::Reserved(result))
-        }
-        Err(error) if pending_reservation_error(&error) => {
-            tx.execute_batch(
-                "ROLLBACK TO automation_publication_reserve; RELEASE automation_publication_reserve",
+    automation_reconcile::with_subject_savepoint(
+        invocation.tx,
+        || {
+            let event = match (event, pending) {
+                (Some(event), None) => event.clone(),
+                (None, Some(pending)) => load_event(
+                    invocation.tx,
+                    pending.observation_id,
+                    &pending.accepted_operation_id,
+                )?,
+                _ => {
+                    return Err(Error::new(
+                        "AUTOMATION_PUBLICATION_SUBJECT_INVALID",
+                        "publication subject source changed before savepoint execution",
+                    ));
+                }
+            };
+            let Some(accepted_operation_id) = event_identity(&event)? else {
+                return Ok(SubjectDisposition::Skipped {
+                    code: "acceptance_fact_not_applied".to_owned(),
+                    reason: "acceptance Observation is not an applied candidate".to_owned(),
+                });
+            };
+            if let Some(pending) = pending {
+                if accepted_operation_id != pending.accepted_operation_id {
+                    return Err(Error::new(
+                        "AUTOMATION_PUBLICATION_STATE_CORRUPT",
+                        "pending acceptance Operation differs from its exact Observation",
+                    ));
+                }
+                if (event.observation_id <= activation_cut) != historical_replay_authorized {
+                    return Err(Error::new(
+                        "AUTOMATION_PUBLICATION_STATE_CORRUPT",
+                        "pending acceptance replay authority no longer matches its activation cut",
+                    ));
+                }
+            }
+            let context = PublicationContext::from_acceptance_observation(
+                invocation.tx,
+                invocation.entry,
+                event.observation_id,
+                &accepted_operation_id,
+                activation_cut,
+                historical_replay_authorized,
+                invocation.launcher_config,
             )?;
-            Ok(ReserveDisposition::Pending {
-                code: "forge_reservation_waiting".to_owned(),
-                reason: "the existing Forge worker reports a temporary repository or slot hold",
-            })
-        }
-        Err(error) if skip_context_error(&error) => {
-            tx.execute_batch(
-                "ROLLBACK TO automation_publication_reserve; RELEASE automation_publication_reserve",
+            let request_value = context.request_value()?;
+            let result = reserve_automatic_publication(
+                invocation.tx,
+                invocation.launcher_config,
+                &context,
+                &request_value,
+                invocation.now_ms,
+                invocation.forge_preparation,
             )?;
-            Ok(ReserveDisposition::Skipped {
-                code: error.code,
-                reason: "Forge no longer admits this exact accepted candidate and target",
-            })
-        }
-        Err(error) => {
-            tx.execute_batch(
-                "ROLLBACK TO automation_publication_reserve; RELEASE automation_publication_reserve",
-            )?;
-            Err(error)
-        }
-    }
+            Ok(SubjectDisposition::Applied((
+                event,
+                accepted_operation_id,
+                result,
+            )))
+        },
+        |error| classify_publication_subject_error(error, evidence.clone()),
+    )
 }
 
 fn reserve_automatic_publication(
@@ -742,14 +820,12 @@ fn save_operation_link(
 }
 
 fn recheck_pending(
-    tx: &Transaction<'_>,
-    launcher_config: &Config,
-    entry: &AutomationEntry,
+    invocation: &PublicationInvocation<'_, '_>,
     state: &mut PublicationState,
     budget: usize,
-    now_ms: i64,
-    forge_preparation: &super::forge::ForgeExecutionPreparation,
+    quarantined: &mut usize,
 ) -> Result<usize> {
+    let now_ms = invocation.now_ms;
     let mut processed = 0usize;
     while processed < budget {
         let Some(index) = state
@@ -759,42 +835,79 @@ fn recheck_pending(
         else {
             break;
         };
-        let mut pending = state.pending.remove(index);
-        let event = load_event(tx, pending.observation_id, &pending.accepted_operation_id)?;
+        let pending = state.pending[index].clone();
         let replay = pending.historical_replay_authorized;
-        if (event.observation_id <= state.activation_cut) != replay {
-            return Err(Error::new(
-                "AUTOMATION_PUBLICATION_STATE_CORRUPT",
-                "pending acceptance replay authority no longer matches its activation cut",
-            ));
-        }
         let disposition = consume_event_isolated(
-            tx,
-            launcher_config,
-            entry,
-            AcceptanceReservation {
-                event: &event,
-                accepted_operation_id: &pending.accepted_operation_id,
-                activation_cut: state.activation_cut,
-                historical_replay_authorized: replay,
-            },
-            now_ms,
-            forge_preparation,
+            invocation,
+            None,
+            Some(&pending),
+            state.activation_cut,
+            replay,
         )?;
-        processed += 1;
-        if let ReserveDisposition::Pending { .. } = disposition {
-            pending.retries = pending.retries.saturating_add(1);
-            pending.next_retry_at_ms = now_ms.saturating_add(retry_delay(pending.retries));
-            state.pending.push(pending.clone());
+        match disposition {
+            SubjectDisposition::Applied((event, accepted_operation_id, result)) => {
+                state.pending.remove(index);
+                processed += 1;
+                remember_recent(
+                    state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "accepted_operation_id":accepted_operation_id,
+                        "status":result["status"],
+                        "code":result.get("code").cloned().unwrap_or(Value::Null),
+                        "operation_id":result.get("operation_id").cloned().unwrap_or(Value::Null),
+                        "operation_state":result.get("operation_state").cloned().unwrap_or(Value::Null),
+                        "publication_started":result["publication_started"] == true,
+                        "coalesced":result["coalesced"] == true
+                    }),
+                );
+            }
+            SubjectDisposition::Pending { code, reason } => {
+                let projection = {
+                    let pending = &mut state.pending[index];
+                    pending.retries = pending.retries.saturating_add(1);
+                    pending.next_retry_at_ms = now_ms.saturating_add(retry_delay(pending.retries));
+                    event_projection(
+                        pending.observation_id,
+                        &pending.accepted_operation_id,
+                        "pending",
+                        &code,
+                        Some(&reason),
+                    )
+                };
+                processed += 1;
+                remember_recent(state, projection);
+            }
+            SubjectDisposition::Skipped { code, reason } => {
+                state.pending.remove(index);
+                processed += 1;
+                remember_recent(
+                    state,
+                    event_projection(
+                        pending.observation_id,
+                        &pending.accepted_operation_id,
+                        "skipped",
+                        &code,
+                        Some(&reason),
+                    ),
+                );
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_subject_quarantine(invocation.tx, &code, evidence, now_ms)?;
+                *quarantined = (*quarantined).saturating_add(1);
+                state.pending.remove(index);
+                processed += 1;
+                remember_recent(
+                    state,
+                    json!({
+                        "observation_id":pending.observation_id,
+                        "status":"quarantined",
+                        "code":code,
+                        "recorded_at_ms":now_ms
+                    }),
+                );
+            }
         }
-        remember_recent(
-            state,
-            disposition_projection(
-                pending.observation_id,
-                &pending.accepted_operation_id,
-                disposition,
-            ),
-        );
     }
     Ok(processed)
 }
@@ -859,39 +972,6 @@ fn event_identity(event: &AcceptanceEvent) -> Result<Option<String>> {
     Ok(Some(operation_id.to_owned()))
 }
 
-fn disposition_projection(
-    observation_id: i64,
-    accepted_operation_id: &str,
-    disposition: ReserveDisposition,
-) -> Value {
-    match disposition {
-        ReserveDisposition::Reserved(value) => json!({
-            "observation_id":observation_id,
-            "accepted_operation_id":accepted_operation_id,
-            "status":value["status"],
-            "code":value["code"],
-            "operation_id":value["operation_id"],
-            "operation_state":value["operation_state"],
-            "publication_started":value["publication_started"] == true,
-            "coalesced":value["coalesced"] == true
-        }),
-        ReserveDisposition::Pending { code, reason } => event_projection(
-            observation_id,
-            accepted_operation_id,
-            "pending",
-            &code,
-            Some(reason),
-        ),
-        ReserveDisposition::Skipped { code, reason } => event_projection(
-            observation_id,
-            accepted_operation_id,
-            "skipped",
-            &code,
-            Some(reason),
-        ),
-    }
-}
-
 fn event_projection(
     observation_id: i64,
     accepted_operation_id: &str,
@@ -921,7 +1001,6 @@ fn skip_context_error(error: &Error) -> bool {
         error.code.as_str(),
         "AUTOMATION_ACTION_CHANGED"
             | "AUTOMATION_ACTION_UNAVAILABLE"
-            | "AUTOMATION_FACT_MISSING"
             | "AUTOMATION_FACT_NOT_APPLIED"
             | "FORGE_ACCEPTANCE_STALE"
             | "FORGE_SUBMISSION_MISMATCH"
@@ -940,7 +1019,89 @@ fn pending_reservation_error(error: &Error) -> bool {
         "FORGE_PROCESS_TREE_UNCONFIRMED"
             | "FORGE_PUBLICATION_SLOT_BUSY"
             | "FORGE_EXECUTION_PREPARATION_MISSING"
+            | "FORGE_WORKER_IMAGE_INVALID"
     )
+}
+
+fn classify_publication_subject_error(
+    error: &Error,
+    evidence: QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    if pending_context_error(error) || pending_reservation_error(error) {
+        return Some(SubjectErrorDisposition::Pending {
+            code: error.code.clone(),
+            reason: "an exact current authority or Forge prerequisite may become available later"
+                .to_owned(),
+        });
+    }
+    if skip_context_error(error) {
+        return Some(SubjectErrorDisposition::Skipped {
+            code: error.code.clone(),
+            reason: "the exact accepted candidate is no longer selected or applicable".to_owned(),
+        });
+    }
+    match error.code.as_str() {
+        "AUTOMATION_FACT_CORRUPT"
+        | "AUTOMATION_FACT_MISSING"
+        | "AUTOMATION_LINK_CORRUPT"
+        | "AUTOMATION_OPERATION_CORRUPT"
+        | "AUTOMATION_RECORD_CORRUPT" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence,
+        }),
+        _ => None,
+    }
+}
+
+fn acceptance_event_evidence(event: &AcceptanceEvent) -> QuarantineEvidence {
+    let operation_digest = event
+        .operation_id
+        .as_deref()
+        .map(|value| model::digest(value.as_bytes()))
+        .unwrap_or_else(|| "missing".to_owned());
+    QuarantineEvidence {
+        subject_identity: format!(
+            "acceptance-observation:{}:operation:{}",
+            event.observation_id, operation_digest
+        ),
+        source_pointer: Some(format!("observations/{}", event.observation_id)),
+        source_digest: Some(model::digest(event.payload_json.as_bytes())),
+    }
+}
+
+fn pending_acceptance_evidence(pending: &PendingAcceptance) -> QuarantineEvidence {
+    QuarantineEvidence {
+        subject_identity: format!(
+            "acceptance-observation:{}:operation:{}",
+            pending.observation_id,
+            model::digest(pending.accepted_operation_id.as_bytes())
+        ),
+        source_pointer: Some(format!("observations/{}", pending.observation_id)),
+        source_digest: None,
+    }
+}
+
+fn persist_subject_quarantine(
+    tx: &Transaction<'_>,
+    code: &str,
+    evidence: QuarantineEvidence,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(tx, &record_key, code, evidence, now_ms)?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_PUBLICATION_QUARANTINE_INVALID",
+            "publication subject did not produce durable quarantine evidence",
+        )),
+    }
 }
 
 fn retry_delay(retries: u32) -> i64 {
@@ -973,13 +1134,27 @@ fn remember_capacity_gap(state: &mut PublicationState, observation_id: Option<i6
 fn enabled_entry_page(
     db: &Connection,
     limit: usize,
-) -> Result<(Vec<AutomationEntry>, Option<String>)> {
+) -> Result<(
+    Vec<AutomationEntry>,
+    Option<String>,
+    Vec<MalformedAutomationEntry>,
+)> {
     if limit == 0 {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Vec::new()));
     }
     let prefix = "automation:v1:entry:";
     let pattern = "automation:v1:entry:%";
-    let cursor_value = config::read_record(db, GLOBAL_CURSOR_KEY, "publication global cursor")?;
+    let cursor_value = config::read_record(db, GLOBAL_CURSOR_KEY, "publication global cursor")
+        .map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_PUBLICATION_CURSOR_CORRUPT",
+                    "publication global cursor record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?;
     let cursor = cursor_value
         .map(|value| {
             serde_json::from_value::<GlobalCursor>(value).map_err(|_| {
@@ -1013,45 +1188,78 @@ fn enabled_entry_page(
         )?);
     }
     if keys.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Vec::new()));
     }
     let last_key = keys.last().cloned();
     let mut entries = Vec::with_capacity(keys.len());
+    let mut malformed_entries = Vec::new();
     for key in keys {
         let raw: String =
             db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
                 row.get(0)
             })?;
-        let sealed: Value = serde_json::from_str(&raw).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry JSON is invalid",
-            )
-        })?;
-        let value = config::open_record(sealed, "automation entry")?;
-        let entry: AutomationEntry = serde_json::from_value(value).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry fields are invalid",
-            )
-        })?;
-        config::validate_entry(&entry)?;
+        let entry = match automation_reconcile::parse_automation_entry(&raw, "automation entry") {
+            Ok(entry) => entry,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_INVALID"
+                ) =>
+            {
+                malformed_entries.push(MalformedAutomationEntry {
+                    code: error.code,
+                    evidence: automation_reconcile::automation_entry_evidence(&key, &raw),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if config::entry_key(
             &entry.owner_manager_id,
             &entry.project_id,
             &entry.automation_id,
         )? != key
         {
-            return Err(Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry identity does not match its metadata key",
-            ));
+            malformed_entries.push(MalformedAutomationEntry {
+                code: "AUTOMATION_RECORD_INVALID".to_owned(),
+                evidence: automation_reconcile::automation_entry_evidence(&key, &raw),
+            });
+            continue;
         }
         if entry.enabled && entry.steps.contains(&AutomationStep::Publication) {
             entries.push(entry);
         }
     }
-    Ok((entries, last_key))
+    Ok((entries, last_key, malformed_entries))
+}
+
+fn persist_malformed_entry(
+    tx: &Transaction<'_>,
+    malformed: &MalformedAutomationEntry,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key =
+        automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &malformed.evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(
+                tx,
+                &record_key,
+                &malformed.code,
+                malformed.evidence.clone(),
+                now_ms,
+            )?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_PUBLICATION_QUARANTINE_INVALID",
+            "malformed publication entry did not produce a durable quarantine",
+        )),
+    }
 }
 
 fn select_entry_keys(
@@ -1063,12 +1271,8 @@ fn select_entry_keys(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step WHERE step.value='publication') \
-         ORDER BY key LIMIT ?3",
-    )?;
+    let mut statement =
+        db.prepare("SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 ORDER BY key LIMIT ?3")?;
     Ok(statement
         .query_map(params![pattern, after, limit as i64], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1085,10 +1289,7 @@ fn select_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step WHERE step.value='publication') \
-         ORDER BY key LIMIT ?4",
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
         .query_map(params![pattern, prefix, before, limit as i64], |row| {
@@ -1098,7 +1299,18 @@ fn select_entry_keys_before(
 }
 
 fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<PublicationState>> {
-    let Some(value) = config::read_record(db, &state_key(entry)?, "publication state")? else {
+    let Some(value) =
+        config::read_record(db, &state_key(entry)?, "publication state").map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_PUBLICATION_STATE_CORRUPT",
+                    "publication state record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?
+    else {
         return Ok(None);
     };
     let state: PublicationState = serde_json::from_value(value).map_err(|_| {
@@ -1264,10 +1476,12 @@ fn state_projection(state: &PublicationState) -> Value {
 fn state_projection_with_processed(
     state: &PublicationState,
     processed: usize,
+    quarantined: usize,
     high_water: i64,
 ) -> Value {
     let mut value = state_projection(state);
     value["processed"] = json!(processed);
+    value["quarantined"] = json!(quarantined);
     value["high_water"] = json!(high_water);
     value
 }

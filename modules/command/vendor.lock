@@ -5,7 +5,7 @@
 # independently of Windows checkout line-ending conversion.
 schema_version = 1
 module = "runtime.command"
-module_artifact_id = "command-mod-0.1.0-glue.4"
+module_artifact_id = "command-mod-0.1.0-glue.5"
 status = "fixture_verified_live_unqualified"
 installed_runtime_verified = false
 
@@ -21,13 +21,13 @@ role = "Pinned Command Code mod: canonical LF text digest; readiness, native eve
 [[units]]
 id = "eliot-command-glue"
 path = "glue.mjs"
-sha256 = "c4d1ec9edb64ad65ba07852931869495f4ab0585166868f04076f84c268464f7"
+sha256 = "898ac90d1229f85950e3064f30292ad1a966c63192c01ad5d1a86e32eb14917a"
 role = "Headless NDJSON driver: canonical prompt binding, isolated mod control directory, saved terminal consistency and read-only reconciliation"
 
 [[units]]
 id = "eliot-command-bridge"
 path = "bridge.mjs"
-sha256 = "1f06a3758ba19809ca1d33f47890c3604780d11f215cdc9ddbc42be7c52a5b3f"
+sha256 = "9b2c46e451870068377224ddbaf3a5582060881833cccd3b8eb52e0f0683d1fb"
 role = "Host module IPC adapter: core-bound one-shot task dispatch and validated saved-evidence reconciliation"
 
 [[units]]

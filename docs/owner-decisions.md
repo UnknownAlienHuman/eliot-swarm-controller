@@ -209,7 +209,7 @@ The first-slice implementation is present in the current candidate. Combined gat
 
 ## 7. Zed sessionless batch wiring — resolves issue #12 questions
 
-- `task.dispatch` uses the same effective instruction contract as other runtimes: exact request `text` plus the immutable Task snapshot in canonical JSON. The instruction is frozen in the RuntimeCommand before launch.
+- Current `task.dispatch` uses the Store-produced `swarm.task_prompt` v1 envelope: exact prompt bytes and digest, immutable Task/Attempt/revision and snapshot identity, plus the matching retained dispatch context. Zed v2 passes those prompt bytes unchanged. The snapshot-based v1 codec remains only for historical readback and settlement.
 - One dispatch Operation owns one Zed batch `run_id`. Producer evidence is batch-shaped, not a synthetic session/turn: exact operation, run ID, exit/result cross-check and terminal disposition.
 - `agent.result` selector is `batch_output` with exact dispatch Operation ID and one allowlisted output name (`result.json`, `thread.md`, `thread.json`). It pages the already published immutable artifact; it cannot inject a filesystem path.
 - `agent.open` is controller preflight/binding readiness only and creates no native session identity.

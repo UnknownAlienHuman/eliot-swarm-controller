@@ -1,10 +1,10 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.8`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and fixture results do not attest model execution.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The TaskPrompt migration targets **`muse-sdk-1.3.0-bridge.9`**. The host must retain and accept the exact bridge.9 descriptor before activating new bindings. Live Muse/Max and Windows native launch remain unqualified; syntax checks do not attest model execution.
 
-**Draft activation blocker:** `module.example.json` still names bridge.7 because
-its version-only publication was blocked by the write tool. This PR is not ready
-for activation until that example is aligned with bridge.8.
+**Activation blocker:** the host currently accepts bridge.8. Register and retain
+the bridge.9 descriptor before selecting it for a new binding. Existing bridge.8
+bindings keep their original artifact identity and code.
 
 ## Ownership and setup
 
@@ -20,7 +20,7 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.8'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.9'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -56,11 +56,27 @@ This follows the pinned SDK's [approval update field ownership](https://github.c
 No SDK approval handler or automatic decision is installed. Presentation still
 returns `{}`; an answer remains an explicit addressed `agent.reply` Operation.
 
-This code requires artifact `muse-sdk-1.3.0-bridge.8` and refuses to announce a
-previous artifact ID. Stage it for new bindings only. Existing bridge.7 bindings
+This code requires artifact `muse-sdk-1.3.0-bridge.9` and refuses to announce a
+previous artifact ID. Stage it for new bindings only. Existing bridge.8 bindings
 and checkpoints retain their original code and identity; they are not migrated.
 The SDK pin is unchanged. Syntax checks are not behavioral qualification; refresh
-race fixtures, SDK import and native qualification remain pending for bridge.8.
+race fixtures, SDK import and native qualification remain pending for bridge.9.
+
+## TaskPrompt v1 — bridge.9
+
+For `task.dispatch`, the bridge consumes the Store-enriched
+`input.task_prompt` and `input.task_dispatch_context`. It checks the exact
+envelope fields, Task/binding/operation identity, source-text digest, prompt
+SHA-256 and UTF-8 byte count (maximum 1,000,000 bytes) before native submission.
+The envelope's `prompt` is the complete native input; the bridge does not render
+or append a raw Task snapshot. An acknowledged native command returns the
+existing `swarm.task_dispatch_admission@1` receipt bound to the exact prompt
+digest, byte count and native command ID.
+
+Proposed descriptor template path: `modules/muse/module-descriptor.template.json`.
+It must declare `swarm.task_prompt@1` and `swarm.task_dispatch_context@1` as
+command schemas and `swarm.task_dispatch_admission@1` as an event schema, with
+the existing runtime command/outcome schemas and `task.dispatch` capability.
 
 ## Recorded-session recovery — bridge.5
 

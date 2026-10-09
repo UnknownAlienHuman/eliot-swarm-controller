@@ -1,4 +1,5 @@
 mod config;
+mod interactions;
 mod journal;
 mod module_runtime;
 mod native_state;
@@ -8,6 +9,7 @@ mod sdk_harness;
 pub use config::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, NativeOptions, RUNTIME};
 pub use module_runtime::OwnedBootstrap;
 
+use interactions::{InteractionJournal, InteractionKind, validate_reply};
 use journal::{OperationJournal, digest_bytes, digest_json};
 use native_state::{NativeControl, safe_family_resource_links};
 use sdk_harness::{HarnessFrame, NativeHarness};
@@ -22,6 +24,7 @@ use swarm_contracts::{
         EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
         TaskDispatchContext,
     },
+    task_prompt::{TASK_PROMPT_CONTRACT_REVISION, TaskPromptEnvelopeV1},
 };
 use tokio::{sync::mpsc, time::sleep};
 
@@ -29,6 +32,8 @@ const IDLE_POLL_MS: u64 = 500;
 const MAX_FRAMES: usize = 256;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TASK_SNAPSHOT_BYTES: usize = 64 * 1024;
+const MAX_TASK_PROMPT_BYTES: usize = 1_000_000;
+const MAX_NATIVE_COMMAND_BYTES: usize = 1_100_000;
 const MAX_REFRESH_EXECUTIONS: usize = 16;
 const MAX_REFRESH_FAMILY_EVENTS: usize = 16;
 
@@ -63,6 +68,13 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &route_sha256,
     )?;
     journal.recover_uncertain()?;
+    let interactions = InteractionJournal::open(
+        &config.state_dir,
+        &config.binding_id,
+        config.generation,
+        &config.native_options.scope_key(),
+    )?;
+    interactions.recover_stale(&journal)?;
     let bridge_path = sdk_harness::materialize(&config.sdk_harness_dir)?;
     let (frame_tx, mut frame_rx) = mpsc::channel::<HarnessFrame>(MAX_FRAMES);
     let mut harness: Option<NativeHarness> = None;
@@ -76,7 +88,8 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     let mut frames_closed = false;
 
     loop {
-        flush_outbox(&mut link, &journal).await?;
+        flush_outbox(&mut link, &journal, &interactions).await?;
+        interactions.process_retention_batch(&journal)?;
         tokio::select! {
             signal = &mut ctrl_c => {
                 signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
@@ -88,17 +101,24 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
             frame = receive_frame(&mut frame_rx, frames_closed) => {
                 match frame {
                     Some(frame) => {
-                        if handle_frame(
+                        let action = handle_frame(
                             frame,
                             &config,
                             &boot_id,
                             &journal,
+                            &interactions,
                             &mut harness_alive,
                             &mut native_prepared,
                             &mut latest_state,
                             &mut session_root,
                             &mut native_control,
-                        )? {
+                        )?;
+                        if action.retire_bridge {
+                            interactions.retire_bridge(&boot_id, &journal)?;
+                            harness.take();
+                            native_prepared = false;
+                        }
+                        if action.reconnect {
                             link = open_link(LinkInvocation {
                                 host_config: &host_config,
                                 expected_options: Some(&config.native_options),
@@ -127,6 +147,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         config: &config,
                         claim: &contract,
                         journal: &journal,
+                        interactions: &interactions,
                         link: &mut link,
                         harness: &mut harness,
                         frame_tx: &frame_tx,
@@ -184,6 +205,7 @@ struct CommandInvocation<'a> {
     config: &'a AdapterConfig,
     claim: &'a ModuleContractClaim,
     journal: &'a OperationJournal,
+    interactions: &'a InteractionJournal,
     link: &'a mut ModuleLink,
     harness: &'a mut Option<NativeHarness>,
     frame_tx: &'a mpsc::Sender<HarnessFrame>,
@@ -206,6 +228,37 @@ struct ResultInvocation<'a> {
     native_root_id: Option<&'a str>,
     native_control: &'a NativeControl,
     command: &'a RuntimeCommand,
+}
+
+struct InteractionReplyInvocation<'a> {
+    config: &'a AdapterConfig,
+    claim: &'a ModuleContractClaim,
+    journal: &'a OperationJournal,
+    interactions: &'a InteractionJournal,
+    harness: &'a mut Option<NativeHarness>,
+    harness_alive: &'a mut bool,
+    native_prepared: bool,
+    boot_id: &'a str,
+    native_root_id: Option<&'a str>,
+    command: &'a RuntimeCommand,
+    receipt: &'a swarm_contracts::runtime::ModuleReceiptIdentity,
+}
+
+struct DispatchAdmissionInvocation<'a> {
+    claim: &'a ModuleContractClaim,
+    command: &'a RuntimeCommand,
+    receipt: &'a swarm_contracts::runtime::ModuleReceiptIdentity,
+    boot_id: &'a str,
+    input_id: &'a str,
+    source_text: &'a str,
+    native_payload: &'a Value,
+    task_prompt: Option<&'a TaskPromptEnvelopeV1>,
+}
+
+#[derive(Default)]
+struct FrameAction {
+    reconnect: bool,
+    retire_bridge: bool,
 }
 
 struct UnknownResultInvocation<'a> {
@@ -261,6 +314,7 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
         config,
         claim,
         journal,
+        interactions,
         link,
         harness,
         frame_tx,
@@ -356,6 +410,8 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                         "model_id":&config.native_options.model_id,
                         "permission_mode":&config.native_options.permission_mode,
                         "allow_dangerously_skip_permissions":config.native_options.allow_dangerously_skip_permissions,
+                        "binding_id":config.binding_id,
+                        "generation":config.generation,
                         "native_scope_key":config.native_options.scope_key(),
                         "bridge_boot_id":boot_id
                     })).await;
@@ -504,7 +560,26 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                     native_root_id,
                 );
             }
-            let text = match input_text(command, first_dispatch) {
+            let dispatch_prompt =
+                match selected_task_prompt(command, boot_id, first_dispatch, claim) {
+                    Ok(prompt) => prompt,
+                    Err(error) => {
+                        return queue_rejected(
+                            config,
+                            claim,
+                            journal,
+                            command,
+                            &receipt,
+                            &error.code,
+                            native_root_id,
+                        );
+                    }
+                };
+            let text = match dispatch_prompt
+                .as_ref()
+                .map(|prompt| prompt.prompt.clone())
+                .map_or_else(|| input_text(command, first_dispatch), Ok)
+            {
                 Ok(text) => text,
                 Err(error) => {
                     return queue_rejected(
@@ -523,12 +598,16 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                 .ok_or_else(|| Error::invalid("input text must be nonempty"))?;
             let prompt_sha256 = digest_bytes(text.as_bytes());
             let task_snapshot_sha256 = if first_dispatch {
-                Some(digest_bytes(
-                    command.input["task_snapshot_canonical"]
-                        .as_str()
-                        .expect("validated canonical snapshot")
-                        .as_bytes(),
-                ))
+                Some(if let Some(prompt) = dispatch_prompt.as_ref() {
+                    prompt.task_snapshot_sha256.clone()
+                } else {
+                    digest_bytes(
+                        command.input["task_snapshot_canonical"]
+                            .as_str()
+                            .expect("validated canonical snapshot")
+                            .as_bytes(),
+                    )
+                })
             } else {
                 None
             };
@@ -541,20 +620,41 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                 "native_root_id":native_root_id,
                 "user_message_uuid":input_id
             });
-            let native_payload_bytes = serde_json::to_vec(&native_payload)?;
-            let native_payload_byte_length = u64::try_from(native_payload_bytes.len())
-                .map_err(|_| Error::invalid("native dispatch payload length is out of range"))?;
-            let native_payload_sha256 = digest_bytes(&native_payload_bytes);
-            let dispatch_admission = if command.method == "task.dispatch" {
-                normalized_dispatch_admission(
+            let native_transport_bytes = serde_json::to_vec(&native_payload)?;
+            if native_transport_bytes.len() > MAX_NATIVE_COMMAND_BYTES {
+                return queue_rejected(
+                    config,
                     claim,
+                    journal,
                     command,
                     &receipt,
+                    "INPUT_BOUNDARY",
+                    native_root_id,
+                );
+            }
+            let native_transport_byte_length = u64::try_from(native_transport_bytes.len())
+                .map_err(|_| Error::invalid("native dispatch payload length is out of range"))?;
+            let native_transport_sha256 = digest_bytes(&native_transport_bytes);
+            let (native_payload_sha256, native_payload_byte_length) =
+                if let Some(prompt) = dispatch_prompt.as_ref() {
+                    (prompt.prompt_sha256.clone(), prompt.prompt_bytes)
+                } else {
+                    (
+                        native_transport_sha256.clone(),
+                        native_transport_byte_length,
+                    )
+                };
+            let dispatch_admission = if command.method == "task.dispatch" {
+                normalized_dispatch_admission(DispatchAdmissionInvocation {
+                    claim,
+                    command,
+                    receipt: &receipt,
                     boot_id,
-                    &input_id,
+                    input_id: &input_id,
                     source_text,
-                    &native_payload,
-                )?
+                    native_payload: &native_payload,
+                    task_prompt: dispatch_prompt.as_ref(),
+                })?
             } else {
                 None
             };
@@ -563,10 +663,15 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                 "prompt_sha256":prompt_sha256,
                 "prompt_bytes":text.len(),
                 "task_snapshot_sha256":task_snapshot_sha256,
+                "task_prompt_contract_revision":dispatch_prompt.as_ref().map(|_| TASK_PROMPT_CONTRACT_REVISION),
+                "task_prompt_sha256":dispatch_prompt.as_ref().map(|prompt| prompt.prompt_sha256.as_str()),
+                "task_prompt_bytes":dispatch_prompt.as_ref().map(|prompt| prompt.prompt_bytes),
                 "native_root_id":native_root_id,
                 "native_scope_key":config.native_options.scope_key(),
                 "native_payload_sha256":native_payload_sha256,
                 "native_payload_bytes":native_payload_byte_length,
+                "native_transport_sha256":native_transport_sha256,
+                "native_transport_bytes":native_transport_byte_length,
             });
             if let Some(admission) = dispatch_admission.as_ref() {
                 native_intent["dispatch_admission"] = serde_json::to_value(admission)?;
@@ -627,7 +732,14 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                     native_root_id,
                 );
             }
-            handle_reconcile(config, journal, command, &receipt, latest_state)
+            handle_reconcile(
+                config,
+                journal,
+                command,
+                &receipt,
+                latest_state,
+                *harness_alive,
+            )
         }
         "agent.refresh" => {
             if let Err(error) = validate_route(config, command) {
@@ -650,7 +762,25 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                 boot_id,
                 native_root_id,
                 latest_state,
+                *harness_alive,
+                interactions,
             )
+        }
+        "agent.reply" => {
+            handle_interaction_reply(InteractionReplyInvocation {
+                config,
+                claim,
+                journal,
+                interactions,
+                harness,
+                harness_alive,
+                native_prepared,
+                boot_id,
+                native_root_id,
+                command,
+                receipt: &receipt,
+            })
+            .await
         }
         "agent.result" => {
             handle_result(ResultInvocation {
@@ -675,6 +805,202 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
             native_root_id,
         ),
     }
+}
+
+async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) -> Result<bool> {
+    let InteractionReplyInvocation {
+        config,
+        claim,
+        journal,
+        interactions,
+        harness,
+        harness_alive,
+        native_prepared,
+        boot_id,
+        native_root_id,
+        command,
+        receipt,
+    } = invocation;
+    if let Err(error) = validate_route(config, command) {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            receipt,
+            &error.code,
+            native_root_id,
+        );
+    }
+    let Some(native_root_id) = native_root_id else {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            receipt,
+            "NATIVE_SESSION_NOT_OPEN",
+            None,
+        );
+    };
+    if command.native_root_id.as_deref() != Some(native_root_id) {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            receipt,
+            "NATIVE_IDENTITY_MISMATCH",
+            Some(native_root_id),
+        );
+    }
+    if !*harness_alive || !native_prepared {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            receipt,
+            "SDK_HARNESS_NOT_ALIVE",
+            Some(native_root_id),
+        );
+    }
+    if harness.is_none() {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            receipt,
+            "SDK_HARNESS_NOT_ALIVE",
+            Some(native_root_id),
+        );
+    }
+    let request_id = command.input["request_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("INTERACTION_REPLY_SCHEMA", "request_id is required"))?;
+    let request = match interactions.get(request_id)? {
+        Some(request) => request,
+        None => {
+            return queue_rejected(
+                config,
+                claim,
+                journal,
+                command,
+                receipt,
+                "INTERACTION_NOT_PENDING",
+                Some(native_root_id),
+            );
+        }
+    };
+    let reply = &command.input["reply"];
+    if request.bridge_boot_id != boot_id
+        || request.native_root_id != native_root_id
+        || request.native_scope_key != config.native_options.scope_key()
+        || command.input["interaction_kind"] != request.kind.as_str()
+        || command.input["request_sha256"] != request.request_sha256
+        || validate_reply(&request, reply).is_err()
+    {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            receipt,
+            "INTERACTION_REPLY_MISMATCH",
+            Some(native_root_id),
+        );
+    }
+    let reply_sha256 = digest_json(reply)?;
+    let native_intent = json!({
+        "interaction_request_id":request.request_id,
+        "interaction_kind":request.kind.as_str(),
+        "tool_name":request.tool_name,
+        "request_sha256":request.request_sha256,
+        "reply_sha256":reply_sha256,
+        "reply":reply,
+        "bridge_boot_id":request.bridge_boot_id,
+        "native_root_id":request.native_root_id,
+        "native_scope_key":request.native_scope_key
+    });
+    let intent = intent_for(
+        command,
+        receipt,
+        Some(native_intent),
+        boot_id,
+        &config.native_options.scope_key(),
+    )?;
+    // The host Operation intent is durable before the SDK callback can be resolved.
+    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
+    if let Err(error) = interactions.begin_reply(
+        &request.request_id,
+        &command.operation_id,
+        reply,
+        &reply_sha256,
+    ) {
+        let saved = journal.get(&command.operation_id)?.ok_or_else(|| {
+            Error::new(
+                "ADAPTER_INTENT_MISSING",
+                "callback reply failure has no durable host Operation intent",
+            )
+        })?;
+        let outcome = if error.code == "INTERACTION_NOT_PENDING" {
+            rejected_outcome_from_saved(&command.operation_id, &saved, &error.code, config)?
+        } else {
+            let _ = interactions.mark_uncertain_reply(
+                &request.request_id,
+                &command.operation_id,
+                reply,
+                &reply_sha256,
+            );
+            unknown_outcome_from_saved(
+                &command.operation_id,
+                &saved,
+                "INTERACTION_INTENT_WRITE_UNKNOWN",
+                config,
+            )?
+        };
+        journal.save_outcome(&command.operation_id, &outcome)?;
+        return Ok(false);
+    }
+    let payload = json!({
+        "kind":"control_reply",
+        "operation_id":command.operation_id,
+        "bridge_boot_id":boot_id,
+        "native_root_id":native_root_id,
+        "native_scope_key":config.native_options.scope_key(),
+        "request_id":request.request_id,
+        "request_sha256":request.request_sha256,
+        "interaction_kind":request.kind.as_str(),
+        "reply_sha256":reply_sha256,
+        "reply":reply
+    });
+    let sent = harness
+        .as_mut()
+        .expect("harness presence checked above")
+        .send(payload)
+        .await;
+    if sent.is_err() {
+        *harness_alive = false;
+        let outcome = unknown_outcome_from_saved(
+            &command.operation_id,
+            &journal.get(&command.operation_id)?.ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_INTENT_MISSING",
+                    "uncertain callback delivery has no durable host Operation intent",
+                )
+            })?,
+            "SDK_HARNESS_PIPE_UNKNOWN",
+            config,
+        )?;
+        journal.save_outcome(&command.operation_id, &outcome)?;
+        interactions.mark_unknown(&request.request_id, &command.operation_id)?;
+        interactions.retire_bridge(boot_id, journal)?;
+        harness.take();
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 async fn handle_result(invocation: ResultInvocation<'_>) -> Result<bool> {
@@ -1271,6 +1597,8 @@ fn handle_refresh(
     boot_id: &str,
     native_root_id: Option<&str>,
     latest_state: &Value,
+    harness_alive: bool,
+    interactions: &InteractionJournal,
 ) -> Result<bool> {
     let Some(requested_session) = command.input["session_id"]
         .as_str()
@@ -1314,13 +1642,18 @@ fn handle_refresh(
     )?;
     journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
 
-    let observation_matches = native_root_id == Some(requested_session)
+    let observation_matches = harness_alive
+        && native_root_id == Some(requested_session)
         && latest_state["bridge_boot_id"] == boot_id
         && latest_state["root_id"] == requested_session
         && latest_state["state"]["init_session_id"] == requested_session
         && latest_state["native_scope_key"] == config.native_options.scope_key();
     let native_observation = if observation_matches {
-        compact_refresh_observation(latest_state)
+        let mut observation = compact_refresh_observation(latest_state);
+        observation["bridge_alive"] = json!(true);
+        observation["pending_interactions"] =
+            interactions.pending_snapshot(boot_id, requested_session)?;
+        observation
     } else {
         Value::Null
     };
@@ -1328,6 +1661,8 @@ fn handle_refresh(
         "completion_condition":"native_snapshot_recorded",
         "readback":"local_sdk_observation_cache",
         "native_observation_available":observation_matches,
+        "pending_interactions_available":observation_matches,
+        "bridge_alive":harness_alive,
         "native_observation":native_observation,
         "native_session_id":requested_session,
         "family_completeness":"partial",
@@ -1338,7 +1673,11 @@ fn handle_refresh(
         "family_events_available":observation_matches,
         "execution_complete":false,
         "task_completion_claimed":false,
-        "replay_permitted":false
+        "replay_permitted":false,
+        "adapter_retention":{
+            "operations":journal.retention_status()?,
+            "interactions":interactions.retention_status()?
+        }
     });
     receipt::insert(&mut details, receipt)?;
     let outcome = RuntimeOutcome {
@@ -1509,12 +1848,13 @@ fn handle_frame(
     config: &AdapterConfig,
     boot_id: &str,
     journal: &OperationJournal,
+    interactions: &InteractionJournal,
     harness_alive: &mut bool,
     native_prepared: &mut bool,
     latest_state: &mut Value,
     session_root: &mut Option<String>,
     native_control: &mut NativeControl,
-) -> Result<bool> {
+) -> Result<FrameAction> {
     match frame {
         HarnessFrame::Message(value) => {
             let kind = value["kind"].as_str().unwrap_or("");
@@ -1542,6 +1882,7 @@ fn handle_frame(
                             "prepared frame differs from the exact open operation",
                         ));
                     }
+                    let sdk_version = required_message_text(&value, "sdk_version")?;
                     let details = json!({
                         "completion_condition":"native_executor_prepared",
                         "native_session_state":"prepared",
@@ -1552,7 +1893,7 @@ fn handle_frame(
                         "requested_model":value["requested_model"],
                         "entrypoint":"claude_agent_sdk_streaming_input",
                         "sdk_package":"@anthropic-ai/claude-agent-sdk",
-                        "sdk_version":"0.3.287",
+                        "sdk_version":sdk_version,
                         "process_owner":"verified_inherited_module_group",
                         "family_completeness":"partial",
                         "module_pre_input_open_contract":{"schema_version":1,"kind":"pre_input_executor_ready","native_identity":"rootless","executor_preparation":"sdk_warm_query"},
@@ -1570,7 +1911,7 @@ fn handle_frame(
                     journal.save_outcome(operation_id, &outcome)?;
                     *harness_alive = true;
                     *native_prepared = true;
-                    Ok(false)
+                    Ok(FrameAction::default())
                 }
                 "sdk_frame" => {
                     let frame = value.get("frame").ok_or_else(|| {
@@ -1580,7 +1921,10 @@ fn handle_frame(
                     native_control.observe_frame(frame, config, boot_id, journal, session_root)?;
                     *latest_state =
                         native_control.snapshot(config, boot_id, session_root.as_deref());
-                    Ok(previous_root.as_deref() != session_root.as_deref())
+                    Ok(FrameAction {
+                        reconnect: previous_root.as_deref() != session_root.as_deref(),
+                        retire_bridge: false,
+                    })
                 }
                 "operation_unknown" => {
                     let operation_id = required_message_text(&value, "operation_id")?;
@@ -1592,9 +1936,14 @@ fn handle_frame(
                     })?;
                     let code = safe_diagnostic(&value["diagnostic_code"], "SDK_EFFECT_UNKNOWN");
                     let outcome = unknown_outcome_from_saved(operation_id, &saved, &code, config)?;
-                    journal.save_outcome(operation_id, &outcome)?;
+                    if saved.outcome.is_none() {
+                        journal.save_outcome(operation_id, &outcome)?;
+                        if let Some(request_id) = saved_interaction_request_id(&saved)? {
+                            interactions.mark_unknown(request_id, operation_id)?;
+                        }
+                    }
                     native_control.forget_operation(operation_id);
-                    Ok(false)
+                    Ok(FrameAction::default())
                 }
                 "operation_rejected" => {
                     let operation_id = required_message_text(&value, "operation_id")?;
@@ -1606,9 +1955,75 @@ fn handle_frame(
                     })?;
                     let code = safe_diagnostic(&value["diagnostic_code"], "SDK_OPERATION_REJECTED");
                     let outcome = rejected_outcome_from_saved(operation_id, &saved, &code, config)?;
-                    journal.save_outcome(operation_id, &outcome)?;
+                    if saved.outcome.is_none() {
+                        journal.save_outcome(operation_id, &outcome)?;
+                        if let Some(request_id) = saved_interaction_request_id(&saved)? {
+                            interactions.mark_rejected(request_id, operation_id)?;
+                        }
+                    }
                     native_control.forget_operation(operation_id);
-                    Ok(false)
+                    Ok(FrameAction::default())
+                }
+                "interaction_request" => {
+                    record_interaction_request(
+                        &value,
+                        config,
+                        boot_id,
+                        session_root.as_deref(),
+                        *harness_alive,
+                        *native_prepared,
+                        interactions,
+                    )?;
+                    Ok(FrameAction::default())
+                }
+                "interaction_cancelled" => {
+                    let request_id = required_message_text(&value, "request_id")?;
+                    let request_sha256 = required_message_text(&value, "request_sha256")?;
+                    let native_root_id = required_message_text(&value, "native_root_id")?;
+                    if value["bridge_boot_id"] != boot_id
+                        || value["native_scope_key"] != config.native_options.scope_key()
+                        || session_root.as_deref() != Some(native_root_id)
+                    {
+                        return Err(Error::new(
+                            "SDK_INTERACTION_IDENTITY",
+                            "cancelled callback differs from the active bridge root",
+                        ));
+                    }
+                    let reply_operation_id = interactions.cancel_request(
+                        boot_id,
+                        native_root_id,
+                        request_id,
+                        request_sha256,
+                    )?;
+                    if let Some(operation_id) = reply_operation_id {
+                        let saved = journal.get(&operation_id)?.ok_or_else(|| {
+                            Error::new(
+                                "ADAPTER_INTENT_MISSING",
+                                "cancelled callback reply has no durable host Operation intent",
+                            )
+                        })?;
+                        if saved.outcome.is_none() {
+                            let outcome = unknown_outcome_from_saved(
+                                &operation_id,
+                                &saved,
+                                "SDK_INTERACTION_CANCELLED_DURING_REPLY",
+                                config,
+                            )?;
+                            journal.save_outcome(&operation_id, &outcome)?;
+                        }
+                    }
+                    Ok(FrameAction::default())
+                }
+                "interaction_reply_ack" => {
+                    acknowledge_interaction_reply(
+                        &value,
+                        config,
+                        boot_id,
+                        session_root.as_deref(),
+                        journal,
+                        interactions,
+                    )?;
+                    Ok(FrameAction::default())
                 }
                 "harness_ended" => {
                     *harness_alive = false;
@@ -1616,9 +2031,12 @@ fn handle_frame(
                     let code = safe_diagnostic(&value["diagnostic_code"], "SDK_STREAM_ENDED");
                     journal.recover_uncertain_with_code(&code)?;
                     native_control.clear_pending();
-                    Ok(true)
+                    Ok(FrameAction {
+                        reconnect: false,
+                        retire_bridge: true,
+                    })
                 }
-                "diagnostic" | "input_queued" | "stopped" => Ok(false),
+                "diagnostic" | "input_queued" | "stopped" => Ok(FrameAction::default()),
                 _ => Err(Error::new(
                     "SDK_HARNESS_SCHEMA",
                     "SDK harness sent an unsupported frame",
@@ -1631,16 +2049,215 @@ fn handle_frame(
             let diagnostic = harness_exit_diagnostic_code(code);
             journal.recover_uncertain_with_code(&diagnostic)?;
             native_control.clear_pending();
-            Ok(true)
+            Ok(FrameAction {
+                reconnect: false,
+                retire_bridge: true,
+            })
         }
         HarnessFrame::ReadFailure => {
             *harness_alive = false;
             *native_prepared = false;
             journal.recover_uncertain_with_code("SDK_HARNESS_FRAME_READ_FAILURE")?;
             native_control.clear_pending();
-            Ok(true)
+            Ok(FrameAction {
+                reconnect: false,
+                retire_bridge: true,
+            })
         }
     }
+}
+
+fn record_interaction_request(
+    frame: &Value,
+    config: &AdapterConfig,
+    boot_id: &str,
+    native_root_id: Option<&str>,
+    harness_alive: bool,
+    native_prepared: bool,
+    interactions: &InteractionJournal,
+) -> Result<()> {
+    let request = frame
+        .get("request")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "SDK_INTERACTION_SCHEMA",
+                "callback event lacks its typed request",
+            )
+        })?;
+    let request_fields = [
+        "schema_version",
+        "request_id",
+        "kind",
+        "tool_name",
+        "input",
+        "request_sha256",
+        "bridge_boot_id",
+        "native_root_id",
+        "native_scope_key",
+    ];
+    let request_object = request.as_object().ok_or_else(|| {
+        Error::new(
+            "SDK_INTERACTION_SCHEMA",
+            "callback request must be an object",
+        )
+    })?;
+    if request_object.len() != request_fields.len()
+        || request_fields
+            .iter()
+            .any(|field| !request_object.contains_key(*field))
+    {
+        return Err(Error::new(
+            "SDK_INTERACTION_SCHEMA",
+            "callback request fields differ from the versioned SDK boundary",
+        ));
+    }
+    let bridge_boot_id = required_message_text(request, "bridge_boot_id")?;
+    let requested_root = required_message_text(request, "native_root_id")?;
+    let request_id = required_message_text(request, "request_id")?;
+    let request_sha256 = required_message_text(request, "request_sha256")?;
+    let scope_key = required_message_text(request, "native_scope_key")?;
+    let tool_name = required_message_text(request, "tool_name")?;
+    let kind = match request["kind"].as_str() {
+        Some("permission") => InteractionKind::Permission,
+        Some("question") => InteractionKind::Question,
+        _ => {
+            return Err(Error::new(
+                "SDK_INTERACTION_SCHEMA",
+                "callback request kind is unsupported",
+            ));
+        }
+    };
+    if request["schema_version"].as_u64() != Some(1)
+        || bridge_boot_id != boot_id
+        || scope_key != config.native_options.scope_key()
+        || native_root_id != Some(requested_root)
+        || !harness_alive
+        || !native_prepared
+    {
+        return Err(Error::new(
+            "SDK_INTERACTION_IDENTITY",
+            "callback request differs from the active prepared bridge and native root",
+        ));
+    }
+    interactions.record_request(interactions::InteractionRequestEvidence {
+        bridge_boot_id: boot_id,
+        native_root_id: requested_root,
+        request_id,
+        kind,
+        tool_name,
+        input: &request["input"],
+        request_sha256,
+    })?;
+    Ok(())
+}
+
+fn saved_interaction_request_id(saved: &journal::OperationState) -> Result<Option<&str>> {
+    if saved.method.as_deref() != Some("agent.reply") {
+        return Ok(None);
+    }
+    let request_id = saved
+        .intent
+        .as_ref()
+        .and_then(|intent| intent.get("native"))
+        .and_then(|native| native.get("interaction_request_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "ADAPTER_INTENT_MISSING",
+                "interactive reply operation has no exact request identity",
+            )
+        })?;
+    Ok(Some(request_id))
+}
+
+fn acknowledge_interaction_reply(
+    frame: &Value,
+    config: &AdapterConfig,
+    boot_id: &str,
+    native_root_id: Option<&str>,
+    journal: &OperationJournal,
+    interactions: &InteractionJournal,
+) -> Result<()> {
+    let operation_id = required_message_text(frame, "operation_id")?;
+    let request_id = required_message_text(frame, "request_id")?;
+    let request_sha256 = required_message_text(frame, "request_sha256")?;
+    let reply_sha256 = required_message_text(frame, "reply_sha256")?;
+    let root_id = required_message_text(frame, "native_root_id")?;
+    let Some(saved) = journal.get(operation_id)? else {
+        return Err(Error::new(
+            "ADAPTER_INTENT_MISSING",
+            "callback acknowledgement has no durable reply intent",
+        ));
+    };
+    let native = saved
+        .intent
+        .as_ref()
+        .and_then(|intent| intent.get("native"))
+        .ok_or_else(|| {
+            Error::new(
+                "ADAPTER_INTENT_MISSING",
+                "callback acknowledgement has no saved native intent",
+            )
+        })?;
+    if saved.method.as_deref() != Some("agent.reply")
+        || saved_interaction_request_id(&saved)? != Some(request_id)
+        || native["bridge_boot_id"] != boot_id
+        || native["native_root_id"] != root_id
+        || native["native_scope_key"] != config.native_options.scope_key()
+        || native["request_sha256"] != request_sha256
+        || native["reply_sha256"] != reply_sha256
+        || frame["bridge_boot_id"] != boot_id
+        || frame["native_scope_key"] != config.native_options.scope_key()
+        || native_root_id != Some(root_id)
+    {
+        return Err(Error::new(
+            "INTERACTION_ACK_MISMATCH",
+            "SDK callback acknowledgement differs from its exact durable reply intent",
+        ));
+    }
+    if let Some(previous) = saved.outcome.as_ref() {
+        if previous["outcome"] == "applied"
+            && previous["details"]["callback_reply_acknowledged"] == true
+            && previous["details"]["interaction_request_id"] == request_id
+            && previous["details"]["reply_sha256"] == reply_sha256
+        {
+            return interactions.acknowledge_reply(request_id, operation_id, reply_sha256);
+        }
+        return Err(Error::new(
+            "INTERACTION_ACK_MISMATCH",
+            "callback acknowledgement conflicts with an already saved operation outcome",
+        ));
+    }
+    let receipt = saved.receipt.as_ref().ok_or_else(|| {
+        Error::new(
+            "ADAPTER_INTENT_MISSING",
+            "callback acknowledgement has no saved module receipt",
+        )
+    })?;
+    let mut details = json!({
+        "completion_condition":"callback_reply_acknowledged",
+        "callback_reply_acknowledged":true,
+        "interaction_request_id":request_id,
+        "request_sha256":request_sha256,
+        "reply_sha256":reply_sha256,
+        "execution_complete":false,
+        "task_completion":"unknown",
+        "native_replay":false
+    });
+    receipt::insert(&mut details, receipt)?;
+    let outcome = RuntimeOutcome {
+        operation_id: operation_id.to_owned(),
+        outcome: EffectOutcome::Applied,
+        native_scope_key: Some(config.native_options.scope_key()),
+        native_root_id: Some(root_id.to_owned()),
+        turn_id: None,
+        native_input_id: None,
+        details,
+    };
+    journal.save_outcome(operation_id, &outcome)?;
+    interactions.acknowledge_reply(request_id, operation_id, reply_sha256)
 }
 
 fn verify_command_scope(
@@ -1749,6 +2366,124 @@ fn intent_for(
     Ok(intent)
 }
 
+fn selected_task_prompt(
+    command: &RuntimeCommand,
+    boot_id: &str,
+    first_dispatch: bool,
+    claim: &ModuleContractClaim,
+) -> Result<Option<TaskPromptEnvelopeV1>> {
+    let revision_value = command
+        .input
+        .get("task_prompt_contract_revision")
+        .filter(|value| !value.is_null());
+    let revision = revision_value.and_then(Value::as_str);
+    let envelope_value = command
+        .input
+        .get("task_prompt_envelope")
+        .filter(|value| !value.is_null());
+    let task_prompt_declared = claim
+        .command_schemas
+        .contains(&swarm_contracts::module_contract::task_prompt_schema());
+    if !first_dispatch {
+        if revision_value.is_some() || envelope_value.is_some() {
+            return Err(Error::new(
+                "TASK_PROMPT_UNEXPECTED",
+                "TaskPrompt envelopes are valid only on the initial task.dispatch",
+            ));
+        }
+        return Ok(None);
+    }
+    if !task_prompt_declared {
+        if revision_value.is_some() || envelope_value.is_some() {
+            return Err(Error::new(
+                "TASK_PROMPT_NOT_DECLARED",
+                "selected TaskPrompt is absent from the retained adapter descriptor",
+            ));
+        }
+        return Ok(None);
+    }
+    match revision {
+        None => {
+            return Err(Error::new(
+                "TASK_PROMPT_SELECTOR_MISSING",
+                "artifact-declared TaskPrompt v1 requires its exact contract selector",
+            ));
+        }
+        Some(value) if value != TASK_PROMPT_CONTRACT_REVISION => {
+            return Err(Error::new(
+                "TASK_PROMPT_SELECTOR_UNSUPPORTED",
+                "selected TaskPrompt contract revision is unsupported",
+            ));
+        }
+        Some(_) => {}
+    }
+
+    let envelope_value = envelope_value.ok_or_else(|| {
+        Error::new(
+            "TASK_PROMPT_ENVELOPE_MISSING",
+            "selected TaskPrompt v1 dispatch has no envelope",
+        )
+    })?;
+    let envelope: TaskPromptEnvelopeV1 =
+        serde_json::from_value(envelope_value.clone()).map_err(|_| {
+            Error::new(
+                "TASK_PROMPT_ENVELOPE_INVALID",
+                "selected TaskPrompt v1 envelope is malformed",
+            )
+        })?;
+    envelope.validate_shape().map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_ENVELOPE_INVALID",
+            "selected TaskPrompt v1 envelope is invalid",
+        )
+    })?;
+    let context_value = command.input.get("task_dispatch_context").ok_or_else(|| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_MISSING",
+            "selected TaskPrompt v1 dispatch has no Store-supplied Task identity",
+        )
+    })?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(context_value.clone()).map_err(|_| {
+            Error::new(
+                "TASK_DISPATCH_CONTEXT_INVALID",
+                "Store-supplied Task identity is malformed",
+            )
+        })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "Store-supplied Task identity is invalid",
+        )
+    })?;
+    let source_text = command.input["text"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::invalid("task.dispatch source text must be nonempty"))?;
+    let source_text_bytes = u64::try_from(source_text.len())
+        .map_err(|_| Error::invalid("task.dispatch source text length is out of range"))?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != boot_id
+        || context.source_text_sha256 != digest_bytes(source_text.as_bytes())
+        || context.source_text_bytes != source_text_bytes
+        || envelope.task_id != context.task_id
+        || envelope.task_revision != context.task_revision
+        || envelope.attempt_id != context.attempt_id
+        || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
+        || envelope.prompt_sha256 != digest_bytes(envelope.prompt.as_bytes())
+        || envelope.prompt_bytes != u64::try_from(envelope.prompt.len()).unwrap_or(u64::MAX)
+        || envelope.prompt.len() > MAX_TASK_PROMPT_BYTES
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_IDENTITY_MISMATCH",
+            "TaskPrompt envelope differs from the exact TaskDispatchContext or prompt bytes",
+        ));
+    }
+    Ok(Some(envelope))
+}
+
 fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
     claim.command_schemas.iter().any(|schema| {
         schema.schema_id == "swarm.task_dispatch_context"
@@ -1762,14 +2497,18 @@ fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
 }
 
 fn normalized_dispatch_admission(
-    claim: &ModuleContractClaim,
-    command: &RuntimeCommand,
-    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
-    boot_id: &str,
-    input_id: &str,
-    source_text: &str,
-    native_payload: &Value,
+    invocation: DispatchAdmissionInvocation<'_>,
 ) -> Result<Option<TaskDispatchAdmissionReceipt>> {
+    let DispatchAdmissionInvocation {
+        claim,
+        command,
+        receipt,
+        boot_id,
+        input_id,
+        source_text,
+        native_payload,
+        task_prompt,
+    } = invocation;
     if !normalized_dispatch_enabled(claim) {
         return Ok(None);
     }
@@ -1808,9 +2547,27 @@ fn normalized_dispatch_admission(
             "Store-supplied task.dispatch context differs from the authenticated command",
         ));
     }
-    let payload_bytes = serde_json::to_vec(native_payload)?;
-    let native_payload_bytes = u64::try_from(payload_bytes.len())
-        .map_err(|_| Error::invalid("native dispatch payload length is out of range"))?;
+    let payload_sha256 = if let Some(prompt) = task_prompt {
+        if prompt.prompt_sha256 != digest_bytes(prompt.prompt.as_bytes())
+            || prompt.prompt_bytes != u64::try_from(prompt.prompt.len()).unwrap_or(u64::MAX)
+        {
+            return Err(Error::new(
+                "TASK_PROMPT_ENVELOPE_INVALID",
+                "native admission prompt digest differs from the exact prompt bytes",
+            ));
+        }
+        prompt.prompt_sha256.clone()
+    } else {
+        let payload_bytes = serde_json::to_vec(native_payload)?;
+        digest_bytes(&payload_bytes)
+    };
+    let native_payload_bytes = if let Some(prompt) = task_prompt {
+        prompt.prompt_bytes
+    } else {
+        let payload_bytes = serde_json::to_vec(native_payload)?;
+        u64::try_from(payload_bytes.len())
+            .map_err(|_| Error::invalid("native dispatch payload length is out of range"))?
+    };
     let admission = TaskDispatchAdmissionReceipt {
         schema_version: context.schema_version,
         module_receipt: receipt.clone(),
@@ -1824,7 +2581,7 @@ fn normalized_dispatch_admission(
         task_snapshot_sha256: context.task_snapshot_sha256.clone(),
         source_text_sha256: context.source_text_sha256.clone(),
         source_text_bytes: context.source_text_bytes,
-        native_payload_sha256: digest_bytes(&payload_bytes),
+        native_payload_sha256: payload_sha256,
         native_payload_bytes,
         native_input_id: Some(input_id.to_owned()),
     };
@@ -1999,6 +2756,7 @@ fn handle_reconcile(
     command: &RuntimeCommand,
     receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
     latest_state: &Value,
+    harness_alive: bool,
 ) -> Result<bool> {
     let target_id = command.input["operation_id"]
         .as_str()
@@ -2038,7 +2796,8 @@ fn handle_reconcile(
     journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
 
     let mut native_result = None;
-    if let Some(target) = target.as_ref()
+    if harness_alive
+        && let Some(target) = target.as_ref()
         && let (Some(target_intent), Some(state)) =
             (target.intent.as_ref(), latest_state["state"].as_object())
     {
@@ -2057,6 +2816,8 @@ fn handle_reconcile(
                 expected_root,
                 state.get("input_executions").and_then(Value::as_array),
             )
+            && latest_state["root_id"] == root
+            && latest_state["state"]["init_session_id"] == root
         {
             native_result = executions
                 .iter()
@@ -2100,7 +2861,11 @@ fn handle_reconcile(
     Ok(false)
 }
 
-async fn flush_outbox(link: &mut ModuleLink, journal: &OperationJournal) -> Result<()> {
+async fn flush_outbox(
+    link: &mut ModuleLink,
+    journal: &OperationJournal,
+    interactions: &InteractionJournal,
+) -> Result<()> {
     for item in journal.pending_outcomes()? {
         let outcome = item
             .outcome
@@ -2116,6 +2881,7 @@ async fn flush_outbox(link: &mut ModuleLink, journal: &OperationJournal) -> Resu
             // page; sending module.outcome would re-submit an Applied
             // agent.result after Store settled it through the page path.
             journal.acknowledge(&item.operation_id, outcome)?;
+            interactions.reclaim_acknowledged_operation(&item.operation_id, journal)?;
             continue;
         }
         let response = link.outcome(outcome.clone()).await?;
@@ -2126,6 +2892,7 @@ async fn flush_outbox(link: &mut ModuleLink, journal: &OperationJournal) -> Resu
             ));
         }
         journal.acknowledge(&item.operation_id, outcome)?;
+        interactions.reclaim_acknowledged_operation(&item.operation_id, journal)?;
     }
     Ok(())
 }

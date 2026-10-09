@@ -21,6 +21,12 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cell::Cell;
+
+use super::automation_reconcile::{
+    DomainErrorDisposition, QuarantineEvidence, SubjectDisposition, SubjectErrorDisposition,
+    persist_quarantine, quarantine_record_key, with_subject_savepoint,
+};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const SLOT_SCHEMA_VERSION: u32 = 1;
@@ -35,6 +41,167 @@ const SLOT_PREFIX: &str = "launch:v1:semantic-slot:";
 const OPERATION_LINK_PREFIX: &str = "work-dispatch:v1:operation-link:";
 const ENTRY_LINK_PREFIX: &str = "work-dispatch:v1:entry-operation:";
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:work-dispatch_global_cursor";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkSubjectPhase {
+    Source,
+    Prepare,
+    Admission,
+}
+
+struct AppliedWorkDispatch {
+    operation_id: String,
+    semantic_slot_id: String,
+}
+
+struct WorkDispatchInvocation<'a, 'db, F> {
+    tx: &'a Transaction<'db>,
+    entry: &'a AutomationEntry,
+    settings: &'a WorkDispatchLaunchSettings,
+    now_ms: i64,
+    admit: &'a mut F,
+    quarantined: &'a mut usize,
+}
+
+/// Only exact WorkDispatch state/config/cursor failures may degrade after the
+/// root rolls back this domain transaction. Unknown and storage errors stop.
+pub(super) fn classify_domain_error(error: Error) -> DomainErrorDisposition {
+    let code = error.code.clone();
+    match code.as_str() {
+        "AUTOMATION_WORK_CURSOR_CORRUPT"
+        | "AUTOMATION_WORK_CURSOR_MISSING"
+        | "AUTOMATION_WORK_STATE_CORRUPT"
+        | "AUTOMATION_WORK_CONFIG_CORRUPT" => DomainErrorDisposition::Degraded { code },
+        _ => DomainErrorDisposition::Fatal(error),
+    }
+}
+
+fn work_quarantine_evidence(
+    entry: &AutomationEntry,
+    observation_id: i64,
+    operation_id: Option<&str>,
+    payload_json: Option<&str>,
+) -> Result<QuarantineEvidence> {
+    let identity_digest = model::digest(
+        model::canonical(&json!({
+            "domain":"work_dispatch",
+            "owner_manager_id":entry.owner_manager_id,
+            "project_id":entry.project_id,
+            "automation_id":entry.automation_id,
+            "observation_id":observation_id,
+            "operation_id":operation_id
+        }))?
+        .as_bytes(),
+    );
+    Ok(QuarantineEvidence {
+        subject_identity: format!("work-dispatch:{identity_digest}:observation:{observation_id}"),
+        source_pointer: Some(format!("observations:{observation_id}")),
+        source_digest: payload_json.map(|payload| model::digest(payload.as_bytes())),
+    })
+}
+
+fn work_domain_record_error(
+    error: Error,
+    domain_code: &str,
+    message: &str,
+    include_invalid: bool,
+) -> Error {
+    let code = error.code.clone();
+    let retained_record_error = matches!(
+        code.as_str(),
+        "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_VERSION"
+    ) || (include_invalid && code == "AUTOMATION_RECORD_INVALID");
+    if retained_record_error {
+        Error::new(domain_code, message).with_secondary_error(error)
+    } else {
+        error
+    }
+}
+
+fn pending_work_quarantine_evidence(
+    tx: &Transaction<'_>,
+    entry: &AutomationEntry,
+    pending: &PendingSubject,
+) -> Result<QuarantineEvidence> {
+    let source: Option<(Option<String>, String)> = tx
+        .query_row(
+            "SELECT operation_id,payload_json FROM observations \
+             WHERE observation_id=?1 AND source_stream_id='controller' \
+               AND kind IN ('task.create','task.revise','task.claim')",
+            [pending.observation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let operation_id = source
+        .as_ref()
+        .and_then(|(operation_id, _)| operation_id.as_deref())
+        .or(Some(pending.source_operation_id.as_str()));
+    work_quarantine_evidence(
+        entry,
+        pending.observation_id,
+        operation_id,
+        source.as_ref().map(|(_, payload)| payload.as_str()),
+    )
+}
+
+fn persist_work_quarantine(
+    tx: &Transaction<'_>,
+    code: &str,
+    evidence: QuarantineEvidence,
+    now_ms: i64,
+) -> Result<()> {
+    let key = quarantine_record_key("automation:v1:quarantine:work-dispatch:", &evidence)?;
+    persist_quarantine(tx, &key, code, evidence, now_ms)?;
+    Ok(())
+}
+
+fn classify_work_subject_error(
+    error: &Error,
+    phase: WorkSubjectPhase,
+    evidence: &QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    match error.code.as_str() {
+        "AUTOMATION_WORK_SOURCE_GAP" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence: evidence.clone(),
+        }),
+        "FORBIDDEN" if phase != WorkSubjectPhase::Source => {
+            Some(SubjectErrorDisposition::Pending {
+                code: error.code.clone(),
+                reason: "manager_authority_unavailable".to_owned(),
+            })
+        }
+        "AUTOMATION_WORK_NOT_READY" => Some(SubjectErrorDisposition::Pending {
+            code: error.code.clone(),
+            reason: "work_subject_not_ready".to_owned(),
+        }),
+        "NOT_FOUND" if phase == WorkSubjectPhase::Prepare => {
+            Some(SubjectErrorDisposition::Skipped {
+                code: error.code.clone(),
+                reason: "work_subject_no_longer_available".to_owned(),
+            })
+        }
+        "AUTOMATION_WORK_SUBJECT_STALE" | "AUTOMATION_WORK_ASSIGNMENT_STALE"
+            if phase == WorkSubjectPhase::Prepare =>
+        {
+            Some(SubjectErrorDisposition::Skipped {
+                code: error.code.clone(),
+                reason: error.code.to_ascii_lowercase(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn work_pending_wake_when(code: &str) -> Vec<String> {
+    match code {
+        "FORBIDDEN" => vec!["manager_registration_or_automation_configuration_changed".to_owned()],
+        "AUTOMATION_WORK_NOT_READY" => {
+            vec!["work_subject_readiness_changed".to_owned()]
+        }
+        _ => vec!["work_dispatch_prerequisite_changed".to_owned()],
+    }
+}
 
 type TaskFactOperationRow = (
     String,
@@ -340,26 +507,33 @@ where
     }
 
     let mut processed = 0usize;
+    let mut quarantined = 0usize;
     let pending_limit = budget.min(MAX_PENDING_RECHECKS);
-    processed += recheck_pending(
+    let mut invocation = WorkDispatchInvocation {
         tx,
         entry,
         settings,
-        &mut state,
-        pending_limit,
         now_ms,
-        &mut admit,
-    )?;
+        admit: &mut admit,
+        quarantined: &mut quarantined,
+    };
+    processed += recheck_pending(&mut invocation, &mut state, pending_limit)?;
     let remaining = budget.saturating_sub(processed);
     if remaining > 0 && state.pending.len() < MAX_PENDING_SUBJECTS {
-        processed += consume_work_fact_page(
-            tx, entry, settings, &mut state, remaining, now_ms, &mut admit,
-        )?;
+        processed += consume_work_fact_page(&mut invocation, &mut state, remaining)?;
     }
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)?;
     let mut result = state_projection(&state);
     result["processed"] = json!(processed);
+    result["quarantined"] = json!(quarantined);
+    result["status"] = json!(if quarantined > 0 {
+        "degraded"
+    } else if processed > 0 {
+        "progressed"
+    } else {
+        "idle"
+    });
     result["high_water"] = json!(work_high_water(tx)?);
     Ok(result)
 }
@@ -420,7 +594,16 @@ fn enabled_entry_page(
 ) -> Result<(Vec<AutomationEntry>, Option<String>)> {
     let prefix = "automation:v1:entry:";
     let pattern = format!("{prefix}%");
-    let cursor = config::read_record(db, GLOBAL_CURSOR_KEY, "WorkDispatch global cursor")?
+    let cursor_record = config::read_record(db, GLOBAL_CURSOR_KEY, "WorkDispatch global cursor")
+        .map_err(|error| {
+            work_domain_record_error(
+                error,
+                "AUTOMATION_WORK_CURSOR_CORRUPT",
+                "global WorkDispatch cursor record is damaged",
+                false,
+            )
+        })?;
+    let cursor = cursor_record
         .map(|value| {
             serde_json::from_value::<GlobalWorkDispatchCursor>(value).map_err(|_| {
                 Error::new(
@@ -461,18 +644,32 @@ fn enabled_entry_page(
             })?;
         let sealed: Value = serde_json::from_str(&raw).map_err(|_| {
             Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
+                "AUTOMATION_WORK_CONFIG_CORRUPT",
                 "automation entry JSON is invalid",
             )
         })?;
-        let value = config::open_record(sealed, "automation entry")?;
+        let value = config::open_record(sealed, "automation entry").map_err(|error| {
+            work_domain_record_error(
+                error,
+                "AUTOMATION_WORK_CONFIG_CORRUPT",
+                "automation entry record cannot be opened",
+                false,
+            )
+        })?;
         let entry: AutomationEntry = serde_json::from_value(value).map_err(|_| {
             Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
+                "AUTOMATION_WORK_CONFIG_CORRUPT",
                 "automation entry fields are invalid",
             )
         })?;
-        config::validate_entry(&entry)?;
+        config::validate_entry(&entry).map_err(|error| {
+            work_domain_record_error(
+                error,
+                "AUTOMATION_WORK_CONFIG_CORRUPT",
+                "stored automation entry settings are invalid",
+                true,
+            )
+        })?;
         if entry.enabled && entry.steps.contains(&AutomationStep::WorkDispatch) {
             entries.push(entry);
         }
@@ -531,17 +728,19 @@ fn select_enabled_entry_keys_before(
 /// Source identity and the immutable Operation result are checked before their
 /// typed subject can influence admission.
 fn consume_work_fact_page<F>(
-    tx: &Transaction<'_>,
-    entry: &AutomationEntry,
-    settings: &WorkDispatchLaunchSettings,
+    invocation: &mut WorkDispatchInvocation<'_, '_, F>,
     state: &mut WorkDispatchState,
     budget: usize,
-    now_ms: i64,
-    admit: &mut F,
 ) -> Result<usize>
 where
     F: FnMut(&Transaction<'_>, &PreparedWorkDispatch) -> Result<WorkDispatchOutcome>,
 {
+    let tx = invocation.tx;
+    let entry = invocation.entry;
+    let settings = invocation.settings;
+    let now_ms = invocation.now_ms;
+    let admit = &mut *invocation.admit;
+    let quarantined = &mut *invocation.quarantined;
     let high_water = work_high_water(tx)?;
     let target = state
         .catch_up_until
@@ -585,128 +784,132 @@ where
         }
         processed += 1;
         let observation_id = fact.observation_id;
-        let identity = read_work_fact_subject(tx, &fact);
-        match identity {
-            Err(error) if error.code == "AUTOMATION_WORK_SOURCE_GAP" => {
-                remember_recent(
-                    state,
-                    json!({
-                        "observation_id":observation_id,
-                        "disposition":"gap",
-                        "reason":error.code.to_ascii_lowercase()
-                    }),
-                );
-                state.cursor = observation_id;
-            }
-            Err(error) => return Err(error),
-            Ok(WorkFactSubject::Ignored { reason }) => {
-                remember_recent(
-                    state,
-                    json!({
-                        "observation_id":observation_id,
-                        "disposition":"skipped",
-                        "reason":reason
-                    }),
-                );
-                state.cursor = observation_id;
-            }
-            Ok(WorkFactSubject::Candidate {
-                source,
-                task_id,
-                task_revision,
-                attempt_id,
-            }) => {
-                match prepare(
+        let evidence = work_quarantine_evidence(
+            entry,
+            observation_id,
+            fact.operation_id.as_deref(),
+            Some(&fact.payload_json),
+        )?;
+        let phase = Cell::new(WorkSubjectPhase::Source);
+        let mut pending_candidate = None;
+        let mut pending_wake_when = None;
+        let disposition = with_subject_savepoint(
+            tx,
+            || {
+                let (source, task_id, task_revision, attempt_id) =
+                    match read_work_fact_subject(tx, &fact)? {
+                        WorkFactSubject::Candidate {
+                            source,
+                            task_id,
+                            task_revision,
+                            attempt_id,
+                        } => (source, task_id, task_revision, attempt_id),
+                        WorkFactSubject::Ignored { reason } => {
+                            return Ok(SubjectDisposition::Skipped {
+                                code: "AUTOMATION_WORK_IDEMPOTENT_REUSE".to_owned(),
+                                reason: reason.to_owned(),
+                            });
+                        }
+                    };
+
+                pending_candidate = Some(PendingSubject {
+                    observation_id,
+                    source_kind: source.event_kind().to_owned(),
+                    source_operation_id: source.operation_id().to_owned(),
+                    task_id: task_id.clone(),
+                    task_revision,
+                    attempt_id: attempt_id.clone(),
+                    reason: "awaiting_work_dispatch".to_owned(),
+                    wake_when: vec!["work_dispatch_prerequisite_changed".to_owned()],
+                    first_seen_at_ms: now_ms,
+                    last_checked_at_ms: now_ms,
+                    held: false,
+                });
+                phase.set(WorkSubjectPhase::Prepare);
+                let plan = prepare(
                     tx,
                     entry,
                     settings,
                     &task_id,
                     task_revision,
                     attempt_id.as_deref(),
-                    source.clone(),
-                ) {
-                    Err(error) if is_stale_subject(&error) => {
-                        remember_recent(
-                            state,
-                            json!({
-                                "observation_id":observation_id,
-                                "task_id":task_id,
-                                "task_revision":task_revision,
-                                "attempt_id":attempt_id,
-                                "disposition":"skipped",
-                                "reason":error.code.to_ascii_lowercase()
-                            }),
-                        );
+                    source,
+                )?;
+                phase.set(WorkSubjectPhase::Admission);
+                let semantic_slot_id = plan.context.semantic_slot_id().to_owned();
+                match admit(tx, &plan)? {
+                    WorkDispatchOutcome::Admitted { operation_id } => {
+                        Ok(SubjectDisposition::Applied(AppliedWorkDispatch {
+                            operation_id,
+                            semantic_slot_id,
+                        }))
                     }
-                    Err(error) if error.code == "FORBIDDEN" => {
-                        retain_pending(
-                            state,
-                            PendingSubject {
-                                observation_id,
-                                source_kind: source.event_kind().to_owned(),
-                                source_operation_id: source.operation_id().to_owned(),
-                                task_id,
-                                task_revision,
-                                attempt_id,
-                                reason: "manager_authority_unavailable".to_owned(),
-                                wake_when: vec![
-                                    "manager_registration_or_automation_configuration_changed"
-                                        .to_owned(),
-                                ],
-                                first_seen_at_ms: now_ms,
-                                last_checked_at_ms: now_ms,
-                                held: false,
-                            },
-                        )?;
+                    WorkDispatchOutcome::Pending { reason, wake_when } => {
+                        pending_wake_when = Some(wake_when);
+                        Ok(SubjectDisposition::Pending {
+                            code: "AUTOMATION_WORK_ADMISSION_PENDING".to_owned(),
+                            reason,
+                        })
                     }
-                    Err(error) => return Err(error),
-                    Ok(plan) => match admit(tx, &plan)? {
-                        WorkDispatchOutcome::Admitted { operation_id } => remember_recent(
-                            state,
-                            json!({
-                                "observation_id":observation_id,
-                                "task_id":task_id,
-                                "task_revision":task_revision,
-                                "attempt_id":attempt_id,
-                                "disposition":"admitted",
-                                "operation_id":operation_id,
-                                "semantic_slot_id":plan.context.semantic_slot_id()
-                            }),
-                        ),
-                        WorkDispatchOutcome::Pending { reason, wake_when } => {
-                            retain_pending(
-                                state,
-                                PendingSubject {
-                                    observation_id,
-                                    source_kind: source.event_kind().to_owned(),
-                                    source_operation_id: source.operation_id().to_owned(),
-                                    task_id,
-                                    task_revision,
-                                    attempt_id,
-                                    reason,
-                                    wake_when,
-                                    first_seen_at_ms: now_ms,
-                                    last_checked_at_ms: now_ms,
-                                    held: false,
-                                },
-                            )?;
-                        }
-                        WorkDispatchOutcome::Skipped { reason } => remember_recent(
-                            state,
-                            json!({
-                                "observation_id":observation_id,
-                                "task_id":task_id,
-                                "task_revision":task_revision,
-                                "attempt_id":attempt_id,
-                                "disposition":"skipped",
-                                "reason":reason
-                            }),
-                        ),
-                    },
+                    WorkDispatchOutcome::Skipped { reason } => Ok(SubjectDisposition::Skipped {
+                        code: "AUTOMATION_WORK_ADMISSION_SKIPPED".to_owned(),
+                        reason,
+                    }),
                 }
-                state.cursor = observation_id;
+            },
+            |error| classify_work_subject_error(error, phase.get(), &evidence),
+        )?;
+
+        match disposition {
+            SubjectDisposition::Applied(applied) => remember_recent(
+                state,
+                json!({
+                    "observation_id":observation_id,
+                    "task_id":pending_candidate.as_ref().map(|pending| pending.task_id.as_str()),
+                    "task_revision":pending_candidate.as_ref().map(|pending| pending.task_revision),
+                    "attempt_id":pending_candidate.as_ref().and_then(|pending| pending.attempt_id.as_deref()),
+                    "disposition":"admitted",
+                    "operation_id":applied.operation_id,
+                    "semantic_slot_id":applied.semantic_slot_id
+                }),
+            ),
+            SubjectDisposition::Pending { code, reason } => {
+                let mut pending = pending_candidate.ok_or_else(|| {
+                    Error::new(
+                        "AUTOMATION_WORK_PENDING_CONTEXT_MISSING",
+                        "pending WorkDispatch disposition has no exact source subject",
+                    )
+                })?;
+                pending.reason = bounded_reason(&reason)?;
+                let wake_when = pending_wake_when
+                    .take()
+                    .unwrap_or_else(|| work_pending_wake_when(&code));
+                pending.wake_when = bounded_wake_when(wake_when)?;
+                pending.last_checked_at_ms = now_ms;
+                retain_pending(state, pending)?;
+            }
+            SubjectDisposition::Skipped { code, reason } => remember_recent(
+                state,
+                json!({
+                    "observation_id":observation_id,
+                    "disposition":"skipped",
+                    "reason":if reason.is_empty() {code.to_ascii_lowercase()} else {reason}
+                }),
+            ),
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_work_quarantine(tx, &code, evidence, now_ms)?;
+                remember_recent(
+                    state,
+                    json!({
+                        "observation_id":observation_id,
+                        "disposition":"quarantined",
+                        "reason":code.to_ascii_lowercase()
+                    }),
+                );
+                *quarantined = (*quarantined).saturating_add(1);
             }
         }
+        state.cursor = observation_id;
     }
     if state.cursor >= target && state.catch_up_until.is_some_and(|cut| state.cursor >= cut) {
         state.catch_up_until = None;
@@ -902,60 +1105,79 @@ fn is_launch_child_claim(
 }
 
 fn recheck_pending<F>(
-    tx: &Transaction<'_>,
-    entry: &AutomationEntry,
-    settings: &WorkDispatchLaunchSettings,
+    invocation: &mut WorkDispatchInvocation<'_, '_, F>,
     state: &mut WorkDispatchState,
     limit: usize,
-    now_ms: i64,
-    admit: &mut F,
 ) -> Result<usize>
 where
     F: FnMut(&Transaction<'_>, &PreparedWorkDispatch) -> Result<WorkDispatchOutcome>,
 {
-    let pending_items = std::mem::take(&mut state.pending);
+    let tx = invocation.tx;
+    let entry = invocation.entry;
+    let settings = invocation.settings;
+    let now_ms = invocation.now_ms;
+    let admit = &mut *invocation.admit;
+    let quarantined = &mut *invocation.quarantined;
     let mut checked = 0usize;
-    let mut keep = Vec::with_capacity(pending_items.len());
-    for mut pending in pending_items {
-        if pending.held || checked >= limit {
-            keep.push(pending);
+    let mut index = 0usize;
+    while index < state.pending.len() && checked < limit {
+        if state.pending[index].held {
+            index += 1;
             continue;
         }
+        // Keep the cause in the durable vector until this exact item reaches
+        // a disposition. Any fallible read, admission, or bounded projection
+        // below therefore leaves the current item and untouched tail intact.
+        let mut pending = state.pending[index].clone();
         checked += 1;
-        match prepare(
+        let evidence = pending_work_quarantine_evidence(tx, entry, &pending)?;
+        let phase = Cell::new(WorkSubjectPhase::Prepare);
+        let mut pending_wake_when = None;
+        let disposition = with_subject_savepoint(
             tx,
-            entry,
-            settings,
-            &pending.task_id,
-            pending.task_revision,
-            pending.attempt_id.as_deref(),
-            WorkDispatchSource::from_committed_fact(
-                pending.observation_id,
-                &pending.source_kind,
-                &pending.source_operation_id,
-            )?,
-        ) {
-            Err(error) if is_stale_subject(&error) => remember_recent(
-                state,
-                json!({
-                    "observation_id":pending.observation_id,
-                    "task_id":pending.task_id,
-                    "task_revision":pending.task_revision,
-                    "attempt_id":pending.attempt_id,
-                    "disposition":"skipped",
-                    "reason":error.code.to_ascii_lowercase()
-                }),
-            ),
-            Err(error) if error.code == "FORBIDDEN" => {
-                pending.reason = "manager_authority_unavailable".to_owned();
-                pending.wake_when =
-                    vec!["manager_registration_or_automation_configuration_changed".to_owned()];
-                pending.last_checked_at_ms = now_ms;
-                keep.push(pending);
-            }
-            Err(error) => return Err(error),
-            Ok(plan) => match admit(tx, &plan)? {
-                WorkDispatchOutcome::Admitted { operation_id } => remember_recent(
+            || {
+                let source = WorkDispatchSource::from_committed_fact(
+                    pending.observation_id,
+                    &pending.source_kind,
+                    &pending.source_operation_id,
+                )?;
+                let plan = prepare(
+                    tx,
+                    entry,
+                    settings,
+                    &pending.task_id,
+                    pending.task_revision,
+                    pending.attempt_id.as_deref(),
+                    source,
+                )?;
+                phase.set(WorkSubjectPhase::Admission);
+                let semantic_slot_id = plan.context.semantic_slot_id().to_owned();
+                match admit(tx, &plan)? {
+                    WorkDispatchOutcome::Admitted { operation_id } => {
+                        Ok(SubjectDisposition::Applied(AppliedWorkDispatch {
+                            operation_id,
+                            semantic_slot_id,
+                        }))
+                    }
+                    WorkDispatchOutcome::Pending { reason, wake_when } => {
+                        pending_wake_when = Some(wake_when);
+                        Ok(SubjectDisposition::Pending {
+                            code: "AUTOMATION_WORK_ADMISSION_PENDING".to_owned(),
+                            reason,
+                        })
+                    }
+                    WorkDispatchOutcome::Skipped { reason } => Ok(SubjectDisposition::Skipped {
+                        code: "AUTOMATION_WORK_ADMISSION_SKIPPED".to_owned(),
+                        reason,
+                    }),
+                }
+            },
+            |error| classify_work_subject_error(error, phase.get(), &evidence),
+        )?;
+
+        match disposition {
+            SubjectDisposition::Applied(applied) => {
+                remember_recent(
                     state,
                     json!({
                         "observation_id":pending.observation_id,
@@ -963,17 +1185,25 @@ where
                         "task_revision":pending.task_revision,
                         "attempt_id":pending.attempt_id,
                         "disposition":"admitted",
-                        "operation_id":operation_id,
-                        "semantic_slot_id":plan.context.semantic_slot_id()
+                        "operation_id":applied.operation_id,
+                        "semantic_slot_id":applied.semantic_slot_id
                     }),
-                ),
-                WorkDispatchOutcome::Pending { reason, wake_when } => {
-                    pending.reason = bounded_reason(&reason)?;
-                    pending.wake_when = bounded_wake_when(wake_when)?;
-                    pending.last_checked_at_ms = now_ms;
-                    keep.push(pending);
-                }
-                WorkDispatchOutcome::Skipped { reason } => remember_recent(
+                );
+                state.pending.remove(index);
+            }
+            SubjectDisposition::Pending { code, reason } => {
+                pending.reason = bounded_reason(&reason)?;
+                pending.wake_when = bounded_wake_when(
+                    pending_wake_when
+                        .take()
+                        .unwrap_or_else(|| work_pending_wake_when(&code)),
+                )?;
+                pending.last_checked_at_ms = now_ms;
+                state.pending[index] = pending;
+                index += 1;
+            }
+            SubjectDisposition::Skipped { code, reason } => {
+                remember_recent(
                     state,
                     json!({
                         "observation_id":pending.observation_id,
@@ -981,13 +1211,29 @@ where
                         "task_revision":pending.task_revision,
                         "attempt_id":pending.attempt_id,
                         "disposition":"skipped",
-                        "reason":reason
+                        "reason":if reason.is_empty() {code.to_ascii_lowercase()} else {reason}
                     }),
-                ),
-            },
+                );
+                state.pending.remove(index);
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_work_quarantine(tx, &code, evidence, now_ms)?;
+                remember_recent(
+                    state,
+                    json!({
+                        "observation_id":pending.observation_id,
+                        "task_id":pending.task_id,
+                        "task_revision":pending.task_revision,
+                        "attempt_id":pending.attempt_id,
+                        "disposition":"quarantined",
+                        "reason":code.to_ascii_lowercase()
+                    }),
+                );
+                *quarantined = (*quarantined).saturating_add(1);
+                state.pending.remove(index);
+            }
         }
     }
-    state.pending = keep;
     Ok(checked)
 }
 
@@ -1011,7 +1257,16 @@ fn empty_state(entry: &AutomationEntry, cut: i64, now_ms: i64) -> WorkDispatchSt
 }
 
 fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<WorkDispatchState>> {
-    let Some(value) = config::read_record(db, &state_key(entry)?, "work-dispatch state")? else {
+    let Some(value) =
+        config::read_record(db, &state_key(entry)?, "work-dispatch state").map_err(|error| {
+            work_domain_record_error(
+                error,
+                "AUTOMATION_WORK_STATE_CORRUPT",
+                "work-dispatch state record is damaged",
+                false,
+            )
+        })?
+    else {
         return Ok(None);
     };
     let state: WorkDispatchState = serde_json::from_value(value).map_err(|_| {
@@ -1198,16 +1453,6 @@ fn state_projection(state: &WorkDispatchState) -> Value {
         "recent":state.recent,
         "updated_at_ms":state.updated_at_ms
     })
-}
-
-fn is_stale_subject(error: &Error) -> bool {
-    matches!(
-        error.code.as_str(),
-        "NOT_FOUND"
-            | "AUTOMATION_WORK_SUBJECT_STALE"
-            | "AUTOMATION_WORK_ASSIGNMENT_STALE"
-            | "AUTOMATION_WORK_NOT_READY"
-    )
 }
 
 pub(crate) fn slot_identity_for_assignment(

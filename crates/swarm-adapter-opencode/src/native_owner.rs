@@ -19,7 +19,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -49,9 +49,10 @@ const PINNED_BUN_VERSION: &str = "1.4.0";
 /// whether native execution was attempted without exposing process stderr.
 #[derive(Debug)]
 pub struct OwnerStartFailure {
-    pub error: Error,
+    pub error: Box<Error>,
     pub effect_attempted: bool,
     pub details: Value,
+    native_owner: Option<Box<NativeOwner>>,
 }
 
 /// Optional owner kept by the long-lived adapter loop.  It has one launch
@@ -82,42 +83,61 @@ impl NativeOwnerController {
         };
         if self.active.is_some() {
             let receipt = self.ready.clone().ok_or_else(|| OwnerStartFailure {
-                error: Error::new(
+                error: Box::new(Error::new(
                     "NATIVE_OWNER_RECEIPT_MISSING",
                     "active native owner has no retained readiness proof",
-                ),
+                )),
                 effect_attempted: true,
                 details: Value::Null,
+                native_owner: None,
             })?;
-            if receipt.service_id != options.service_id
-                || receipt.service_version != options.expected_version
-            {
+            if receipt.service_id != options.service_id {
                 return Err(OwnerStartFailure {
-                    error: Error::new(
+                    error: Box::new(Error::new(
                         "NATIVE_OWNER_ROUTE_CHANGED",
                         "active native owner proof differs from the selected route",
-                    ),
+                    )),
                     effect_attempted: true,
                     details: Value::Null,
+                    native_owner: None,
                 });
             }
             return Ok(Some(receipt));
         }
-        let (owner, receipt) = NativeOwner::start(&config, options).await?;
+        let (owner, receipt) = match NativeOwner::start(&config, options).await {
+            Ok(started) => started,
+            Err(mut failure) => {
+                self.active = failure.native_owner.take().map(|owner| *owner);
+                self.ready = None;
+                return Err(failure);
+            }
+        };
         self.active = Some(owner);
         self.ready = Some(receipt.clone());
         Ok(Some(receipt))
     }
 
-    /// Send only the documented stdin EOF stop signal to a ready owner.  A
-    /// timeout remains an error; dropping the child never claims departure.
+    /// Send stdin EOF once and retain an unconfirmed child for a later wait.
     pub async fn shutdown(&mut self) -> Result<()> {
-        let Some(owner) = self.active.take() else {
-            self.ready = None;
+        self.ready = None;
+        let Some(owner) = self.active.as_mut() else {
             return Ok(());
         };
-        self.ready = None;
-        owner.shutdown().await
+        let status = owner.shutdown().await?;
+        self.active = None;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                "NATIVE_OWNER_STOP_UNKNOWN",
+                "OpenCode child exited without a successful stop receipt",
+            ))
+        }
+    }
+
+    /// The adapter must remain alive while this child has no confirmed exit.
+    pub fn owns_child(&self) -> bool {
+        self.active.is_some()
     }
 
     /// Bootstrap provider auth only for a route that also supplied a fresh
@@ -139,6 +159,7 @@ impl NativeOwnerController {
     }
 }
 
+#[derive(Debug)]
 struct NativeOwner {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -232,7 +253,8 @@ impl NativeOwner {
                     None,
                     Value::Null,
                     stderr_snapshot(&stderr),
-                ));
+                )
+                .with_child(child));
             }
         };
         let birth_identity = match process_birth_identity(pid) {
@@ -287,7 +309,8 @@ impl NativeOwner {
                             "wait_error":safe_code(&error.to_string())
                         }),
                         stderr_snapshot(&stderr),
-                    ));
+                    )
+                    .with_child(child));
                 }
             }
             if let Some(receipt) = ready_receipt(&plan, pid, &birth_identity["identity"]) {
@@ -303,7 +326,8 @@ impl NativeOwner {
                             "ready_receipt":receipt
                         }),
                         stderr_snapshot(&stderr),
-                    ));
+                    )
+                    .with_child(child));
                 }
                 return Ok((
                     Self {
@@ -327,13 +351,14 @@ impl NativeOwner {
                         "image_identity":image_identity
                     }),
                     stderr_snapshot(&stderr),
-                ));
+                )
+                .with_child(child));
             }
             sleep(Duration::from_millis(100)).await;
         }
     }
 
-    async fn shutdown(mut self) -> Result<()> {
+    async fn shutdown(&mut self) -> Result<ExitStatus> {
         self.stdin.take();
         let status = timeout(STOP_TIMEOUT, self.child.wait())
             .await
@@ -343,14 +368,7 @@ impl NativeOwner {
                     "OpenCode owner did not confirm a graceful stop before its deadline",
                 )
             })??;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(Error::new(
-                "NATIVE_OWNER_STOP_UNKNOWN",
-                "OpenCode owner exited without a successful stop receipt",
-            ))
-        }
+        Ok(status)
     }
 }
 
@@ -538,6 +556,7 @@ fn ready_receipt(
     let owner = read_json(&owner_path, MAX_OWNER_BYTES).ok()?;
     let connection_bytes = read_bounded(connection_path, MAX_CONNECTION_BYTES).ok()?;
     let connection: ConnectionRecord = serde_json::from_slice(&connection_bytes).ok()?;
+    let server_version = owner["native_server_version"].as_str()?;
     let endpoint = reqwest::Url::parse(&connection.endpoint).ok()?;
     if owner["schema_version"] != 1
         || owner["status"] != "ready"
@@ -545,7 +564,9 @@ fn ready_receipt(
         || owner["runtime"] != "bun"
         || owner["runtime_version"] != PINNED_BUN_VERSION
         || owner["native_server"] != "@opencode/server"
-        || owner["native_server_version"] != plan.options.expected_version
+        || server_version.trim().is_empty()
+        || server_version.len() > 256
+        || server_version.chars().any(char::is_control)
         || owner["pid"].as_u64() != Some(u64::from(pid))
         || owner["native_reported_pid"].as_u64() != Some(u64::from(pid))
         || owner["endpoint"] != connection.endpoint
@@ -567,7 +588,7 @@ fn ready_receipt(
         schema_version: 1,
         status: "ready".to_owned(),
         service_id: plan.options.service_id.clone(),
-        service_version: plan.options.expected_version.clone(),
+        service_version: server_version.to_owned(),
         owner_nonce: plan.config.owner_nonce.clone(),
         process: OwnedServiceProcessIdentity {
             pid,
@@ -707,7 +728,7 @@ fn failure(
     stderr: Value,
 ) -> OwnerStartFailure {
     OwnerStartFailure {
-        error,
+        error: Box::new(error),
         effect_attempted,
         details: json!({
             "native_owner":{
@@ -724,12 +745,22 @@ fn failure(
             },
             "native_replay":false
         }),
+        native_owner: None,
     }
 }
 
 impl OwnerStartFailure {
     fn with_io(mut self, value: String) -> Self {
         self.details["native_owner"]["io_kind"] = json!(safe_code(&value));
+        self
+    }
+
+    fn with_child(mut self, mut child: Child) -> Self {
+        self.details["native_owner"]["child_retained_by_adapter"] = json!(true);
+        self.native_owner = Some(Box::new(NativeOwner {
+            stdin: child.stdin.take(),
+            child,
+        }));
         self
     }
 }

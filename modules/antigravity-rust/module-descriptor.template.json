@@ -3,7 +3,7 @@
   "module_id": "antigravity",
   "artifact": {
     "artifact_id": "eliot-antigravity.rust-headless.1",
-    "version": "4",
+    "version": "5",
     "build_id": null
   },
   "launch": {
@@ -39,6 +39,11 @@
     },
     {
       "schema_id": "swarm.task_dispatch_context",
+      "version": "1",
+      "sha256": null
+    },
+    {
+      "schema_id": "swarm.task_prompt",
       "version": "1",
       "sha256": null
     }

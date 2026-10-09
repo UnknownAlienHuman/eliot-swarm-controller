@@ -17,6 +17,105 @@ pub const MAX_CHILD_STRINGS: usize = 8;
 pub const MAX_CHILD_URI_CHARS: usize = 256;
 pub const MAX_TEXT_CHARS_PER_STEP: u64 = 1_000_000;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct UsageSnapshot {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub thinking_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl UsageSnapshot {
+    fn from_value(value: &Value) -> Option<Self> {
+        let usage = value.as_object()?;
+        let known_fields = [
+            "input_tokens",
+            "output_tokens",
+            "thinking_tokens",
+            "cache_read_tokens",
+            "total_tokens",
+        ];
+        if !known_fields.iter().any(|field| usage.contains_key(*field)) {
+            return None;
+        }
+        Some(Self {
+            input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+            output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+            thinking_tokens: usage.get("thinking_tokens").and_then(Value::as_u64),
+            cache_read_tokens: usage.get("cache_read_tokens").and_then(Value::as_u64),
+            total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        })
+    }
+
+    fn is_complete(self) -> bool {
+        self.input_tokens.is_some()
+            && self.output_tokens.is_some()
+            && self.thinking_tokens.is_some()
+            && self.cache_read_tokens.is_some()
+            && self.total_tokens.is_some()
+    }
+
+    fn delta_from(self, previous: Self) -> Option<UsageDelta> {
+        Some(UsageDelta {
+            input_tokens: self.input_tokens?.checked_sub(previous.input_tokens?)?,
+            output_tokens: self.output_tokens?.checked_sub(previous.output_tokens?)?,
+            thinking_tokens: self
+                .thinking_tokens?
+                .checked_sub(previous.thinking_tokens?)?,
+            cache_read_tokens: self
+                .cache_read_tokens?
+                .checked_sub(previous.cache_read_tokens?)?,
+            total_tokens: self.total_tokens?.checked_sub(previous.total_tokens?)?,
+        })
+    }
+
+    fn delta_from_zero(self) -> Option<UsageDelta> {
+        Some(UsageDelta {
+            input_tokens: self.input_tokens?,
+            output_tokens: self.output_tokens?,
+            thinking_tokens: self.thinking_tokens?,
+            cache_read_tokens: self.cache_read_tokens?,
+            total_tokens: self.total_tokens?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct UsageDelta {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageBasis {
+    FreshProcessZero,
+    PreviousTerminal,
+    ResumedBaseline,
+    ResetOrGap,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TurnUsageEvidence {
+    pub cumulative: Option<UsageSnapshot>,
+    pub delta: Option<UsageDelta>,
+    pub basis: UsageBasis,
+}
+
+#[derive(Debug, Clone)]
+struct UsageBaseline {
+    conversation_id: String,
+    result_ordinal: u64,
+    num_turns: u64,
+    duration_seconds: f64,
+    usage: UsageSnapshot,
+    gaps: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -44,6 +143,7 @@ pub struct Step {
     pub step_type: Option<String>,
     pub tool_name: Option<String>,
     pub text_chars: u64,
+    pub usage: Option<UsageSnapshot>,
     pub tool_error_type: Option<String>,
     pub subagent_ids: Vec<String>,
 }
@@ -67,6 +167,8 @@ pub struct Turn {
     pub response_chars: u64,
     pub num_turns: Option<u64>,
     pub duration_seconds: Option<f64>,
+    pub duration_delta_seconds: Option<f64>,
+    pub usage: TurnUsageEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +201,8 @@ pub struct StreamState {
     pub gaps: u64,
     pub stream_error_code: Option<&'static str>,
     pub exit_code: Option<i32>,
+    resumed_baseline_pending: bool,
+    last_terminal_usage: Option<UsageBaseline>,
 }
 
 impl StreamState {
@@ -119,7 +223,14 @@ impl StreamState {
             gaps: 0,
             stream_error_code: None,
             exit_code: None,
+            resumed_baseline_pending: false,
+            last_terminal_usage: None,
         }
+    }
+
+    pub fn set_resume_baseline_pending(&mut self, pending: bool) {
+        self.resumed_baseline_pending = pending;
+        self.last_terminal_usage = None;
     }
 
     pub fn consume_line(&mut self, line: &[u8]) {
@@ -272,6 +383,7 @@ impl StreamState {
             step_type: None,
             tool_name: None,
             text_chars: 0,
+            usage: None,
             tool_error_type: None,
             subagent_ids: Vec::new(),
         });
@@ -283,6 +395,13 @@ impl StreamState {
                 .text_chars
                 .saturating_add(delta.chars().count() as u64)
                 .min(MAX_TEXT_CHARS_PER_STEP);
+        }
+        if let Some(raw_usage) = payload.get("usage") {
+            if let Some(usage) = UsageSnapshot::from_value(raw_usage) {
+                step.usage = Some(usage);
+            } else {
+                self.gaps = self.gaps.saturating_add(1);
+            }
         }
 
         let tool_info = payload.get("tool_info").and_then(Value::as_object);
@@ -375,6 +494,129 @@ impl StreamState {
         }
     }
 
+    fn usage_evidence(
+        &self,
+        status: &str,
+        conversation_id: Option<&str>,
+        result_ordinal: u64,
+        num_turns: Option<u64>,
+        duration_seconds: Option<f64>,
+        cumulative: Option<UsageSnapshot>,
+    ) -> (TurnUsageEvidence, Option<f64>) {
+        let reset = || {
+            (
+                TurnUsageEvidence {
+                    cumulative,
+                    delta: None,
+                    basis: UsageBasis::ResetOrGap,
+                },
+                None,
+            )
+        };
+        if !is_terminal_status(status) {
+            return reset();
+        }
+        let (
+            Some(init),
+            Some(conversation_id),
+            Some(num_turns),
+            Some(duration_seconds),
+            Some(usage),
+        ) = (
+            self.init.as_ref(),
+            conversation_id,
+            num_turns,
+            duration_seconds,
+            cumulative,
+        )
+        else {
+            return reset();
+        };
+        if init.conversation_id.as_str() != conversation_id
+            || !duration_seconds.is_finite()
+            || duration_seconds < 0.0
+            || !usage.is_complete()
+        {
+            return reset();
+        }
+        if let Some(previous) = &self.last_terminal_usage {
+            if previous.conversation_id == conversation_id
+                && previous.result_ordinal.checked_add(1) == Some(result_ordinal)
+                && previous.num_turns.checked_add(1) == Some(num_turns)
+                && previous.gaps == self.gaps
+                && duration_seconds >= previous.duration_seconds
+                && let Some(delta) = usage.delta_from(previous.usage)
+            {
+                return (
+                    TurnUsageEvidence {
+                        cumulative,
+                        delta: Some(delta),
+                        basis: UsageBasis::PreviousTerminal,
+                    },
+                    Some(duration_seconds - previous.duration_seconds),
+                );
+            }
+            return reset();
+        }
+        if self.resumed_baseline_pending {
+            return (
+                TurnUsageEvidence {
+                    cumulative,
+                    delta: None,
+                    basis: UsageBasis::ResumedBaseline,
+                },
+                None,
+            );
+        }
+        if result_ordinal == 1 && num_turns == 1 && self.gaps == 0 {
+            return (
+                TurnUsageEvidence {
+                    cumulative,
+                    delta: usage.delta_from_zero(),
+                    basis: UsageBasis::FreshProcessZero,
+                },
+                Some(duration_seconds),
+            );
+        }
+        reset()
+    }
+
+    fn remember_terminal_usage(&mut self, turn: &Turn) {
+        if !is_terminal_status(&turn.status) {
+            return;
+        }
+        self.resumed_baseline_pending = false;
+        let (
+            Some(init),
+            Some(conversation_id),
+            Some(num_turns),
+            Some(duration_seconds),
+            Some(usage),
+        ) = (
+            self.init.as_ref(),
+            turn.conversation_id.as_ref(),
+            turn.num_turns,
+            turn.duration_seconds,
+            turn.usage.cumulative,
+        )
+        else {
+            self.last_terminal_usage = None;
+            return;
+        };
+        if init.conversation_id.as_str() != conversation_id.as_str() || !usage.is_complete() {
+            self.last_terminal_usage = None;
+            return;
+        }
+        self.last_terminal_usage = Some(UsageBaseline {
+            conversation_id: conversation_id.clone(),
+            result_ordinal: turn.result_ordinal,
+            num_turns,
+            duration_seconds,
+            usage,
+            gaps: self.gaps,
+        });
+    }
+
     fn apply_result(&mut self, event: &Value) {
         let Some(payload) = event.get("result").and_then(Value::as_object) else {
             self.gaps = self.gaps.saturating_add(1);
@@ -385,22 +627,38 @@ impl StreamState {
             return;
         };
         self.result_ordinal = self.result_ordinal.saturating_add(1);
+        let status = bounded_string(status, 64);
         let response = payload.get("response").and_then(Value::as_str);
         let conversation_id = payload
             .get("conversation_id")
             .and_then(Value::as_str)
             .or_else(|| event.get("conversation_id").and_then(Value::as_str))
             .map(|value| bounded_string(value, 512));
+        let num_turns = payload.get("num_turns").and_then(Value::as_u64);
+        let duration_seconds = payload
+            .get("duration_seconds")
+            .and_then(nonnegative_finite_f64);
+        let cumulative_usage = payload.get("usage").and_then(UsageSnapshot::from_value);
+        let (usage, duration_delta_seconds) = self.usage_evidence(
+            &status,
+            conversation_id.as_deref(),
+            self.result_ordinal,
+            num_turns,
+            duration_seconds,
+            cumulative_usage,
+        );
         let turn = Turn {
-            status: bounded_string(status, 64),
+            status,
             conversation_id,
             result_ordinal: self.result_ordinal,
             response_sha256: response.map(sha256_hex),
             response_chars: response
                 .map(|value| value.chars().count() as u64)
                 .unwrap_or(0),
-            num_turns: payload.get("num_turns").and_then(Value::as_u64),
-            duration_seconds: payload.get("duration_seconds").and_then(Value::as_f64),
+            num_turns,
+            duration_seconds,
+            duration_delta_seconds,
+            usage,
         };
         if self.turns.len() == MAX_TURNS {
             self.turns.pop_front();
@@ -417,6 +675,8 @@ impl StreamState {
                 // prove that initialization failed or establish a session.
                 self.gaps = self.gaps.saturating_add(1);
             }
+            self.resumed_baseline_pending = false;
+            self.last_terminal_usage = None;
             return;
         }
         self.execution = match turn.status.as_str() {
@@ -425,7 +685,20 @@ impl StreamState {
             "RUNNING" => "turn_open",
             _ => "turn_failed",
         };
+        self.remember_terminal_usage(&turn);
     }
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "SUCCESS" | "ERROR" | "CANCELED" | "INTERRUPTED" | "INVALID"
+    )
+}
+
+fn nonnegative_finite_f64(value: &Value) -> Option<f64> {
+    let value = value.as_f64()?;
+    (value.is_finite() && value >= 0.0).then_some(value)
 }
 
 pub struct NativeLineReader<R> {

@@ -10,8 +10,8 @@ use swarm_contracts::{
     error::{Error, Result},
     module_contract::ModuleContractClaim,
     runtime::{
-        ModuleReceiptIdentity, NormalizedResultPageSource, RuntimeCommand,
-        TaskDispatchAdmissionReceipt, TaskDispatchContext,
+        ModuleReceiptIdentity, NormalizedResultOriginContext, NormalizedResultPageSource,
+        RuntimeCommand, TaskDispatchAdmissionReceipt, TaskDispatchContext,
     },
 };
 
@@ -166,7 +166,6 @@ pub fn build_output(
         &command.binding_id,
         command.generation,
     )?;
-    let result_receipt = receipt(command, claim, &command.operation_id, result_input_sha256)?;
     let bytes = store.read_native_output(
         target_id,
         target_input_sha256,
@@ -255,7 +254,7 @@ pub fn build_normalized_output(
     {
         return Err(invalid("normalized Command output contract is unavailable"));
     }
-    let origin: swarm_contracts::runtime::NormalizedResultOriginContext =
+    let origin: NormalizedResultOriginContext =
         serde_json::from_value(command.input["normalized_result_origin"].clone())
             .map_err(|_| invalid("Store omitted the sealed normalized result origin"))?;
     origin
@@ -327,6 +326,69 @@ pub fn build_normalized_output(
             "journal output differs from the sealed payload identity",
         ));
     }
+    build_normalized_page(command, claim, origin, result_input_sha256, &bytes)
+}
+
+/// Build the shared normalized page from the ACP adapter's own immutable
+/// capture. The Store-projected origin and payload identity remain the only
+/// authority for target binding and complete-output digest.
+pub fn build_acp_output(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    bytes: &[u8],
+) -> Result<Value> {
+    if command.method != "agent.result"
+        || command.route["runtime"] != "command"
+        || command.route["module_artifact_id"] != crate::ACP_ARTIFACT_ID
+        || command.input["selector"]["kind"] != "command_output"
+        || command.input["selector"]["native_output"] != "acp.assistant_messages.txt"
+        || !crate::module_host::normalized_result_enabled(claim)
+    {
+        return Err(invalid("ACP normalized output result contract is unavailable"));
+    }
+    let origin: NormalizedResultOriginContext =
+        serde_json::from_value(command.input["normalized_result_origin"].clone())
+            .map_err(|_| invalid("Store omitted the sealed ACP result origin"))?;
+    origin
+        .validate()
+        .map_err(|_| invalid("Store supplied an invalid ACP result origin"))?;
+    if origin.binding_id != command.binding_id
+        || origin.binding_generation != command.generation
+        || origin.target_operation_id != command.input["selector"]["input_operation_id"]
+        || command.target_input_sha256.as_deref() != Some(origin.target_input_sha256.as_str())
+    {
+        return Err(invalid("ACP result origin differs from its exact Store request"));
+    }
+    let expected = &command.input["normalized_result_payload_identity"];
+    let payload_sha256 = text(expected, "sha256")?;
+    let payload_bytes = expected["byte_length"]
+        .as_u64()
+        .ok_or_else(|| invalid("Store omitted the sealed ACP output byte length"))?;
+    if expected["complete"] != true
+        || !is_sha256(payload_sha256)
+        || payload_sha256 != sha256_hex(bytes)
+        || payload_bytes != bytes.len() as u64
+    {
+        return Err(invalid("ACP capture differs from the Store-sealed output identity"));
+    }
+    let result_input_sha256 = command
+        .input_sha256
+        .as_deref()
+        .filter(|digest| is_sha256(digest))
+        .ok_or_else(|| invalid("Store omitted the exact ACP result Operation digest"))?;
+    build_normalized_page(command, claim, origin, result_input_sha256, bytes)
+}
+
+fn build_normalized_page(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    origin: NormalizedResultOriginContext,
+    result_input_sha256: &str,
+    bytes: &[u8],
+) -> Result<Value> {
+    let result_receipt = receipt(command, claim, &command.operation_id, result_input_sha256)?;
+    let payload_sha256 = sha256_hex(bytes);
+    let payload_bytes = bytes.len() as u64;
     let source = NormalizedResultPageSource {
         schema_id: swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
         schema_version: 1,
@@ -334,7 +396,7 @@ pub fn build_normalized_output(
         result_operation_id: command.operation_id.clone(),
         result_input_sha256: result_input_sha256.to_owned(),
         result_module_receipt: result_receipt,
-        payload_sha256: payload_sha256.to_owned(),
+        payload_sha256,
         payload_bytes,
         native_response_identity: None,
         execution_complete: false,
@@ -369,7 +431,11 @@ pub fn build_normalized_output(
             "byte_length":selected.len(),
             "total_bytes":payload_bytes,
             "eof":end == payload_bytes,
-            "media_type":if native_output == "stdout.ndjson" { "application/x-ndjson" } else { "text/plain; charset=utf-8" },
+            "media_type":match command.input["selector"]["native_output"].as_str() {
+                Some("stdout.ndjson") => "application/x-ndjson",
+                Some("stderr.txt" | "acp.assistant_messages.txt") => "text/plain; charset=utf-8",
+                _ => return Err(invalid("normalized output stream is unsupported")),
+            },
             "content_base64":encode_base64(selected),
             "page_sha256":sha256_hex(selected)
         }

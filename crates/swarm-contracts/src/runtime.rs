@@ -300,6 +300,7 @@ impl NormalizedResultOriginContext {
                 ),
                 ("native_input_admitted", false, "admitted")
                     | ("native_turn_completed", true, "completed")
+                    | ("native_result_observed", true, "completed")
             )
             || producer.module_receipt.validate().is_err()
             || producer.module_receipt.operation_id != self.target_operation_id

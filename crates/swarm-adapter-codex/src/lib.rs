@@ -2,18 +2,26 @@
 //! only on the shared host client/contracts and its native JSON-RPC transport.
 
 mod module_contract;
+mod native_usage;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    task::{Poll, Waker},
     time::Duration,
 };
 
 use base64::Engine as _;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    SinkExt, StreamExt,
+    future::poll_fn,
+    lock::Mutex as AsyncMutex,
+    stream::{SplitSink, SplitStream},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +34,7 @@ use swarm_contracts::{
         NormalizedResultPageSource, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
         TaskDispatchContext,
     },
+    task_prompt::TaskPromptEnvelopeV1,
 };
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
@@ -36,7 +45,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const ARTIFACT_VERSION: &str = "4";
+pub const ARTIFACT_VERSION: &str = "5";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
@@ -55,6 +64,12 @@ const JOURNAL_MARKER_FILE: &str = "journal.active";
 const JOURNAL_MARKER_BYTES: &[u8] = b"eliot-codex-journal-v1\n";
 const MAX_OPERATION_ACK_BYTES: u64 = 64 * 1024;
 const MAX_PENDING_OUTCOMES_PER_BATCH: usize = 32;
+const MAX_PENDING_NATIVE_EVENT_BYTES: u64 = 1024 * 1024;
+const MAX_PENDING_NATIVE_EVENT_ITEMS: usize = 1024;
+const MAX_NATIVE_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_NATIVE_EVENT_ITEMS: usize = 1024;
+const NATIVE_EVENT_FAULT_RESERVE_BYTES: usize = 512;
+const MAX_PENDING_NATIVE_RPC: usize = 32;
 const NATIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HOST_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -92,6 +107,342 @@ pub struct AdapterConfig {
     pub token_env: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeRootPhase {
+    Pending,
+    Candidate,
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootApplicability {
+    Current,
+    Historical,
+}
+
+impl RootApplicability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Historical => "historical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum NativeRpcEvent {
+    NativeUsageChanged,
+    AccountRateLimitsUpdated {
+        method: String,
+        rate_limits: NativeRateLimitSnapshot,
+        raw_params: Value,
+    },
+    ThreadTokenUsageUpdated {
+        method: String,
+        usage: NativeThreadTokenUsage,
+        raw_params: Value,
+    },
+    MalformedUsageNotification {
+        method: String,
+        params: Value,
+    },
+    CurrentNotification {
+        method: String,
+        params: Value,
+    },
+    NativeNotification {
+        method: String,
+        params: Value,
+    },
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+        reply: Value,
+    },
+    DemultiplexerFault {
+        diagnostic_code: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NativeEventRecord {
+    appserver_scope: Option<String>,
+    event: NativeRpcEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRateLimitSnapshot {
+    credits: Option<NativeCreditsSnapshot>,
+    individual_limit: Option<NativeSpendControlLimitSnapshot>,
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    normal_model_slug: Option<String>,
+    plan_type: Option<String>,
+    primary: Option<NativeRateLimitWindow>,
+    rate_limit_reached_type: Option<String>,
+    secondary: Option<NativeRateLimitWindow>,
+    spend_control_reached: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRateLimitNotification {
+    rate_limits: NativeRateLimitSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeCreditsSnapshot {
+    balance: Option<String>,
+    has_credits: bool,
+    unlimited: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSpendControlLimitSnapshot {
+    limit: String,
+    remaining_percent: i32,
+    resets_at: i64,
+    used: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRateLimitWindow {
+    resets_at: Option<i64>,
+    used_percent: i32,
+    window_duration_mins: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeThreadTokenUsage {
+    thread_id: String,
+    turn_id: String,
+    token_usage: NativeThreadTokenUsageBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeThreadTokenUsageBreakdown {
+    last: NativeTokenUsageCounts,
+    model_context_window: Option<i64>,
+    total: NativeTokenUsageCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeTokenUsageCounts {
+    cache_write_input_tokens: Option<i64>,
+    cached_input_tokens: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedNativeEvent {
+    sequence: u64,
+    encoded_bytes: usize,
+    record: NativeEventRecord,
+}
+
+#[derive(Default)]
+struct NativeEventQueue {
+    items: VecDeque<QueuedNativeEvent>,
+    encoded_bytes: usize,
+    next_sequence: u64,
+    terminal: bool,
+    fault_recorded: bool,
+}
+
+#[derive(Clone)]
+struct NativeEventSink {
+    queue: Arc<Mutex<NativeEventQueue>>,
+    scope: Arc<Mutex<Option<String>>>,
+    usage: Arc<Mutex<native_usage::Collector>>,
+}
+
+impl NativeEventSink {
+    fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(NativeEventQueue::default())),
+            scope: Arc::new(Mutex::new(None)),
+            usage: Arc::new(Mutex::new(native_usage::Collector::default())),
+        }
+    }
+
+    fn set_scope(&self, scope: String) -> Result<(), NativeError> {
+        let mut current_scope = self.scope.lock().map_err(|_| NativeError::Protocol)?;
+        let mut queue = self.queue.lock().map_err(|_| NativeError::Protocol)?;
+        let mut usage = self.usage.lock().map_err(|_| NativeError::Protocol)?;
+        usage.connect();
+        for event in &queue.items {
+            if let NativeRpcEvent::AccountRateLimitsUpdated { rate_limits, .. } =
+                &event.record.event
+            {
+                usage.rolling_update(rate_limits.clone());
+            }
+        }
+        let mut encoded_bytes = 0usize;
+        for event in &queue.items {
+            let mut record = event.record.clone();
+            record.appserver_scope = Some(scope.clone());
+            encoded_bytes = encoded_bytes
+                .checked_add(
+                    serde_json::to_vec(&record)
+                        .map_err(|_| NativeError::Protocol)?
+                        .len(),
+                )
+                .ok_or(NativeError::DemultiplexerCapacity)?;
+        }
+        if encoded_bytes > MAX_NATIVE_EVENT_BYTES {
+            queue.terminal = true;
+            Self::record_fault_locked(&mut queue, Some(scope), "NATIVE_EVENT_BUFFER_LIMIT");
+            return Err(NativeError::DemultiplexerCapacity);
+        }
+        for event in &mut queue.items {
+            event.record.appserver_scope = Some(scope.clone());
+            event.encoded_bytes = serde_json::to_vec(&event.record)
+                .map_err(|_| NativeError::Protocol)?
+                .len();
+        }
+        queue.encoded_bytes = encoded_bytes;
+        *current_scope = Some(scope);
+        Ok(())
+    }
+
+    fn queue_event(&self, event: NativeRpcEvent) -> Result<(), NativeError> {
+        let scope = self.scope.lock().map_err(|_| NativeError::Protocol)?;
+        {
+            let mut usage = self.usage.lock().map_err(|_| NativeError::Protocol)?;
+            match &event {
+                NativeRpcEvent::AccountRateLimitsUpdated { rate_limits, .. } => {
+                    usage.rolling_update(rate_limits.clone())
+                }
+                NativeRpcEvent::MalformedUsageNotification { method, .. }
+                    if method == "account/rateLimits/updated" =>
+                {
+                    usage.malformed_update()
+                }
+                NativeRpcEvent::NativeNotification { method, .. }
+                    if method == "account/updated" =>
+                {
+                    usage.invalidate_auth()
+                }
+                _ => {}
+            }
+        }
+        let record = NativeEventRecord {
+            appserver_scope: scope.clone(),
+            event,
+        };
+        let encoded_bytes = serde_json::to_vec(&record)
+            .map_err(|_| NativeError::Protocol)?
+            .len();
+        let mut queue = self.queue.lock().map_err(|_| NativeError::Protocol)?;
+        if queue.terminal {
+            return Err(NativeError::DemultiplexerCapacity);
+        }
+        let ordinary_byte_limit = MAX_NATIVE_EVENT_BYTES - NATIVE_EVENT_FAULT_RESERVE_BYTES;
+        if queue.items.len() >= MAX_NATIVE_EVENT_ITEMS - 1
+            || encoded_bytes > ordinary_byte_limit.saturating_sub(queue.encoded_bytes)
+        {
+            Self::record_fault_locked(
+                &mut queue,
+                record.appserver_scope.clone(),
+                "NATIVE_EVENT_BUFFER_LIMIT",
+            );
+            return Err(NativeError::DemultiplexerCapacity);
+        }
+        Self::push_locked(&mut queue, record, encoded_bytes)?;
+        Ok(())
+    }
+
+    fn record_fault(&self, diagnostic_code: &'static str) {
+        if let Ok(mut usage) = self.usage.lock() {
+            usage.closed();
+        }
+        if let Ok(scope) = self.scope.lock()
+            && let Ok(mut queue) = self.queue.lock()
+        {
+            queue.terminal = true;
+            Self::record_fault_locked(&mut queue, scope.clone(), diagnostic_code);
+        }
+    }
+
+    fn record_fault_locked(
+        queue: &mut NativeEventQueue,
+        scope: Option<String>,
+        diagnostic_code: &'static str,
+    ) {
+        if queue.fault_recorded {
+            return;
+        }
+        let record = NativeEventRecord {
+            appserver_scope: scope,
+            event: NativeRpcEvent::DemultiplexerFault {
+                diagnostic_code: diagnostic_code.into(),
+            },
+        };
+        let encoded_bytes = serde_json::to_vec(&record).map_or(0, |value| value.len());
+        if queue.items.len() < MAX_NATIVE_EVENT_ITEMS
+            && encoded_bytes <= MAX_NATIVE_EVENT_BYTES.saturating_sub(queue.encoded_bytes)
+        {
+            let _ = Self::push_locked(queue, record, encoded_bytes);
+        }
+        queue.fault_recorded = true;
+    }
+
+    fn push_locked(
+        queue: &mut NativeEventQueue,
+        record: NativeEventRecord,
+        encoded_bytes: usize,
+    ) -> Result<(), NativeError> {
+        queue.next_sequence = queue
+            .next_sequence
+            .checked_add(1)
+            .ok_or(NativeError::DemultiplexerCapacity)?;
+        queue.encoded_bytes = queue
+            .encoded_bytes
+            .checked_add(encoded_bytes)
+            .ok_or(NativeError::DemultiplexerCapacity)?;
+        queue.items.push_back(QueuedNativeEvent {
+            sequence: queue.next_sequence,
+            encoded_bytes,
+            record,
+        });
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<Vec<QueuedNativeEvent>, AdapterError> {
+        self.queue
+            .lock()
+            .map_err(|_| AdapterError::Checkpoint)
+            .map(|queue| queue.items.iter().cloned().collect())
+    }
+
+    fn acknowledge_through(&self, sequence: u64) -> Result<(), AdapterError> {
+        let mut queue = self.queue.lock().map_err(|_| AdapterError::Checkpoint)?;
+        while queue
+            .items
+            .front()
+            .is_some_and(|event| event.sequence <= sequence)
+        {
+            if let Some(event) = queue.items.pop_front() {
+                queue.encoded_bytes = queue.encoded_bytes.saturating_sub(event.encoded_bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Checkpoint {
     version: u32,
@@ -100,6 +451,10 @@ struct Checkpoint {
     binding_id: Option<String>,
     generation: Option<i64>,
     native_root_id: Option<String>,
+    #[serde(default)]
+    native_root_phase: Option<NativeRootPhase>,
+    #[serde(default)]
+    root_operation_id: Option<String>,
     native_scope_key: Option<String>,
     requested_model_provider: Option<String>,
     requested_model: Option<String>,
@@ -110,6 +465,10 @@ struct Checkpoint {
     acknowledged_outcomes: BTreeSet<String>,
     observe_sequence: u64,
     pending_observation: Option<Value>,
+    #[serde(default)]
+    pending_native_events: Vec<NativeEventRecord>,
+    #[serde(default)]
+    native_usage: Option<swarm_contracts::native_usage::NativeUsageSnapshot>,
 }
 
 impl Checkpoint {
@@ -121,6 +480,8 @@ impl Checkpoint {
             binding_id: None,
             generation: None,
             native_root_id: None,
+            native_root_phase: None,
+            root_operation_id: None,
             native_scope_key: None,
             requested_model_provider: None,
             requested_model: None,
@@ -131,6 +492,200 @@ impl Checkpoint {
             acknowledged_outcomes: BTreeSet::new(),
             observe_sequence: 0,
             pending_observation: None,
+            pending_native_events: Vec::new(),
+            native_usage: None,
+        }
+    }
+
+    fn is_current_root(
+        &self,
+        root: &str,
+        scope: &str,
+        provider: &str,
+        model: &str,
+        workspace: &str,
+    ) -> bool {
+        self.native_root_phase == Some(NativeRootPhase::Active)
+            && self.root_context_matches(root, scope, provider, model, workspace)
+            && self.effective_model_provider.as_deref() == Some(provider)
+            && self.effective_model.as_deref() == Some(model)
+            && self.verified_open_operation_matches(root, scope, provider, model, workspace)
+    }
+
+    fn verified_open_operation_matches(
+        &self,
+        root: &str,
+        scope: &str,
+        provider: &str,
+        model: &str,
+        workspace: &str,
+    ) -> bool {
+        let Some(operation_id) = self.root_operation_id.as_deref() else {
+            return false;
+        };
+        let Some(record) = self.operations.get(operation_id) else {
+            return false;
+        };
+        record.method == "agent.open"
+            && record.kind == "open"
+            && record.native_root_id.as_deref() == Some(root)
+            && record.native_scope_key.as_deref() == Some(scope)
+            && record.requested_model_provider.as_deref() == Some(provider)
+            && record.requested_model.as_deref() == Some(model)
+            && record.workspace_root.as_deref().and_then(normalize_path)
+                == normalize_path(workspace)
+            && record.thread_configuration_readback.as_deref() == Some("verified")
+    }
+
+    fn active_root_proof_matches(&self) -> bool {
+        let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+            self.native_root_id.as_deref(),
+            self.native_scope_key.as_deref(),
+            self.requested_model_provider.as_deref(),
+            self.requested_model.as_deref(),
+            self.workspace_root.as_deref(),
+        ) else {
+            return false;
+        };
+        self.root_context_matches(root, scope, provider, model, workspace)
+            && self.effective_model_provider.as_deref() == Some(provider)
+            && self.effective_model.as_deref() == Some(model)
+            && self.verified_open_operation_matches(root, scope, provider, model, workspace)
+    }
+
+    fn root_context_matches(
+        &self,
+        root: &str,
+        scope: &str,
+        provider: &str,
+        model: &str,
+        workspace: &str,
+    ) -> bool {
+        self.native_root_id.as_deref() == Some(root)
+            && self.native_scope_key.as_deref() == Some(scope)
+            && self.requested_model_provider.as_deref() == Some(provider)
+            && self.requested_model.as_deref() == Some(model)
+            && self.workspace_root.as_deref().and_then(normalize_path) == normalize_path(workspace)
+    }
+
+    fn classify_root_applicability(
+        &self,
+        record: &OperationRecord,
+        outcome: &RuntimeOutcome,
+    ) -> Result<Option<RootApplicability>, AdapterError> {
+        let (Some(root), Some(scope)) = (
+            outcome.native_root_id.as_deref(),
+            outcome.native_scope_key.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let (Some(provider), Some(model)) = (
+            outcome.details["requested_model_provider"].as_str(),
+            outcome.details["requested_model"].as_str(),
+        ) else {
+            return Ok(None);
+        };
+        if record
+            .native_root_id
+            .as_deref()
+            .is_some_and(|saved| saved != root)
+            || record
+                .native_scope_key
+                .as_deref()
+                .is_some_and(|saved| saved != scope)
+            || record
+                .requested_model_provider
+                .as_deref()
+                .is_some_and(|saved| saved != provider)
+            || record
+                .requested_model
+                .as_deref()
+                .is_some_and(|saved| saved != model)
+        {
+            return Err(AdapterError::Checkpoint);
+        }
+        if let Some(workspace) = self.workspace_root.as_deref()
+            && self.is_current_root(root, scope, provider, model, workspace)
+        {
+            if record
+                .workspace_root
+                .as_deref()
+                .is_some_and(|saved| normalize_path(saved) != normalize_path(workspace))
+            {
+                return Err(AdapterError::Checkpoint);
+            }
+            return Ok(Some(RootApplicability::Current));
+        }
+        let historical_context_matches = matches!(
+            (record.method.as_str(), record.kind.as_str()),
+            ("agent.open", "open") | ("agent.send", "send") | ("task.dispatch", "send")
+        ) && record.native_root_id.as_deref() == Some(root)
+            && record.native_scope_key.as_deref() == Some(scope)
+            && record.requested_model_provider.as_deref() == Some(provider)
+            && record.requested_model.as_deref() == Some(model)
+            && record.thread_configuration_readback.as_deref() == Some("verified")
+            && record
+                .workspace_root
+                .as_deref()
+                .and_then(normalize_path)
+                .is_some()
+            && (outcome.details["native_thread_readback"] == "verified"
+                || outcome.details["native_input_readback"] == "verified");
+        if historical_context_matches {
+            Ok(Some(RootApplicability::Historical))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn restore_legacy_root_phase(&mut self) {
+        if self.native_root_phase == Some(NativeRootPhase::Active)
+            && !self.active_root_proof_matches()
+        {
+            self.native_root_phase = if self.native_root_id.is_some() {
+                Some(NativeRootPhase::Candidate)
+            } else if self.native_scope_key.is_some() || self.root_operation_id.is_some() {
+                Some(NativeRootPhase::Pending)
+            } else {
+                None
+            };
+            self.effective_model_provider = None;
+            self.effective_model = None;
+        }
+        if self.native_root_phase.is_some() {
+            return;
+        }
+        let matching_open_operations: Vec<String> = self
+            .operations
+            .iter()
+            .filter(|(_, record)| {
+                record.method == "agent.open"
+                    && record.kind == "open"
+                    && record.native_root_id.as_deref() == self.native_root_id.as_deref()
+                    && record.native_scope_key.as_deref() == self.native_scope_key.as_deref()
+                    && record.requested_model_provider.as_deref()
+                        == self.requested_model_provider.as_deref()
+                    && record.requested_model.as_deref() == self.requested_model.as_deref()
+                    && record.workspace_root.as_deref().and_then(normalize_path)
+                        == self.workspace_root.as_deref().and_then(normalize_path)
+            })
+            .map(|(operation_id, _)| operation_id.clone())
+            .collect();
+        if matching_open_operations.len() == 1 {
+            self.root_operation_id = matching_open_operations.into_iter().next();
+        }
+        if self.native_root_id.is_some() {
+            // Old checkpoints have no proof-state marker. Re-read the exact
+            // open operation before allowing this root to act as current.
+            self.native_root_phase = Some(NativeRootPhase::Candidate);
+            self.effective_model_provider = None;
+            self.effective_model = None;
+        } else if self.native_scope_key.is_some() || self.root_operation_id.is_some() {
+            // A start may have taken effect without returning its root id.
+            // Preserve the uncertainty and prevent a second thread/start.
+            self.native_root_phase = Some(NativeRootPhase::Pending);
+            self.effective_model_provider = None;
+            self.effective_model = None;
         }
     }
 }
@@ -151,9 +706,13 @@ struct OperationRecord {
     requested_model_provider: Option<String>,
     requested_model: Option<String>,
     workspace_root: Option<String>,
+    #[serde(default)]
+    thread_configuration_readback: Option<String>,
     client_user_message_id: Option<String>,
     prompt_sha256: Option<String>,
     prompt_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_contract_revision: Option<String>,
     delivery: Option<String>,
     expected_turn_id: Option<String>,
     returned_turn_id: Option<String>,
@@ -184,9 +743,11 @@ impl OperationRecord {
             requested_model_provider: None,
             requested_model: None,
             workspace_root: None,
+            thread_configuration_readback: None,
             client_user_message_id: None,
             prompt_sha256: None,
             prompt_bytes: None,
+            prompt_contract_revision: None,
             delivery: None,
             expected_turn_id: None,
             returned_turn_id: None,
@@ -213,9 +774,11 @@ impl OperationRecord {
             requested_model_provider: None,
             requested_model: None,
             workspace_root: None,
+            thread_configuration_readback: None,
             client_user_message_id: None,
             prompt_sha256: None,
             prompt_bytes: None,
+            prompt_contract_revision: None,
             delivery: None,
             expected_turn_id: None,
             returned_turn_id: None,
@@ -247,9 +810,11 @@ impl OperationRecord {
             requested_model_provider: None,
             requested_model: None,
             workspace_root: None,
+            thread_configuration_readback: None,
             client_user_message_id: None,
             prompt_sha256: None,
             prompt_bytes: None,
+            prompt_contract_revision: None,
             delivery: None,
             expected_turn_id: None,
             returned_turn_id: None,
@@ -320,6 +885,7 @@ struct Journal {
     directory: PathBuf,
     sequence: u64,
     state: Checkpoint,
+    native_events: NativeEventSink,
 }
 
 impl Journal {
@@ -395,15 +961,34 @@ impl Journal {
         if state.version != 2 || state.module_artifact_id != ARTIFACT_ID {
             return Err(AdapterError::Checkpoint);
         }
+        state.restore_legacy_root_phase();
+        match state.native_root_phase {
+            Some(NativeRootPhase::Pending) if state.native_root_id.is_some() => {
+                return Err(AdapterError::Checkpoint);
+            }
+            Some(NativeRootPhase::Candidate | NativeRootPhase::Active)
+                if state.native_root_id.is_none() =>
+            {
+                return Err(AdapterError::Checkpoint);
+            }
+            Some(NativeRootPhase::Active) if state.root_operation_id.is_none() => {
+                return Err(AdapterError::Checkpoint);
+            }
+            _ => {}
+        }
         let prior_boot = state.boot_id.clone();
         state.boot_id = boot_id;
         if prior_boot != state.boot_id {
             state.pending_observation = None;
+            if let Some(usage) = &mut state.native_usage {
+                usage.freshness = swarm_contracts::native_usage::UsageFreshness::Stale;
+            }
         }
         let mut journal = Self {
             directory,
             sequence,
             state,
+            native_events: NativeEventSink::new(),
         };
         journal.compact_acknowledged()?;
         journal.validate_live_bounds()?;
@@ -453,6 +1038,40 @@ impl Journal {
         }
         self.sequence = next;
         self.prune_old_checkpoints()
+    }
+
+    fn native_event_sink(&self) -> NativeEventSink {
+        self.native_events.clone()
+    }
+
+    fn capture_native_events(&mut self) -> Result<bool, AdapterError> {
+        let queued = self.native_events.snapshot()?;
+        let Some(last_sequence) = queued.last().map(|event| event.sequence) else {
+            return Ok(false);
+        };
+        let mut pending = self.state.pending_native_events.clone();
+        pending.extend(queued.iter().map(|event| event.record.clone()));
+        let encoded = serde_json::to_vec(&pending).map_err(|_| AdapterError::Checkpoint)?;
+        if pending.len() > MAX_PENDING_NATIVE_EVENT_ITEMS
+            || encoded.len() as u64 > MAX_PENDING_NATIVE_EVENT_BYTES
+        {
+            return Err(AdapterError::Checkpoint);
+        }
+        let prior = std::mem::replace(&mut self.state.pending_native_events, pending);
+        let usage = self
+            .native_events
+            .usage
+            .lock()
+            .map_err(|_| AdapterError::Checkpoint)?
+            .snapshot();
+        let prior_usage = std::mem::replace(&mut self.state.native_usage, usage);
+        if self.save().is_err() {
+            self.state.pending_native_events = prior;
+            self.state.native_usage = prior_usage;
+            return Err(AdapterError::Checkpoint);
+        }
+        self.native_events.acknowledge_through(last_sequence)?;
+        Ok(true)
     }
 
     fn ensure_journal_marker(&self) -> Result<(), AdapterError> {
@@ -526,7 +1145,14 @@ impl Journal {
 
     fn validate_live_bounds(&self) -> Result<(), AdapterError> {
         let (count, bytes) = self.live_usage()?;
-        if count > MAX_LIVE_OPERATION_COUNT || bytes > MAX_LIVE_OPERATION_BYTES {
+        let native_event_bytes = serde_json::to_vec(&self.state.pending_native_events)
+            .map_err(|_| AdapterError::Checkpoint)?
+            .len();
+        if count > MAX_LIVE_OPERATION_COUNT
+            || bytes > MAX_LIVE_OPERATION_BYTES
+            || self.state.pending_native_events.len() > MAX_PENDING_NATIVE_EVENT_ITEMS
+            || native_event_bytes as u64 > MAX_PENDING_NATIVE_EVENT_BYTES
+        {
             return Err(AdapterError::Checkpoint);
         }
         Ok(())
@@ -795,6 +1421,9 @@ impl Journal {
         let operation_ids = self.state.operations.keys().cloned().collect::<Vec<_>>();
         let mut compact = Vec::new();
         for operation_id in operation_ids {
+            if self.state.root_operation_id.as_deref() == Some(operation_id.as_str()) {
+                continue;
+            }
             let record = self
                 .state
                 .operations
@@ -1030,6 +1659,20 @@ impl Journal {
         ) else {
             return Err(AdapterError::Checkpoint);
         };
+        let operation = self
+            .operation_record(&outcome.operation_id)?
+            .ok_or(AdapterError::Checkpoint)?;
+        if self
+            .state
+            .classify_root_applicability(&operation, outcome)?
+            .is_none()
+            && !matches!(
+                (operation.method.as_str(), operation.kind.as_str()),
+                ("agent.send", "send") | ("task.dispatch", "send")
+            )
+        {
+            return Err(AdapterError::Checkpoint);
+        }
         let event: GoalTerminalEventRef = serde_json::from_value(existing["event"].clone())
             .map_err(|_| AdapterError::Checkpoint)?;
         event.validate().map_err(|_| AdapterError::Checkpoint)?;
@@ -1139,6 +1782,20 @@ impl Journal {
             .transpose()?;
         if dispatch_admission.is_none() && continuation_admission.is_none() {
             return Ok(());
+        }
+        let (Some(scope), Some(provider), Some(model), Some(workspace)) = (
+            outcome.native_scope_key.as_deref(),
+            outcome.details["requested_model_provider"].as_str(),
+            outcome.details["requested_model"].as_str(),
+            self.state.workspace_root.as_deref(),
+        ) else {
+            return Err(AdapterError::Checkpoint);
+        };
+        if !self
+            .state
+            .is_current_root(root, scope, provider, model, workspace)
+        {
+            return Err(AdapterError::Checkpoint);
         }
         let sequence = self
             .state
@@ -1385,11 +2042,20 @@ impl Journal {
         let state = json!({
             "module_artifact_id": ARTIFACT_ID,
             "boot_id": self.state.boot_id.as_str(),
-            "native_root_id": self.state.native_root_id.as_deref(),
+            "native_usage": self.state.native_usage,
+            "native_root_id": self.active_root_id(),
             "native": {
-                "root_id": self.state.native_root_id.as_deref(),
-                "scope_key": self.state.native_scope_key.as_deref(),
+                "root_id": self.active_root_id(),
+                "candidate_root_id": if self.state.native_root_phase == Some(NativeRootPhase::Candidate) { self.state.native_root_id.as_deref() } else { None },
+                "root_phase": self.state.native_root_phase,
+                "root_operation_id": self.state.root_operation_id.as_deref(),
+                "scope_key": if self.active_root_id().is_some() { self.state.native_scope_key.as_deref() } else { None },
+                "candidate_scope_key": if self.state.native_root_phase.is_some() { self.state.native_scope_key.as_deref() } else { None },
                 "ready": ready,
+                "events": self.state.pending_native_events.iter().filter(|record| !matches!(&record.event,
+                    NativeRpcEvent::AccountRateLimitsUpdated { .. } | NativeRpcEvent::NativeUsageChanged
+                    | NativeRpcEvent::MalformedUsageNotification { .. }) && !matches!(&record.event,
+                    NativeRpcEvent::NativeNotification { method, .. } if method.starts_with("account/"))).collect::<Vec<_>>(),
             },
             "describe": {
                 "module_artifact_id": ARTIFACT_ID,
@@ -1417,7 +2083,23 @@ impl Journal {
 
     fn acknowledge_observation(&mut self) -> Result<(), AdapterError> {
         self.state.pending_observation = None;
+        self.state.pending_native_events.clear();
         self.save()
+    }
+
+    fn active_root_id(&self) -> Option<&str> {
+        let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+            self.state.native_root_id.as_deref(),
+            self.state.native_scope_key.as_deref(),
+            self.state.requested_model_provider.as_deref(),
+            self.state.requested_model.as_deref(),
+            self.state.workspace_root.as_deref(),
+        ) else {
+            return None;
+        };
+        self.state
+            .is_current_root(root, scope, provider, model, workspace)
+            .then_some(root)
     }
 }
 
@@ -1475,7 +2157,7 @@ fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, Adapter
     Ok(bytes)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum NativeError {
     Attach,
     EndpointInvalid,
@@ -1484,8 +2166,9 @@ enum NativeError {
     HttpRejected(u16),
     Transport,
     Protocol,
+    DemultiplexerCapacity,
+    PendingRequestLimit,
     Rejected { rpc_code: Option<i64> },
-    UnsupportedServerRequest,
 }
 
 impl NativeError {
@@ -1501,11 +2184,12 @@ impl NativeError {
             Self::HttpRejected(_) => "NATIVE_WEBSOCKET_HANDSHAKE_REJECTED",
             Self::Transport => "NATIVE_TRANSPORT_UNAVAILABLE",
             Self::Protocol => "NATIVE_PROTOCOL_INVALID",
+            Self::DemultiplexerCapacity => "NATIVE_EVENT_BUFFER_LIMIT",
+            Self::PendingRequestLimit => "NATIVE_RPC_PENDING_LIMIT",
             Self::Rejected {
                 rpc_code: Some(-32602),
             } => "NATIVE_RPC_INVALID_PARAMS",
             Self::Rejected { .. } => "NATIVE_RPC_REQUEST_REJECTED",
-            Self::UnsupportedServerRequest => "NATIVE_SERVER_REQUEST_UNSUPPORTED",
         }
     }
 
@@ -1592,11 +2276,189 @@ fn turn_error_http_status(turn: &Value) -> Option<u64> {
     .find(|status| (100..=599).contains(status))
 }
 
+type NativeSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type NativeWriter = Arc<AsyncMutex<SplitSink<NativeSocket, Message>>>;
+
 struct NativeClient {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    writer: Option<NativeWriter>,
+    demux: Arc<NativeRpcDemultiplexer>,
+    events: NativeEventSink,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
     endpoint_identity: String,
     server_name: String,
     server_version: String,
+}
+
+struct NativeRpcDemultiplexer {
+    state: Mutex<NativeRpcState>,
+    events: NativeEventSink,
+}
+
+#[derive(Default)]
+struct NativeRpcState {
+    pending_responses: HashMap<String, Arc<Mutex<NativeResponseSlot>>>,
+    terminal_error: Option<NativeError>,
+}
+
+#[derive(Default)]
+struct NativeResponseSlot {
+    response: Option<Result<Value, NativeError>>,
+    waker: Option<Waker>,
+}
+
+struct NativeResponseRegistration {
+    demux: Arc<NativeRpcDemultiplexer>,
+    key: String,
+    slot: Arc<Mutex<NativeResponseSlot>>,
+}
+
+impl Drop for NativeResponseRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.demux.state.lock()
+            && state
+                .pending_responses
+                .get(&self.key)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
+        {
+            state.pending_responses.remove(&self.key);
+        }
+    }
+}
+
+impl NativeRpcDemultiplexer {
+    fn new(events: NativeEventSink) -> Self {
+        Self {
+            state: Mutex::new(NativeRpcState::default()),
+            events,
+        }
+    }
+
+    fn event_for_notification(method: String, params: Value) -> NativeRpcEvent {
+        match method.as_str() {
+            "account/rateLimits/updated" => {
+                match serde_json::from_value::<NativeRateLimitNotification>(params.clone()) {
+                    Ok(notification) => NativeRpcEvent::AccountRateLimitsUpdated {
+                        method,
+                        rate_limits: notification.rate_limits,
+                        raw_params: params,
+                    },
+                    Err(_) => NativeRpcEvent::MalformedUsageNotification { method, params },
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                match serde_json::from_value::<NativeThreadTokenUsage>(params.clone()) {
+                    Ok(usage) => NativeRpcEvent::ThreadTokenUsageUpdated {
+                        method,
+                        usage,
+                        raw_params: params,
+                    },
+                    Err(_) => NativeRpcEvent::MalformedUsageNotification { method, params },
+                }
+            }
+            _ if method.starts_with("thread/")
+                || method.starts_with("turn/")
+                || method.starts_with("item/") =>
+            {
+                NativeRpcEvent::CurrentNotification { method, params }
+            }
+            _ => NativeRpcEvent::NativeNotification { method, params },
+        }
+    }
+
+    fn register(self: &Arc<Self>, key: String) -> Result<NativeResponseRegistration, NativeError> {
+        let mut state = self.state.lock().map_err(|_| NativeError::Protocol)?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        if state.pending_responses.len() >= MAX_PENDING_NATIVE_RPC
+            || state.pending_responses.contains_key(&key)
+        {
+            return Err(NativeError::PendingRequestLimit);
+        }
+        let slot = Arc::new(Mutex::new(NativeResponseSlot::default()));
+        state
+            .pending_responses
+            .insert(key.clone(), Arc::clone(&slot));
+        Ok(NativeResponseRegistration {
+            demux: Arc::clone(self),
+            key,
+            slot,
+        })
+    }
+
+    fn terminal_error(&self) -> Result<Option<NativeError>, NativeError> {
+        self.state
+            .lock()
+            .map(|state| state.terminal_error.clone())
+            .map_err(|_| NativeError::Protocol)
+    }
+
+    fn fail(&self, error: NativeError) {
+        let pending = match self.state.lock() {
+            Ok(mut state) => {
+                if state.terminal_error.is_some() {
+                    return;
+                }
+                state.terminal_error = Some(error.clone());
+                std::mem::take(&mut state.pending_responses)
+            }
+            Err(_) => {
+                self.events.record_fault("NATIVE_RPC_DEMUX_POISONED");
+                return;
+            }
+        };
+        for slot in pending.into_values() {
+            if let Ok(mut response) = slot.lock() {
+                response.response = Some(Err(error.clone()));
+                if let Some(waker) = response.waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+        self.events.record_fault(error.diagnostic_code());
+    }
+
+    fn queue_event(&self, event: NativeRpcEvent) -> Result<(), NativeError> {
+        self.events.queue_event(event)
+    }
+
+    fn route_response(&self, packet: Value) -> Result<(), NativeError> {
+        let id = packet.get("id").ok_or(NativeError::Protocol)?;
+        let key = Self::response_key(id)?;
+        let slot = {
+            let mut state = self.state.lock().map_err(|_| NativeError::Protocol)?;
+            if let Some(error) = &state.terminal_error {
+                return Err(error.clone());
+            }
+            state
+                .pending_responses
+                .remove(&key)
+                .ok_or(NativeError::Protocol)?
+        };
+        let response = Self::response(packet);
+        let waker = {
+            let mut slot = slot.lock().map_err(|_| NativeError::Protocol)?;
+            slot.response = Some(response);
+            slot.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    fn response_key(id: &Value) -> Result<String, NativeError> {
+        serde_json::to_string(id).map_err(|_| NativeError::Protocol)
+    }
+
+    fn response(packet: Value) -> Result<Value, NativeError> {
+        if let Some(error) = packet.get("error") {
+            return Err(NativeError::Rejected {
+                rpc_code: error.get("code").and_then(Value::as_i64),
+            });
+        }
+        packet.get("result").cloned().ok_or(NativeError::Protocol)
+    }
 }
 
 impl NativeClient {
@@ -1604,6 +2466,7 @@ impl NativeClient {
         endpoint: &str,
         bearer: Option<&str>,
         credential_unavailable: bool,
+        events: NativeEventSink,
     ) -> Result<Self, NativeError> {
         if credential_unavailable {
             return Err(NativeError::CredentialUnavailable);
@@ -1646,8 +2509,19 @@ impl NativeClient {
             _ => NativeError::Attach,
         })?;
         let (socket, _) = connection;
+        let (writer, reader) = socket.split();
+        let writer = Arc::new(AsyncMutex::new(writer));
+        let demux = Arc::new(NativeRpcDemultiplexer::new(events.clone()));
+        let reader_task = tokio::spawn(read_native_messages(
+            reader,
+            Arc::clone(&writer),
+            Arc::clone(&demux),
+        ));
         let mut client = Self {
-            socket,
+            writer: Some(writer),
+            demux,
+            events,
+            reader_task: Some(reader_task),
             endpoint_identity,
             server_name: "unknown-server".into(),
             server_version: "unknown-version".into(),
@@ -1675,8 +2549,74 @@ impl NativeClient {
             .filter(|v| !v.trim().is_empty())
             .unwrap_or("unknown-version")
             .to_owned();
+        client
+            .events
+            .set_scope(client.scope_key())
+            .map_err(|_| NativeError::Protocol)?;
         client.notify("initialized", None).await?;
+        // Optional subscription reads use this same authenticated connection.
+        // Unsupported reads do not prevent ordinary native session work.
+        let _ = client
+            .request("account/read", json!({"refreshToken":false}))
+            .await;
+        let before = client
+            .events
+            .usage
+            .lock()
+            .map_err(|_| NativeError::Protocol)?
+            .revision();
+        let limits = client
+            .request("account/rateLimits/read", json!({}))
+            .await
+            .map_err(|error| error.rpc_code() == Some(-32601));
+        client
+            .events
+            .usage
+            .lock()
+            .map_err(|_| NativeError::Protocol)?
+            .full_read(before, limits);
+        client
+            .events
+            .queue_event(NativeRpcEvent::NativeUsageChanged)?;
         Ok(client)
+    }
+
+    fn unavailable(error: NativeError, events: NativeEventSink) -> Self {
+        let demux = Arc::new(NativeRpcDemultiplexer::new(events.clone()));
+        demux.fail(error);
+        Self {
+            writer: None,
+            demux,
+            events,
+            reader_task: None,
+            endpoint_identity: String::from("unavailable"),
+            server_name: String::from("unknown-server"),
+            server_version: String::from("unknown-version"),
+        }
+    }
+
+    async fn refresh_usage_after_auth_change(&mut self) -> Result<(), NativeError> {
+        let marker = {
+            let mut collector = self
+                .events
+                .usage
+                .lock()
+                .map_err(|_| NativeError::Protocol)?;
+            collector.take_refresh_revision()
+        };
+        let Some(marker) = marker else {
+            return Ok(());
+        };
+        let result = self
+            .request("account/rateLimits/read", json!({}))
+            .await
+            .map_err(|error| error.rpc_code() == Some(-32601));
+        self.events
+            .usage
+            .lock()
+            .map_err(|_| NativeError::Protocol)?
+            .full_read(marker, result);
+        self.events.queue_event(NativeRpcEvent::NativeUsageChanged)
     }
 
     fn scope_key(&self) -> String {
@@ -1690,25 +2630,35 @@ impl NativeClient {
         self.server_name != "unknown-server" && self.server_version != "unknown-version"
     }
 
-    async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), NativeError> {
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), NativeError> {
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            self.demux
+                .terminal_error()
+                .ok()
+                .flatten()
+                .unwrap_or(NativeError::Transport)
+        })?;
+        if let Some(error) = self.demux.terminal_error()? {
+            return Err(error);
+        }
         let mut packet = json!({"method":method});
         if let Some(params) = params {
             packet["params"] = params;
         }
-        let frame = serde_json::to_string(&packet).map_err(|_| NativeError::Protocol)?;
-        if frame.len() > MAX_FRAME_BYTES {
-            return Err(NativeError::Protocol);
+        match timeout(NATIVE_TIMEOUT, send_native_packet(writer, packet)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.demux.fail(error.clone());
+                Err(error)
+            }
+            Err(_) => {
+                self.demux.fail(NativeError::Transport);
+                Err(NativeError::Transport)
+            }
         }
-        timeout(
-            NATIVE_TIMEOUT,
-            self.socket.send(Message::Text(frame.into())),
-        )
-        .await
-        .map_err(|_| NativeError::Transport)?
-        .map_err(|_| NativeError::Transport)
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, NativeError> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, NativeError> {
         if !matches!(
             method,
             "initialize"
@@ -1722,6 +2672,8 @@ impl NativeClient {
             return Err(NativeError::Protocol);
         }
         let id = Uuid::new_v4().to_string();
+        let key = NativeRpcDemultiplexer::response_key(&json!(id))?;
+        let registration = self.demux.register(key.clone())?;
         let frame = serde_json::to_string(&json!({
             "id":id,
             "method":method,
@@ -1731,70 +2683,156 @@ impl NativeClient {
         if frame.len() > MAX_FRAME_BYTES {
             return Err(NativeError::Protocol);
         }
-        timeout(
+        let writer = self.writer.as_ref().ok_or(NativeError::Transport)?;
+        match timeout(
             NATIVE_TIMEOUT,
-            self.socket.send(Message::Text(frame.into())),
+            send_native_frame(writer, Message::Text(frame.into())),
         )
         .await
-        .map_err(|_| NativeError::Transport)?
-        .map_err(|_| NativeError::Transport)?;
-        timeout(NATIVE_TIMEOUT, self.receive_response(&id))
-            .await
-            .map_err(|_| NativeError::Transport)?
-    }
-
-    async fn receive_response(&mut self, request_id: &str) -> Result<Value, NativeError> {
-        loop {
-            let message = self
-                .socket
-                .next()
-                .await
-                .ok_or(NativeError::Transport)?
-                .map_err(|_| NativeError::Transport)?;
-            let text = match message {
-                Message::Text(text) => text,
-                Message::Ping(_) | Message::Pong(_) => continue,
-                _ => return Err(NativeError::Protocol),
-            };
-            if text.len() > MAX_FRAME_BYTES {
-                return Err(NativeError::Protocol);
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.demux.fail(error.clone());
+                return Err(error);
             }
-            let packet: Value =
-                serde_json::from_str(text.as_str()).map_err(|_| NativeError::Protocol)?;
-            if packet.get("id").and_then(Value::as_str) == Some(request_id) {
-                if let Some(error) = packet.get("error") {
-                    return Err(NativeError::Rejected {
-                        rpc_code: error.get("code").and_then(Value::as_i64),
-                    });
+            Err(_) => {
+                self.demux.fail(NativeError::Transport);
+                return Err(NativeError::Transport);
+            }
+        }
+        let slot = Arc::clone(&registration.slot);
+        let response = timeout(
+            NATIVE_TIMEOUT,
+            poll_fn(move |context| {
+                let Ok(mut slot) = slot.lock() else {
+                    return Poll::Ready(Err(NativeError::Protocol));
+                };
+                if let Some(response) = slot.response.take() {
+                    Poll::Ready(response)
+                } else {
+                    slot.waker = Some(context.waker().clone());
+                    Poll::Pending
                 }
-                return packet.get("result").cloned().ok_or(NativeError::Protocol);
+            }),
+        )
+        .await;
+        match response {
+            Ok(response) => response,
+            Err(_) => {
+                self.demux.fail(NativeError::Transport);
+                Err(NativeError::Transport)
             }
-            if packet.get("method").and_then(Value::as_str).is_some() && packet.get("id").is_some()
-            {
-                let id = packet.get("id").cloned().ok_or(NativeError::Protocol)?;
-                let method = packet["method"].as_str().ok_or(NativeError::Protocol)?;
-                let params = packet.get("params").cloned().unwrap_or(Value::Null);
-                let reply = match decline_server_request(method, &params) {
-                    Some(result) => json!({"id":id,"result":result}),
-                    None => {
-                        let failure = json!({"id":id,"error":{"code":-32601,"message":"unsupported server request"}});
-                        let wire =
-                            serde_json::to_string(&failure).map_err(|_| NativeError::Protocol)?;
-                        timeout(NATIVE_TIMEOUT, self.socket.send(Message::Text(wire.into())))
-                            .await
-                            .map_err(|_| NativeError::Transport)?
-                            .map_err(|_| NativeError::Transport)?;
-                        return Err(NativeError::UnsupportedServerRequest);
+        }
+    }
+}
+
+impl Drop for NativeClient {
+    fn drop(&mut self) {
+        if let Some(reader_task) = self.reader_task.take() {
+            reader_task.abort();
+        }
+    }
+}
+
+async fn send_native_packet(writer: &NativeWriter, packet: Value) -> Result<(), NativeError> {
+    let frame = serde_json::to_string(&packet).map_err(|_| NativeError::Protocol)?;
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(NativeError::Protocol);
+    }
+    send_native_frame(writer, Message::Text(frame.into())).await
+}
+
+async fn send_native_frame(writer: &NativeWriter, message: Message) -> Result<(), NativeError> {
+    writer
+        .lock()
+        .await
+        .send(message)
+        .await
+        .map_err(|_| NativeError::Transport)
+}
+
+async fn read_native_messages(
+    mut reader: SplitStream<NativeSocket>,
+    writer: NativeWriter,
+    demux: Arc<NativeRpcDemultiplexer>,
+) {
+    loop {
+        let message = match reader.next().await {
+            Some(Ok(message)) => message,
+            Some(Err(_)) | None => {
+                demux.fail(NativeError::Transport);
+                return;
+            }
+        };
+        match message {
+            Message::Text(text) => {
+                if text.len() > MAX_FRAME_BYTES {
+                    demux.fail(NativeError::Protocol);
+                    return;
+                }
+                let packet = match serde_json::from_str::<Value>(text.as_str()) {
+                    Ok(packet) => packet,
+                    Err(_) => {
+                        demux.fail(NativeError::Protocol);
+                        return;
                     }
                 };
-                let wire = serde_json::to_string(&reply).map_err(|_| NativeError::Protocol)?;
-                if wire.len() > MAX_FRAME_BYTES {
-                    return Err(NativeError::Protocol);
+                if let Some(method) = packet.get("method").and_then(Value::as_str) {
+                    let params = packet.get("params").cloned().unwrap_or(Value::Null);
+                    if let Some(id) = packet.get("id").cloned() {
+                        let reply = match decline_server_request(method, &params) {
+                            Some(result) => json!({"id":id.clone(),"result":result}),
+                            None => json!({
+                                "id":id.clone(),
+                                "error":{"code":-32601,"message":"unsupported server request"}
+                            }),
+                        };
+                        if demux
+                            .queue_event(NativeRpcEvent::ServerRequest {
+                                id,
+                                method: method.to_owned(),
+                                params,
+                                reply: reply.clone(),
+                            })
+                            .is_err()
+                        {
+                            demux.fail(NativeError::DemultiplexerCapacity);
+                            return;
+                        }
+                        if let Err(error) = send_native_packet(&writer, reply).await {
+                            demux.fail(error);
+                            return;
+                        }
+                    } else if demux
+                        .queue_event(NativeRpcDemultiplexer::event_for_notification(
+                            method.to_owned(),
+                            params,
+                        ))
+                        .is_err()
+                    {
+                        demux.fail(NativeError::DemultiplexerCapacity);
+                        return;
+                    }
+                    continue;
                 }
-                timeout(NATIVE_TIMEOUT, self.socket.send(Message::Text(wire.into())))
+                if demux.route_response(packet).is_err() {
+                    demux.fail(NativeError::Protocol);
+                    return;
+                }
+            }
+            Message::Ping(payload) => {
+                if send_native_frame(&writer, Message::Pong(payload))
                     .await
-                    .map_err(|_| NativeError::Transport)?
-                    .map_err(|_| NativeError::Transport)?;
+                    .is_err()
+                {
+                    demux.fail(NativeError::Transport);
+                    return;
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) | Message::Binary(_) | Message::Frame(_) => {
+                demux.fail(NativeError::Protocol);
+                return;
             }
         }
     }
@@ -1833,7 +2871,7 @@ struct HistoryMatch {
 
 enum HistoryRead {
     Complete(Vec<HistoryMatch>),
-    Truncated,
+    Truncated(Vec<HistoryMatch>),
     Failed(NativeError),
 }
 
@@ -1921,13 +2959,13 @@ impl NativeClient {
                     return HistoryRead::Complete(matches);
                 }
                 Some(Value::String(next)) if !seen.insert(next.clone()) => {
-                    return HistoryRead::Truncated;
+                    return HistoryRead::Truncated(matches);
                 }
                 Some(Value::String(next)) => cursor = Some(next.clone()),
                 Some(_) => return HistoryRead::Failed(NativeError::Protocol),
             }
         }
-        HistoryRead::Truncated
+        HistoryRead::Truncated(matches)
     }
 
     async fn read_turn(&mut self, thread_id: &str, turn_id: &str) -> TurnRead {
@@ -2064,33 +3102,6 @@ impl NativeClient {
             }
         }
         AssistantRead::Truncated
-    }
-
-    async fn active_turns(
-        &mut self,
-        thread_id: &str,
-    ) -> Result<(Vec<(String, String)>, bool), NativeError> {
-        let response = self
-            .request(
-                "thread/turns/list",
-                json!({"threadId":thread_id,"limit":20,"sortDirection":"desc"}),
-            )
-            .await?;
-        let data = response["data"].as_array().ok_or(NativeError::Protocol)?;
-        let mut active = Vec::new();
-        for turn in data {
-            let status = turn["status"].as_str().ok_or(NativeError::Protocol)?;
-            if status == "inProgress" {
-                let id = turn["id"].as_str().ok_or(NativeError::Protocol)?;
-                active.push((id.to_owned(), status.to_owned()));
-            }
-        }
-        let page_limited = match response.get("nextCursor") {
-            None | Some(Value::Null) => false,
-            Some(Value::String(cursor)) => !cursor.is_empty(),
-            Some(_) => return Err(NativeError::Protocol),
-        };
-        Ok((active, page_limited))
     }
 }
 
@@ -2300,15 +3311,37 @@ fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), 
 fn prompt_for(command: &RuntimeCommand) -> Result<String, &'static str> {
     let input = &command.input;
     let prompt = if command.method == "task.dispatch" {
-        let canonical = input["task_snapshot_canonical"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("TASK_SNAPSHOT_CANONICAL_REQUIRED")?;
-        let text = input["text"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or("PROMPT_REQUIRED")?;
-        format!("Task specification: {canonical}\n\n{text}")
+        if let Some(value) = input.get("task_prompt") {
+            let envelope: TaskPromptEnvelopeV1 =
+                serde_json::from_value(value.clone()).map_err(|_| "TASK_PROMPT_INVALID")?;
+            envelope
+                .validate_shape()
+                .map_err(|_| "TASK_PROMPT_INVALID")?;
+            let context: TaskDispatchContext = serde_json::from_value(
+                input
+                    .get("task_dispatch_context")
+                    .cloned()
+                    .ok_or("TASK_PROMPT_CONTEXT_REQUIRED")?,
+            )
+            .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
+            context
+                .validate()
+                .map_err(|_| "TASK_PROMPT_CONTEXT_INVALID")?;
+            if context.operation_id != command.operation_id
+                || context.binding_id != command.binding_id
+                || context.binding_generation != command.generation
+                || envelope.attempt_id != context.attempt_id
+                || envelope.task_id != context.task_id
+                || envelope.task_revision != context.task_revision
+                || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
+                || envelope.prompt_sha256 != digest_hex(envelope.prompt.as_bytes())
+            {
+                return Err("TASK_PROMPT_IDENTITY_MISMATCH");
+            }
+            envelope.prompt
+        } else {
+            return Err("TASK_PROMPT_REQUIRED");
+        }
     } else {
         input["text"]
             .as_str()
@@ -2389,7 +3422,11 @@ fn normalized_dispatch_admission(
         &command.operation_id,
         input_sha256,
     )?;
-    let native_payload = serde_json::to_vec(payload).map_err(|_| AdapterError::HostProtocol)?;
+    let prompt = prompt_for(command).map_err(|_| AdapterError::HostProtocol)?;
+    if payload["input"][0]["text"].as_str() != Some(prompt.as_str()) {
+        return Err(AdapterError::HostProtocol);
+    }
+    let native_payload = prompt.as_bytes();
     let receipt = TaskDispatchAdmissionReceipt {
         schema_version: 1,
         module_receipt,
@@ -2403,7 +3440,7 @@ fn normalized_dispatch_admission(
         task_snapshot_sha256: context.task_snapshot_sha256,
         source_text_sha256: context.source_text_sha256,
         source_text_bytes: context.source_text_bytes,
-        native_payload_sha256: digest_hex(&native_payload),
+        native_payload_sha256: digest_hex(native_payload),
         native_payload_bytes: native_payload.len() as u64,
         native_input_id: Some(command.operation_id.clone()),
     };
@@ -2492,6 +3529,31 @@ fn decode_outcome(value: &Value, operation_id: &str) -> RuntimeOutcome {
             json!({"diagnostic_code":"CHECKPOINT_OUTCOME_INVALID","native_replay":false}),
         )
     })
+}
+
+fn annotate_root_applicability(
+    state: &Checkpoint,
+    record: &OperationRecord,
+    outcome: &mut RuntimeOutcome,
+) -> Result<(), AdapterError> {
+    if let Some(applicability) = state.classify_root_applicability(record, outcome)? {
+        outcome.details["root_applicability"] = json!(applicability.as_str());
+    } else if record.method == "agent.open"
+        && outcome.native_root_id.is_some()
+        && outcome.outcome == EffectOutcome::Applied
+    {
+        // Old checkpoints could record a started root from the start reply
+        // alone. Keep that open outcome Unknown until native config readback
+        // proves it is compatible.
+        outcome.outcome = EffectOutcome::Unknown;
+        outcome.details["diagnostic_code"] = json!("ROOT_COMPATIBILITY_UNVERIFIED");
+        outcome.details["completion_condition"] = Value::Null;
+        outcome.details["execution_complete"] = json!(false);
+        outcome.details["task_completion"] = json!("unknown");
+        outcome.details["disposition"] = json!("unknown");
+        outcome.details["native_replay"] = json!(false);
+    }
+    Ok(())
 }
 
 fn receipt_identity_from_outcome(
@@ -2731,6 +3793,8 @@ fn validate_saved_goal_continuation_admission(
 fn base_details(state: &Checkpoint) -> Value {
     json!({
         "module_artifact_id": ARTIFACT_ID,
+        "native_root_phase": state.native_root_phase,
+        "root_operation_id": state.root_operation_id.as_deref(),
         "requested_model_provider": state.requested_model_provider.as_deref(),
         "requested_model": state.requested_model.as_deref(),
         "effective_model_provider": state.effective_model_provider.as_deref(),
@@ -2756,6 +3820,7 @@ fn unknown_send(
         "client_user_message_id": record.client_user_message_id,
         "prompt_sha256": record.prompt_sha256,
         "prompt_bytes": record.prompt_bytes,
+        "prompt_contract_revision": record.prompt_contract_revision,
         "requested_model_provider": record.requested_model_provider,
         "requested_model": record.requested_model,
         "served_model": null,
@@ -2821,9 +3886,12 @@ async fn reconcile_send(
     ) else {
         return unknown_send(record, operation_id, "NATIVE_IDENTITY_UNAVAILABLE");
     };
-    let matches = match native.read_history(root, client_id).await {
-        HistoryRead::Complete(matches) => matches,
-        HistoryRead::Truncated => {
+    let (matches, history_truncated) = match native.read_history(root, client_id).await {
+        HistoryRead::Complete(matches) => (matches, false),
+        HistoryRead::Truncated(matches) if record.delivery.as_deref() == Some("steer") => {
+            (matches, true)
+        }
+        HistoryRead::Truncated(_) => {
             return unknown_send(record, operation_id, "NATIVE_HISTORY_PAGE_LIMIT");
         }
         HistoryRead::Failed(error) => {
@@ -2893,6 +3961,16 @@ async fn reconcile_send(
             record,
             operation_id,
             "NATIVE_ITEM_CONTENT_OR_IDENTITY_MISMATCH",
+        );
+    }
+    if history_truncated {
+        return accepted_after_exact_input(
+            &verified_record,
+            operation_id,
+            &matched.turn_id,
+            &matched.item_id,
+            "NATIVE_HISTORY_PAGE_LIMIT",
+            "not_read_due_to_history_truncation",
         );
     }
     let turn = match native.read_turn(root, &matched.turn_id).await {
@@ -2997,6 +4075,7 @@ async fn reconcile_send(
         "client_user_message_id": client_id,
         "prompt_sha256": expected_digest,
         "prompt_bytes": expected_bytes,
+        "prompt_contract_revision": record.prompt_contract_revision,
         "native_replay": false,
         "native_request_failure_code": record.native_request_failure_code,
         "native_rpc_error_code": record.native_rpc_error_code,
@@ -3071,6 +4150,7 @@ async fn reconcile_send(
 }
 
 async fn reconcile_open(
+    journal: &mut Journal,
     native: &mut NativeClient,
     record: &OperationRecord,
     operation_id: &str,
@@ -3134,10 +4214,8 @@ async fn reconcile_open(
         }
     };
     let observed_cwd = thread["cwd"].as_str();
-    let exact = thread["id"].as_str() == Some(root)
-        && thread["modelProvider"].as_str() == Some(provider)
-        && thread["model"].as_str() == Some(model)
-        && observed_cwd.and_then(normalize_path) == normalize_path(workspace);
+    let adoption = adopt_verified_root(journal, operation_id, scope, root, &thread);
+    let exact = adoption.is_ok();
     let mut details = json!({
         "module_artifact_id": ARTIFACT_ID,
         "native_thread_readback": if exact { "verified" } else { "mismatch" },
@@ -3160,7 +4238,8 @@ async fn reconcile_open(
         }
     });
     if !exact {
-        details["diagnostic_code"] = json!("THREAD_CONFIGURATION_MISMATCH");
+        details["diagnostic_code"] =
+            json!(adoption.err().unwrap_or("THREAD_CONFIGURATION_MISMATCH"));
         return outcome(
             operation_id,
             EffectOutcome::Unknown,
@@ -3240,12 +4319,106 @@ fn rejected_before_input(
     )
 }
 
+fn adopt_verified_root(
+    journal: &mut Journal,
+    operation_id: &str,
+    scope: &str,
+    root: &str,
+    thread: &Value,
+) -> Result<(), &'static str> {
+    if journal.state.native_root_phase == Some(NativeRootPhase::Active)
+        && journal.state.native_root_id.as_deref() != Some(root)
+    {
+        return Err("ACTIVE_ROOT_CONFLICT");
+    }
+    if !matches!(
+        journal.state.native_root_phase,
+        Some(NativeRootPhase::Candidate | NativeRootPhase::Active)
+    ) || journal.state.root_operation_id.as_deref() != Some(operation_id)
+        || journal.state.native_root_id.as_deref() != Some(root)
+    {
+        return Err("OPEN_OPERATION_MISMATCH");
+    }
+    let record = journal
+        .state
+        .operations
+        .get(operation_id)
+        .ok_or("OPEN_OPERATION_MISMATCH")?;
+    let (Some(provider), Some(model), Some(workspace)) = (
+        journal.state.requested_model_provider.as_deref(),
+        journal.state.requested_model.as_deref(),
+        journal.state.workspace_root.as_deref(),
+    ) else {
+        return Err("THREAD_CONFIGURATION_MISMATCH");
+    };
+    if record.method != "agent.open"
+        || record.kind != "open"
+        || record.native_root_id.as_deref() != Some(root)
+    {
+        return Err("OPEN_OPERATION_MISMATCH");
+    }
+    if record.native_scope_key.as_deref() != Some(scope)
+        || journal.state.native_scope_key.as_deref() != Some(scope)
+    {
+        return Err("NATIVE_SCOPE_CHANGED");
+    }
+    if record.requested_model_provider.as_deref() != Some(provider)
+        || record.requested_model.as_deref() != Some(model)
+        || record.workspace_root.as_deref().and_then(normalize_path) != normalize_path(workspace)
+    {
+        return Err("THREAD_CONFIGURATION_MISMATCH");
+    }
+    if thread["id"].as_str() != Some(root)
+        || thread["modelProvider"].as_str() != Some(provider)
+        || thread["model"].as_str() != Some(model)
+        || thread["cwd"].as_str().and_then(normalize_path) != normalize_path(workspace)
+    {
+        return Err("THREAD_CONFIGURATION_MISMATCH");
+    }
+    // This is the sole Pending/Candidate -> Active transition. Its inputs are
+    // the exact open Operation and a fresh native thread/read response.
+    let prior_phase = journal.state.native_root_phase;
+    let prior_effective_provider = journal.state.effective_model_provider.clone();
+    let prior_effective_model = journal.state.effective_model.clone();
+    let prior_readback = journal
+        .state
+        .operations
+        .get(operation_id)
+        .and_then(|record| record.thread_configuration_readback.clone());
+    if let Some(record) = journal.state.operations.get_mut(operation_id) {
+        record.thread_configuration_readback = Some("verified".into());
+    }
+    journal.state.effective_model_provider = Some(provider.to_owned());
+    journal.state.effective_model = Some(model.to_owned());
+    journal.state.native_root_phase = Some(NativeRootPhase::Active);
+    if !journal
+        .state
+        .is_current_root(root, scope, provider, model, workspace)
+    {
+        journal.state.native_root_phase = prior_phase;
+        journal.state.effective_model_provider = prior_effective_provider;
+        journal.state.effective_model = prior_effective_model;
+        if let Some(record) = journal.state.operations.get_mut(operation_id) {
+            record.thread_configuration_readback = prior_readback;
+        }
+        return Err("THREAD_CONFIGURATION_MISMATCH");
+    }
+    if journal.save().is_err() {
+        journal.state.native_root_phase = prior_phase;
+        journal.state.effective_model_provider = prior_effective_provider;
+        journal.state.effective_model = prior_effective_model;
+        if let Some(record) = journal.state.operations.get_mut(operation_id) {
+            record.thread_configuration_readback = prior_readback;
+        }
+        return Err("CHECKPOINT_WRITE_FAILED");
+    }
+    Ok(())
+}
+
 async fn open_operation(
     command: &RuntimeCommand,
     journal: &mut Journal,
-    endpoint: &str,
-    token: Option<&str>,
-    credential_unavailable: bool,
+    native: &mut NativeClient,
 ) -> RuntimeOutcome {
     if command.native_root_id.is_some() {
         return rejected(command, "OPEN_ROOT_ALREADY_ASSIGNED", &journal.state);
@@ -3287,26 +4460,14 @@ async fn open_operation(
             details,
         );
     }
-    if journal.state.native_root_id.is_some() {
+    if journal.state.native_root_phase.is_some() {
         return rejected(command, "THREAD_ALREADY_OPEN", &journal.state);
     }
     let (provider, model, workspace) = match validate_route(command) {
         Ok(route) => route,
         Err(code) => return rejected(command, code, &journal.state),
     };
-    let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
-        Ok(native) => native,
-        Err(error) => {
-            return rejected_before_input(
-                command,
-                &journal.state,
-                &error,
-                "app_server_attach",
-                Some(&provider),
-                Some(&model),
-            );
-        }
-    };
+    let canonical_workspace = normalize_path(&workspace).expect("validated absolute workspace");
     if !native.identity_is_known() {
         return rejected_before_input(
             command,
@@ -3323,11 +4484,15 @@ async fn open_operation(
     record.native_scope_key = Some(scope.clone());
     record.requested_model_provider = Some(provider.clone());
     record.requested_model = Some(model.clone());
-    record.workspace_root = Some(workspace.clone());
+    record.workspace_root = Some(canonical_workspace.clone());
     journal.state.requested_model_provider = Some(provider.clone());
     journal.state.requested_model = Some(model.clone());
-    journal.state.workspace_root = Some(workspace.clone());
+    journal.state.workspace_root = Some(canonical_workspace);
     journal.state.native_scope_key = Some(scope.clone());
+    journal.state.effective_model_provider = None;
+    journal.state.effective_model = None;
+    journal.state.native_root_phase = Some(NativeRootPhase::Pending);
+    journal.state.root_operation_id = Some(command.operation_id.clone());
     journal
         .state
         .operations
@@ -3378,15 +4543,8 @@ async fn open_operation(
             );
         }
     };
-    let thread = &response["thread"];
-    let thread_id = thread["id"].as_str().filter(|s| !s.is_empty());
-    let observed_cwd = thread["cwd"].as_str();
-    let effective_provider = thread["modelProvider"].as_str();
-    let effective_model = thread["model"].as_str();
-    let exact_workspace = observed_cwd
-        .and_then(normalize_path)
-        .zip(normalize_path(&workspace))
-        .is_some_and(|(observed, requested)| observed == requested);
+    let started_thread = &response["thread"];
+    let thread_id = started_thread["id"].as_str().filter(|s| !s.is_empty());
     let Some(thread_id) = thread_id else {
         let mut details = base_details(&journal.state);
         details["diagnostic_code"] = json!("THREAD_START_IDENTITY_MISSING");
@@ -3402,14 +4560,10 @@ async fn open_operation(
         );
     };
     journal.state.native_root_id = Some(thread_id.to_owned());
-    journal.state.effective_model_provider = effective_provider.map(str::to_owned);
-    journal.state.effective_model = effective_model.map(str::to_owned);
+    journal.state.native_root_phase = Some(NativeRootPhase::Candidate);
     if let Some(record) = journal.state.operations.get_mut(&command.operation_id) {
         record.native_root_id = Some(thread_id.to_owned());
     }
-    let config_exact = effective_provider == Some(provider.as_str())
-        && effective_model == Some(model.as_str())
-        && exact_workspace;
     if journal.save().is_err() {
         return outcome(
             &command.operation_id,
@@ -3421,18 +4575,44 @@ async fn open_operation(
             json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false}),
         );
     }
+    let readback = match native.read_thread(thread_id).await {
+        Ok(response) => response["thread"].clone(),
+        Err(error) => {
+            let mut details = base_details(&journal.state);
+            details["diagnostic_code"] = json!(error.diagnostic_code());
+            details["native_replay"] = json!(false);
+            with_native_failure_details(&mut details, &error, "thread_read_after_start");
+            return outcome(
+                &command.operation_id,
+                EffectOutcome::Unknown,
+                Some(thread_id),
+                Some(&scope),
+                None,
+                None,
+                details,
+            );
+        }
+    };
+    let adoption =
+        adopt_verified_root(journal, &command.operation_id, &scope, thread_id, &readback);
     let mut details = base_details(&journal.state);
     details["native_replay"] = json!(false);
+    let adoption_error = adoption.err();
+    details["native_thread_readback"] = json!(if adoption_error.is_none() {
+        "verified"
+    } else {
+        "mismatch"
+    });
     details["thread"] = json!({
         "id": thread_id,
-        "model_provider": effective_provider,
-        "model": effective_model,
-        "cwd": observed_cwd,
-        "workspace_status": if exact_workspace { "workspace_exact" } else { "workspace_mismatch" },
+        "model_provider": readback["modelProvider"],
+        "model": readback["model"],
+        "cwd": readback["cwd"],
+        "workspace_status": if readback["cwd"].as_str().and_then(normalize_path) == normalize_path(&workspace) { "workspace_exact" } else { "workspace_mismatch" },
     });
-    if !config_exact {
-        details["diagnostic_code"] = json!("THREAD_CONFIGURATION_MISMATCH");
-        let result = outcome(
+    if let Some(code) = adoption_error {
+        details["diagnostic_code"] = json!(code);
+        return outcome(
             &command.operation_id,
             EffectOutcome::Unknown,
             Some(thread_id),
@@ -3441,7 +4621,6 @@ async fn open_operation(
             None,
             details,
         );
-        return result;
     }
     details["completion_condition"] = json!("native_thread_opened");
     outcome(
@@ -3458,19 +4637,27 @@ async fn open_operation(
 async fn send_operation(
     command: &RuntimeCommand,
     journal: &mut Journal,
+    native: &mut NativeClient,
     claim: &ModuleContractClaim,
     boot_id: &str,
-    endpoint: &str,
-    token: Option<&str>,
-    credential_unavailable: bool,
 ) -> RuntimeOutcome {
     if let Some(previous) = journal.state.operations.get(&command.operation_id) {
         if let Some(result) = &previous.outcome {
             return decode_outcome(result, &command.operation_id);
         }
-        if previous.native_root_id.as_deref() != journal.state.native_root_id.as_deref()
-            || previous.native_scope_key.as_deref() != journal.state.native_scope_key.as_deref()
-        {
+        let previous_is_current = match (
+            previous.native_root_id.as_deref(),
+            previous.native_scope_key.as_deref(),
+            previous.requested_model_provider.as_deref(),
+            previous.requested_model.as_deref(),
+            previous.workspace_root.as_deref(),
+        ) {
+            (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
+                .state
+                .is_current_root(root, scope, provider, model, workspace),
+            _ => false,
+        };
+        if !previous_is_current {
             return unknown_send(
                 previous,
                 &command.operation_id,
@@ -3495,38 +4682,26 @@ async fn send_operation(
                 "GOAL_CONTINUATION_ADMISSION_INTENT_MISSING",
             );
         }
-        let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
-            Ok(native) => native,
-            Err(error) => {
-                let mut unresolved =
-                    unknown_send(previous, &command.operation_id, error.diagnostic_code());
-                with_native_failure_details(
-                    &mut unresolved.details,
-                    &error,
-                    "send_reconciliation_attach",
-                );
-                return unresolved;
-            }
-        };
         if journal.state.native_scope_key.as_deref() != Some(native.scope_key().as_str()) {
             return unknown_send(previous, &command.operation_id, "NATIVE_SCOPE_CHANGED");
         }
-        return reconcile_send(&mut native, previous, &command.operation_id).await;
+        return reconcile_send(native, previous, &command.operation_id).await;
     }
-    let root = match (
-        journal.state.native_root_id.as_deref(),
-        command.native_root_id.as_deref(),
-    ) {
-        (Some(expected), Some(supplied)) if expected == supplied => expected.to_owned(),
-        _ => return rejected(command, "NATIVE_IDENTITY_MISMATCH", &journal.state),
-    };
     let (provider, model, workspace) = match validate_route(command) {
         Ok(route) => route,
         Err(code) => return rejected(command, code, &journal.state),
     };
-    if journal.state.requested_model_provider.as_deref() != Some(provider.as_str())
-        || journal.state.requested_model.as_deref() != Some(model.as_str())
-        || journal.state.workspace_root.as_deref() != Some(workspace.as_str())
+    let canonical_workspace = normalize_path(&workspace).expect("validated absolute workspace");
+    let root = match (journal.active_root_id(), command.native_root_id.as_deref()) {
+        (Some(expected), Some(supplied)) if expected == supplied => expected.to_owned(),
+        _ => return rejected(command, "NATIVE_IDENTITY_MISMATCH", &journal.state),
+    };
+    let Some(root_scope) = journal.state.native_scope_key.as_deref() else {
+        return rejected(command, "NATIVE_SCOPE_CHANGED", &journal.state);
+    };
+    if !journal
+        .state
+        .is_current_root(&root, root_scope, &provider, &model, &workspace)
     {
         return rejected(command, "ROUTE_CONFIGURATION_MISMATCH", &journal.state);
     }
@@ -3551,19 +4726,6 @@ async fn send_operation(
         }
     } else {
         None
-    };
-    let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
-        Ok(native) => native,
-        Err(error) => {
-            return rejected_before_input(
-                command,
-                &journal.state,
-                &error,
-                "app_server_attach",
-                Some(&provider),
-                Some(&model),
-            );
-        }
     };
     if !native.identity_is_known() {
         return rejected_before_input(
@@ -3601,24 +4763,7 @@ async fn send_operation(
     {
         return rejected(command, "THREAD_CONFIGURATION_MISMATCH", &journal.state);
     }
-    if steer {
-        let (active, limited) = match native.active_turns(&root).await {
-            Ok(result) => result,
-            Err(error) => {
-                return rejected_before_input(
-                    command,
-                    &journal.state,
-                    &error,
-                    "active_turns_preflight",
-                    Some(&provider),
-                    Some(&model),
-                );
-            }
-        };
-        if limited || active.len() != 1 || Some(active[0].0.as_str()) != expected_turn.as_deref() {
-            return rejected(command, "EXPECTED_TURN_NOT_ACTIVE", &journal.state);
-        }
-    } else if thread["status"]["type"] != "idle" {
+    if !steer && thread["status"]["type"] != "idle" {
         return rejected(command, "THREAD_NOT_IDLE", &journal.state);
     }
     let native_payload = native_send_payload(
@@ -3647,10 +4792,15 @@ async fn send_operation(
     record.native_scope_key = Some(scope.clone());
     record.requested_model_provider = Some(provider.clone());
     record.requested_model = Some(model.clone());
-    record.workspace_root = Some(workspace);
+    record.workspace_root = Some(canonical_workspace);
+    record.thread_configuration_readback = Some("verified".into());
     record.client_user_message_id = Some(command.operation_id.clone());
     record.prompt_sha256 = Some(digest);
     record.prompt_bytes = Some(byte_count);
+    if command.method == "task.dispatch" {
+        record.prompt_contract_revision =
+            Some(swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION.to_owned());
+    }
     record.delivery = Some(if steer { "steer" } else { "next_turn" }.into());
     record.expected_turn_id = expected_turn.clone();
     record.dispatch_admission = dispatch_admission;
@@ -3720,17 +4870,15 @@ async fn send_operation(
         .operations
         .get(&command.operation_id)
         .expect("send marker persisted");
-    reconcile_send(&mut native, record, &command.operation_id).await
+    reconcile_send(native, record, &command.operation_id).await
 }
 
 async fn reconcile_operation(
     command: &RuntimeCommand,
     journal: &mut Journal,
+    native: &mut NativeClient,
     target_record: Option<OperationRecord>,
     claim: &ModuleContractClaim,
-    endpoint: &str,
-    token: Option<&str>,
-    credential_unavailable: bool,
 ) -> Result<Vec<RuntimeOutcome>, AdapterError> {
     let Some(input_sha256) = command
         .input_sha256
@@ -3815,6 +4963,8 @@ async fn reconcile_operation(
             target_id,
             target_input_sha256,
         )?;
+        let mut result = result;
+        annotate_root_applicability(&journal.state, &target, &mut result)?;
         Some(result)
     } else {
         None
@@ -3826,38 +4976,46 @@ async fn reconcile_operation(
             EffectOutcome::Applied | EffectOutcome::Rejected
         )
     });
-    let target_context_matches = target.native_root_id.as_deref()
-        == journal.state.native_root_id.as_deref()
-        && target.native_scope_key.as_deref() == journal.state.native_scope_key.as_deref();
+    let target_context_matches = match (
+        target.native_root_id.as_deref(),
+        target.native_scope_key.as_deref(),
+        target.requested_model_provider.as_deref(),
+        target.requested_model.as_deref(),
+        target.workspace_root.as_deref(),
+    ) {
+        (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
+            .state
+            .root_context_matches(root, scope, provider, model, workspace),
+        _ => false,
+    };
+    let target_is_current = match (
+        target.native_root_id.as_deref(),
+        target.native_scope_key.as_deref(),
+        target.requested_model_provider.as_deref(),
+        target.requested_model.as_deref(),
+        target.workspace_root.as_deref(),
+    ) {
+        (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
+            .state
+            .is_current_root(root, scope, provider, model, workspace),
+        _ => false,
+    };
     if target.kind == "send" && !prior_resolved {
         let mut reconciled = None;
-        if target_context_matches {
-            match NativeClient::attach(endpoint, token, credential_unavailable).await {
-                Ok(mut native)
-                    if journal.state.native_scope_key.as_deref()
-                        == Some(native.scope_key().as_str()) =>
-                {
-                    reconciled = Some(reconcile_send(&mut native, &target, target_id).await);
-                }
-                Ok(_) => {
-                    reconciled = Some(unknown_send(&target, target_id, "NATIVE_SCOPE_CHANGED"));
-                }
-                Err(error) => {
-                    let mut unresolved = unknown_send(&target, target_id, error.diagnostic_code());
-                    with_native_failure_details(
-                        &mut unresolved.details,
-                        &error,
-                        "send_reconciliation_attach",
-                    );
-                    reconciled = Some(unresolved);
-                }
+        if target_is_current {
+            if !native.identity_is_known()
+                || journal.state.native_scope_key.as_deref() != Some(native.scope_key().as_str())
+            {
+                reconciled = Some(unknown_send(&target, target_id, "NATIVE_SCOPE_CHANGED"));
+            } else {
+                reconciled = Some(reconcile_send(native, &target, target_id).await);
             }
         }
         let mut result = reconciled.unwrap_or_else(|| {
             unknown_send(
                 &target,
                 target_id,
-                if target_context_matches {
+                if target_is_current {
                     "NATIVE_CLIENT_UNAVAILABLE"
                 } else {
                     "NATIVE_OPERATION_CONTEXT_CHANGED"
@@ -3885,34 +5043,12 @@ async fn reconcile_operation(
         journal.store_outcome(&result, &target.method, &target.kind)?;
         target_result = Some(result);
     }
-    if target.kind == "open" && !prior_resolved {
+    let legacy_candidate_needs_proof = target.kind == "open"
+        && journal.state.native_root_phase == Some(NativeRootPhase::Candidate)
+        && journal.state.root_operation_id.as_deref() == Some(target_id);
+    if target.kind == "open" && (!prior_resolved || legacy_candidate_needs_proof) {
         if target.native_root_id.is_some() && target_context_matches {
-            let mut value =
-                match NativeClient::attach(endpoint, token, credential_unavailable).await {
-                    Ok(mut native) => reconcile_open(&mut native, &target, target_id).await,
-                    Err(error) => {
-                        let mut details = json!({
-                            "diagnostic_code": error.diagnostic_code(),
-                            "native_replay": false,
-                            "requested_model_provider": target.requested_model_provider,
-                            "requested_model": target.requested_model,
-                        });
-                        with_native_failure_details(
-                            &mut details,
-                            &error,
-                            "thread_reconciliation_attach",
-                        );
-                        outcome(
-                            target_id,
-                            EffectOutcome::Unknown,
-                            target.native_root_id.as_deref(),
-                            target.native_scope_key.as_deref(),
-                            None,
-                            None,
-                            details,
-                        )
-                    }
-                };
+            let mut value = reconcile_open(journal, native, &target, target_id).await;
             value.details["reconcile_operation_id"] = json!(command.operation_id.as_str());
             disposition = if matches!(value.outcome, EffectOutcome::Applied) {
                 String::from("native_thread_readback_verified")
@@ -4009,11 +5145,9 @@ async fn reconcile_operation(
 async fn handle_command(
     command: RuntimeCommand,
     journal: &mut Journal,
+    native: &mut NativeClient,
     claim: &ModuleContractClaim,
     boot_id: &str,
-    endpoint: &str,
-    token: Option<&str>,
-    credential_unavailable: bool,
 ) -> Result<Vec<RuntimeOutcome>, AdapterError> {
     let Some(input_sha256) = command
         .input_sha256
@@ -4055,7 +5189,7 @@ async fn handle_command(
             return Ok(Vec::new());
         }
         if let Some(saved) = &record.outcome {
-            let result: RuntimeOutcome =
+            let mut result: RuntimeOutcome =
                 serde_json::from_value(saved.clone()).map_err(|_| AdapterError::Checkpoint)?;
             validate_saved_receipt(
                 &result,
@@ -4068,6 +5202,24 @@ async fn handle_command(
             validate_saved_dispatch_admission(&result, &command, claim, boot_id)?;
             validate_saved_goal_continuation_admission(&result, &command, claim, boot_id)?;
             journal.validate_existing_goal_terminal_event(&result)?;
+            if record.method == "agent.open"
+                && record.kind == "open"
+                && journal.state.native_root_phase == Some(NativeRootPhase::Candidate)
+                && journal.state.root_operation_id.as_deref() == Some(command.operation_id.as_str())
+                && record
+                    .outcome
+                    .as_ref()
+                    .and_then(|saved| serde_json::from_value::<RuntimeOutcome>(saved.clone()).ok())
+                    .is_some_and(|saved| {
+                        matches!(
+                            saved.outcome,
+                            EffectOutcome::Applied | EffectOutcome::Accepted
+                        )
+                    })
+            {
+                return Ok(Vec::new());
+            }
+            annotate_root_applicability(&journal.state, record, &mut result)?;
             return Ok(vec![result]);
         }
     }
@@ -4089,50 +5241,26 @@ async fn handle_command(
         };
         match command.method.as_str() {
             "agent.open" => {
-                let mut result =
-                    open_operation(&command, journal, endpoint, token, credential_unavailable)
-                        .await;
+                let mut result = open_operation(&command, journal, native).await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
             "task.dispatch" | "agent.send" => {
-                let mut result = send_operation(
-                    &command,
-                    journal,
-                    claim,
-                    boot_id,
-                    endpoint,
-                    token,
-                    credential_unavailable,
-                )
-                .await;
+                let mut result = send_operation(&command, journal, native, claim, boot_id).await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
             "agent.reconcile" => {
-                reconcile_operation(
-                    &command,
-                    journal,
-                    reconciliation_target,
-                    claim,
-                    endpoint,
-                    token,
-                    credential_unavailable,
-                )
-                .await?
+                let result =
+                    reconcile_operation(&command, journal, native, reconciliation_target, claim)
+                        .await;
+                journal.capture_native_events()?;
+                result?
             }
             "agent.result" if module_contract::normalized_result_enabled(claim) => {
-                match build_normalized_result_page(
-                    &command,
-                    journal,
-                    claim,
-                    endpoint,
-                    token,
-                    credential_unavailable,
-                )
-                .await
-                {
+                match build_normalized_result_page(&command, journal, native, claim).await {
                     Ok(params) => {
+                        journal.capture_native_events()?;
                         journal.store_result_page(&command.operation_id, input_sha256, params)?;
                         Vec::new()
                     }
@@ -4151,6 +5279,7 @@ async fn handle_command(
             }
         }
     };
+    journal.capture_native_events()?;
     for outcome in &mut result {
         journal.seal_goal_terminal_event(outcome)?;
         let (method, kind) = if outcome.operation_id == command.operation_id {
@@ -4176,10 +5305,8 @@ async fn handle_command(
 async fn build_normalized_result_page(
     command: &RuntimeCommand,
     journal: &Journal,
+    native: &mut NativeClient,
     claim: &ModuleContractClaim,
-    endpoint: &str,
-    token: Option<&str>,
-    credential_unavailable: bool,
 ) -> Result<Value, &'static str> {
     if command.method != "agent.result" || !module_contract::normalized_result_enabled(claim) {
         return Err("CODEX_RESULT_CONTRACT_UNAVAILABLE");
@@ -4413,14 +5540,15 @@ async fn build_normalized_result_page(
         return Err("CODEX_RESULT_DISPATCH_ADMISSION_MISMATCH");
     }
 
-    if journal.state.native_root_id.as_deref() != Some(native_root_id)
-        || journal.state.native_scope_key.as_deref() != Some(native_scope_key)
-    {
+    if !journal.state.is_current_root(
+        native_root_id,
+        native_scope_key,
+        &route_provider,
+        &route_model,
+        &route_workspace,
+    ) {
         return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
     }
-    let mut native = NativeClient::attach(endpoint, token, credential_unavailable)
-        .await
-        .map_err(|error| error.diagnostic_code())?;
     if !native.identity_is_known() || native.scope_key() != native_scope_key {
         return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
     }
@@ -4446,7 +5574,7 @@ async fn build_normalized_result_page(
         .await
     {
         HistoryRead::Complete(matches) => matches,
-        HistoryRead::Truncated => return Err("CODEX_RESULT_HISTORY_TRUNCATED"),
+        HistoryRead::Truncated(_) => return Err("CODEX_RESULT_HISTORY_TRUNCATED"),
         HistoryRead::Failed(error) => return Err(error.diagnostic_code()),
     };
     if history.len() != 1 {
@@ -4590,15 +5718,39 @@ async fn report_pending(
         if batch.is_empty() {
             break;
         }
+        let mut compatibility_deferred = false;
         for result in batch {
-            journal
+            let record = journal
                 .operation_record(&result.operation_id)?
                 .ok_or(AdapterError::Checkpoint)?;
             journal.validate_existing_goal_terminal_event(&result)?;
+            let mut result = result;
+            annotate_root_applicability(&journal.state, &record, &mut result)?;
+            if record.method == "agent.open"
+                && record.kind == "open"
+                && journal.state.native_root_phase == Some(NativeRootPhase::Candidate)
+                && journal.state.root_operation_id.as_deref() == Some(result.operation_id.as_str())
+                && record
+                    .outcome
+                    .as_ref()
+                    .and_then(|saved| serde_json::from_value::<RuntimeOutcome>(saved.clone()).ok())
+                    .is_some_and(|saved| {
+                        matches!(
+                            saved.outcome,
+                            EffectOutcome::Applied | EffectOutcome::Accepted
+                        )
+                    })
+            {
+                compatibility_deferred = true;
+                continue;
+            }
             let operation_id = result.operation_id.clone();
             let value = serde_json::to_value(&result).map_err(|_| AdapterError::Checkpoint)?;
             host.outcome(value).await.map_err(|_| AdapterError::Host)?;
             journal.acknowledge_outcome(&operation_id)?;
+        }
+        if compatibility_deferred {
+            break;
         }
     }
     let pending = journal.next_observation(false, normalized_results)?;
@@ -4635,6 +5787,7 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
         None => None,
     };
     let endpoint = config.endpoint.clone();
+    let mut native: Option<NativeClient> = None;
     loop {
         let mut host = match connect_host(&config, &context, &ipc).await {
             Ok(host) => host,
@@ -4646,8 +5799,8 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
         let hello = json!({
             "boot_id": journal.state.boot_id,
             "module_artifact_id": ARTIFACT_ID,
-            "native_root_id": journal.state.native_root_id,
-            "native_scope_key": journal.state.native_scope_key,
+            "native_root_id": journal.active_root_id(),
+            "native_scope_key": if journal.active_root_id().is_some() { journal.state.native_scope_key.as_deref() } else { None },
             "native_ready": false,
             "managed_owner": context.worker.owner_record.clone(),
         });
@@ -4660,6 +5813,27 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
         };
         module_contract::validate_negotiated_hello(&hello_result, &context)?;
         journal.bind(&context.binding_id, context.generation)?;
+        if native.is_none() {
+            let events = journal.native_event_sink();
+            native = Some(
+                match NativeClient::attach(
+                    &endpoint,
+                    token.as_deref(),
+                    credential_unavailable,
+                    events.clone(),
+                )
+                .await
+                {
+                    Ok(native) => native,
+                    Err(error) => NativeClient::unavailable(error, events),
+                },
+            );
+        }
+        let native = native.as_mut().expect("native session initialized once");
+        if let Err(error) = native.refresh_usage_after_auth_change().await {
+            native.events.record_fault(error.diagnostic_code());
+        }
+        journal.capture_native_events()?;
         let normalized_results = module_contract::normalized_result_enabled(&context.claim);
         match report_pending(&mut host, &mut journal, normalized_results).await {
             Ok(()) => {}
@@ -4674,6 +5848,10 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                 Ok(value) => value,
                 Err(_) => break,
             };
+            if let Err(error) = native.refresh_usage_after_auth_change().await {
+                native.events.record_fault(error.diagnostic_code());
+            }
+            let captured_events = journal.capture_native_events()?;
             if let Some(raw) = response.get("command").filter(|value| !value.is_null()) {
                 let command: RuntimeCommand = match serde_json::from_value(raw.clone()) {
                     Ok(command) => command,
@@ -4682,11 +5860,9 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                 let outcomes = handle_command(
                     command,
                     &mut journal,
+                    native,
                     &context.claim,
                     &context.worker.boot_id,
-                    &endpoint,
-                    token.as_deref(),
-                    credential_unavailable,
                 )
                 .await?;
                 for result in outcomes {
@@ -4698,6 +5874,12 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                     }
                     journal.acknowledge_outcome(&operation_id)?;
                 }
+                match report_pending(&mut host, &mut journal, normalized_results).await {
+                    Ok(()) => {}
+                    Err(AdapterError::Host) => break,
+                    Err(error) => return Err(error),
+                }
+            } else if captured_events {
                 match report_pending(&mut host, &mut journal, normalized_results).await {
                     Ok(()) => {}
                     Err(AdapterError::Host) => break,

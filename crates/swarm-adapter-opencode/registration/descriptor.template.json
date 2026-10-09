@@ -3,7 +3,7 @@
   "module_id": "eliot.opencode.v2",
   "artifact": {
     "artifact_id": "eliot-opencode-v2.rust-http.1",
-    "version": "0.3.0",
+    "version": "0.5.0",
     "build_id": null
   },
   "launch": {
@@ -20,8 +20,8 @@
   },
   "config_schema": {
     "schema_id": "opencode-v2-native-options",
-    "version": "2",
-    "sha256": "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68"
+    "version": "3",
+    "sha256": "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e"
   },
   "workspace_option": {
     "schema_version": 1,
@@ -31,11 +31,15 @@
   "command_schemas": [
     {"schema_id": "swarm.native_mcp_command", "version": "1"},
     {"schema_id": "swarm.normalized_result_context", "version": "1"},
+    {"schema_id": "swarm.opencode_loop_step_command", "version": "1"},
+    {"schema_id": "swarm.opencode_reply_command", "version": "1"},
     {"schema_id": "swarm.runtime_command", "version": "1"},
-    {"schema_id": "swarm.task_dispatch_context", "version": "1"}
+    {"schema_id": "swarm.task_dispatch_context", "version": "1"},
+    {"schema_id": "swarm.task_prompt", "version": "1"}
   ],
   "event_schemas": [
     {"schema_id": "swarm.normalized_result_page", "version": "1"},
+    {"schema_id": "swarm.opencode_interaction_observation", "version": "1"},
     {"schema_id": "swarm.runtime_outcome", "version": "1"},
     {"schema_id": "swarm.task_dispatch_admission", "version": "1"}
   ],
@@ -44,14 +48,18 @@
     "maximum": {"major": 1, "minor": 0}
   },
   "capabilities": [
+    "agent.background",
     "agent.open",
     "agent.reconcile",
+    "agent.refresh",
+    "agent.reply",
     "agent.result",
     "agent.send/next_turn",
     "native.mcp.arm",
     "native.mcp.install",
     "native.mcp.observe",
     "native.mcp.read",
+    "native.opencode.loop_step",
     "task.dispatch"
   ],
   "lifecycle": "owned_service",

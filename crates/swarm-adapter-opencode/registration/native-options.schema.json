@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://eliot.invalid/schemas/opencode-v2-native-options/2",
+  "$id": "https://eliot.invalid/schemas/opencode-v2-native-options/3",
   "title": "OpenCode V2 binding launch values",
   "description": "Values passed individually as ELIOT_SWARM_CONFIG_<KEY>; they are copied from the exact immutable OpenCode route and are not synthesized by the supervisor.",
   "type": "object",
@@ -8,7 +8,6 @@
   "required": [
     "OPENCODE_SERVICE_ID",
     "OPENCODE_CONNECTION_FILE",
-    "OPENCODE_EXPECTED_VERSION",
     "OPENCODE_DIRECTORY",
     "OPENCODE_MODEL_ID",
     "OPENCODE_PROVIDER_ID",
@@ -28,12 +27,6 @@
       "maxLength": 4096,
       "pattern": "^(?:[A-Za-z]:\\\\|/)",
       "description": "Absolute path to the existing operator-owned OpenCode connection record."
-    },
-    "OPENCODE_EXPECTED_VERSION": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 256,
-      "description": "Exact expected version reported by the attached server."
     },
     "OPENCODE_DIRECTORY": {
       "type": "string",

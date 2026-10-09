@@ -900,6 +900,23 @@ export function createAdapter(config, env = process.env) {
     return { state, fields };
   }
 
+  function outcomeFromReadback(record) {
+    // A response receipt or a merely non-mismatching observation is not
+    // enough: every requested field needs exact native GET verification.
+    if (record.verification?.state === 'verified') {
+      record.outcome = 'applied';
+      delete record.reason;
+      delete record.code;
+      return;
+    }
+    record.outcome = 'unknown';
+    if (!record.reason) {
+      record.reason = record.verification?.state === 'mismatch'
+        ? 'configuration_readback_mismatch'
+        : 'configuration_readback_incomplete';
+    }
+  }
+
   function setEqual(a, b) {
     if (!Array.isArray(a) || !Array.isArray(b)) return false;
     const left = [...a].sort();
@@ -993,6 +1010,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) record.verification = protocolVerification(leaves, after);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status !== 200) return finish(refuseFromResponse(record, result));
@@ -1000,7 +1018,7 @@ export function createAdapter(config, env = process.env) {
     const after = await protocolCurrent(record);
     record.readback = { before, after };
     record.verification = protocolVerification(leaves, after);
-    record.outcome = record.verification.state === 'mismatch' ? 'partial' : 'applied';
+    outcomeFromReadback(record);
     return finish(record);
   }
 
@@ -1016,7 +1034,7 @@ export function createAdapter(config, env = process.env) {
     return { model: row, clientIntegrations: integrations };
   }
 
-  function modelVerification(request, readback, receipt) {
+  function modelVerification(request, readback) {
     const fields = {};
     const row = readback?.model;
     if (request.contextWindow !== undefined) {
@@ -1034,20 +1052,14 @@ export function createAdapter(config, env = process.env) {
           ? 'verified' : 'mismatch')
         : 'not_checked';
     }
-    // The ladder and default have no declared readback field on the
-    // model row (row values are effective); the receipt's stored-state
-    // echo is the evidence for those two axes.
+    // The ladder and default have no exact declared readback field on
+    // the model row. The mutation receipt is not a native readback, so
+    // it cannot verify either requested axis.
     if (request.reasoningEfforts !== undefined) {
-      fields.reasoningEfforts = receipt
-        ? (setEqual(receipt.reasoningEfforts ?? [], request.reasoningEfforts ?? [])
-          || (request.reasoningEfforts === null && receipt.reasoningEfforts === null)
-          ? 'verified' : 'mismatch')
-        : 'not_checked';
+      fields.reasoningEfforts = 'not_checked';
     }
     if (request.defaultReasoningEffort !== undefined) {
-      fields.defaultReasoningEffort = receipt
-        ? (receipt.defaultReasoningEffort === request.defaultReasoningEffort ? 'verified' : 'mismatch')
-        : 'not_checked';
+      fields.defaultReasoningEffort = 'not_checked';
     }
     return verifyFields(fields);
   }
@@ -1080,11 +1092,12 @@ export function createAdapter(config, env = process.env) {
       record.reason = result.reason;
       const readback = await modelReadback(record, request.provider, request.modelId);
       record.readback = readback;
-      record.verification = modelVerification(request, readback, null);
+      record.verification = modelVerification(request, readback);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
-    if (result.status !== 200) {
+    if (result.status !== 200 && result.status !== 207) {
       // e.g. 500: upstream states the save failed and live config is
       // unchanged; the refusal is recorded, nothing is retried.
       return finish(refuseFromResponse(record, result));
@@ -1093,12 +1106,16 @@ export function createAdapter(config, env = process.env) {
     record.elements = normalizeIntegrationOutcomes(result.body);
     const readback = await modelReadback(record, request.provider, request.modelId);
     record.readback = readback;
-    record.verification = modelVerification(request, readback, record.receipt);
-    const elementFailures = (record.elements ?? []).some((entry) => entry.ok === false);
+    record.verification = modelVerification(request, readback);
+    outcomeFromReadback(record);
+    const elementResults = record.elements ?? [];
+    const elementFailures = elementResults.some((entry) => entry.ok !== true)
+      || (result.status === 207 && elementResults.length === 0);
     const refreshFailed = record.receipt?.catalogRefresh?.status === 'failed';
-    record.outcome = elementFailures || refreshFailed || record.verification.state === 'mismatch'
-      ? 'partial'
-      : 'applied';
+    if (elementFailures || refreshFailed) {
+      record.outcome = 'unknown';
+      if (!record.reason) record.reason = 'model_settings_followup_incomplete';
+    }
     // saved (this request published config) and applied (per-client
     // integration files after catalog convergence) stay separate
     // facts; neither is inferred from the other.
@@ -1185,6 +1202,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) record.verification = verify(after);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status === 200) {
@@ -1193,7 +1211,7 @@ export function createAdapter(config, env = process.env) {
       const after = afterResult.ok ? normalizeV2State(afterResult.body) : null;
       record.readback = { before, after };
       record.verification = verify(after);
-      record.outcome = record.verification.state === 'mismatch' ? 'partial' : 'applied';
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status === 502) {
@@ -1206,8 +1224,8 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) {
         record.verification = verify(after);
-        if (record.verification.state === 'verified') record.outcome = 'partial';
       }
+      outcomeFromReadback(record);
       return finish(record);
     }
     return finish(refuseFromResponse(record, result));
@@ -1267,6 +1285,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) record.verification = verify(after);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status !== 200) return finish(refuseFromResponse(record, result));
@@ -1275,7 +1294,7 @@ export function createAdapter(config, env = process.env) {
     const after = afterResult.ok ? normalizeInjectionModel(afterResult.body) : null;
     record.readback = { before, after };
     record.verification = verify(after);
-    record.outcome = record.verification.state === 'mismatch' ? 'partial' : 'applied';
+    outcomeFromReadback(record);
     return finish(record);
   }
 
@@ -1324,6 +1343,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) record.verification = verify(after);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status !== 200) return finish(refuseFromResponse(record, result));
@@ -1332,7 +1352,7 @@ export function createAdapter(config, env = process.env) {
     const after = afterResult.ok ? normalizeEffortCaps(afterResult.body) : null;
     record.readback = { before, after };
     record.verification = verify(after);
-    record.outcome = record.verification.state === 'mismatch' ? 'partial' : 'applied';
+    outcomeFromReadback(record);
     return finish(record);
   }
 
@@ -1366,6 +1386,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) record.verification = verify(after);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status !== 200) return finish(refuseFromResponse(record, result));
@@ -1374,7 +1395,7 @@ export function createAdapter(config, env = process.env) {
     const after = afterResult.ok ? normalizeSubagentModels(afterResult.body) : null;
     record.readback = { before, after };
     record.verification = verify(after);
-    record.outcome = record.verification.state === 'mismatch' ? 'partial' : 'applied';
+    outcomeFromReadback(record);
     return finish(record);
   }
 
@@ -1421,6 +1442,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { before, after };
       if (after) record.verification = verify(after);
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (result.status !== 200) return finish(refuseFromResponse(record, result));
@@ -1429,7 +1451,7 @@ export function createAdapter(config, env = process.env) {
     const after = afterResult.ok ? normalizeSubagentFallback(afterResult.body) : null;
     record.readback = { before, after };
     record.verification = verify(after);
-    record.outcome = record.verification.state === 'mismatch' ? 'partial' : 'applied';
+    outcomeFromReadback(record);
     return finish(record);
   }
 
@@ -1578,12 +1600,12 @@ export function createAdapter(config, env = process.env) {
       record.reason = result.reason;
       const after = await integrationStateRead(record, request, paths);
       record.readback = { after };
-      if (after && paths.expectedState) {
-        record.verification = verifyFields({
-          state: after.state === paths.expectedState ? 'verified' : 'observed',
-        });
-      }
+      record.verification = verifyFields({
+        state: after && paths.expectedState !== null ?
+          (after.state === paths.expectedState ? 'verified' : 'mismatch') : 'not_checked',
+      });
       record.verification.reconciledByRead = true;
+      outcomeFromReadback(record);
       return finish(record);
     }
     if (isStale(result)) {
@@ -1593,7 +1615,7 @@ export function createAdapter(config, env = process.env) {
       record.readback = { after };
       return finish(staleFromResponse(record, result));
     }
-    if (result.status !== 200) {
+    if (result.status !== 200 && result.status !== 207) {
       const refused = refuseFromResponse(record, result);
       refused.receipt = normalizeIntegrationOutcome(result.body);
       refused.elements = normalizeIntegrationOutcomes(result.body);
@@ -1605,13 +1627,20 @@ export function createAdapter(config, env = process.env) {
     record.elements = normalizeIntegrationOutcomes(result.body);
     const after = await integrationStateRead(record, request, paths);
     record.readback = { after };
-    if (after && record.receipt?.state) {
-      record.verification = verifyFields({
-        state: after.state === record.receipt.state ? 'verified' : 'mismatch',
-      });
+    const expectedState = paths.expectedState ?? record.receipt?.state ?? null;
+    record.verification = verifyFields({
+      state: after && expectedState !== null
+        ? (after.state === expectedState ? 'verified' : 'mismatch')
+        : 'not_checked',
+    });
+    outcomeFromReadback(record);
+    const elementResults = record.elements ?? [];
+    const elementFailures = elementResults.some((entry) => entry.ok !== true)
+      || (result.status === 207 && elementResults.length === 0);
+    if (elementFailures) {
+      record.outcome = 'unknown';
+      if (!record.reason) record.reason = 'integration_elements_incomplete';
     }
-    const elementFailures = (record.elements ?? []).some((entry) => entry.ok === false);
-    record.outcome = elementFailures || record.verification.state === 'mismatch' ? 'partial' : 'applied';
     return finish(record);
   }
 

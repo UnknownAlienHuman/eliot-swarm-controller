@@ -121,6 +121,18 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::CoordinationMutation,
     },
     MethodPolicy {
+        method: "coordination.contract.ratify",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "coordination.contract.reject",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "coordination.contract.get",
         class: MethodClass::ReadOnly,
         mcp: true,
@@ -422,6 +434,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
     },
     MethodPolicy {
         method: "agent.state",
+        class: MethodClass::ReadOnly,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "agent.usage",
         class: MethodClass::ReadOnly,
         mcp: true,
         participant: ParticipantAccess::None,
@@ -736,6 +754,24 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         method: "agent.reply",
         class: MethodClass::Mutation,
         mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "native.opencode.loop_step",
+        class: MethodClass::Mutation,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "native.command.cancel_turn",
+        class: MethodClass::Mutation,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "native.command.close_session",
+        class: MethodClass::Mutation,
+        mcp: false,
         participant: ParticipantAccess::None,
     },
     MethodPolicy {

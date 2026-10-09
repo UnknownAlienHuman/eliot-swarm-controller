@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use swarm_contracts::runtime::RuntimeCommand;
 
-use crate::wire::REQUIRED_MODEL_ID;
-
 /// A validated direct-child launch request. Only this module can construct the
 /// fixed argv from a manager-owned RuntimeCommand; the Tokio spawner inherits
 /// the verified module runner's non-killing process group/job.
@@ -50,11 +48,7 @@ pub fn build_launch_spec(
         .filter(|path| path.is_absolute() && bounded_path_text(path))
         .ok_or("WORKSPACE_ROOT_MUST_BE_ABSOLUTE")?;
 
-    let requested_model = options
-        .get("modelId")
-        .and_then(Value::as_str)
-        .filter(|model| *model == REQUIRED_MODEL_ID)
-        .ok_or("UNSUPPORTED_MODEL_ID")?;
+    let requested_model = selected_model_id(&command.route)?;
 
     let mut args = vec![
         "--input-format".to_owned(),
@@ -101,6 +95,22 @@ pub fn build_launch_spec(
         shell: false,
         kill_on_drop: false,
     })
+}
+
+pub fn selected_model_id(route: &Value) -> Result<&str, &'static str> {
+    let options = route
+        .get("native_options")
+        .and_then(Value::as_object)
+        .ok_or("NATIVE_OPTIONS_REQUIRED")?;
+    let model = options
+        .get("modelId")
+        .and_then(Value::as_str)
+        .ok_or("MODEL_ID_REQUIRED")?;
+    if model.trim().is_empty() || model.chars().count() > 256 || model.chars().any(char::is_control)
+    {
+        return Err("INVALID_MODEL_ID");
+    }
+    Ok(model)
 }
 
 fn bounded_option_string(value: &Value, max_chars: usize) -> Option<String> {

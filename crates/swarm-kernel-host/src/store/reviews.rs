@@ -21,6 +21,25 @@ use std::collections::BTreeSet;
 use swarm_kernel::reviews as review_contract;
 
 const REVIEW_STREAM: &str = "controller:review";
+const REVIEW_LIST_SCAN_MAX: i64 = 512;
+const REVIEW_LIST_RESPONSE_MAX_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Copy)]
+enum ReviewReplacementClass {
+    Unanswered,
+    Inconclusive,
+    ReturnedForCorrection,
+}
+
+impl ReviewReplacementClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unanswered => "unanswered",
+            Self::Inconclusive => "inconclusive",
+            Self::ReturnedForCorrection => "returned_for_correction",
+        }
+    }
+}
 
 /// A public Principal is accepted only for direct manager/operator requests.
 /// Automatic actions use a retained context constructed by the Store.
@@ -148,6 +167,206 @@ fn exact_scope(identity: &ReviewSlotIdentity, assignment_id: &str) -> Value {
 
 fn slot_meta_key(identity: &ReviewSlotIdentity) -> Result<String> {
     Ok(format!("review:slot:{}", identity.digest()?))
+}
+
+fn current_slot_pointer(
+    db: &Connection,
+    identity: &ReviewSlotIdentity,
+) -> Result<Option<(String, String)>> {
+    let key = slot_meta_key(identity)?;
+    let raw: Option<String> = db
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let pointer: Value = serde_json::from_str(&raw).map_err(|_| {
+        Error::new(
+            "REVIEW_SLOT_DAMAGED",
+            "current review slot pointer is not valid JSON",
+        )
+    })?;
+    let slot_key = identity.digest()?;
+    let assignment_id = pointer
+        .get("review_assignment_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "REVIEW_SLOT_DAMAGED",
+                "current review slot pointer has no assignment ID",
+            )
+        })?;
+    if pointer["slot_key"] != slot_key || pointer["identity"] != json!(identity) {
+        return Err(Error::new(
+            "REVIEW_SLOT_DAMAGED",
+            "current review slot pointer differs from its exact slot identity",
+        ));
+    }
+    Ok(Some((raw, assignment_id.to_owned())))
+}
+
+fn require_retained_reviewer_scope(
+    db: &Connection,
+    principal: &Principal,
+    identity: &ReviewSlotIdentity,
+    assignment_id: &str,
+) -> Result<()> {
+    let Some((_, current_assignment_id)) = current_slot_pointer(db, identity)? else {
+        return Err(Error::new(
+            "REVIEW_SLOT_DAMAGED",
+            "retained review assignment has no current slot pointer",
+        ));
+    };
+    let scope = exact_scope(identity, assignment_id);
+    if current_assignment_id == assignment_id {
+        coordination::require_review_scope(db, principal, assignment_id, &scope)
+    } else {
+        coordination::require_historical_review_result_scope(db, principal, assignment_id, &scope)
+    }
+}
+
+fn authorize_direct_successor_read(
+    db: &Connection,
+    principal: &Principal,
+    predecessor_assignment_id: &str,
+    identity: &ReviewSlotIdentity,
+) -> Result<bool> {
+    let Some(registration) = meta(db, &format!("client:{}", principal.client_id))? else {
+        return Ok(false);
+    };
+    let Some(scope) = registration
+        .get("participation_basis")
+        .and_then(|basis| basis.get("review_scope"))
+    else {
+        return Ok(false);
+    };
+    let Some(successor_assignment_id) = scope.get("review_assignment_id").and_then(Value::as_str)
+    else {
+        return Ok(false);
+    };
+    if successor_assignment_id == predecessor_assignment_id {
+        return Ok(false);
+    }
+    let successor = assignment_observation(db, successor_assignment_id)?;
+    if successor["reviewer_client_id"] != principal.client_id
+        || successor["supersedes_review_assignment_id"] != predecessor_assignment_id
+        || successor["identity"] != json!(identity)
+    {
+        return Ok(false);
+    }
+    let successor_identity: ReviewSlotIdentity =
+        serde_json::from_value(successor["identity"].clone())?;
+    require_retained_reviewer_scope(db, principal, &successor_identity, successor_assignment_id)?;
+    Ok(true)
+}
+
+fn replacement_class(
+    tx: &Transaction<'_>,
+    assignment_id: &str,
+    previous: &Value,
+    identity: &ReviewSlotIdentity,
+) -> Result<(ReviewReplacementClass, Option<Value>, Option<Value>)> {
+    let prior_result = result_observation(tx, assignment_id)?;
+    let prior_disposition = latest_disposition(tx, assignment_id)?;
+    let Some(result) = prior_result.as_ref() else {
+        if !prior_disposition.is_null() {
+            return Err(Error::new(
+                "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
+                "an unanswered assignment cannot have a retained result disposition",
+            ));
+        }
+        return Ok((ReviewReplacementClass::Unanswered, None, None));
+    };
+    if result["identity"] != previous["identity"] || result["identity"] != json!(identity) {
+        return Err(Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "prior result does not match the exact current review assignment",
+        ));
+    }
+    let verdict = result["result"]["verdict"].as_str().map(str::to_owned);
+    match verdict.as_deref() {
+        Some("inconclusive") => {
+            if !prior_disposition.is_null() {
+                return Err(Error::new(
+                    "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
+                    "an inconclusive result cannot be replaced through a correction disposition",
+                ));
+            }
+            Ok((ReviewReplacementClass::Inconclusive, prior_result, None))
+        }
+        Some("changes_requested") => {
+            if prior_disposition.is_null() {
+                return Err(Error::new(
+                    "REVIEW_REPLACEMENT_UNDISPOSED",
+                    "replacement of a changes_requested result requires its retained manager disposition",
+                ));
+            }
+            if prior_disposition["review_assignment_id"] != assignment_id
+                || prior_disposition["identity"] != json!(identity)
+                || prior_disposition["review_result_operation_id"] != result["operation_id"]
+                || prior_disposition["disposition"]
+                    != review_contract::ReviewDisposition::ReturnForCorrection.as_str()
+            {
+                return Err(Error::new(
+                    "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
+                    "prior disposition does not authorize replacement of this exact returned result",
+                ));
+            }
+            Ok((
+                ReviewReplacementClass::ReturnedForCorrection,
+                prior_result,
+                Some(prior_disposition),
+            ))
+        }
+        Some("pass") => Err(Error::new(
+            "REVIEW_REPLACEMENT_NOT_ALLOWED",
+            "a passing review assignment cannot be replaced through this path",
+        )),
+        _ => Err(Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "prior review result has an unsupported verdict",
+        )),
+    }
+}
+
+fn compare_and_set_slot_pointer(
+    tx: &Transaction<'_>,
+    slot_record_key: &str,
+    slot_key: &str,
+    identity: &ReviewSlotIdentity,
+    assignment_id: &str,
+    expected_pointer: Option<&str>,
+) -> Result<()> {
+    let value = model::canonical(&json!({
+        "review_assignment_id":assignment_id,
+        "slot_key":slot_key,
+        "identity":identity,
+    }))?;
+    let changed = if let Some(expected_pointer) = expected_pointer {
+        tx.execute(
+            "UPDATE meta SET value_json=?2 WHERE key=?1 AND value_json=?3",
+            params![slot_record_key, value, expected_pointer],
+        )?
+    } else {
+        tx.execute(
+            "INSERT INTO meta(key,value_json) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+            params![slot_record_key, value],
+        )?
+    };
+    if changed != 1 {
+        return Err(Error::new(
+            if expected_pointer.is_some() {
+                "REVIEW_REPLACEMENT_STALE"
+            } else {
+                "REVIEW_SLOT_CONFLICT"
+            },
+            "review slot pointer changed before the assignment could be committed",
+        ));
+    }
+    Ok(())
 }
 
 fn assignment_observation(db: &Connection, assignment_id: &str) -> Result<Value> {
@@ -335,14 +554,12 @@ pub(crate) fn reserve_assign(
     }
     let slot_key = context.identity.digest()?;
     let slot_record_key = slot_meta_key(&context.identity)?;
-    let existing_id = meta(tx, &slot_record_key)?.and_then(|record| {
-        record
-            .get("review_assignment_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
+    let current_pointer = current_slot_pointer(tx, &context.identity)?;
+    let existing_id = current_pointer
+        .as_ref()
+        .map(|(_, assignment_id)| assignment_id.as_str());
 
-    if let Some(existing_id) = existing_id.as_deref() {
+    if let Some(existing_id) = existing_id {
         let previous = assignment_observation(tx, existing_id)?;
         let previous_identity = &previous["identity"];
         if previous["slot_key"].as_str() != Some(slot_key.as_str())
@@ -388,9 +605,7 @@ pub(crate) fn reserve_assign(
                 ));
             }
             if same_target {
-                let mut result = previous.clone();
-                result["operation_id"] = json!(operation_id);
-                result["coalesced"] = json!(true);
+                let result = assignment_receipt(&previous, operation_id, true)?;
                 tx.execute(
                     "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
                     params![operation_id, context.identity.task_id, context.identity.attempt_id, model::canonical(&json!({"review_assignment":result,"on_behalf":on_behalf}))?],
@@ -402,43 +617,30 @@ pub(crate) fn reserve_assign(
                 "this exact candidate slot already has a different reviewer; an explicit prior disposition is required",
             ));
         }
-        let previous_result = result_observation(tx, existing_id)?.ok_or_else(|| {
-            Error::new(
-                "REVIEW_REPLACEMENT_UNDISPOSED",
-                "an unresolved assignment cannot be replaced without observed prior disposition",
-            )
-        })?;
-        let disposition_key = format!("disposition:{existing_id}");
-        let prior_disposition: Option<String> = tx
-            .query_row(
-                "SELECT payload_json FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind='review.disposition'",
-                params![REVIEW_STREAM, disposition_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(prior_disposition) = prior_disposition else {
-            return Err(Error::new(
-                "REVIEW_REPLACEMENT_UNDISPOSED",
-                "replacement requires an already retained manager disposition for the prior result",
-            ));
-        };
-        let prior_disposition: Value = serde_json::from_str(&prior_disposition)?;
-        review_contract::validate_disposition(&prior_disposition).map_err(|_| {
-            Error::new(
-                "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
-                "prior disposition does not authorize replacement of this exact returned result",
-            )
-        })?;
-        if prior_disposition["review_assignment_id"] != existing_id
-            || prior_disposition["identity"] != json!(context.identity)
-            || prior_disposition["review_result_operation_id"] != previous_result["operation_id"]
-            || prior_disposition["disposition"]
-                != review_contract::ReviewDisposition::ReturnForCorrection.as_str()
+        let (replacement_class, prior_result, prior_disposition) =
+            replacement_class(tx, existing_id, &previous, &context.identity)?;
+        if matches!(
+            replacement_class,
+            ReviewReplacementClass::ReturnedForCorrection
+        ) && context.attempt["state"] != "needs_correction"
         {
             return Err(Error::new(
                 "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
-                "prior disposition does not authorize replacement of this exact returned result",
+                "returned-for-correction replacement requires the same Attempt in needs_correction",
             ));
+        }
+        let mut replacement_context = json!({
+            "class":replacement_class.as_str(),
+            "reason":request.replacement_reason,
+            "evidence_refs":request.replacement_evidence_refs,
+        });
+        if let Some(result) = prior_result {
+            replacement_context["prior_review_result_operation_id"] =
+                result["operation_id"].clone();
+        }
+        if let Some(disposition) = prior_disposition {
+            replacement_context["prior_disposition_operation_id"] =
+                disposition["operation_id"].clone();
         }
         let reviewer_id = resolve_request_reviewer(
             tx,
@@ -464,13 +666,10 @@ pub(crate) fn reserve_assign(
             &reviewer_id,
             request.review_profile.as_deref(),
             Some(existing_id),
-            Some(json!({
-                "reason":request.replacement_reason,
-                "evidence_refs":request.replacement_evidence_refs,
-                "prior_disposition_operation_id":prior_disposition["operation_id"],
-            })),
+            Some(replacement_context),
             &slot_key,
             &slot_record_key,
+            current_pointer.as_ref().map(|(raw, _)| raw.as_str()),
         );
     }
 
@@ -501,6 +700,7 @@ pub(crate) fn reserve_assign(
         None,
         &slot_key,
         &slot_record_key,
+        None,
     )
 }
 
@@ -527,6 +727,36 @@ fn resolve_request_reviewer(
     }
 }
 
+fn assignment_receipt(assignment: &Value, operation_id: &str, coalesced: bool) -> Result<Value> {
+    if assignment["assignment_state"] != "assigned"
+        || model::text(assignment, "review_assignment_id").is_err()
+        || assignment["identity"].as_object().is_none()
+        || model::text(assignment, "sponsor_client_id").is_err()
+        || model::text(assignment, "technical_requester_id").is_err()
+        || model::text(assignment, "reviewer_client_id").is_err()
+    {
+        return Err(Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "retained assignment cannot produce a public assignment receipt",
+        ));
+    }
+    Ok(json!({
+        "operation_id":operation_id,
+        "review_assignment_id":assignment["review_assignment_id"],
+        "identity":assignment["identity"],
+        "sponsor_client_id":assignment["sponsor_client_id"],
+        "technical_requester_id":assignment["technical_requester_id"],
+        "reviewer_client_id":assignment["reviewer_client_id"],
+        "review_profile":assignment["review_profile"],
+        "state":"assigned",
+        "coalesced":coalesced,
+        "supersedes_review_assignment_id":assignment["supersedes_review_assignment_id"],
+        "replacement_context":assignment["replacement_context"],
+        "task_transition":"none",
+        "on_behalf":assignment["on_behalf"],
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_assignment(
     tx: &Transaction<'_>,
@@ -542,15 +772,8 @@ fn create_assignment(
     replacement_context: Option<Value>,
     slot_key: &str,
     slot_record_key: &str,
+    expected_pointer: Option<&str>,
 ) -> Result<Value> {
-    let reviewer_registration = meta(tx, &format!("client:{reviewer_id}"))?
-        .ok_or_else(|| Error::new("REVIEW_AUDITOR_UNAVAILABLE", "reviewer is not registered"))?;
-    if reviewer_registration["disabled"] == true {
-        return Err(Error::new(
-            "REVIEW_AUDITOR_UNAVAILABLE",
-            "reviewer credential is disabled",
-        ));
-    }
     let assignment_id = model::new_id();
     let scope = pending_scope(&context.identity);
     let mut assignment = json!({
@@ -578,33 +801,21 @@ fn create_assignment(
         "assignment_state":"assigned",
         "on_behalf":on_behalf,
     });
-    let result = json!({
-        "operation_id":operation_id,
-        "review_assignment_id":assignment_id,
-        "identity":context.identity,
-        "sponsor_client_id":sponsor_id,
-        "technical_requester_id":technical_requester_id,
-        "reviewer_client_id":reviewer_id,
-        "review_profile":review_profile,
-        "state":"assigned",
-        "coalesced":false,
-        "supersedes_review_assignment_id":supersedes,
-        "replacement_context":replacement_context,
-        "task_transition":"none",
-        "on_behalf":on_behalf,
-    });
+    coordination::bind_review_assignment(tx, reviewer_id, &assignment_id, sponsor_id, &scope)?;
+    let result = assignment_receipt(&assignment, operation_id, false)?;
     assignment["result"] = result.clone();
     let event_key = format!("assignment:{assignment_id}");
     tx.execute(
         "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,'review.assignment',?4,?5)",
         params![REVIEW_STREAM, event_key, operation_id, model::canonical(&assignment)?, now],
     )?;
-    // Registration binds only after this transaction has retained the exact
-    // slot evidence; it remains ineffective until Operation commit/settlement.
-    coordination::bind_review_assignment(tx, reviewer_id, &assignment_id, sponsor_id, &scope)?;
-    tx.execute(
-        "INSERT INTO meta(key,value_json) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
-        params![slot_record_key, model::canonical(&json!({"review_assignment_id":assignment_id,"slot_key":slot_key,"identity":context.identity}))?],
+    compare_and_set_slot_pointer(
+        tx,
+        slot_record_key,
+        slot_key,
+        &context.identity,
+        &assignment_id,
+        expected_pointer,
     )?;
     tx.execute(
         "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
@@ -683,7 +894,7 @@ pub(crate) fn reserve_submit(
             "this assigned review attempt already retained a different result",
         ));
     }
-    let current = current_applicability(tx, &identity)?;
+    let current = current_applicability(tx, &identity, assignment_id)?;
     let mut result = json!({
         "operation_id":operation_id,
         "review_assignment_id":assignment_id,
@@ -731,17 +942,16 @@ pub(crate) fn reserve_submit(
     Ok(result)
 }
 
-/// Find one exact currently applicable actionable finding for the existing
-/// manager feedback handler. This validates review provenance only; callers
-/// must still run their normal current manager/Task authorization.
-pub(crate) fn actionable_finding(
+/// Return the exact current actionable review result with its original ordered
+/// findings array. Feedback/disposition callers still apply their own manager
+/// authority and select/package findings without reordering this source list.
+pub(crate) fn actionable_review_result(
     db: &Connection,
     task_id: &str,
     attempt_id: &str,
     task_revision: i64,
     submission_ref: &str,
     candidate_ref: &str,
-    finding_id: &str,
 ) -> Result<Value> {
     let retained = load_submission_context(
         db,
@@ -757,14 +967,8 @@ pub(crate) fn actionable_finding(
             "feedback Task differs from the reviewed submission",
         ));
     }
-    let slot_key = slot_meta_key(&retained.identity)?;
-    let assignment_id = meta(db, &slot_key)?
-        .and_then(|record| {
-            record
-                .get("review_assignment_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+    let assignment_id = current_slot_pointer(db, &retained.identity)?
+        .map(|(_, assignment_id)| assignment_id)
         .ok_or_else(|| {
             Error::new(
                 "REVIEW_FINDING_NOT_FOUND",
@@ -784,8 +988,51 @@ pub(crate) fn actionable_finding(
             "current assigned result is not an applicable changes_requested verdict",
         ));
     }
-    let finding = review_contract::actionable_finding(&result["result"], finding_id).map_err(
-        |error| match error {
+    let validated = review_contract::validate_result(&result["result"]).map_err(|error| {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            format!("retained review result is invalid: {error}"),
+        )
+    })?;
+    if validated.verdict != review_contract::ReviewVerdict::ChangesRequested
+        || validated.applicability != review_contract::ReviewApplicability::CurrentCandidate
+    {
+        return Err(Error::new(
+            "REVIEW_FINDING_NOT_ACTIONABLE",
+            "current assigned result is not an applicable changes_requested verdict",
+        ));
+    }
+    Ok(json!({
+        "review_assignment_id":assignment_id,
+        "review_operation_id":result["operation_id"],
+        "reviewer_client_id":assignment["reviewer_client_id"],
+        "identity":retained.identity,
+        "review_result":result["result"],
+    }))
+}
+
+/// Find one exact actionable finding for legacy single-finding feedback.
+/// New multi-finding callers should consume `actionable_review_result` and
+/// preserve its findings order. Callers still apply manager authorization.
+pub(crate) fn actionable_finding(
+    db: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    task_revision: i64,
+    submission_ref: &str,
+    candidate_ref: &str,
+    finding_id: &str,
+) -> Result<Value> {
+    let provenance = actionable_review_result(
+        db,
+        task_id,
+        attempt_id,
+        task_revision,
+        submission_ref,
+        candidate_ref,
+    )?;
+    let finding = review_contract::actionable_finding(&provenance["review_result"], finding_id)
+        .map_err(|error| match error {
             review_contract::ReviewValidationError::NotActionable => Error::new(
                 "REVIEW_FINDING_NOT_ACTIONABLE",
                 "current assigned result is not an applicable changes_requested verdict",
@@ -798,14 +1045,13 @@ pub(crate) fn actionable_finding(
                 "REVIEW_RESULT_DAMAGED",
                 format!("retained review result is invalid: {error}"),
             ),
-        },
-    )?;
+        })?;
     Ok(json!({
-        "review_assignment_id":assignment_id,
-        "review_operation_id":result["operation_id"],
-        "reviewer_client_id":assignment["reviewer_client_id"],
+        "review_assignment_id":provenance["review_assignment_id"],
+        "review_operation_id":provenance["review_operation_id"],
+        "reviewer_client_id":provenance["reviewer_client_id"],
         "finding":finding,
-        "identity":retained.identity,
+        "identity":provenance["identity"],
     }))
 }
 
@@ -846,7 +1092,16 @@ fn validate_requirement_review_evidence(
     Ok(())
 }
 
-fn current_applicability(db: &Connection, identity: &ReviewSlotIdentity) -> Result<bool> {
+fn current_applicability(
+    db: &Connection,
+    identity: &ReviewSlotIdentity,
+    review_assignment_id: &str,
+) -> Result<bool> {
+    let current_slot = current_slot_pointer(db, identity)?
+        .is_some_and(|(_, current_assignment_id)| current_assignment_id == review_assignment_id);
+    if !current_slot {
+        return Ok(false);
+    }
     let task = tasks::get_task(db, &identity.task_id)?;
     let attempt = tasks::get_attempt(db, &identity.attempt_id)?;
     Ok(task["state"] == "open"
@@ -896,15 +1151,15 @@ fn authorize_assignment_read(
         && principal.client_id == assignment["reviewer_client_id"]
     {
         return if allow_historical_reviewer {
-            coordination::require_historical_review_result_scope(
-                db,
-                principal,
-                assignment_id,
-                &scope,
-            )
+            require_retained_reviewer_scope(db, principal, &identity, assignment_id)
         } else {
             coordination::require_review_scope(db, principal, assignment_id, &scope)
         };
+    }
+    if principal.role == Role::Participant
+        && authorize_direct_successor_read(db, principal, assignment_id, &identity)?
+    {
+        return Ok(());
     }
     Err(Error::new(
         "FORBIDDEN",
@@ -916,10 +1171,13 @@ fn review_view(db: &Connection, assignment: &Value, include_context: bool) -> Re
     let assignment_id = model::text(assignment, "review_assignment_id")?;
     let identity: ReviewSlotIdentity = serde_json::from_value(assignment["identity"].clone())?;
     let result = result_observation(db, assignment_id)?;
+    let current_slot = current_slot_pointer(db, &identity)?
+        .is_some_and(|(_, current_assignment_id)| current_assignment_id == assignment_id);
     let mut view = json!({
         "assignment":assignment,
         "result":result.as_ref().map(|record| record["result"].clone()),
-        "current_candidate":current_applicability(db, &identity)?,
+        "current_slot":current_slot,
+        "current_candidate":current_applicability(db, &identity, assignment_id)?,
         "latest_disposition":latest_disposition(db, assignment_id)?,
     });
     if include_context {
@@ -978,21 +1236,6 @@ fn latest_disposition(db: &Connection, assignment_id: &str) -> Result<Value> {
         )
     })?;
     Ok(value)
-}
-
-fn list_assignments(db: &Connection) -> Result<Vec<(i64, Value)>> {
-    let rows = {
-        let mut statement = db.prepare(
-            "SELECT observation_id,payload_json FROM observations WHERE source_stream_id=?1 AND kind='review.assignment' AND source_event_key GLOB 'assignment:*' ORDER BY observation_id",
-        )?;
-        let rows = statement.query_map([REVIEW_STREAM], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    rows.into_iter()
-        .map(|(id, raw)| Ok((id, serde_json::from_str(&raw)?)))
-        .collect()
 }
 
 pub(crate) fn read(
@@ -1163,38 +1406,59 @@ pub(crate) fn authorize_operation_read(
         ));
     }
     let identity: ReviewSlotIdentity = serde_json::from_value(assignment["identity"].clone())?;
-    let exact_scope = exact_scope(&identity, assignment_id);
     let operation = operations::get_operation(db, operation_id)?;
-    let assignment_operation = operation["method"] == "review.assign"
-        && operation_id == assignment["operation_id"].as_str().unwrap_or_default()
-        && operation["result"]["review_assignment_id"] == assignment_id;
-    let result_operation = if operation["method"] == "review.submit"
-        && operation["caller_id"] == principal.client_id
-        && operation["result"]["review_assignment_id"] == assignment_id
-    {
-        result_observation(db, assignment_id)?
-            .is_some_and(|record| record["operation_id"].as_str() == Some(operation_id))
-    } else {
-        false
-    };
-    if assignment_operation || result_operation {
-        return coordination::require_historical_review_result_scope(
-            db,
-            principal,
-            assignment_id,
-            &exact_scope,
-        );
+    if operation["method"] == "review.assign" {
+        let Some(target_assignment_id) = operation["result"]["review_assignment_id"].as_str()
+        else {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "operation is outside the assigned review evidence path",
+            ));
+        };
+        let target_assignment = assignment_observation(db, target_assignment_id)?;
+        if target_assignment["operation_id"] != operation_id
+            || operation["result"]["review_assignment_id"] != target_assignment_id
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "operation is outside the assigned review evidence path",
+            ));
+        }
+        return authorize_assignment_read(db, principal, &target_assignment, true);
     }
-    let applied_submission_operation = if operation["method"] == "task.submit"
+    if operation["method"] == "review.submit" {
+        let Some(target_assignment_id) = operation["result"]["review_assignment_id"].as_str()
+        else {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "operation is outside the assigned review evidence path",
+            ));
+        };
+        let target_assignment = assignment_observation(db, target_assignment_id)?;
+        let Some(result) = result_observation(db, target_assignment_id)? else {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "operation is outside the assigned review evidence path",
+            ));
+        };
+        if operation["caller_id"] != target_assignment["reviewer_client_id"]
+            || operation["result"]["review_assignment_id"] != target_assignment_id
+            || result["operation_id"] != operation_id
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "operation is outside the assigned review evidence path",
+            ));
+        }
+        return authorize_assignment_read(db, principal, &target_assignment, true);
+    }
+    if operation["method"] == "task.submit"
         && operation["result"]["submission_ref"] == identity.submission_ref
     {
         let submission_document = submissions::document(db, &identity.submission_ref)?;
-        model::text(&submission_document, "operation_id")? == operation_id
-    } else {
-        false
-    };
-    if applied_submission_operation {
-        return coordination::require_review_scope(db, principal, assignment_id, &exact_scope);
+        if model::text(&submission_document, "operation_id")? == operation_id {
+            return require_retained_reviewer_scope(db, principal, &identity, assignment_id);
+        }
     }
     Err(Error::new(
         "FORBIDDEN",
@@ -1205,7 +1469,14 @@ pub(crate) fn authorize_operation_read(
 fn list(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
     model::fields(
         value,
-        &["task_id", "attempt_id", "submission_ref", "after", "limit"],
+        &[
+            "task_id",
+            "attempt_id",
+            "submission_ref",
+            "after",
+            "after_observation_id",
+            "limit",
+        ],
     )?;
     let optional_text = |name: &str| -> Result<Option<&str>> {
         value
@@ -1233,38 +1504,133 @@ fn list(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> 
             "after must be nonnegative and limit must be 1..200",
         ));
     }
-    let mut visible = Vec::new();
-    for (observation_id, assignment) in list_assignments(db)? {
+    let after_observation_id = value
+        .get("after_observation_id")
+        .map(|item| {
+            item.as_i64()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| Error::invalid("after_observation_id must be a positive integer"))
+        })
+        .transpose()?;
+    if after_observation_id.is_some() && after != 0 {
+        return Err(Error::invalid(
+            "after remains a visible-result offset; use after_observation_id with after=0 for keyset continuation",
+        ));
+    }
+    let scan_limit = usize::try_from(REVIEW_LIST_SCAN_MAX)
+        .map_err(|_| Error::new("REVIEW_LIST_DAMAGED", "review scan bound is invalid"))?;
+    let mut statement = db.prepare(
+        "SELECT observation_id,payload_json FROM observations \
+         WHERE source_stream_id=?1 AND kind='review.assignment' \
+           AND source_event_key GLOB 'assignment:*' AND observation_id>?2 \
+         ORDER BY observation_id LIMIT ?3",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                REVIEW_STREAM,
+                after_observation_id.unwrap_or(0),
+                REVIEW_LIST_SCAN_MAX + 1
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let scan_window_has_more = rows.len() > scan_limit;
+    let mut visible_offset_remaining = after;
+    let mut visible_skipped = 0_i64;
+    let mut items = Vec::new();
+    let mut last_examined = after_observation_id;
+    let mut consumed_rows = 0_usize;
+    let mut stopped_before_visible = false;
+
+    for (observation_id, raw) in rows.iter().take(scan_limit) {
+        let assignment: Value = serde_json::from_str(raw)?;
         let identity: ReviewSlotIdentity = serde_json::from_value(assignment["identity"].clone())?;
         if task_filter.is_some_and(|filter| identity.task_id != filter)
             || attempt_filter.is_some_and(|filter| identity.attempt_id != filter)
             || submission_filter.is_some_and(|filter| identity.submission_ref != filter)
         {
+            last_examined = Some(*observation_id);
+            consumed_rows += 1;
             continue;
         }
-        if authorize_assignment_read(db, principal, &assignment, false).is_err() {
+        match authorize_assignment_read(db, principal, &assignment, false) {
+            Ok(()) => {}
+            Err(error) if error.code == "FORBIDDEN" => {
+                last_examined = Some(*observation_id);
+                consumed_rows += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        if visible_offset_remaining > 0 {
+            visible_offset_remaining -= 1;
+            visible_skipped += 1;
+            last_examined = Some(*observation_id);
+            consumed_rows += 1;
             continue;
         }
-        visible.push((observation_id, review_view(db, &assignment, false)?));
+        if items.len() >= limit as usize {
+            // The next visible row is deliberately left beyond the cursor so
+            // the caller can receive it on the next bounded page.
+            stopped_before_visible = true;
+            break;
+        }
+        let mut item = review_view(db, &assignment, false)?;
+        item["observation_id"] = json!(observation_id);
+        let mut candidate_items = items.clone();
+        candidate_items.push(item.clone());
+        if review_list_response_size(&candidate_items)? > REVIEW_LIST_RESPONSE_MAX_BYTES {
+            if items.is_empty() {
+                return Err(Error::new(
+                    "REVIEW_LIST_ITEM_TOO_LARGE",
+                    "one review list item exceeds the bounded response size",
+                ));
+            }
+            // Do not advance over a valid item excluded by the byte budget.
+            stopped_before_visible = true;
+            break;
+        }
+        items.push(item);
+        last_examined = Some(*observation_id);
+        consumed_rows += 1;
     }
-    let start = usize::try_from(after)
-        .unwrap_or(usize::MAX)
-        .min(visible.len());
-    let end = visible.len().min(start.saturating_add(limit as usize));
-    let items = visible[start..end]
-        .iter()
-        .map(|(observation_id, value)| {
-            let mut item = value.clone();
-            item["observation_id"] = json!(observation_id);
-            item
-        })
-        .collect::<Vec<_>>();
+    if visible_offset_remaining > 0 && scan_window_has_more {
+        return Err(Error::new(
+            "REVIEW_LIST_OFFSET_TOO_DEEP",
+            "the visible-result offset exceeds this bounded scan; restart from the first page and continue with after_observation_id",
+        ));
+    }
+    let has_more = stopped_before_visible
+        || scan_window_has_more
+        || consumed_rows < rows.len().min(scan_limit);
+    let scan_complete = !has_more;
+    let visible_count = visible_skipped + items.len() as i64;
+    let next_after = has_more.then(|| after.saturating_add(items.len() as i64));
     Ok(json!({
         "items":items,
-        "count":visible.len(),
-        "next_after":if end < visible.len() {Some(end)} else {None},
-        "has_older":start > 0,
-        "has_newer":end < visible.len(),
+        "count":if scan_complete {Some(visible_count)} else {None},
+        "count_exact":scan_complete,
+        "next_after":next_after,
+        "next_after_observation_id":if has_more {last_examined} else {None},
+        "has_older":after > 0 || after_observation_id.is_some(),
+        "has_newer":has_more,
+        "coverage":if scan_complete { "complete" } else { "partial" },
         "scope_filtered_before_paging":true,
     }))
+}
+
+fn review_list_response_size(items: &[Value]) -> Result<usize> {
+    let response = json!({
+        "items":items,
+        "count":i64::MAX,
+        "count_exact":true,
+        "next_after":i64::MAX,
+        "next_after_observation_id":i64::MAX,
+        "has_older":true,
+        "has_newer":true,
+        "coverage":"partial",
+        "scope_filtered_before_paging":true,
+    });
+    Ok(model::canonical(&response)?.len())
 }

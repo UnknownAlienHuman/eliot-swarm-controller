@@ -9,7 +9,7 @@ the new version is activated for new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Module artifact | `muse-sdk-1.3.0-bridge.8` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
+| Module artifact | `muse-sdk-1.3.0-bridge.9` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
 | SDK package | `@muse-code/sdk` **1.3.0**, exact, via `package.json` + `package-lock.json`; installed module-locally with `npm ci`, never globally |
 | SDK canonical source | `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT); the MSP schema is pinned at that commit |
 | Bridge code | ELIOT-owned `*.mjs` in this directory (`bridge`, `checkpoint`, `control`, `owned`, `results`, `settings`) |
@@ -19,6 +19,7 @@ the new version is activated for new bindings, and how to roll back.
 ## What may change
 
 - Bridge `*.mjs` files — ELIOT code, changed directly.
+- Proposed trusted descriptor template: `modules/muse/module-descriptor.template.json`.
 - `package.json` / `package-lock.json` — only to move the SDK pin,
   deliberately, to an exact version. No `@latest`, no range drift, no
   global installs, nothing installed as a side effect of reading status.
@@ -33,7 +34,7 @@ handled at the bridge boundary or by a new pin, not by patching
 
 - SDK version change: artifact becomes `muse-sdk-<new-sdk>-bridge.1`.
 - Bridge-only change on the same SDK: increment the suffix,
-  `bridge.7` → `bridge.8`.
+  `bridge.8` → `bridge.9`.
 
 Any change to shipped bridge code or to the SDK pin gets a new artifact
 id. Reusing an existing id for different code is forbidden: bindings
@@ -72,19 +73,18 @@ or Windows qualification; live qualification of the new pin against the
 installed runtime is a separate step and never follows from these
 checks.
 
-Bridge.8 changes pending-request freshness and inventory replacement only. The
-SDK pin and native command/recovery protocol are unchanged. The current bridge
-rejects a configuration naming an earlier artifact; do not relabel an existing
-checkpoint or overwrite a running bridge to bypass that check. The fixture
-selftest uses bridge.8 for its generated current-bridge configuration while the
-saved historical checkpoint fixture remains unchanged. No earlier fixture pass
-is transferred to bridge.8.
+Bridge.9 adds Store-provided TaskPrompt v1 consumption, exact prompt byte/digest
+admission, and native usage evidence projection. The SDK pin and native
+command/recovery protocol are unchanged. The current bridge rejects a
+configuration naming an earlier artifact; do not relabel an existing
+checkpoint or overwrite a running bridge to bypass that check. The host must
+retain and accept the exact bridge.9 descriptor before activation. No earlier
+fixture pass is transferred to bridge.9.
 
 ## Activation
 
-**Current PR blocker:** `module.example.json` still names bridge.7; its update was
-not published because the write tool rejected that action. Do not activate this
-PR until the example and the selected artifact are consistent.
+**Current activation blocker:** the host currently accepts bridge.8. Register
+the exact bridge.9 descriptor before activating this source for new bindings.
 
 Activation is per binding, through the recorded artifact id:
 

@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeSet,
     env,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus},
     time::Duration,

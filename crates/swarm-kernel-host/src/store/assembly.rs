@@ -32,11 +32,28 @@ fn pages(db: &Connection, input: &AssemblyRequest) -> Result<Vec<ArtifactRecord>
         })
         .collect()
 }
+
+/// Resolve the exact source pages for assembly admission. This is a write-side
+/// prerequisite; public `artifact.parts` listing has a separate read projection.
+fn assembly_sources_for_admission(
+    db: &Connection,
+    p: &Principal,
+    input: &AssemblyRequest,
+) -> Result<Vec<ArtifactRecord>> {
+    input.validate()?;
+    let records = pages(db, input)?;
+    if super::object_scope::resolve_assembly_sources(db, p, &records)?.is_none() {
+        return Err(super::object_scope::unauthorized_artifact());
+    }
+    Ok(records)
+}
+
 pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
     writer(p)?;
     let input: AssemblyRequest = serde_json::from_value(v.clone())?;
-    input.validate()?;
-    let _ = pages(tx, &input)?; // Existence before admission; bytes checked off the DB thread.
+    // Admission authority is resolved per page before the durable Operation is
+    // reserved, so a denied assembly never publishes a file or an effect.
+    let _ = assembly_sources_for_admission(tx, p, &input)?;
     Ok(json!({"operation_id":id,"state":"queued","admission":"durable_local","native_call":false}))
 }
 
@@ -64,8 +81,10 @@ pub(super) fn begin(
         |r| r.get(0),
     )?;
     let input: AssemblyRequest = serde_json::from_str(&raw)?;
-    input.validate()?;
-    let records = pages(&tx, &input)?;
+    // Recovery re-resolves the exact retained pages and re-derives their
+    // intersection. A revoked or diverged source scope stops the assembly before
+    // any file publication and never broadens to a generic Manager fallback.
+    let records = assembly_sources_for_admission(&tx, &p, &input)?;
     let now = model::now_ms()?;
     // Replay after host restart is safe ONLY for this deterministic local file
     // publication, never for vendor prompts. Publication compares existing bytes.
@@ -100,11 +119,21 @@ pub(super) fn finish(db: &mut Connection, id: &str, outcome: Result<ArtifactReco
     Ok(())
 }
 
-pub(super) fn parts(db: &Connection, v: &Value) -> Result<Value> {
+pub(super) fn parts(db: &Connection, p: &Principal, v: &Value) -> Result<Value> {
     model::fields(v, &["artifact_id", "after", "limit"])?;
     let a = results::get(db, model::text(v, "artifact_id")?)?;
     if a.kind != "native_result" {
         return Err(Error::invalid("artifact is not an assembled result"));
+    }
+    if super::object_scope::resolve_artifact_read(
+        db,
+        p,
+        &a,
+        super::object_scope::ArtifactReadLevel::Metadata,
+    )?
+    .is_none()
+    {
+        return Err(super::object_scope::unauthorized_artifact());
     }
     let list = a.metadata["parts"]
         .as_array()
@@ -116,8 +145,52 @@ pub(super) fn parts(db: &Connection, v: &Value) -> Result<Value> {
         return Err(Error::invalid("part offset exceeds manifest"));
     }
     let end = list.len().min(after.saturating_add(limit as usize));
+    // Metadata access above validates the complete retained manifest. Each page
+    // disclosed in this page of the response also needs its own Bytes grant.
+    let mut visible_parts = Vec::with_capacity(end - after);
+    for part in &list[after..end] {
+        let page_id = part
+            .get("artifact_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part has no artifact reference"))?;
+        let offset_bytes = part
+            .get("offset_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part offset is malformed"))?;
+        let byte_length = part
+            .get("byte_length")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part length is malformed"))?;
+        let sha256 = part
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part digest is malformed"))?;
+        let page = results::get(db, page_id)?;
+        if page.kind != "native_result_page" {
+            return Err(Error::new(
+                "ARTIFACT_DAMAGED",
+                "assembled part is not a native result page",
+            ));
+        }
+        if super::object_scope::resolve_artifact_read(
+            db,
+            p,
+            &page,
+            super::object_scope::ArtifactReadLevel::Bytes,
+        )?
+        .is_none()
+        {
+            return Err(super::object_scope::unauthorized_artifact());
+        }
+        visible_parts.push(json!({
+            "artifact_ref":page_id,
+            "offset_bytes":offset_bytes,
+            "byte_length":byte_length,
+            "sha256":sha256,
+        }));
+    }
     Ok(
-        json!({"artifact_id":a.artifact_id,"parts":&list[after..end],"part_count":list.len(),
+        json!({"artifact_id":a.artifact_id,"parts":visible_parts,"part_count":list.len(),
         "next_after":if end<list.len(){Some(end)}else{None}}),
     )
 }

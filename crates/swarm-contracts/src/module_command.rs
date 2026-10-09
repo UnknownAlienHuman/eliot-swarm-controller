@@ -10,7 +10,7 @@ use crate::native_mcp::{
 use serde_json::Value;
 
 /// Every command that may require a selected module credential.
-pub const MODULE_COMMAND_METHODS: [&str; 15] = [
+pub const MODULE_COMMAND_METHODS: [&str; 18] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -22,6 +22,9 @@ pub const MODULE_COMMAND_METHODS: [&str; 15] = [
     "agent.reconcile",
     "agent.result",
     "agent.recover",
+    "native.opencode.loop_step",
+    "native.command.cancel_turn",
+    "native.command.close_session",
     NATIVE_MCP_INSTALL_METHOD,
     NATIVE_MCP_OBSERVE_METHOD,
     NATIVE_MCP_ARM_METHOD,
@@ -30,7 +33,7 @@ pub const MODULE_COMMAND_METHODS: [&str; 15] = [
 
 /// Commands selected by the module-demand page. Native-MCP phases reuse an
 /// already-retained native session and do not create a second process demand.
-pub const MODULE_DEMAND_METHODS: [&str; 11] = [
+pub const MODULE_DEMAND_METHODS: [&str; 14] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -42,6 +45,9 @@ pub const MODULE_DEMAND_METHODS: [&str; 11] = [
     "agent.reconcile",
     "agent.result",
     "agent.recover",
+    "native.opencode.loop_step",
+    "native.command.cancel_turn",
+    "native.command.close_session",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +64,9 @@ pub enum RuntimeCommandKind {
     AgentReconcile,
     AgentResult,
     AgentRecover,
+    OpenCodeLoopStep,
+    CommandCancelTurn,
+    CommandCloseSession,
     NativeMcp(NativeMcpPhase),
 }
 
@@ -76,6 +85,9 @@ impl RuntimeCommandKind {
             Self::AgentReconcile => "agent.reconcile",
             Self::AgentResult => "agent.result",
             Self::AgentRecover => "agent.recover",
+            Self::OpenCodeLoopStep => "native.opencode.loop_step",
+            Self::CommandCancelTurn => "native.command.cancel_turn",
+            Self::CommandCloseSession => "native.command.close_session",
             Self::NativeMcp(phase) => phase.method(),
         }
     }
@@ -131,6 +143,9 @@ pub fn classify_runtime_command(
         "agent.reconcile" => RuntimeCommandKind::AgentReconcile,
         "agent.result" => RuntimeCommandKind::AgentResult,
         "agent.recover" => RuntimeCommandKind::AgentRecover,
+        "native.opencode.loop_step" => RuntimeCommandKind::OpenCodeLoopStep,
+        "native.command.cancel_turn" => RuntimeCommandKind::CommandCancelTurn,
+        "native.command.close_session" => RuntimeCommandKind::CommandCloseSession,
         NATIVE_MCP_INSTALL_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Install),
         NATIVE_MCP_OBSERVE_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Observe),
         NATIVE_MCP_ARM_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Arm),

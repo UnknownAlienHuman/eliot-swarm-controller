@@ -37,20 +37,80 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 
-/// Operation readback adds bounded retained native-MCP, workspace-launch
-/// and Participant issuance diagnostics for an
-/// authenticated Manager or local Operator that can already see this exact
-/// Operation. Current-GM authority remains required for action projections;
-/// retained diagnostics never grant a new command, retry, or recovery right.
-pub(super) fn get_operation_for_current_manager(
+/// Public projection consumes the resolved object grant. Internal fact loaders
+/// remain available to Store transitions, never to an unauthorised reader.
+pub(super) fn project_operation(
     db: &Connection,
     p: &Principal,
     id: &str,
+    grant: super::object_scope::OperationReadGrant,
 ) -> Result<Value> {
-    let mut operation = get_operation(db, id)?;
-    let operation_reader =
-        matches!(p.role, Role::Manager | Role::Operator) && super::operation_visible_to(db, p, id)?;
-    let current_manager = operation_reader && super::gm::require_authority(db, p).is_ok();
+    let retained = get_operation(db, id)?;
+    use super::object_scope::OperationReadLevel;
+    let diagnostic = grant.level == OperationReadLevel::Diagnostic;
+    let mut operation = json!({
+        "operation_id":retained["operation_id"], "method":retained["method"],
+        "state":retained["state"], "created_at_ms":retained["created_at_ms"],
+        "updated_at_ms":retained["updated_at_ms"],
+    });
+    if grant.level >= OperationReadLevel::Receipt {
+        for field in [
+            "task_id",
+            "attempt_id",
+            "binding_id",
+            "binding_generation",
+            "prerequisite_operation_id",
+        ] {
+            operation[field] = retained[field].clone();
+        }
+        if let Some(result) =
+            project_result_receipt(model::text(&retained, "method")?, &retained["result"])?
+        {
+            operation["result"] = result;
+        } else {
+            operation["result_status"] = json!("not_projected");
+        }
+    }
+    if diagnostic {
+        // A Diagnostic grant still has a closed vocabulary. The private loader's
+        // arbitrary result, contract and native JSON are never a public fallback.
+        let mut details = serde_json::Map::new();
+        project_tokens(
+            &retained,
+            &[
+                "caller_id",
+                "native_mcp_parent_launch_operation_id",
+                "native_mcp_phase",
+            ],
+            &mut details,
+        );
+        details.insert(
+            "native_refs".into(),
+            public_receipt(&retained["native_refs"]),
+        );
+        operation["diagnostic"] = crate::redaction::value(Value::Object(details));
+    }
+    let launch_diagnostic = if diagnostic {
+        true
+    } else {
+        match super::object_scope::resolve_launch_diagnostic_read(db, p, id) {
+            Ok(allowed) => allowed,
+            Err(error) if optional_diagnostic_damage(&error) => {
+                operation["diagnostic_gaps"] =
+                    json!([{"card":"launch_scope","reason_code":error.code}]);
+                false
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let current_manager = match p.role {
+        Role::Operator => {
+            super::require_local_operator(db, &p.client_id)?;
+            true
+        }
+        Role::Manager => super::gm::read_current(db)?.is_some_and(|gm| gm.client_id == p.client_id),
+        _ => false,
+    };
     if current_manager && let Some(action) = owned_service_start_action_for_operation(db, id)? {
         operation["manager_action_required"] = action;
     }
@@ -63,26 +123,251 @@ pub(super) fn get_operation_for_current_manager(
     if current_manager && let Some(action) = module_outcome_readback_action_for_operation(db, id)? {
         operation["module_outcome_readback_required"] = action;
     }
-    if operation_reader && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
-        operation["native_mcp_readback"] = readback;
-    }
-    if operation_reader
-        && operation["method"] == "swarm.launch"
-        && let Some(readback) = super::launcher_mcp_tools::diagnostic_for_operation(db, id)?
-    {
-        operation["native_mcp_tools_readback"] = readback;
-    }
-    if operation_reader
-        && operation["method"] == "swarm.launch"
-        && let Some(readback) = workspace_launch_failure_readback_for_operation(db, id, &operation)?
-    {
-        operation["workspace_failure_readback"] = readback;
-    }
-    if operation_reader && let Some(issuance) = participant_issuance_failure_for_operation(db, id)?
-    {
-        operation["participant_issuance"] = issuance;
+    if launch_diagnostic {
+        optional_diagnostic_card(
+            &mut operation,
+            "native_mcp_readback",
+            native_mcp_readback_for_operation(db, id),
+        )?;
+        if operation["method"] == "swarm.launch" {
+            optional_diagnostic_card(
+                &mut operation,
+                "native_mcp_tools_readback",
+                super::launcher_mcp_tools::diagnostic_for_operation(db, id),
+            )?;
+            optional_diagnostic_card(
+                &mut operation,
+                "workspace_failure_readback",
+                workspace_launch_failure_readback_for_operation(db, id, &retained),
+            )?;
+        }
+        optional_diagnostic_card(
+            &mut operation,
+            "participant_issuance",
+            participant_issuance_failure_for_operation(db, id),
+        )?;
     }
     Ok(operation)
+}
+
+fn optional_diagnostic_card(
+    operation: &mut Value,
+    card: &'static str,
+    result: Result<Option<Value>>,
+) -> Result<()> {
+    match result {
+        Ok(Some(value)) => operation[card] = crate::redaction::value(value),
+        Ok(None) => {}
+        Err(error) if optional_diagnostic_damage(&error) => {
+            if operation.get("diagnostic_gaps").is_none() {
+                operation["diagnostic_gaps"] = json!([]);
+            }
+            if let Some(gaps) = operation["diagnostic_gaps"].as_array_mut() {
+                gaps.push(json!({"card":card,"reason_code":error.code}));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn optional_diagnostic_damage(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "OBJECT_SCOPE_DAMAGED"
+            | "INVALID_PARAMS"
+            | "GM_DESIGNATION_MISSING"
+            | "GM_DESIGNATION_DAMAGED"
+            | "GM_REGISTRATION_STALE"
+            | "GM_EPOCH_HISTORY_DAMAGED"
+    )
+}
+
+/// A closed receipt vocabulary. Unrecognized methods retain their summary;
+/// arbitrary result JSON and native/debug data never become a public fallback.
+fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>> {
+    let fields: &[&str] = match method {
+        "task.create"
+        | "task.revise"
+        | "task.cancel"
+        | "task.claim"
+        | "task.release"
+        | "task.dispatch"
+        | "task.submit"
+        | "task.submit.recover"
+        | "task.accept"
+        | "task.acceptance.invalidate"
+        | "task.request_changes" => &[
+            "operation_id",
+            "task_id",
+            "attempt_id",
+            "task_revision",
+            "revision",
+            "state",
+            "outcome",
+            "submission_ref",
+            "submission_artifact_ref",
+            "candidate_ref",
+            "acceptance_operation_id",
+            "target_operation_id",
+            "target_outcome",
+            "phase",
+            "task_accepted",
+            "applied_to_attempt",
+            "applied",
+            "status",
+            "coalesced",
+            "coalesced_from_operation_id",
+            "message_id",
+            "delivery",
+            "native_input_sent",
+            "acceptance_changed",
+            "repair_started",
+            "publication_started",
+        ],
+        "swarm.launch"
+        | "agent.open"
+        | "agent.send"
+        | "agent.cancel"
+        | "agent.close"
+        | "agent.model.set"
+        | "agent.goal.set"
+        | "agent.goal.get"
+        | "agent.goal.clear"
+        | "agent.settings.set"
+        | "agent.native.control"
+        | "agent.native.reply"
+        | "agent.configure"
+        | "agent.goal"
+        | "agent.reply"
+        | "agent.background"
+        | "agent.refresh"
+        | "agent.reconcile"
+        | "agent.result"
+        | "agent.recover"
+        | "native.opencode.loop_step"
+        | "native.command.cancel_turn"
+        | "native.command.close_session" => &[
+            "operation_id",
+            "state",
+            "outcome",
+            "binding_id",
+            "binding_generation",
+            "admission",
+            "native_call",
+            "semantic_reuse",
+            "operation_state_at_receipt",
+            "receipt_recorded_at_ms",
+            "current_state_read_method",
+            "reason",
+            "status",
+        ],
+        "message.send"
+        | "message.cancel"
+        | "coordination.send"
+        | "coordination.message.send"
+        | "coordination.consult" => &[
+            "operation_id",
+            "message_id",
+            "delivery_id",
+            "payload_digest",
+            "sender",
+            "recipient",
+            "state",
+            "status",
+            "delivery",
+            "delivery_created",
+            "cancelled",
+        ],
+        "check.run" | "check.cancel" => &[
+            "operation_id",
+            "check_id",
+            "attempt_id",
+            "candidate_ref",
+            "state",
+            "outcome",
+            "result_ref",
+            "cached_from_check_id",
+            "resource_released",
+            "cancel_requested",
+        ],
+        "artifact.assemble" => &[
+            "operation_id",
+            "state",
+            "outcome",
+            "artifact_id",
+            "admission",
+            "native_call",
+        ],
+        "gm.handover" => &[
+            "operation_id",
+            "client_id",
+            "gm_epoch",
+            "binding_id",
+            "binding_generation",
+            "authority_changed",
+            "session_binding_changed",
+            "designation_recovered",
+        ],
+        "coordination.contract.ratify" | "coordination.contract.reject" => &[
+            "operation_id",
+            "decision",
+            "thread_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "proposal_id",
+            "proposal_revision_id",
+            "proposal_digest",
+            "decision_observation_id",
+            "changed",
+            "model_work_started",
+            "native_execution",
+        ],
+        _ => return Ok(None),
+    };
+    if result.is_null() {
+        return Ok(Some(Value::Null));
+    }
+    let Some(object) = result.as_object() else {
+        return Ok(None);
+    };
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        if let Some(value) = object.get(*field)
+            && (value.is_null()
+                || value.is_boolean()
+                || value.is_number()
+                || value
+                    .as_str()
+                    .is_some_and(|text| text.len() <= 512 && !text.chars().any(char::is_control)))
+        {
+            projected.insert((*field).to_owned(), value.clone());
+        }
+    }
+    for field in ["failure", "error"] {
+        if let Some(code) = result[field]["code"]
+            .as_str()
+            .filter(|code| safe_receipt_code(code))
+        {
+            projected.insert(field.to_owned(), json!({"code":code}));
+        }
+    }
+    if let Some(code) = result["code"]
+        .as_str()
+        .filter(|code| safe_receipt_code(code))
+    {
+        projected.insert("code".into(), json!(code));
+    }
+    Ok(Some(Value::Object(projected)))
+}
+
+fn safe_receipt_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Project only safe retained readback for a proven closed workspace admission
@@ -2047,7 +2332,7 @@ fn public_native_failure(value: &Value) -> Value {
     Value::Object(failure)
 }
 
-fn public_observation(value: &Value) -> Value {
+pub(super) fn public_observation(value: &Value) -> Value {
     let mut observation = serde_json::Map::new();
     project_tokens(
         value,
@@ -2472,6 +2757,8 @@ fn reserve_open_route(
     if let Some(existing) = existing {
         return Err(Error::new("LANE_ALREADY_OWNED", existing));
     }
+    let admission = super::launcher::route_admission(tx, route, None, Some(id))?;
+    super::launcher::require_route_admission(&admission)?;
     let binding = model::new_id();
     let instance = model::new_id();
     let module_contract_selector = super::module_handshake::selection_for_new_binding(
@@ -2481,6 +2768,7 @@ fn reserve_open_route(
         &route.runtime,
         &route.module_artifact_id,
     )?;
+    super::task_prompt::require_new_binding(route, module_contract_selector.as_ref())?;
     super::module_handshake::require_selected_native_command(
         tx,
         &binding,
@@ -2792,6 +3080,8 @@ pub(super) fn dispatch(
             "native binding has not been observed ready",
         ));
     }
+    let admission = super::runtime::binding_route_admission(tx, &b, Some(config), Some(id))?;
+    super::launcher::require_route_admission(&admission)?;
     super::module_handshake::require_selected_native_command(
         tx,
         binding,
@@ -2802,12 +3092,15 @@ pub(super) fn dispatch(
     )?;
     let prerequisite = prerequisites::validate_request(tx, &b, v, id)?;
     let launch_dispatch = launcher_dispatch::prepare_admission(tx, config, p, v, &a, &task, &b)?;
+    let task_prompt = super::task_prompt::build_task_prompt_v1(&a, body, launch_dispatch.as_ref())?;
+    let prompt_selected = super::task_prompt::selected_task_prompt_v1(tx, &b)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
     let prerequisite_contract_revision = prerequisite.contract_revision().map(str::to_owned);
     let mut effective = json!({
         "route":b["route"],
         "input":body,
-        "task_snapshot":a["task_snapshot"]
+        "task_snapshot":a["task_snapshot"],
+        "task_prompt":task_prompt
     });
     if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
         effective["operation_contract"] = json!({
@@ -2834,6 +3127,11 @@ pub(super) fn dispatch(
             "operation_id":prerequisite_id,
             "required_completion_condition":"native_configuration_applied",
             "required_contract_revision":prerequisite_contract_revision
+        });
+    }
+    if prompt_selected {
+        effective["operation_contract"]["task_prompt"] = json!({
+            "contract_revision":swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION
         });
     }
     let operation_changed = tx.execute(
@@ -3359,10 +3657,7 @@ pub(super) fn cancel(
             [target],
             |row| row.get(0),
         )?;
-        let current_epoch = match super::gm::record(tx)? {
-            None => 0,
-            Some(gm) => model::positive(&gm, "epoch")?,
-        };
+        let current_epoch = super::gm::current_epoch(tx)?;
         if stale_publication || admitted_epoch != Some(current_epoch) {
             return Err(Error::new(
                 "FORBIDDEN",

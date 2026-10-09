@@ -7,7 +7,6 @@
   "native_options": {
     "service_id": "<operator-stable-service-id>",
     "connection_file": "<absolute-path-to-existing-connection-record>",
-    "expected_version": "<exact-version-from-attached-server>",
     "directory": "<absolute-workspace-path>",
     "model": {
       "id": "ling-3.1-flash",

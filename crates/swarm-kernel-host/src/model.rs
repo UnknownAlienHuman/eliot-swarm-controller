@@ -557,6 +557,8 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         | "coordination.contract_card.withdraw"
         | "coordination.contract.propose"
         | "coordination.contract.respond"
+        | "coordination.contract.ratify"
+        | "coordination.contract.reject"
         | "coordination.send"
         | "coordination.consult" => {
             crate::coordination::validate_mutation(method, params)?;
@@ -758,6 +760,55 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "length_bytes",
         ],
         "agent.reply" => &["client_request_id", "binding_id", "generation", "reply"],
+        "native.opencode.loop_step" => {
+            fields(
+                params,
+                &["client_request_id", "binding_id", "generation", "text"],
+            )?;
+            text(params, "client_request_id")?;
+            text(params, "binding_id")?;
+            positive(params, "generation")?;
+            text(params, "text")?;
+            return Ok(());
+        }
+        "native.command.cancel_turn" => {
+            fields(
+                params,
+                &[
+                    "client_request_id",
+                    "binding_id",
+                    "generation",
+                    "session_id",
+                    "target_operation_id",
+                    "turn_id",
+                ],
+            )?;
+            text(params, "client_request_id")?;
+            text(params, "binding_id")?;
+            positive(params, "generation")?;
+            text(params, "session_id")?;
+            text(params, "target_operation_id")?;
+            text(params, "turn_id")?;
+            return Ok(());
+        }
+        "native.command.close_session" => {
+            fields(
+                params,
+                &[
+                    "client_request_id",
+                    "binding_id",
+                    "generation",
+                    "session_id",
+                    "target_operation_id",
+                ],
+            )?;
+            text(params, "client_request_id")?;
+            text(params, "binding_id")?;
+            positive(params, "generation")?;
+            text(params, "session_id")?;
+            text(params, "target_operation_id")?;
+            return Ok(());
+        }
         "agent.configure" => &[
             "client_request_id",
             "binding_id",

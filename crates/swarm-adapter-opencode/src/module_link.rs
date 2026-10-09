@@ -1,8 +1,8 @@
 //! Fixed common module RPC bridge over swarm-client::ModuleLink.
 //!
-//! Each call is preceded by a typed hello on the same authenticated IPC link,
-//! because the host scopes a module binding to that link's principal ID. A
-//! failed application exchange is never transparently replayed; only the
+//! Each authenticated link receives one typed hello because the host scopes a
+//! module binding to that link's principal ID. Ordinary calls reuse the link.
+//! A failed application exchange is never transparently replayed; only the
 //! caller's saved outcome/observation acknowledgement policy may retry it.
 
 use serde_json::Value;

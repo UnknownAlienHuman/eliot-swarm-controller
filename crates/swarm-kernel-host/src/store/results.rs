@@ -9,6 +9,31 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
+/// Historical input status remains available under its original contract.
+/// Loop-step status additionally requires the exact selected native command
+/// contract; a runtime name alone cannot admit a new result source.
+pub(super) fn input_status_target_supported(
+    db: &Connection,
+    binding: &Value,
+    target: &Value,
+) -> Result<bool> {
+    match target["method"].as_str() {
+        Some("task.dispatch" | "agent.send") => Ok(true),
+        Some("native.opencode.loop_step")
+            if binding["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME =>
+        {
+            Ok(super::module_handshake::selected_native_command_supported(
+                db,
+                model::text(binding, "module_artifact_id")?,
+                binding["observation"].get("module_contract_selector"),
+                "native.opencode.loop_step",
+                &Value::Null,
+            )? == Some(true))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Build a bounded status projection from a terminal Operation already
 /// recorded by the same strict Antigravity binding. This is Store-side
 /// provenance only; it deliberately contains no native response body or
@@ -555,15 +580,12 @@ pub(super) fn prepare(
         let target = operations::get_operation(db, target_id)?;
         if target["binding_id"] != id
             || target["binding_generation"] != generation
-            || !matches!(
-                target["method"].as_str(),
-                Some("task.dispatch" | "agent.send")
-            )
+            || !input_status_target_supported(db, &b, &target)?
             || b["native_root_id"].as_str() != Some(session_id)
         {
             return Err(Error::new(
                 "FORBIDDEN",
-                "input status must name a dispatch or send on this exact binding session",
+                "input status must name an admitted input Operation on this exact binding session",
             ));
         }
         let target_raw: String = db.query_row(
@@ -1081,6 +1103,75 @@ pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
         metadata: serde_json::from_str(&metadata)?,
     })
 }
+/// Closed projection for one already-authorized artifact. This function never
+/// reopens identity and never widens a resolved grant.
+pub(super) fn project_authorized(authorized: &super::object_scope::AuthorizedArtifact) -> Value {
+    json!({"artifact_id":authorized.record.artifact_id,"kind":authorized.record.kind,
+        "byte_length":authorized.record.byte_length,
+        "content_digest":authorized.record.content_digest,
+        "metadata":project_metadata(&authorized.record),
+        "grant":{"level":authorized.grant.level.as_str(),
+            "basis":authorized.grant.basis.as_str()}})
+}
+
+/// Per-kind metadata ceiling for authorized artifact projections. Stored
+/// metadata remains private provenance; arbitrary keys and nested producer data
+/// are never copied into a public artifact result.
+pub(super) fn project_metadata(record: &ArtifactRecord) -> Value {
+    let fields: &[&str] = match record.kind.as_str() {
+        "task_submission" => &[
+            "task_id",
+            "attempt_id",
+            "task_revision",
+            "candidate_ref",
+            "candidate_sha256",
+            "candidate_byte_length",
+            "candidate_kind",
+        ],
+        "source_snapshot" => &[
+            "task_id",
+            "attempt_id",
+            "task_revision",
+            "commit",
+            "tree",
+            "coverage",
+            "file_count",
+        ],
+        "check_result" => &["check_id", "candidate_ref", "state"],
+        "check_output" => &["check_id", "candidate_ref", "state", "stream"],
+        "native_result_page" => &[
+            "offset_bytes",
+            "byte_length",
+            "total_bytes",
+            "eof",
+            "media_type",
+            "page_sha256",
+        ],
+        "native_result" => &[
+            "coverage",
+            "byte_length",
+            "sha256",
+            "part_count",
+            "expected_sha256",
+        ],
+        "script_bundle" | "script_result" | "script_output" => {
+            &["script_id", "revision", "artifact_role"]
+        }
+        _ => &[],
+    };
+    let Some(metadata) = record.metadata.as_object() else {
+        return json!({});
+    };
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        if let Some(value) = metadata.get(*field) {
+            projected.insert((*field).to_owned(), value.clone());
+        }
+    }
+    Value::Object(projected)
+}
+
+/// Object-authorized artifact metadata read (`artifact.get`).
 pub(super) fn describe(db: &Connection, p: &Principal, v: &Value) -> Result<Value> {
     if p.role == Role::Module {
         return Err(Error::new(
@@ -1089,15 +1180,17 @@ pub(super) fn describe(db: &Connection, p: &Principal, v: &Value) -> Result<Valu
         ));
     }
     model::fields(v, &["artifact_id"])?;
-    let a = get(db, model::text(v, "artifact_id")?)?;
-    if matches!(
-        a.kind.as_str(),
-        "script_bundle" | "script_result" | "script_output"
-    ) {
-        super::scripts::authorize_artifact_read(db, p, &a)?;
-    }
-    Ok(
-        json!({"artifact_id":a.artifact_id,"kind":a.kind,"byte_length":a.byte_length,
-        "content_digest":a.content_digest,"metadata":a.public_metadata()}),
-    )
+    let record = get(db, model::text(v, "artifact_id")?)?;
+    let Some(grant) = super::object_scope::resolve_artifact_read(
+        db,
+        p,
+        &record,
+        super::object_scope::ArtifactReadLevel::Metadata,
+    )?
+    else {
+        return Err(super::object_scope::unauthorized_artifact());
+    };
+    Ok(project_authorized(
+        &super::object_scope::AuthorizedArtifact { record, grant },
+    ))
 }

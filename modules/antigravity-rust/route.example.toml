@@ -3,9 +3,9 @@
 alias = 'antigravity-rust-example'
 runtime = 'antigravity'
 module_artifact_id = 'eliot-antigravity.rust-headless.1'
-# After registration, module.route.select must name descriptor version '4'.
-# Version 4 admits normalized result provenance but remains status-only when
-# the native stream cannot prove an input-bound assistant body.
+# After registration, module.route.select must name descriptor version '5'.
+# Version 5 consumes the Store-produced swarm.task_prompt@1 envelope for
+# task.dispatch; it never renders or falls back to a raw Task snapshot.
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\\Projects\\YourRepository'

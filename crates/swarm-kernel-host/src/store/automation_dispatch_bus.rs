@@ -14,11 +14,11 @@ const MAX_CONCILIUM_RECEIPT_BYTES: i64 = 4096;
 const MAX_CONCILIUM_LINK_BYTES: i64 = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ConciliumEventSourceProof {
-    operation_id: String,
-    task_id: String,
-    task_revision: i64,
-    attempt_id: String,
+pub(super) struct ConciliumEventSourceProof {
+    pub(super) operation_id: String,
+    pub(super) task_id: String,
+    pub(super) task_revision: i64,
+    pub(super) attempt_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3374,9 +3374,9 @@ pub(super) fn validate_retained_concilium_event_source(
     db: &Connection,
     event: &crate::automation::intake::ObservedEvent,
     project_id: &str,
-) -> Result<()> {
-    let _ = concilium_event_source_proof(db, event, Some(project_id))?;
-    Ok(())
+) -> Result<ConciliumEventSourceProof> {
+    concilium_event_source_proof(db, event, Some(project_id))?
+        .ok_or_else(concilium_source_unauthorized)
 }
 
 fn concilium_event_is_script_feedback_from_same_automation(

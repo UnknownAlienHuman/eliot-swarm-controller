@@ -63,15 +63,12 @@ pub(crate) fn prepare_plugin_config(options: &NativeOptions) -> Result<PreparedP
     });
     let bytes = serialize_bounded(&value)?;
     let identity = verify_plugin_config_value(&value, options)?;
-    if identity.module_sha256 != module_sha256
-        || identity.entrypoint_sha256 != entrypoint_sha256
-    {
-        return Err(source_error("native MCP plugin source changed during preparation"));
+    if identity.module_sha256 != module_sha256 || identity.entrypoint_sha256 != entrypoint_sha256 {
+        return Err(source_error(
+            "native MCP plugin source changed during preparation",
+        ));
     }
-    Ok(PreparedPluginConfig {
-        bytes,
-        identity,
-    })
+    Ok(PreparedPluginConfig { bytes, identity })
 }
 
 /// Revalidate the exact config shape and pinned source closure before use.
@@ -105,13 +102,9 @@ pub(crate) fn verify_plugin_config_value(
         || plugin_options.is_none_or(|options_value| {
             options_value.get("serviceId").and_then(Value::as_str)
                 != Some(options.service_id.as_str())
-                || options_value
-                    .get("serviceVersion")
-                    .and_then(Value::as_str)
+                || options_value.get("serviceVersion").and_then(Value::as_str)
                     != Some(PINNED_VERSION)
-                || options_value
-                    .get("moduleSha256")
-                    .and_then(Value::as_str)
+                || options_value.get("moduleSha256").and_then(Value::as_str)
                     != Some(module_sha256.as_str())
         })
     {
@@ -146,8 +139,7 @@ pub(crate) fn verify_plugin_config_file(
 }
 
 fn validate_options(options: &NativeOptions) -> Result<()> {
-    if options.expected_version != PINNED_VERSION
-        || options.service_id.is_empty()
+    if options.service_id.is_empty()
         || options.service_id.len() > 128
         || !options
             .service_id
@@ -155,7 +147,7 @@ fn validate_options(options: &NativeOptions) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
     {
         return Err(source_error(
-            "native MCP plugin requires a bounded service ID and OpenCode 2.0.7",
+            "native MCP plugin requires a bounded service ID",
         ));
     }
     Ok(())
@@ -299,7 +291,9 @@ fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
         .read_to_end(&mut bytes)
         .map_err(|_| source_error("native MCP plugin file read failed"))?;
     if bytes.len() as u64 > max_bytes {
-        return Err(source_error("native MCP plugin file exceeds its byte boundary"));
+        return Err(source_error(
+            "native MCP plugin file exceeds its byte boundary",
+        ));
     }
     Ok(bytes)
 }
@@ -308,7 +302,9 @@ fn serialize_bounded(value: &Value) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| source_error("native MCP plugin config cannot be serialized"))?;
     if bytes.is_empty() || bytes.len() > MAX_CONFIG_BYTES {
-        return Err(source_error("native MCP plugin config exceeds its byte boundary"));
+        return Err(source_error(
+            "native MCP plugin config exceeds its byte boundary",
+        ));
     }
     Ok(bytes)
 }

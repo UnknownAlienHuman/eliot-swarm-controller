@@ -7,12 +7,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import { Control } from "../claude/control.mjs";
 import {
+  HISTORICAL_MODULE_ARTIFACT_ID,
   MODULE_ARTIFACT_ID,
+  TASK_PROMPT_CONTRACT_REVISION,
   batchRunId,
-  buildTaskPrompt,
-  commandReceiptFacts,
   controlRecordRef,
   describe,
   openRun,
@@ -20,12 +21,34 @@ import {
   resultRecordRef,
   sha256Hex,
   snapshotRun,
+  validateTaskPromptDispatch,
 } from "./glue.mjs";
 
 const ENTRYPOINT = "command_headless_one_shot";
 const FREE_MODEL_ID = "stealth/space-bunny-alpha";
 // Canonical LF digest of the tracked mod source; glue normalizes CRLF checkouts.
 const PINNED_MOD_SHA256 = "513eaa7d6034cc22b5abf14d080888cdd3e8782133e39f859b7703db123e1f80";
+const CONTRACT_SCHEMA = (schemaId) => ({ schema_id: schemaId, version: "1" });
+const EXPECTED_MODULE_CONTRACT = {
+  schema_version: 1,
+  module_id: "runtime.command",
+  artifact: {
+    artifact_id: MODULE_ARTIFACT_ID,
+    version: "5",
+  },
+  protocol: { major: 1, minor: 0 },
+  capabilities: ["agent.open", "agent.reconcile", "agent.refresh", "task.dispatch"],
+  config_schema: null,
+  command_schemas: [
+    CONTRACT_SCHEMA("swarm.runtime_command"),
+    CONTRACT_SCHEMA("swarm.task_dispatch_context"),
+    CONTRACT_SCHEMA("swarm.task_prompt"),
+  ],
+  event_schemas: [
+    CONTRACT_SCHEMA("swarm.runtime_outcome"),
+    CONTRACT_SCHEMA("swarm.task_dispatch_admission"),
+  ],
+};
 const CAPABILITIES = {
   describe: "implemented",
   open: "executor_preflight_only_no_native_session",
@@ -57,6 +80,76 @@ function codedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+function ownerModuleContract() {
+  if (!managedOwner) throw codedError("MODULE_OWNER_REQUIRED");
+  const encoded = process.env.ELIOT_SWARM_MODULE_CONTRACT;
+  if (typeof encoded !== "string" || Buffer.byteLength(encoded, "utf8") > 64 * 1024) {
+    throw codedError("MODULE_CONTRACT_REQUIRED");
+  }
+  let claim;
+  try {
+    claim = JSON.parse(encoded);
+  } catch {
+    throw codedError("MODULE_CONTRACT_INVALID");
+  }
+  if (!isDeepStrictEqual(claim, EXPECTED_MODULE_CONTRACT)) {
+    throw codedError("MODULE_CONTRACT_MISMATCH");
+  }
+  return claim;
+}
+
+function verifyModuleContractNegotiation(hello, claim) {
+  const negotiated = hello?.module_contract_negotiation;
+  if (hello?.route?.runtime !== "command"
+      || hello.route.module_artifact_id !== MODULE_ARTIFACT_ID
+      || negotiated?.status !== "negotiated"
+      || negotiated.source !== "store_registered_descriptor"
+      || !Number.isSafeInteger(negotiated.descriptor_revision)
+      || negotiated.descriptor_revision <= 0
+      || negotiated.effects_authorized_by_descriptor !== false
+      || negotiated.module_id !== claim.module_id
+      || !isDeepStrictEqual(negotiated.artifact, claim.artifact)
+      || !isDeepStrictEqual(negotiated.protocol, claim.protocol)
+      || !isDeepStrictEqual(negotiated.capabilities, claim.capabilities)
+      || !isDeepStrictEqual(negotiated.config_schema, claim.config_schema)
+      || !isDeepStrictEqual(negotiated.pre_input_open ?? null, claim.pre_input_open ?? null)
+      || !isDeepStrictEqual(negotiated.command_schemas, claim.command_schemas)
+      || !isDeepStrictEqual(negotiated.event_schemas, claim.event_schemas)) {
+    throw codedError("MODULE_CONTRACT_NEGOTIATION_FAILED");
+  }
+}
+
+function moduleReceiptFor(command, operationId = command.operation_id, inputSha256 = command.input_sha256) {
+  if (typeof command.binding_id !== "string" || command.binding_id.trim() === ""
+      || !Number.isSafeInteger(command.generation) || command.generation <= 0
+      || typeof operationId !== "string" || operationId.trim() === ""
+      || !/^[0-9a-f]{64}$/.test(inputSha256 ?? "")) {
+    throw codedError("MODULE_RECEIPT_IDENTITY_INVALID");
+  }
+  return {
+    schema_version: 1,
+    module_id: moduleContract.module_id,
+    artifact: moduleContract.artifact,
+    protocol: moduleContract.protocol,
+    binding_id: command.binding_id,
+    binding_generation: command.generation,
+    operation_id: operationId,
+    input_sha256: inputSha256,
+  };
+}
+
+function attachModuleReceipt(result, moduleReceipt) {
+  return {
+    ...result,
+    details: {
+      ...(result?.details && typeof result.details === "object" && !Array.isArray(result.details)
+        ? result.details
+        : {}),
+      module_receipt: moduleReceipt,
+    },
+  };
 }
 
 function capabilityError(capability) {
@@ -120,6 +213,7 @@ let bootId = randomUUID();
     throw codedError("INVALID_MODULE_OWNER_PATH");
   }
 }
+const moduleContract = ownerModuleContract();
 
 let control = null;
 let connected = false;
@@ -170,10 +264,10 @@ function observation() {
     latest_preflight: latestPreflight,
   };
 }
-function saveOutcome(operationId, result, method) {
+function saveOutcome(operationId, result, method, moduleReceipt) {
   const previous = outcomes.get(operationId);
-  if (previous && ["applied", "rejected"].includes(previous.outcome)) return;
-  const outcome = { operation_id: operationId, ...result };
+  if (previous && ["applied", "rejected"].includes(previous.outcome)) return previous;
+  const outcome = attachModuleReceipt({ operation_id: operationId, ...result }, moduleReceipt);
   outcomes.set(operationId, outcome);
   journal.set(operationId, {
     method: method ?? null,
@@ -183,6 +277,7 @@ function saveOutcome(operationId, result, method) {
   });
   if (journal.size > 128) journal.delete(journal.keys().next().value);
   changed();
+  return outcome;
 }
 
 async function preflight(command) {
@@ -244,6 +339,17 @@ function unknownTaskOutcome(admission, diagnosticCode, fallback = {}) {
       native_session_id: null,
       prompt_sha256: facts.prompt_sha256 ?? admission?.prompt_sha256 ?? null,
       prompt_bytes: facts.prompt_bytes ?? admission?.prompt_bytes ?? null,
+      ...(fallback.task_prompt_contract_revision ? {
+        task_prompt_contract_revision: fallback.task_prompt_contract_revision,
+        prompt_contract_revision: fallback.task_prompt_contract_revision,
+        task_prompt: fallback.task_prompt,
+        task_dispatch_context: fallback.task_dispatch_context,
+      } : admission?.task_prompt_contract_revision ? {
+        task_prompt_contract_revision: admission.task_prompt_contract_revision,
+        prompt_contract_revision: admission.prompt_contract_revision,
+        task_prompt: admission.task_prompt,
+        task_dispatch_context: admission.task_dispatch_context,
+      } : {}),
       control_record_ref: operationId ? controlRecordRef(operationId) : null,
       result_ref: operationId ? resultRecordRef(operationId) : null,
       artifact_refs: operationId ? [
@@ -266,16 +372,17 @@ function runEvidenceMatches(run, admission, operationId, evidence) {
     { kind: "command_control_record", ref: controlRecordRef(operationId) },
     { kind: "command_result_record", ref: resultRecordRef(operationId) },
   ];
-  return evidence?.valid === true
-    && admission?.schema === 2
+  const currentArtifact = admission?.schema === 3
     && admission.module_artifact_id === MODULE_ARTIFACT_ID
+    && run?.schema === 3
+    && run.module_artifact_id === MODULE_ARTIFACT_ID;
+  return evidence?.valid === true
+    && currentArtifact
     && admission.operation_id === operationId
     && admission.batch_run_id === batchRunId(operationId)
     && admission.control_record_ref === controlRecordRef(operationId)
     && admission.result_ref === resultRecordRef(operationId)
     && JSON.stringify(admission.artifact_refs) === JSON.stringify(artifacts)
-    && run?.schema === 2
-    && run.module_artifact_id === MODULE_ARTIFACT_ID
     && (!run || (
       run.operation_id === operationId
       && run.batch_run_id === batchRunId(operationId)
@@ -286,22 +393,28 @@ function runEvidenceMatches(run, admission, operationId, evidence) {
       && run.control_record_ref === controlRecordRef(operationId)
       && run.result_ref === resultRecordRef(operationId)
       && JSON.stringify(run.artifact_refs) === JSON.stringify(artifacts)
+      && (!currentArtifact || (
+        admission.task_prompt_contract_revision === TASK_PROMPT_CONTRACT_REVISION
+        && run.task_prompt_contract_revision === admission.task_prompt_contract_revision
+        && run.prompt_contract_revision === admission.prompt_contract_revision
+        && isDeepStrictEqual(run.task_prompt, admission.task_prompt)
+        && isDeepStrictEqual(run.task_dispatch_context, admission.task_dispatch_context)
+        && isDeepStrictEqual(run.dispatch_admission, admission.dispatch_admission)
+      ))
     ));
 }
 
 async function dispatchTask(command) {
-  const { operationId, modelId, cwd, input, prompt, coreBinding } = dispatchIdentity(command);
-  if (input.command_core_binding?.batch_run_id !== coreBinding.batch_run_id
-      || input.command_core_binding?.prompt_sha256 !== coreBinding.prompt_sha256
-      || input.command_core_binding?.prompt_bytes !== coreBinding.prompt_bytes) {
-    throw codedError("CORE_PROMPT_BINDING_MISMATCH");
-  }
+  const { operationId, modelId, cwd, prompt, coreBinding } = dispatchIdentity(command);
   const controlDir = runDirectory(operationId);
   const record = await openRun(config, {
     operationId,
     requestedModel: modelId,
     prompt,
     coreBinding,
+    command,
+    bootId,
+    moduleContract,
     controlDir,
     cwd,
     ...(runTimeoutMs === undefined ? {} : { timeoutMs: runTimeoutMs }),
@@ -320,10 +433,9 @@ function dispatchIdentity(command) {
   const nativeOptions = command.route.native_options ?? {};
   const cwd = required(nativeOptions, "workspaceRoot");
   if (!path.isAbsolute(cwd)) throw codedError("WORKSPACE_ROOT_MUST_BE_ABSOLUTE");
-  const input = command.input ?? {};
-  const prompt = buildTaskPrompt(input.task_snapshot, input.text, input.task_snapshot_canonical);
-  const coreBinding = commandReceiptFacts(operationId, prompt);
-  return { operationId, modelId, cwd, input, prompt, coreBinding };
+  const validated = validateTaskPromptDispatch(command, bootId, moduleContract);
+  if (validated.operationId !== operationId) throw codedError("TASK_DISPATCH_CONTEXT_INVALID");
+  return { operationId, modelId, cwd, ...validated };
 }
 
 function dispatchFallback(identity) {
@@ -331,6 +443,9 @@ function dispatchFallback(identity) {
     operation_id: identity.operationId,
     requested_model: identity.modelId,
     core_binding: identity.coreBinding,
+    task_prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    task_prompt: identity.taskPrompt,
+    task_dispatch_context: identity.taskDispatchContext,
   };
 }
 
@@ -380,10 +495,9 @@ function targetDispatchFallback(command, targetOperationId) {
   };
 }
 
-function targetUnknown(targetOperationId, fallback, diagnosticCode) {
+function targetUnknown(targetOperationId, fallback, diagnosticCode, moduleReceipt) {
   const result = unknownTaskOutcome(null, diagnosticCode, fallback);
-  saveOutcome(targetOperationId, result, "task.dispatch");
-  return { operation_id: targetOperationId, ...result };
+  return saveOutcome(targetOperationId, result, "task.dispatch", moduleReceipt);
 }
 
 function unknownOpenTargetOutcome() {
@@ -403,12 +517,21 @@ function reconcileTarget(command) {
   if (!new Set(["agent.open", "task.dispatch"]).has(targetMethod)) {
     throw codedError("TARGET_COMMAND_METHOD_INVALID");
   }
+  const targetModuleReceipt = moduleReceiptFor(
+    command,
+    targetOperationId,
+    command.target_input_sha256,
+  );
   if (targetMethod === "agent.open") {
     // The original open is a version/mod preflight only. The bridge keeps no
     // durable operation receipt for it, so a lost acknowledgement cannot be
     // reconstructed by probing the CLI again.
-    const targetResult = unknownOpenTargetOutcome();
-    saveOutcome(targetOperationId, targetResult, "agent.open");
+    const targetResult = saveOutcome(
+      targetOperationId,
+      unknownOpenTargetOutcome(),
+      "agent.open",
+      targetModuleReceipt,
+    );
     return {
       target_operation_id: targetOperationId,
       target_record_state: "preflight_receipt_unavailable",
@@ -421,7 +544,12 @@ function reconcileTarget(command) {
   try {
     saved = snapshotRun(targetDir);
   } catch {
-    const targetResult = targetUnknown(targetOperationId, fallback, "saved_record_unreadable");
+      const targetResult = targetUnknown(
+        targetOperationId,
+        fallback,
+        "saved_record_unreadable",
+        targetModuleReceipt,
+      );
     return {
       target_operation_id: targetOperationId,
       target_record_state: "unreadable",
@@ -434,6 +562,7 @@ function reconcileTarget(command) {
       targetOperationId,
       fallback,
       missing ? "saved_admission_missing" : "saved_admission_identity_mismatch",
+      targetModuleReceipt,
     );
     return {
       target_operation_id: targetOperationId,
@@ -443,6 +572,27 @@ function reconcileTarget(command) {
   }
   const admissionMatchesCore = saved.admission.requested_model === fallback.requested_model
     && matchesCoreBinding(saved.admission.core_binding, fallback.core_binding);
+  if (saved.admission.module_artifact_id === HISTORICAL_MODULE_ARTIFACT_ID
+      && saved.evidence?.valid === true) {
+    const historical = unknownTaskOutcome(null, "historical_artifact_readback_only", fallback);
+    historical.details.historical_evidence = {
+      source_artifact_id: HISTORICAL_MODULE_ARTIFACT_ID,
+      terminal: saved.terminal,
+      prompt_sha256: saved.admission.prompt_sha256,
+      prompt_bytes: saved.admission.prompt_bytes,
+    };
+    const targetOutcome = saveOutcome(
+      targetOperationId,
+      historical,
+      "task.dispatch",
+      targetModuleReceipt,
+    );
+    return {
+      target_operation_id: targetOperationId,
+      target_record_state: "historical_record_readable",
+      target_outcome: targetOutcome,
+    };
+  }
   const identityMatches = admissionMatchesCore
     && runEvidenceMatches(saved.run, saved.admission, targetOperationId, saved.evidence);
   if (!identityMatches) {
@@ -450,6 +600,7 @@ function reconcileTarget(command) {
       targetOperationId,
       fallback,
       saved.evidence?.diagnostic_code ?? "saved_record_identity_mismatch",
+      targetModuleReceipt,
     );
     return {
       target_operation_id: targetOperationId,
@@ -460,26 +611,32 @@ function reconcileTarget(command) {
   const targetResult = saved.run
     ? taskOutcome(saved.run, saved.evidence)
     : unknownTaskOutcome(null, "native_result_missing_after_admission", fallback);
-  saveOutcome(targetOperationId, targetResult, "task.dispatch");
+  const targetOutcome = saveOutcome(
+    targetOperationId,
+    targetResult,
+    "task.dispatch",
+    targetModuleReceipt,
+  );
   return {
     target_operation_id: targetOperationId,
     target_record_state: saved.run ? "terminal_record_observed" : "admission_only",
-    target_outcome: { operation_id: targetOperationId, ...targetResult },
+    target_outcome: targetOutcome,
   };
 }
 
 async function execute(command) {
   const operationId = required(command, "operation_id");
+  const moduleReceipt = moduleReceiptFor(command);
   active.add(operationId);
   try {
     let result;
     if (command.method === "agent.open") {
       result = await preflight(command);
       const { outcome, ...record } = result;
-      saveOutcome(operationId, { outcome, details: record.details }, command.method);
+      saveOutcome(operationId, { outcome, details: record.details }, command.method, moduleReceipt);
     } else if (command.method === "task.dispatch") {
       result = await dispatchTask(command);
-      saveOutcome(operationId, result, command.method);
+      saveOutcome(operationId, result, command.method, moduleReceipt);
     } else if (command.method === "agent.reconcile") {
       result = reconcileTarget(command);
       saveOutcome(operationId, {
@@ -490,7 +647,7 @@ async function execute(command) {
           native_replay: false,
           ...result,
         },
-      }, command.method);
+      }, command.method, moduleReceipt);
     } else if (command.method === "agent.refresh") {
       saveOutcome(operationId, {
         outcome: "applied",
@@ -499,7 +656,7 @@ async function execute(command) {
           completion_condition: "batch_snapshot_readback",
           snapshot: observation(),
         },
-      }, command.method);
+      }, command.method, moduleReceipt);
     } else if (command.method === "agent.send") {
       throw capabilityError("send_next_turn");
     } else if (command.method === "agent.configure") {
@@ -553,7 +710,7 @@ async function execute(command) {
             },
           };
     }
-    saveOutcome(operationId, result, command.method);
+    saveOutcome(operationId, result, command.method, moduleReceipt);
   } finally {
     active.delete(operationId);
   }
@@ -602,8 +759,10 @@ while (!stopping) {
       boot_id: bootId,
       module_artifact_id: MODULE_ARTIFACT_ID,
       native_ready: false,
-      ...(managedOwner ? { managed_owner: managedOwner } : {}),
+      managed_owner: managedOwner,
+      module_contract: moduleContract,
     });
+    verifyModuleContractNegotiation(hello, moduleContract);
     currentRoute = hello.route?.native_options ?? null;
     lastSentRevision = -1;
     await report();

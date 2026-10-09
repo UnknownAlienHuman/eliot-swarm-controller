@@ -6,6 +6,7 @@
 
 use std::{env, path::PathBuf};
 
+use crate::{ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION, ARTIFACT_ID, ARTIFACT_VERSION, Profile};
 use serde_json::Value;
 use swarm_contracts::{
     error::{Error, Result},
@@ -13,8 +14,10 @@ use swarm_contracts::{
     runtime::{ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome},
 };
 
+#[derive(Clone)]
 pub struct ModuleHostIdentity {
     pub claim: ModuleContractClaim,
+    pub profile: Profile,
     pub boot_id: String,
     pub binding_id: String,
     pub generation: i64,
@@ -62,9 +65,18 @@ pub fn load_claim_and_verify_owner(owner_record: &Value) -> Result<ModuleHostIde
     let module_client_id = required_env("ELIOT_SWARM_MODULE_CLIENT_ID")?;
     let credential_file = PathBuf::from(required_env("ELIOT_SWARM_MODULE_CREDENTIAL_FILE")?);
 
+    let profile = match (artifact_id.as_str(), artifact_version.as_str()) {
+        (ARTIFACT_ID, ARTIFACT_VERSION) => Profile::BatchV3,
+        (ARTIFACT_ID, "4") => Profile::BatchV4,
+        (ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION) => Profile::AcpV1,
+        _ => {
+            return Err(Error::new(
+                "MODULE_CONTRACT_MISMATCH",
+                "unsupported Command adapter artifact profile",
+            ));
+        }
+    };
     if module != "runtime.command"
-        || artifact_id != crate::ARTIFACT_ID
-        || artifact_version != crate::ARTIFACT_VERSION
         || claim.module_id.as_str() != module
         || claim.artifact.artifact_id.as_str() != artifact_id
         || claim.artifact.version.as_str() != artifact_version
@@ -72,8 +84,8 @@ pub fn load_claim_and_verify_owner(owner_record: &Value) -> Result<ModuleHostIde
         || protocol != "1.0"
         || claim.protocol.major != 1
         || claim.protocol.minor != 0
-        || !command_capabilities_match(&claim)
-        || !schemas_match(&claim)
+        || !command_capabilities_match(&claim, profile)
+        || !schemas_match(&claim, profile)
         || claim.config_schema.is_some()
         || binding_id.trim().is_empty()
         || !credential_file.is_absolute()
@@ -86,6 +98,7 @@ pub fn load_claim_and_verify_owner(owner_record: &Value) -> Result<ModuleHostIde
 
     Ok(ModuleHostIdentity {
         claim,
+        profile,
         boot_id: verified.boot_id,
         binding_id,
         generation,
@@ -131,7 +144,7 @@ fn optional_env(name: &str) -> Result<Option<String>> {
     }
 }
 
-fn command_capabilities_match(claim: &ModuleContractClaim) -> bool {
+fn command_capabilities_match(claim: &ModuleContractClaim, profile: Profile) -> bool {
     const V2: [&str; 4] = [
         "agent.open",
         "agent.reconcile",
@@ -145,10 +158,34 @@ fn command_capabilities_match(claim: &ModuleContractClaim) -> bool {
         "agent.result",
         "task.dispatch",
     ];
-    let expected: &[&str] = match claim.artifact.version.as_str() {
-        "2" => &V2,
-        "3" => &V3,
-        _ => return false,
+    const ACP_V1: [&str; 9] = [
+        "agent.configure",
+        "agent.open",
+        "agent.reconcile",
+        "agent.refresh",
+        "agent.reply",
+        "agent.result",
+        "agent.send/next_turn",
+        "native.command.cancel_turn",
+        "task.dispatch",
+    ];
+    const ACP_V1_CLOSE: [&str; 10] = [
+        "agent.configure",
+        "agent.open",
+        "agent.reconcile",
+        "agent.refresh",
+        "agent.reply",
+        "agent.result",
+        "agent.send/next_turn",
+        "native.command.cancel_turn",
+        "native.command.close_session",
+        "task.dispatch",
+    ];
+    let expected: &[&str] = match profile {
+        Profile::BatchV3 | Profile::BatchV4 => &V3,
+        Profile::AcpV1 if claim.capabilities.len() == ACP_V1.len() => &ACP_V1,
+        Profile::AcpV1 if claim.capabilities.len() == ACP_V1_CLOSE.len() => &ACP_V1_CLOSE,
+        Profile::AcpV1 => return false,
     };
     claim.capabilities.len() == expected.len()
         && claim
@@ -158,7 +195,7 @@ fn command_capabilities_match(claim: &ModuleContractClaim) -> bool {
             .all(|(actual, expected)| actual.as_str() == *expected)
 }
 
-fn schemas_match(claim: &ModuleContractClaim) -> bool {
+fn schemas_match(claim: &ModuleContractClaim, profile: Profile) -> bool {
     let legacy = exact_schema_set(&claim.command_schemas, &["swarm.runtime_command"])
         && exact_schema_set(&claim.event_schemas, &["swarm.runtime_outcome"]);
     let normalized = exact_schema_set(
@@ -169,21 +206,65 @@ fn schemas_match(claim: &ModuleContractClaim) -> bool {
         &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
     );
     let normalized_results = normalized_result_schemas_match(claim);
-    legacy || normalized || normalized_results
+    match profile {
+        Profile::BatchV3 => legacy || normalized || normalized_results,
+        Profile::BatchV4 => acp_v1_schemas_match(claim),
+        Profile::AcpV1 => acp_v1_schemas_match(claim),
+    }
 }
 
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
-    exact_schema_set(
-        &claim.command_schemas,
-        &["swarm.runtime_command", "swarm.task_dispatch_context"],
-    ) && exact_schema_set(
-        &claim.event_schemas,
-        &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
-    ) || normalized_result_schemas_match(claim)
+    matches!(profile_for_claim(claim), Some(Profile::BatchV4 | Profile::AcpV1))
+        || exact_schema_set(
+            &claim.command_schemas,
+            &["swarm.runtime_command", "swarm.task_dispatch_context"],
+        ) && exact_schema_set(
+            &claim.event_schemas,
+            &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
+        )
+        || normalized_result_schemas_match(claim)
 }
 
 pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
     normalized_result_schemas_match(claim)
+        || matches!(profile_for_claim(claim), Some(Profile::BatchV4 | Profile::AcpV1))
+            && acp_v1_schemas_match(claim)
+}
+
+pub fn task_prompt_v1_enabled(claim: &ModuleContractClaim) -> bool {
+    matches!(profile_for_claim(claim), Some(Profile::BatchV4 | Profile::AcpV1))
+        && acp_v1_schemas_match(claim)
+}
+
+fn profile_for_claim(claim: &ModuleContractClaim) -> Option<Profile> {
+    match (
+        claim.artifact.artifact_id.as_str(),
+        claim.artifact.version.as_str(),
+    ) {
+        (ARTIFACT_ID, ARTIFACT_VERSION) => Some(Profile::BatchV3),
+        (ARTIFACT_ID, "4") => Some(Profile::BatchV4),
+        (ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION) => Some(Profile::AcpV1),
+        _ => None,
+    }
+}
+
+fn acp_v1_schemas_match(claim: &ModuleContractClaim) -> bool {
+    exact_schema_set(
+        &claim.command_schemas,
+        &[
+            "swarm.normalized_result_context",
+            "swarm.runtime_command",
+            "swarm.task_dispatch_context",
+            "swarm.task_prompt",
+        ],
+    ) && exact_schema_set(
+        &claim.event_schemas,
+        &[
+            "swarm.normalized_result_page",
+            "swarm.runtime_outcome",
+            "swarm.task_dispatch_admission",
+        ],
+    )
 }
 
 fn is_schema(schema: &swarm_contracts::module_catalog::SchemaDescriptor, id: &str) -> bool {
@@ -256,7 +337,7 @@ pub fn require_negotiated(hello: &Value, host: &ModuleHostIdentity) -> Result<()
     if hello["binding_id"] != host.binding_id
         || hello["generation"].as_i64() != Some(host.generation)
         || hello["route"]["runtime"] != crate::RUNTIME
-        || hello["route"]["module_artifact_id"] != crate::ARTIFACT_ID
+        || hello["route"]["module_artifact_id"] != host.profile.artifact_id()
         || negotiated["status"] != "negotiated"
         || negotiated["source"] != "store_registered_descriptor"
         || negotiated["descriptor_revision"]

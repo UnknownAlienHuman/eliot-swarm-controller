@@ -4,10 +4,10 @@ use sha2::{Digest, Sha256};
 use swarm_contracts::runtime::{
     ModuleReceiptIdentity, RuntimeCommand, TaskDispatchAdmissionReceipt, TaskDispatchContext,
 };
+use swarm_contracts::task_prompt::TaskPromptEnvelopeV1;
 
 pub const ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-pub const ARTIFACT_VERSION: &str = "4";
-pub const REQUIRED_MODEL_ID: &str = "gemini-3.8-flash-high";
+pub const ARTIFACT_VERSION: &str = "5";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationIdentity {
@@ -157,35 +157,25 @@ pub fn normalized_dispatch_admission(
     command: &RuntimeCommand,
     identity: &OperationIdentity,
     boot_id: &str,
-    payload: &[u8],
+    prompt: &str,
 ) -> Result<TaskDispatchAdmissionReceipt, &'static str> {
     if command.method != "task.dispatch" {
         return Err("EXPECTED_TASK_DISPATCH");
     }
-    let context: TaskDispatchContext = serde_json::from_value(
-        command.input["task_dispatch_context"].clone(),
-    )
-    .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
-    context
-        .validate()
-        .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
-    if context.operation_id != command.operation_id
+    let (envelope, context) = validated_task_prompt(command)?;
+    if identity.method != "task.dispatch"
+        || context.operation_id != command.operation_id
         || context.binding_id != command.binding_id
         || context.binding_generation != command.generation
         || context.worker_boot_id != boot_id
         || identity.operation_id != command.operation_id
+        || identity.binding_id != command.binding_id
+        || identity.generation != command.generation
+        || prompt != envelope.prompt.as_str()
     {
         return Err("TASK_DISPATCH_CONTEXT_INVALID");
     }
-    let source_text = command.input["text"]
-        .as_str()
-        .filter(|text| !text.trim().is_empty())
-        .ok_or("TASK_DISPATCH_CONTEXT_INVALID")?;
-    if context.source_text_sha256 != sha256(source_text.as_bytes())
-        || context.source_text_bytes != source_text.len() as u64
-    {
-        return Err("TASK_DISPATCH_CONTEXT_INVALID");
-    }
+    let prompt_bytes = u64::try_from(prompt.len()).map_err(|_| "TASK_PROMPT_INVALID")?;
     let receipt = TaskDispatchAdmissionReceipt {
         schema_version: 1,
         module_receipt: identity.module_receipt.clone(),
@@ -199,8 +189,8 @@ pub fn normalized_dispatch_admission(
         task_snapshot_sha256: context.task_snapshot_sha256,
         source_text_sha256: context.source_text_sha256,
         source_text_bytes: context.source_text_bytes,
-        native_payload_sha256: sha256(payload),
-        native_payload_bytes: payload.len() as u64,
+        native_payload_sha256: envelope.prompt_sha256,
+        native_payload_bytes: prompt_bytes,
         native_input_id: None,
     };
     receipt
@@ -213,22 +203,69 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn validated_task_prompt(
+    command: &RuntimeCommand,
+) -> Result<(TaskPromptEnvelopeV1, TaskDispatchContext), &'static str> {
+    if command.input.get("task_snapshot").is_some()
+        || command.input.get("task_snapshot_canonical").is_some()
+    {
+        return Err("TASK_PROMPT_SNAPSHOT_FALLBACK_FORBIDDEN");
+    }
+    let envelope: TaskPromptEnvelopeV1 = serde_json::from_value(
+        command
+            .input
+            .get("task_prompt")
+            .cloned()
+            .ok_or("TASK_PROMPT_REQUIRED")?,
+    )
+    .map_err(|_| "TASK_PROMPT_INVALID")?;
+    envelope
+        .validate_shape()
+        .map_err(|_| "TASK_PROMPT_INVALID")?;
+    if envelope.prompt_sha256 != sha256(envelope.prompt.as_bytes()) {
+        return Err("TASK_PROMPT_DIGEST_MISMATCH");
+    }
+
+    let context: TaskDispatchContext = serde_json::from_value(
+        command
+            .input
+            .get("task_dispatch_context")
+            .cloned()
+            .ok_or("TASK_DISPATCH_CONTEXT_INVALID")?,
+    )
+    .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
+    context
+        .validate()
+        .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || envelope.task_id != context.task_id
+        || envelope.task_revision != context.task_revision
+        || envelope.attempt_id != context.attempt_id
+        || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
+    {
+        return Err("TASK_PROMPT_IDENTITY_MISMATCH");
+    }
+    let source_text = command
+        .input
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or("TASK_DISPATCH_CONTEXT_INVALID")?;
+    let source_text_bytes =
+        u64::try_from(source_text.len()).map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
+    if context.source_text_sha256 != sha256(source_text.as_bytes())
+        || context.source_text_bytes != source_text_bytes
+    {
+        return Err("TASK_DISPATCH_CONTEXT_INVALID");
+    }
+    Ok((envelope, context))
+}
+
 pub fn prompt_for(command: &RuntimeCommand) -> Result<String, &'static str> {
     match command.method.as_str() {
-        "task.dispatch" => {
-            let snapshot = command.input.get("task_snapshot");
-            let body = command.input.get("text").and_then(Value::as_str);
-            let specification = snapshot
-                .filter(|value| !value.is_null())
-                .map(|value| format!("Task specification: {value}"));
-            let body = body.filter(|value| !value.trim().is_empty());
-            match (specification, body) {
-                (Some(specification), Some(body)) => Ok(format!("{specification}\n\n{body}")),
-                (Some(specification), None) => Ok(specification),
-                (None, Some(body)) => Ok(body.to_owned()),
-                (None, None) => Err("DISPATCH_TEXT_REQUIRED"),
-            }
-        }
+        "task.dispatch" => validated_task_prompt(command).map(|(envelope, _)| envelope.prompt),
         "agent.send" => {
             if command.input.get("delivery").and_then(Value::as_str) == Some("steer") {
                 return Err("UNSUPPORTED_DELIVERY");

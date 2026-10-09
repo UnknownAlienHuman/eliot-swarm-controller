@@ -128,7 +128,10 @@ pub fn materialize(directory: &Path) -> Result<PathBuf> {
     }
     private_permissions(directory, true)?;
     let bridge_path = directory.join("bridge.mjs");
-    ensure_embedded_file(&bridge_path, include_bytes!("../sdk-harness/bridge.mjs"))?;
+    ensure_embedded_file(
+        &bridge_path,
+        include_str!("../sdk-harness/bridge.mjs").as_bytes(),
+    )?;
     ensure_embedded_file(
         &directory.join("prepared-query.mjs"),
         include_bytes!("../sdk-harness/prepared-query.mjs"),

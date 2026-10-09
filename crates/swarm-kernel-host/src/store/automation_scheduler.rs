@@ -10,7 +10,7 @@ use crate::{
     error::{Error, Result},
     model::{self, Principal, Role},
 };
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use swarm_contracts::{DeclaredServicePurpose, DeclaredServiceScope};
@@ -23,7 +23,34 @@ const METHOD_SCOPE: [&str; 2] = ["automation.scheduler.page", "automation.schedu
 const MAX_SOURCE_PAGE: usize = 32;
 const CRON_DUE_PREFIX: &str = "automation:v1:cron:due:";
 const GOAL_DUE_PREFIX: &str = "goals:v1:due:";
-type DueIndexSnapshot = (Option<i64>, Vec<(String, String)>);
+const SCHEDULE_REGISTRY_KEY: &str = "schedule_registry:v1";
+const SCHEDULER_QUARANTINE_PREFIX: &str = "automation:v1:quarantine:scheduler:";
+type ScheduleCursor = (String, Option<i64>, Option<i64>, Option<i64>);
+
+#[derive(Debug, Clone)]
+struct DueSourceDamage {
+    kind: &'static str,
+    code: &'static str,
+    evidence: super::automation_reconcile::QuarantineEvidence,
+    source_key: Option<String>,
+    source_raw: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DueIndexSnapshot {
+    next_due_at_ms: Option<i64>,
+    due_count: usize,
+    rows: Vec<(String, String)>,
+    damaged_subjects: Vec<DueSourceDamage>,
+}
+
+struct ScheduleSourceSnapshot {
+    due_count: usize,
+    next_due_at_ms: Option<i64>,
+    cursor_digest: String,
+    schedule_cursors: Vec<ScheduleCursor>,
+    damaged_subjects: Vec<DueSourceDamage>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +94,10 @@ struct DueProjection {
     goal_digest: String,
     snapshot_sha256: String,
     schedule_next_due: Option<i64>,
+    damaged_subjects: Vec<DueSourceDamage>,
+    schedule_cursors: Vec<ScheduleCursor>,
+    cron_rows: Vec<(String, String)>,
+    goal_rows: Vec<(String, String)>,
 }
 
 impl DueProjection {
@@ -99,11 +130,88 @@ impl DueProjection {
 
     fn due_sources(&self) -> [bool; 3] {
         [
-            self.schedule_due_count > 0,
+            self.schedule_due_count > 0 && !self.has_damage("interval_schedule"),
             self.cron_due_count > 0,
             self.goal_due_count > 0,
         ]
     }
+
+    fn has_damage(&self, kind: &str) -> bool {
+        self.damaged_subjects
+            .iter()
+            .any(|damage| damage.kind == kind)
+    }
+
+    fn cursor_advanced(&self, after: &Self, kind: &str) -> bool {
+        match kind {
+            "interval_schedule" => {
+                schedule_cursor_advanced(&self.schedule_cursors, &after.schedule_cursors)
+            }
+            "manager_calendar" => source_row_removed(&self.cron_rows, &after.cron_rows),
+            "goal_reminder" => source_row_removed(&self.goal_rows, &after.goal_rows),
+            _ => false,
+        }
+    }
+
+    fn source_outcome(&self, after: &Self, kind: &'static str, invoked: bool) -> Value {
+        let damaged_subjects = self
+            .damaged_subjects
+            .iter()
+            .filter(|damage| damage.kind == kind)
+            .map(|damage| {
+                json!({
+                    "code":damage.code,
+                    "subject_identity":damage.evidence.subject_identity,
+                    "source_pointer":damage.evidence.source_pointer,
+                    "source_digest":damage.evidence.source_digest,
+                })
+            })
+            .collect::<Vec<_>>();
+        let cursor_advanced = self.cursor_advanced(after, kind);
+        let disposition = if !damaged_subjects.is_empty() {
+            "degraded"
+        } else if invoked && cursor_advanced {
+            "progressed"
+        } else {
+            "idle"
+        };
+        json!({
+            "kind":kind,
+            "disposition":disposition,
+            "cursor_advanced":cursor_advanced,
+            "damaged_subjects":damaged_subjects,
+        })
+    }
+}
+
+fn schedule_cursor_advanced(before: &[ScheduleCursor], after: &[ScheduleCursor]) -> bool {
+    fn advanced(before: Option<i64>, after: Option<i64>) -> bool {
+        match (before, after) {
+            (None, Some(_)) => true,
+            (Some(before), Some(after)) => after > before,
+            _ => false,
+        }
+    }
+
+    before
+        .iter()
+        .any(|(schedule_id, observed, considered, admitted)| {
+            let Some((_, after_observed, after_considered, after_admitted)) = after
+                .iter()
+                .find(|(after_id, _, _, _)| after_id == schedule_id)
+            else {
+                return false;
+            };
+            advanced(*observed, *after_observed)
+                || advanced(*considered, *after_considered)
+                || advanced(*admitted, *after_admitted)
+        })
+}
+
+fn source_row_removed(before: &[(String, String)], after: &[(String, String)]) -> bool {
+    before
+        .iter()
+        .any(|(key, _)| after.iter().all(|(after_key, _)| after_key != key))
 }
 
 /// The Store owns the one local scheduler Module credential. A retained
@@ -585,6 +693,13 @@ pub(crate) async fn call(
         Err(receipt) => return Ok(receipt),
     };
     let due = cut.due_sources();
+    // Goal reminders are independent of check recovery and schedule admission.
+    // Reconcile them first so an unclassified prerequisite failure cannot
+    // starve an otherwise due reminder source.
+    let mut goal_next_due_at_ms = None;
+    if due[2] {
+        goal_next_due_at_ms = store.reconcile_goals_once(cut.observed_at_ms).await?;
+    }
     if due[0] || due[1] {
         store.reconcile_checks_once().await?;
     }
@@ -600,10 +715,6 @@ pub(crate) async fn call(
         calendar_next_due_at_ms = store
             .reconcile_automation_cron_once(MAX_SOURCE_PAGE, cut.observed_at_ms)
             .await?;
-    }
-    let mut goal_next_due_at_ms = None;
-    if due[2] {
-        goal_next_due_at_ms = store.reconcile_goals_once(cut.observed_at_ms).await?;
     }
     let scope = cut.scope.clone();
     let config = store.config.clone();
@@ -637,6 +748,11 @@ pub(crate) async fn call(
         "calendar_next_due_at_ms":calendar_next_due_at_ms,
         "goal_next_due_at_ms":goal_next_due_at_ms,
         "next_due_at_ms":latest.next_due_at_ms,
+        "source_outcomes":[
+            cut.source_outcome(&latest, "interval_schedule", due[0]),
+            cut.source_outcome(&latest, "manager_calendar", due[1]),
+            cut.source_outcome(&latest, "goal_reminder", due[2]),
+        ],
     }))
 }
 
@@ -798,7 +914,8 @@ fn prepare_admit(
             "observed_at_ms",
         ],
     )?;
-    let service = registration(db, principal, METHOD_SCOPE[1], owner_token)?;
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let service = registration(&tx, principal, METHOD_SCOPE[1], owner_token)?;
     let requested_scope: DeclaredServiceScope = serde_json::from_value(params["scope"].clone())
         .map_err(|_| Error::invalid("scope is invalid"))?;
     let request_id = model::text(params, "client_request_id")?;
@@ -826,27 +943,91 @@ fn prepare_admit(
             "client_request_id must bind the exact scheduler page cut",
         ));
     }
-    let current = project_due_page(db, config, service.scope)?;
+    let current = project_due_page(&tx, config, service.scope)?;
     if current.snapshot_sha256 != expected_digest
         || current.observed_at_ms < observed_at_ms
         || current.observed_at_ms.saturating_sub(observed_at_ms) > 60_000
     {
-        return Ok(Err(json!({
+        let receipt = json!({
             "schema_version":1,
             "scope":current.scope,
             "disposition":"page_stale",
             "next_due_at_ms":current.next_due_at_ms,
-        })));
+        });
+        tx.commit()?;
+        return Ok(Err(receipt));
     }
     if !current.is_due() {
-        return Ok(Err(json!({
+        let receipt = json!({
             "schema_version":1,
             "scope":current.scope,
             "disposition":"already_observed",
             "next_due_at_ms":current.next_due_at_ms,
-        })));
+        });
+        tx.commit()?;
+        return Ok(Err(receipt));
     }
+    for damage in current
+        .damaged_subjects
+        .iter()
+        .filter(|damage| damage.kind != "goal_reminder")
+    {
+        quarantine_due_source_damage(&tx, damage, current.observed_at_ms)?;
+    }
+    tx.commit()?;
     Ok(Ok(current))
+}
+
+fn quarantine_due_source_damage(
+    tx: &Transaction<'_>,
+    damage: &DueSourceDamage,
+    now_ms: i64,
+) -> Result<()> {
+    let quarantine_key = super::automation_reconcile::quarantine_record_key(
+        SCHEDULER_QUARANTINE_PREFIX,
+        &damage.evidence,
+    )?;
+    super::automation_reconcile::persist_quarantine(
+        tx,
+        &quarantine_key,
+        damage.code,
+        damage.evidence.clone(),
+        now_ms,
+    )?;
+
+    if damage.kind != "manager_calendar" {
+        return Ok(());
+    }
+    let (Some(source_key), Some(source_raw)) = (&damage.source_key, &damage.source_raw) else {
+        return Err(Error::new(
+            "AUTOMATION_DUE_EVIDENCE_INCOMPLETE",
+            "damaged manager-calendar subject has no exact source row for quarantine CAS",
+        ));
+    };
+    let key_digest = model::digest(source_key.as_bytes());
+    let expected_identity = format!("meta-key-sha256:{key_digest}");
+    let expected_pointer = format!("meta/key-sha256:{key_digest}");
+    let expected_digest = model::digest(source_raw.as_bytes());
+    if damage.evidence.subject_identity != expected_identity
+        || damage.evidence.source_pointer.as_deref() != Some(expected_pointer.as_str())
+        || damage.evidence.source_digest.as_deref() != Some(expected_digest.as_str())
+    {
+        return Err(Error::new(
+            "AUTOMATION_DUE_EVIDENCE_INVALID",
+            "damaged manager-calendar evidence does not bind its exact source row",
+        ));
+    }
+    let deleted = tx.execute(
+        "DELETE FROM meta WHERE key=?1 AND value_json=?2",
+        params![source_key, source_raw],
+    )?;
+    if deleted != 1 {
+        return Err(Error::new(
+            "AUTOMATION_DUE_SUBJECT_CHANGED",
+            "manager-calendar source row changed before quarantine CAS",
+        ));
+    }
+    Ok(())
 }
 
 fn project_due_page(
@@ -855,33 +1036,24 @@ fn project_due_page(
     scope: DeclaredServiceScope,
 ) -> Result<DueProjection> {
     let observed_at_ms = model::now_ms()?;
-    let schedule_status = super::schedules::status(db, &config.schedules, observed_at_ms)?;
-    let schedule_items = schedule_status["items"]
-        .as_array()
-        .ok_or_else(|| Error::new("SCHEDULE_STATE_INVALID", "schedule status has no items"))?;
-    let schedule_due = schedule_items
-        .iter()
-        .filter(|item| {
-            item["next_due_ms"]
-                .as_i64()
-                .is_some_and(|due| due <= observed_at_ms)
-        })
-        .count();
-    let schedule_next = schedule_items
-        .iter()
-        .filter_map(|item| item["next_due_ms"].as_i64())
-        .min();
-    let schedule_digest = digest_json(&json!({
-        "definitions":config.schedules,
-        "state":schedule_status,
-    }))?;
-
-    let (cron_next, cron_rows) = due_index_snapshot(db, CRON_DUE_PREFIX, 20)?;
-    let (goal_next, goal_rows) = due_index_snapshot(db, GOAL_DUE_PREFIX, 19)?;
-    let cron_due = due_count(&cron_rows, CRON_DUE_PREFIX, 20, observed_at_ms)?;
-    let goal_due = due_count(&goal_rows, GOAL_DUE_PREFIX, 19, observed_at_ms)?;
-    let cron_digest = digest_index_rows(&cron_rows)?;
-    let goal_digest = digest_index_rows(&goal_rows)?;
+    let ScheduleSourceSnapshot {
+        due_count: schedule_due,
+        next_due_at_ms: schedule_next,
+        cursor_digest: schedule_digest,
+        schedule_cursors,
+        damaged_subjects: schedule_damage,
+    } = schedule_source_snapshot(db, config, observed_at_ms)?;
+    let cron = due_index_snapshot(db, CRON_DUE_PREFIX, 20, "manager_calendar", observed_at_ms)?;
+    let goal = due_index_snapshot(db, GOAL_DUE_PREFIX, 19, "goal_reminder", observed_at_ms)?;
+    let mut damaged_subjects = schedule_damage;
+    damaged_subjects.extend(cron.damaged_subjects.iter().cloned());
+    damaged_subjects.extend(goal.damaged_subjects.iter().cloned());
+    let cron_next = cron.next_due_at_ms;
+    let goal_next = goal.next_due_at_ms;
+    let cron_due = cron.due_count;
+    let goal_due = goal.due_count;
+    let cron_digest = digest_index_rows(&cron.rows)?;
+    let goal_digest = digest_index_rows(&goal.rows)?;
     let next_due_at_ms = [schedule_next, cron_next, goal_next]
         .into_iter()
         .flatten()
@@ -910,6 +1082,114 @@ fn project_due_page(
         goal_due_count: bounded_count(goal_due),
         goal_digest,
         snapshot_sha256,
+        damaged_subjects,
+        schedule_cursors,
+        cron_rows: cron.rows,
+        goal_rows: goal.rows,
+    })
+}
+
+fn schedule_source_snapshot(
+    db: &Connection,
+    config: &Config,
+    observed_at_ms: i64,
+) -> Result<ScheduleSourceSnapshot> {
+    let raw_registry = raw_meta(db, SCHEDULE_REGISTRY_KEY)?;
+    if let Some(raw) = raw_registry.as_deref()
+        && serde_json::from_str::<Value>(raw).is_err()
+    {
+        return damaged_schedule_registry(config, raw, "SCHEDULE_STATE_INVALID");
+    }
+    let schedule_status = match super::schedules::status(db, &config.schedules, observed_at_ms) {
+        Ok(status) => status,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "SCHEDULE_STATE_INVALID" | "SCHEDULE_STATE_VERSION"
+            ) && raw_registry.is_some() =>
+        {
+            let code = if error.code == "SCHEDULE_STATE_VERSION" {
+                "SCHEDULE_STATE_VERSION"
+            } else {
+                "SCHEDULE_STATE_INVALID"
+            };
+            return damaged_schedule_registry(
+                config,
+                raw_registry.as_deref().unwrap_or_default(),
+                code,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    let schedule_items = schedule_status["items"].as_array().ok_or_else(|| {
+        Error::new(
+            "SCHEDULER_SOURCE_PROJECTION_INVALID",
+            "schedule status does not contain its closed item list",
+        )
+    })?;
+    let mut schedule_cursors = Vec::with_capacity(schedule_items.len());
+    for item in schedule_items {
+        let schedule_id = item["schedule_id"].as_str().ok_or_else(|| {
+            Error::new(
+                "SCHEDULER_SOURCE_PROJECTION_INVALID",
+                "schedule status item has no retained identity",
+            )
+        })?;
+        schedule_cursors.push((
+            schedule_id.to_owned(),
+            item["last_observed_due_slot"].as_i64(),
+            item["last_considered_slot"].as_i64(),
+            item["last_admitted_slot"].as_i64(),
+        ));
+    }
+    let due_count = schedule_items
+        .iter()
+        .filter(|item| {
+            item["next_due_ms"]
+                .as_i64()
+                .is_some_and(|due| due <= observed_at_ms)
+        })
+        .count();
+    let next_due = schedule_items
+        .iter()
+        .filter_map(|item| item["next_due_ms"].as_i64())
+        .min();
+    let cursor_digest = digest_json(&json!({
+        "definitions":config.schedules,
+        "state":schedule_status,
+    }))?;
+    Ok(ScheduleSourceSnapshot {
+        due_count,
+        next_due_at_ms: next_due,
+        cursor_digest,
+        schedule_cursors,
+        damaged_subjects: Vec::new(),
+    })
+}
+
+fn damaged_schedule_registry(
+    config: &Config,
+    raw_registry: &str,
+    code: &'static str,
+) -> Result<ScheduleSourceSnapshot> {
+    let evidence =
+        super::automation_reconcile::automation_entry_evidence(SCHEDULE_REGISTRY_KEY, raw_registry);
+    let cursor_digest = digest_json(&json!({
+        "definitions":config.schedules,
+        "damaged_registry_sha256":evidence.source_digest,
+    }))?;
+    Ok(ScheduleSourceSnapshot {
+        due_count: 1,
+        next_due_at_ms: Some(0),
+        cursor_digest,
+        schedule_cursors: Vec::new(),
+        damaged_subjects: vec![DueSourceDamage {
+            kind: "interval_schedule",
+            code,
+            evidence,
+            source_key: None,
+            source_raw: None,
+        }],
     })
 }
 
@@ -927,6 +1207,8 @@ fn due_index_snapshot(
     db: &Connection,
     prefix: &str,
     timestamp_width: usize,
+    kind: &'static str,
+    observed_at_ms: i64,
 ) -> Result<DueIndexSnapshot> {
     let upper = format!("{prefix}~");
     let mut statement = db.prepare(
@@ -937,26 +1219,111 @@ fn due_index_snapshot(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let first = rows
-        .first()
-        .map(|(key, _)| parse_due_key(key, prefix, timestamp_width))
-        .transpose()?;
-    if let Some(first) = first
-        && first < 0
-    {
-        return Err(Error::new(
-            "AUTOMATION_DUE_INDEX_INVALID",
-            "due index contains a negative timestamp",
-        ));
+    let mut due_times = Vec::with_capacity(rows.len());
+    let mut damaged_subjects = Vec::new();
+    for (key, raw) in &rows {
+        let due = match parse_due_key(key, prefix, timestamp_width) {
+            Ok(due) => due,
+            Err(error) if error.code == "AUTOMATION_DUE_INDEX_INVALID" => {
+                damaged_subjects.push(due_index_damage(kind, key, raw));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let value: Value = match serde_json::from_str(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                damaged_subjects.push(due_index_damage(kind, key, raw));
+                continue;
+            }
+        };
+        if kind == "manager_calendar" && !valid_cron_due_index(key, &value, due) {
+            damaged_subjects.push(due_index_damage(kind, key, raw));
+            continue;
+        }
+        due_times.push(due);
     }
-    Ok((first, rows))
+    let valid_next = due_times.iter().copied().min();
+    let next_due_at_ms = if damaged_subjects.is_empty() {
+        valid_next
+    } else {
+        Some(0)
+    };
+    let due_count = due_times
+        .iter()
+        .filter(|due| **due <= observed_at_ms)
+        .count()
+        .saturating_add(if kind == "goal_reminder" {
+            damaged_subjects.len()
+        } else {
+            0
+        });
+    Ok(DueIndexSnapshot {
+        next_due_at_ms,
+        due_count,
+        rows,
+        damaged_subjects,
+    })
 }
 
-fn due_count(rows: &[(String, String)], prefix: &str, width: usize, now_ms: i64) -> Result<usize> {
-    rows.iter()
-        .map(|(key, _)| parse_due_key(key, prefix, width))
-        .collect::<Result<Vec<_>>>()
-        .map(|times| times.iter().filter(|due| **due <= now_ms).count())
+fn due_index_damage(kind: &'static str, key: &str, raw: &str) -> DueSourceDamage {
+    DueSourceDamage {
+        kind,
+        code: match kind {
+            "manager_calendar" => "AUTOMATION_CRON_STATE_INVALID",
+            "goal_reminder" => "GOAL_RECORD_CORRUPT",
+            _ => unreachable!("closed due source kind"),
+        },
+        evidence: super::automation_reconcile::automation_entry_evidence(key, raw),
+        source_key: Some(key.to_owned()),
+        source_raw: Some(raw.to_owned()),
+    }
+}
+
+fn valid_cron_due_index(key: &str, value: &Value, due_at_ms: i64) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let required = [
+        "schema_version",
+        "logical_id",
+        "origin_manager_id",
+        "current_owner_manager_id",
+        "project_id",
+        "automation_id",
+        "generation",
+        "wake_at_ms",
+    ];
+    if object.len() != required.len() || required.iter().any(|field| !object.contains_key(*field)) {
+        return false;
+    }
+    let logical_id = object["logical_id"].as_str().unwrap_or_default();
+    let generation = object["generation"].as_str().unwrap_or_default();
+    object["schema_version"].as_u64() == Some(1)
+        && is_sha256(logical_id)
+        && [
+            "origin_manager_id",
+            "current_owner_manager_id",
+            "project_id",
+            "automation_id",
+        ]
+        .iter()
+        .all(|field| {
+            object[*field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        })
+        && is_sha256(generation)
+        && object["wake_at_ms"].as_i64() == Some(due_at_ms)
+        && key == format!("{CRON_DUE_PREFIX}{due_at_ms:020}:{logical_id}")
+}
+
+fn raw_meta(db: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(db
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
 }
 
 fn parse_due_key(key: &str, prefix: &str, timestamp_width: usize) -> Result<i64> {

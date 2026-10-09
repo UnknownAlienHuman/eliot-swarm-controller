@@ -82,6 +82,14 @@ pub fn task_dispatch_context_schema() -> SchemaDescriptor {
     }
 }
 
+pub fn task_prompt_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: crate::task_prompt::TASK_PROMPT_SCHEMA_ID.to_owned(),
+        version: crate::task_prompt::TASK_PROMPT_SCHEMA_VERSION.to_string(),
+        sha256: None,
+    }
+}
+
 /// Descriptor declaration for the typed normalized dispatch receipt returned
 /// by an adapter that implements `task_dispatch_context_schema`.
 pub fn task_dispatch_admission_schema() -> SchemaDescriptor {
@@ -248,6 +256,14 @@ impl ModuleContractTemplate {
             task_dispatch_admission_schema(),
             normalized_result_page_schema(),
         ]);
+        Ok(template)
+    }
+
+    /// New immutable artifact version consuming the Store-produced prompt.
+    pub fn codex_rust_controller_v5() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v4()?;
+        template.artifact.version = ArtifactVersion::new("5")?;
+        template.command_schemas.insert(task_prompt_schema());
         Ok(template)
     }
 

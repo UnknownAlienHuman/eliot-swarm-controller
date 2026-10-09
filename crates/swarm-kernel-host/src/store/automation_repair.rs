@@ -16,7 +16,7 @@ use crate::{
     error::{Error, Result},
     model,
     model::{Principal, Role},
-    review::{ReviewFinding, ReviewSlotIdentity},
+    review::{ReviewFinding, ReviewFindingsPackage, ReviewSlotIdentity},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,10 @@ struct RepairSlotReceipt {
     attempt_id: String,
     submission_ref: String,
     candidate_ref: String,
-    finding_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    findings_digest: Option<String>,
     parameters_digest: String,
     operation_id: String,
     reserved_at_ms: i64,
@@ -88,7 +91,8 @@ pub(crate) struct RepairDispatchOperationLink {
     pub(crate) attempt_id: String,
     pub(crate) submission_ref: String,
     pub(crate) candidate_ref: String,
-    pub(crate) finding_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finding_id: Option<String>,
     pub(crate) review_assignment_id: String,
     pub(crate) review_result_operation_id: String,
     pub(crate) disposition_operation_id: String,
@@ -97,8 +101,15 @@ pub(crate) struct RepairDispatchOperationLink {
     pub(crate) binding_id: String,
     pub(crate) binding_generation: i64,
     pub(crate) request_digest: String,
-    pub(crate) identity: ReviewSlotIdentity,
-    pub(crate) finding: ReviewFinding,
+    /// Legacy v1 links serialized a duplicate top-level identity. Decode it
+    /// only to validate against `cause.identity`; new links keep the existing
+    /// cause/package identity sources and do not serialize a second copy.
+    #[serde(default, skip_serializing, rename = "identity")]
+    legacy_identity: Option<ReviewSlotIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) findings_package: Option<ReviewFindingsPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finding: Option<ReviewFinding>,
     pub(crate) cause: Value,
     pub(crate) linked_at_ms: i64,
     #[serde(default)]
@@ -126,7 +137,7 @@ pub(crate) struct PreparedRepairDispatch {
 pub(crate) struct DirectRepairSlot {
     manager_id: String,
     identity: ReviewSlotIdentity,
-    finding: ReviewFinding,
+    findings_package: ReviewFindingsPackage,
     assignment_id: String,
     result_operation_id: String,
     disposition_operation_id: String,
@@ -314,61 +325,80 @@ pub(crate) fn consume_review_result_for_entry(
     let finding_ids = disposition["finding_ids"]
         .as_array()
         .ok_or_else(|| source_gap("review disposition has no selected finding list"))?;
-    if finding_ids.len() != 1 {
-        return Ok(json!({
-            "status":"capability_gap",
-            "code":"repair_finding_selection_unsupported",
-            "review_assignment_id":assignment_id,
-            "review_result_operation_id":result_operation_id,
-            "selected_finding_count":finding_ids.len()
-        }));
+    if finding_ids.is_empty() {
+        return Err(source_gap(
+            "review disposition has an empty findings package",
+        ));
     }
-    let finding_id = finding_ids[0]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| source_gap("review disposition finding identity is invalid"))?;
+    let ordered_finding_ids = finding_ids
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| source_gap("review disposition finding identity is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let feedback_operation_id = disposition["task_feedback_operation_id"]
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| source_gap("review disposition has no feedback Operation identity"))?;
     let feedback_observation_id = observation_id_for_feedback(tx, feedback_operation_id)?;
-    let provenance = match reviews::actionable_finding(
-        tx,
-        &review.identity.task_id,
-        &review.identity.attempt_id,
-        review.identity.task_revision,
-        &review.identity.submission_ref,
-        &review.identity.candidate_ref,
-        finding_id,
-    ) {
-        Ok(provenance) => provenance,
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "REVIEW_FINDING_NOT_FOUND"
-                    | "REVIEW_FINDING_NOT_ACTIONABLE"
-                    | "REVIEW_ANCHOR_MISMATCH"
-            ) =>
+    let mut ordered_findings = Vec::with_capacity(ordered_finding_ids.len());
+    for finding_id in &ordered_finding_ids {
+        let provenance = match reviews::actionable_finding(
+            tx,
+            &review.identity.task_id,
+            &review.identity.attempt_id,
+            review.identity.task_revision,
+            &review.identity.submission_ref,
+            &review.identity.candidate_ref,
+            finding_id,
+        ) {
+            Ok(provenance) => provenance,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "REVIEW_FINDING_NOT_FOUND"
+                        | "REVIEW_FINDING_NOT_ACTIONABLE"
+                        | "REVIEW_ANCHOR_MISMATCH"
+                ) =>
+            {
+                return Ok(repair_skipped(
+                    assignment_id,
+                    result_operation_id,
+                    "selected_finding_is_no_longer_actionable",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if provenance["review_assignment_id"] != assignment_id
+            || provenance["review_operation_id"] != result_operation_id
+            || provenance["identity"] != json!(review.identity)
+            || provenance["finding"]["finding_id"].as_str() != Some(finding_id.as_str())
         {
-            return Ok(repair_skipped(
-                assignment_id,
-                result_operation_id,
-                "selected_finding_is_no_longer_actionable",
+            return Err(source_gap(
+                "actionable finding differs from the exact review result",
             ));
         }
-        Err(error) => return Err(error),
-    };
-    if provenance["review_assignment_id"] != assignment_id
-        || provenance["review_operation_id"] != result_operation_id
-        || provenance["identity"] != json!(review.identity)
-        || provenance["finding"]["finding_id"] != finding_id
-    {
+        ordered_findings.push(
+            serde_json::from_value::<ReviewFinding>(provenance["finding"].clone())
+                .map_err(|_| source_gap("actionable review finding fields are invalid"))?,
+        );
+    }
+    let findings_package = ReviewFindingsPackage::new(
+        review.identity.clone(),
+        assignment_id.to_owned(),
+        result_operation_id.to_owned(),
+        ordered_findings,
+    )
+    .map_err(|_| source_gap("ordered committed findings package is invalid"))?;
+    if findings_package.finding_ids() != ordered_finding_ids {
         return Err(source_gap(
-            "actionable finding differs from the exact review result",
+            "review disposition changed the immutable finding order",
         ));
     }
-    let finding: ReviewFinding = serde_json::from_value(provenance["finding"].clone())
-        .map_err(|_| source_gap("actionable review finding fields are invalid"))?;
     let context = match RepairDispatchContext::from_committed_disposition(
         tx,
         entry,
@@ -378,7 +408,7 @@ pub(crate) fn consume_review_result_for_entry(
         &disposition_operation_id,
         feedback_operation_id,
         feedback_observation_id,
-        finding,
+        findings_package,
     ) {
         Ok(context) => context,
         Err(error) if error.code == "REPAIR_OWNER_UNAVAILABLE" => {
@@ -528,7 +558,7 @@ fn consume_transferred_repair_slot(
         let semantic_slot_id = crate::automation::repair::semantic_slot_id(
             owner_id,
             current_context.identity(),
-            &current_context.finding().finding_id,
+            current_context.findings_package().semantic_subject_key(),
         )?;
         let Some(value) = config::read_record(
             tx,
@@ -552,7 +582,7 @@ fn consume_transferred_repair_slot(
             || receipt.attempt_id != current_context.identity().attempt_id
             || receipt.submission_ref != current_context.identity().submission_ref
             || receipt.candidate_ref != current_context.identity().candidate_ref
-            || receipt.finding_id != current_context.finding().finding_id
+            || !receipt_matches_package(&receipt, current_context.findings_package())
             || receipt
                 .source_attempt_owner_id
                 .as_deref()
@@ -583,7 +613,7 @@ fn consume_transferred_repair_slot(
             tx,
             owner_id,
             current_context.identity(),
-            &current_context.finding().finding_id,
+            current_context.findings_package(),
             current_context.binding_id(),
             current_context.binding_generation(),
             &semantic_slot_id,
@@ -671,8 +701,8 @@ fn consume_transferred_repair_slot(
             .as_ref()
             .is_some_and(|operations| operations.as_slice() != context.transfer_operation_ids())
         || receipt.captured_transfer_gm_epoch != context.captured_transfer_gm_epoch()
-        || serde_json::to_value(context.finding())?
-            != serde_json::to_value(current_context.finding())?
+        || serde_json::to_value(context.findings_package())?
+            != serde_json::to_value(current_context.findings_package())?
     {
         return Err(Error::new(
             "REPAIR_LINK_CORRUPT",
@@ -1223,13 +1253,24 @@ pub(crate) fn recognize_direct_correction_request(
         {
             return Err(source_gap("manager disposition identity is inconsistent"));
         }
-        let Some(finding_id) = disposition["finding_ids"]
+        let finding_ids = disposition["finding_ids"]
             .as_array()
-            .filter(|findings| findings.len() == 1)
-            .and_then(|findings| findings[0].as_str())
-        else {
-            continue;
-        };
+            .ok_or_else(|| source_gap("manager disposition has no findings package"))?;
+        if finding_ids.is_empty() {
+            return Err(source_gap(
+                "manager disposition has an empty findings package",
+            ));
+        }
+        let ordered_finding_ids = finding_ids
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| source_gap("manager disposition finding identity is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let identity: ReviewSlotIdentity = serde_json::from_value(disposition["identity"].clone())
             .map_err(|_| source_gap("manager disposition review identity is invalid"))?;
         let feedback_operation_id = disposition["task_feedback_operation_id"]
@@ -1237,48 +1278,71 @@ pub(crate) fn recognize_direct_correction_request(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| source_gap("manager disposition has no feedback Operation identity"))?;
         let feedback_observation_id = observation_id_for_feedback(db, feedback_operation_id)?;
-        let provenance = match reviews::actionable_finding(
-            db,
-            &identity.task_id,
-            &identity.attempt_id,
-            identity.task_revision,
-            &identity.submission_ref,
-            &identity.candidate_ref,
-            finding_id,
-        ) {
-            Ok(provenance) => provenance,
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "REVIEW_FINDING_NOT_FOUND"
-                        | "REVIEW_FINDING_NOT_ACTIONABLE"
-                        | "REVIEW_ANCHOR_MISMATCH"
-                ) =>
+        let result_operation_id = model::text(&disposition, "review_result_operation_id")?;
+        let mut ordered_findings = Vec::with_capacity(ordered_finding_ids.len());
+        let mut no_longer_actionable = false;
+        for finding_id in &ordered_finding_ids {
+            let provenance = match reviews::actionable_finding(
+                db,
+                &identity.task_id,
+                &identity.attempt_id,
+                identity.task_revision,
+                &identity.submission_ref,
+                &identity.candidate_ref,
+                finding_id,
+            ) {
+                Ok(provenance) => provenance,
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "REVIEW_FINDING_NOT_FOUND"
+                            | "REVIEW_FINDING_NOT_ACTIONABLE"
+                            | "REVIEW_ANCHOR_MISMATCH"
+                    ) =>
+                {
+                    no_longer_actionable = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if provenance["review_assignment_id"] != assignment_id
+                || provenance["review_operation_id"] != result_operation_id
+                || provenance["identity"] != json!(identity)
+                || provenance["finding"]["finding_id"].as_str() != Some(finding_id.as_str())
             {
-                continue;
+                return Err(source_gap(
+                    "current actionable finding differs from retained disposition",
+                ));
             }
-            Err(error) => return Err(error),
-        };
-        if provenance["review_assignment_id"] != assignment_id
-            || provenance["review_operation_id"] != disposition["review_result_operation_id"]
-            || provenance["identity"] != json!(identity)
-            || provenance["finding"]["finding_id"] != finding_id
-        {
+            ordered_findings.push(
+                serde_json::from_value::<ReviewFinding>(provenance["finding"].clone())
+                    .map_err(|_| source_gap("actionable finding fields are invalid"))?,
+            );
+        }
+        if no_longer_actionable {
+            continue;
+        }
+        let findings_package = ReviewFindingsPackage::new(
+            identity.clone(),
+            assignment_id.to_owned(),
+            result_operation_id.to_owned(),
+            ordered_findings,
+        )
+        .map_err(|_| source_gap("retained ordered findings package is invalid"))?;
+        if findings_package.finding_ids() != ordered_finding_ids {
             return Err(source_gap(
-                "current actionable finding differs from retained disposition",
+                "retained disposition changed the findings order",
             ));
         }
-        let finding: ReviewFinding = serde_json::from_value(provenance["finding"].clone())
-            .map_err(|_| source_gap("actionable finding fields are invalid"))?;
         let lineage = crate::automation::repair::validate_committed_review_and_feedback(
             db,
             &identity,
             assignment_id,
-            model::text(&disposition, "review_result_operation_id")?,
+            result_operation_id,
             &disposition_operation_id,
             feedback_operation_id,
             feedback_observation_id,
-            &finding,
+            &findings_package,
         )?;
         if lineage.decision_manager_id.as_str() != principal.client_id.as_str()
             || lineage.binding_id.as_str() != binding_id
@@ -1298,7 +1362,7 @@ pub(crate) fn recognize_direct_correction_request(
         let semantic_slot_id = crate::automation::repair::semantic_slot_id(
             &principal.client_id,
             &identity,
-            finding_id,
+            findings_package.semantic_subject_key(),
         )?;
         let request_id = model::text(request, "client_request_id")?;
         let expected = json!({
@@ -1306,7 +1370,7 @@ pub(crate) fn recognize_direct_correction_request(
             "binding_id":binding_id,
             "generation":binding_generation,
             "delivery":"next_turn",
-            "text":crate::automation::repair::render_correction_text(&identity, &finding)
+            "text":crate::automation::repair::render_correction_text(&identity, &findings_package)
         });
         if model::canonical(request)? != model::canonical(&expected)? {
             continue;
@@ -1315,7 +1379,7 @@ pub(crate) fn recognize_direct_correction_request(
         let candidate = DirectRepairSlot {
             manager_id: principal.client_id.clone(),
             identity,
-            finding,
+            findings_package,
             assignment_id: assignment_id.to_owned(),
             result_operation_id: model::text(&disposition, "review_result_operation_id")?
                 .to_owned(),
@@ -1347,7 +1411,7 @@ pub(crate) fn resolve_direct_slot(
         db,
         &slot.manager_id,
         &slot.identity,
-        &slot.finding.finding_id,
+        &slot.findings_package,
         &slot.binding_id,
         slot.binding_generation,
         &slot.semantic_slot_id,
@@ -1367,7 +1431,7 @@ pub(crate) fn resolve_semantic_slot(
         db,
         prepared.context.effective_manager_id(),
         prepared.context.identity(),
-        &prepared.context.finding().finding_id,
+        prepared.context.findings_package(),
         prepared.context.binding_id(),
         prepared.context.binding_generation(),
         prepared.context.semantic_slot_id(),
@@ -1381,7 +1445,7 @@ fn resolve_slot_parts(
     db: &Connection,
     manager_id: &str,
     identity: &ReviewSlotIdentity,
-    finding_id: &str,
+    findings_package: &ReviewFindingsPackage,
     expected_binding_id: &str,
     binding_generation: i64,
     semantic_slot_id: &str,
@@ -1406,7 +1470,7 @@ fn resolve_slot_parts(
         || receipt.attempt_id != identity.attempt_id
         || receipt.submission_ref != identity.submission_ref
         || receipt.candidate_ref != identity.candidate_ref
-        || receipt.finding_id != finding_id
+        || !receipt_matches_package(&receipt, findings_package)
     {
         return Err(Error::new(
             "REPAIR_SLOT_CORRUPT",
@@ -1492,6 +1556,16 @@ fn resolve_slot_parts(
             operation_state: state,
         })
     }
+}
+
+fn receipt_matches_package(receipt: &RepairSlotReceipt, package: &ReviewFindingsPackage) -> bool {
+    receipt.findings_digest.as_deref() == Some(package.findings_digest.as_str())
+        || (package.findings.len() == 1
+            && receipt.finding_id.as_deref()
+                == package
+                    .findings
+                    .first()
+                    .map(|finding| finding.finding_id.as_str()))
 }
 
 fn repair_request_digest(request: &Value) -> Result<String> {
@@ -1585,7 +1659,7 @@ pub(crate) fn retain_direct_admission(
         &slot.disposition_operation_id,
         &slot.feedback_operation_id,
         slot.feedback_observation_id,
-        &slot.finding,
+        &slot.findings_package,
     )?;
     if lineage.decision_manager_id.as_str() != slot.manager_id.as_str()
         || lineage.binding_id.as_str() != slot.binding_id.as_str()
@@ -1661,7 +1735,7 @@ pub(crate) fn retain_direct_admission(
         tx,
         &slot.manager_id,
         &slot.identity,
-        &slot.finding.finding_id,
+        &slot.findings_package.findings_digest,
         &slot.semantic_slot_id,
         operation_id,
         &slot.request_digest,
@@ -1681,7 +1755,7 @@ fn retain_slot(
         tx,
         context.effective_manager_id(),
         context.identity(),
-        &context.finding().finding_id,
+        &context.findings_package().findings_digest,
         context.semantic_slot_id(),
         operation_id,
         parameters_digest,
@@ -1695,7 +1769,7 @@ fn retain_slot_parts(
     tx: &Transaction<'_>,
     manager_id: &str,
     identity: &ReviewSlotIdentity,
-    finding_id: &str,
+    findings_digest: &str,
     semantic_slot_id: &str,
     operation_id: &str,
     parameters_digest: &str,
@@ -1713,6 +1787,7 @@ fn retain_slot_parts(
         if existing.operation_id == operation_id
             && existing.parameters_digest == parameters_digest
             && existing.semantic_slot_id == semantic_slot_id
+            && existing.findings_digest.as_deref() == Some(findings_digest)
         {
             return Ok(());
         }
@@ -1745,7 +1820,8 @@ fn retain_slot_parts(
         attempt_id: identity.attempt_id.clone(),
         submission_ref: identity.submission_ref.clone(),
         candidate_ref: identity.candidate_ref.clone(),
-        finding_id: finding_id.to_owned(),
+        finding_id: None,
+        findings_digest: Some(findings_digest.to_owned()),
         parameters_digest: parameters_digest.to_owned(),
         operation_id: operation_id.to_owned(),
         reserved_at_ms: now_ms,
@@ -1786,7 +1862,7 @@ fn link_from_context(
         attempt_id: context.identity().attempt_id.clone(),
         submission_ref: context.identity().submission_ref.clone(),
         candidate_ref: context.identity().candidate_ref.clone(),
-        finding_id: context.finding().finding_id.clone(),
+        finding_id: None,
         review_assignment_id: context.review_assignment_id().to_owned(),
         review_result_operation_id: context.review_result_operation_id().to_owned(),
         disposition_operation_id: context.disposition_operation_id().to_owned(),
@@ -1795,8 +1871,9 @@ fn link_from_context(
         binding_id: context.binding_id().to_owned(),
         binding_generation: context.binding_generation(),
         request_digest: request_digest.to_owned(),
-        identity: context.identity().clone(),
-        finding: context.finding().clone(),
+        legacy_identity: None,
+        findings_package: Some(context.findings_package().clone()),
+        finding: None,
         cause: context.cause_value(),
         linked_at_ms,
         source_attempt_owner_id: Some(context.source_attempt_owner_id().to_owned()),
@@ -1859,6 +1936,8 @@ pub(crate) fn context_for_delivery_operation(
             "delivery Operation has no retained RepairDispatch attribution",
         )
     })?;
+    let findings_package = findings_package_from_link(&link)?;
+    let identity = findings_package.identity.clone();
     RepairDispatchContext::from_retained_link(
         db,
         &link.effective_manager_id,
@@ -1870,13 +1949,72 @@ pub(crate) fn context_for_delivery_operation(
         &link.disposition_operation_id,
         &link.feedback_operation_id,
         link.feedback_observation_id,
-        link.identity,
-        link.finding,
+        identity,
+        findings_package,
         &link.binding_id,
         link.binding_generation,
         &link.semantic_slot_id,
         link.captured_transfer_gm_epoch,
     )
+}
+
+fn findings_package_from_link(link: &RepairDispatchOperationLink) -> Result<ReviewFindingsPackage> {
+    let identity = identity_from_link(link)?;
+    if let Some(package) = link.findings_package.as_ref() {
+        package
+            .validate()
+            .map_err(|_| source_gap("retained RepairDispatch findings package is invalid"))?;
+        if package.identity != identity
+            || package.review_assignment_id != link.review_assignment_id
+            || package.review_result_operation_id != link.review_result_operation_id
+        {
+            return Err(source_gap(
+                "retained RepairDispatch package differs from its review cause",
+            ));
+        }
+        return Ok(package.clone());
+    }
+    let finding = link
+        .finding
+        .as_ref()
+        .filter(|finding| link.finding_id.as_deref() == Some(finding.finding_id.as_str()))
+        .ok_or_else(|| source_gap("legacy RepairDispatch link has no exact finding"))?;
+    ReviewFindingsPackage::new(
+        identity,
+        link.review_assignment_id.clone(),
+        link.review_result_operation_id.clone(),
+        vec![finding.clone()],
+    )
+    .map_err(|_| source_gap("legacy RepairDispatch finding cannot form a package"))
+}
+
+/// Recover the complete review identity from the retained v1 cause and verify
+/// its flat Operation-link projection. The nested identity preserves review
+/// policy generation and slot for the historical single-finding decoder;
+/// plural findings are additionally bound by the validated package digest.
+fn identity_from_link(link: &RepairDispatchOperationLink) -> Result<ReviewSlotIdentity> {
+    let identity: ReviewSlotIdentity = serde_json::from_value(link.cause["identity"].clone())
+        .map_err(|_| source_gap("retained RepairDispatch cause has no valid review identity"))?;
+    if identity.task_id != link.task_id
+        || identity.task_revision != link.task_revision
+        || identity.attempt_id != link.attempt_id
+        || identity.submission_ref != link.submission_ref
+        || identity.candidate_ref != link.candidate_ref
+        || link
+            .legacy_identity
+            .as_ref()
+            .is_some_and(|legacy_identity| legacy_identity != &identity)
+        || link.findings_package.as_ref().is_some_and(|package| {
+            package.identity != identity
+                || package.review_assignment_id != link.review_assignment_id
+                || package.review_result_operation_id != link.review_result_operation_id
+        })
+    {
+        return Err(source_gap(
+            "retained RepairDispatch identity differs from its flat link or package",
+        ));
+    }
+    Ok(identity)
 }
 
 fn validate_operation_link(
@@ -1890,6 +2028,8 @@ fn validate_operation_link(
             "RepairDispatch link does not match its Operation and source facts",
         )
     };
+    let findings_package = findings_package_from_link(link).map_err(|_| corrupt())?;
+    let identity = findings_package.identity.clone();
     if link.schema_version != LINK_SCHEMA_VERSION
         || link.operation_id != operation_id
         || link.technical_requester_id
@@ -1898,12 +2038,10 @@ fn validate_operation_link(
         || link.semantic_cause_kind != "review_disposition"
         || link.automation_revision <= 0
         || link.binding_generation <= 0
-        || link.identity.task_id != link.task_id
-        || link.identity.task_revision != link.task_revision
-        || link.identity.attempt_id != link.attempt_id
-        || link.identity.submission_ref != link.submission_ref
-        || link.identity.candidate_ref != link.candidate_ref
-        || link.finding.finding_id != link.finding_id
+        || link.finding_id.as_ref().is_some_and(|finding_id| {
+            findings_package.findings.len() != 1
+                || findings_package.findings[0].finding_id.as_str() != finding_id.as_str()
+        })
     {
         return Err(corrupt());
     }
@@ -1918,8 +2056,8 @@ fn validate_operation_link(
         &link.disposition_operation_id,
         &link.feedback_operation_id,
         link.feedback_observation_id,
-        link.identity.clone(),
-        link.finding.clone(),
+        identity,
+        findings_package,
         &link.binding_id,
         link.binding_generation,
         &link.semantic_slot_id,
@@ -1966,6 +2104,16 @@ fn link_provenance_matches_context(
         link.decision_manager_id.is_some(),
         link.transfer_operation_ids.is_some(),
     ];
+    let package_matches = link.findings_package.as_ref().map_or_else(
+        || {
+            context.findings_package().findings.len() == 1
+                && link.finding.as_ref() == context.findings_package().findings.first()
+        },
+        |package| package == context.findings_package(),
+    );
+    if !package_matches {
+        return false;
+    }
     if fields.iter().all(|present| !present) {
         return link.captured_transfer_gm_epoch.is_none()
             && link.cause == context.legacy_cause_value();
@@ -2000,6 +2148,7 @@ fn validate_slot_for_link(db: &Connection, link: &RepairDispatchOperationLink) -
             "RepairDispatch slot fields are invalid",
         )
     })?;
+    let findings_package = findings_package_from_link(link)?;
     if slot.schema_version != SLOT_SCHEMA_VERSION
         || slot.semantic_slot_id != link.semantic_slot_id
         || slot.effective_manager_id != link.effective_manager_id
@@ -2008,7 +2157,7 @@ fn validate_slot_for_link(db: &Connection, link: &RepairDispatchOperationLink) -
         || slot.attempt_id != link.attempt_id
         || slot.submission_ref != link.submission_ref
         || slot.candidate_ref != link.candidate_ref
-        || slot.finding_id != link.finding_id
+        || !receipt_matches_package(&slot, &findings_package)
         || slot.operation_id != link.operation_id
         || slot.parameters_digest != link.request_digest
         || slot.source_attempt_owner_id != link.source_attempt_owner_id

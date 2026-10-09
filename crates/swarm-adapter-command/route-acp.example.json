@@ -1,0 +1,11 @@
+{
+  "alias": "<OPERATOR_SELECTED_ROUTE_ALIAS>",
+  "runtime": "module",
+  "module_artifact_id": "eliot-command.acp-rust.1",
+  "enabled": false,
+  "workspace_option": "workspaceRoot",
+  "native_options": {
+    "workspaceRoot": "<ABSOLUTE_ADMITTED_WORKSPACE_PATH>",
+    "modelId": "<OPERATOR_SELECTED_ACP_MODEL_ID>"
+  }
+}

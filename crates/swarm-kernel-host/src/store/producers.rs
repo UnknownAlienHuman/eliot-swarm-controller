@@ -354,6 +354,7 @@ pub(super) fn record_batch(
     tx: &Transaction<'_>,
     operation: &Value,
     outcome: &RuntimeOutcome,
+    admission: Option<&swarm_contracts::runtime::TaskDispatchAdmissionReceipt>,
     now: i64,
 ) -> Result<Value> {
     if operation["method"] != "task.dispatch"
@@ -376,7 +377,35 @@ pub(super) fn record_batch(
             "batch terminal evidence cannot be attached to a resolved or differently started Attempt",
         ));
     }
-    let producer = batch::dispatch_producer(outcome);
+    let mut producer = batch::dispatch_producer(outcome);
+    if let Some(admission) = admission {
+        if admission.operation_id != outcome.operation_id
+            || admission.binding_id != model::text(operation, "binding_id")?
+            || admission.binding_generation != model::positive(operation, "binding_generation")?
+            || admission.attempt_id != attempt_id
+            || admission.task_id != model::text(&attempt, "task_id")?
+            || admission.task_revision != model::positive(&attempt, "task_revision")?
+        {
+            return Err(Error::invalid(
+                "batch admission differs from its exact dispatch and Attempt",
+            ));
+        }
+        // Keep the already validated one-shot terminal proof alongside the
+        // immutable normalized prompt identity. It is not an ongoing input.
+        producer["attempt_id"] = json!(admission.attempt_id);
+        producer["task_id"] = json!(admission.task_id);
+        producer["task_revision"] = json!(admission.task_revision);
+        producer["task_snapshot_sha256"] = json!(admission.task_snapshot_sha256);
+        producer["source_text_sha256"] = json!(admission.source_text_sha256);
+        producer["source_text_bytes"] = json!(admission.source_text_bytes);
+        producer["native_payload_sha256"] = json!(admission.native_payload_sha256);
+        producer["native_payload_bytes"] = json!(admission.native_payload_bytes);
+        producer["module_receipt"] = serde_json::to_value(&admission.module_receipt)?;
+        producer["admission_kind"] = json!("normalized_task_dispatch");
+        producer["completion_condition"] = outcome.details["completion_condition"].clone();
+        producer["execution_complete"] = json!(true);
+        producer["task_completion"] = json!("unknown");
+    }
     let mut producers: Vec<Value> = serde_json::from_value(attempt["producers"].clone())?;
     if let Some(existing) = producers
         .iter()

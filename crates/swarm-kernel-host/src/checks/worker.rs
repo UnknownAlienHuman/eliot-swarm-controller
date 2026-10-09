@@ -23,8 +23,9 @@ use std::{
     time::Duration,
 };
 use swarm_checks::{
-    CheckControl, CheckExecution, CheckIdentity, MAX_CAPTURE_BYTES_PER_STREAM, OwnedCheckProcess,
-    ResolvedCheckPlan, StartDecision, Termination,
+    CaptureDisposition, CapturedStream, CheckControl, CheckExecution, CheckIdentity, DirectExit,
+    FamilyDeparture, MAX_CAPTURE_BYTES_PER_STREAM, OwnedCheckProcess, ResolvedCheckPlan,
+    StartDecision, Termination,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +81,67 @@ pub struct Completion {
     pub outputs: Vec<ArtifactRecord>,
     #[serde(default)]
     pub cancellation: Option<Value>,
+    /// Immutable execution-time process and capture facts. A later release
+    /// readback is recorded separately so the original uncertainty is retained.
+    #[serde(default)]
+    pub process_facts: Option<Value>,
+    /// Exact `departed_empty` readback for the same process identity and token.
+    #[serde(default)]
+    pub release_evidence: Option<Value>,
+}
+
+fn process_facts(execution: &CheckExecution) -> Value {
+    let direct_exit = match execution.direct_exit {
+        DirectExit::NotStarted => json!({"state":"not_started"}),
+        DirectExit::Observed { exit_code } => json!({"state":"observed","exit_code":exit_code}),
+        DirectExit::ObservationUnknown => json!({"state":"observation_unknown"}),
+    };
+    let (family_state, family_process) = match &execution.family_departure {
+        FamilyDeparture::Confirmed => ("confirmed", execution.process.clone()),
+        FamilyDeparture::CleanupPending { process } => ("cleanup_pending", process.clone()),
+        FamilyDeparture::ObservationUnknown { process } => ("observation_unknown", process.clone()),
+    };
+    json!({
+        "schema_version": 1,
+        "termination": termination_name(execution.termination),
+        "direct_exit": direct_exit,
+        "family_departure": {"state":family_state,"process":family_process},
+        "stdout_capture": stream_facts(&execution.stdout),
+        "stderr_capture": stream_facts(&execution.stderr),
+        "resource_released": execution.resource_released,
+        "cleanup_pending": !execution.resource_released,
+        "termination_requests": execution.termination_requests,
+        "control_read_unknown": execution.control_read_unknown,
+        "termination_request_unconfirmed": execution.termination_request_unconfirmed
+    })
+}
+
+fn stream_facts(stream: &CapturedStream) -> Value {
+    let disposition = match stream.capture_disposition {
+        CaptureDisposition::NotStarted => "not_started",
+        CaptureDisposition::Complete => "complete",
+        CaptureDisposition::Incomplete => "incomplete",
+    };
+    json!({
+        "bytes_written": stream.bytes_written,
+        "bytes_observed": stream.bytes_observed,
+        "truncated": stream.truncated,
+        "capture_complete": stream.capture_complete,
+        "capture_disposition": disposition,
+        "capture_error": stream.capture_error
+    })
+}
+
+fn termination_name(termination: Termination) -> &'static str {
+    match termination {
+        Termination::Exited => "exited",
+        Termination::Cancelled => "cancelled",
+        Termination::TimedOut => "timed_out",
+        Termination::CancelledBeforeStart => "cancelled_before_start",
+        Termination::ControlReadUnknownBeforeStart => "control_read_unknown_before_start",
+        Termination::ProcessObservationUnknown => "process_observation_unknown",
+        Termination::StartGateTimedOut => "start_gate_timed_out",
+    }
 }
 pub fn directory(root: &Path, id: &str) -> Result<PathBuf> {
     if uuid::Uuid::parse_str(id).is_err() {
@@ -343,6 +405,7 @@ pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
         }
     }
     let mut output_capture_pending = None;
+    let mut cleanup_pending = None;
     let capture_path = dir.join("output-capture.json");
     if capture_path.try_exists()? {
         let diagnostic = read_value(&capture_path)?;
@@ -386,6 +449,44 @@ pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
             ));
         }
     }
+    let completion_path = dir.join("completion.json");
+    if completion_path.try_exists()? {
+        let completion: Completion = serde_json::from_value(read_value(&completion_path)?)?;
+        if completion.check_id != work.check_id
+            || completion.operation_id != work.operation_id
+            || completion.token != work.token
+        {
+            return Err(Error::conflict(
+                "pending completion differs from the accepted CheckRun owner",
+            ));
+        }
+        if !completion.resource_released
+            && !matches!(departed_empty(&identity["process"], &work.token), Ok(true))
+        {
+            let facts = completion
+                .process_facts
+                .as_ref()
+                .ok_or_else(|| Error::invalid("pending completion has no process facts"))?;
+            if facts["resource_released"] != false
+                || facts["cleanup_pending"] != true
+                || facts["family_departure"]["process"] != identity["process"]
+            {
+                return Err(Error::conflict(
+                    "pending completion process facts differ from the accepted owner",
+                ));
+            }
+            cleanup_pending = Some(facts.clone());
+            if selected.as_ref().is_none_or(|(priority, ..)| *priority < 5) {
+                selected = Some((
+                    5,
+                    "CHECK_RESOURCE_RELEASE_UNKNOWN",
+                    "cleanup_pending",
+                    0,
+                    model::now_ms()?,
+                ));
+            }
+        }
+    }
     let Some((_, code, cause, elapsed_ms, observed_at_ms)) = selected else {
         return Ok(None);
     };
@@ -401,6 +502,9 @@ pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
         }
         "output_capture_pending" => {
             "the owned process group is empty but output capture has not finished; the CheckRun remains unresolved"
+        }
+        "cleanup_pending" => {
+            "the executor retained partial output, but family departure is not yet proved; the resource remains held"
         }
         _ => return Err(Error::invalid("process diagnostic cause is invalid")),
     };
@@ -419,6 +523,11 @@ pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
             .ok_or_else(|| Error::invalid("output capture status was not retained"))?;
         public["stdout_pending"] = json!(stdout_pending);
         public["stderr_pending"] = json!(stderr_pending);
+    }
+    if let Some(process_facts) = cleanup_pending {
+        public["cleanup_pending"] = json!(true);
+        public["resource_released"] = json!(false);
+        public["process_facts"] = process_facts;
     }
     Ok(Some(json!({
         "version": 1,
@@ -723,7 +832,78 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         return Ok(None);
     }
     let c: Completion = serde_json::from_value(read_value(&p)?)?;
-    validate_completion(work, files, c).map(Some)
+    let mut c = validate_completion(work, files, c)?;
+    if !c.resource_released
+        && let Some(process) = c
+            .process_facts
+            .as_ref()
+            .map(|facts| &facts["family_departure"]["process"])
+            .filter(|process| !process.is_null())
+        && matches!(departed_empty(process, &work.token), Ok(true))
+    {
+        let proof = release_evidence(work, &directory(&work.data_dir, &work.check_id)?, process)?;
+        let mut report: Value = serde_json::from_slice(&files.document_bytes(&c.result)?)?;
+        report["resource_released"] = json!(true);
+        report["cleanup_pending"] = json!(false);
+        report["release_evidence"] = proof.clone();
+        report["recovery"] = json!({
+            "disposition":"departed_empty",
+            "command_replayed":false
+        });
+        let id = format!(
+            "check-release-{}",
+            model::digest(format!("{}:{}", work.operation_id, work.token).as_bytes())
+        );
+        let (record, bytes) = ArtifactFiles::document(
+            "check_result",
+            &id,
+            &report,
+            json!({
+                "check_id":work.check_id,
+                "candidate_ref":work.candidate.artifact_id,
+                "state":c.state
+            }),
+        )?;
+        files.publish(&record, &bytes)?;
+        c.resource_released = true;
+        c.release_evidence = Some(proof);
+        c.result = record;
+        c = validate_completion(work, files, c)?;
+    }
+    Ok(Some(c))
+}
+
+pub(super) fn release_evidence(work: &Work, directory: &Path, process: &Value) -> Result<Value> {
+    let path = directory.join("release-evidence.json");
+    if !path.try_exists()? {
+        let proposed = json!({
+            "method":"departed_empty",
+            "process":process,
+            "token":work.token,
+            "observed_at_ms":model::now_ms()?
+        });
+        if let Err(error) = write_once(&path, &proposed)
+            && !path.try_exists()?
+        {
+            return Err(error);
+        }
+    }
+    let proof = read_value(&path)?;
+    if proof.as_object().is_none_or(|fields| {
+        fields.len() != 4
+            || !["method", "process", "token", "observed_at_ms"]
+                .iter()
+                .all(|field| fields.contains_key(*field))
+    }) || proof["method"] != "departed_empty"
+        || proof["process"] != *process
+        || proof["token"] != work.token
+        || proof["observed_at_ms"].as_i64().is_none_or(|time| time < 0)
+    {
+        return Err(Error::conflict(
+            "retained family-departure proof differs from the CheckRun owner",
+        ));
+    }
+    Ok(proof)
 }
 
 /// Validate the retained coverage receipt before either Store or a worker may
@@ -947,7 +1127,6 @@ fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Res
     if c.token != work.token
         || c.operation_id != work.operation_id
         || c.check_id != work.check_id
-        || !c.resource_released
         || !matches!(
             c.state.as_str(),
             "passed" | "failed" | "error" | "incomplete" | "cancelled"
@@ -962,6 +1141,28 @@ fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Res
         files.verify(out)?;
     }
     let report: Value = serde_json::from_slice(&files.document_bytes(&c.result)?)?;
+    let pending = !c.resource_released;
+    let upgraded = c.release_evidence.is_some();
+    let initial_release = report["resource_released"].as_bool().unwrap_or(false);
+    let process_facts_match =
+        report["process_facts"] == c.process_facts.clone().unwrap_or(Value::Null);
+    let process_identity_matches = c
+        .process_facts
+        .as_ref()
+        .is_none_or(|facts| facts["family_departure"]["process"] == report["process"]);
+    let release_proof_valid = c.release_evidence.as_ref().is_some_and(|proof| {
+        proof["method"] == "departed_empty"
+            && proof["token"] == work.token
+            && proof["observed_at_ms"]
+                .as_i64()
+                .is_some_and(|time| time >= 0)
+            && c.process_facts.as_ref().is_some_and(|facts| {
+                facts["resource_released"] == false
+                    && facts["cleanup_pending"] == true
+                    && proof["process"] == facts["family_departure"]["process"]
+                    && !proof["process"].is_null()
+            })
+    });
     if report["check_id"] != work.check_id
         || report["operation_id"] != work.operation_id
         || report["candidate_ref"] != work.candidate.artifact_id
@@ -969,7 +1170,31 @@ fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Res
         || report["coverage"] != c.coverage
         || report["exit_code"] != json!(c.exit_code)
         || !profile_report_matches(work, &report["profile"])?
-        || report["resource_released"] != true
+        || !process_facts_match
+        || !process_identity_matches
+        || (pending
+            && (c.state != "incomplete"
+                || initial_release
+                || report["cleanup_pending"] != true
+                || c.release_evidence.is_some()
+                || c.process_facts.as_ref().is_none_or(|facts| {
+                    facts["resource_released"] != false
+                        || facts["cleanup_pending"] != true
+                        || facts["family_departure"]["process"].is_null()
+                })))
+        || (upgraded
+            && (!c.resource_released
+                || c.state != "incomplete"
+                || !initial_release
+                || report["cleanup_pending"] != false
+                || report["release_evidence"] != c.release_evidence.clone().unwrap_or(Value::Null)
+                || !release_proof_valid))
+        || (!pending && !upgraded && !initial_release)
+        || (!pending
+            && !upgraded
+            && c.process_facts.as_ref().is_some_and(|facts| {
+                facts["resource_released"] != true || facts["cleanup_pending"] != false
+            }))
         || report["cancellation"] != json!(c.cancellation)
     {
         return Err(Error::conflict(
@@ -1045,6 +1270,8 @@ pub(super) fn failure_with_process(
         result: record,
         outputs: Vec::new(),
         cancellation: None,
+        process_facts: None,
+        release_evidence: None,
     };
     let dir = directory(&work.data_dir, &work.check_id)?;
     std::fs::create_dir_all(&dir)?;
@@ -1147,6 +1374,8 @@ pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>>
         result: record,
         outputs,
         cancellation: None,
+        process_facts: None,
+        release_evidence: None,
     };
     write_once(&dir.join("completion.json"), &json!(c))?;
     Ok(Some(c))
@@ -1223,6 +1452,8 @@ pub fn recover_pre_identity(work: &Work, files: &ArtifactFiles) -> Result<Option
         result: record,
         outputs,
         cancellation: None,
+        process_facts: None,
+        release_evidence: None,
     };
     write_once(&dir.join("completion.json"), &json!(c))?;
     Ok(Some(c))
@@ -1791,6 +2022,21 @@ pub fn run(file: &Path) -> Result<()> {
                     "the check executor timed out without an admitted timeout policy",
                 ));
             }
+            Termination::StartGateTimedOut => {
+                if !matches!(executed.direct_exit, DirectExit::NotStarted)
+                    || !matches!(executed.family_departure, FamilyDeparture::Confirmed)
+                    || !executed.resource_released
+                {
+                    return Err(Error::new(
+                        "CHECK_START_GATE_TIMEOUT_UNCONFIRMED",
+                        "the start-gate timeout lacks positive no-spawn and process-group release evidence",
+                    ));
+                }
+                return Err(Error::new(
+                    "CHECK_START_GATE_TIMEOUT",
+                    "Store Go did not arrive before the bounded check start gate expired",
+                ));
+            }
             Termination::Exited | Termination::Cancelled => {}
         }
         if executed.control_read_unknown {
@@ -1799,13 +2045,6 @@ pub fn run(file: &Path) -> Result<()> {
                 "the check cancellation receipt could not be read while the process was active",
             ));
         }
-        if !executed.resource_released {
-            return Err(Error::new(
-                "CHECK_RESOURCE_RELEASE_UNKNOWN",
-                "the check executor did not confirm release of its process group",
-            ));
-        }
-
         let (expected_targets, source_dir, manifest, _) = prepared.take().ok_or_else(|| {
             Error::new(
                 "CHECK_EXECUTION_PLAN_MISSING",
@@ -1838,6 +2077,9 @@ pub fn run(file: &Path) -> Result<()> {
         }
         if !executed.stderr.capture_complete {
             gaps.push(json!("stderr_capture_incomplete"));
+        }
+        if !executed.resource_released {
+            gaps.push(json!("process_family_departure_pending"));
         }
         gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
         gaps.dedup();
@@ -1897,8 +2139,15 @@ pub fn run(file: &Path) -> Result<()> {
                     "check_id":work.check_id,
                     "stream":stream,
                     "bytes_written":captured.bytes_written,
+                    "bytes_observed":captured.bytes_observed,
                     "truncated":captured.truncated,
-                    "capture_complete":captured.capture_complete
+                    "capture_complete":captured.capture_complete,
+                    "capture_disposition":match captured.capture_disposition {
+                        CaptureDisposition::NotStarted => "not_started",
+                        CaptureDisposition::Complete => "complete",
+                        CaptureDisposition::Incomplete => "incomplete"
+                    },
+                    "capture_error":captured.capture_error
                 }),
             )?);
         }
@@ -1922,7 +2171,9 @@ pub fn run(file: &Path) -> Result<()> {
         coverage_gaps.dedup();
     }
     let cancellation = std::mem::take(&mut control.cancellation);
-    let state = if cancellation.applied() {
+    let state = if !executed.resource_released {
+        "incomplete"
+    } else if cancellation.applied() {
         "cancelled"
     } else if error.is_some() {
         "error"
@@ -1947,11 +2198,12 @@ pub fn run(file: &Path) -> Result<()> {
         })
         .unwrap_or(Value::Null);
     let started = control.started_at_ms.unwrap_or(model::now_ms()?);
+    let facts = process_facts(executed);
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,"candidate_sha256":work.candidate.content_digest,
         "input_fingerprint":work.input_fingerprint,"resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
         "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
-        "profile":inputs::profile_identity(&work.profile)? ,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":process,"state":state,"exit_code":code,"resource_released":executed.resource_released,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
-        "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length,"bytes_written":r.metadata["bytes_written"],"truncated":r.metadata["truncated"],"capture_complete":r.metadata["capture_complete"]})).collect::<Vec<_>>(),"started_at_ms":started,"finished_at_ms":model::now_ms()?});
+        "profile":inputs::profile_identity(&work.profile)? ,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":process,"process_facts":facts,"state":state,"exit_code":code,"resource_released":executed.resource_released,"cleanup_pending":!executed.resource_released,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
+        "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length,"bytes_written":r.metadata["bytes_written"],"truncated":r.metadata["truncated"],"capture_complete":r.metadata["capture_complete"],"bytes_observed":r.metadata["bytes_observed"],"capture_disposition":r.metadata["capture_disposition"],"capture_error":r.metadata["capture_error"]})).collect::<Vec<_>>(),"started_at_ms":started,"finished_at_ms":model::now_ms()?});
     let id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
     let (record, bytes) = ArtifactFiles::document(
         "check_result",
@@ -1971,6 +2223,8 @@ pub fn run(file: &Path) -> Result<()> {
         result: record,
         outputs,
         cancellation: cancellation.evidence(),
+        process_facts: Some(facts),
+        release_evidence: None,
     };
     write_once(&dir.join("terminal.json"), &json!(completed))?;
     write_once(&dir.join("completion.json"), &json!(completed))?;

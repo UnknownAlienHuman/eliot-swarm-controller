@@ -7,6 +7,8 @@ publish = false
 description = "Independent authenticated one-shot Command Code module adapter"
 
 [dependencies]
+agent-client-protocol = "3.3.0"
+futures = "0.3.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -14,6 +16,7 @@ swarm-client = { path = "../swarm-client" }
 swarm-contracts = { path = "../swarm-contracts" }
 swarm-process = { path = "../swarm-process" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 uuid = { version = "1", features = ["v4"] }
 
 [[bin]]

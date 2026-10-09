@@ -119,8 +119,17 @@ byte count of the exact native payload it submitted plus an optional native inpu
 ID. Store recomputes the context from the original Operation and retained Attempt,
 requires the outer identity and native input ID to match, and records an existing
 Attempt producer for `Accepted` or `Applied`. `Unknown` remains unresolved and
-cannot mark the Task complete. Descriptors without both schemas retain the legacy
-codec and runtime-specific producer path.
+cannot mark the Task complete. The original dispatch context is retained before
+the command leaves Store, so recovery validates the original admitted worker
+boot rather than a replacement boot. Descriptors without both schemas retain
+the legacy codec and runtime-specific producer path.
+
+Current TaskPrompt artifacts also advertise `swarm.task_prompt@1`. Store builds
+one exact prompt envelope from the retained Task snapshot and source text; it
+contains Task/Attempt/revision identity, the snapshot digest, prompt bytes and
+their digest. The adapter validates the envelope against the dispatch context
+and submits its prompt unchanged. Legacy snapshot renderers remain only behind
+historical artifact contracts, never as a fallback for a current artifact.
 
 The adapter owns native schemas, workspace-field mapping, connection identity,
 capability interpretation, command translation and normalization of observations.

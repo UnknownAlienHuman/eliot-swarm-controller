@@ -365,6 +365,26 @@ pub(super) fn descriptor_for_new_binding(
                 "selected module descriptor is unavailable for a new binding",
             )
         })?;
+    let contract = &descriptor.descriptor;
+    if contract
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == "task.dispatch")
+        && (!contract
+            .command_schemas
+            .contains(&swarm_contracts::module_contract::task_prompt_schema())
+            || !contract
+                .command_schemas
+                .contains(&swarm_contracts::module_contract::task_dispatch_context_schema())
+            || !contract
+                .event_schemas
+                .contains(&swarm_contracts::module_contract::task_dispatch_admission_schema()))
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_CONTRACT_REQUIRED",
+            "new dispatch-capable bindings require the exact TaskPrompt and admission schemas",
+        ));
+    }
     Ok(Some(NewBindingDescriptorContract {
         selector: serde_json::to_value(selection)?,
         workspace_option: descriptor.descriptor.workspace_option.clone(),
@@ -771,14 +791,52 @@ pub(super) fn selected_native_command_supported(
     method: &str,
     input: &Value,
 ) -> Result<Option<bool>> {
+    // OpenCode's loop-step input is a vendor command with its own exact
+    // capability/schema pair. Do not route it through generic agent.send
+    // classification, where "steer" means an expected-turn operation.
+    if method == "native.opencode.loop_step" {
+        let Some(retained) = retained_contract_identity(db, binding_artifact_id, selector)? else {
+            return Ok(Some(false));
+        };
+        let exact_opencode = retained.module_id.as_str() == "eliot.opencode.v2"
+            && retained.artifact.artifact_id.as_str() == "eliot-opencode-v2.rust-http.1"
+            && retained.artifact.version.as_str() == "0.5.0";
+        let capability_supported = retained
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "native.opencode.loop_step");
+        let schema_supported = retained.command_schemas.iter().any(|schema| {
+            schema.schema_id == "swarm.opencode_loop_step_command"
+                && schema.version == "1"
+                && schema.sha256.is_none()
+        });
+        return Ok(Some(
+            exact_opencode && capability_supported && schema_supported,
+        ));
+    }
+    // Unknown OpenCode-native extensions are never enabled by their prefix or
+    // by a broad native capability. Each future method needs an explicit map.
+    if method.starts_with("native.opencode.") {
+        return Ok(Some(false));
+    }
+
     let command = classify_runtime_command(method, input)
         .map_err(|error| Error::new(error.code(), error.message()))?;
     let native_mcp = command.is_native_mcp();
+    let command_control = matches!(
+        command,
+        swarm_contracts::module_command::RuntimeCommandKind::CommandCancelTurn
+            | swarm_contracts::module_command::RuntimeCommandKind::CommandCloseSession
+    );
     let Some(retained) = retained_contract_identity(db, binding_artifact_id, selector)? else {
         // Native MCP phase Operations are meaningful only under the exact
         // retained descriptor that authorizes their command schema. Preserve
         // legacy behavior only for known pre-existing agent.* commands.
-        return Ok(if native_mcp { Some(false) } else { None });
+        return Ok(if native_mcp || command_control {
+            Some(false)
+        } else {
+            None
+        });
     };
     let required = command.capability();
     let capability_supported = retained
@@ -789,7 +847,29 @@ pub(super) fn selected_native_command_supported(
         || retained
             .command_schemas
             .contains(&native_mcp_command_schema());
-    Ok(Some(capability_supported && schema_supported))
+    let command_control_supported = !command_control
+        || (retained.artifact.artifact_id.as_str() == "eliot-command.acp-rust.1"
+            && retained.artifact.version.as_str() == "1"
+            && retained.command_schemas.iter().any(|schema| {
+                schema.schema_id == "swarm.runtime_command"
+                    && schema.version == "1"
+                    && schema.sha256.is_none()
+            }));
+    let is_opencode_artifact = retained.module_id.as_str() == "eliot.opencode.v2"
+        && retained.artifact.artifact_id.as_str() == "eliot-opencode-v2.rust-http.1";
+    let opencode_reply_schema_supported = !is_opencode_artifact
+        || (retained.artifact.version.as_str() == "0.5.0"
+            && retained.command_schemas.iter().any(|schema| {
+                schema.schema_id == "swarm.opencode_reply_command"
+                    && schema.version == "1"
+                    && schema.sha256.is_none()
+            }));
+    Ok(Some(
+        capability_supported
+            && schema_supported
+            && command_control_supported
+            && opencode_reply_schema_supported,
+    ))
 }
 
 pub(super) fn retained_descriptor(

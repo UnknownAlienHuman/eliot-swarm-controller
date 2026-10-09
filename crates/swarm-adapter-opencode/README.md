@@ -1,30 +1,34 @@
 # OpenCode V2 module adapter
 
-eliot-opencode-v2.rust-http.1 is the standalone OpenCode adapter. The prepared registration contract is artifact version 0.3.0, config schema opencode-v2-native-options@2 (SHA-256 7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68), and protocol 1.0. The descriptor is disabled by default and activates on demand; a trusted catalog and an explicitly selected route are still required.
+`eliot-opencode-v2.rust-http.1@0.5.0` is the standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@3` (SHA-256 `070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt bytes. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
 
-The descriptor declares agent.open, agent.reconcile, agent.result, agent.send/next_turn, and task.dispatch. Its four native MCP command capabilities are native.mcp.arm, native.mcp.install, native.mcp.observe, and native.mcp.read. It binds the swarm.native_mcp_command@1, swarm.normalized_result_context@1, swarm.runtime_command@1, and swarm.task_dispatch_context@1 command schemas, plus the normalized result page, runtime outcome, and task dispatch admission event schemas.
+The descriptor declares `agent.open`, `task.dispatch`, `agent.send/next_turn`, `native.opencode.loop_step`, `agent.reply`, `agent.background`, `agent.refresh`, `agent.reconcile`, and `agent.result`, along with the four `native.mcp.*` commands. Loop-step is a vendor command with its own `swarm.opencode_loop_step_command@1` schema; ordinary `agent.send/next_turn` remains native queue delivery. Reply commands use `swarm.opencode_reply_command@1`. Unknown OpenCode-native methods stay unsupported.
 
 ## Service lifecycle
 
-The adapter retains the external-attach path when a route omits owned_service. In this mode, the route supplies the exact service_id, existing connection file, expected server version, workspace, and provider/model/variant. The adapter uses that connection and never starts, stops, adopts, or restarts the native OpenCode service. An unavailable attached service is not replaced by an implicit fresh owner.
+External attach uses the exact service ID, connection file, workspace, and provider/model/variant from the selected route. The observed OpenCode version is diagnostic data, not an admission gate. The adapter never starts, stops, adopts, or restarts an externally attached service.
 
-A route can request a fresh owned service only with an explicit owned_service declaration whose origin is fresh_owned_service. The Store admission and retained owner intent provide the exact task, binding, workspace, and nonce scope before the adapter receives private owner options. The adapter writes its operation intent before it starts the pinned child. This owner path uses the pinned Bun 1.4.0 runtime, repository-pinned OpenCode 2.0.7 server, and project-local plugin source, with pinned executable hashes and a separate fresh state root. It makes one launch attempt for that fresh state root; uncertain launches are not replayed or adopted. A partial or invalid owner declaration fails closed rather than falling back to external attach.
+A route can request a fresh owned service only with an explicit `fresh_owned_service` declaration. Store admission and the retained owner intent provide the exact task, binding, workspace, and nonce scope before private owner options reach the adapter. The adapter writes intent before launching the pinned child and does not replay or adopt an uncertain launch. A partial or invalid owner declaration fails closed rather than falling back to external attach.
 
-The example model is the exact selected route inclusionai/ling-3.1-flash: providerID is inclusionai, id is ling-3.1-flash, and variant must be copied exactly from the selected Manager route. Owner credentials are referenced only through an opaque protected credential_ref. The host-side protected mapping must resolve that reference to the same exact provider ID. Examples contain no credential values or auth-file paths.
+The example model is the exact selected route inclusionai/ling-3.1-flash: `providerID` is `inclusionai`, `id` is `ling-3.1-flash`, and `variant` must be copied exactly from the selected Manager route. Owner credentials are referenced only through an opaque protected `credential_ref`; examples contain no credential values or auth-file paths.
 
-The pinned MCP plugin code prepares a bounded config in the fresh owner's private OpenCode config. It does not install a global plugin, issue an MCP effect by itself, or prove that OpenCode loaded the plugin. The four native MCP commands remain individually descriptor- and Store-gated.
+## Native history and controls
 
-## Normalized result boundary
+Queue and loop-step inputs share the durable admission/readback path but persist distinct native deliveries. The adapter records intent before POST, never replays a possibly-sent request, and uses bounded session history to distinguish admission, promotion, and terminal step evidence. A history gap or missing exact event remains unknown.
 
-agent.result is declared with swarm.normalized_result_page@1 and requires an exact selector containing the dispatch operation, native session, and assistant message IDs, validated against the saved dispatch receipt. OpenCode 2.0.7 public projections omit the immutable assistant-to-input parent link, so exact assistant readback fails closed with NATIVE_ASSISTANT_PARENT_UNAVAILABLE. The adapter records an Unknown outcome with correlation unknown, task_completion=unknown, and execution_complete=false; the Store projects it as operation.outcome_unknown with OUTCOME_UNKNOWN. The adapter never substitutes the latest assistant message or infers causality from timestamps or ordering. Runtime qualification remains unrun, and no task-completion claim is made.
+Questions and permissions are read from the current pending endpoints and projected as bounded typed observations. Replies bind the exact current request fingerprint. Generic permission replies allow only `once` and `reject`; `always` is unsupported. Lost reply responses reconcile from complete contiguous durable history and exact reply payload digests. Permission feedback text is not exposed by that history, so a reject carrying feedback remains unknown after a lost response.
 
-Artifact version 0.3.0 is selected explicitly. The retained legacy v1 artifact is a separate registration target, not a fallback when v0.3.0 is disabled, unavailable, or rejected.
+Background first reads `backgroundSubagents`; false is rejected before POST. The documented boolean response distinguishes changed from no-op, while a lost response remains unknown and is never replayed. It does not claim child IDs or execution completion.
+
+`agent.refresh` uses one bounded history page and queues `module.observe`; the cursor advances only after Store acknowledgement. Observations omit transcript and tool output. Result reads bind the exact input operation/session/message. OpenCode's public message projection omits the assistant-to-input parent edge, so assistant result correlation fails closed with `NATIVE_ASSISTANT_PARENT_UNAVAILABLE`; the adapter never substitutes the latest assistant message or guesses from ordering.
+
+Acknowledged non-source operation journals are eligible for bounded reclamation only after exact outcome/result acknowledgements, reference checks, and root-checkpoint readback. Dispatch, send, and loop-step journals remain as result sources only when they retain the exact native input and root identity: later `agent.result` reads reopen that intent and admission, while a per-page Store acknowledgement settles only that read Operation and does not say that no future reader exists.
 
 ## Registration examples
 
-- registration/route.example.json shows external attach.
-- registration/route.fresh-owner.example.json shows the explicit fresh-owner declaration and opaque protected provider reference. Its path and digest placeholders must be replaced with locally reviewed values; the example remains disabled.
-- registration/binding-launch-values.example.json shows the seven required route fields for the external-attach path. Owner fields are supplied only when the explicit owner declaration is admitted.
-- registration/select-route.request.example.json selects artifact 0.3.0.
+- `registration/route.example.json` shows external attach.
+- `registration/route.fresh-owner.example.json` shows the explicit fresh-owner declaration and opaque protected provider reference. Its path and digest placeholders need locally reviewed values; the example remains disabled.
+- `registration/binding-launch-values.example.json` shows the route fields for external attach. Owner fields are supplied only when that explicit owner declaration is admitted.
+- `registration/select-route.request.example.json` selects artifact version `0.5.0`.
 
-The adapter launch argument remains --config <absolute-host-connection-config-path>. That route-neutral file contains only HostConnectionConfig (schema_version, host_data_dir, and bounded IPC settings); descriptor-declared route values are supplied separately by the supervisor. The adapter was not built or tested as part of this documentation packet.
+The launch argument remains `--config <absolute-host-connection-config-path>`. That route-neutral file contains only host connection settings; descriptor-declared route values are supplied separately by the supervisor.

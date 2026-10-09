@@ -2,8 +2,9 @@
 // SDK-owned native execution. Host IPC reconnect never closes Muse or repeats input.
 import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import museDescriptor from './module-descriptor.template.json' with { type: 'json' };
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
 import { configuration, modelMatches, goalCommand } from './settings.mjs';
@@ -11,10 +12,185 @@ import { readResult } from './results.mjs';
 import { spawnOwned } from './owned.mjs';
 import { recoveryState } from './checkpoint.mjs';
 import { commandIdFor, durabilityProfile, gapFillObservation, hostDeathObservation, failedReconcileOutcome } from './observe.mjs';
+import {
+  closedNativeUsageSnapshot,
+  emptyNativeUsageSnapshot,
+  nativeUsageReadSnapshot,
+  nativeUsageSnapshot,
+  restoredNativeUsageSnapshot,
+} from './native-usage.mjs';
+
+const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.9';
+const MUSE_ARTIFACT_VERSION = '9';
+const MAX_TASK_PROMPT_BYTES = 1_000_000;
+const SHA256 = /^[0-9a-f]{64}$/;
+const TASK_PROMPT_FIELDS = [
+  'schema_id', 'schema_version', 'task_id', 'task_revision', 'attempt_id',
+  'task_snapshot_sha256', 'prompt_sha256', 'prompt_bytes', 'prompt',
+];
+const TASK_DISPATCH_CONTEXT_FIELDS = [
+  'schema_version', 'operation_id', 'binding_id', 'binding_generation', 'worker_boot_id',
+  'attempt_id', 'task_id', 'task_revision', 'task_snapshot_sha256', 'source_text_sha256',
+  'source_text_bytes',
+];
 
 function required(object, key) {
   if (typeof object?.[key] !== 'string' || !object[key].trim()) throw new Error(`MISSING_${key}`);
   return object[key];
+}
+function isRecord(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+function exactFields(value, fields) {
+  return isRecord(value) && Object.keys(value).length === fields.length && fields.every(key => Object.hasOwn(value,key));
+}
+function sha256(value) { return createHash('sha256').update(value).digest('hex'); }
+function compareText(left,right) { return left<right?-1:left>right?1:0; }
+function canonicalJson(value) {
+  if(Array.isArray(value))return value.map(canonicalJson);
+  if(isRecord(value))return Object.fromEntries(Object.keys(value).sort(compareText).map(key=>[key,canonicalJson(value[key])]));
+  return value;
+}
+function sameJson(left,right) { return JSON.stringify(canonicalJson(left))===JSON.stringify(canonicalJson(right)); }
+function claimSchema(schema) {
+  if(!isRecord(schema) || typeof schema.schema_id!=='string' || typeof schema.version!=='string')
+    throw new Error('MODULE_DESCRIPTOR_SCHEMA_INVALID');
+  return {schema_id:schema.schema_id,version:schema.version,...(schema.sha256==null?{}:{sha256:schema.sha256})};
+}
+function moduleContractClaim(descriptor) {
+  const artifact=descriptor?.artifact;
+  const protocol=descriptor?.protocol;
+  if(!isRecord(descriptor) || descriptor.schema_version!==1 || descriptor.module_id!=='muse'
+      || !isRecord(artifact) || artifact.artifact_id!==MUSE_ARTIFACT_ID
+      || artifact.version!==MUSE_ARTIFACT_VERSION || !isRecord(protocol)
+      || !sameJson(protocol.minimum,{major:1,minor:0})
+      || !sameJson(protocol.maximum,{major:1,minor:0})
+      || !Array.isArray(descriptor.capabilities)
+      || !Array.isArray(descriptor.command_schemas) || !Array.isArray(descriptor.event_schemas))
+    throw new Error('MODULE_DESCRIPTOR_IDENTITY_INVALID');
+  const capabilities=[...descriptor.capabilities].sort(compareText);
+  if(new Set(capabilities).size!==capabilities.length || !capabilities.includes('task.dispatch'))
+    throw new Error('MODULE_DESCRIPTOR_CAPABILITIES_INVALID');
+  const commandSchemas=descriptor.command_schemas.map(claimSchema).sort((a,b)=>
+    compareText(a.schema_id,b.schema_id)||compareText(a.version,b.version)||compareText(a.sha256??'',b.sha256??''));
+  const eventSchemas=descriptor.event_schemas.map(claimSchema).sort((a,b)=>
+    compareText(a.schema_id,b.schema_id)||compareText(a.version,b.version)||compareText(a.sha256??'',b.sha256??''));
+  const hasExactSchema=(schemas,id,version)=>schemas.some(schema=>schema.schema_id===id
+    && schema.version===version && schema.sha256==null);
+  if(!hasExactSchema(commandSchemas,'swarm.runtime_command','1')
+      || !hasExactSchema(commandSchemas,'swarm.task_prompt','1')
+      || !hasExactSchema(commandSchemas,'swarm.task_dispatch_context','1')
+      || !hasExactSchema(eventSchemas,'swarm.runtime_outcome','1')
+      || !hasExactSchema(eventSchemas,'swarm.task_dispatch_admission','1'))
+    throw new Error('MODULE_DESCRIPTOR_TASK_PROMPT_CONTRACT_INVALID');
+  const claimArtifact={artifact_id:artifact.artifact_id,version:artifact.version,
+    ...(artifact.build_id==null?{}:{build_id:artifact.build_id})};
+  return {
+    schema_version:1,
+    module_id:descriptor.module_id,
+    artifact:claimArtifact,
+    protocol:{major:1,minor:0},
+    capabilities,
+    config_schema:descriptor.config_schema??null,
+    ...(descriptor.pre_input_open==null?{}:{pre_input_open:descriptor.pre_input_open}),
+    command_schemas:commandSchemas,
+    event_schemas:eventSchemas,
+  };
+}
+const MUSE_MODULE_CONTRACT=moduleContractClaim(museDescriptor);
+function requireModuleContractNegotiated(hello) {
+  const negotiation=hello?.module_contract_negotiation;
+  const fields=['status','source','descriptor_revision','module_id','artifact','protocol','capabilities',
+    'config_schema','pre_input_open','command_schemas','event_schemas','effects_authorized_by_descriptor'];
+  if(!exactFields(negotiation,fields) || negotiation.status!=='negotiated'
+      || negotiation.source!=='store_registered_descriptor'
+      || !Number.isSafeInteger(negotiation.descriptor_revision) || negotiation.descriptor_revision<=0
+      || negotiation.effects_authorized_by_descriptor!==false)
+    throw new Error('MODULE_CONTRACT_NEGOTIATION_REQUIRED');
+  const expected={module_id:MUSE_MODULE_CONTRACT.module_id,artifact:MUSE_MODULE_CONTRACT.artifact,
+    protocol:MUSE_MODULE_CONTRACT.protocol,capabilities:MUSE_MODULE_CONTRACT.capabilities,
+    config_schema:MUSE_MODULE_CONTRACT.config_schema,pre_input_open:MUSE_MODULE_CONTRACT.pre_input_open??null,
+    command_schemas:MUSE_MODULE_CONTRACT.command_schemas,event_schemas:MUSE_MODULE_CONTRACT.event_schemas};
+  const actual={module_id:negotiation.module_id,artifact:negotiation.artifact,protocol:negotiation.protocol,
+    capabilities:negotiation.capabilities,config_schema:negotiation.config_schema,
+    pre_input_open:negotiation.pre_input_open,command_schemas:negotiation.command_schemas,
+    event_schemas:negotiation.event_schemas};
+  if(!sameJson(actual,expected))throw new Error('MODULE_CONTRACT_NEGOTIATION_MISMATCH');
+}
+function validIdentity(value, maxBytes = 512) {
+  return typeof value === 'string' && value.trim().length > 0
+    && Buffer.byteLength(value,'utf8') <= maxBytes && !/\p{Cc}/u.test(value);
+}
+function moduleReceipt(command) {
+  const inputSha256=command?.input_sha256;
+  if(!validIdentity(command?.operation_id) || !validIdentity(command?.binding_id)
+      || !Number.isSafeInteger(command?.generation) || command.generation<=0
+      || command?.route?.module_artifact_id!==MUSE_ARTIFACT_ID || !SHA256.test(inputSha256??'')) return null;
+  return {
+    schema_version:1,
+    module_id:'muse',
+    artifact:{artifact_id:MUSE_ARTIFACT_ID,version:MUSE_ARTIFACT_VERSION,build_id:null},
+    protocol:{major:1,minor:0},
+    binding_id:command.binding_id,
+    binding_generation:command.generation,
+    operation_id:command.operation_id,
+    input_sha256:inputSha256,
+  };
+}
+function taskPromptFor(command) {
+  const input=command?.input;
+  const envelope=input?.task_prompt;
+  const context=input?.task_dispatch_context;
+  const sourceText=input?.text;
+  const sourceBytes=typeof sourceText==='string'?Buffer.byteLength(sourceText,'utf8'):-1;
+  if(!exactFields(envelope,TASK_PROMPT_FIELDS) || !exactFields(context,TASK_DISPATCH_CONTEXT_FIELDS)
+      || envelope.schema_id!=='swarm.task_prompt' || envelope.schema_version!==1
+      || !validIdentity(envelope.task_id) || !validIdentity(envelope.attempt_id)
+      || !Number.isSafeInteger(envelope.task_revision) || envelope.task_revision<=0
+      || !SHA256.test(envelope.task_snapshot_sha256) || !SHA256.test(envelope.prompt_sha256)
+      || typeof envelope.prompt!=='string' || !envelope.prompt.trim()
+      || !Number.isSafeInteger(envelope.prompt_bytes) || envelope.prompt_bytes<=0
+      || envelope.prompt_bytes>MAX_TASK_PROMPT_BYTES
+      || Buffer.byteLength(envelope.prompt,'utf8')!==envelope.prompt_bytes
+      || sha256(Buffer.from(envelope.prompt,'utf8'))!==envelope.prompt_sha256
+      || context.schema_version!==1 || !validIdentity(context.operation_id)
+      || !validIdentity(context.binding_id) || !validIdentity(context.worker_boot_id)
+      || !validIdentity(context.attempt_id) || !validIdentity(context.task_id)
+      || !Number.isSafeInteger(context.binding_generation) || context.binding_generation<=0
+      || !Number.isSafeInteger(context.task_revision) || context.task_revision<=0
+      || !SHA256.test(context.task_snapshot_sha256) || !SHA256.test(context.source_text_sha256)
+      || !Number.isSafeInteger(context.source_text_bytes) || context.source_text_bytes<=0
+      || typeof sourceText!=='string' || !sourceText.trim()
+      || context.operation_id!==command.operation_id || context.binding_id!==command.binding_id
+      || context.binding_generation!==command.generation || context.worker_boot_id!==bootId
+      || context.source_text_bytes!==sourceBytes
+      || context.source_text_sha256!==sha256(Buffer.from(sourceText,'utf8'))
+      || context.attempt_id!==envelope.attempt_id || context.task_id!==envelope.task_id
+      || context.task_revision!==envelope.task_revision
+      || context.task_snapshot_sha256!==envelope.task_snapshot_sha256) {
+    throw new Error('TASK_PROMPT_INVALID');
+  }
+  return {envelope,context};
+}
+function taskDispatchAdmission(entry) {
+  const {envelope,context}=entry.taskPrompt;
+  const receipt=moduleReceipt(entry.command);
+  if(!receipt)throw new Error('HOST_COMMAND_IDENTITY_INVALID');
+  return {
+    schema_version:context.schema_version,
+    module_receipt:receipt,
+    operation_id:context.operation_id,
+    binding_id:context.binding_id,
+    binding_generation:context.binding_generation,
+    worker_boot_id:context.worker_boot_id,
+    attempt_id:context.attempt_id,
+    task_id:context.task_id,
+    task_revision:context.task_revision,
+    task_snapshot_sha256:context.task_snapshot_sha256,
+    source_text_sha256:context.source_text_sha256,
+    source_text_bytes:context.source_text_bytes,
+    native_payload_sha256:envelope.prompt_sha256,
+    native_payload_bytes:envelope.prompt_bytes,
+    native_input_id:entry.id,
+  };
 }
 function commandId(command) {
   // Minted once per Operation and persisted before native I/O; the
@@ -33,7 +209,7 @@ if (argv.length !== 2 || argv[0] !== '--config') {
 const config = JSON.parse(await readFile(argv[1], 'utf8'));
 const credential = JSON.parse(await readFile(required(config, 'credentialFile'), 'utf8'));
 required(config, 'endpoint'); required(config, 'command'); required(config, 'moduleArtifactId');
-if (config.moduleArtifactId !== 'muse-sdk-1.3.0-bridge.8') throw new Error('MODULE_ARTIFACT_MISMATCH');
+if (config.moduleArtifactId !== MUSE_ARTIFACT_ID) throw new Error('MODULE_ARTIFACT_MISMATCH');
 if (!path.isAbsolute(config.command)) throw new Error('NATIVE_EXECUTABLE_MUST_BE_ABSOLUTE');
 if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(config.command)) throw new Error('USE_NATIVE_EXE_NOT_SHELL_WRAPPER');
 if (!Array.isArray(config.args) || config.args.some(a => typeof a !== 'string')) throw new Error('EXPLICIT_ARGV_REQUIRED');
@@ -44,6 +220,7 @@ if(saved && (saved.client_id!==credential.client_id || saved.module_artifact_id!
 const bootId = recovery?.owner.token ?? randomUUID();
 let control, connected = false, stopping = false, nativeReady = false, handshake, msp, rootId, nativeScope;
 let revision = 0, lastSentRevision = -1, eventsSeen = 0, savedRevision = -1;
+let nativeUsageConnectionId, nativeUsageGeneration = 0, nativeConnectionExited = false;
 let latest = { execution: 'not_started', family_completeness: 'partial', observed_children: [], pending_requests: [], gaps: 0 };
 const children = new Map(), pendingRequests = new Map(), outcomes = new Map(), active = new Map();
 const routeDefaults = {};
@@ -72,6 +249,10 @@ if(saved) {
   for(const [id,value] of saved.turns??[])turns.set(id,value);
   latest={...saved.latest,execution:'recovery_required',gaps:(saved.latest?.gaps??0)+1,
     family_completeness:'partial',recovered_checkpoint:true};
+  delete latest.usage;
+  const restoredUsage=restoredNativeUsageSnapshot(latest.native_usage);
+  if(restoredUsage)latest.native_usage=restoredUsage;
+  else delete latest.native_usage;
 }
 function checkpoint(force=false) {
   if(!recovery || !force && savedRevision===revision)return Promise.resolve();
@@ -81,17 +262,21 @@ function checkpoint(force=false) {
     route_defaults:routeDefaults,standing_effort:standingEffort,latest,
     outcomes:[...outcomes],native_pending:[...nativePending],children:[...children],turns:[...turns]}).then(()=>{savedRevision=at;});
 }
-function saveOutcome(operationId, result) {
+function saveOutcome(operationId, result, command) {
   const pending = nativePending.get(operationId);
   if (pending?.resolved && !['applied','rejected'].includes(result.outcome)) return;
   const old = outcomes.get(operationId);
   if (old && ['applied','rejected'].includes(old.outcome)) return;
-  outcomes.set(operationId, {operation_id:operationId,...result}); changed();
+  const receipt=moduleReceipt(command??pending?.command);
+  const details={...(result.details??{}),...(receipt?{module_receipt:receipt}:{})};
+  outcomes.set(operationId, {operation_id:operationId,...result,details}); changed();
 }
 function settle(entry, details, turnId) {
   entry.resolved = true;
+  const admission=entry.taskPrompt?taskDispatchAdmission(entry):undefined;
   saveOutcome(entry.command.operation_id, {outcome:'applied',native_root_id:rootId,native_scope_key:nativeScope,
-    ...(turnId?{turn_id:turnId}:{}), details});
+    ...(turnId?{turn_id:turnId}:{}),...(admission?{native_input_id:entry.id}:{}),
+    details:{...details,...(admission?{dispatch_admission:admission}:{})}},entry.command);
 }
 function acceptModel(entry, session, evidence) {
   if (!entry.ack || entry.setting?.key !== 'model' || !modelMatches(session, entry.setting.desired)) return false;
@@ -114,6 +299,46 @@ function sessionChanged(sessionId, reason = 'native_event_after_read') {
   if (typeof sessionId !== 'string' || !sessionId) return;
   sessionVersions.set(sessionId, (sessionVersions.get(sessionId)??0)+1);
   invalidateChildSnapshot(sessionId, reason);
+}
+function beginNativeUsageConnection() {
+  nativeUsageConnectionId=randomUUID();
+  nativeUsageGeneration=1;
+  latest.native_usage=emptyNativeUsageSnapshot({connectionId:nativeUsageConnectionId,method:'usage/read',
+    revision:nativeUsageGeneration,collectedAtMs:Date.now(),completeness:'not_observed'});
+  changed();
+}
+function recordNativeUsageChanged(value) {
+  if(!nativeUsageConnectionId)return;
+  nativeUsageGeneration++;
+  latest.native_usage=nativeUsageSnapshot({connectionId:nativeUsageConnectionId,method:'usage/changed',
+    revision:nativeUsageGeneration,collectedAtMs:Date.now(),value});
+}
+async function readNativeUsage() {
+  const connectionId=nativeUsageConnectionId;
+  if(!connectionId || !msp)return;
+  const generation=nativeUsageGeneration;
+  try {
+    const result=await msp.connection.request('usage/read',{});
+    if(connectionId!==nativeUsageConnectionId || generation!==nativeUsageGeneration)return;
+    nativeUsageGeneration++;
+    latest.native_usage=nativeUsageReadSnapshot({connectionId,revision:nativeUsageGeneration,
+      collectedAtMs:Date.now(),result});
+  } catch(error) {
+    if(connectionId!==nativeUsageConnectionId || generation!==nativeUsageGeneration)return;
+    nativeUsageGeneration++;
+    const unsupported=error instanceof MspError && error.kind==='methodNotFound';
+    latest.native_usage=emptyNativeUsageSnapshot({connectionId,method:'usage/read',revision:nativeUsageGeneration,
+      collectedAtMs:Date.now(),completeness:unsupported?'unsupported':'not_observed'});
+  }
+  changed();
+}
+function closeNativeUsageConnection() {
+  const connectionId=nativeUsageConnectionId;
+  if(!connectionId)return;
+  nativeUsageGeneration++;
+  nativeUsageConnectionId=undefined;
+  latest.native_usage=closedNativeUsageSnapshot(latest.native_usage,{connectionId,revision:nativeUsageGeneration,
+    collectedAtMs:Date.now()});
 }
 function pendingRequestKey(sessionId, kind, requestId) {
   if (typeof sessionId !== 'string' || !sessionId) throw new Error('PENDING_REQUEST_SESSION_REQUIRED');
@@ -231,7 +456,7 @@ function onNotification(n) {
   }
   if (n.method === 'session/goalChanged' && p.sessionId === rootId) latest.goal = p.goal ?? null;
   if (n.method === 'session/reasoningEffortChanged' && p.sessionId === rootId) { latest.reasoning_effort = p.reasoningEffort; standingEffort = p.reasoningEffort; }
-  if (n.method === 'usage/changed') latest.usage = { basis:'native_snapshot', value:p };
+  if (n.method === 'usage/changed') recordNativeUsageChanged(p);
   if (n.method === 'session/modelChanged' && p.sessionId === rootId) {
     latest.model = { modelId:p.modelId,providerId:p.providerId };
     for (const entry of nativePending.values()) acceptModel(entry, p, {method:n.method,viewCursor:p.viewCursor,sourceRange:p.sourceRange});
@@ -332,7 +557,7 @@ async function completeNative(entry, ack) {
       settle(entry, {native_ack:ack,completion_condition:'native_configuration_applied',boundary:'next_action'});
     } else {
       saveOutcome(entry.command.operation_id, {outcome:'accepted',native_root_id:rootId,native_scope_key:nativeScope,
-        details:{native_ack:ack,completion_condition:'native_configuration_applied',waiting_for:'model_readback',requested:setting.desired}});
+        details:{native_ack:ack,completion_condition:'native_configuration_applied',waiting_for:'model_readback',requested:setting.desired}},entry.command);
       await refreshRoot();
       // If no matching observation exists yet, preserve accepted/pending. New
       // model work remains serialized behind it while replies/refresh continue.
@@ -343,8 +568,8 @@ async function completeNative(entry, ack) {
   }
 }
 
-async function submitNative(command, method, params, kind, setting) {
-  const entry = {command,id:commandId(command),method,params,kind,setting,ack:null,resolved:false,submission_boot_id:bootId};
+async function submitNative(command, method, params, kind, setting, taskPrompt) {
+  const entry = {command,id:commandId(command),method,params,kind,setting,taskPrompt,ack:null,resolved:false,submission_boot_id:bootId};
   nativePending.set(command.operation_id, entry);
   await checkpoint(true); // Native mutation must not precede its recoverable ID/payload.
   const ack = await msp.connection.command(method, params, {maxAttempts:1,commandId:entry.id});
@@ -367,7 +592,7 @@ async function reconcileNative(target) {
     await completeNative(entry, ack);
   } catch (error) {
     saveOutcome(target, {outcome:failedReconcileOutcome(error instanceof MspError?{code:error.code,kind:error.kind}:null, Boolean(entry.ack)),native_root_id:rootId,native_scope_key:nativeScope,
-      details:{evidence_kind:'explicit_same_command_reconciliation',native_code:error instanceof MspError?error.code:null,native_kind:error instanceof MspError?error.kind:null}});
+      details:{evidence_kind:'explicit_same_command_reconciliation',native_code:error instanceof MspError?error.code:null,native_kind:error instanceof MspError?error.kind:null}},entry.command);
     throw error;
   }
   return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:true,native_command_id:entry.id};
@@ -452,11 +677,12 @@ async function launchConnection(options) {
     pendingRequests.set(key,{view:{method:request.method,params:p}}); changed();
     return {};
   });
-  handshake.exited.then(exit=>{nativeReady=false;latest.execution='native_exited';latest.exit=exit;
-    latest.host_death=hostDeathObservation(latest.host_durability?.profile,exit,Date.now());changed();},
-    ()=>{nativeReady=false;latest.execution='native_failed';
-    latest.host_death=hostDeathObservation(latest.host_durability?.profile,null,Date.now());changed();});
+  handshake.exited.then(exit=>{nativeReady=false;nativeConnectionExited=true;latest.execution='native_exited';latest.exit=exit;
+    latest.host_death=hostDeathObservation(latest.host_durability?.profile,exit,Date.now());closeNativeUsageConnection();changed();},
+    ()=>{nativeReady=false;nativeConnectionExited=true;latest.execution='native_failed';
+    latest.host_death=hostDeathObservation(latest.host_durability?.profile,null,Date.now());closeNativeUsageConnection();changed();});
   msp=await handshake.initialize({clientInfo:{name:'eliot-swarm-controller',version:'0.1.0'}});
+  beginNativeUsageConnection();
   const init=msp.initializeResult;
   const home=await realpath(required(init,'museHome'));
   const scope=`muse:${process.platform}:${process.platform==='win32'?home.toLowerCase():home}`;
@@ -468,6 +694,8 @@ async function launchConnection(options) {
   // connection's profile until a new handshake replaces it.
   latest.host_durability=durabilityProfile(init);
   latest.fingerprint_warning=Boolean(msp.fingerprintWarning);
+  if(nativeConnectionExited)closeNativeUsageConnection();
+  else void readNativeUsage();
   return init;
 }
 
@@ -517,6 +745,7 @@ async function execute(command) {
   const base={operation_id:command.operation_id};
   let nativeAdmissionPossible=false;
   try {
+    if(!moduleReceipt(command))throw new Error('HOST_COMMAND_IDENTITY_INVALID');
     let result;
     if (command.method==='agent.open') { nativeAdmissionPossible=true;result=await startNative(command); }
     else if(command.method==='agent.recover') {nativeAdmissionPossible=true;await recoverNative(command);return;}
@@ -524,14 +753,15 @@ async function execute(command) {
       if (!msp || command.native_root_id!==rootId) throw new Error('NATIVE_IDENTITY_MISMATCH');
       const p=command.input;
       if (command.method==='task.dispatch' || command.method==='agent.send') {
+        const taskPrompt=command.method==='task.dispatch'?taskPromptFor(command):undefined;
         const observed=await msp.connection.request('session/read',{sessionId:rootId});
         if(!modelMatches(observed.session,routeDefaults))throw new Error('MODEL_CHANGED_BEFORE_SEND');
         const steer=p.delivery==='steer';
-        const input={sessionId:rootId,input:[{type:'text',text:required(p,'text')}],reasoningEffort:routeDefaults.reasoningEffort};
-        if(command.method === 'task.dispatch') input.input.unshift({type:'text',text:'Task specification: '+JSON.stringify(p.task_snapshot)});
+        const promptText=taskPrompt?taskPrompt.envelope.prompt:required(p,'text');
+        const input={sessionId:rootId,input:[{type:'text',text:promptText}],reasoningEffort:routeDefaults.reasoningEffort};
         if(steer)input.expectedTurnId=required(p,'expected_turn_id');else input.ifBusy='queue';
         nativeAdmissionPossible=true;
-        await submitNative(command,steer?'turn/steer':'turn/start',input,'input');
+        await submitNative(command,steer?'turn/steer':'turn/start',input,'input',undefined,taskPrompt);
         return;
       } else if(command.method==='agent.reply') {
         const r=p.reply;
@@ -569,7 +799,7 @@ async function execute(command) {
       } else throw new Error('UNSUPPORTED_OPERATION');
       result.native_root_id=rootId;result.native_scope_key=nativeScope;
     }
-    saveOutcome(command.operation_id,{outcome:'applied',...result});
+    saveOutcome(command.operation_id,{outcome:'applied',...result},command);
   } catch(error) {
     // Only the pinned durable commandRejected code/kind settles admitted
     // native work. Other errors can prove nothing or mean nothing was admitted;
@@ -578,7 +808,7 @@ async function execute(command) {
     const accepted = nativePending.get(command.operation_id)?.ack;
     const outcome={...base,outcome:accepted?'accepted':rejected?'rejected':'unknown',details:{error_type:error.name,native_kind:error instanceof MspError?error.kind:null,native_code:error instanceof MspError?error.code:null,diagnostic_code:error instanceof MspError?'NATIVE_ERROR':String(error.message).slice(0,120)}};
     if(rootId){outcome.native_root_id=rootId;outcome.native_scope_key=nativeScope;}
-    saveOutcome(command.operation_id,outcome);
+    saveOutcome(command.operation_id,outcome,command);
   } finally {
     active.delete(command.operation_id);
     if(nativePending.get(command.operation_id)?.hostAcknowledged)nativePending.delete(command.operation_id);
@@ -630,9 +860,11 @@ process.once('SIGINT',()=>{void stop();});process.once('SIGTERM',()=>{void stop(
 while(!stopping){
   try{
     control=new Control(config.endpoint,credential);await control.connect();
-    const hello=await control.call('module.hello',{boot_id:bootId,module_artifact_id:config.moduleArtifactId,native_ready:nativeReady,
+    const hello=await control.call('module.hello',{boot_id:bootId,module_artifact_id:config.moduleArtifactId,
+      module_contract:MUSE_MODULE_CONTRACT,native_ready:nativeReady,
       ...(recovery?{managed_owner:recovery.owner}:{}),
       ...(rootId?{native_root_id:rootId,native_scope_key:nativeScope}:{})});
+    requireModuleContractNegotiated(hello);
     if(bindingContext && (hello.binding_id!==bindingContext.binding_id || hello.generation!==bindingContext.generation))throw new Error('CHECKPOINT_BINDING_CHANGED');
     bindingContext={binding_id:hello.binding_id,generation:hello.generation};
     if(hello.recovery_required)latest.recovery={status:'awaiting_explicit_agent_recover',boot_id:bootId};

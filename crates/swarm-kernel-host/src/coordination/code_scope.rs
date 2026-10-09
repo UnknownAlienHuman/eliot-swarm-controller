@@ -27,7 +27,6 @@ impl ScopeMode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProposeRequest {
-    pub client_request_id: String,
     pub task_id: String,
     pub task_revision: Option<i64>,
     pub attempt_id: String,
@@ -43,7 +42,6 @@ pub(crate) struct ProposeRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptRequest {
-    pub client_request_id: String,
     pub scope_intent_id: String,
     pub expected_state_revision: i64,
     pub proposal_digest: String,
@@ -59,7 +57,6 @@ pub(crate) struct AcceptRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReleaseRequest {
-    pub client_request_id: String,
     pub scope_intent_id: String,
     pub expected_state_revision: i64,
     pub reason: String,
@@ -242,12 +239,12 @@ pub(crate) fn parse_propose_request(value: &Value) -> Result<ProposeRequest> {
             "a scope proposal must name a path, symbol or interface",
         ));
     }
+    text(
+        value,
+        "client_request_id",
+        limits::MAX_CLIENT_REQUEST_ID_BYTES,
+    )?;
     Ok(ProposeRequest {
-        client_request_id: text(
-            value,
-            "client_request_id",
-            limits::MAX_CLIENT_REQUEST_ID_BYTES,
-        )?,
         task_id: text(value, "task_id", limits::MAX_IDENTIFIER_BYTES)?,
         task_revision: positive_optional(value, "task_revision")?,
         attempt_id: text(value, "attempt_id", limits::MAX_IDENTIFIER_BYTES)?,
@@ -307,12 +304,12 @@ pub(crate) fn parse_accept_request(value: &Value) -> Result<AcceptRequest> {
             ids
         }
     };
+    text(
+        value,
+        "client_request_id",
+        limits::MAX_CLIENT_REQUEST_ID_BYTES,
+    )?;
     Ok(AcceptRequest {
-        client_request_id: text(
-            value,
-            "client_request_id",
-            limits::MAX_CLIENT_REQUEST_ID_BYTES,
-        )?,
         scope_intent_id: scope_id(value, "scope_intent_id")?,
         expected_state_revision: model::positive(value, "expected_state_revision")?,
         proposal_digest,
@@ -341,12 +338,12 @@ pub(crate) fn parse_release_request(value: &Value) -> Result<ReleaseRequest> {
             "reason",
         ],
     )?;
+    text(
+        value,
+        "client_request_id",
+        limits::MAX_CLIENT_REQUEST_ID_BYTES,
+    )?;
     Ok(ReleaseRequest {
-        client_request_id: text(
-            value,
-            "client_request_id",
-            limits::MAX_CLIENT_REQUEST_ID_BYTES,
-        )?,
         scope_intent_id: scope_id(value, "scope_intent_id")?,
         expected_state_revision: model::positive(value, "expected_state_revision")?,
         reason: text(value, "reason", limits::MAX_REASON_BYTES)?,

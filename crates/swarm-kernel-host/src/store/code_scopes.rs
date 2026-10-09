@@ -36,6 +36,29 @@ struct Overlap {
     paths: Vec<String>,
     symbols: Vec<String>,
     interfaces: Vec<String>,
+    unsupported_paths: Vec<UnsupportedPath>,
+}
+
+/// One path pair whose glob form cannot be classified safely. Retained as an
+/// explicit uncertainty field on `Overlap` so an unclassified pair survives
+/// classification instead of being dropped whenever another pair matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnsupportedPath {
+    left: String,
+    right: String,
+}
+
+impl UnsupportedPath {
+    fn pair(left: &str, right: &str) -> Self {
+        Self {
+            left: left.to_owned(),
+            right: right.to_owned(),
+        }
+    }
+
+    fn projection(&self) -> Value {
+        json!({"left": self.left, "right": self.right})
+    }
 }
 
 /// Store mutation seam. Every code-scope change is a synchronous metadata
@@ -258,7 +281,7 @@ pub(crate) fn current_scope_revisions(
 ) -> Result<Value> {
     let task = match tasks::get_task(db, task_id) {
         Ok(task) => task,
-        Err(_) => {
+        Err(error) if error.code == "NOT_FOUND" => {
             return Ok(scope_refs_unavailable(
                 task_id,
                 task_revision,
@@ -266,10 +289,11 @@ pub(crate) fn current_scope_revisions(
                 "task_unavailable",
             ));
         }
+        Err(error) => return Err(error),
     };
     let attempt = match tasks::get_attempt(db, attempt_id) {
         Ok(attempt) => attempt,
-        Err(_) => {
+        Err(error) if error.code == "NOT_FOUND" => {
             return Ok(scope_refs_unavailable(
                 task_id,
                 task_revision,
@@ -277,6 +301,7 @@ pub(crate) fn current_scope_revisions(
                 "attempt_unavailable",
             ));
         }
+        Err(error) => return Err(error),
     };
     if task["task_id"] != task_id
         || task["revision"] != task_revision
@@ -337,6 +362,90 @@ pub(crate) fn current_scope_revisions(
         "coverage":if more || !gaps.is_empty() { "partial" } else { "complete" },
         "gaps":gaps,
     }))
+}
+
+/// Return the current accepted scope revisions relevant to one contract
+/// proposal. This uses the same overlap relation as code-scope conflict reads;
+/// an unclassifiable path pair keeps the coverage partial instead of being
+/// treated as disjoint.
+pub(crate) fn affected_scope_revisions(
+    db: &Connection,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    affected: &Value,
+) -> Result<Value> {
+    let mut snapshot = current_scope_revisions(db, task_id, task_revision, attempt_id)?;
+    if snapshot["coverage"] != "complete" {
+        return Ok(snapshot);
+    }
+
+    model::fields(affected, &["paths", "symbols", "schemas"]).map_err(|_| {
+        Error::new(
+            "PROPOSAL_DAMAGED",
+            "proposal affected scope contains unknown fields",
+        )
+    })?;
+    let strings = |field: &str| -> Result<Vec<String>> {
+        let items = affected
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Error::new(
+                    "PROPOSAL_DAMAGED",
+                    format!("proposal affected {field} is not an array"),
+                )
+            })?;
+        items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::new(
+                        "PROPOSAL_DAMAGED",
+                        format!("proposal affected {field} contains a non-text item"),
+                    )
+                })
+            })
+            .collect()
+    };
+    let proposal_scope = json!({
+        "mode":"exclusive_edit",
+        "paths":strings("paths")?,
+        "symbols":strings("symbols")?,
+        "interfaces":strings("schemas")?,
+    });
+    let current_items = snapshot["items"].as_array().cloned().ok_or_else(|| {
+        Error::new(
+            "SCOPE_COVERAGE_INCOMPLETE",
+            "current accepted-scope snapshot has no item list",
+        )
+    })?;
+    let mut relevant = Vec::new();
+    let mut overlap_unknown = false;
+    for scope in current_items {
+        let relation = overlap(&proposal_scope, &scope);
+        if relation.class == "unknown" || !relation.unsupported_paths.is_empty() {
+            overlap_unknown = true;
+        }
+        if relation.class != "none" {
+            relevant.push(scope);
+        }
+    }
+    relevant.sort_by(|left: &Value, right: &Value| {
+        left["scope_intent_id"]
+            .as_str()
+            .cmp(&right["scope_intent_id"].as_str())
+    });
+    snapshot["items"] = json!(relevant);
+    if overlap_unknown {
+        snapshot["coverage"] = json!("partial");
+        let mut gaps = snapshot["gaps"].as_array().cloned().unwrap_or_default();
+        gaps.push(json!("affected_scope_overlap_unknown"));
+        gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        gaps.dedup();
+        snapshot["gaps"] = json!(gaps);
+    }
+    Ok(snapshot)
 }
 
 fn propose(
@@ -896,6 +1005,11 @@ fn conflicts_for(record: &Value, active: &[Value]) -> Vec<Value> {
                     "paths":overlap.paths,
                     "symbols":overlap.symbols,
                     "interfaces":overlap.interfaces,
+                    "unsupported_paths":overlap
+                        .unsupported_paths
+                        .iter()
+                        .map(UnsupportedPath::projection)
+                        .collect::<Vec<_>>(),
                     "advisory_only":true,
                     "native_execution":false,
                 })
@@ -917,13 +1031,20 @@ fn overlap(left: &Value, right: &Value) -> Overlap {
     let mut matched_symbols = BTreeSet::new();
     let mut matched_interfaces = BTreeSet::new();
     let mut unknown_path = false;
+    let mut unsupported_paths = Vec::new();
     for left_path in string_array(&left["paths"]) {
         for right_path in string_array(&right["paths"]) {
             match path_overlap(&left_path, &right_path) {
                 (Some(true), _) => {
                     matched_paths.insert(format!("{left_path} <> {right_path}"));
                 }
-                (None, _) => unknown_path = true,
+                (None, _) => {
+                    unknown_path = true;
+                    let pair = UnsupportedPath::pair(&left_path, &right_path);
+                    if !unsupported_paths.contains(&pair) {
+                        unsupported_paths.push(pair);
+                    }
+                }
                 _ => {}
             }
         }
@@ -940,6 +1061,9 @@ fn overlap(left: &Value, right: &Value) -> Overlap {
     }
     let matched =
         !matched_paths.is_empty() || !matched_symbols.is_empty() || !matched_interfaces.is_empty();
+    // Classification describes only the pairs that were classified. Keep
+    // unsupported pairs alongside it so uncertainty cannot erase a known
+    // conflict or imply complete path coverage.
     let class = if matched {
         if left_mode == "read_review" || right_mode == "read_review" {
             "informational"
@@ -958,6 +1082,7 @@ fn overlap(left: &Value, right: &Value) -> Overlap {
         paths: matched_paths.into_iter().collect(),
         symbols: matched_symbols.into_iter().collect(),
         interfaces: matched_interfaces.into_iter().collect(),
+        unsupported_paths,
     }
 }
 
@@ -971,17 +1096,17 @@ fn path_overlap(left: &str, right: &str) -> (Option<bool>, &'static str) {
     }
     let left_prefix = terminal_glob_prefix(left);
     let right_prefix = terminal_glob_prefix(right);
-    if let Some(prefix) = left_prefix {
-        if right_prefix.is_some_and(|other| prefixes_overlap(prefix, other))
+    if let Some(prefix) = left_prefix
+        && (right_prefix.is_some_and(|other| prefixes_overlap(prefix, other))
             || (right_prefix.is_none() && right.starts_with(&format!("{prefix}/")))
-        {
-            return (Some(true), "prefix_glob");
-        }
+    {
+        return (Some(true), "prefix_glob");
     }
-    if let Some(prefix) = right_prefix {
-        if left_prefix.is_none() && left.starts_with(&format!("{prefix}/")) {
-            return (Some(true), "prefix_glob");
-        }
+    if let Some(prefix) = right_prefix
+        && left_prefix.is_none()
+        && left.starts_with(&format!("{prefix}/"))
+    {
+        return (Some(true), "prefix_glob");
     }
     if has_unsupported_glob(left) || has_unsupported_glob(right) {
         return (None, "unsupported_glob");

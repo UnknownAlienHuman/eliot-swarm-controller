@@ -32,9 +32,9 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedModuleOwnerHelperSha256,
     [ValidateSet('OpenCode', 'Command', 'Codex', 'Antigravity', 'Claude')][string] $Adapter = 'OpenCode',
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
-    [string] $OpenCodeCommandTestModelRef = 'inclusionai/ling-3.1-flash',
+    [string] $OpenCodeCommandTestModelRef = 'kilo/stepfun-step-5-preview-free',
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
-    [string] $CommandTestModelId = 'inclusionai/ling-3.1-flash:free',
+    [string] $CommandTestModelId = 'kilo/stepfun-step-5-preview-free',
     [ValidateRange(30, 300)][int] $TimeoutSeconds = 180,
     [ValidateRange(1, 2147483647)][int] $CodexAppServerPid,
     [string] $CodexAppServerImagePath,
@@ -176,6 +176,7 @@ function Get-BuildProvenance {
         [Parameter(Mandatory)][string] $BinaryPath,
         [Parameter(Mandatory)][string] $ExpectedPackage,
         [Parameter(Mandatory)][string] $ExpectedTarget,
+        [string] $ExpectedPackageManifestPath,
         [switch] $HostComponent,
         [switch] $RequireBinaryPathMatch
     )
@@ -186,6 +187,10 @@ function Get-BuildProvenance {
     $binaryHash = Get-FileSha256 $binary
     if ($manifestHash -ne $ExpectedManifestSha256.ToLowerInvariant()) { Stop-Qualification 'BUILD_MANIFEST_HASH_MISMATCH' }
     $manifest = Read-JsonFile $manifestFile
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedPackageManifestPath) -and
+        [string]$manifest.source.package_manifest_path -cne $ExpectedPackageManifestPath) {
+        Stop-Qualification 'BUILD_PACKAGE_MANIFEST_PATH_MISMATCH'
+    }
     if ($manifest.schema_version -ne 1 -or $manifest.format -ne 'eliot.module_build_manifest.v1' -or
         $manifest.source.checkout_clean_before -ne $true -or $manifest.source.checkout_clean_after -ne $true -or
         $manifest.source.commit -notmatch '\A[a-f0-9]{40}\z' -or $manifest.source.tree -notmatch '\A[a-f0-9]{40}\z' -or
@@ -629,22 +634,24 @@ function Get-AdapterContract {
     switch ($Adapter) {
         'OpenCode' {
             return [pscustomobject]@{
-                module_id = 'eliot.opencode.v2'; artifact_id = 'eliot-opencode-v2.rust-http.1'; version = '0.3.0'; runtime = 'module';
+                module_id = 'eliot.opencode.v2'; artifact_id = 'eliot-opencode-v2.rust-http.1'; version = '0.5.0'; runtime = 'module';
                 build_package = 'swarm-adapter-opencode'; build_target = 'swarm-adapter-opencode';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send/next_turn', 'task.dispatch', 'native.mcp.arm', 'native.mcp.install', 'native.mcp.observe', 'native.mcp.read');
-                command_schemas = @('swarm.native_mcp_command@1:', 'swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
-                event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
-                expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '2'; expected_config_schema_sha256 = '7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68';
+                build_manifest = 'crates/swarm-adapter-opencode/Cargo.toml';
+                capabilities = @('agent.background', 'agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.result', 'agent.send/next_turn', 'native.mcp.arm', 'native.mcp.install', 'native.mcp.observe', 'native.mcp.read', 'native.opencode.loop_step', 'task.dispatch');
+                command_schemas = @('swarm.native_mcp_command@1:', 'swarm.normalized_result_context@1:', 'swarm.opencode_loop_step_command@1:', 'swarm.opencode_reply_command@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
+                event_schemas = @('swarm.normalized_result_page@1:', 'swarm.opencode_interaction_observation@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
+                expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '3'; expected_config_schema_sha256 = '070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e';
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
-                expected_provider = $null; expected_model = $null; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
+                expected_provider = ($OpenCodeCommandTestModelRef.Split('/')[0]); expected_model = ($OpenCodeCommandTestModelRef.Split('/')[1]); expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
             }
         }
         'Command' {
             return [pscustomobject]@{
-                module_id = 'runtime.command'; artifact_id = 'eliot-command.rust-headless.1'; version = '3'; runtime = 'command';
+                module_id = 'runtime.command'; artifact_id = 'eliot-command.rust-headless.1'; version = '4'; runtime = 'command';
                 build_package = 'swarm-adapter-command'; build_target = 'swarm-adapter-command';
+                build_manifest = 'crates/swarm-adapter-command/Cargo.toml';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.result', 'task.dispatch');
-                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
@@ -653,10 +660,11 @@ function Get-AdapterContract {
         }
         'Codex' {
             return [pscustomobject]@{
-                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '4'; runtime = 'codex';
+                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '5'; runtime = 'codex';
                 build_package = 'swarm-adapter-codex'; build_target = 'swarm-codex-adapter';
+                build_manifest = 'crates/swarm-adapter-codex/Cargo.toml';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send', 'task.dispatch');
-                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = 'modelProvider'; model_field = 'model'; effort_field = $null;
@@ -665,10 +673,11 @@ function Get-AdapterContract {
         }
         'Antigravity' {
             return [pscustomobject]@{
-                module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '4'; runtime = 'antigravity';
+                module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '5'; runtime = 'antigravity';
                 build_package = 'swarm-antigravity-adapter'; build_target = 'swarm-antigravity';
+                build_manifest = 'modules/antigravity-rust/Cargo.toml';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
-                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
@@ -677,10 +686,11 @@ function Get-AdapterContract {
         }
         'Claude' {
             return [pscustomobject]@{
-                module_id = 'claude'; artifact_id = 'claude-agent-sdk-0.3.287-rust-controller.4'; version = '4'; runtime = 'module';
+                module_id = 'claude'; artifact_id = 'claude-agent-sdk-rust-controller.5'; version = '5'; runtime = 'module';
                 build_package = 'swarm-adapter-claude'; build_target = 'swarm-adapter-claude';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch');
-                command_schemas = @('swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
+                build_manifest = 'crates/swarm-adapter-claude/Cargo.toml';
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
+                command_schemas = @('swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
@@ -689,6 +699,38 @@ function Get-AdapterContract {
         }
         default { Stop-Qualification 'ADAPTER_UNSUPPORTED' }
     }
+}
+
+function Assert-QualificationArtifactCoordinate {
+    param(
+        [Parameter(Mandatory)][string] $AdapterName,
+        [Parameter(Mandatory)] $Contract
+    )
+    $policyPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\ci\module-package-policy.json'))
+    try { $policy = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json -AsHashtable }
+    catch { Stop-Qualification 'MODULE_PACKAGE_POLICY_INVALID' }
+    if ($policy.schema_version -ne 2 -or $policy.format -cne 'eliot.module_build_policy.v2' -or
+        $policy.approved_package_coordinates -isnot [array]) {
+        Stop-Qualification 'MODULE_PACKAGE_POLICY_INVALID'
+    }
+    $coordinates = @($policy.approved_package_coordinates | Where-Object {
+        [string]$_.package_name -ceq [string]$Contract.build_package
+    })
+    if ($coordinates.Count -ne 1 -or
+        [string]$coordinates[0].manifest -cne [string]$Contract.build_manifest -or
+        [string]$coordinates[0].binary_target -cne [string]$Contract.build_target) {
+        Stop-Qualification 'MODULE_PACKAGE_POLICY_COORDINATE_MISMATCH'
+    }
+    $artifacts = @($coordinates[0].qualification_artifacts | Where-Object {
+        [string]$_.adapter -ceq $AdapterName
+    })
+    if ($artifacts.Count -ne 1 -or
+        [string]$artifacts[0].module_id -cne [string]$Contract.module_id -or
+        [string]$artifacts[0].artifact_id -cne [string]$Contract.artifact_id -or
+        [string]$artifacts[0].version -cne [string]$Contract.version) {
+        Stop-Qualification 'MODULE_PACKAGE_POLICY_ARTIFACT_MISMATCH'
+    }
+    return Get-FileSha256 $policyPath
 }
 
 function Assert-TaskFixture {
@@ -1033,11 +1075,9 @@ function Get-RouteModelFacts {
         $provider = [string]$model.providerID
         $modelId = [string]$model.id
         $effort = [string]$model.variant
-        $qualifiedModelRef = '{0}/{1}' -f $provider, $modelId
-        $modelIdMatches = [string]::Equals($modelId, [string]$Contract.expected_model_ref, [StringComparison]::Ordinal)
-        $qualifiedRefMatches = [string]::Equals($qualifiedModelRef, [string]$Contract.expected_model_ref, [StringComparison]::Ordinal)
         if ([string]::IsNullOrWhiteSpace($provider) -or [string]::IsNullOrWhiteSpace($modelId) -or
-            (-not $modelIdMatches -and -not $qualifiedRefMatches)) {
+            -not [string]::Equals($provider, [string]$Contract.expected_provider, [StringComparison]::Ordinal) -or
+            -not [string]::Equals($modelId, [string]$Contract.expected_model, [StringComparison]::Ordinal)) {
             Stop-Qualification 'ROUTE_MODEL_MISMATCH'
         }
         if ($null -ne $Contract.expected_effort -and $effort -ne $Contract.expected_effort) { Stop-Qualification 'ROUTE_VARIANT_MISMATCH' }
@@ -1201,6 +1241,7 @@ try {
         }
     }
     $contract = Get-AdapterContract
+    $qualificationPolicySha256 = Assert-QualificationArtifactCoordinate -AdapterName $Adapter -Contract $contract
     $script:HostPath = Assert-ExistingFile $HostExecutable
     $script:HostSupervisorPath = Assert-ExistingFile $HostSupervisorExecutable
     $script:HostLauncherPath = Assert-ExistingFile $HostLauncherExecutable
@@ -1246,6 +1287,7 @@ try {
     $script:Report.safe_facts.host_launcher = $hostLauncherBuild
     $script:Report.safe_facts.host_supervisor = $hostSupervisorBuild
     $script:Report.safe_facts.public_cli = $publicCliBuild
+    $script:Report.safe_facts.module_package_policy_sha256 = $qualificationPolicySha256
     $script:Report.safe_facts.owner_helper_sha256 = (Get-FileSha256 $ownerHelper)
     $script:Report.safe_facts.task_spec_sha256 = Get-FileSha256 $taskPath
     $script:Report.safe_facts.launch_settings_sha256 = Get-FileSha256 $settingsPath
@@ -1254,7 +1296,7 @@ try {
     $script:Report.safe_facts.one_turn_input_bytes = $oneTurnBytes
     Assert-ModuleSupervisorConfig -Path $script:ConfigPath -InstallRoot $installRoot -DescriptorPath $descriptorPath -OwnerHelperPath $ownerHelper -OwnerHelperSha256 $expectedHelperHash
     $module = Get-InstalledModuleFacts -InstallRoot $installRoot -ExecutablePath $executable -DescriptorPath $descriptorPath -OwnerHelperPath $ownerHelper -OwnerHelperSha256 $expectedHelperHash -Contract $contract
-    $moduleBuild = Get-BuildProvenance -ManifestPath $ModuleBuildManifestPath -ExpectedManifestSha256 $ExpectedModuleBuildManifestSha256 -BinaryPath $module.executable -ExpectedPackage $contract.build_package -ExpectedTarget $contract.build_target
+    $moduleBuild = Get-BuildProvenance -ManifestPath $ModuleBuildManifestPath -ExpectedManifestSha256 $ExpectedModuleBuildManifestSha256 -BinaryPath $module.executable -ExpectedPackage $contract.build_package -ExpectedTarget $contract.build_target -ExpectedPackageManifestPath $contract.build_manifest
     if ($hostBuild.source_commit -cne $moduleBuild.source_commit -or $hostBuild.source_tree -cne $moduleBuild.source_tree -or
         $hostBuild.cargo_toml_sha256 -cne $moduleBuild.cargo_toml_sha256 -or
         $hostBuild.cargo_lock_sha256 -cne $moduleBuild.cargo_lock_sha256 -or

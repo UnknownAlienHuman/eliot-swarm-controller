@@ -171,22 +171,15 @@ pub(super) fn consume_review_result_for_entry(
             "the current assigned pass was not produced under the entry's selected reviewer profile",
         ));
     }
-    let gm: Option<(String, i64)> = tx
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') \
-             FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((current_gm_id, gm_epoch)) = gm else {
+    let Some(current_gm) = super::gm::current(tx)? else {
         return Ok(capability_gap(
             &review,
             "current_gm_required",
             "automatic acceptance requires the selected manager to hold the current GM designation",
         ));
     };
-    if current_gm_id != entry.owner_manager_id || gm_epoch <= 0 {
+    let gm_epoch = current_gm.epoch;
+    if current_gm.client_id != entry.owner_manager_id {
         return Ok(skipped(
             &review,
             "manager_is_not_current_gm",

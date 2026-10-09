@@ -32,8 +32,257 @@ const HANDOVER_ATTENTION_LIMIT: i64 = 20;
 /// Wake mode exposed in `host.status` until a native push path is qualified.
 pub(super) const WAKE_MODE: &str = "checkpoint_poll";
 
-/// The current designation record, or `None` before the first handover. With
-/// no designation, GM-only authority rests with the local operator alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentGm {
+    pub(crate) client_id: String,
+    pub(crate) epoch: i64,
+    binding: Option<GmBindingRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GmBindingRef {
+    binding_id: String,
+    generation: i64,
+}
+
+impl CurrentGm {
+    fn facts(&self) -> Value {
+        json!({
+            "client_id": self.client_id,
+            "epoch": self.epoch,
+            "binding_id": self.binding.as_ref().map(|binding| &binding.binding_id),
+            "binding_generation": self.binding.as_ref().map(|binding| binding.generation),
+        })
+    }
+}
+
+#[derive(Debug)]
+enum DesignationState {
+    NeverDesignated,
+    Current(CurrentGm),
+    MissingAfterHistory { high_water: i64 },
+    Damaged { high_water: i64 },
+    StaleRegistration { current: CurrentGm, high_water: i64 },
+}
+
+fn designation_error(code: &str) -> Error {
+    Error::new(
+        code,
+        "GM designation requires verified local Operator recovery",
+    )
+}
+
+fn bounded_identity(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)?
+        .as_str()
+        .filter(|text| {
+            !text.trim().is_empty() && text.len() <= 128 && !text.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+}
+
+fn parse_designation(value: &Value) -> Option<CurrentGm> {
+    if !value.is_object() {
+        return None;
+    }
+    let client_id = bounded_identity(value, "client_id")?;
+    let epoch = value.get("epoch")?.as_i64().filter(|epoch| *epoch > 0)?;
+    let binding_id = value.get("binding_id").filter(|value| !value.is_null());
+    let generation = value
+        .get("binding_generation")
+        .filter(|value| !value.is_null());
+    let binding = match (binding_id, generation) {
+        (None, None) => None,
+        (Some(_), Some(generation)) => Some(GmBindingRef {
+            binding_id: bounded_identity(value, "binding_id")?,
+            generation: generation.as_i64().filter(|generation| *generation > 0)?,
+        }),
+        _ => return None,
+    };
+    Some(CurrentGm {
+        client_id,
+        epoch,
+        binding,
+    })
+}
+
+fn registered_manager(db: &Connection, client_id: &str) -> Result<bool> {
+    Ok(
+        meta(db, &format!("client:{client_id}"))?.is_some_and(|registration| {
+            registration.is_object()
+                && registration["role"] == "manager"
+                && matches!(
+                    registration.get("disabled"),
+                    None | Some(Value::Bool(false))
+                )
+        }),
+    )
+}
+
+/// Successful immutable handover receipts are the existing durable epoch ledger.
+/// A malformed successful receipt is damage, not a row to skip during MAX.
+fn handover_epoch_high_water(db: &Connection) -> Result<i64> {
+    let (high_water, damaged): (i64, i64) = db.query_row(
+        "WITH retained AS (
+             SELECT operation_id,
+                    CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END AS result,
+                    CASE WHEN json_valid(original_request_json) THEN original_request_json ELSE '{}' END AS request,
+                    json_valid(result_json) AND json_valid(original_request_json) AS valid_json
+             FROM operations WHERE method='gm.handover' AND state='settled'
+         ), history AS (
+             SELECT json_extract(result,'$.gm_epoch') AS epoch,
+                    COALESCE(valid_json AND json_type(result) = 'object'
+                     AND json_type(result,'$.operation_id') = 'text'
+                     AND json_extract(result,'$.operation_id') = operation_id
+                     AND json_type(result,'$.client_id') = 'text'
+                     AND length(trim(json_extract(result,'$.client_id'))) BETWEEN 1 AND 128
+                     AND json_type(request,'$.client_id') = 'text'
+                     AND json_extract(request,'$.client_id') = json_extract(result,'$.client_id')
+                     AND json_type(result,'$.gm_epoch') = 'integer'
+                     AND json_extract(result,'$.gm_epoch') > 0, 0) AS valid
+             FROM retained
+         ) SELECT COALESCE(MAX(CASE WHEN valid=1 THEN epoch END),0),
+                  COALESCE(SUM(CASE WHEN valid=1 THEN 0 ELSE 1 END),0) FROM history",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if damaged != 0 {
+        return Err(designation_error("GM_EPOCH_HISTORY_DAMAGED"));
+    }
+    Ok(high_water)
+}
+
+fn designation_state(db: &Connection) -> Result<DesignationState> {
+    let high_water = handover_epoch_high_water(db)?;
+    let Some(value) = meta(db, "gm")? else {
+        return Ok(if high_water == 0 {
+            DesignationState::NeverDesignated
+        } else {
+            DesignationState::MissingAfterHistory { high_water }
+        });
+    };
+    let Some(current) = parse_designation(&value) else {
+        // A surviving positive integer fence is a conservative recovery
+        // floor, never an authority grant. Do not reissue it after damage.
+        let high_water = value
+            .get("epoch")
+            .and_then(Value::as_i64)
+            .filter(|epoch| *epoch > 0)
+            .map_or(high_water, |epoch| high_water.max(epoch));
+        return Ok(DesignationState::Damaged { high_water });
+    };
+    if current.epoch < high_water {
+        return Ok(DesignationState::Damaged { high_water });
+    }
+    if !registered_manager(db, &current.client_id)? {
+        // A structurally valid legacy epoch remains a fence even if its
+        // registration was subsequently disabled or removed.
+        return Ok(DesignationState::StaleRegistration {
+            high_water: high_water.max(current.epoch),
+            current,
+        });
+    }
+    Ok(DesignationState::Current(current))
+}
+
+pub(crate) fn current(db: &Connection) -> Result<Option<CurrentGm>> {
+    match designation_state(db)? {
+        DesignationState::NeverDesignated => Ok(None),
+        DesignationState::Current(current) => Ok(Some(current)),
+        DesignationState::MissingAfterHistory { .. } => {
+            Err(designation_error("GM_DESIGNATION_MISSING"))
+        }
+        DesignationState::Damaged { .. } => Err(designation_error("GM_DESIGNATION_DAMAGED")),
+        DesignationState::StaleRegistration { .. } => {
+            Err(designation_error("GM_REGISTRATION_STALE"))
+        }
+    }
+}
+
+fn is_designation_damage(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "GM_DESIGNATION_MISSING"
+            | "GM_DESIGNATION_DAMAGED"
+            | "GM_REGISTRATION_STALE"
+            | "GM_EPOCH_HISTORY_DAMAGED"
+    )
+}
+
+/// Reads may retain their own object grant during GM damage. Damage never
+/// supplies the current-GM shortcut; genuine Store failures remain errors.
+pub(crate) fn read_current(db: &Connection) -> Result<Option<CurrentGm>> {
+    match current(db) {
+        Err(error) if is_designation_damage(&error) => Ok(None),
+        result => result,
+    }
+}
+
+pub(crate) fn current_epoch(db: &Connection) -> Result<i64> {
+    Ok(current(db)?.map_or(0, |current| current.epoch))
+}
+
+pub(crate) fn require_current_manager(db: &Connection, manager_id: &str) -> Result<i64> {
+    current(db)?
+        .filter(|current| current.client_id == manager_id)
+        .map(|current| current.epoch)
+        .ok_or_else(|| Error::new("FORBIDDEN", "current registered GM authority required"))
+}
+
+pub(crate) fn authority_facts(db: &Connection) -> Result<Value> {
+    Ok(current(db)?.map_or(Value::Null, |current| current.facts()))
+}
+
+pub(super) fn status(db: &Connection) -> Result<Value> {
+    let state = match designation_state(db) {
+        Err(error) if is_designation_damage(&error) => {
+            return Ok(json!({"state":"damaged", "error_code":error.code,"epoch_high_water":null}));
+        }
+        state => state?,
+    };
+    Ok(match state {
+        DesignationState::NeverDesignated => json!({"state":"none","client_id":null,"epoch":0}),
+        DesignationState::Current(current) => {
+            let mut facts = current.facts();
+            // Continuity checkpoints are diagnostics, not authority. Preserve
+            // the retained handover context in status while identity and fence
+            // always come from the validated designation above.
+            if let Some(retained) = meta(db, "gm")? {
+                for field in [
+                    "handover_operation_id",
+                    "previous_client_id",
+                    "previous_gm_epoch",
+                    "previous_binding_id",
+                    "previous_binding_generation",
+                    "authority_changed",
+                    "session_binding_changed",
+                    "designation_recovered",
+                    "recovery_reason",
+                    "epoch_high_water_before",
+                    "resync",
+                ] {
+                    if let Some(value) = retained.get(field) {
+                        facts[field] = value.clone();
+                    }
+                }
+            }
+            facts["state"] = json!("current");
+            facts
+        }
+        DesignationState::MissingAfterHistory { high_water } => {
+            json!({"state":"missing_after_history","error_code":"GM_DESIGNATION_MISSING","epoch_high_water":high_water})
+        }
+        DesignationState::Damaged { high_water } => {
+            json!({"state":"damaged","error_code":"GM_DESIGNATION_DAMAGED","epoch_high_water":high_water})
+        }
+        DesignationState::StaleRegistration { high_water, .. } => {
+            json!({"state":"stale_registration","error_code":"GM_REGISTRATION_STALE","epoch_high_water":high_water})
+        }
+    })
+}
+
+#[cfg(test)]
 pub(super) fn record(db: &Connection) -> Result<Option<Value>> {
     meta(db, "gm")
 }
@@ -42,15 +291,15 @@ pub(super) fn record(db: &Connection) -> Result<Option<Value>> {
 /// currently holds the GM designation. Checks happen both at admission and at
 /// dispatch/begin, so a principal rotation between the two revokes the old GM.
 pub(super) fn require_authority(db: &Connection, p: &Principal) -> Result<()> {
-    if p.role == Role::Operator {
-        return Ok(());
+    let principal = super::current_principal(db, p.clone())?;
+    match principal.role {
+        Role::Operator => super::require_local_operator(db, &principal.client_id),
+        Role::Manager => require_current_manager(db, &principal.client_id).map(|_| ()),
+        _ => Err(Error::new(
+            "FORBIDDEN",
+            "GM or local Operator authority required",
+        )),
     }
-    if let Some(gm) = record(db)?
-        && gm["client_id"] == p.client_id
-    {
-        return Ok(());
-    }
-    Err(Error::new("FORBIDDEN", "GM or operator authority required"))
 }
 
 /// Admit control of an Attempt by its original owner or the verified local
@@ -152,25 +401,31 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
         ],
     )?;
     let client = model::text(v, "client_id")?;
+    if bounded_identity(v, "client_id").is_none() {
+        return Err(Error::invalid(
+            "GM client identity must be bounded nonempty text",
+        ));
+    }
     let target = meta(tx, &format!("client:{client}"))?
         .ok_or_else(|| Error::new("NOT_FOUND", "GM client is not registered"))?;
     if target["disabled"] == true {
         return Err(Error::new("UNAUTHORIZED", "GM client is disabled"));
     }
-    let role: Role = serde_json::from_value(target["role"].clone())?;
-    if matches!(
-        role,
-        Role::Module | Role::ModuleSupervisor | Role::Scheduler | Role::HookSource
-    ) {
+    if !registered_manager(tx, client)? {
         return Err(Error::new(
             "FORBIDDEN",
-            "module, supervisor, hook source and internal scheduler principals cannot become GM",
+            "GM target must be an enabled registered Manager",
         ));
     }
     let (binding_id, binding_generation) = match (v.get("binding_id"), v.get("binding_generation"))
     {
         (None, None) => (Value::Null, Value::Null),
         (Some(_), Some(_)) => {
+            if bounded_identity(v, "binding_id").is_none() {
+                return Err(Error::invalid(
+                    "GM binding identity must be bounded nonempty text",
+                ));
+            }
             let binding = operations::get_binding(
                 tx,
                 model::text(v, "binding_id")?,
@@ -190,31 +445,60 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
             ));
         }
     };
-    let previous = record(tx)?;
+    let designation = designation_state(tx)?;
+    let (previous, epoch_high_water_before, designation_recovered, recovery_reason) =
+        match designation {
+            DesignationState::NeverDesignated => (None, 0, false, None),
+            DesignationState::Current(current) => {
+                let epoch = current.epoch;
+                (Some(current.facts()), epoch, false, None)
+            }
+            DesignationState::MissingAfterHistory { high_water } => {
+                (None, high_water, true, Some("missing_after_history"))
+            }
+            DesignationState::Damaged { high_water } => {
+                if high_water == 0 {
+                    return Err(designation_error("GM_EPOCH_HISTORY_UNAVAILABLE"));
+                }
+                (None, high_water, true, Some("damaged_current"))
+            }
+            DesignationState::StaleRegistration {
+                current,
+                high_water,
+            } => (
+                Some(current.facts()),
+                high_water,
+                true,
+                Some("stale_registration"),
+            ),
+        };
+    if designation_recovered {
+        // require_authority above permits only the independently refreshed
+        // local Operator to reach recovery; no damaged client ID is a grant.
+        super::require_local_operator(tx, &p.client_id)?;
+    }
     if let Some(prev) = &previous
+        && !designation_recovered
         && prev["client_id"] == client
         && prev["binding_id"] == binding_id
         && prev["binding_generation"] == binding_generation
     {
         return Err(Error::conflict("GM designation is unchanged"));
     }
-    let authority_changed = previous.as_ref().is_none_or(|gm| gm["client_id"] != client);
+    let authority_changed =
+        designation_recovered || previous.as_ref().is_none_or(|gm| gm["client_id"] != client);
     let session_binding_changed = match &previous {
         Some(gm) => {
             gm["binding_id"] != binding_id || gm["binding_generation"] != binding_generation
         }
         None => !binding_id.is_null(),
     };
-    let previous_epoch = previous
-        .as_ref()
-        .and_then(|gm| gm["epoch"].as_i64())
-        .unwrap_or(0);
     let epoch = if authority_changed {
-        previous_epoch
+        epoch_high_water_before
             .checked_add(1)
             .ok_or_else(|| Error::new("EPOCH_OVERFLOW", "GM epoch exhausted"))?
     } else {
-        previous_epoch
+        epoch_high_water_before
     };
     let previous_binding_id = previous
         .as_ref()
@@ -237,6 +521,9 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
         "previous_binding_id": previous_binding_id,
         "previous_binding_generation": previous_binding_generation,
         "authority_changed": authority_changed,
+        "designation_recovered": designation_recovered,
+        "recovery_reason": recovery_reason,
+        "epoch_high_water_before": epoch_high_water_before,
         "session_binding_changed": session_binding_changed,
         "resync": resync,
     });
@@ -252,6 +539,9 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
         "previous_binding_id": previous_binding_id,
         "previous_binding_generation": previous_binding_generation,
         "authority_changed": authority_changed,
+        "designation_recovered": designation_recovered,
+        "recovery_reason": recovery_reason,
+        "epoch_high_water_before": epoch_high_water_before,
         "session_binding_changed": session_binding_changed,
         "resync": resync,
         "manager_tasks_automatically_cancelled": false,

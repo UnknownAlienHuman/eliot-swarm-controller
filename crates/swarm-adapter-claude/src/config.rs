@@ -13,8 +13,8 @@ use swarm_contracts::{
 };
 
 pub const MODULE_ID: &str = "claude";
-pub const ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-rust-controller.4";
-pub const ARTIFACT_VERSION: &str = "4";
+pub const ARTIFACT_ID: &str = "claude-agent-sdk-rust-controller.5";
+pub const ARTIFACT_VERSION: &str = "5";
 pub const RUNTIME: &str = "module";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;

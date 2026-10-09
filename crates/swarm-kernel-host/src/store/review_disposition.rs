@@ -5,6 +5,10 @@
 //! its last successful observation, so the entry can retry on a later pass.
 
 use super::automation_disposition;
+use super::automation_reconcile::{
+    self, DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
+    SubjectErrorDisposition,
+};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -22,6 +26,7 @@ use swarm_kernel::reviews as review_contract;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:review-disposition:global-cursor";
 const STATE_PREFIX: &str = "automation:v1:review-disposition:state:";
+const QUARANTINE_PREFIX: &str = "automation:v1:review-disposition:quarantine:";
 const REVIEW_STREAM: &str = "controller:review";
 const MAX_ENTRIES_PER_PASS: usize = 16;
 const MAX_FACTS_PER_ENTRY: usize = 16;
@@ -32,6 +37,21 @@ const MAX_PENDING_RETRIES: u32 = 32;
 const BASE_RETRY_DELAY_MS: i64 = 1_000;
 const MAX_RETRY_DELAY_MS: i64 = 60_000;
 const MAX_CURSOR_KEY_BYTES: usize = 512;
+
+/// Root may continue after these exact review-disposition state failures only
+/// after rolling back this domain transaction. All other errors stop.
+pub(super) fn classify_domain_error(error: Error) -> DomainErrorDisposition {
+    if matches!(
+        error.code.as_str(),
+        "AUTOMATION_REVIEW_DISPOSITION_CURSOR_CORRUPT"
+            | "AUTOMATION_REVIEW_DISPOSITION_CURSOR_MISMATCH"
+            | "AUTOMATION_REVIEW_DISPOSITION_STATE_CORRUPT"
+    ) {
+        DomainErrorDisposition::Degraded { code: error.code }
+    } else {
+        DomainErrorDisposition::Fatal(error)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,13 +186,23 @@ pub(super) fn reconcile(
         }));
     }
 
-    let (entries, last_entry_key) = enabled_entry_page(tx, entry_budget)?;
+    let (entries, last_entry_key, malformed_entries) = enabled_entry_page(tx, entry_budget)?;
+    for malformed in &malformed_entries {
+        persist_malformed_entry(tx, malformed, now_ms)?;
+    }
     let mut results = Vec::with_capacity(entries.len());
     let mut total_processed = 0usize;
+    let mut total_quarantined = malformed_entries.len();
     for entry in &entries {
         let result = reconcile_entry(tx, config, entry, fact_budget, now_ms)?;
         total_processed = total_processed.saturating_add(
             result["processed"]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default(),
+        );
+        total_quarantined = total_quarantined.saturating_add(
+            result["quarantined"]
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or_default(),
@@ -193,6 +223,14 @@ pub(super) fn reconcile(
     Ok(json!({
         "entries":results,
         "processed":total_processed,
+        "quarantined":total_quarantined,
+        "status":if total_quarantined > 0 {
+            "degraded"
+        } else if total_processed == 0 {
+            "idle"
+        } else {
+            "progressed"
+        },
         "entry_budget":entry_budget,
         "fact_budget_per_entry":fact_budget,
         "cursor":last_entry_key
@@ -247,7 +285,7 @@ fn reconcile_entry(
                 }),
             );
             save_state(tx, &key, &state)?;
-            return Ok(state_projection_with_processed(&state, 0, high_water));
+            return Ok(state_projection_with_processed(&state, 0, 0, high_water));
         }
     };
     if state.configured_revision != entry.revision {
@@ -256,8 +294,14 @@ fn reconcile_entry(
             "result activation cursor does not match the current automation revision",
         ));
     }
+    let mut quarantined = 0usize;
     if budget == 0 {
-        return Ok(state_projection_with_processed(&state, 0, high_water));
+        return Ok(state_projection_with_processed(
+            &state,
+            0,
+            quarantined,
+            high_water,
+        ));
     }
 
     let mut processed = recheck_pending(
@@ -267,13 +311,17 @@ fn reconcile_entry(
         &mut state,
         budget.min(MAX_PENDING_RECHECKS),
         now_ms,
+        &mut quarantined,
     )?;
     let remaining_budget = budget.saturating_sub(processed);
     if remaining_budget == 0 {
         state.updated_at_ms = now_ms;
         save_state(tx, &key, &state)?;
         return Ok(state_projection_with_processed(
-            &state, processed, high_water,
+            &state,
+            processed,
+            quarantined,
+            high_water,
         ));
     }
     if state.pending.len() >= MAX_PENDING_RESULTS {
@@ -281,7 +329,10 @@ fn reconcile_entry(
         state.updated_at_ms = now_ms;
         save_state(tx, &key, &state)?;
         return Ok(state_projection_with_processed(
-            &state, processed, high_water,
+            &state,
+            processed,
+            quarantined,
+            high_water,
         ));
     }
 
@@ -296,7 +347,10 @@ fn reconcile_entry(
             save_state(tx, &key, &state)?;
         }
         return Ok(state_projection_with_processed(
-            &state, processed, high_water,
+            &state,
+            processed,
+            quarantined,
+            high_water,
         ));
     }
 
@@ -322,53 +376,68 @@ fn reconcile_entry(
     let has_more = events.len() > remaining_budget;
     let mut blocked_on_pending_capacity = false;
     for event in events.iter().take(remaining_budget) {
-        let (assignment_id, result_operation_id) = event_identity(event)?;
-        if state.pending.iter().any(|pending| {
-            pending.observation_id == event.observation_id
-                && pending.review_assignment_id == assignment_id
-                && pending.review_result_operation_id == result_operation_id
-        }) {
-            remember_recent(
-                &mut state,
-                json!({
-                    "observation_id":event.observation_id,
-                    "review_assignment_id":assignment_id,
-                    "review_result_operation_id":result_operation_id,
-                    "status":"pending",
-                    "code":"pending_result_already_queued",
-                    "disposition_applied":false
-                }),
-            );
-            state.cursor = event.observation_id;
-            processed += 1;
-            continue;
-        }
-        if state.pending.len() >= MAX_PENDING_RESULTS {
+        let queued = state
+            .pending
+            .iter()
+            .find(|pending| pending.observation_id == event.observation_id);
+        if state.pending.len() >= MAX_PENDING_RESULTS && queued.is_none() {
             remember_capacity_gap(&mut state, Some(event.observation_id), now_ms);
             blocked_on_pending_capacity = true;
             break;
         }
-        let result = consume_isolated(
-            tx,
-            config,
-            entry,
-            &assignment_id,
-            &result_operation_id,
-            now_ms,
-        )?;
-        if is_unresolved(&result) {
-            state.pending.push(PendingResult {
-                observation_id: event.observation_id,
-                review_assignment_id: assignment_id.clone(),
-                review_result_operation_id: result_operation_id.clone(),
-                retries: 0,
-                next_retry_at_ms: now_ms.saturating_add(BASE_RETRY_DELAY_MS),
-            });
+        let disposition = consume_isolated(tx, config, entry, event, queued, now_ms)?;
+        match disposition {
+            SubjectDisposition::Applied((assignment_id, result_operation_id, result)) => {
+                if is_unresolved(&result) {
+                    state.pending.push(PendingResult {
+                        observation_id: event.observation_id,
+                        review_assignment_id: assignment_id.clone(),
+                        review_result_operation_id: result_operation_id.clone(),
+                        retries: 0,
+                        next_retry_at_ms: now_ms.saturating_add(BASE_RETRY_DELAY_MS),
+                    });
+                }
+                remember_recent(
+                    &mut state,
+                    summarize_event(event, &assignment_id, &result_operation_id, result),
+                );
+            }
+            SubjectDisposition::Skipped { code, reason } => {
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "status":"skipped",
+                        "code":code,
+                        "reason":reason,
+                        "disposition_applied":false
+                    }),
+                );
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_subject_quarantine(tx, &code, evidence, now_ms)?;
+                quarantined = quarantined.saturating_add(1);
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "status":"quarantined",
+                        "code":code,
+                        "source_pointer":format!("observations/{}", event.observation_id),
+                        "source_digest":model::digest(event.payload_json.as_bytes()),
+                        "recorded_at_ms":now_ms
+                    }),
+                );
+            }
+            SubjectDisposition::Pending { code, reason } => {
+                return Err(Error::new(
+                    "AUTOMATION_REVIEW_DISPOSITION_CLASSIFIER_INVALID",
+                    format!(
+                        "review event classifier returned unsupported pending code {code}: {reason}"
+                    ),
+                ));
+            }
         }
-        remember_recent(
-            &mut state,
-            summarize_event(event, &assignment_id, &result_operation_id, result),
-        );
         state.cursor = event.observation_id;
         processed += 1;
     }
@@ -382,7 +451,10 @@ fn reconcile_entry(
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)?;
     Ok(state_projection_with_processed(
-        &state, processed, high_water,
+        &state,
+        processed,
+        quarantined,
+        high_water,
     ))
 }
 
@@ -410,31 +482,46 @@ fn consume_isolated(
     tx: &Transaction<'_>,
     config: &Config,
     entry: &AutomationEntry,
-    assignment_id: &str,
-    result_operation_id: &str,
+    event: &ReviewResultEvent,
+    queued: Option<&PendingResult>,
     now_ms: i64,
-) -> Result<Value> {
-    tx.execute_batch("SAVEPOINT review_disposition_consumer")?;
-    match automation_disposition::consume_review_result_for_entry(
+) -> Result<SubjectDisposition<(String, String, Value)>> {
+    let evidence = review_event_evidence(event);
+    automation_reconcile::with_subject_savepoint(
         tx,
-        config,
-        entry,
-        assignment_id,
-        result_operation_id,
-        now_ms,
-    ) {
-        Ok(result) => {
-            tx.execute_batch("RELEASE SAVEPOINT review_disposition_consumer")?;
-            Ok(result)
-        }
-        Err(error) => {
-            tx.execute_batch(
-                "ROLLBACK TO SAVEPOINT review_disposition_consumer; \
-                 RELEASE SAVEPOINT review_disposition_consumer",
+        || {
+            let (assignment_id, result_operation_id) = event_identity(event)?;
+            if let Some(pending) = queued {
+                if pending.review_assignment_id != assignment_id
+                    || pending.review_result_operation_id != result_operation_id
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_REVIEW_DISPOSITION_STATE_CORRUPT",
+                        "pending review result identity differs from its exact Observation",
+                    ));
+                }
+                return Ok(SubjectDisposition::Skipped {
+                    code: "pending_result_already_queued".to_owned(),
+                    reason: "the exact review result already has a durable pending record"
+                        .to_owned(),
+                });
+            }
+            let result = automation_disposition::consume_review_result_for_entry(
+                tx,
+                config,
+                entry,
+                &assignment_id,
+                &result_operation_id,
+                now_ms,
             )?;
-            Err(error)
-        }
-    }
+            Ok(SubjectDisposition::Applied((
+                assignment_id,
+                result_operation_id,
+                result,
+            )))
+        },
+        |error| classify_subject_error(error, evidence.clone()),
+    )
 }
 
 fn recheck_pending(
@@ -444,6 +531,7 @@ fn recheck_pending(
     state: &mut DispositionState,
     budget: usize,
     now_ms: i64,
+    quarantined: &mut usize,
 ) -> Result<usize> {
     let mut processed = 0usize;
     while processed < budget {
@@ -454,44 +542,167 @@ fn recheck_pending(
         else {
             break;
         };
-        let mut pending = state.pending.remove(index);
-        let event = ReviewResultEvent {
-            observation_id: pending.observation_id,
-            source_event_key: Some(format!("result:{}", pending.review_assignment_id)),
-            operation_id: Some(pending.review_result_operation_id.clone()),
-            payload_json: load_result_payload(
-                tx,
-                pending.observation_id,
-                &pending.review_assignment_id,
-                &pending.review_result_operation_id,
-            )?,
-        };
-        event_identity(&event)?;
-        let result = consume_isolated(
-            tx,
-            config,
-            entry,
-            &pending.review_assignment_id,
-            &pending.review_result_operation_id,
-            now_ms,
-        )?;
-        processed += 1;
-        if is_unresolved(&result) {
-            pending.retries = pending.retries.saturating_add(1).min(MAX_PENDING_RETRIES);
-            pending.next_retry_at_ms = now_ms.saturating_add(retry_delay(pending.retries));
-            state.pending.push(pending.clone());
+        let pending = state.pending[index].clone();
+        let disposition = consume_pending_isolated(tx, config, entry, &pending, now_ms)?;
+        match disposition {
+            SubjectDisposition::Applied((event, assignment_id, result_operation_id, result)) => {
+                processed += 1;
+                if is_unresolved(&result) {
+                    let pending = &mut state.pending[index];
+                    pending.retries = pending.retries.saturating_add(1).min(MAX_PENDING_RETRIES);
+                    pending.next_retry_at_ms = now_ms.saturating_add(retry_delay(pending.retries));
+                } else {
+                    state.pending.remove(index);
+                }
+                remember_recent(
+                    state,
+                    summarize_event(&event, &assignment_id, &result_operation_id, result),
+                );
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_subject_quarantine(tx, &code, evidence, now_ms)?;
+                *quarantined = (*quarantined).saturating_add(1);
+                state.pending.remove(index);
+                processed += 1;
+                remember_recent(
+                    state,
+                    json!({
+                        "observation_id":pending.observation_id,
+                        "status":"quarantined",
+                        "code":code,
+                        "source_pointer":format!("observations/{}", pending.observation_id),
+                        "recorded_at_ms":now_ms
+                    }),
+                );
+            }
+            SubjectDisposition::Pending { code, reason } => {
+                {
+                    let pending = &mut state.pending[index];
+                    pending.retries = pending.retries.saturating_add(1).min(MAX_PENDING_RETRIES);
+                    pending.next_retry_at_ms = now_ms.saturating_add(retry_delay(pending.retries));
+                }
+                remember_recent(
+                    state,
+                    json!({"observation_id":pending.observation_id,"status":"pending","code":code,"reason":reason}),
+                );
+                processed += 1;
+            }
+            SubjectDisposition::Skipped { code, reason } => {
+                state.pending.remove(index);
+                remember_recent(
+                    state,
+                    json!({"observation_id":pending.observation_id,"status":"skipped","code":code,"reason":reason}),
+                );
+                processed += 1;
+            }
         }
-        remember_recent(
-            state,
-            summarize_event(
-                &event,
-                &pending.review_assignment_id,
-                &pending.review_result_operation_id,
-                result,
-            ),
-        );
     }
     Ok(processed)
+}
+
+fn consume_pending_isolated(
+    tx: &Transaction<'_>,
+    config: &Config,
+    entry: &AutomationEntry,
+    pending: &PendingResult,
+    now_ms: i64,
+) -> Result<SubjectDisposition<(ReviewResultEvent, String, String, Value)>> {
+    let evidence = pending_event_evidence(pending);
+    automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            let event = ReviewResultEvent {
+                observation_id: pending.observation_id,
+                source_event_key: Some(format!("result:{}", pending.review_assignment_id)),
+                operation_id: Some(pending.review_result_operation_id.clone()),
+                payload_json: load_result_payload(
+                    tx,
+                    pending.observation_id,
+                    &pending.review_assignment_id,
+                    &pending.review_result_operation_id,
+                )?,
+            };
+            let (assignment_id, result_operation_id) = event_identity(&event)?;
+            if assignment_id != pending.review_assignment_id
+                || result_operation_id != pending.review_result_operation_id
+            {
+                return Err(Error::new(
+                    "REVIEW_DISPOSITION_EVENT_DAMAGED",
+                    "pending review result identity differs from its canonical event",
+                ));
+            }
+            let result = automation_disposition::consume_review_result_for_entry(
+                tx,
+                config,
+                entry,
+                &assignment_id,
+                &result_operation_id,
+                now_ms,
+            )?;
+            Ok(SubjectDisposition::Applied((
+                event,
+                assignment_id,
+                result_operation_id,
+                result,
+            )))
+        },
+        |error| classify_subject_error(error, evidence.clone()),
+    )
+}
+
+fn classify_subject_error(
+    error: &Error,
+    evidence: QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    match error.code.as_str() {
+        "REVIEW_DISPOSITION_EVENT_DAMAGED"
+        | "AUTOMATION_REVIEW_DISPOSITION_PENDING_EVENT_MISSING" => {
+            Some(SubjectErrorDisposition::Quarantined {
+                code: error.code.clone(),
+                evidence,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn review_event_evidence(event: &ReviewResultEvent) -> QuarantineEvidence {
+    QuarantineEvidence {
+        subject_identity: format!("observation:{}", event.observation_id),
+        source_pointer: Some(format!("observations/{}", event.observation_id)),
+        source_digest: Some(model::digest(event.payload_json.as_bytes())),
+    }
+}
+
+fn pending_event_evidence(pending: &PendingResult) -> QuarantineEvidence {
+    QuarantineEvidence {
+        subject_identity: format!("observation:{}", pending.observation_id),
+        source_pointer: Some(format!("observations/{}", pending.observation_id)),
+        source_digest: None,
+    }
+}
+
+fn persist_subject_quarantine(
+    tx: &Transaction<'_>,
+    code: &str,
+    evidence: QuarantineEvidence,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(tx, &record_key, code, evidence, now_ms)?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_REVIEW_DISPOSITION_QUARANTINE_INVALID",
+            "review subject did not produce durable quarantine evidence",
+        )),
+    }
 }
 
 fn load_result_payload(
@@ -559,14 +770,24 @@ fn event_identity(event: &ReviewResultEvent) -> Result<(String, String)> {
                 "canonical review result has an invalid event key",
             )
         })?;
-    validate_event_id(assignment_id)?;
+    validate_event_id(assignment_id).map_err(|_| {
+        Error::new(
+            "REVIEW_DISPOSITION_EVENT_DAMAGED",
+            "canonical review result assignment identity is invalid",
+        )
+    })?;
     let result_operation_id = event.operation_id.as_deref().ok_or_else(|| {
         Error::new(
             "REVIEW_DISPOSITION_EVENT_DAMAGED",
             "canonical review result has no Operation identity",
         )
     })?;
-    validate_event_id(result_operation_id)?;
+    validate_event_id(result_operation_id).map_err(|_| {
+        Error::new(
+            "REVIEW_DISPOSITION_EVENT_DAMAGED",
+            "canonical review result Operation identity is invalid",
+        )
+    })?;
     let record: Value = serde_json::from_str(&event.payload_json).map_err(|_| {
         Error::new(
             "REVIEW_DISPOSITION_EVENT_DAMAGED",
@@ -598,6 +819,8 @@ fn summarize_event(
         "code":result.get("code").cloned().unwrap_or(Value::Null),
         "reason":result.get("reason").cloned().unwrap_or(Value::Null),
         "operation_id":result.get("operation_id").cloned().unwrap_or(Value::Null),
+        "findings_digest":result.get("findings_digest").cloned().unwrap_or(Value::Null),
+        "finding_count":result.get("finding_count").cloned().unwrap_or(Value::Null),
         "disposition_applied":result.get("disposition_applied").cloned().unwrap_or(json!(false)),
         "coalesced":result.get("status").is_some_and(|status| status == "coalesced")
     })
@@ -606,10 +829,27 @@ fn summarize_event(
 fn enabled_entry_page(
     db: &Connection,
     limit: usize,
-) -> Result<(Vec<AutomationEntry>, Option<String>)> {
+) -> Result<(
+    Vec<AutomationEntry>,
+    Option<String>,
+    Vec<MalformedAutomationEntry>,
+)> {
+    if limit == 0 {
+        return Ok((Vec::new(), None, Vec::new()));
+    }
     let prefix = "automation:v1:entry:";
     let pattern = format!("{prefix}%");
-    let cursor = config::read_record(db, GLOBAL_CURSOR_KEY, "review disposition global cursor")?
+    let cursor = config::read_record(db, GLOBAL_CURSOR_KEY, "review disposition global cursor")
+        .map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_REVIEW_DISPOSITION_CURSOR_CORRUPT",
+                    "review-disposition global cursor record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?
         .map(|value| {
             serde_json::from_value::<GlobalCursor>(value).map_err(|_| {
                 Error::new(
@@ -637,46 +877,79 @@ fn enabled_entry_page(
         keys.extend(wrapped);
     }
     if keys.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Vec::new()));
     }
 
     let last_key = keys.last().cloned();
     let mut entries = Vec::with_capacity(keys.len());
+    let mut malformed_entries = Vec::new();
     for key in keys {
         let raw: String =
             db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
                 row.get(0)
             })?;
-        let sealed: Value = serde_json::from_str(&raw).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry JSON is invalid",
-            )
-        })?;
-        let value = config::open_record(sealed, "automation entry")?;
-        let entry: AutomationEntry = serde_json::from_value(value).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry fields are invalid",
-            )
-        })?;
-        config::validate_entry(&entry)?;
+        let entry = match automation_reconcile::parse_automation_entry(&raw, "automation entry") {
+            Ok(entry) => entry,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_INVALID"
+                ) =>
+            {
+                malformed_entries.push(MalformedAutomationEntry {
+                    code: error.code,
+                    evidence: automation_reconcile::automation_entry_evidence(&key, &raw),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if config::entry_key(
             &entry.owner_manager_id,
             &entry.project_id,
             &entry.automation_id,
         )? != key
         {
-            return Err(Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry identity does not match its metadata key",
-            ));
+            malformed_entries.push(MalformedAutomationEntry {
+                code: "AUTOMATION_RECORD_INVALID".to_owned(),
+                evidence: automation_reconcile::automation_entry_evidence(&key, &raw),
+            });
+            continue;
         }
         if entry_has_result_action(&entry) {
             entries.push(entry);
         }
     }
-    Ok((entries, last_key))
+    Ok((entries, last_key, malformed_entries))
+}
+
+fn persist_malformed_entry(
+    tx: &Transaction<'_>,
+    malformed: &MalformedAutomationEntry,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key =
+        automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &malformed.evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(
+                tx,
+                &record_key,
+                &malformed.code,
+                malformed.evidence.clone(),
+                now_ms,
+            )?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_REVIEW_DISPOSITION_QUARANTINE_INVALID",
+            "malformed review-disposition entry did not produce a durable quarantine",
+        )),
+    }
 }
 
 fn select_entry_keys(
@@ -688,13 +961,8 @@ fn select_entry_keys(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value IN ('review_disposition','repair_dispatch','acceptance')) \
-         ORDER BY key LIMIT ?3",
-    )?;
+    let mut statement =
+        db.prepare("SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 ORDER BY key LIMIT ?3")?;
     Ok(statement
         .query_map(params![pattern, after, limit as i64], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?)
@@ -711,11 +979,7 @@ fn select_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value IN ('review_disposition','repair_dispatch','acceptance')) \
-         ORDER BY key LIMIT ?4",
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
         .query_map(params![pattern, prefix, before, limit as i64], |row| {
@@ -725,7 +989,17 @@ fn select_entry_keys_before(
 }
 
 fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<DispositionState>> {
-    let Some(value) = config::read_record(db, &state_key(entry)?, "review-disposition state")?
+    let Some(value) = config::read_record(db, &state_key(entry)?, "review-disposition state")
+        .map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_REVIEW_DISPOSITION_STATE_CORRUPT",
+                    "review-disposition state record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?
     else {
         return Ok(None);
     };
@@ -908,10 +1182,12 @@ fn state_projection(state: &DispositionState) -> Value {
 fn state_projection_with_processed(
     state: &DispositionState,
     processed: usize,
+    quarantined: usize,
     high_water: i64,
 ) -> Value {
     let mut projection = state_projection(state);
     projection["processed"] = json!(processed);
+    projection["quarantined"] = json!(quarantined);
     projection["high_water"] = json!(high_water);
     projection
 }

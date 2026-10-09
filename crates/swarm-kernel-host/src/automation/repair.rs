@@ -2,7 +2,7 @@
 //!
 //! A retained manager disposition is only mailbox feedback. This context is
 //! constructed from that committed disposition plus the exact assigned review
-//! finding, and is revalidated before a correction Operation is admitted or
+//! findings package, and is revalidated before a correction Operation is admitted or
 //! sent. It is never deserialized from caller input and never impersonates a
 //! Manager Principal.
 
@@ -10,7 +10,7 @@ use super::{actions::AutomationStep, authorization, config};
 use crate::{
     error::{Error, Result},
     model,
-    review::{ReviewFinding, ReviewSlotIdentity},
+    review::{ReviewFindingsPackage, ReviewSlotIdentity},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -85,7 +85,7 @@ pub(crate) struct RepairDispatchContext {
     feedback_operation_id: String,
     feedback_observation_id: i64,
     identity: ReviewSlotIdentity,
-    finding: ReviewFinding,
+    findings_package: ReviewFindingsPackage,
     binding_id: String,
     binding_generation: i64,
     semantic_slot_id: String,
@@ -136,7 +136,7 @@ impl RepairDeliveryRequest {
 
 impl RepairDispatchContext {
     /// Construct from Store-verified evidence for one actual return-for-
-    /// correction disposition. The exact finding and feedback lineage are
+    /// correction disposition. The exact ordered findings package and feedback lineage are
     /// checked here again so no caller can mint this authority from a result
     /// summary or a request body.
     #[allow(clippy::too_many_arguments)] // Each argument is one immutable evidence anchor.
@@ -149,7 +149,7 @@ impl RepairDispatchContext {
         disposition_operation_id: &str,
         feedback_operation_id: &str,
         feedback_observation_id: i64,
-        finding: ReviewFinding,
+        findings_package: ReviewFindingsPackage,
     ) -> Result<Self> {
         config::validate_entry(entry)?;
         validate_identity_text(review_assignment_id, "review_assignment_id")?;
@@ -181,7 +181,7 @@ impl RepairDispatchContext {
             disposition_operation_id,
             feedback_operation_id,
             feedback_observation_id,
-            &finding,
+            &findings_package,
         )?;
         if lineage.project_id != entry.project_id {
             return Err(source_damaged());
@@ -246,7 +246,7 @@ impl RepairDispatchContext {
             feedback_operation_id: feedback_operation_id.to_owned(),
             feedback_observation_id,
             identity,
-            finding,
+            findings_package,
             binding_id,
             binding_generation,
             semantic_slot_id: String::new(),
@@ -276,7 +276,7 @@ impl RepairDispatchContext {
         feedback_operation_id: &str,
         feedback_observation_id: i64,
         identity: ReviewSlotIdentity,
-        finding: ReviewFinding,
+        findings_package: ReviewFindingsPackage,
         binding_id: &str,
         binding_generation: i64,
         semantic_slot_id: &str,
@@ -302,7 +302,7 @@ impl RepairDispatchContext {
             disposition_operation_id,
             feedback_operation_id,
             feedback_observation_id,
-            finding,
+            findings_package,
             binding_id,
             binding_generation,
             captured_transfer_gm_epoch,
@@ -326,7 +326,7 @@ impl RepairDispatchContext {
         disposition_operation_id: &str,
         feedback_operation_id: &str,
         feedback_observation_id: i64,
-        finding: ReviewFinding,
+        findings_package: ReviewFindingsPackage,
         expected_binding_id: &str,
         expected_binding_generation: i64,
         captured_transfer_gm_epoch: Option<i64>,
@@ -360,7 +360,7 @@ impl RepairDispatchContext {
             feedback_operation_id: feedback_operation_id.to_owned(),
             feedback_observation_id,
             identity,
-            finding,
+            findings_package,
             binding_id: expected_binding_id.to_owned(),
             binding_generation: expected_binding_generation,
             semantic_slot_id: String::new(),
@@ -373,7 +373,7 @@ impl RepairDispatchContext {
             disposition_operation_id,
             feedback_operation_id,
             feedback_observation_id,
-            &context.finding,
+            &context.findings_package,
         )?;
         if lineage.project_id != project_id
             || lineage.binding_id != expected_binding_id
@@ -622,7 +622,7 @@ impl RepairDispatchContext {
             &self.disposition_operation_id,
             &self.feedback_operation_id,
             self.feedback_observation_id,
-            &self.finding,
+            &self.findings_package,
         )?;
         if lineage.source_attempt_owner_id != self.source_attempt_owner_id
             || lineage.review_assignment_sponsor_id != self.review_assignment_sponsor_id
@@ -704,12 +704,12 @@ impl RepairDispatchContext {
         semantic_slot_id(
             &self.effective_manager_id,
             &self.identity,
-            &self.finding.finding_id,
+            self.findings_package.semantic_subject_key(),
         )
     }
 
     pub(crate) fn delivery_request(&self) -> Result<RepairDeliveryRequest> {
-        let text = render_correction_text(&self.identity, &self.finding);
+        let text = render_correction_text(&self.identity, &self.findings_package);
         if text.len() > MAX_REPAIR_TEXT_BYTES {
             return Err(Error::new(
                 "REPAIR_REQUEST_TOO_LARGE",
@@ -792,8 +792,8 @@ impl RepairDispatchContext {
         &self.identity
     }
 
-    pub(crate) fn finding(&self) -> &ReviewFinding {
-        &self.finding
+    pub(crate) fn findings_package(&self) -> &ReviewFindingsPackage {
+        &self.findings_package
     }
 
     pub(crate) fn binding_id(&self) -> &str {
@@ -818,7 +818,8 @@ impl RepairDispatchContext {
             "feedback_operation_id":self.feedback_operation_id,
             "feedback_observation_id":self.feedback_observation_id,
             "identity":self.identity,
-            "finding_id":self.finding.finding_id,
+            "findings_digest":self.findings_package.findings_digest,
+            "finding_ids":self.findings_package.finding_ids(),
             "semantic_slot_id":self.semantic_slot_id,
             "source_attempt_owner_id":self.source_attempt_owner_id,
             "review_assignment_sponsor_id":self.review_assignment_sponsor_id,
@@ -836,6 +837,14 @@ impl RepairDispatchContext {
     pub(crate) fn legacy_cause_value(&self) -> Value {
         let mut value = self.cause_value();
         if let Some(object) = value.as_object_mut() {
+            if self.findings_package.findings.len() == 1 {
+                object.remove("findings_digest");
+                object.remove("finding_ids");
+                object.insert(
+                    "finding_id".to_owned(),
+                    json!(self.findings_package.findings[0].finding_id),
+                );
+            }
             object.remove("source_attempt_owner_id");
             object.remove("review_assignment_sponsor_id");
             object.remove("decision_manager_id");
@@ -1162,9 +1171,16 @@ pub(crate) fn validate_committed_review_and_feedback(
     disposition_operation_id: &str,
     feedback_operation_id: &str,
     feedback_observation_id: i64,
-    finding: &ReviewFinding,
+    findings_package: &ReviewFindingsPackage,
 ) -> Result<RepairCommittedLineage> {
     let damaged = source_damaged;
+    findings_package.validate().map_err(|_| damaged())?;
+    if findings_package.identity != *identity
+        || findings_package.review_assignment_id != assignment_id
+        || findings_package.review_result_operation_id != result_operation_id
+    {
+        return Err(damaged());
+    }
     let attempt: Option<RepairCommittedAttemptRow> = db
         .query_row(
             "SELECT a.owner_id,a.task_id,a.task_revision,a.submission_ref,a.candidate_ref,\
@@ -1290,7 +1306,7 @@ pub(crate) fn validate_committed_review_and_feedback(
     };
     let result_value: Value =
         serde_json::from_str(&result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
-    let finding_value = serde_json::to_value(finding).map_err(|_| damaged())?;
+    let findings_value = serde_json::to_value(&findings_package.findings).map_err(|_| damaged())?;
     if method != "review.submit"
         || state != "settled"
         || reviewer_id
@@ -1307,14 +1323,7 @@ pub(crate) fn validate_committed_review_and_feedback(
         || result_value["candidate_ref"] != identity.candidate_ref
         || result_value["verdict"] != "changes_requested"
         || result_value["applicability"] != "current_candidate"
-        || !result_value["findings"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .filter(|item| item["finding_id"] == finding.finding_id)
-                .count()
-                == 1
-                && items.iter().any(|item| item == &finding_value)
-        })
+        || result_value["findings"] != findings_value
     {
         return Err(damaged());
     }
@@ -1344,7 +1353,7 @@ pub(crate) fn validate_committed_review_and_feedback(
         || disposition["review_result_operation_id"] != result_operation_id
         || disposition["identity"] != json!(identity)
         || disposition["disposition"] != "return_for_correction"
-        || disposition["finding_ids"] != json!([finding.finding_id])
+        || disposition["finding_ids"] != json!(findings_package.finding_ids())
         || disposition["task_feedback_operation_id"] != feedback_operation_id
     {
         return Err(damaged());
@@ -1393,22 +1402,28 @@ pub(crate) fn validate_committed_review_and_feedback(
         serde_json::from_str(&feedback_result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
     let feedback_request_value: Value =
         serde_json::from_str(&feedback_request_json).map_err(|_| damaged())?;
-    let feedback_request =
-        crate::submission::ChangeRequest::parse(&feedback_request_value).map_err(|_| damaged())?;
-    let feedback_request_finding = feedback_request.finding();
-    let preserves_review_scope = feedback_request.attempt_id == identity.attempt_id
-        && feedback_request.expected_revision == identity.task_revision
-        && feedback_request.submission_ref == identity.submission_ref
-        && feedback_request.candidate_ref == identity.candidate_ref
-        && feedback_request.finding_id == finding.finding_id
-        && feedback_request.requirement_ids.as_slice() == finding.requirement_ids.as_slice()
-        && finding
-            .evidence_refs
-            .iter()
-            .all(|reference| feedback_request.evidence.contains(reference));
+    let package_value = serde_json::to_value(findings_package).map_err(|_| damaged())?;
+    let request_client_request_id = feedback_request_value["client_request_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(damaged)?;
+    let expected_feedback_client_request_id = model::digest(
+        model::canonical(&json!([
+            decision_manager_id,
+            identity.submission_ref,
+            findings_package.findings_digest
+        ]))?
+        .as_bytes(),
+    );
+    let preserves_review_scope = feedback_request_value
+        == json!({
+            "client_request_id":request_client_request_id,
+            "package":package_value
+        });
     if feedback_method != "task.request_changes"
         || feedback_state != "settled"
-        || feedback_client_request_id != feedback_request.client_request_id
+        || feedback_client_request_id != expected_feedback_client_request_id
+        || request_client_request_id != feedback_client_request_id
         || !preserves_review_scope
         || feedback_task.as_deref() != Some(identity.task_id.as_str())
         || feedback_attempt.as_deref() != Some(identity.attempt_id.as_str())
@@ -1419,12 +1434,18 @@ pub(crate) fn validate_committed_review_and_feedback(
         || feedback_result["sender"] != decision_manager_id
         || feedback_result["recipient"] != source_attempt_owner_id
         || feedback_result["task_id"] != identity.task_id
-        || feedback_result["finding"] != feedback_request_finding
-        || feedback_result["text"] != feedback_request.reason
+        || !feedback_result["finding"].is_null()
+        || feedback_result["findings_package"] != package_value
+        || feedback_result["findings_digest"] != findings_package.findings_digest
+        || feedback_result["text"]
+            != format!(
+                "Applied exact ordered reviewer findings package {}.",
+                findings_package.findings_digest
+            )
         || feedback_result["review_provenance"]["review_assignment_id"] != assignment_id
         || feedback_result["review_provenance"]["review_operation_id"] != result_operation_id
         || feedback_result["review_provenance"]["identity"] != json!(identity)
-        || feedback_result["review_provenance"]["finding"] != finding_value
+        || feedback_result["review_provenance"]["findings_package"] != package_value
         || feedback_result["native_input_sent"] != false
         || feedback_result["repair_started"] != false
     {
@@ -1509,10 +1530,10 @@ fn validate_manager_disposition_operation(
 pub(crate) fn semantic_slot_id(
     manager_id: &str,
     identity: &ReviewSlotIdentity,
-    finding_id: &str,
+    findings_digest: &str,
 ) -> Result<String> {
     validate_identity_text(manager_id, "manager_id")?;
-    validate_identity_text(finding_id, "finding_id")?;
+    validate_identity_text(findings_digest, "findings_digest")?;
     let slot_identity = json!({
         "manager_id":manager_id,
         "task_id":identity.task_id,
@@ -1521,41 +1542,54 @@ pub(crate) fn semantic_slot_id(
         "submission_ref":identity.submission_ref,
         "candidate_ref":identity.candidate_ref,
         "action":"repair_dispatch",
-        "finding_id":finding_id
+        "findings_digest":findings_digest
     });
     Ok(model::digest(model::canonical(&slot_identity)?.as_bytes()))
 }
 
 pub(crate) fn render_correction_text(
     identity: &ReviewSlotIdentity,
-    finding: &ReviewFinding,
+    package: &ReviewFindingsPackage,
 ) -> String {
-    let requirements = finding
-        .requirement_ids
+    let findings = package
+        .findings
         .iter()
-        .map(|value| format!("- {value}"))
+        .enumerate()
+        .map(|(index, finding)| {
+            let requirements = finding
+                .requirement_ids
+                .iter()
+                .map(|value| format!("- {value}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let evidence = finding
+                .evidence_refs
+                .iter()
+                .map(|value| format!("- {value}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Finding {}: {}\nReason:\n{}\n\nRequested change:\n{}\n\nRequirements:\n{}\n\nEvidence references:\n{}",
+                index + 1,
+                finding.finding_id,
+                finding.reason,
+                finding.requested_change,
+                requirements,
+                evidence
+            )
+        })
         .collect::<Vec<_>>()
-        .join("\n");
-    let evidence = finding
-        .evidence_refs
-        .iter()
-        .map(|value| format!("- {value}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = format!(
-        "A manager applied this correction request to your current Task Attempt. Keep the same unreleased Attempt, address the exact finding and requirements below, and submit a new candidate linked to the prior submission.\n\nTask: {}\nTask revision: {}\nAttempt: {}\nPrior submission: {}\nPrior candidate: {}\nFinding: {}\n\nReason:\n{}\n\nRequested change:\n{}\n\nRequirements:\n{}\n\nEvidence references:\n{}",
+        .join("\n\n---\n\n");
+    format!(
+        "A manager applied this ordered correction package to your current Task Attempt. Keep the same unreleased Attempt, address every finding in reviewer order, and submit a new candidate linked to the prior submission.\n\nTask: {}\nTask revision: {}\nAttempt: {}\nPrior submission: {}\nPrior candidate: {}\nFindings package digest: {}\n\n{}",
         identity.task_id,
         identity.task_revision,
         identity.attempt_id,
         identity.submission_ref,
         identity.candidate_ref,
-        finding.finding_id,
-        finding.reason,
-        finding.requested_change,
-        requirements,
-        evidence
-    );
-    text
+        package.findings_digest,
+        findings
+    )
 }
 
 fn source_damaged() -> Error {

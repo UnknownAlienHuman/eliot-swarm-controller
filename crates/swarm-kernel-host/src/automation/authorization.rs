@@ -126,6 +126,15 @@ pub(crate) struct CronExecutionContext {
     cause: AutomationCause,
 }
 
+struct CommittedManagedLabelOperationRow {
+    caller_id: String,
+    method: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    original_request_json: String,
+    effective_request_json: String,
+}
+
 impl GithubProjectionContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_acceptance_observation(
@@ -200,20 +209,36 @@ impl GithubProjectionContext {
     /// on-behalf record. Current Manager/GM authority is checked separately
     /// immediately before an unsent effect; uncertain writes remain readback-only.
     pub(crate) fn from_committed_operation(db: &Connection, operation_id: &str) -> Result<Self> {
-        let row: Option<(String, String, Option<String>, Option<String>, String, String)> = db
+        let row: Option<CommittedManagedLabelOperationRow> = db
             .query_row(
                 "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
                 [operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| {
+                    Ok(CommittedManagedLabelOperationRow {
+                        caller_id: row.get(0)?,
+                        method: row.get(1)?,
+                        task_id: row.get(2)?,
+                        attempt_id: row.get(3)?,
+                        original_request_json: row.get(4)?,
+                        effective_request_json: row.get(5)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((caller_id, method, task_id, attempt_id, original_json, effective_json)) = row
-        else {
+        let Some(row) = row else {
             return Err(Error::new(
                 "NOT_FOUND",
                 "automated managed-label Operation was not found",
             ));
         };
+        let CommittedManagedLabelOperationRow {
+            caller_id,
+            method,
+            task_id,
+            attempt_id,
+            original_request_json: original_json,
+            effective_request_json: effective_json,
+        } = row;
         if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID || method != GITHUB_PROJECTION_ACTION {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
@@ -852,26 +877,16 @@ fn validate_github_projection_entry_authority_for_identity(
 }
 
 fn current_gm_epoch_for(db: &Connection, manager_id: &str) -> Result<i64> {
-    let gm: Option<(String, i64)> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (gm_id, epoch) = gm.ok_or_else(|| {
-        Error::new(
-            "AUTOMATION_CURRENT_GM_REQUIRED",
-            "automatic GitHub projection requires a designated current GM",
-        )
-    })?;
-    if gm_id != manager_id || epoch <= 0 {
-        return Err(Error::new(
-            "AUTOMATION_CURRENT_GM_REQUIRED",
-            "automatic GitHub projection requires the entry owner to be current GM",
-        ));
-    }
-    Ok(epoch)
+    crate::store::gm::require_current_manager(db, manager_id).map_err(|error| {
+        if error.code == "FORBIDDEN" {
+            Error::new(
+                "AUTOMATION_CURRENT_GM_REQUIRED",
+                "automatic GitHub projection requires the entry owner to be current GM",
+            )
+        } else {
+            error
+        }
+    })
 }
 
 fn github_projection_source_revision(
@@ -2883,7 +2898,17 @@ fn validate_script_event_run_operation_link(
         &link.project_id,
         cause,
     )
-    .map_err(|_| corrupt())?;
+    .map_err(|error| {
+        let code = error.code.clone();
+        match code.as_str() {
+            "AUTOMATION_LINK_CORRUPT" => error,
+            "INVALID_PARAMS"
+            | "SCRIPT_EVENT_SOURCE_UNAUTHORIZED"
+            | "SCRIPT_EVENT_PROJECTION_INVALID"
+            | "SCRIPT_EVENT_PROJECTION_AMBIGUOUS" => corrupt().with_secondary_error(error),
+            _ => error,
+        }
+    })?;
     let row: Option<ScriptEventRunLinkRow> = db
         .query_row(
             "SELECT o.caller_id,o.method,o.task_id,o.attempt_id,o.client_request_id,\
@@ -3613,6 +3638,16 @@ struct PublicationAttemptSubjectRow {
     candidate_ref: Option<String>,
 }
 
+struct GithubProjectionOperationRow {
+    caller_id: String,
+    method: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    original_request_json: String,
+    effective_request_json: String,
+    result_json: Option<String>,
+}
+
 fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
     let corrupt = || {
         Error::new(
@@ -3645,18 +3680,35 @@ fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink
         &cause.operation_id,
     )
     .map_err(|_| corrupt())?;
-    let operation: Option<(String, String, Option<String>, Option<String>, String, String, Option<String>)> = db
+    let operation: Option<GithubProjectionOperationRow> = db
         .query_row(
             "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json,result_json FROM operations WHERE operation_id=?1",
             [&link.operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| {
+                Ok(GithubProjectionOperationRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    original_request_json: row.get(4)?,
+                    effective_request_json: row.get(5)?,
+                    result_json: row.get(6)?,
+                })
+            },
         )
         .optional()?;
-    let Some((caller_id, method, task_id, attempt_id, original_json, effective_json, result_json)) =
-        operation
-    else {
+    let Some(operation) = operation else {
         return Err(corrupt());
     };
+    let GithubProjectionOperationRow {
+        caller_id,
+        method,
+        task_id,
+        attempt_id,
+        original_request_json: original_json,
+        effective_request_json: effective_json,
+        result_json,
+    } = operation;
     let request_value: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
     let request = ManagedLabelRequest::parse(&request_value).map_err(|_| corrupt())?;
     GithubProjectionContext::from_link(link, cause.clone())
@@ -4553,14 +4605,8 @@ fn is_current_registered_gm(db: &Connection, principal: &Principal) -> Result<bo
         }
         return Err(error);
     }
-    let current_gm: Option<String> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id') FROM meta WHERE key='gm'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(current_gm.as_deref() == Some(principal.client_id.as_str()))
+    Ok(crate::store::gm::read_current(db)?
+        .is_some_and(|current| current.client_id == principal.client_id))
 }
 
 fn current_gm_has_task_project(db: &Connection, task_id: &str, project_id: &str) -> Result<bool> {
@@ -4630,7 +4676,7 @@ pub(crate) fn any_on_behalf_operation_link(
             Ok(Some(AnyOnBehalfOperationLink::ScriptRun(link)))
         }
         (Some(link), None, None)
-            if link.action == "message.send"
+            if matches!(link.action.as_str(), "message.send" | "task.create")
                 && link.cause["kind"] == "script_controller_effect" =>
         {
             Ok(Some(AnyOnBehalfOperationLink::ScriptEffect(link)))
@@ -4827,26 +4873,7 @@ pub(crate) fn current_transferred_attempt_authority(
     }
 
     require_registered_manager(db, &entry.owner_manager_id)?;
-    let gm: Option<(String, i64)> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') \
-             FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((gm_client_id, current_gm_epoch)) = gm else {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "transferred Attempt action requires a current GM designation",
-        ));
-    };
-    if gm_client_id != entry.owner_manager_id || current_gm_epoch <= 0 {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "the current registered GM must own the transferred automation entry",
-        ));
-    }
+    let current_gm_epoch = crate::store::gm::require_current_manager(db, &entry.owner_manager_id)?;
 
     let lineage = config::transfer_successors(
         db,
@@ -5202,26 +5229,7 @@ pub(crate) fn current_transfer_workspace_readback_authority(
         .map(|transfer| transfer.new_owner_manager_id.clone())
         .ok_or_else(|| Error::new("AUTOMATION_TRANSFER_CORRUPT", "transfer chain is empty"))?;
     require_registered_manager(db, &current_owner_id)?;
-    let designated_gm: Option<(String, i64)> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') \
-             FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((designated_manager, epoch)) = designated_gm else {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "workspace readback requires a current GM designation",
-        ));
-    };
-    if designated_manager != current_owner_id || epoch <= 0 {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "workspace readback requires the current GM to own the transferred entry",
-        ));
-    }
+    crate::store::gm::require_current_manager(db, &current_owner_id)?;
     let current_entry =
         config::load_entry(db, &current_owner_id, &link.project_id, &link.automation_id)?
             .ok_or_else(|| {
@@ -5457,25 +5465,7 @@ fn current_transfer_continuation_at_phase(
             )
         })?;
     require_registered_manager(db, &current_owner_id)?;
-    let designated_gm: Option<(String, i64)> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((designated_manager, current_gm_epoch)) = designated_gm else {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "transfer continuation requires a current GM designation",
-        ));
-    };
-    if designated_manager != current_owner_id || current_gm_epoch <= 0 {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "transfer continuation requires the current registered GM to own the destination entry",
-        ));
-    }
+    let current_gm_epoch = crate::store::gm::require_current_manager(db, &current_owner_id)?;
     let current_entry = config::load_entry(db, &current_owner_id, project_id, automation_id)?
         .ok_or_else(|| {
             Error::new(
@@ -5730,14 +5720,7 @@ pub(crate) fn current_manager_id_has_task_scope(
     if current_attempt_owner.as_deref() == Some(manager_id) {
         return Ok(true);
     }
-    let current_gm: Option<String> = db
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id') FROM meta WHERE key='gm'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(current_gm.as_deref() == Some(manager_id))
+    Ok(crate::store::gm::read_current(db)?.is_some_and(|current| current.client_id == manager_id))
 }
 
 /// ScriptEffect history is visible to its retained effective Manager while the

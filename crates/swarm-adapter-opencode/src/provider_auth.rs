@@ -5,9 +5,12 @@
 //! one native POST, and retains only bounded non-secret readback metadata.  It has
 //! no Store, SQL, retry, or completion authority.
 
-use crate::{config::{ModelRef, NativeOptions}, native::NativeClient};
-use serde::{Deserialize, Deserializer};
+use crate::{
+    config::{ModelRef, NativeOptions},
+    native::NativeClient,
+};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,7 +41,9 @@ impl ProviderAuthOptions {
                 .as_deref()
                 .is_some_and(|value| !valid_ref(value))
         {
-            return Err(auth_error("provider authorization does not match the OpenCode route"));
+            return Err(auth_error(
+                "provider authorization does not match the OpenCode route",
+            ));
         }
         Ok(())
     }
@@ -80,8 +85,7 @@ struct SecretKey(Vec<u8>);
 
 impl SecretKey {
     fn as_str(&self) -> Result<&str> {
-        std::str::from_utf8(&self.0)
-            .map_err(|_| auth_error("provider key is not valid UTF-8"))
+        std::str::from_utf8(&self.0).map_err(|_| auth_error("provider key is not valid UTF-8"))
     }
 
     fn is_usable(&self) -> bool {
@@ -136,9 +140,12 @@ impl<'de> Deserialize<'de> for SelectedProviderEntry {
                     }
                 }
                 if entry_type.as_deref() != Some("api") {
-                    return Err(serde::de::Error::custom("provider entry is not API-key shaped"));
+                    return Err(serde::de::Error::custom(
+                        "provider entry is not API-key shaped",
+                    ));
                 }
-                let key = key.ok_or_else(|| serde::de::Error::custom("provider API key is missing"))?;
+                let key =
+                    key.ok_or_else(|| serde::de::Error::custom("provider API key is missing"))?;
                 if !key.is_usable() {
                     return Err(serde::de::Error::custom("provider API key is unusable"));
                 }
@@ -207,18 +214,27 @@ fn read_selected_key(path: &Path, provider_id: &str) -> Result<SecretKey> {
         || metadata.len() == 0
         || metadata.len() > MAX_AUTH_FILE_BYTES
     {
-        return Err(auth_error("provider authorization source is not a bounded plain file"));
+        return Err(auth_error(
+            "provider authorization source is not a bounded plain file",
+        ));
     }
     let canonical = fs::canonicalize(path)
         .map_err(|_| auth_error("provider authorization source cannot be resolved"))?;
     if canonical != path {
-        return Err(auth_error("provider authorization source path was redirected"));
+        return Err(auth_error(
+            "provider authorization source path was redirected",
+        ));
     }
-    let mut file = File::open(path).map_err(|_| auth_error("provider authorization source cannot be opened"))?;
+    let mut file = File::open(path)
+        .map_err(|_| auth_error("provider authorization source cannot be opened"))?;
     let mut bytes = Vec::new();
-    file.by_ref().take(MAX_AUTH_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    file.by_ref()
+        .take(MAX_AUTH_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > MAX_AUTH_FILE_BYTES {
-        return Err(auth_error("provider authorization source changed while reading"));
+        return Err(auth_error(
+            "provider authorization source changed while reading",
+        ));
     }
     let parsed = parse_selected_auth(&bytes, provider_id);
     for byte in &mut bytes {
@@ -262,12 +278,20 @@ fn validate_integration(
             selected = Some(integration);
         }
     }
-    let integration = selected.ok_or_else(|| auth_error("provider integration identity is unavailable"))?;
+    let integration =
+        selected.ok_or_else(|| auth_error("provider integration identity is unavailable"))?;
     let methods = integration["methods"]
         .as_array()
         .ok_or_else(|| auth_error("provider integration methods are malformed"))?;
-    if methods.iter().filter(|method| method["type"] == "key").count() != 1 {
-        return Err(auth_error("provider does not expose one unambiguous API-key method"));
+    if methods
+        .iter()
+        .filter(|method| method["type"] == "key")
+        .count()
+        != 1
+    {
+        return Err(auth_error(
+            "provider does not expose one unambiguous API-key method",
+        ));
     }
     let connections = integration["connections"]
         .as_array()
@@ -283,7 +307,9 @@ fn validate_integration(
                 .ok_or_else(|| auth_error("provider credential metadata is malformed"))
         })
         .collect::<Result<Vec<_>>>()?;
-    if (!require_credential && !credential_ids.is_empty()) || (require_credential && credential_ids.len() != 1) {
+    if (!require_credential && !credential_ids.is_empty())
+        || (require_credential && credential_ids.len() != 1)
+    {
         return Err(auth_error(if require_credential {
             "provider credential metadata readback is absent or ambiguous"
         } else {
@@ -295,7 +321,9 @@ fn validate_integration(
 
 fn validate_auth_source(path: &Path) -> Result<()> {
     if !absolute_auth_path(path) {
-        return Err(auth_error("provider authorization source path is malformed"));
+        return Err(auth_error(
+            "provider authorization source path is malformed",
+        ));
     }
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -306,17 +334,24 @@ fn validate_auth_source(path: &Path) -> Result<()> {
                 current.push(part);
                 let metadata = fs::symlink_metadata(&current)
                     .map_err(|_| auth_error("provider authorization source path is unavailable"))?;
-                if metadata.file_type().is_symlink()
-                    || (current != path && !metadata.is_dir())
-                {
-                    return Err(auth_error("provider authorization source contains a redirected ancestor"));
+                if metadata.file_type().is_symlink() || (current != path && !metadata.is_dir()) {
+                    return Err(auth_error(
+                        "provider authorization source contains a redirected ancestor",
+                    ));
                 }
-                if fs::canonicalize(&current).map_err(|_| auth_error("provider authorization source path was redirected"))? != current {
-                    return Err(auth_error("provider authorization source path was redirected"));
+                if fs::canonicalize(&current)
+                    .map_err(|_| auth_error("provider authorization source path was redirected"))?
+                    != current
+                {
+                    return Err(auth_error(
+                        "provider authorization source path was redirected",
+                    ));
                 }
             }
             Component::CurDir | Component::ParentDir => {
-                return Err(auth_error("provider authorization source is not normalized"));
+                return Err(auth_error(
+                    "provider authorization source is not normalized",
+                ));
             }
         }
     }
@@ -332,12 +367,22 @@ fn absolute_auth_path(path: &Path) -> bool {
 }
 
 fn canonical_directory_text(path: &Path) -> Result<String> {
-    let canonical = fs::canonicalize(path).map_err(|_| Error::new("NATIVE_LOCATION_UNAVAILABLE", "selected workspace cannot be resolved"))?;
+    let canonical = fs::canonicalize(path).map_err(|_| {
+        Error::new(
+            "NATIVE_LOCATION_UNAVAILABLE",
+            "selected workspace cannot be resolved",
+        )
+    })?;
     canonical
         .to_str()
         .filter(|value| !value.is_empty() && value.len() <= 4096)
         .map(str::to_owned)
-        .ok_or_else(|| Error::new("NATIVE_LOCATION_UNAVAILABLE", "selected workspace is not a bounded path"))
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_LOCATION_UNAVAILABLE",
+                "selected workspace is not a bounded path",
+            )
+        })
 }
 
 fn model_digest(model: &ModelRef) -> Result<String> {
@@ -355,13 +400,17 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn safe_metadata_text(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= MAX_SAFE_ID_BYTES && !value.chars().any(char::is_control)
+    !value.trim().is_empty()
+        && value.len() <= MAX_SAFE_ID_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 fn valid_ref(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn valid_provider_id(value: &str) -> bool {

@@ -7,7 +7,11 @@
 //! itself. Store supplies the normal authority/admission callback and commits
 //! it with the cursor and event receipt in the same SQLite transaction.
 
-use super::{operations, tasks};
+use super::automation_reconcile::{
+    DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
+    SubjectErrorDisposition,
+};
+use super::{automation_reconcile, operations, tasks};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -26,6 +30,7 @@ use swarm_contracts::runtime::{
 };
 
 const STATE_PREFIX: &str = "automation:v1:goal-progression:state:";
+const QUARANTINE_PREFIX: &str = "automation:v1:goal-progression:quarantine:";
 const SLOT_PREFIX: &str = "goal-progression:v1:terminal-slot:";
 const ENTRY_PREFIX: &str = "automation:v1:entry:";
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:goal-progression_global_cursor";
@@ -37,6 +42,19 @@ const MAX_RECENT: usize = 20;
 const MAX_PENDING_SOURCE_GAPS: usize = 64;
 const MAX_SOURCE_GAP_RECHECKS: usize = 8;
 const GOAL_TERMINAL_EVIDENCE_KIND: &str = "goal.terminal.evidence";
+
+/// Root may continue after these exact Goal cursor failures only after rolling
+/// back the Goal domain transaction. All other errors stop.
+pub(super) fn classify_domain_error(error: Error) -> DomainErrorDisposition {
+    if matches!(
+        error.code.as_str(),
+        "AUTOMATION_GOAL_CURSOR_CORRUPT" | "AUTOMATION_GOAL_CURSOR_MISSING"
+    ) {
+        DomainErrorDisposition::Degraded { code: error.code }
+    } else {
+        DomainErrorDisposition::Fatal(error)
+    }
+}
 
 type ObservationRow = (i64, String, String);
 type LinkedGoalOperationRow = (
@@ -56,6 +74,13 @@ struct GoalSourceRow {
     raw: String,
     from_pending_source_gap: bool,
     verified_fact: Option<Value>,
+}
+
+struct GoalAttemptSubjectRow {
+    task_id: Option<String>,
+    task_revision: Option<i64>,
+    binding_id: Option<String>,
+    binding_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,7 +254,18 @@ fn event_slot_id(fact: &Value) -> Result<String> {
 }
 
 fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<State>> {
-    let Some(value) = config::read_record(db, &state_key(entry)?, "Goal progression state")? else {
+    let Some(value) = config::read_record(db, &state_key(entry)?, "Goal progression state")
+        .map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_GOAL_CURSOR_CORRUPT",
+                    "Goal progression cursor state record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?
+    else {
         return Ok(None);
     };
     let state: State = serde_json::from_value(value).map_err(|_| {
@@ -448,8 +484,7 @@ fn pending_source_gap_payload(db: &Connection, pending: &PendingSourceGap) -> Re
     if operation_id != pending.source_operation_id
         || model::digest(raw.as_bytes()) != pending.source_payload_sha256
     {
-        return Err(Error::new(
-            "AUTOMATION_GOAL_CURSOR_CORRUPT",
+        return Err(invalid_source(
             "retained terminal source observation identity or payload changed",
         ));
     }
@@ -508,16 +543,17 @@ fn next_source_gap_check_at(previous: i64, now_ms: i64) -> i64 {
 }
 
 fn recheck_pending_source_gaps(
-    db: &Connection,
+    tx: &Transaction<'_>,
     state: &mut State,
     budget: usize,
     now_ms: i64,
-) -> Result<(Vec<GoalSourceRow>, usize)> {
+) -> Result<(Vec<GoalSourceRow>, usize, usize)> {
     let limit = budget
         .min(MAX_SOURCE_GAP_RECHECKS)
         .min(state.pending_source_gaps.len());
     let mut rows = Vec::new();
     let mut checked = 0usize;
+    let mut quarantined = 0usize;
     let mut visited = HashSet::new();
     while checked < limit && !state.pending_source_gaps.is_empty() {
         let Some(index) = state
@@ -539,31 +575,23 @@ fn recheck_pending_source_gaps(
         let pending = state.pending_source_gaps[index].clone();
         visited.insert(pending.source_observation_id);
         checked += 1;
-        let raw = match pending_source_gap_payload(db, &pending) {
-            Ok(raw) => raw,
-            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
-                state.pending_source_gaps.remove(index);
-                append_recent(
-                    state,
-                    json!({
-                        "observation_id":pending.source_observation_id,
-                        "source_operation_id":pending.source_operation_id,
-                        "disposition":"source_invalid",
-                        "reason":error.message,
-                        "retryable":false
-                    }),
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        match verified_terminal(
-            db,
-            pending.source_observation_id,
-            &pending.source_operation_id,
-            &raw,
-        ) {
-            Ok(fact) => {
+        let evidence = pending_source_gap_evidence(&pending);
+        let disposition = automation_reconcile::with_subject_savepoint(
+            tx,
+            || {
+                let raw = pending_source_gap_payload(tx, &pending)?;
+                let fact = verified_terminal(
+                    tx,
+                    pending.source_observation_id,
+                    &pending.source_operation_id,
+                    &raw,
+                )?;
+                Ok(SubjectDisposition::Applied((raw, fact)))
+            },
+            |error| classify_goal_source_error(error, evidence.clone()),
+        )?;
+        match disposition {
+            SubjectDisposition::Applied((raw, fact)) => {
                 state.pending_source_gaps.remove(index);
                 rows.push(GoalSourceRow {
                     observation_id: pending.source_observation_id,
@@ -573,39 +601,51 @@ fn recheck_pending_source_gaps(
                     verified_fact: Some(fact),
                 });
             }
-            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_GAP" => {
-                let retained = retain_source_gap(
-                    state,
-                    pending.source_observation_id,
-                    &pending.source_operation_id,
-                    &raw,
-                    &error,
-                    now_ms,
-                )?;
-                if !retained {
-                    return Err(Error::new(
-                        "AUTOMATION_GOAL_CURSOR_CORRUPT",
-                        "pending terminal source gap disappeared at capacity",
-                    ));
+            SubjectDisposition::Pending { code, reason } => {
+                {
+                    let pending = &mut state.pending_source_gaps[index];
+                    pending.reason = code.to_ascii_lowercase();
+                    pending.last_checked_at_ms =
+                        next_source_gap_check_at(pending.last_checked_at_ms, now_ms);
                 }
+                append_recent(
+                    state,
+                    json!({
+                        "observation_id":pending.source_observation_id,
+                        "source_operation_id":pending.source_operation_id,
+                        "disposition":"pending",
+                        "reason":reason,
+                        "code":code,
+                        "retryable":true
+                    }),
+                );
             }
-            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_goal_quarantine(tx, &code, evidence, now_ms)?;
+                quarantined = quarantined.saturating_add(1);
                 state.pending_source_gaps.remove(index);
                 append_recent(
                     state,
                     json!({
                         "observation_id":pending.source_observation_id,
                         "source_operation_id":pending.source_operation_id,
-                        "disposition":"source_invalid",
-                        "reason":error.message,
+                        "disposition":"quarantined",
+                        "code":code,
                         "retryable":false
                     }),
                 );
             }
-            Err(error) => return Err(error),
+            SubjectDisposition::Skipped { code, reason } => {
+                return Err(Error::new(
+                    "AUTOMATION_GOAL_SOURCE_CLASSIFIER_INVALID",
+                    format!(
+                        "Goal source classifier returned unsupported skipped code {code}: {reason}"
+                    ),
+                ));
+            }
         }
     }
-    Ok((rows, checked))
+    Ok((rows, checked, quarantined))
 }
 
 fn advance_cursor_for_source_row(
@@ -642,15 +682,28 @@ fn source_task_revision(db: &Connection, operation: &Value) -> Result<i64> {
     // Read the durable Attempt by its retained identity first. Compare the
     // Operation tuple in Rust so a present mismatching Attempt is invalid,
     // while an absent row remains a retryable evidence gap.
-    let subject: Option<(Option<String>, Option<i64>, Option<String>, Option<i64>)> = db
+    let subject: Option<GoalAttemptSubjectRow> = db
         .query_row(
             "SELECT task_id,task_revision,binding_id,binding_generation \
              FROM attempts WHERE attempt_id=?1",
             [operation_attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok(GoalAttemptSubjectRow {
+                    task_id: row.get(0)?,
+                    task_revision: row.get(1)?,
+                    binding_id: row.get(2)?,
+                    binding_generation: row.get(3)?,
+                })
+            },
         )
         .optional()?;
-    let Some((task_id, revision, binding_id, generation)) = subject else {
+    let Some(GoalAttemptSubjectRow {
+        task_id,
+        task_revision: revision,
+        binding_id,
+        binding_generation: generation,
+    }) = subject
+    else {
         return Err(Error::new(
             "AUTOMATION_GOAL_SOURCE_GAP",
             "terminal source is not linked to one exact Task Attempt and binding",
@@ -678,6 +731,131 @@ fn source_task_revision(db: &Connection, operation: &Value) -> Result<i64> {
 
 fn invalid_source(message: &str) -> Error {
     Error::new("AUTOMATION_GOAL_SOURCE_INVALID", message)
+}
+
+fn goal_source_evidence(
+    observation_id: i64,
+    operation_id: &str,
+    raw: Option<&str>,
+) -> QuarantineEvidence {
+    QuarantineEvidence {
+        subject_identity: format!(
+            "goal-observation:{}:operation:{}",
+            observation_id,
+            model::digest(operation_id.as_bytes())
+        ),
+        source_pointer: Some(format!("observations/{observation_id}")),
+        source_digest: raw.map(|payload| model::digest(payload.as_bytes())),
+    }
+}
+
+fn pending_source_gap_evidence(pending: &PendingSourceGap) -> QuarantineEvidence {
+    QuarantineEvidence {
+        subject_identity: format!(
+            "goal-observation:{}:operation:{}",
+            pending.source_observation_id,
+            model::digest(pending.source_operation_id.as_bytes())
+        ),
+        source_pointer: Some(format!("observations/{}", pending.source_observation_id)),
+        source_digest: Some(pending.source_payload_sha256.clone()),
+    }
+}
+
+fn classify_goal_source_error(
+    error: &Error,
+    evidence: QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    match error.code.as_str() {
+        "AUTOMATION_GOAL_SOURCE_GAP" => Some(SubjectErrorDisposition::Pending {
+            code: error.code.clone(),
+            reason: error.message.clone(),
+        }),
+        "AUTOMATION_GOAL_SOURCE_INVALID" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence,
+        }),
+        _ => None,
+    }
+}
+
+fn classify_goal_admission_error(
+    error: &Error,
+    evidence: QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    match error.code.as_str() {
+        "AUTOMATION_GOAL_SOURCE_GAP" | "GOAL_NATIVE_STATE_UNRESOLVED" | "BINDING_NOT_READY" => {
+            Some(SubjectErrorDisposition::Pending {
+                code: error.code.clone(),
+                reason: error.message.clone(),
+            })
+        }
+        "AUTOMATION_GOAL_SOURCE_INVALID" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence,
+        }),
+        "GOAL_NOT_ACTIVE"
+        | "AUTOMATION_ACTION_CHANGED"
+        | "GOAL_OWNER_CONFLICT"
+        | "GOAL_NATIVE_OWNERSHIP_CONFLICT"
+        | "GOAL_MANAGER_SCOPE_CONFLICT"
+        | "FORBIDDEN" => Some(SubjectErrorDisposition::Skipped {
+            code: error.code.clone(),
+            reason: error.message.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn verify_terminal_isolated(
+    tx: &Transaction<'_>,
+    observation_id: i64,
+    operation_id: &str,
+    raw: &str,
+) -> Result<SubjectDisposition<Value>> {
+    let evidence = goal_source_evidence(observation_id, operation_id, Some(raw));
+    automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            Ok(SubjectDisposition::Applied(verified_terminal(
+                tx,
+                observation_id,
+                operation_id,
+                raw,
+            )?))
+        },
+        |error| classify_goal_source_error(error, evidence.clone()),
+    )
+}
+
+fn persist_goal_quarantine(
+    tx: &Transaction<'_>,
+    code: &str,
+    evidence: QuarantineEvidence,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(tx, &record_key, code, evidence, now_ms)?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_GOAL_QUARANTINE_INVALID",
+            "Goal subject did not produce durable quarantine evidence",
+        )),
+    }
+}
+
+fn persist_malformed_entry(
+    tx: &Transaction<'_>,
+    malformed: &MalformedAutomationEntry,
+    now_ms: i64,
+) -> Result<()> {
+    persist_goal_quarantine(tx, &malformed.code, malformed.evidence.clone(), now_ms)
 }
 
 fn original_request(db: &Connection, operation_id: &str) -> Result<Value> {
@@ -946,12 +1124,11 @@ fn validate_opencode_execution_proof(operation: &Value, proof: &Value) -> Result
     if let Some(retained_run) = operation["native_refs"]["input_execution"]["native_run_id"]
         .as_str()
         .filter(|value| !value.is_empty())
+        && proof["native_run_id"].as_str() != Some(retained_run)
     {
-        if proof["native_run_id"].as_str() != Some(retained_run) {
-            return Err(invalid_source(
-                "OpenCode terminal proof native run differs from the retained execution",
-            ));
-        }
+        return Err(invalid_source(
+            "OpenCode terminal proof native run differs from the retained execution",
+        ));
     }
     Ok(())
 }
@@ -1862,9 +2039,15 @@ fn append_recent(state: &mut State, value: Value) {
     trim_recent(&mut state.recent);
 }
 
-fn state_projection(db: &Connection, state: &State, processed: usize) -> Result<Value> {
+fn state_projection(
+    db: &Connection,
+    state: &State,
+    processed: usize,
+    quarantined: usize,
+) -> Result<Value> {
     let mut projection = serde_json::to_value(state)?;
     projection["processed"] = json!(processed);
+    projection["quarantined"] = json!(quarantined);
     projection["source_high_water"] = json!(observation_high_water(db)?);
     Ok(projection)
 }
@@ -1939,11 +2122,12 @@ where
             .min(MAX_SOURCE_GAP_RECHECKS)
     };
     let mut processed = 0usize;
-    let (mut rows, source_gap_checks) = if pending_recheck_budget == 0 {
-        (Vec::new(), 0)
+    let (mut rows, source_gap_checks, source_gap_quarantines) = if pending_recheck_budget == 0 {
+        (Vec::new(), 0, 0)
     } else {
         recheck_pending_source_gaps(tx, &mut state, pending_recheck_budget, now_ms)?
     };
+    let mut quarantined = source_gap_quarantines;
     processed += source_gap_checks;
     if pass_budget == 1 && initial_pending_source_gaps > 0 {
         state.prefer_pending_source_retry = pending_recheck_budget == 0;
@@ -1992,13 +2176,14 @@ where
             state.cursor = target;
             break;
         }
-        let fact_result = match verified_fact {
-            Some(fact) => Ok(fact),
-            None => verified_terminal(tx, observation_id, &operation_id, &raw),
+        let fact_disposition = match verified_fact {
+            Some(fact) => SubjectDisposition::Applied(fact),
+            None => verify_terminal_isolated(tx, observation_id, &operation_id, &raw)?,
         };
-        let fact = match fact_result {
-            Ok(fact) => fact,
-            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_GAP" => {
+        let fact = match fact_disposition {
+            SubjectDisposition::Applied(fact) => fact,
+            SubjectDisposition::Pending { code, reason } => {
+                let error = Error::new(code.clone(), reason.clone());
                 if !retain_source_gap(
                     &mut state,
                     observation_id,
@@ -2012,20 +2197,29 @@ where
                 }
                 append_recent(
                     &mut state,
-                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"held","reason":"terminal_source_unverified","code":error.code,"retryable":true}),
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"pending","reason":reason,"code":code,"retryable":true}),
                 );
                 advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
-            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_goal_quarantine(tx, &code, evidence, now_ms)?;
+                quarantined = quarantined.saturating_add(1);
                 append_recent(
                     &mut state,
-                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"source_invalid","reason":error.message,"retryable":false}),
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"quarantined","code":code,"retryable":false}),
                 );
                 advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
-            Err(error) => return Err(error),
+            SubjectDisposition::Skipped { code, reason } => {
+                return Err(Error::new(
+                    "AUTOMATION_GOAL_SOURCE_CLASSIFIER_INVALID",
+                    format!(
+                        "Goal source classifier returned unsupported skipped code {code}: {reason}"
+                    ),
+                ));
+            }
         };
         let target = match target_for(tx, entry, &fact, now_ms) {
             Ok(target) => target,
@@ -2049,9 +2243,16 @@ where
                 continue;
             }
             Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                persist_goal_quarantine(
+                    tx,
+                    &error.code,
+                    goal_source_evidence(observation_id, &operation_id, Some(&raw)),
+                    now_ms,
+                )?;
+                quarantined = quarantined.saturating_add(1);
                 append_recent(
                     &mut state,
-                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"source_invalid","reason":error.message,"retryable":false}),
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"quarantined","code":error.code,"retryable":false}),
                 );
                 advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
@@ -2116,25 +2317,56 @@ where
                 advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
-            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+            Err(error) if error.code == "GOAL_NATIVE_STATE_UNRESOLVED" => {
+                if !retain_source_gap(
+                    &mut state,
+                    observation_id,
+                    &operation_id,
+                    &raw,
+                    &error,
+                    now_ms,
+                )? {
+                    stopped_for_source_gap_capacity = true;
+                    break;
+                }
                 append_recent(
                     &mut state,
-                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"source_invalid","reason":error.message,"retryable":false}),
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"pending","reason":error.message,"code":error.code,"retryable":true}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                persist_goal_quarantine(
+                    tx,
+                    &error.code,
+                    goal_source_evidence(observation_id, &operation_id, Some(&raw)),
+                    now_ms,
+                )?;
+                quarantined = quarantined.saturating_add(1);
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"quarantined","code":error.code,"retryable":false}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            Err(error) if error.code == "GOAL_NOT_ACTIVE" => {
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"skipped","code":error.code,"reason":error.message}),
                 );
                 advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
             Err(error) => {
-                let disposition = if error.code == "GOAL_OWNER_CONFLICT"
-                    || error.code == "GOAL_NATIVE_OWNERSHIP_CONFLICT"
-                    || error.code == "GOAL_MANAGER_SCOPE_CONFLICT"
-                    || error.code == "FORBIDDEN"
-                {
-                    "ownership_conflict"
-                } else if error.code == "GOAL_UNSUPPORTED_RUNTIME" {
-                    "unsupported_runtime"
-                } else {
-                    "held"
+                let disposition = match error.code.as_str() {
+                    "GOAL_OWNER_CONFLICT"
+                    | "GOAL_NATIVE_OWNERSHIP_CONFLICT"
+                    | "GOAL_MANAGER_SCOPE_CONFLICT"
+                    | "FORBIDDEN" => "ownership_conflict",
+                    "GOAL_UNSUPPORTED_RUNTIME" => "unsupported_runtime",
+                    _ => return Err(error),
                 };
                 let slot = TerminalSlot {
                     schema_version: SLOT_SCHEMA,
@@ -2203,18 +2435,108 @@ where
                 continue;
             }
         };
-        let outcome = admit(tx, &prepared)?;
+        let evidence = goal_source_evidence(observation_id, &operation_id, Some(&raw));
+        let subject_outcome = automation_reconcile::with_subject_savepoint(
+            tx,
+            || match admit(tx, &prepared)? {
+                outcome @ (AdmissionResult::Admitted { .. } | AdmissionResult::Reused { .. }) => {
+                    Ok(SubjectDisposition::Applied(outcome))
+                }
+                AdmissionResult::Conflict { code, reason } => match code.as_str() {
+                    "AUTOMATION_GOAL_SOURCE_GAP"
+                    | "GOAL_NATIVE_STATE_UNRESOLVED"
+                    | "BINDING_NOT_READY" => Ok(SubjectDisposition::Pending { code, reason }),
+                    "AUTOMATION_GOAL_SOURCE_INVALID" => Ok(SubjectDisposition::Quarantined {
+                        code,
+                        evidence: evidence.clone(),
+                    }),
+                    "GOAL_NOT_ACTIVE"
+                    | "AUTOMATION_ACTION_CHANGED"
+                    | "GOAL_OWNER_CONFLICT"
+                    | "GOAL_NATIVE_OWNERSHIP_CONFLICT"
+                    | "GOAL_MANAGER_SCOPE_CONFLICT"
+                    | "FORBIDDEN"
+                    | "GOAL_REVISION_CONFLICT"
+                    | "NATIVE_GOAL_CONFLICT" => Ok(SubjectDisposition::Skipped { code, reason }),
+                    "REQUEST_ID_CONFLICT" => Err(Error::new(
+                        "AUTOMATION_GOAL_ADMISSION_IDENTITY_CONFLICT",
+                        "Goal continuation request identity collides with retained inputs",
+                    )),
+                    _ => Err(Error::new(
+                        "AUTOMATION_GOAL_ADMISSION_CONFLICT_UNKNOWN",
+                        format!("Goal admission returned an unclassified conflict code {code}"),
+                    )),
+                },
+            },
+            |error| classify_goal_admission_error(error, evidence.clone()),
+        )?;
+        let outcome = match subject_outcome {
+            SubjectDisposition::Applied(outcome) => outcome,
+            SubjectDisposition::Pending { code, reason } => {
+                let error = Error::new(code.clone(), reason.clone());
+                if !retain_source_gap(
+                    &mut state,
+                    observation_id,
+                    &operation_id,
+                    &raw,
+                    &error,
+                    now_ms,
+                )? {
+                    stopped_for_source_gap_capacity = true;
+                    break;
+                }
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"pending","code":code,"reason":reason,"retryable":true}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_goal_quarantine(tx, &code, evidence, now_ms)?;
+                quarantined = quarantined.saturating_add(1);
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"quarantined","code":code,"retryable":false}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            SubjectDisposition::Skipped { code, reason }
+                if matches!(
+                    code.as_str(),
+                    "GOAL_NOT_ACTIVE" | "AUTOMATION_ACTION_CHANGED"
+                ) =>
+            {
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"skipped","code":code,"reason":reason}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            SubjectDisposition::Skipped { code, reason } => {
+                AdmissionResult::Conflict { code, reason }
+            }
+        };
         let (disposition, admitted_operation_id) = match outcome {
             AdmissionResult::Admitted { operation_id } => ("admitted", Some(operation_id)),
             AdmissionResult::Reused { operation_id } => ("reused", Some(operation_id)),
             AdmissionResult::Conflict { code, reason } => {
-                let disposition = if code == "FORBIDDEN"
-                    || code.contains("OWNER")
-                    || code.contains("MANAGER_SCOPE")
-                {
-                    "ownership_conflict"
-                } else {
-                    "admission_conflict"
+                let disposition = match code.as_str() {
+                    "FORBIDDEN"
+                    | "GOAL_OWNER_CONFLICT"
+                    | "GOAL_NATIVE_OWNERSHIP_CONFLICT"
+                    | "GOAL_MANAGER_SCOPE_CONFLICT" => "ownership_conflict",
+                    "GOAL_REVISION_CONFLICT" | "NATIVE_GOAL_CONFLICT" => "admission_conflict",
+                    _ => {
+                        return Err(Error::new(
+                            "AUTOMATION_GOAL_ADMISSION_CONFLICT_UNKNOWN",
+                            format!(
+                                "Goal admission conflict code changed after classification: {code}"
+                            ),
+                        ));
+                    }
                 };
                 let slot = TerminalSlot {
                     schema_version: SLOT_SCHEMA,
@@ -2330,7 +2652,7 @@ where
     }
     state.updated_at_ms = now_ms;
     save_state(tx, entry, &state)?;
-    state_projection(tx, &state, processed)
+    state_projection(tx, &state, processed, quarantined)
 }
 
 /// Shared pump for enabled Goal progression entries, with one global entry
@@ -2348,7 +2670,17 @@ where
     let limit = entry_budget.clamp(1, MAX_ENTRY_PAGE);
     let prefix = ENTRY_PREFIX;
     let pattern = format!("{prefix}%");
-    let cursor = config::read_record(tx, GLOBAL_CURSOR_KEY, "Goal progression global cursor")?
+    let cursor = config::read_record(tx, GLOBAL_CURSOR_KEY, "Goal progression global cursor")
+        .map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_GOAL_CURSOR_CORRUPT",
+                    "global Goal progression cursor record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?
         .map(|value| {
             serde_json::from_value::<GlobalCursor>(value).map_err(|_| {
                 Error::new(
@@ -2374,30 +2706,45 @@ where
         rows = select(prefix, limit)?;
     }
     let mut entries = Vec::new();
+    let mut malformed_entries = Vec::new();
     for (key, raw) in &rows {
-        let value: Value = serde_json::from_str(raw)?;
-        let record = config::open_record(value, "Goal progression automation entry")?;
-        let entry: AutomationEntry = serde_json::from_value(record).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "Goal progression automation entry fields are invalid",
-            )
-        })?;
-        config::validate_entry(&entry)?;
+        let entry = match automation_reconcile::parse_automation_entry(
+            raw,
+            "Goal progression automation entry",
+        ) {
+            Ok(entry) => entry,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_INVALID"
+                ) =>
+            {
+                malformed_entries.push(MalformedAutomationEntry {
+                    code: error.code,
+                    evidence: automation_reconcile::automation_entry_evidence(key, raw),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if config::entry_key(
             &entry.owner_manager_id,
             &entry.project_id,
             &entry.automation_id,
         )? != *key
         {
-            return Err(Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "Goal progression entry key does not match its identity",
-            ));
+            malformed_entries.push(MalformedAutomationEntry {
+                code: "AUTOMATION_RECORD_INVALID".to_owned(),
+                evidence: automation_reconcile::automation_entry_evidence(key, raw),
+            });
+            continue;
         }
         if entry.goal_progression_ready() {
             entries.push(entry);
         }
+    }
+    for malformed in &malformed_entries {
+        persist_malformed_entry(tx, malformed, now_ms)?;
     }
     let mut results = Vec::new();
     for entry in entries {
@@ -2409,6 +2756,22 @@ where
             &mut admit,
         )?);
     }
+    let total_processed = results
+        .iter()
+        .map(|result| result["processed"].as_u64().unwrap_or_default())
+        .fold(0u64, u64::saturating_add);
+    let total_quarantined = results
+        .iter()
+        .map(|result| result["quarantined"].as_u64().unwrap_or_default())
+        .fold(malformed_entries.len() as u64, u64::saturating_add);
+    let status = if total_quarantined > 0 {
+        "degraded"
+    } else if rows.is_empty() && total_processed == 0 {
+        "idle"
+    } else {
+        "progressed"
+    };
+    let last_entry_key = rows.last().map(|(key, _)| key.as_str());
     if let Some((last_entry_key, _)) = rows.last() {
         config::write_record(
             tx,
@@ -2416,7 +2779,16 @@ where
             &json!({"schema_version":1,"last_entry_key":last_entry_key}),
         )?;
     }
-    Ok(json!({"entries":results,"entry_budget":limit,"event_budget_per_entry":event_budget}))
+    let processed = usize::try_from(total_processed).unwrap_or(usize::MAX);
+    Ok(json!({
+        "entries":results,
+        "processed":processed,
+        "quarantined":total_quarantined,
+        "status":status,
+        "entry_budget":limit,
+        "event_budget_per_entry":event_budget,
+        "cursor":last_entry_key
+    }))
 }
 
 pub(crate) fn state(db: &Connection, entry: &AutomationEntry) -> Result<Value> {

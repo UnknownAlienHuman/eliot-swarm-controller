@@ -5,6 +5,7 @@ mod module_link;
 mod module_receipt;
 mod module_runtime;
 mod native;
+mod native_interactions;
 mod native_mcp;
 mod native_mcp_intake;
 mod native_owner;
@@ -21,8 +22,8 @@ use journal::{
     Journal, OperationIntent, ResultAssistantIntent, ResultInputStatusIntent, digest_json,
 };
 use native::{
-    AssistantResultEvidence, InputEvidence, NativeClient, canonical_json, input_id, input_payload,
-    intent_for, root_id,
+    AssistantResultEvidence, InputEvidence, NativeClient, canonical_json, input_id, intent_for,
+    root_id,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -35,7 +36,9 @@ use swarm_contracts::{
         EffectOutcome, NormalizedResultOriginContext, NormalizedResultPageSource, RuntimeCommand,
         RuntimeOutcome, TaskDispatchAdmissionReceipt, TaskDispatchContext,
     },
+    task_prompt::TaskPromptEnvelopeV1,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 
 const ACK_ATTEMPTS: usize = 4;
@@ -50,6 +53,7 @@ struct HostSession<'a> {
     boot_id: String,
     hello_base: Value,
     root_hint: Mutex<Option<String>>,
+    ipc_link: AsyncMutex<Option<swarm_client::ModuleLink>>,
 }
 
 pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
@@ -68,7 +72,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &config.native_options.scope_key(),
         &route_sha256,
     )?;
-    journal.recover_outbox()?;
+    let journal_recovery = journal.recover_outbox()?;
     let mut native_owner = native_owner::NativeOwnerController::new(config.owned_native.clone());
 
     // The verified owner and boot identity come from the per-scope helper.
@@ -100,61 +104,123 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         boot_id: boot_id.clone(),
         hello_base,
         root_hint: Mutex::new(root_hint),
+        ipc_link: AsyncMutex::new(None),
     };
-    host.hello_retry().await?;
+    let run_result = async {
+        host.hello_retry().await?;
 
-    if let Some(probe) = native_probe {
-        let event_id = uuid::Uuid::new_v4().to_string();
-        let observation = json!({
-            "event_id":event_id,
-            "state":{
-                "boot_id":boot_id,
-                "native_scope_key":scope,
-                "service_id":config.native_options.service_id,
-                "service_version":probe.version,
-                "service_pid":probe.pid,
-                "route_model":config.native_options.model
-            }
-        });
-        journal.queue_observation(&event_id, observation)?;
-        flush_outbox(&host).await?;
-    }
-
-    flush_outbox(&host).await?;
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    loop {
-        let response = tokio::select! {
-            signal = &mut ctrl_c => {
-                signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
-                native_owner.shutdown().await?;
-                return Ok(());
-            }
-            result = host.call("module.next", json!({})) => result?,
-        };
-        let command_value = response.get("command").ok_or_else(|| {
-            Error::new(
-                "HOST_COMMAND_SCHEMA",
-                "module.next response lacks command state",
-            )
-        })?;
-        if !command_value.is_null() {
-            let command: RuntimeCommand =
-                serde_json::from_value(command_value.clone()).map_err(|_| {
-                    Error::new(
-                        "HOST_COMMAND_SCHEMA",
-                        "module command does not match the shared contract",
-                    )
-                })?;
-            verify_command_scope(host.config, &command, host.claim)?;
-            handle_command(&host, &command, &mut native_owner).await?;
+        if !journal_recovery.is_empty() {
+            let entries = journal_recovery.iter().take(32).map(|recovered| json!({
+                "operation_key":recovered.operation_key,
+                "operation_id":recovered.operation_id,
+                "native_effect_unknown":recovered.history.recovery_unknown(),
+                "torn_tail":recovered.history.torn_tail_evidence.as_ref().map(|tail| json!({
+                    "valid_prefix_bytes":tail.valid_prefix_bytes,
+                    "tail_sha256":tail.tail_sha256,
+                    "tail_bytes":tail.tail_bytes,
+                })),
+                "native_replay_permitted":false,
+            })).collect::<Vec<_>>();
+            let event_id = uuid::Uuid::new_v4().to_string();
+            journal.queue_observation(&event_id, json!({
+                "event_id":event_id,
+                "state":{
+                    "boot_id":boot_id,
+                    "native_scope_key":scope,
+                    "journal_recovery":{
+                        "count":journal_recovery.len(),
+                        "entries":entries,
+                        "coverage":if journal_recovery.len() > 32 {"partial"} else {"complete"},
+                        "native_replay_permitted":false,
+                    },
+                },
+            }))?;
             flush_outbox(&host).await?;
-        } else {
-            sleep(Duration::from_millis(IDLE_POLL_MS)).await;
         }
-        // A failed module.next may have admitted work before its response was
-        // lost. It is intentionally not retried on this boot; startup recovery
-        // will make that Operation unknown and offer readback-only reconcile.
+
+        if let Some(probe) = native_probe {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let observation = json!({
+                "event_id":event_id,
+                "state":{
+                    "boot_id":boot_id,
+                    "native_scope_key":scope,
+                    "service_id":config.native_options.service_id,
+                    "service_version":probe.version,
+                    "service_pid":probe.pid,
+                    "route_model":config.native_options.model
+                }
+            });
+            journal.queue_observation(&event_id, observation)?;
+            flush_outbox(&host).await?;
+        }
+
+        flush_outbox(&host).await?;
+        attempt_journal_retention(&host);
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            let response = tokio::select! {
+                signal = &mut ctrl_c => {
+                    signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
+                    break;
+                }
+                result = host.call("module.next", json!({})) => result?,
+            };
+            let command_value = response.get("command").ok_or_else(|| {
+                Error::new(
+                    "HOST_COMMAND_SCHEMA",
+                    "module.next response lacks command state",
+                )
+            })?;
+            if !command_value.is_null() {
+                let command: RuntimeCommand =
+                    serde_json::from_value(command_value.clone()).map_err(|_| {
+                        Error::new(
+                            "HOST_COMMAND_SCHEMA",
+                            "module command does not match the shared contract",
+                        )
+                    })?;
+                verify_command_scope(host.config, &command, host.claim)?;
+                handle_command(&host, &command, &mut native_owner).await?;
+                flush_outbox(&host).await?;
+            } else {
+                sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+            }
+            // A failed module.next may have admitted work before its response was
+            // lost. It is intentionally not retried on this boot; startup recovery
+            // will make that Operation unknown and offer readback-only reconcile.
+        }
+        Ok(())
+    }
+    .await;
+    let stop_result = shutdown_native_owner_until_confirmed(&mut native_owner).await;
+    match (run_result, stop_result) {
+        (Ok(()), stop) => stop,
+        (Err(run_error), Ok(())) => Err(run_error),
+        (Err(run_error), Err(stop_error)) => Err(Error::new(
+            run_error.code,
+            format!(
+                "adapter loop failed; native owner stop also reported {}",
+                stop_error.code
+            ),
+        )),
+    }
+}
+
+async fn shutdown_native_owner_until_confirmed(
+    native_owner: &mut native_owner::NativeOwnerController,
+) -> Result<()> {
+    loop {
+        match native_owner.shutdown().await {
+            Ok(()) => return Ok(()),
+            Err(_) if native_owner.owns_child() => {
+                // The owner and Child remain in this process across each
+                // cancel-safe wait timeout. No new native work is admitted.
+                sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -170,6 +236,12 @@ async fn handle_command(
         host.set_root_hint(root)?;
     }
     let history = journal.load(&command.operation_id)?;
+    if history.torn_tail_evidence.is_some() {
+        return Err(Error::new(
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+            "torn operation evidence requires readback; native action and journal append are withheld",
+        ));
+    }
     let expected_receipt = module_receipt::for_command(claim, command)?;
     let expected_receipt_value = serde_json::to_value(&expected_receipt)?;
     if history
@@ -229,7 +301,12 @@ async fn handle_command(
 
     match command.method.as_str() {
         "agent.open" => handle_open(host, command, &options, native_owner).await,
-        "task.dispatch" | "agent.send" => handle_send(host, command, &options).await,
+        "task.dispatch" | "agent.send" | "native.opencode.loop_step" => {
+            handle_send(host, command, &options).await
+        }
+        "agent.reply" => handle_reply(host, command, &options).await,
+        "agent.background" => handle_background(host, command, &options).await,
+        "agent.refresh" => handle_refresh(host, command, &options).await,
         "agent.reconcile" => handle_reconcile(host, command, &options).await,
         "agent.result" => handle_result(host, command, &options).await,
         "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read" => {
@@ -238,7 +315,7 @@ async fn handle_command(
         _ => {
             let error = Error::new(
                 "UNSUPPORTED_CAPABILITY",
-                "this Rust artifact implements only OpenCode session open, next-turn input and saved readback",
+                "the requested native method is not implemented by this OpenCode artifact",
             );
             let outcome = outcome(
                 command,
@@ -403,7 +480,7 @@ async fn handle_result(
     };
     if !matches!(
         target_intent.method.as_str(),
-        "task.dispatch" | "agent.send"
+        "task.dispatch" | "agent.send" | "native.opencode.loop_step"
     ) {
         return queue_rejected(
             host,
@@ -1166,6 +1243,109 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn task_prompt_for(
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+    claim: &ModuleContractClaim,
+) -> Result<Option<String>> {
+    if command.method != "task.dispatch" {
+        if command.input.get("task_prompt").is_some() {
+            return Err(Error::new(
+                "TASK_PROMPT_INVALID",
+                "TaskPrompt envelope is only valid for task.dispatch",
+            ));
+        }
+        return Ok(None);
+    }
+    if !module_runtime::task_prompt_v1_selected(claim) {
+        return Err(Error::new(
+            "TASK_PROMPT_SCHEMA_NOT_SELECTED",
+            "this OpenCode artifact requires the exact TaskPrompt v1 descriptor",
+        ));
+    }
+    let value = command.input.get("task_prompt").ok_or_else(|| {
+        Error::new(
+            "TASK_PROMPT_REQUIRED",
+            "selected TaskPrompt v1 dispatch has no Store-produced envelope",
+        )
+    })?;
+    let envelope: TaskPromptEnvelopeV1 = serde_json::from_value(value.clone())
+        .map_err(|_| Error::new("TASK_PROMPT_INVALID", "TaskPrompt envelope is malformed"))?;
+    envelope
+        .validate_shape()
+        .map_err(|_| Error::new("TASK_PROMPT_INVALID", "TaskPrompt envelope is invalid"))?;
+    let context: TaskDispatchContext = serde_json::from_value(
+        command
+            .input
+            .get("task_dispatch_context")
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "TASK_PROMPT_CONTEXT_REQUIRED",
+                    "TaskPrompt requires its Store dispatch context",
+                )
+            })?,
+    )
+    .map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_CONTEXT_INVALID",
+            "TaskPrompt dispatch context is malformed",
+        )
+    })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_CONTEXT_INVALID",
+            "TaskPrompt dispatch context is invalid",
+        )
+    })?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || envelope.attempt_id != context.attempt_id
+        || envelope.task_id != context.task_id
+        || envelope.task_revision != context.task_revision
+        || envelope.task_snapshot_sha256 != context.task_snapshot_sha256
+        || envelope.prompt_sha256 != sha256(envelope.prompt.as_bytes())
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_IDENTITY_MISMATCH",
+            "TaskPrompt differs from its authenticated dispatch identity or digest",
+        ));
+    }
+    let expected_snapshot_digest = format!("sha256:{}", context.task_snapshot_sha256);
+    if let Some(packet) = command.input.get("launch_dispatch_packet") {
+        if packet["task"]["task_id"].as_str() != Some(context.task_id.as_str())
+            || packet["task"]["revision"].as_i64() != Some(context.task_revision)
+            || packet["task"]["attempt_id"].as_str() != Some(context.attempt_id.as_str())
+            || packet["task"]["snapshot_digest"].as_str() != Some(expected_snapshot_digest.as_str())
+            || packet["selection"]["provider"].as_str() != Some(options.model.provider_id.as_str())
+            || packet["selection"]["model"].as_str() != Some(options.model.id.as_str())
+            || packet["selection"]["variant"].as_str() != Some(options.model.variant.as_str())
+        {
+            return Err(Error::new(
+                "TASK_PROMPT_LAUNCH_PACKET_MISMATCH",
+                "launch packet differs from the frozen dispatch or pinned native model",
+            ));
+        }
+    }
+    Ok(Some(envelope.prompt))
+}
+
+fn task_prompt_preflight_command(command: &RuntimeCommand, prompt: &str) -> RuntimeCommand {
+    RuntimeCommand {
+        operation_id: command.operation_id.clone(),
+        method: String::from("agent.send"),
+        created_at_ms: command.created_at_ms,
+        binding_id: command.binding_id.clone(),
+        generation: command.generation,
+        native_root_id: command.native_root_id.clone(),
+        route: command.route.clone(),
+        input: json!({"delivery":"next_turn","text":prompt}),
+        input_sha256: command.input_sha256.clone(),
+        target_input_sha256: command.target_input_sha256.clone(),
+    }
+}
+
 fn normalized_dispatch_admission(
     host: &HostSession<'_>,
     command: &RuntimeCommand,
@@ -1221,8 +1401,12 @@ fn normalized_dispatch_admission(
             "native input identity differs from the durable module intent",
         ));
     }
-    let payload = input_payload(command, input_id, prompt_text);
-    let payload_bytes = serde_json::to_vec(&payload)?;
+    if !module_runtime::task_prompt_v1_selected(host.claim) {
+        return Err(Error::new(
+            "TASK_PROMPT_SCHEMA_NOT_SELECTED",
+            "dispatch admission requires the exact TaskPrompt v1 descriptor",
+        ));
+    }
     let receipt = TaskDispatchAdmissionReceipt {
         schema_version: 1,
         module_receipt: intent.module_receipt.clone(),
@@ -1236,8 +1420,8 @@ fn normalized_dispatch_admission(
         task_snapshot_sha256: context.task_snapshot_sha256,
         source_text_sha256: context.source_text_sha256,
         source_text_bytes: context.source_text_bytes,
-        native_payload_sha256: sha256(&payload_bytes),
-        native_payload_bytes: payload_bytes.len() as u64,
+        native_payload_sha256: sha256(prompt_text.as_bytes()),
+        native_payload_bytes: prompt_text.len() as u64,
         native_input_id: Some(input_id.to_owned()),
     };
     receipt.validate().map_err(|_| {
@@ -1288,6 +1472,13 @@ fn validate_saved_dispatch_outcome(
                     "dispatch source text is missing while validating saved receipt",
                 )
             })?;
+            let prompt_text = task_prompt_for(command, &host.config.native_options, host.claim)?
+                .ok_or_else(|| {
+                    Error::new(
+                        "ADAPTER_INTENT_MISMATCH",
+                        "selected TaskPrompt v1 dispatch has no immutable prompt",
+                    )
+                })?;
             let expected = module_receipt::for_command(host.claim, command)?;
             if receipt.module_receipt != expected
                 || context.operation_id != command.operation_id
@@ -1296,6 +1487,8 @@ fn validate_saved_dispatch_outcome(
                 || context.worker_boot_id != host.boot_id
                 || context.source_text_sha256 != sha256(source_text.as_bytes())
                 || context.source_text_bytes != source_text.len() as u64
+                || receipt.native_payload_sha256 != sha256(prompt_text.as_bytes())
+                || receipt.native_payload_bytes != prompt_text.len() as u64
                 || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
                 || history
                     .intent
@@ -1345,11 +1538,35 @@ async fn handle_send(
             return queue_rejected(host, command, options, Some(root.into()), &error).await;
         }
     };
-    let prompt_text = match native.preflight_send(command, options, root).await {
-        Ok(text) => text,
+    let prompt_text = match task_prompt_for(command, options, claim) {
         Err(error) => {
             return queue_rejected(host, command, options, Some(root.into()), &error).await;
         }
+        Ok(Some(prompt)) => {
+            let preflight_command = task_prompt_preflight_command(command, &prompt);
+            match native
+                .preflight_send(&preflight_command, options, root)
+                .await
+            {
+                Ok(preflight_prompt) if preflight_prompt == prompt => prompt,
+                Ok(_) => {
+                    let error = Error::new(
+                        "TASK_PROMPT_PREFLIGHT_MISMATCH",
+                        "OpenCode preflight changed the Store-produced TaskPrompt",
+                    );
+                    return queue_rejected(host, command, options, Some(root.into()), &error).await;
+                }
+                Err(error) => {
+                    return queue_rejected(host, command, options, Some(root.into()), &error).await;
+                }
+            }
+        }
+        Ok(None) => match native.preflight_send(command, options, root).await {
+            Ok(text) => text,
+            Err(error) => {
+                return queue_rejected(host, command, options, Some(root.into()), &error).await;
+            }
+        },
     };
     let input = input_id(&command.operation_id);
     let mut intent = intent_for(
@@ -1368,10 +1585,20 @@ async fn handle_send(
         .admit_input(command, root, &input, &prompt_text)
         .await
     {
-        Ok(()) => {
+        Ok(admission) => {
+            let delivery =
+                native::native_delivery_for_method(&command.method).ok_or_else(|| {
+                    Error::new(
+                        "ADAPTER_INTENT_MISMATCH",
+                        "admitted input method has no native delivery",
+                    )
+                })?;
             let mut details = json!({
                 "completion_condition":"native_input_admitted",
-                "delivery":"queue",
+                "delivery":delivery,
+                "execution_boundary":if admission.promoted_sequence.is_some() { "native_input_promoted" } else if delivery == "steer" { "native_safe_next_loop_step" } else { "queued_next_turn" },
+                "admitted_sequence":admission.admitted_sequence,
+                "promoted_sequence":admission.promoted_sequence,
                 "evidence":"prompt_response",
                 "assistant_result_correlation":"not_exposed",
                 "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
@@ -1408,6 +1635,238 @@ async fn handle_send(
         )?,
     };
     journal.queue_outcome(&outcome)?;
+    flush_outbox(host).await
+}
+
+async fn handle_reply(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> Result<()> {
+    let journal = host.journal;
+    let claim = host.claim;
+    let root = command.native_root_id.clone();
+    let (native, _) = match NativeClient::connect(options).await {
+        Ok(value) => value,
+        Err(error) => return queue_rejected(host, command, options, root, &error).await,
+    };
+    let prepared = match native_interactions::prepare_reply(&native, command, options).await {
+        Ok(prepared) => prepared,
+        Err(error) => return queue_rejected(host, command, options, root, &error).await,
+    };
+    let mut intent = intent_for(command, claim, options, None, None)?;
+    intent.marker["native_opencode_reply"] = prepared.intent_identity();
+    journal.write_intent(&intent)?;
+
+    let response = match prepared.body.clone() {
+        Some(body) => native.control_post(&prepared.path, body).await,
+        None => native.control_post_empty(&prepared.path).await,
+    };
+    let result = match response {
+        Ok(Value::Null) => outcome(
+            command,
+            claim,
+            EffectOutcome::Applied,
+            options,
+            root,
+            None,
+            json!({
+                "completion_condition":"native_reply_acknowledged",
+                "evidence":"exact_native_204",
+                "kind":prepared.kind,
+                "action":prepared.action,
+                "session_id":prepared.session_id,
+                "request_id":prepared.request_id,
+                "request_fingerprint":prepared.request_fingerprint,
+                "affected_request_ids":prepared.affected_request_ids,
+                "native_replay":false
+            }),
+        )?,
+        Ok(_) => {
+            let error = Error::new(
+                "NATIVE_OUTCOME_UNKNOWN",
+                "native reply returned an unsupported response body",
+            );
+            effect_failure(command, claim, options, root, None, &error, true)?
+        }
+        Err(error) => effect_failure(command, claim, options, root, None, &error, true)?,
+    };
+    journal.queue_outcome(&result)?;
+    flush_outbox(host).await
+}
+
+async fn handle_background(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> Result<()> {
+    let journal = host.journal;
+    let claim = host.claim;
+    let root = command.native_root_id.clone();
+    let target = match native_interactions::validate_target(command, "session_id") {
+        Ok(target) => target,
+        Err(error) => return queue_rejected(host, command, options, root, &error).await,
+    };
+    let (native, _) = match NativeClient::connect(options).await {
+        Ok(value) => value,
+        Err(error) => return queue_rejected(host, command, options, root, &error).await,
+    };
+    if let Err(error) = native.verify_control_scope(command, options, &target).await {
+        return queue_rejected(host, command, options, root, &error).await;
+    }
+    let supported = match native_interactions::background_capability(&native).await {
+        Ok(supported) => supported,
+        Err(error) => return queue_rejected(host, command, options, root, &error).await,
+    };
+    if !supported {
+        let error = Error::new(
+            "UNSUPPORTED_CAPABILITY",
+            "OpenCode does not advertise backgroundSubagents for this service",
+        );
+        return queue_rejected(host, command, options, root, &error).await;
+    }
+
+    let mut intent = intent_for(command, claim, options, None, None)?;
+    intent.marker["native_opencode_background"] = json!({
+        "session_id":target,
+        "capability":"backgroundSubagents",
+        "capability_value":true
+    });
+    journal.write_intent(&intent)?;
+    let path = format!("/experimental/session/{target}/background");
+    let result = match native.control_post_empty(&path).await {
+        Ok(Value::Bool(changed)) => outcome(
+            command,
+            claim,
+            EffectOutcome::Applied,
+            options,
+            root,
+            None,
+            json!({
+                "completion_condition":if changed { "native_background_changed" } else { "native_background_noop" },
+                "native_endpoint":"/experimental/session/:sessionID/background",
+                "capability_observation":{"backgroundSubagents":true},
+                "session_id":target,
+                "changed":changed,
+                "execution_complete":false,
+                "native_replay":false
+            }),
+        )?,
+        Ok(_) => {
+            let error = Error::new(
+                "NATIVE_OUTCOME_UNKNOWN",
+                "background endpoint did not return its documented boolean",
+            );
+            effect_failure(command, claim, options, root, None, &error, true)?
+        }
+        Err(error) => effect_failure(command, claim, options, root, None, &error, true)?,
+    };
+    journal.queue_outcome(&result)?;
+    flush_outbox(host).await
+}
+
+async fn handle_refresh(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> Result<()> {
+    let journal = host.journal;
+    let claim = host.claim;
+    let root = command.native_root_id.clone();
+    let session_id = match native_interactions::validate_target(command, "session_id") {
+        Ok(session_id) => session_id,
+        Err(error) => return queue_rejected(host, command, options, root, &error).await,
+    };
+    let after_sequence = match command.input.get("after_sequence") {
+        None => 0,
+        Some(value) => match value.as_u64() {
+            Some(sequence) => sequence,
+            None => {
+                let error = Error::new(
+                    "INVALID_NATIVE_INTERACTION",
+                    "after_sequence must be a nonnegative integer",
+                );
+                return queue_rejected(host, command, options, root, &error).await;
+            }
+        },
+    };
+    let (native, _) = match NativeClient::connect(options).await {
+        Ok(value) => value,
+        Err(error) => {
+            let result = outcome(
+                command,
+                claim,
+                EffectOutcome::Unknown,
+                options,
+                root,
+                None,
+                diagnostic(&error),
+            )?;
+            journal.queue_outcome(&result)?;
+            return flush_outbox(host).await;
+        }
+    };
+    let page = match native_interactions::read_interaction_page(
+        &native,
+        command,
+        options,
+        &session_id,
+        after_sequence,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            let result = outcome(
+                command,
+                claim,
+                EffectOutcome::Unknown,
+                options,
+                root,
+                None,
+                diagnostic(&error),
+            )?;
+            journal.queue_outcome(&result)?;
+            return flush_outbox(host).await;
+        }
+    };
+    journal.queue_observation(
+        &page.event_id,
+        json!({
+            "event_id":page.event_id,
+            "state":page.observation
+        }),
+    )?;
+    // A successful module.observe call is the cursor-advance boundary. The
+    // Store supplies this acknowledged position on the next refresh command.
+    flush_outbox(host).await?;
+    let state = if page.coverage == "gap" {
+        EffectOutcome::Unknown
+    } else {
+        EffectOutcome::Applied
+    };
+    let result = outcome(
+        command,
+        claim,
+        state,
+        options,
+        root,
+        None,
+        json!({
+            "completion_condition":"native_interaction_observation",
+            "observation_event_id":page.event_id,
+            "session_id":session_id,
+            "after_sequence":page.after_sequence,
+            "through_sequence":page.through_sequence,
+            "next_after_sequence":page.through_sequence,
+            "has_more":page.has_more,
+            "coverage":page.coverage,
+            "pending_question_count":page.pending_questions,
+            "pending_permission_count":page.pending_permissions,
+            "native_replay":false
+        }),
+    )?;
+    journal.queue_outcome(&result)?;
     flush_outbox(host).await
 }
 
@@ -1481,55 +1940,52 @@ async fn handle_reconcile(
             && target_intent.native_scope_key == options.scope_key()
             && target_intent.route_sha256 == digest_json(&serde_json::to_value(options)?)?
         {
-            if let Ok((native, _)) = NativeClient::connect(options).await {
-                let evidence = match target_intent.method.as_str() {
+            let evidence = match NativeClient::connect(options).await {
+                Ok((native, _)) => match target_intent.method.as_str() {
                     "agent.open" => native
                         .reconcile_open(target_intent, options)
                         .await
                         .map(|()| None),
-                    "task.dispatch" | "agent.send" => native
+                    "task.dispatch" | "agent.send" | "native.opencode.loop_step" => native
                         .reconcile_input(target_intent, options)
                         .await
                         .map(Some),
+                    "agent.reply" => native_interactions::reconcile_reply(
+                        &native,
+                        command,
+                        options,
+                        target_intent,
+                    )
+                    .await
+                    .map(|()| None),
                     _ => Err(Error::new(
                         "NATIVE_EVIDENCE_UNAVAILABLE",
                         "saved method is outside the readback subset",
                     )),
-                };
-                match evidence {
-                    Ok(input_evidence) => {
-                        if target_can_settle {
-                            let target_outcome = link_reconcile_target(
-                                applied_from_intent(target_intent, input_evidence)?,
-                                &command.operation_id,
-                            )?;
-                            journal.queue_outcome(&target_outcome)?;
-                            resolved = true;
-                        } else {
-                            resolved = target_already_applied;
-                        }
-                    }
-                    Err(error) => {
-                        if target_history.outcome.is_none() {
-                            let target_outcome = link_reconcile_target(
-                                unknown_from_intent(target_intent, &error.code)?,
-                                &command.operation_id,
-                            )?;
-                            journal.queue_outcome(&target_outcome)?;
-                        }
+                },
+                Err(error) => Err(error),
+            };
+            match evidence {
+                Ok(input_evidence) => {
+                    if target_can_settle {
+                        let target_outcome = link_reconcile_target(
+                            applied_from_intent(target_intent, input_evidence)?,
+                            &command.operation_id,
+                        )?;
+                        journal.queue_outcome(&target_outcome)?;
+                        resolved = true;
+                    } else {
+                        resolved = target_already_applied;
                     }
                 }
-            } else {
-                if target_history.outcome.is_none() {
-                    let error = Error::new(
-                        "NATIVE_READ_FAILED",
-                        "native service was unavailable for readback",
-                    );
-                    let target_outcome = link_reconcile_target(
-                        unknown_from_intent(target_intent, &error.code)?,
-                        &command.operation_id,
-                    )?;
-                    journal.queue_outcome(&target_outcome)?;
+                Err(error) => {
+                    if target_history.outcome.is_none() {
+                        let target_outcome = link_reconcile_target(
+                            unknown_from_intent(target_intent, &error.code)?,
+                            &command.operation_id,
+                        )?;
+                        journal.queue_outcome(&target_outcome)?;
+                    }
                 }
             }
         } else {
@@ -1610,26 +2066,45 @@ fn applied_from_intent(
     intent: &OperationIntent,
     input_evidence: Option<InputEvidence>,
 ) -> Result<RuntimeOutcome> {
-    let (completion_condition, evidence, input_id) = match input_evidence {
-        None => ("native_session_created", "exact_session_readback", None),
-        Some(InputEvidence::InboxReadback) => (
-            "native_input_admitted",
-            "inbox_readback",
-            intent.native_input_id.clone(),
-        ),
-        Some(InputEvidence::ProjectedMessageReadback) => (
-            "native_input_admitted",
-            "projected_message_readback",
-            intent.native_input_id.clone(),
-        ),
-    };
+    let (completion_condition, evidence, input_id, admitted_sequence, prompted_sequence) =
+        match input_evidence {
+            None => (
+                "native_session_created",
+                "exact_session_readback",
+                None,
+                None,
+                None,
+            ),
+            Some(evidence) => (
+                "native_input_admitted",
+                "durable_session_history",
+                intent.native_input_id.clone(),
+                evidence.admitted_sequence,
+                evidence.prompted_sequence,
+            ),
+        };
     let is_input = input_id.is_some();
+    let delivery = if is_input {
+        Some(
+            native::native_delivery_for_method(&intent.method).ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "saved input intent has no recognized native delivery",
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     let mut details = if is_input {
         json!({
             "completion_condition":completion_condition,
             "evidence":evidence,
             "selected_model":intent.model.clone(),
-            "delivery":"queue",
+            "delivery":delivery,
+            "execution_boundary":if prompted_sequence.is_some() { "native_input_promoted" } else if delivery == Some("steer") { "native_safe_next_loop_step" } else { "queued_next_turn" },
+            "admitted_sequence":admitted_sequence,
+            "promoted_sequence":prompted_sequence,
             "execution_complete":false,
             "native_replay":false
         })
@@ -1819,7 +2294,10 @@ impl<'a> HostSession<'a> {
         let mut last_error = Error::new("HOST_UNAVAILABLE", "module hello was not acknowledged");
         for (attempt, backoff_ms) in ACK_BACKOFF_MS.into_iter().enumerate() {
             match self.open_link().await {
-                Ok(_) => return Ok(()),
+                Ok(link) => {
+                    *self.ipc_link.lock().await = Some(link);
+                    return Ok(());
+                }
                 Err(error) => last_error = error,
             }
             if attempt + 1 < ACK_ATTEMPTS {
@@ -1832,12 +2310,29 @@ impl<'a> HostSession<'a> {
         ))
     }
 
-    /// Each authenticated connection receives a fresh principal link ID.
-    /// Rebind it with typed module.hello and perform the application RPC on
-    /// that same connection so Store's link-scoped admission remains valid.
+    /// Reuse the authenticated, hello-bound link for ordinary RPCs. A
+    /// transport-ambiguous exchange retires it; a later saved-receipt retry
+    /// establishes and hello-binds a fresh link before resending those bytes.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let mut link = self.open_link().await?;
-        module_link::call(&mut link, method, params).await
+        let mut saved = self.ipc_link.lock().await;
+        if saved.is_none() {
+            *saved = Some(self.open_link().await?);
+        }
+        let link = saved
+            .as_mut()
+            .ok_or_else(|| Error::new("HOST_UNAVAILABLE", "module IPC link was not opened"))?;
+        match module_link::call(link, method, params).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if matches!(
+                    error.code.as_str(),
+                    "OUTCOME_UNKNOWN" | "PROTOCOL_ERROR" | "DISCONNECTED"
+                ) {
+                    *saved = None;
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn call_recorded_retry(&self, method: &str, params: Value) -> Result<()> {
@@ -1874,6 +2369,7 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
         for (path, item) in items {
             match item.kind.as_str() {
                 "outcome" => {
+                    let mut acknowledged_now = false;
                     let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
                         Error::new("ADAPTER_OUTBOX", "saved outcome has no operation ID")
                     })?;
@@ -1883,12 +2379,16 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
                         host.call_recorded_retry("module.outcome", item.payload.clone())
                             .await?;
                         journal.acknowledge_outcome(&item.payload)?;
+                        acknowledged_now = true;
                     }
                     remember_root_from_outcome(host.config, journal, &item.payload)?;
                     if let Some(root) = item.payload["native_root_id"].as_str() {
                         host.set_root_hint(root)?;
                     }
                     journal.remove_pending(&path)?;
+                    if acknowledged_now && journal.retention_pass_due_after_ack() {
+                        attempt_journal_retention(host);
+                    }
                 }
                 "observation" => {
                     host.call_recorded_retry("module.observe", item.payload.clone())
@@ -1896,6 +2396,7 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
                     journal.remove_pending(&path)?;
                 }
                 "result" => {
+                    let mut acknowledged_now = false;
                     let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
                         Error::new("ADAPTER_OUTBOX", "saved result page has no operation ID")
                     })?;
@@ -1905,12 +2406,16 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
                         host.call_recorded_retry("module.result", item.payload.clone())
                             .await?;
                         journal.acknowledge_result(&item.payload)?;
+                        acknowledged_now = true;
                     }
                     if let Some(root) = item.payload["page"]["source"]["native_session_id"].as_str()
                     {
                         host.set_root_hint(root)?;
                     }
                     journal.remove_pending(&path)?;
+                    if acknowledged_now && journal.retention_pass_due_after_ack() {
+                        attempt_journal_retention(host);
+                    }
                 }
                 _ => {
                     return Err(Error::new(
@@ -1920,6 +2425,24 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+fn attempt_journal_retention(host: &HostSession<'_>) {
+    match host.journal.reclaim_acknowledged(
+        &host.config.binding_id,
+        host.config.generation,
+        &host.config.native_options.scope_key(),
+    ) {
+        Ok(summary) if summary.reclaimed > 0 => eprintln!(
+            "OpenCode acknowledged journal retention reclaimed {} operation(s)",
+            summary.reclaimed
+        ),
+        Ok(summary) if !summary.complete => {
+            eprintln!("OpenCode journal retention deferred at its bounded delete batch")
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("OpenCode journal retention deferred after {}", error.code),
     }
 }
 

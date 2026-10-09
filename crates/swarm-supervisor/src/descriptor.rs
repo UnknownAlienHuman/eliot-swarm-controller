@@ -31,7 +31,8 @@ struct InstallReceipt {
     artifact_id: String,
     version: String,
     build_id: Option<String>,
-    source_file: PathBuf,
+    #[serde(rename = "source_file")]
+    _source_file: PathBuf,
     installed_file: PathBuf,
     source_sha256: String,
     staged_sha256: String,
@@ -42,7 +43,8 @@ struct InstallReceipt {
 
 /// Load one exact installed descriptor under an explicitly configured root.
 /// The unsigned receipt is consistency evidence only; executable bytes are
-/// independently hashed before Store registration by `register_descriptor`.
+/// independently hashed under that root. The receipt's source_file is
+/// install-time provenance and is never reopened at runtime.
 pub fn load_installed_descriptor(
     descriptor_path: &Path,
     install_root: &Path,
@@ -109,13 +111,6 @@ pub fn load_installed_descriptor(
         return Err(Error::new(
             "MODULE_INSTALL_RECEIPT_MISMATCH",
             "descriptor, install receipt, executable path, or installed bytes do not match exactly",
-        ));
-    }
-    let source_file = checked_existing_file(&receipt.source_file, "source executable")?;
-    if hash_file_sha256(&source_file)? != receipt.source_sha256 {
-        return Err(Error::new(
-            "MODULE_INSTALL_RECEIPT_MISMATCH",
-            "source executable bytes do not match the install receipt",
         ));
     }
     for digest in [
@@ -209,23 +204,6 @@ fn reject_link_ancestors(path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn checked_existing_file(path: &Path, field: &str) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        return Err(Error::new(
-            "MODULE_INSTALL_PATH_INVALID",
-            format!("{field} path must be absolute"),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if is_link_or_reparse(&metadata) || !metadata.is_file() {
-        return Err(Error::new(
-            "MODULE_INSTALL_PATH_INVALID",
-            format!("{field} path must be a regular file without a link leaf"),
-        ));
-    }
-    fs::canonicalize(path).map_err(Into::into)
 }
 
 #[cfg(windows)]

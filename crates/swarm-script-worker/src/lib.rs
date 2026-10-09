@@ -2,8 +2,8 @@
 //!
 //! This crate owns no Store, cursor, scheduler, manager credential, or effect
 //! API. It accepts the kernel's immutable Work receipt, waits for the existing
-//! ready/Go protocol, verifies a plan materialized after Go, and launches one
-//! interpreter inside the existing script process Group.
+//! ready/start-decision protocol, verifies a plan materialized after Allow,
+//! and launches one interpreter inside the existing script process Group.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -12,11 +12,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -44,6 +44,11 @@ use swarm_scripts::{
 const CONTROL_LIMIT: usize = 16 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const START_GATE_TIMEOUT: Duration = Duration::from_secs(120);
+const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+const CAPTURE_STOP_GRACE: Duration = Duration::from_millis(250);
+const TERMINATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_TERMINATION_ATTEMPTS: u8 = 3;
 const MAX_INTERPRETER_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +58,61 @@ pub struct ExecutorPin {
     pub sha256: String,
     pub artifact_id: String,
     pub version: String,
+}
+
+/// The one immutable, identity-bound authorization for a ScriptRun to start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScriptStartDecision {
+    Allow {
+        schema_version: u16,
+        run_id: String,
+        operation_id: String,
+        token: String,
+        decided_at_ms: i64,
+    },
+    Deny {
+        schema_version: u16,
+        run_id: String,
+        operation_id: String,
+        token: String,
+        error_code: String,
+        decided_at_ms: i64,
+    },
+}
+
+/// A fail-closed read of current or pre-migration ScriptRun authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartDecisionRead {
+    Pending,
+    Current(ScriptStartDecision),
+    LegacyAllow,
+    LegacyDeny { error_code: String },
+    Ambiguous,
+}
+
+/// Readback classification for a first-writer-wins decision publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartDecisionPublish {
+    Retained(StartDecisionRead),
+    Conflict(StartDecisionRead),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyGoReceipt {
+    run_id: String,
+    operation_id: String,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDenyReceipt {
+    run_id: String,
+    operation_id: String,
+    token: String,
+    error_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,7 +197,7 @@ struct WorkerReceipt {
     data_dir: PathBuf,
 }
 
-/// Private post-Go plan. It carries execution inputs only; Store-derived
+/// Private post-Allow plan. It carries execution inputs only; Store-derived
 /// automation attribution and manager/source authorization remain in Store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,12 +245,31 @@ struct Completion {
     #[serde(default)]
     controller_effects: Vec<ScriptEffectRequest>,
     error_code: Option<String>,
+    process_facts: Value,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 struct Captured {
+    started: bool,
     bytes: Vec<u8>,
+    bytes_observed: u64,
     overflow: bool,
+    capture_complete: bool,
+    capture_error: Option<String>,
+}
+
+struct CaptureTask {
+    reader: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    captured: Arc<Mutex<Captured>>,
+}
+
+#[derive(Default)]
+struct ProcessTermination {
+    started: Option<Instant>,
+    last_request: Option<Instant>,
+    attempts: u8,
+    request_unconfirmed: bool,
 }
 
 struct CompletionPublication<'a> {
@@ -203,6 +282,17 @@ struct CompletionPublication<'a> {
     started_at_ms: Option<i64>,
     exit_code: Option<i32>,
     process: &'a Value,
+    process_facts: Value,
+}
+
+struct CleanupPendingPublication<'a> {
+    process: &'a Value,
+    stdout_capture: &'a Captured,
+    stderr_capture: &'a Captured,
+    process_facts: Value,
+    started_at_ms: Option<i64>,
+    exit_code: Option<i32>,
+    error_code: Option<String>,
 }
 
 /// Materialize the execution plan only after Store has durably acknowledged
@@ -219,10 +309,11 @@ pub fn materialize_after_go(receipt_path: &Path) -> Result<String> {
     let dir = directory(&work.data_dir, &work.run_id)?;
     ensure_run_directory(&work.data_dir, &dir)?;
     verify_ready_worker(&work, &dir)?;
-    verify_go(&work, &dir)?;
+    verify_start_allow(&work, &dir)?;
     if receipt_exists(&dir.join("started.json"))?
         || receipt_exists(&dir.join("terminal.json"))?
         || receipt_exists(&dir.join("completion.json"))?
+        || receipt_exists(&dir.join("cleanup-pending.json"))?
     {
         return Err(Error::new(
             "SCRIPT_RECOVERY_REQUIRED",
@@ -316,6 +407,7 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
         || receipt_exists(&dir.join("terminal.json"))?
         || receipt_exists(&dir.join("worker.json"))?
         || receipt_exists(&dir.join("started.json"))?
+        || receipt_exists(&dir.join("cleanup-pending.json"))?
     {
         return Err(Error::new(
             "SCRIPT_RECOVERY_REQUIRED",
@@ -331,32 +423,48 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
         "control_version":1,
         "process":group.identity
     });
+    let mut group = Some(group);
     write_once(
         &dir.join("worker.json"),
         &canonical_json(&identity)?.into_bytes(),
     )?;
 
     if let Err(error) = stage_bundle(&work, &dir) {
-        return finish_worker_error(&work, &group, &identity, error.code, "failed");
+        return finish_worker_error(
+            &work,
+            group.as_ref().expect("group retained before execution"),
+            &identity,
+            error.code,
+            "failed",
+        );
     }
-    if let Err(error) = wait_for_go(&work, &dir) {
-        return finish_worker_error(&work, &group, &identity, error.code, "failed");
+    if let Err(error) = wait_for_start_decision(&work, &dir) {
+        return finish_worker_error(
+            &work,
+            group.as_ref().expect("group retained before execution"),
+            &identity,
+            error.code,
+            "failed",
+        );
     }
     let plan = match wait_for_plan(&work, &work_sha256, &dir) {
         Ok(plan) => plan,
-        Err(error) => return finish_worker_error(&work, &group, &identity, error.code, "failed"),
-    };
-    match execute(&work, &plan, &dir, &group, &identity) {
-        Ok(()) => Ok(()),
         Err(error) => {
-            let started = receipt_exists(&dir.join("started.json"))?;
-            let state = if started || error.code == "SCRIPT_CHILD_STARTED" {
-                "incomplete"
-            } else {
-                "failed"
-            };
-            finish_worker_error(&work, &group, &identity, error.code, state)
+            return finish_worker_error(
+                &work,
+                group.as_ref().expect("group retained before execution"),
+                &identity,
+                error.code,
+                "failed",
+            );
         }
+    };
+    match execute(&work, &plan, &dir, &mut group, &identity) {
+        Ok(()) => Ok(()),
+        Err(error) => match group.as_ref() {
+            Some(group) => finish_worker_error(&work, group, &identity, error.code, "failed"),
+            None => Err(error),
+        },
     }
 }
 
@@ -708,25 +816,314 @@ fn verify_ready_worker(work: &ScriptWork, dir: &Path) -> Result<()> {
     match lock.try_lock() {
         Ok(()) => Err(Error::new(
             "SCRIPT_WORKER_LOST",
-            "worker lock is free before Go",
+            "worker lock is free before the start decision",
         )),
         Err(std::fs::TryLockError::WouldBlock) => Ok(()),
         Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
 }
 
-fn verify_go(work: &ScriptWork, dir: &Path) -> Result<()> {
-    let go = read_json(&dir.join("go.json"))?;
-    if go["run_id"] != work.run_id
-        || go["operation_id"] != work.operation_id
-        || go["token"] != work.token
+/// Read the retained authorization, including read-only compatibility for old
+/// runs. The expected identity must match every present receipt exactly.
+pub fn read_start_decision(
+    dir: &Path,
+    run_id: &str,
+    operation_id: &str,
+    token: &str,
+) -> Result<StartDecisionRead> {
+    if !valid_start_identity_part(run_id)
+        || !valid_start_identity_part(operation_id)
+        || !valid_start_identity_part(token)
     {
-        return Err(Error::new(
-            "SCRIPT_START_GATE_INVALID",
-            "Go receipt differs from the admitted ScriptRun",
+        return Err(start_decision_invalid("expected start identity is invalid"));
+    }
+
+    let current_path = dir.join("start-decision.json");
+    let allow_path = dir.join("go.json");
+    let deny_path = dir.join("deny.json");
+    let has_current = receipt_exists(&current_path)?;
+    let has_legacy_allow = receipt_exists(&allow_path)?;
+    let has_legacy_deny = receipt_exists(&deny_path)?;
+    if !has_current && !has_legacy_allow && !has_legacy_deny {
+        return Ok(StartDecisionRead::Pending);
+    }
+
+    let current = if has_current {
+        let value = read_start_decision_json(&current_path)?;
+        let decision: ScriptStartDecision = serde_json::from_value(value)
+            .map_err(|_| start_decision_invalid("current decision cannot be decoded"))?;
+        validate_start_decision(&decision, run_id, operation_id, token)?;
+        Some(decision)
+    } else {
+        None
+    };
+    if has_legacy_allow {
+        validate_legacy_go(&allow_path, run_id, operation_id, token)?;
+    }
+    let legacy_deny = if has_legacy_deny {
+        Some(validate_legacy_deny(
+            &deny_path,
+            run_id,
+            operation_id,
+            token,
+        )?)
+    } else {
+        None
+    };
+
+    if current.is_some() && (has_legacy_allow || has_legacy_deny) {
+        return Ok(StartDecisionRead::Ambiguous);
+    }
+    if let Some(decision) = current {
+        return Ok(StartDecisionRead::Current(decision));
+    }
+    match (has_legacy_allow, legacy_deny) {
+        (true, Some(_)) => Ok(StartDecisionRead::Ambiguous),
+        (true, None) => Ok(StartDecisionRead::LegacyAllow),
+        (false, Some(error_code)) => Ok(StartDecisionRead::LegacyDeny { error_code }),
+        (false, None) => Ok(StartDecisionRead::Pending),
+    }
+}
+
+/// Publish one immutable decision and return the exact retained winner. A
+/// competing intent is reported as Conflict and never replaces the winner.
+pub fn publish_start_decision(
+    dir: &Path,
+    decision: ScriptStartDecision,
+) -> Result<StartDecisionPublish> {
+    let (run_id, operation_id, token) = start_decision_identity(&decision);
+    validate_start_decision(&decision, run_id, operation_id, token)?;
+
+    let existing = read_start_decision(dir, run_id, operation_id, token)?;
+    if existing != StartDecisionRead::Pending {
+        return Ok(if start_read_matches_intent(&existing, &decision) {
+            StartDecisionPublish::Retained(existing)
+        } else {
+            StartDecisionPublish::Conflict(existing)
+        });
+    }
+
+    let bytes = canonical_json(&serde_json::to_value(&decision)?)?.into_bytes();
+    let write_result = write_private_new(&dir.join("start-decision.json"), &bytes);
+    let retained = read_start_decision(dir, run_id, operation_id, token)?;
+    if retained != StartDecisionRead::Pending {
+        return Ok(if start_read_matches_intent(&retained, &decision) {
+            StartDecisionPublish::Retained(retained)
+        } else {
+            StartDecisionPublish::Conflict(retained)
+        });
+    }
+    write_result?;
+    Err(Error::new(
+        "SCRIPT_START_DECISION_MISSING",
+        "durable decision publication returned without a retained record",
+    ))
+}
+
+fn validate_start_decision(
+    decision: &ScriptStartDecision,
+    run_id: &str,
+    operation_id: &str,
+    token: &str,
+) -> Result<()> {
+    let invalid = match decision {
+        ScriptStartDecision::Allow {
+            schema_version,
+            run_id: actual_run_id,
+            operation_id: actual_operation_id,
+            token: actual_token,
+            decided_at_ms,
+        } => {
+            *schema_version != 1
+                || actual_run_id != run_id
+                || actual_operation_id != operation_id
+                || actual_token != token
+                || *decided_at_ms < 0
+        }
+        ScriptStartDecision::Deny {
+            schema_version,
+            run_id: actual_run_id,
+            operation_id: actual_operation_id,
+            token: actual_token,
+            error_code,
+            decided_at_ms,
+        } => {
+            *schema_version != 1
+                || actual_run_id != run_id
+                || actual_operation_id != operation_id
+                || actual_token != token
+                || !valid_start_error_code(error_code)
+                || *decided_at_ms < 0
+        }
+    };
+    if invalid
+        || !valid_start_identity_part(run_id)
+        || !valid_start_identity_part(operation_id)
+        || !valid_start_identity_part(token)
+    {
+        return Err(start_decision_invalid(
+            "decision schema, identity, timestamp, or denial code is invalid",
         ));
     }
     Ok(())
+}
+
+fn validate_legacy_go(path: &Path, run_id: &str, operation_id: &str, token: &str) -> Result<()> {
+    let value = read_start_decision_json(path)?;
+    let receipt: LegacyGoReceipt = serde_json::from_value(value)
+        .map_err(|_| start_decision_invalid("legacy allow receipt cannot be decoded"))?;
+    if receipt.run_id != run_id || receipt.operation_id != operation_id || receipt.token != token {
+        return Err(start_decision_invalid(
+            "legacy allow receipt identity differs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_legacy_deny(
+    path: &Path,
+    run_id: &str,
+    operation_id: &str,
+    token: &str,
+) -> Result<String> {
+    let value = read_start_decision_json(path)?;
+    let receipt: LegacyDenyReceipt = serde_json::from_value(value)
+        .map_err(|_| start_decision_invalid("legacy denial receipt cannot be decoded"))?;
+    if receipt.run_id != run_id
+        || receipt.operation_id != operation_id
+        || receipt.token != token
+        || !valid_start_error_code(&receipt.error_code)
+    {
+        return Err(start_decision_invalid(
+            "legacy denial receipt identity or error code differs",
+        ));
+    }
+    Ok(receipt.error_code)
+}
+
+fn start_decision_identity(decision: &ScriptStartDecision) -> (&str, &str, &str) {
+    match decision {
+        ScriptStartDecision::Allow {
+            run_id,
+            operation_id,
+            token,
+            ..
+        }
+        | ScriptStartDecision::Deny {
+            run_id,
+            operation_id,
+            token,
+            ..
+        } => (run_id, operation_id, token),
+    }
+}
+
+fn start_read_matches_intent(
+    retained: &StartDecisionRead,
+    requested: &ScriptStartDecision,
+) -> bool {
+    match (retained, requested) {
+        (StartDecisionRead::Current(existing), requested) => same_start_intent(existing, requested),
+        (StartDecisionRead::LegacyAllow, ScriptStartDecision::Allow { .. }) => true,
+        (
+            StartDecisionRead::LegacyDeny { error_code },
+            ScriptStartDecision::Deny {
+                error_code: requested_code,
+                ..
+            },
+        ) => error_code == requested_code,
+        _ => false,
+    }
+}
+
+fn same_start_intent(left: &ScriptStartDecision, right: &ScriptStartDecision) -> bool {
+    match (left, right) {
+        (
+            ScriptStartDecision::Allow {
+                run_id: left_run,
+                operation_id: left_operation,
+                token: left_token,
+                ..
+            },
+            ScriptStartDecision::Allow {
+                run_id: right_run,
+                operation_id: right_operation,
+                token: right_token,
+                ..
+            },
+        ) => {
+            left_run == right_run && left_operation == right_operation && left_token == right_token
+        }
+        (
+            ScriptStartDecision::Deny {
+                run_id: left_run,
+                operation_id: left_operation,
+                token: left_token,
+                error_code: left_code,
+                ..
+            },
+            ScriptStartDecision::Deny {
+                run_id: right_run,
+                operation_id: right_operation,
+                token: right_token,
+                error_code: right_code,
+                ..
+            },
+        ) => {
+            left_run == right_run
+                && left_operation == right_operation
+                && left_token == right_token
+                && left_code == right_code
+        }
+        _ => false,
+    }
+}
+
+fn valid_start_identity_part(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| !byte.is_ascii_control())
+}
+
+fn valid_start_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn read_start_decision_json(path: &Path) -> Result<Value> {
+    let bytes = read_bytes(path, CONTROL_LIMIT as u64)
+        .map_err(|_| start_decision_invalid("decision receipt is not a bounded regular file"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| start_decision_invalid("decision receipt contains invalid JSON"))
+}
+
+fn start_decision_invalid(message: &str) -> Error {
+    Error::new("SCRIPT_START_DECISION_INVALID", message)
+}
+
+fn verify_start_allow(work: &ScriptWork, dir: &Path) -> Result<()> {
+    match read_start_decision(dir, &work.run_id, &work.operation_id, &work.token)? {
+        StartDecisionRead::Current(ScriptStartDecision::Allow { .. })
+        | StartDecisionRead::LegacyAllow => Ok(()),
+        StartDecisionRead::Current(ScriptStartDecision::Deny { error_code, .. })
+        | StartDecisionRead::LegacyDeny { error_code } => Err(Error::new(
+            error_code,
+            "script start was denied by the retained Store decision",
+        )),
+        StartDecisionRead::Pending => Err(Error::new(
+            "SCRIPT_START_DECISION_MISSING",
+            "Store has not retained a start decision",
+        )),
+        StartDecisionRead::Ambiguous => Err(Error::new(
+            "SCRIPT_START_DECISION_AMBIGUOUS",
+            "multiple start decisions are retained for this ScriptRun",
+        )),
+    }
 }
 
 fn make_plan(work: &ScriptWork, work_sha256: &str, dir: &Path) -> Result<ScriptWorkerPlan> {
@@ -788,42 +1185,37 @@ fn validate_plan_against_work(
     {
         return Err(Error::new(
             "SCRIPT_PLAN_INVALID",
-            "post-Go plan differs from immutable Work or interpreter profile",
+            "post-Allow plan differs from immutable Work or interpreter profile",
         ));
     }
     Ok(())
 }
 
-fn wait_for_go(work: &ScriptWork, dir: &Path) -> Result<()> {
-    let gate = dir.join("go.json");
-    let denial = dir.join("deny.json");
+fn wait_for_start_decision(work: &ScriptWork, dir: &Path) -> Result<()> {
     let deadline = Instant::now() + START_GATE_TIMEOUT;
     loop {
-        if receipt_exists(&gate)? {
-            return verify_go(work, dir);
-        }
-        if receipt_exists(&denial)? {
-            let denied = read_json(&denial)?;
-            if denied["run_id"] != work.run_id
-                || denied["operation_id"] != work.operation_id
-                || denied["token"] != work.token
-            {
+        match read_start_decision(dir, &work.run_id, &work.operation_id, &work.token)? {
+            StartDecisionRead::Current(ScriptStartDecision::Allow { .. })
+            | StartDecisionRead::LegacyAllow => return Ok(()),
+            StartDecisionRead::Current(ScriptStartDecision::Deny { error_code, .. })
+            | StartDecisionRead::LegacyDeny { error_code } => {
                 return Err(Error::new(
-                    "SCRIPT_START_DENIAL_INVALID",
-                    "denial receipt identity differs",
+                    error_code,
+                    "script start was denied by the retained Store decision",
                 ));
             }
-            return Err(Error::new(
-                denied["error_code"]
-                    .as_str()
-                    .unwrap_or("SCRIPT_START_DENIED"),
-                "script start was denied by Store",
-            ));
+            StartDecisionRead::Ambiguous => {
+                return Err(Error::new(
+                    "SCRIPT_START_DECISION_AMBIGUOUS",
+                    "multiple start decisions are retained for this ScriptRun",
+                ));
+            }
+            StartDecisionRead::Pending => {}
         }
         if Instant::now() >= deadline {
             return Err(Error::new(
                 "SCRIPT_START_GATE_TIMEOUT",
-                "Store did not publish Go",
+                "Store did not publish a start decision",
             ));
         }
         thread::sleep(POLL_INTERVAL);
@@ -886,7 +1278,7 @@ fn execute(
     work: &ScriptWork,
     plan: &ScriptWorkerPlan,
     dir: &Path,
-    group: &Group,
+    group_slot: &mut Option<Group>,
     identity: &Value,
 ) -> Result<()> {
     let input = validate_invocation_size(&plan.invocation).map_err(script_error)?;
@@ -910,109 +1302,316 @@ fn execute(
     }
     let started_at_ms = now_ms()?;
     let mut child = command.spawn()?;
+    let mut primary_error_code = None::<String>;
     let mut cancellation_failure_reported = false;
     if let Err(error) = write_once(
         &dir.join("started.json"),
         &canonical_json(&json!({"pid":child.id(),"started_at_ms":started_at_ms,"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}))?.into_bytes(),
     ) {
-        cancel_children_and_record(
-            work,
-            group,
-            identity,
-            &mut cancellation_failure_reported,
-        );
-        return Err(Error::new("SCRIPT_CHILD_STARTED", error.to_string()));
+        let _ = error;
+        primary_error_code = Some("SCRIPT_START_RECEIPT_FAILED".to_owned());
     }
     let overflow = Arc::new(AtomicBool::new(false));
-    let stdout = child
+    let stdout_flag = Arc::clone(&overflow);
+    let stdout_reader = child
         .stdout
         .take()
-        .ok_or_else(|| Error::new("SCRIPT_PIPE_FAILED", "script stdout pipe is missing"))?;
-    let stderr = child
+        .and_then(|pipe| start_capture(pipe, MAX_RESULT_BYTES, stdout_flag).ok());
+    let stderr_flag = Arc::clone(&overflow);
+    let stderr_reader = child
         .stderr
         .take()
-        .ok_or_else(|| Error::new("SCRIPT_PIPE_FAILED", "script stderr pipe is missing"))?;
-    let stdout_flag = Arc::clone(&overflow);
-    let stdout_reader = thread::Builder::new()
-        .name("script-stdout".into())
-        .spawn(move || read_bounded(stdout, MAX_RESULT_BYTES, stdout_flag))?;
-    let stderr_flag = Arc::clone(&overflow);
-    let stderr_reader = thread::Builder::new()
-        .name("script-stderr".into())
-        .spawn(move || read_bounded(stderr, MAX_STDERR_BYTES, stderr_flag))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::new("SCRIPT_PIPE_FAILED", "script stdin pipe is missing"))?;
-    let input_writer = thread::Builder::new()
-        .name("script-stdin".into())
-        .spawn(move || stdin.write_all(&input))?;
+        .and_then(|pipe| start_capture(pipe, MAX_STDERR_BYTES, stderr_flag).ok());
+    let input_writer = child.stdin.take().and_then(|mut stdin| {
+        thread::Builder::new()
+            .name("script-stdin".into())
+            .spawn(move || stdin.write_all(&input))
+            .ok()
+    });
 
     let deadline =
         Instant::now() + Duration::from_millis(plan.process.timeout_ms.min(MAX_SCRIPT_DURATION_MS));
     let mut timed_out = false;
-    let mut status = None;
+    let mut direct_exit = None::<Option<i32>>;
+    let mut direct_observation_unknown = false;
+    let mut termination = ProcessTermination::default();
+    if stdout_reader.is_none() || stderr_reader.is_none() || input_writer.is_none() {
+        primary_error_code.get_or_insert_with(|| "SCRIPT_PIPE_SETUP_FAILED".to_owned());
+    }
+    if primary_error_code.is_some()
+        && let Some(group) = group_slot.as_ref()
+    {
+        request_script_termination(
+            work,
+            group,
+            identity,
+            &mut termination,
+            &mut cancellation_failure_reported,
+        );
+    }
     loop {
-        if overflow.load(Ordering::Acquire) {
-            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
-            break;
+        if overflow.load(Ordering::Acquire)
+            && termination.started.is_none()
+            && let Some(group) = group_slot.as_ref()
+        {
+            request_script_termination(
+                work,
+                group,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
         }
         match child.try_wait() {
             Ok(Some(exit)) => {
-                status = Some(exit);
+                direct_exit = Some(exit.code());
                 break;
             }
             Ok(None) => {}
-            Err(error) => {
-                cancel_children_and_record(
-                    work,
-                    group,
-                    identity,
-                    &mut cancellation_failure_reported,
-                );
-                return Err(error.into());
+            Err(_) => {
+                direct_observation_unknown = true;
+                if primary_error_code.is_none() {
+                    primary_error_code = Some("SCRIPT_PROCESS_OBSERVATION_FAILED".to_owned());
+                }
+                if termination.started.is_none()
+                    && let Some(group) = group_slot.as_ref()
+                {
+                    request_script_termination(
+                        work,
+                        group,
+                        identity,
+                        &mut termination,
+                        &mut cancellation_failure_reported,
+                    );
+                }
             }
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
+        }
+        if (timed_out || termination.started.is_some())
+            && let Some(group) = group_slot.as_ref()
+        {
+            if termination.started.is_none() {
+                request_script_termination(
+                    work,
+                    group,
+                    identity,
+                    &mut termination,
+                    &mut cancellation_failure_reported,
+                );
+            } else {
+                retry_script_termination(
+                    work,
+                    group,
+                    identity,
+                    &mut termination,
+                    &mut cancellation_failure_reported,
+                );
+            }
+        }
+        if termination
+            .started
+            .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
+        {
             break;
         }
         thread::sleep(POLL_INTERVAL);
     }
-    if status.is_none() {
-        status = Some(child.wait()?);
-    }
-    while !group.children_empty()? {
-        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
+    drop(child);
+
+    let mut family_confirmed = false;
+    let mut family_observation_unknown = false;
+    while let Some(group) = group_slot.as_ref() {
+        match group.children_empty() {
+            Ok(true) => {
+                family_confirmed = true;
+                break;
+            }
+            Ok(false) => family_observation_unknown = false,
+            Err(_) => family_observation_unknown = true,
+        }
+        if termination.started.is_none() {
+            request_script_termination(
+                work,
+                group,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
+        } else {
+            retry_script_termination(
+                work,
+                group,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
+        }
+        if termination
+            .started
+            .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
+        {
+            break;
+        }
         thread::sleep(POLL_INTERVAL);
     }
-    group.disarm()?;
-    let writer_result = input_writer
-        .join()
-        .map_err(|_| Error::new("SCRIPT_PIPE_FAILED", "script stdin writer panicked"))?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| Error::new("SCRIPT_PIPE_FAILED", "script stdout reader panicked"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| Error::new("SCRIPT_PIPE_FAILED", "script stderr reader panicked"))?;
-    let exit_code = status.and_then(|status| status.code());
-    let projection = project_completion(
+
+    let process_identity = identity["process"].clone();
+    let mut resource_released = false;
+    if let Some(group) = group_slot.take() {
+        if family_confirmed {
+            resource_released = group.disarm().is_ok();
+        }
+        drop(group);
+    }
+
+    let (stdout, stderr) = finish_captures_bounded(stdout_reader, stderr_reader);
+    let input_writer_started = input_writer.is_some();
+    let mut input_write = finish_input_writer(input_writer);
+    if input_write.is_none() && !input_writer_started {
+        input_write = Some(false);
+    }
+    if input_write != Some(true) && primary_error_code.is_none() {
+        primary_error_code = Some(if input_write.is_none() {
+            "SCRIPT_INPUT_DRAIN_PENDING".to_owned()
+        } else {
+            "SCRIPT_INPUT_WRITE_FAILED".to_owned()
+        });
+    }
+
+    let direct_fact = match direct_exit {
+        Some(exit_code) => json!({"state":"observed","exit_code":exit_code}),
+        None if direct_observation_unknown => json!({"state":"observation_unknown"}),
+        None => json!({"state":"observation_unknown"}),
+    };
+    let family_fact = if family_confirmed {
+        json!({"state":"confirmed","process":process_identity.clone()})
+    } else if family_observation_unknown {
+        json!({"state":"observation_unknown","process":process_identity.clone()})
+    } else {
+        json!({"state":"cleanup_pending","process":process_identity.clone()})
+    };
+    let cleanup_pending = !family_confirmed
+        || !resource_released
+        || !stdout.capture_complete
+        || !stderr.capture_complete
+        || input_write.is_none();
+    let process_facts = json!({
+        "schema_version":1,
+        "direct_exit":direct_fact,
+        "family_departure":family_fact,
+        "stdout_capture":capture_fact(&stdout),
+        "stderr_capture":capture_fact(&stderr),
+        "resource_released":resource_released,
+        "cleanup_pending":cleanup_pending,
+        "timed_out":timed_out,
+        "termination_attempts":termination.attempts,
+        "termination_request_unconfirmed":termination.request_unconfirmed,
+        "input_write_complete":input_write,
+        "primary_error_code":primary_error_code.clone(),
+    });
+
+    if cleanup_pending {
+        return publish_cleanup_pending(
+            work,
+            CleanupPendingPublication {
+                process: &process_identity,
+                stdout_capture: &stdout,
+                stderr_capture: &stderr,
+                process_facts,
+                started_at_ms: Some(started_at_ms),
+                exit_code: direct_exit.flatten(),
+                error_code: primary_error_code,
+            },
+        );
+    }
+
+    let Some(exit_code) = direct_exit else {
+        return publish_completion(
+            work,
+            CompletionPublication {
+                stdout: &stdout.bytes,
+                stderr: &stderr.bytes,
+                result_value: None,
+                controller_effects: &[],
+                error_code: primary_error_code
+                    .or_else(|| Some("SCRIPT_PROCESS_OBSERVATION_UNKNOWN".to_owned())),
+                state: "incomplete",
+                started_at_ms: Some(started_at_ms),
+                exit_code: None,
+                process: &identity["process"],
+                process_facts,
+            },
+        );
+    };
+    if primary_error_code.is_some() {
+        return publish_completion(
+            work,
+            CompletionPublication {
+                stdout: &stdout.bytes,
+                stderr: &stderr.bytes,
+                result_value: None,
+                controller_effects: &[],
+                error_code: primary_error_code,
+                state: "incomplete",
+                started_at_ms: Some(started_at_ms),
+                exit_code,
+                process: &identity["process"],
+                process_facts,
+            },
+        );
+    }
+    let projection = match project_completion(
         ProcessOutcome {
             stdout: &stdout.bytes,
             exit: ProcessExit::Observed { exit_code },
             timed_out,
             output_overflow: stdout.overflow || stderr.overflow,
-            input_failed: writer_result.is_err(),
+            input_failed: input_write != Some(true),
         },
         &work.operation_id,
         &work.run_id,
         &plan.result_schema,
         &plan.granted_effects,
-    )
-    .map_err(script_error)?
-    .ok_or_else(|| Error::new("SCRIPT_OUTCOME_UNKNOWN", "child exit was not observed"))?;
+    ) {
+        Ok(Some(projection)) => projection,
+        Ok(None) => {
+            return publish_completion(
+                work,
+                CompletionPublication {
+                    stdout: &stdout.bytes,
+                    stderr: &stderr.bytes,
+                    result_value: None,
+                    controller_effects: &[],
+                    error_code: Some("SCRIPT_OUTCOME_UNKNOWN".to_owned()),
+                    state: "incomplete",
+                    started_at_ms: Some(started_at_ms),
+                    exit_code,
+                    process: &identity["process"],
+                    process_facts,
+                },
+            );
+        }
+        Err(error) => {
+            let error = script_error(error);
+            return publish_completion(
+                work,
+                CompletionPublication {
+                    stdout: &stdout.bytes,
+                    stderr: &stderr.bytes,
+                    result_value: None,
+                    controller_effects: &[],
+                    error_code: Some(error.code),
+                    state: "incomplete",
+                    started_at_ms: Some(started_at_ms),
+                    exit_code,
+                    process: &identity["process"],
+                    process_facts,
+                },
+            );
+        }
+    };
     publish_completion(
         work,
         CompletionPublication {
@@ -1025,7 +1624,347 @@ fn execute(
             started_at_ms: Some(started_at_ms),
             exit_code: projection.exit_code,
             process: &identity["process"],
+            process_facts,
         },
+    )
+}
+
+fn start_capture<R: PollableRead + Send + 'static>(
+    mut input: R,
+    limit: usize,
+    overflow_signal: Arc<AtomicBool>,
+) -> io::Result<CaptureTask> {
+    input.make_nonblocking()?;
+    let captured = Arc::new(Mutex::new(Captured {
+        started: true,
+        ..Captured::default()
+    }));
+    let thread_capture = Arc::clone(&captured);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let reader = thread::Builder::new()
+        .name("script-output-capture".into())
+        .spawn(move || {
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                if thread_stop.load(Ordering::Acquire) {
+                    capture_set_error(&thread_capture, "capture_drain_timeout");
+                    return;
+                }
+                match input.read_available(&mut buffer) {
+                    Ok(PipeRead::Pending) => thread::sleep(POLL_INTERVAL),
+                    Ok(PipeRead::Eof) => {
+                        capture_lock(&thread_capture).capture_complete = true;
+                        return;
+                    }
+                    Ok(PipeRead::Data(count)) => {
+                        let mut current = capture_lock(&thread_capture);
+                        current.bytes_observed =
+                            current.bytes_observed.saturating_add(count as u64);
+                        let remaining = limit.saturating_sub(current.bytes.len());
+                        let keep = remaining.min(count);
+                        current.bytes.extend_from_slice(&buffer[..keep]);
+                        if keep < count {
+                            current.overflow = true;
+                            overflow_signal.store(true, Ordering::Release);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        capture_set_error(&thread_capture, "capture_read_failed");
+                        return;
+                    }
+                }
+            }
+        })?;
+    Ok(CaptureTask {
+        reader,
+        stop,
+        captured,
+    })
+}
+
+fn capture_lock(captured: &Mutex<Captured>) -> std::sync::MutexGuard<'_, Captured> {
+    captured
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn capture_set_error(captured: &Mutex<Captured>, code: &str) {
+    let mut current = capture_lock(captured);
+    if current.capture_error.is_none() {
+        current.capture_error = Some(code.to_owned());
+    }
+}
+
+fn finish_captures_bounded(
+    stdout: Option<CaptureTask>,
+    stderr: Option<CaptureTask>,
+) -> (Captured, Captured) {
+    let drain_deadline = Instant::now() + CAPTURE_DRAIN_GRACE;
+    while Instant::now() < drain_deadline
+        && (capture_task_pending(&stdout) || capture_task_pending(&stderr))
+    {
+        thread::sleep(POLL_INTERVAL);
+    }
+    let stdout_pending = capture_task_pending(&stdout);
+    let stderr_pending = capture_task_pending(&stderr);
+    if let Some(task) = stdout.as_ref().filter(|_| stdout_pending) {
+        task.stop.store(true, Ordering::Release);
+    }
+    if let Some(task) = stderr.as_ref().filter(|_| stderr_pending) {
+        task.stop.store(true, Ordering::Release);
+    }
+    let stop_deadline = Instant::now() + CAPTURE_STOP_GRACE;
+    while Instant::now() < stop_deadline
+        && (capture_task_pending(&stdout) || capture_task_pending(&stderr))
+    {
+        thread::sleep(POLL_INTERVAL);
+    }
+    (
+        finish_capture_task(stdout, stdout_pending),
+        finish_capture_task(stderr, stderr_pending),
+    )
+}
+
+fn capture_task_pending(task: &Option<CaptureTask>) -> bool {
+    task.as_ref().is_some_and(|task| !task.reader.is_finished())
+}
+
+fn finish_capture_task(task: Option<CaptureTask>, stopped_at_deadline: bool) -> Captured {
+    let Some(task) = task else {
+        return capture_setup_failed();
+    };
+    let join_panicked = if task.reader.is_finished() {
+        task.reader.join().is_err()
+    } else {
+        false
+    };
+    let mut captured = capture_lock(&task.captured).clone();
+    if join_panicked && captured.capture_error.is_none() {
+        captured.capture_error = Some("capture_reader_panicked".to_owned());
+    }
+    if stopped_at_deadline && captured.capture_error.is_none() {
+        captured.capture_error = Some("capture_reader_stop_pending".to_owned());
+    }
+    captured
+}
+
+fn capture_setup_failed() -> Captured {
+    Captured {
+        started: true,
+        capture_error: Some("capture_setup_failed".to_owned()),
+        ..Captured::default()
+    }
+}
+
+fn capture_not_started() -> Captured {
+    Captured {
+        capture_error: Some("capture_not_started".to_owned()),
+        ..Captured::default()
+    }
+}
+
+fn capture_fact(captured: &Captured) -> Value {
+    json!({
+        "state": if !captured.started {"not_started"} else if captured.capture_complete {"complete"} else {"incomplete"},
+        "bytes_retained":captured.bytes.len() as u64,
+        "bytes_observed":captured.bytes_observed,
+        "truncated":captured.overflow,
+        "capture_complete":captured.capture_complete,
+        "capture_error":captured.capture_error.as_deref(),
+    })
+}
+
+fn finish_input_writer(writer: Option<thread::JoinHandle<io::Result<()>>>) -> Option<bool> {
+    let writer = writer?;
+    let deadline = Instant::now() + TERMINATION_GRACE;
+    while !writer.is_finished() && Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if !writer.is_finished() {
+        return None;
+    }
+    Some(matches!(writer.join(), Ok(Ok(()))))
+}
+
+fn request_script_termination(
+    work: &ScriptWork,
+    group: &Group,
+    identity: &Value,
+    state: &mut ProcessTermination,
+    failure_reported: &mut bool,
+) {
+    state.started.get_or_insert_with(Instant::now);
+    if state.attempts >= MAX_TERMINATION_ATTEMPTS {
+        return;
+    }
+    state.attempts += 1;
+    state.last_request = Some(Instant::now());
+    if let Err(error) = group.cancel_children() {
+        state.request_unconfirmed = true;
+        if !*failure_reported {
+            *failure_reported = true;
+            let _ = write_process_control_failure(work, identity, &error.code);
+        }
+    }
+}
+
+fn retry_script_termination(
+    work: &ScriptWork,
+    group: &Group,
+    identity: &Value,
+    state: &mut ProcessTermination,
+    failure_reported: &mut bool,
+) {
+    if state.attempts < MAX_TERMINATION_ATTEMPTS
+        && state
+            .last_request
+            .is_some_and(|last| last.elapsed() >= TERMINATION_RETRY_INTERVAL)
+    {
+        request_script_termination(work, group, identity, state, failure_reported);
+    }
+}
+
+trait PollableRead: Read {
+    fn make_nonblocking(&self) -> io::Result<()>;
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead>;
+}
+
+enum PipeRead {
+    Data(usize),
+    Pending,
+    Eof,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: Read + std::os::fd::AsRawFd> PollableRead for T {
+    fn make_nonblocking(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+        const O_NONBLOCK: i32 = 0x800;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+        // SAFETY: fcntl reads and updates flags on this live child-pipe descriptor.
+        let flags = unsafe { fcntl(self.as_raw_fd(), F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: F_SETFL accepts the current flags plus O_NONBLOCK.
+        if unsafe { fcntl(self.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
+        match self.read(buffer) {
+            Ok(0) => Ok(PipeRead::Eof),
+            Ok(count) => Ok(PipeRead::Data(count)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle> PollableRead for T {
+    fn make_nonblocking(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
+        use std::ffi::c_void;
+        unsafe extern "system" {
+            fn PeekNamedPipe(
+                pipe: *mut c_void,
+                buffer: *mut c_void,
+                buffer_size: u32,
+                bytes_read: *mut u32,
+                total_available: *mut u32,
+                bytes_left: *mut u32,
+            ) -> i32;
+            fn GetLastError() -> u32;
+        }
+        let mut available = 0u32;
+        // SAFETY: this is the live child-pipe handle and output points to local storage.
+        let ok = unsafe {
+            PeekNamedPipe(
+                self.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            if code == 109 {
+                return Ok(PipeRead::Eof);
+            }
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        if available == 0 {
+            return Ok(PipeRead::Pending);
+        }
+        let bound = buffer.len().min(available as usize);
+        match self.read(&mut buffer[..bound]) {
+            Ok(0) => Ok(PipeRead::Eof),
+            Ok(count) => Ok(PipeRead::Data(count)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+impl<T: Read> PollableRead for T {
+    fn make_nonblocking(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded script pipe capture is unsupported on this platform",
+        ))
+    }
+
+    fn read_available(&mut self, _buffer: &mut [u8]) -> io::Result<PipeRead> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded script pipe capture is unsupported on this platform",
+        ))
+    }
+}
+
+fn publish_cleanup_pending(
+    work: &ScriptWork,
+    publication: CleanupPendingPublication<'_>,
+) -> Result<()> {
+    let files = ArtifactFiles::new(&work.data_dir)?;
+    let stdout = output_record(work, "stdout", &publication.stdout_capture.bytes);
+    let stderr = output_record(work, "stderr", &publication.stderr_capture.bytes);
+    files.publish(&stdout, &publication.stdout_capture.bytes)?;
+    files.publish(&stderr, &publication.stderr_capture.bytes)?;
+    let pending = json!({
+        "schema_version":1,
+        "run_id":work.run_id,
+        "operation_id":work.operation_id,
+        "token":work.token,
+        "state":"cleanup_pending",
+        "started_at_ms":publication.started_at_ms,
+        "exit_code":publication.exit_code,
+        "error_code":publication.error_code,
+        "process":publication.process,
+        "process_facts":publication.process_facts,
+        "stdout":{"artifact":stdout,"capture":capture_fact(publication.stdout_capture)},
+        "stderr":{"artifact":stderr,"capture":capture_fact(publication.stderr_capture)},
+        "controller_effects":[],
+    });
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    write_once(
+        &dir.join("cleanup-pending.json"),
+        &canonical_json(&pending)?.into_bytes(),
     )
 }
 
@@ -1037,29 +1976,95 @@ fn finish_worker_error(
     state: &str,
 ) -> Result<()> {
     let mut cancellation_failure_reported = false;
-    while !group.children_empty()? {
-        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
+    let mut termination = ProcessTermination::default();
+    let mut family_observation_unknown = false;
+    let family_confirmed = loop {
+        match group.children_empty() {
+            Ok(true) => break true,
+            Ok(false) => family_observation_unknown = false,
+            Err(_) => family_observation_unknown = true,
+        }
+        if termination.started.is_none() {
+            request_script_termination(
+                work,
+                group,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
+        } else {
+            retry_script_termination(
+                work,
+                group,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
+        }
+        if termination
+            .started
+            .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
+        {
+            break false;
+        }
         thread::sleep(POLL_INTERVAL);
-    }
-    group.disarm()?;
+    };
+    let resource_released = family_confirmed && group.disarm().is_ok();
     let dir = directory(&work.data_dir, &work.run_id)?;
     let started_at_ms = if receipt_exists(&dir.join("started.json"))? {
         read_json(&dir.join("started.json"))?["started_at_ms"].as_i64()
     } else {
         None
     };
+    let process_identity = identity["process"].clone();
+    let stdout = capture_not_started();
+    let stderr = capture_not_started();
+    let family_departure = if family_confirmed {
+        json!({"state":"confirmed","process":process_identity.clone()})
+    } else if family_observation_unknown {
+        json!({"state":"observation_unknown","process":process_identity.clone()})
+    } else {
+        json!({"state":"cleanup_pending","process":process_identity.clone()})
+    };
+    let process_facts = json!({
+        "schema_version":1,
+        "direct_exit":{"state":"not_started"},
+        "family_departure":family_departure,
+        "stdout_capture":capture_fact(&stdout),
+        "stderr_capture":capture_fact(&stderr),
+        "resource_released":resource_released,
+        "cleanup_pending":!resource_released,
+        "termination_attempts":termination.attempts,
+        "termination_request_unconfirmed":termination.request_unconfirmed,
+        "primary_error_code":error_code.clone(),
+    });
+    if !resource_released {
+        return publish_cleanup_pending(
+            work,
+            CleanupPendingPublication {
+                process: &process_identity,
+                stdout_capture: &stdout,
+                stderr_capture: &stderr,
+                process_facts,
+                started_at_ms,
+                exit_code: None,
+                error_code: Some(error_code),
+            },
+        );
+    }
     publish_completion(
         work,
         CompletionPublication {
-            stdout: &[],
-            stderr: &[],
+            stdout: &stdout.bytes,
+            stderr: &stderr.bytes,
             result_value: None,
             controller_effects: &[],
             error_code: Some(error_code),
             state,
             started_at_ms,
             exit_code: None,
-            process: &identity["process"],
+            process: &process_identity,
+            process_facts,
         },
     )
 }
@@ -1075,6 +2080,7 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
         started_at_ms,
         exit_code,
         process,
+        process_facts,
     } = publication;
     let files = ArtifactFiles::new(&work.data_dir)?;
     let stdout = output_record(work, "stdout", stdout_bytes);
@@ -1095,6 +2101,7 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
         "stdout_ref":stdout.artifact_id,
         "stderr_ref":stderr.artifact_id,
         "controller_effects":controller_effects,
+        "process_facts":process_facts,
     });
     let result_id = format!("scriptresult-{}", sha256_hex(work.operation_id.as_bytes()));
     let result_bytes = canonical_json(&result_document)?.into_bytes();
@@ -1121,6 +2128,7 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
         result_value,
         controller_effects: controller_effects.to_vec(),
         error_code,
+        process_facts,
     };
     let dir = directory(&work.data_dir, &work.run_id)?;
     let bytes = canonical_json(&serde_json::to_value(completion)?)?.into_bytes();
@@ -1276,31 +2284,6 @@ fn ensure_private_tree(root: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn read_bounded<R: Read>(mut input: R, limit: usize, overflow: Arc<AtomicBool>) -> Captured {
-    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-    let mut buffer = [0u8; 8192];
-    let mut local_overflow = false;
-    loop {
-        match input.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                let remaining = limit.saturating_sub(bytes.len());
-                bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-                if count > remaining {
-                    local_overflow = true;
-                    overflow.store(true, Ordering::Release);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    Captured {
-        bytes,
-        overflow: local_overflow,
-    }
 }
 
 struct ArtifactFiles {
@@ -1576,20 +2559,6 @@ fn write_process_control_failure(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_once(&path, &bytes),
         Err(error) => Err(error.into()),
-    }
-}
-
-fn cancel_children_and_record(
-    work: &ScriptWork,
-    group: &Group,
-    identity: &Value,
-    failure_reported: &mut bool,
-) {
-    if let Err(error) = group.cancel_children()
-        && !*failure_reported
-    {
-        *failure_reported = true;
-        let _ = write_process_control_failure(work, identity, &error.code);
     }
 }
 

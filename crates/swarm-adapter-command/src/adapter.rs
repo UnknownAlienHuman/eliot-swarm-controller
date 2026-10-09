@@ -1,5 +1,7 @@
 use crate::module_host::{self, ModuleHostIdentity};
 use crate::{ARTIFACT_ID, CONTRACT_REVISION, EXECUTION_SHAPE, RUNTIME};
+use crate::Profile;
+use crate::acp_prompt::PreparedAcpDispatch;
 use crate::{
     journal::{DispatchIdentity, RunStore, digest},
     native, result_page,
@@ -25,19 +27,22 @@ const MAX_CREDENTIAL_BYTES: u64 = 16_384;
 const MAX_FIXED_ARGS: usize = 32;
 const MAX_FIXED_ARG_BYTES: usize = 4096;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     module_artifact_id: String,
     command: PathBuf,
     #[serde(default)]
     command_args: Vec<String>,
-    mod_path: PathBuf,
-    run_timeout_ms: u64,
+    #[serde(default)]
+    mod_path: Option<PathBuf>,
+    #[serde(default)]
+    run_timeout_ms: Option<u64>,
     #[serde(skip)]
     host_connection: Option<HostConnectionConfig>,
 }
 
+#[derive(Clone)]
 struct Owner {
     state_dir: PathBuf,
     token: String,
@@ -55,8 +60,8 @@ struct Link {
 
 pub async fn run() -> Result<()> {
     let (host_config_path, config_path) = config_arguments()?;
-    let config = load_config(&config_path)?;
     let owner = load_owner()?;
+    let config = load_config(&config_path, owner.host.profile)?;
     let host_connection = load_host_connection_config(&host_config_path, &owner.state_dir)?;
     let mut config = config;
     config.host_connection = Some(host_connection);
@@ -67,7 +72,10 @@ pub async fn run() -> Result<()> {
             "module credential client differs from the supervisor binding identity",
         ));
     }
-    let store = RunStore::new(&owner.state_dir)?;
+    if owner.host.profile == Profile::AcpV1 {
+        return acp::run(config, owner, credential).await;
+    }
+    let store = RunStore::new_for_profile(&owner.state_dir, owner.host.profile)?;
     let mut next_observation_sequence = 1_u64;
     let mut pending_observation: Option<(u64, Value)> = None;
     let mut expected_route: Option<Value> = None;
@@ -294,6 +302,8 @@ pub async fn run() -> Result<()> {
     }
 }
 
+mod acp;
+
 fn normalized_dispatch_admission(
     owner: &Owner,
     command: &RuntimeCommand,
@@ -382,6 +392,57 @@ fn normalized_dispatch_admission(
         )
     })?;
     Ok(Some(receipt))
+}
+
+fn acp_dispatch_admission(
+    owner: &Owner,
+    command: &RuntimeCommand,
+    dispatch: &PreparedAcpDispatch,
+) -> Result<TaskDispatchAdmissionReceipt> {
+    if !matches!(owner.host.profile, Profile::AcpV1 | Profile::BatchV4)
+        || !module_host::task_prompt_v1_enabled(&owner.host.claim)
+        || dispatch.identity.operation_id != command.operation_id
+        || dispatch.identity.input_sha256
+            != command.input_sha256.as_deref().unwrap_or_default()
+        || dispatch.identity.prompt_sha256 != dispatch.envelope.prompt_sha256
+        || dispatch.identity.prompt_bytes != dispatch.envelope.prompt_bytes
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_INVALID",
+            "ACP dispatch is not bound to the selected TaskPrompt artifact and request",
+        ));
+    }
+    let context = &dispatch.context;
+    let module_receipt = module_host::receipt_identity_for_input(
+        &owner.host.claim,
+        command,
+        &command.operation_id,
+        &dispatch.identity.input_sha256,
+    )?;
+    let receipt = TaskDispatchAdmissionReceipt {
+        schema_version: 1,
+        module_receipt,
+        operation_id: context.operation_id.clone(),
+        binding_id: context.binding_id.clone(),
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id.clone(),
+        attempt_id: dispatch.identity.attempt_id.clone(),
+        task_id: dispatch.identity.task_id.clone(),
+        task_revision: dispatch.identity.task_revision,
+        task_snapshot_sha256: dispatch.identity.task_snapshot_sha256.clone(),
+        source_text_sha256: context.source_text_sha256.clone(),
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: dispatch.identity.prompt_sha256.clone(),
+        native_payload_bytes: dispatch.identity.prompt_bytes,
+        native_input_id: None,
+    };
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "ACP dispatch admission receipt is invalid",
+        )
+    })?;
+    Ok(receipt)
 }
 
 fn validate_dispatch_outcome(
@@ -474,7 +535,7 @@ async fn process_command(
                     }),
                 }
             } else {
-                let mod_check = check_mod(&config.mod_path);
+                let mod_check = check_mod(batch_mod_path(config)?);
                 let executable_ready = config.command.is_file();
                 let workspace_ready = workspace.is_dir();
                 let ready = mod_check.is_ok() && executable_ready && workspace_ready;
@@ -507,10 +568,18 @@ async fn process_command(
             Ok((vec![outcome], false))
         }
         "task.dispatch" => {
-            let (prompt, identity) = native::prompt_for(command)?;
+            let (prompt, identity, dispatch_admission) = if owner.host.profile == Profile::BatchV4 {
+                let dispatch = acp_prompt::prepare(command)?;
+                let identity = native::task_prompt_identity(command, &dispatch)?;
+                let admission = acp_dispatch_admission(owner, command, &dispatch)?;
+                (dispatch.envelope.prompt.clone(), identity, Some(admission))
+            } else {
+                let (prompt, identity) = native::prompt_for(command)?;
+                let admission =
+                    normalized_dispatch_admission(owner, command, &identity, &prompt)?;
+                (prompt, identity, admission)
+            };
             let workspace = native::route_workspace(command)?;
-            let dispatch_admission =
-                normalized_dispatch_admission(owner, command, &identity, &prompt)?;
             let (_dir, existing) = store.admit(
                 &command.operation_id,
                 Some(&identity),
@@ -519,7 +588,7 @@ async fn process_command(
                 &command.route,
             )?;
             if existing {
-                if module_host::normalized_dispatch_enabled(&owner.host.claim)
+                if dispatch_admission.is_some()
                     && store
                         .read_dispatch_admission(&command.operation_id)?
                         .as_ref()
@@ -555,8 +624,8 @@ async fn process_command(
                 &native::InvocationConfig {
                     program: config.command.clone(),
                     fixed_args: config.command_args.clone(),
-                    mod_path: config.mod_path.clone(),
-                    run_timeout: Duration::from_millis(config.run_timeout_ms),
+                    mod_path: batch_mod_path(config)?.to_path_buf(),
+                    run_timeout: batch_run_timeout(config)?,
                     owner_token: owner.token.clone(),
                 },
                 store,
@@ -985,6 +1054,22 @@ async fn deliver_result_page(
 }
 
 async fn connect_module(config: &Config, credential: &Credential, owner: &Owner) -> Result<Link> {
+    connect_module_with_native_state(config, credential, owner, None, None).await
+}
+
+pub(super) async fn connect_module_with_native_state(
+    config: &Config,
+    credential: &Credential,
+    owner: &Owner,
+    native_root_id: Option<&str>,
+    native_scope_key: Option<&str>,
+) -> Result<Link> {
+    if native_root_id.is_some() != native_scope_key.is_some() {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "module hello requires a paired native root and scope",
+        ));
+    }
     let host_connection = config.host_connection.as_ref().ok_or_else(|| {
         Error::new(
             "MODULE_HOST_CONFIG_INVALID",
@@ -1001,9 +1086,9 @@ async fn connect_module(config: &Config, credential: &Credential, owner: &Owner)
         .hello(
             json!({
                 "boot_id":owner.host.boot_id,
-                "module_artifact_id":ARTIFACT_ID,
-                "native_root_id":Value::Null,
-                "native_scope_key":Value::Null,
+                "module_artifact_id":owner.host.profile.artifact_id(),
+                "native_root_id":native_root_id,
+                "native_scope_key":native_scope_key,
                 "native_ready":false,
                 "managed_owner":owner.record
             }),
@@ -1017,7 +1102,9 @@ async fn connect_module(config: &Config, credential: &Credential, owner: &Owner)
             "module.hello response omitted its route",
         )
     })?;
-    if route["runtime"] != RUNTIME || route["module_artifact_id"] != ARTIFACT_ID {
+    if route["runtime"] != RUNTIME
+        || route["module_artifact_id"] != owner.host.profile.artifact_id()
+    {
         return Err(Error::new(
             "ARTIFACT_MISMATCH",
             "reserved route does not name this Rust Command adapter artifact",
@@ -1085,10 +1172,11 @@ fn module_state(
         "boot_id":owner.host.boot_id,
         "describe":{
             "runtime":RUNTIME,
-            "module_artifact_id":ARTIFACT_ID,
-            "contract_revision":CONTRACT_REVISION,
+            "module_artifact_id":owner.host.profile.artifact_id(),
+            "module_artifact_version":owner.host.profile.artifact_version(),
+            "contract_revision":owner.host.profile.contract_revision(),
             "entrypoint":"native_headless_cli",
-            "execution_shape":EXECUTION_SHAPE,
+            "execution_shape":owner.host.profile.execution_shape(),
             "installed_runtime_verified":false,
             "version_probe":"not_run",
             "requested_model":model,
@@ -1128,28 +1216,57 @@ fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
             "module command differs from its authenticated binding route",
         ));
     }
-    if !matches!(
-        command.method.as_str(),
-        "agent.open" | "task.dispatch" | "agent.refresh" | "agent.reconcile" | "agent.result"
-    ) {
+    let acp_profile = command.route["module_artifact_id"] == crate::ACP_ARTIFACT_ID;
+    let supported = if acp_profile {
+        matches!(
+            command.method.as_str(),
+            "agent.open"
+                | "task.dispatch"
+                | "agent.send"
+                | "agent.configure"
+                | "agent.refresh"
+                | "agent.reconcile"
+                | "agent.reply"
+                | "agent.result"
+                | "native.command.cancel_turn"
+                | "native.command.close_session"
+        )
+    } else {
+        matches!(
+            command.method.as_str(),
+            "agent.open" | "task.dispatch" | "agent.refresh" | "agent.reconcile" | "agent.result"
+        )
+    };
+    if !supported {
         return Err(Error::new(
             "CAPABILITY_UNAVAILABLE",
             "Command sessionless module received an unsupported method",
         ));
     }
     let result_kind = command.input["selector"]["kind"].as_str();
+    let acp_result = acp_profile
+        && result_kind == Some("command_output")
+        && command.input["selector"]["native_output"] == "acp.assistant_messages.txt";
+    let missing_result_data = if acp_result {
+        command.input["normalized_result_origin"]
+            .as_object()
+            .is_none()
+            || command.input["normalized_result_payload_identity"]
+                .as_object()
+                .is_none()
+    } else {
+        (result_kind == Some("command_status")
+            && command.input["target_operation_status"].as_object().is_none())
+            || (result_kind == Some("command_output")
+                && command.input["target_command_output"].as_object().is_none())
+    };
     if command.method == "agent.result"
         && (!matches!(result_kind, Some("command_status" | "command_output"))
             || command
                 .target_input_sha256
                 .as_deref()
                 .is_none_or(|digest| !is_sha256(digest))
-            || (result_kind == Some("command_status")
-                && command.input["target_operation_status"]
-                    .as_object()
-                    .is_none())
-            || (result_kind == Some("command_output")
-                && command.input["target_command_output"].as_object().is_none()))
+            || missing_result_data)
     {
         return Err(Error::new(
             "CAPABILITY_UNAVAILABLE",
@@ -1176,7 +1293,7 @@ fn route_model_from_value(route: &Value) -> Result<&str> {
         })
 }
 
-fn load_config(path: &Path) -> Result<Config> {
+fn load_config(path: &Path, profile: Profile) -> Result<Config> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| Error::new("CONFIG_UNAVAILABLE", "adapter config file is unavailable"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES
@@ -1198,17 +1315,30 @@ fn load_config(path: &Path) -> Result<Config> {
     }
     let config: Config = serde_json::from_slice(&bytes)
         .map_err(|_| Error::new("CONFIG_INVALID", "adapter config JSON is invalid"))?;
-    if config.module_artifact_id != ARTIFACT_ID
+    let batch_config_valid = config
+        .mod_path
+        .as_deref()
+        .is_some_and(Path::is_absolute)
+        && config
+            .run_timeout_ms
+            .is_some_and(|timeout| (100..=86_400_000).contains(&timeout))
+        && config.command_args.len() <= MAX_FIXED_ARGS
+        && config.command_args.iter().all(|arg| {
+            Path::new(arg).is_absolute()
+                && arg.len() <= MAX_FIXED_ARG_BYTES
+                && !arg.chars().any(char::is_control)
+                && !reserved_argument(arg)
+        });
+    let acp_config_valid = config.mod_path.is_none()
+        && config.run_timeout_ms.is_none()
+        && config.command_args.len() == 1
+        && config.command_args[0] == "acp";
+    if config.module_artifact_id != profile.artifact_id()
         || !config.command.is_absolute()
-        || !config.mod_path.is_absolute()
-        || !(100..=86_400_000).contains(&config.run_timeout_ms)
-        || config.command_args.len() > MAX_FIXED_ARGS
-        || config.command_args.iter().any(|arg| {
-            !Path::new(arg).is_absolute()
-                || arg.len() > MAX_FIXED_ARG_BYTES
-                || arg.chars().any(char::is_control)
-                || reserved_argument(arg)
-        })
+        || match profile {
+            Profile::BatchV3 => !batch_config_valid,
+            Profile::AcpV1 => !acp_config_valid,
+        }
     {
         return Err(Error::new(
             "CONFIG_INVALID",
@@ -1225,6 +1355,20 @@ fn load_config(path: &Path) -> Result<Config> {
         ));
     }
     Ok(config)
+}
+
+fn batch_mod_path(config: &Config) -> Result<&Path> {
+    config
+        .mod_path
+        .as_deref()
+        .ok_or_else(|| Error::new("CONFIG_INVALID", "batch Command mod path is missing"))
+}
+
+fn batch_run_timeout(config: &Config) -> Result<Duration> {
+    config
+        .run_timeout_ms
+        .map(Duration::from_millis)
+        .ok_or_else(|| Error::new("CONFIG_INVALID", "batch Command timeout is missing"))
 }
 
 fn load_host_connection_config(path: &Path, state_dir: &Path) -> Result<HostConnectionConfig> {

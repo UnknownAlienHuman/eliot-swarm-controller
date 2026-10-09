@@ -237,6 +237,9 @@ pub fn validate_mutation(method: &str, value: &Value) -> Result<()> {
         "coordination.contract.respond" => {
             return contract::parse_response_request(value).map(|_| ());
         }
+        "coordination.contract.ratify" | "coordination.contract.reject" => {
+            return contract::parse_decision_request(method, value).map(|_| ());
+        }
         _ => {}
     }
     let allowed: &[&str] = match method {

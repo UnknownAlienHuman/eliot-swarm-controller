@@ -4,10 +4,12 @@ use serde_json::json;
 use swarm_contracts::{
     error::Result,
     runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt},
+    task_prompt::TASK_PROMPT_CONTRACT_REVISION,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
+    launch::selected_model_id,
     module_receipt,
     stream::{StreamState, TerminalDisposition, Turn},
     wire::{OperationIdentity, encode_user_line, normalized_dispatch_admission, prompt_for},
@@ -49,6 +51,9 @@ pub struct Controller {
     binding_id: String,
     generation: i64,
     native_root_id: Option<String>,
+    requested_model_id: Option<String>,
+    model_readback_state: Option<&'static str>,
+    open_failure_code: Option<&'static str>,
     normalized_dispatch_enabled: bool,
     pending_open: Option<OperationIdentity>,
     pending: Option<PendingPrompt>,
@@ -75,6 +80,9 @@ impl Controller {
             binding_id,
             generation,
             native_root_id,
+            requested_model_id: None,
+            model_readback_state: None,
+            open_failure_code: None,
             normalized_dispatch_enabled,
             pending_open: None,
             pending: None,
@@ -148,6 +156,16 @@ impl Controller {
                 "this adapter process already owns an open native session",
             ));
         }
+        let requested_model = selected_model_id(&command.route)
+            .map_err(|code| {
+                swarm_contracts::error::Error::new(code, "native route model ID is required")
+            })?
+            .to_owned();
+        self.requested_model_id = Some(requested_model);
+        self.model_readback_state = None;
+        self.open_failure_code = None;
+        self.stream
+            .set_resume_baseline_pending(command.input.get("resume_conversation_id").is_some());
         self.pending_open = Some(identity.clone());
         Ok(identity)
     }
@@ -173,11 +191,37 @@ impl Controller {
                 "native session initialization has not been observed",
             )
         })?;
+        let Some(requested_model) = self.requested_model_id.clone() else {
+            self.open_failure_code = Some("NATIVE_MODEL_ID_UNAVAILABLE");
+            self.model_readback_state = Some("not_observed");
+            return Err(swarm_contracts::error::Error::new(
+                "NATIVE_MODEL_ID_UNAVAILABLE",
+                "the selected native route model is unavailable for init verification",
+            ));
+        };
+        let Some(observed_model) = init.model.as_deref() else {
+            self.open_failure_code = Some("NATIVE_MODEL_READBACK_MISSING");
+            self.model_readback_state = Some("not_observed");
+            return Err(swarm_contracts::error::Error::new(
+                "NATIVE_MODEL_READBACK_MISSING",
+                "native init did not report the explicitly selected model",
+            ));
+        };
+        if observed_model != requested_model {
+            self.open_failure_code = Some("NATIVE_MODEL_READBACK_MISMATCH");
+            self.model_readback_state = Some("mismatch");
+            return Err(swarm_contracts::error::Error::new(
+                "NATIVE_MODEL_READBACK_MISMATCH",
+                "native init model differs from the current native route selection",
+            ));
+        }
+        self.model_readback_state = Some("verified");
         if command
             .native_root_id
             .as_deref()
             .is_some_and(|stored| stored != init.conversation_id.as_str())
         {
+            self.open_failure_code = Some("NATIVE_RESUME_IDENTITY_MISMATCH");
             return Err(swarm_contracts::error::Error::new(
                 "NATIVE_RESUME_IDENTITY_MISMATCH",
                 "native init differs from the manager's stored conversation identity",
@@ -189,6 +233,7 @@ impl Controller {
             .and_then(serde_json::Value::as_str)
             && resume_id != init.conversation_id
         {
+            self.open_failure_code = Some("NATIVE_RESUME_IDENTITY_MISMATCH");
             return Err(swarm_contracts::error::Error::new(
                 "NATIVE_RESUME_IDENTITY_MISMATCH",
                 "native init did not identify the explicitly resumed conversation",
@@ -206,11 +251,14 @@ impl Controller {
             details: json!({
                 "completion_condition": "native_session_initialized",
                 "native_conversation_id": init.conversation_id,
+                "native_init": init,
                 "bridge_boot_id": self.boot_id,
                 "resumed_conversation": command.input.get("resume_conversation_id").is_some(),
                 "describe": {
                     "session_id": init.conversation_id,
+                    "model_requested": requested_model,
                     "model_observed": init.model,
+                    "model_verification": "verified",
                     "permission_mode_observed": init.permission_mode,
                     "agent_observed": init.agent,
                     "executor_version": serde_json::Value::Null,
@@ -227,6 +275,11 @@ impl Controller {
     pub fn finish_open_without_init(&mut self) -> Option<RuntimeOutcome> {
         let identity = self.pending_open.take()?;
         let native_responded = self.stream.phase == crate::stream::Phase::InitFailed;
+        let diagnostic_code = self.open_failure_code.unwrap_or(if native_responded {
+            "NATIVE_INIT_REJECTED"
+        } else {
+            "NATIVE_INIT_OUTCOME_UNKNOWN"
+        });
         let outcome = RuntimeOutcome {
             operation_id: identity.operation_id.clone(),
             outcome: if native_responded {
@@ -239,12 +292,13 @@ impl Controller {
             turn_id: None,
             native_input_id: None,
             details: json!({
-                "diagnostic_code": if native_responded {
-                    "NATIVE_INIT_REJECTED"
-                } else {
-                    "NATIVE_INIT_OUTCOME_UNKNOWN"
-                },
+                "diagnostic_code": diagnostic_code,
                 "native_status": self.stream.init_failure_status,
+                "native_init": self.stream.init,
+                "native_conversation_id_observed": self.stream.init.as_ref().map(|init| &init.conversation_id),
+                "model_requested": self.requested_model_id,
+                "model_observed": self.stream.init.as_ref().and_then(|init| init.model.as_deref()),
+                "model_verification": self.model_readback_state,
             }),
         };
         let _ = self.record_outcome(&outcome, "agent.open", &identity.module_receipt);
@@ -278,6 +332,12 @@ impl Controller {
                 "EXPECTED_PROMPT_OPERATION",
             ));
         }
+        if identity.method == "task.dispatch" && !self.normalized_dispatch_enabled {
+            return Err(swarm_contracts::error::Error::new(
+                "TASK_PROMPT_CONTRACT_REQUIRED",
+                "artifact v5 requires the Store-produced TaskPrompt and dispatch admission schemas",
+            ));
+        }
         let conversation_id = self.native_root_id.as_deref().ok_or_else(|| {
             swarm_contracts::error::Error::new(
                 "NATIVE_SESSION_NOT_READY",
@@ -300,7 +360,7 @@ impl Controller {
         let dispatch_admission =
             if self.normalized_dispatch_enabled && identity.method == "task.dispatch" {
                 Some(
-                    normalized_dispatch_admission(command, &identity, &self.boot_id, &line)
+                    normalized_dispatch_admission(command, &identity, &self.boot_id, &text)
                         .map_err(swarm_contracts::error::Error::invalid)?,
                 )
             } else {
@@ -585,6 +645,14 @@ impl Controller {
             object.insert("native_scope_key".to_owned(), json!(self.native_scope_key));
             object.insert("boot_id".to_owned(), json!(self.boot_id));
             object.insert(
+                "requested_model_id".to_owned(),
+                json!(self.requested_model_id),
+            );
+            object.insert(
+                "model_readback_state".to_owned(),
+                json!(self.model_readback_state),
+            );
+            object.insert(
                 "local_execution_results".to_owned(),
                 json!(self.local_execution_results),
             );
@@ -806,6 +874,9 @@ fn terminal_outcome(
         "completion_condition": "native_terminal_result_observed",
         "turn_status": status,
         "num_turns": turn.num_turns,
+        "duration_seconds": turn.duration_seconds,
+        "duration_delta_seconds": turn.duration_delta_seconds,
+        "usage": turn.usage,
         "local_execution_ref": reference,
     });
     if matches!(disposition, TerminalDisposition::Applied)
@@ -813,6 +884,7 @@ fn terminal_outcome(
     {
         details["dispatch_admission"] =
             serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
+        details["prompt_contract_revision"] = json!(TASK_PROMPT_CONTRACT_REVISION);
     }
     RuntimeOutcome {
         operation_id: identity.operation_id.clone(),

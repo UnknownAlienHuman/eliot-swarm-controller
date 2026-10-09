@@ -82,11 +82,12 @@ struct ScriptRunArtifactLinks {
 
 struct RunnerObservation {
     completion: Option<runner::Completion>,
+    cleanup_pending: Option<runner::CleanupPending>,
     process_control_failure: Option<swarm_scripts::process::ProcessControlFailure>,
     ready: Option<Value>,
     launch: Option<Value>,
     launch_departed: bool,
-    has_go: bool,
+    start_allowed: bool,
 }
 
 struct ScriptEffectParentOperationRow {
@@ -1837,6 +1838,11 @@ impl Store {
                     continue;
                 }
             };
+            if work.executor.is_none() && pending.operation_state == "queued" {
+                self.fail_before_start(&pending, "SCRIPT_EXECUTOR_UNSELECTED")
+                    .await?;
+                continue;
+            }
             let observe_work = work.clone();
             let observed = self
                 .file_io(move |files| observe(&observe_work, &files))
@@ -1850,9 +1856,12 @@ impl Store {
                     } else if pending.operation_state == "sending"
                         && !self.start_gate_exists(&work).await
                     {
-                        self.deny_work(&work, &error.code).await?;
-                        self.settle_prestart_failure_if_family_departed(&pending, &error.code)
-                            .await?;
+                        if self.deny_work(&work, &error.code).await.unwrap_or(false) {
+                            self.settle_prestart_failure_if_family_departed(&pending, &error.code)
+                                .await?;
+                        } else {
+                            self.mark_unknown(&pending, &error.code).await?;
+                        }
                     } else if matches!(
                         pending.operation_state.as_str(),
                         "native_accepted" | "outcome_unknown"
@@ -1868,6 +1877,17 @@ impl Store {
             if let Some(failure) = observed.process_control_failure.as_ref() {
                 self.record_process_control_failure(&pending, failure)
                     .await?;
+            }
+            if let Some(cleanup) = observed.cleanup_pending {
+                let retained = pending.clone();
+                let changed = self
+                    .run(move |db| record_cleanup_pending(db, &retained, &cleanup))
+                    .await?;
+                if changed {
+                    self.changed
+                        .send_modify(|revision| *revision = revision.wrapping_add(1));
+                }
+                continue;
             }
             if let Some(completion) = observed.completion {
                 if !completion_matches_retained_worker(&pending, &completion) {
@@ -1898,7 +1918,7 @@ impl Store {
                     continue;
                 }
                 let execution_may_have_started =
-                    observed.has_go || completion.started_at_ms.is_some();
+                    observed.start_allowed || completion.started_at_ms.is_some();
                 let id = pending.run_id.clone();
                 let config = self.config.clone();
                 let result = self
@@ -1936,7 +1956,7 @@ impl Store {
                                 .await;
                             if let Err(error) = launch {
                                 self.record_run_error(&pending, error.clone()).await?;
-                                self.deny_work(&start_work, &error.code).await?;
+                                let _ = self.deny_work(&start_work, &error.code).await;
                                 self.mark_unknown(&pending, &error.code).await?;
                             }
                         }
@@ -1961,7 +1981,7 @@ impl Store {
                                 if let Err(error) = result {
                                     self.record_run_error(&pending, error.clone()).await?;
                                     if !self.start_gate_exists(&work).await {
-                                        self.deny_work(&work, &error.code).await?;
+                                        let _ = self.deny_work(&work, &error.code).await;
                                     }
                                     self.mark_unknown(&pending, &error.code).await?;
                                 } else {
@@ -1973,7 +1993,7 @@ impl Store {
                             Ok(false) => {}
                             Err(error) => {
                                 self.record_run_error(&pending, error.clone()).await?;
-                                self.deny_work(&work, &error.code).await?;
+                                let _ = self.deny_work(&work, &error.code).await;
                                 self.mark_unknown(&pending, &error.code).await?;
                             }
                         }
@@ -1984,12 +2004,13 @@ impl Store {
                             Error::new(code, "worker exited before its start gate"),
                         )
                         .await?;
-                        if observed.has_go {
+                        if observed.start_allowed {
                             self.mark_unknown(&pending, code).await?;
-                        } else {
-                            self.deny_work(&work, code).await?;
+                        } else if self.deny_work(&work, code).await.unwrap_or(false) {
                             self.settle_prestart_failure_if_family_departed(&pending, code)
                                 .await?;
+                        } else {
+                            self.mark_unknown(&pending, code).await?;
                         }
                     } else if pending.sent_at_ms.is_some_and(|sent| {
                         model::now_ms()
@@ -2001,9 +2022,12 @@ impl Store {
                             Error::new(code, "worker did not publish its ready receipt"),
                         )
                         .await?;
-                        self.deny_work(&work, code).await?;
-                        self.settle_prestart_failure_if_family_departed(&pending, code)
-                            .await?;
+                        if self.deny_work(&work, code).await.unwrap_or(false) {
+                            self.settle_prestart_failure_if_family_departed(&pending, code)
+                                .await?;
+                        } else {
+                            self.mark_unknown(&pending, code).await?;
+                        }
                     }
                 }
                 "native_accepted" | "outcome_unknown"
@@ -2021,7 +2045,7 @@ impl Store {
                     };
                     self.record_run_error(&pending, Error::new(code, detail))
                         .await?;
-                    if pending.worker_identity_json.is_none() && !observed.has_go {
+                    if pending.worker_identity_json.is_none() && !observed.start_allowed {
                         self.settle_prestart_failure_if_family_departed(&pending, code)
                             .await?;
                     } else if observed.launch_departed {
@@ -2037,14 +2061,26 @@ impl Store {
         Ok(())
     }
 
-    async fn deny_work(&self, work: &runner::Work, code: &str) -> Result<()> {
-        let work = work.clone();
-        let code = code.to_owned();
-        // A missing denial file cannot authorize execution: the worker still
-        // requires the separate go receipt, and will time out if it never
-        // arrives. Keep this optional run failure local to its Operation.
-        let _ = self.file_io(move |_| runner::deny(&work, &code)).await;
-        Ok(())
+    async fn deny_work(&self, work: &runner::Work, code: &str) -> Result<bool> {
+        let deny_work = work.clone();
+        let deny_code = code.to_owned();
+        let publication = self
+            .file_io(move |_| runner::deny(&deny_work, &deny_code))
+            .await;
+        let read_work = work.clone();
+        let retained = self
+            .file_io(move |_| runner::start_decision(&read_work))
+            .await?;
+        match runner::start_decision_allows_start(&retained)? {
+            Some(true) => Ok(false),
+            Some(false) => Ok(true),
+            None => match publication {
+                Err(error) => Err(error),
+                Ok(()) => Err(Error::conflict(
+                    "script denial publication returned without a retained decision",
+                )),
+            },
+        }
     }
 
     async fn start_gate_exists(&self, work: &runner::Work) -> bool {
@@ -2737,11 +2773,34 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
         let launch_departed = runner::completion_family_departed(work, &completion)?;
         return Ok(RunnerObservation {
             completion: Some(completion),
+            cleanup_pending: None,
             process_control_failure,
             ready: None,
             launch: None,
             launch_departed,
-            has_go: runner::has_start_gate(work)?,
+            start_allowed: runner::has_start_gate(work)?,
+        });
+    }
+    if let Some(pending) = runner::cleanup_pending(work, files)? {
+        if let Some(completion) = runner::recover_cleanup_pending(work, files, &pending)? {
+            return Ok(RunnerObservation {
+                completion: Some(completion),
+                cleanup_pending: None,
+                process_control_failure,
+                ready: None,
+                launch: None,
+                launch_departed: true,
+                start_allowed: runner::has_start_gate(work)?,
+            });
+        }
+        return Ok(RunnerObservation {
+            completion: None,
+            cleanup_pending: Some(pending),
+            process_control_failure,
+            ready: None,
+            launch: None,
+            launch_departed: false,
+            start_allowed: runner::has_start_gate(work)?,
         });
     }
     let ready = runner::ready(work)?;
@@ -2752,12 +2811,82 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
     };
     Ok(RunnerObservation {
         completion: None,
+        cleanup_pending: None,
         process_control_failure,
         ready,
         launch,
         launch_departed,
-        has_go: runner::has_start_gate(work)?,
+        start_allowed: runner::has_start_gate(work)?,
     })
+}
+
+fn record_cleanup_pending(
+    db: &mut Connection,
+    retained: &PendingRun,
+    pending: &runner::CleanupPending,
+) -> Result<bool> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (operation_id, state, identity_raw, previous): (String,String,Option<String>,Option<String>) = tx.query_row(
+        "SELECT operation_id,state,process_identity_json,json_extract(spec_json,'$.cleanup_pending') FROM script_runs WHERE run_id=?1",
+        [&retained.run_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+    if operation_id != retained.operation_id
+        || pending.operation_id != operation_id
+        || pending.run_id != retained.run_id
+    {
+        return Err(Error::conflict(
+            "script cleanup receipt names another retained execution",
+        ));
+    }
+    if matches!(state.as_str(), "completed" | "failed" | "incomplete") {
+        return Ok(false);
+    }
+    let identity: Value = serde_json::from_str(identity_raw.as_deref().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "cleanup receipt has no acknowledged worker",
+        )
+    })?)?;
+    if identity["run_id"] != pending.run_id
+        || identity["operation_id"] != pending.operation_id
+        || identity["token"] != pending.token
+        || identity["process"] != pending.process
+    {
+        return Err(Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "cleanup receipt differs from acknowledged worker",
+        ));
+    }
+    let cleanup = json!({"run_id":pending.run_id,"operation_id":pending.operation_id,
+        "process_facts":pending.process_facts,"started_at_ms":pending.started_at_ms,
+        "exit_code":pending.exit_code,"stdout_ref":pending.stdout.artifact.artifact_id,
+        "stderr_ref":pending.stderr.artifact.artifact_id,"error_code":pending.error_code});
+    let canonical = model::canonical(&cleanup)?;
+    if previous.as_deref() == Some(canonical.as_str()) {
+        return Ok(false);
+    }
+    let now = model::now_ms()?;
+    register_output_artifact(&tx, &pending.stdout.artifact, now)?;
+    register_output_artifact(&tx, &pending.stderr.artifact, now)?;
+    tx.execute("UPDATE script_runs SET state='outcome_unknown',stdout_ref=?2,stderr_ref=?3,exit_code=?4,started_at_ms=COALESCE(started_at_ms,?5),spec_json=json_set(spec_json,'$.cleanup_pending',json(?6)) WHERE run_id=?1",
+        params![pending.run_id,pending.stdout.artifact.artifact_id,pending.stderr.artifact.artifact_id,pending.exit_code,pending.started_at_ms,canonical])?;
+    let result = json!({"operation_id":pending.operation_id,"run_id":pending.run_id,
+        "outcome":"unknown","state":"outcome_unknown","cleanup_pending":true,
+        "resource_released":pending.process_facts["resource_released"],"process_facts":pending.process_facts,
+        "stdout_ref":pending.stdout.artifact.artifact_id,"stderr_ref":pending.stderr.artifact.artifact_id,
+        "controller_effects":[],"error_code":pending.error_code});
+    tx.execute("UPDATE operations SET state='outcome_unknown',result_json=?2,settled_at_ms=NULL,updated_at_ms=?3 WHERE operation_id=?1 AND state IN ('sending','native_accepted','outcome_unknown')",
+        params![pending.operation_id,model::canonical(&result)?,now])?;
+    record_incident(
+        &tx,
+        &pending.run_id,
+        &pending.operation_id,
+        Error::new(
+            "SCRIPT_CLEANUP_PENDING",
+            "partial capture is retained while exact cleanup remains unresolved",
+        ),
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 fn record_process_control_failure(
@@ -3444,6 +3573,17 @@ fn settle_incomplete(
         tx.commit()?;
         return Ok(());
     }
+    let has_cleanup_pending: bool = tx.query_row(
+        "SELECT json_type(spec_json,'$.cleanup_pending') IS NOT NULL FROM script_runs WHERE run_id=?1",
+        [run_id], |row| row.get(0),
+    )?;
+    if has_cleanup_pending {
+        // Departure alone cannot discard already-retained capture/result
+        // evidence. Publishing or Store errors must remain recoverable.
+        mark_unknown_tx(&tx, run_id, code, model::now_ms()?)?;
+        tx.commit()?;
+        return Ok(());
+    }
     let now = model::now_ms()?;
     let mut result = json!({
         "operation_id":operation_id,
@@ -3868,8 +4008,12 @@ fn finish(
         "error_code":completion.error_code,
         "task_revision":task_revision,
         "controller_effects":controller_effects,
+        "cleanup_pending":false,
+        "resource_released":true,
+        "process_facts":completion.process_facts,
     });
     retain_process_control_diagnostic(previous_result_json.as_deref(), &mut result)?;
+    tx.execute("UPDATE script_runs SET spec_json=json_remove(json_set(spec_json,'$.cleanup_history',json_extract(spec_json,'$.cleanup_pending')),'$.cleanup_pending') WHERE run_id=?1", [run_id])?;
     tx.execute(
         "UPDATE script_runs SET state=?2,result_ref=?3,stdout_ref=?4,stderr_ref=?5,exit_code=?6,started_at_ms=COALESCE(?7,started_at_ms),finished_at_ms=?8 WHERE run_id=?1",
         params![run_id, completion.state, completion.result.artifact_id, completion.stdout.artifact_id, completion.stderr.artifact_id, completion.exit_code, completion.started_at_ms, now],

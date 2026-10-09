@@ -12,6 +12,7 @@ use swarm_contracts::{
         MODULE_PROTOCOL_V1, ModuleContractClaim, ModuleContractTemplate,
         normalized_result_context_schema, normalized_result_page_schema, runtime_command_schema,
         runtime_outcome_schema, task_dispatch_admission_schema, task_dispatch_context_schema,
+        task_prompt_schema,
     },
 };
 
@@ -65,6 +66,7 @@ pub fn template() -> Result<ModuleContractTemplate> {
             normalized_result_context_schema(),
             runtime_command_schema(),
             task_dispatch_context_schema(),
+            task_prompt_schema(),
         ]),
         event_schemas: BTreeSet::from([
             normalized_result_page_schema(),
@@ -131,45 +133,35 @@ pub fn claim() -> Result<ModuleContractClaim> {
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
     claim
         .command_schemas
-        .iter()
-        .any(|schema| schema.schema_id == "swarm.task_dispatch_context" && schema.version == "1")
+        .contains(&task_dispatch_context_schema())
+        && claim.command_schemas.contains(&task_prompt_schema())
         && claim
             .event_schemas
-            .iter()
-            .any(|schema| schema.schema_id == "swarm.task_dispatch_admission" && schema.version == "1")
+            .contains(&task_dispatch_admission_schema())
 }
 
 pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
-    claim.command_schemas.contains(&normalized_result_context_schema())
-        && claim.event_schemas.contains(&normalized_result_page_schema())
+    claim
+        .command_schemas
+        .contains(&normalized_result_context_schema())
+        && claim
+            .event_schemas
+            .contains(&normalized_result_page_schema())
 }
 
 fn schemas_match(claim: &ModuleContractClaim) -> bool {
-    let legacy_commands = vec![runtime_command_schema()];
-    let legacy_events = vec![runtime_outcome_schema()];
-    let normalized_commands = vec![
-        runtime_command_schema(),
-        task_dispatch_context_schema(),
-    ];
-    let normalized_events = vec![
-        runtime_outcome_schema(),
-        task_dispatch_admission_schema(),
-    ];
-    let normalized_result_commands = vec![
+    let task_prompt_commands = vec![
         normalized_result_context_schema(),
         runtime_command_schema(),
         task_dispatch_context_schema(),
+        task_prompt_schema(),
     ];
-    let normalized_result_events = vec![
+    let task_prompt_events = vec![
         normalized_result_page_schema(),
         runtime_outcome_schema(),
         task_dispatch_admission_schema(),
     ];
-    (claim.command_schemas == legacy_commands && claim.event_schemas == legacy_events)
-        || (claim.command_schemas == normalized_commands
-            && claim.event_schemas == normalized_events)
-        || (claim.command_schemas == normalized_result_commands
-            && claim.event_schemas == normalized_result_events)
+    claim.command_schemas == task_prompt_commands && claim.event_schemas == task_prompt_events
 }
 
 fn valid_build_id(value: &str) -> bool {

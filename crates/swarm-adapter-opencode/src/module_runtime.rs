@@ -19,27 +19,35 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
 const NATIVE_OPTIONS_SCHEMA_SHA256: &str =
-    "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68";
-const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "2";
-const CAPABILITIES: [&str; 9] = [
+    "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e";
+const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "3";
+const CAPABILITIES: [&str; 13] = [
+    "agent.background",
     "agent.open",
     "agent.reconcile",
+    "agent.refresh",
+    "agent.reply",
     "agent.result",
     "agent.send/next_turn",
     "native.mcp.arm",
     "native.mcp.install",
     "native.mcp.observe",
     "native.mcp.read",
+    "native.opencode.loop_step",
     "task.dispatch",
 ];
-const COMMAND_SCHEMAS: [&str; 4] = [
+const COMMAND_SCHEMAS: [&str; 7] = [
     "swarm.native_mcp_command",
     "swarm.normalized_result_context",
+    "swarm.opencode_loop_step_command",
+    "swarm.opencode_reply_command",
     "swarm.runtime_command",
     "swarm.task_dispatch_context",
+    "swarm.task_prompt",
 ];
-const EVENT_SCHEMAS: [&str; 3] = [
+const EVENT_SCHEMAS: [&str; 4] = [
     "swarm.normalized_result_page",
+    "swarm.opencode_interaction_observation",
     "swarm.runtime_outcome",
     "swarm.task_dispatch_admission",
 ];
@@ -111,7 +119,6 @@ impl OwnedBootstrap {
         let native_options = NativeOptions {
             service_id: required_env("ELIOT_SWARM_CONFIG_OPENCODE_SERVICE_ID")?,
             connection_file: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_CONNECTION_FILE")?,
-            expected_version: required_env("ELIOT_SWARM_CONFIG_OPENCODE_EXPECTED_VERSION")?,
             directory: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_DIRECTORY")?,
             model: crate::config::ModelRef {
                 id: required_env("ELIOT_SWARM_CONFIG_OPENCODE_MODEL_ID")?,
@@ -167,16 +174,12 @@ fn owned_native_options(native: &NativeOptions) -> Result<Option<OwnedNativeOpti
         owner_nonce: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_NONCE")?,
         bun_executable: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_BUN_EXECUTABLE")?,
         bun_sha256: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_BUN_SHA256")?,
-        server_program: absolute_config_path(
-            "ELIOT_SWARM_CONFIG_OPENCODE_OWNER_SERVER_PROGRAM",
-        )?,
+        server_program: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_SERVER_PROGRAM")?,
         server_program_sha256: required_env(
             "ELIOT_SWARM_CONFIG_OPENCODE_OWNER_SERVER_PROGRAM_SHA256",
         )?,
         state_root: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_STATE_ROOT")?,
-        password_file: absolute_config_path(
-            "ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PASSWORD_FILE",
-        )?,
+        password_file: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PASSWORD_FILE")?,
         port,
         model_catalog: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_MODEL_CATALOG")?,
         provider_auth: provider_auth_options(native)?,
@@ -192,8 +195,7 @@ fn owned_native_options(native: &NativeOptions) -> Result<Option<OwnedNativeOpti
 }
 
 fn provider_auth_options(native: &NativeOptions) -> Result<Option<ProviderAuthOptions>> {
-    let Some(source) = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PROVIDER_AUTH_FILE")?
-    else {
+    let Some(source) = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PROVIDER_AUTH_FILE")? else {
         return Ok(None);
     };
     let source_file = absolute_config_path_value(source)?;
@@ -213,7 +215,9 @@ fn capabilities_match(claim: &ModuleContractClaim) -> bool {
         .map(CapabilityId::as_str)
         .collect::<Vec<_>>();
     values.len() == CAPABILITIES.len()
-        && CAPABILITIES.iter().all(|capability| values.contains(capability))
+        && CAPABILITIES
+            .iter()
+            .all(|capability| values.contains(capability))
 }
 
 fn config_schema_matches(claim: &ModuleContractClaim) -> bool {
@@ -229,9 +233,7 @@ fn schema_set_matches(schemas: &[SchemaDescriptor], expected: &[&str]) -> bool {
     schemas.len() == expected.len()
         && expected.iter().all(|expected_id| {
             schemas.iter().any(|schema| {
-                schema.schema_id == *expected_id
-                    && schema.version == "1"
-                    && schema.sha256.is_none()
+                schema.schema_id == *expected_id && schema.version == "1" && schema.sha256.is_none()
             })
         })
 }
@@ -247,6 +249,19 @@ pub fn native_mcp_enabled(claim: &ModuleContractClaim) -> bool {
 
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
     capabilities_match(claim) && command_event_schemas_match(claim)
+}
+
+/// TaskPrompt v1 is selected by this artifact's exact descriptor, never by
+/// the presence of a similarly named command input field.
+pub fn task_prompt_v1_selected(claim: &ModuleContractClaim) -> bool {
+    claim.module_id.as_str() == MODULE_ID
+        && claim.artifact.artifact_id.as_str() == ARTIFACT_ID
+        && claim.artifact.version.as_str() == ARTIFACT_VERSION
+        && schema_set_matches(&claim.command_schemas, &COMMAND_SCHEMAS)
+        && claim
+            .command_schemas
+            .iter()
+            .any(|schema| schema.schema_id == "swarm.task_prompt" && schema.version == "1")
 }
 
 pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {

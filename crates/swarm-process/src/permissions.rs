@@ -1,5 +1,10 @@
-use std::{fs::OpenOptions, io::Write, path::Path};
-use swarm_contracts::error::Result;
+use std::{
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Component, Path, PathBuf},
+};
+use swarm_contracts::error::{Error, Result};
 
 /// Restrict only the explicitly selected path to the current user's access.
 pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
@@ -16,8 +21,181 @@ pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
-/// Create a new private file, write all bytes, and flush them to the OS.
+/// Create a new private file without clobbering an existing path.
+///
+/// Bytes are written to a same-directory private temporary file and synced
+/// before atomic no-replace publication. Unix also syncs the parent directory
+/// before success. Windows uses a write-through move; this does not claim a
+/// Unix-equivalent parent-directory fsync.
 pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
+    let target = private_target_path(path)?;
+    if target_is_regular_file(&target)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "private file already exists",
+        )
+        .into());
+    }
+    let temp = private_temp_path(&target)?;
+    let result = (|| {
+        let mut file = create_private_temp(&temp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        publish_new(&temp, &target)?;
+        sync_parent_directory(&target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Atomically replace a regular private file using a synced same-directory
+/// temporary file. The target may be absent; a symlink, reparse point, or
+/// non-file target is rejected. Unix syncs the parent directory after the
+/// replacement. Windows uses `MOVEFILE_WRITE_THROUGH` without claiming an
+/// equivalent directory fsync.
+pub fn replace_private_durable(path: &Path, data: &[u8]) -> Result<()> {
+    let target = private_target_path(path)?;
+    let _ = target_is_regular_file(&target)?;
+    let temp = private_temp_path(&target)?;
+    let result = (|| {
+        let mut file = create_private_temp(&temp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        publish_replace(&temp, &target)?;
+        sync_parent_directory(&target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Remove an exact regular private file and sync its parent on Unix.
+/// Returns `false` when the file was already absent. On Windows the removal
+/// uses the platform file API; no parent-directory flush equivalence is
+/// claimed.
+pub fn remove_private_durable(path: &Path) -> Result<bool> {
+    let target = private_target_path(path)?;
+    if !target_is_regular_file(&target)? {
+        return Ok(false);
+    }
+    fs::remove_file(&target)?;
+    sync_parent_directory(&target)?;
+    Ok(true)
+}
+
+/// Sync the parent directory on Unix. Windows currently has no directory
+/// flush implementation here, so this returns success without claiming that
+/// the directory entry itself is durable there.
+pub fn sync_parent_directory(path: &Path) -> Result<()> {
+    let target = private_target_path(path)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::invalid("private file path has no parent directory"))?;
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        let directory = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(parent)?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let directory = fs::File::open(parent)?;
+        directory.sync_all()?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = parent;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = parent;
+        return Err(Error::new(
+            "DURABILITY_UNSUPPORTED",
+            "parent-directory durability is unsupported on this platform",
+        ));
+    }
+    Ok(())
+}
+
+fn private_target_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute()
+        && path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err(Error::invalid(
+            "private file path has a drive-relative prefix",
+        ));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if absolute
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || absolute.file_name().is_none()
+    {
+        return Err(Error::invalid(
+            "private file path must name one file without traversal components",
+        ));
+    }
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| Error::invalid("private file path has no parent directory"))?;
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(Error::new(
+                "PRIVATE_PATH_INVALID",
+                "private file path cannot traverse links or non-directories",
+            ));
+        }
+    }
+    Ok(absolute)
+}
+
+fn target_is_regular_file(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse(&metadata) || !metadata.is_file() => Err(Error::new(
+            "PRIVATE_FILE_INVALID",
+            "private file target is a link or is not a regular file",
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn private_temp_path(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::invalid("private file path has no parent directory"))?;
+    let mut name = OsString::from(".");
+    name.push(
+        target
+            .file_name()
+            .ok_or_else(|| Error::invalid("private file path has no file name"))?,
+    );
+    name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    Ok(parent.join(name))
+}
+
+fn create_private_temp(path: &Path) -> Result<fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -25,11 +203,61 @@ pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     private_permissions(path, false)?;
-    file.write_all(data)?;
-    file.sync_all()?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn publish_new(temp: &Path, target: &Path) -> Result<()> {
+    // Hard-link publication is atomic and fails if the target already exists.
+    fs::hard_link(temp, target)?;
+    fs::remove_file(temp)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn publish_new(temp: &Path, target: &Path) -> Result<()> {
+    windows::move_file(temp, target, false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_new(temp: &Path, target: &Path) -> Result<()> {
+    fs::hard_link(temp, target)?;
+    fs::remove_file(temp)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publish_replace(temp: &Path, target: &Path) -> Result<()> {
+    fs::rename(temp, target)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publish_replace(temp: &Path, target: &Path) -> Result<()> {
+    windows::move_file(temp, target, true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_replace(temp: &Path, target: &Path) -> Result<()> {
+    fs::rename(temp, target)?;
+    Ok(())
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || is_reparse(metadata)
+}
+
+#[cfg(windows)]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -113,6 +341,26 @@ mod windows {
             LocalFree(descriptor);
             result
         }
+    }
+
+    pub(super) fn move_file(source: &Path, destination: &Path, replace: bool) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut flags = MOVEFILE_WRITE_THROUGH;
+        if replace {
+            flags |= MOVEFILE_REPLACE_EXISTING;
+        }
+        // SAFETY: both paths are NUL-terminated UTF-16 strings that remain
+        // alive for the duration of the Win32 call.
+        let ok = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
+        if ok == 0 { Err(last_error()) } else { Ok(()) }
     }
 
     pub(super) fn restrict_path(path: &Path, directory: bool) -> Result<()> {

@@ -17,10 +17,8 @@ use crate::{
     error::{Error, Result},
     model::{Principal, Role},
 };
-use rusqlite::{OptionalExtension, Transaction};
+use rusqlite::Transaction;
 use serde_json::{Value, json};
-
-type GmScopeRow = (String, i64);
 
 pub(super) fn apply(
     tx: &Transaction<'_>,
@@ -46,20 +44,15 @@ pub(super) fn apply(
     }
 
     let request = TransferRequest::parse(value)?;
-    let gm: Option<GmScopeRow> = tx
-        .query_row(
-            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((new_owner_manager_id, gm_epoch)) = gm else {
+    let Some(current_gm) = super::gm::current(tx)? else {
         return Err(Error::new(
             "FORBIDDEN",
             "automation ownership transfer requires a current GM designation",
         ));
     };
-    if gm_epoch <= 0 || new_owner_manager_id == request.former_owner_manager_id {
+    let new_owner_manager_id = current_gm.client_id;
+    let gm_epoch = current_gm.epoch;
+    if new_owner_manager_id == request.former_owner_manager_id {
         return Err(Error::new(
             "AUTOMATION_TRANSFER_CONFLICT",
             "the current GM must be different from the former automation owner",

@@ -4,11 +4,11 @@
 **Status:** actionable research and implementation plan; NOT a claim of release readiness.
 **Source of evidence:** full Master Audit v26, accepted owner decisions, existing R01–R51 handoffs, and GitHub PR/Issue status checked on 2026-10-09.
 
-## Required source input: HIGH appendix (not checked into this repository)
+## Supplied source input: HIGH appendix
 
-The phrase **"full HIGH appendix"** in the master audit refers to **section 8, "Приложение: полный реестр доказанных дефектов, не вошедших в §1–§4"**, of the owner's source document **"Что чинить + полный реестр.md"** (historical source baseline `40591a2`). That section contains 61 source-labelled **[HIGH]** entries, 136 [MED], 82 [LOW] and 128 ungraded entries. **This original source file is in the owner's ChatGPT Library, not this GitHub repository.** The owner must attach/provide it separately to agents assigned exhaustive HIGH disposition. The companion **"Реестр подозрений.md"** is a different, explicitly **НЕ доказано** hypothesis inventory, also outside this repository. The audit v26/v27 and this map are **not** replacements for those original sources.
+The phrase **"full HIGH appendix"** in the master audit refers to **section 8, "Приложение: полный реестр доказанных дефектов, не вошедших в §1–§4"**, of the owner's source document **"Что чинить + полный реестр.md"** (historical source baseline `40591a2`). That section contains 61 source-labelled **[HIGH]** entries, 136 [MED], 82 [LOW] and 128 ungraded entries. The original source was retained outside this repository and has now been supplied locally. The companion **"Реестр подозрений.md"** is a different, explicitly **НЕ доказано** hypothesis inventory. The audit v26/v27 and this map do not replace the original sources.
 
-If source access is unavailable: proceed with well-scoped implementation PRs using exact code and their existing handoffs, but **do not claim the complete HIGH appendix was checked**. When it is supplied, classify each entry against current `main` as `fixed(commit/PR)`, `refuted(verified guard)`, `outstanding(one owner)` or `needs-evidence`. Some historical HIGH entries were already fixed in merged #75–#104. Preserve source text separately from revised verdicts, and do not reimplement merged fixes.
+The owner supplied the original registry and extracted appendix on 2026-10-09 in `C:/Users/kleym/Downloads/Swarm V27 audit map`. All 61 HIGH rows and the additional MED/HIGH row are now classified exactly once in [HIGH-VERDICTS.json](HIGH-VERDICTS.json), with source hashes and comparison evidence in [CURRENT-AUDIT.md](CURRENT-AUDIT.md). The source-access prerequisite is satisfied. Two explicit runtime evidence gaps remain; uncommitted implementation does not upgrade a confirmed defect to a qualified fix. Historical merged fixes are not reimplemented.
 
 ## 0. Ground truth before any code
 

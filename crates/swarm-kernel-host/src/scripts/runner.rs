@@ -1,12 +1,12 @@
-//! One bounded worker per admitted direct script run. The worker receives no
-//! Store connection, manager credential, or controller API capability.
+//! Store-side ScriptRun receipt and observation protocol. Execution is owned
+//! by the standalone `swarm-script-worker` process.
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     error::{Error, Result},
     model,
     platform::{
         self,
-        process_group::{Group, departed_empty, spawned_departed, spawned_identity},
+        process_group::{departed_empty, spawned_departed, spawned_identity},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -17,20 +17,12 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread,
-    time::{Duration, Instant},
 };
 
 use super::{
-    manifest::{
-        self, InterpreterIdentity, MAX_INVOCATION_BYTES, MAX_RESULT_BYTES, MAX_SCRIPT_DURATION_MS,
-        MAX_STDERR_BYTES, ScriptBundle,
-    },
-    protocol::{ScriptEffectRequest, ScriptInvocation, ScriptResult},
+    manifest::{self, InterpreterIdentity, MAX_RESULT_BYTES, MAX_STDERR_BYTES, ScriptBundle},
+    protocol::{ScriptEffectRequest, ScriptInvocation},
     registry,
 };
 use swarm_scripts::process::{
@@ -38,8 +30,6 @@ use swarm_scripts::process::{
 };
 
 const CONTROL_LIMIT: usize = 16 * 1024 * 1024;
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const START_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,9 +44,8 @@ pub struct Work {
     pub environment: BTreeMap<String, String>,
     pub environment_sha256: String,
     pub invocation: ScriptInvocation,
-    /// `None` preserves receipts admitted before the optional standalone
-    /// executor migration. A selected pin is durable per run and never falls
-    /// back to this root-binary worker.
+    /// `None` is retained only to decode pre-cutover receipts for reconciliation.
+    /// New runs require a pin and never fall back to a root-binary executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<swarm_script_worker::ExecutorPin>,
 }
@@ -104,24 +93,36 @@ pub struct Completion {
     #[serde(default)]
     pub controller_effects: Vec<ScriptEffectRequest>,
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub process_facts: Option<Value>,
 }
 
-#[derive(Debug)]
-struct Captured {
-    bytes: Vec<u8>,
-    overflow: bool,
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOutput {
+    pub artifact: ArtifactRecord,
+    pub capture: Value,
 }
 
-struct CompletionPublication<'a> {
-    stdout: &'a [u8],
-    stderr: &'a [u8],
-    result_value: Option<Value>,
-    controller_effects: &'a [ScriptEffectRequest],
-    error_code: Option<String>,
-    state: &'a str,
-    started_at_ms: Option<i64>,
-    exit_code: Option<i32>,
-    process: &'a Value,
+/// Exact standalone-worker fact retained when family, output capture, or
+/// input-drain cleanup did not finish within its bounded grace period.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupPending {
+    pub schema_version: u8,
+    pub run_id: String,
+    pub operation_id: String,
+    pub token: String,
+    pub state: String,
+    pub started_at_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub error_code: Option<String>,
+    pub process: Value,
+    pub process_facts: Value,
+    pub stdout: RetainedOutput,
+    pub stderr: RetainedOutput,
+    #[serde(default)]
+    pub controller_effects: Vec<ScriptEffectRequest>,
 }
 
 pub fn directory(data_dir: &Path, run_id: &str) -> Result<PathBuf> {
@@ -169,6 +170,14 @@ pub fn capture_environment(bundle: &ScriptBundle) -> Result<BTreeMap<String, Str
 /// Create both the immutable private work document and the CLI receipt before
 /// reserving the DB row. A host restart uses these exact captured values.
 pub fn write_work(work: &Work) -> Result<(PathBuf, String)> {
+    validate_work(work)?;
+    let pin = work.executor.as_ref().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_EXECUTOR_UNSELECTED",
+            "new ScriptRun requires a pinned standalone worker",
+        )
+    })?;
+    swarm_script_worker::verify_pinned_executor_file(pin)?;
     let dir = directory(&work.data_dir, &work.run_id)?;
     ensure_private_directory(&work.data_dir, &dir)?;
     let path = dir.join("work.json");
@@ -299,27 +308,18 @@ pub fn prepare_and_spawn(work: &Work, work_digest: &str) -> Result<Value> {
             "configured interpreter changed after admission",
         ));
     }
-    let mut command = if let Some(pin) = &work.executor {
-        let executable = swarm_script_worker::verify_pinned_executor_file(pin)?;
-        let mut command = Command::new(executable);
-        command.arg("--file").arg(dir.join("receipt.json"));
-        command
-    } else {
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .arg("script-worker")
-            .arg("--file")
-            .arg(dir.join("receipt.json"));
-        command
-    };
-    let launch_environment = if work.executor.is_some() {
-        standalone_worker_environment()
-    } else {
-        worker_environment()
-    };
+    let pin = work.executor.as_ref().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_EXECUTOR_UNSELECTED",
+            "new ScriptRun requires a pinned standalone worker",
+        )
+    })?;
+    let executable = swarm_script_worker::verify_pinned_executor_file(pin)?;
+    let mut command = Command::new(executable);
+    command.arg("--file").arg(dir.join("receipt.json"));
     command
         .env_clear()
-        .envs(launch_environment)
+        .envs(standalone_worker_environment())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -346,6 +346,7 @@ pub fn prepare_and_spawn(work: &Work, work_digest: &str) -> Result<Value> {
             })?;
             let dir = directory(&work.data_dir, &work.run_id)?;
             if receipt_exists(&dir.join("worker.json"))?
+                || receipt_exists(&dir.join("start-decision.json"))?
                 || receipt_exists(&dir.join("go.json"))?
                 || receipt_exists(&dir.join("started.json"))?
                 || receipt_exists(&dir.join("completion.json"))?
@@ -497,21 +498,23 @@ pub fn process_control_failure(work: &Work) -> Result<Option<ProcessControlFailu
 }
 
 pub fn allow(work: &Work) -> Result<()> {
-    if directory(&work.data_dir, &work.run_id)?
-        .join("deny.json")
-        .try_exists()?
-    {
-        return Err(Error::conflict(
-            "script run was denied before its start gate",
-        ));
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    let decision = swarm_script_worker::ScriptStartDecision::Allow {
+        schema_version: 1,
+        run_id: work.run_id.clone(),
+        operation_id: work.operation_id.clone(),
+        token: work.token.clone(),
+        decided_at_ms: model::now_ms()?,
+    };
+    match swarm_script_worker::publish_start_decision(&dir, decision)? {
+        swarm_script_worker::StartDecisionPublish::Retained(retained)
+            if start_decision_allows_start(&retained)? == Some(true) => {}
+        _ => {
+            return Err(Error::conflict(
+                "script start decision was denied or conflicted before Allow",
+            ));
+        }
     }
-    write_once(
-        &directory(&work.data_dir, &work.run_id)?.join("go.json"),
-        &model::canonical(
-            &json!({"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}),
-        )?
-        .into_bytes(),
-    )?;
     if work.executor.is_some() {
         let receipt = directory(&work.data_dir, &work.run_id)?.join("receipt.json");
         swarm_script_worker::materialize_after_go(&receipt)?;
@@ -520,10 +523,25 @@ pub fn allow(work: &Work) -> Result<()> {
 }
 
 pub fn deny(work: &Work, error_code: &str) -> Result<()> {
-    write_once(
-        &directory(&work.data_dir, &work.run_id)?.join("deny.json"),
-        &model::canonical(&json!({"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token,"error_code":error_code}))?.into_bytes(),
-    )
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    let decision = swarm_script_worker::ScriptStartDecision::Deny {
+        schema_version: 1,
+        run_id: work.run_id.clone(),
+        operation_id: work.operation_id.clone(),
+        token: work.token.clone(),
+        error_code: error_code.to_owned(),
+        decided_at_ms: model::now_ms()?,
+    };
+    match swarm_script_worker::publish_start_decision(&dir, decision)? {
+        swarm_script_worker::StartDecisionPublish::Retained(retained)
+            if start_decision_allows_start(&retained)? == Some(false) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::conflict(
+            "script start decision was allowed or conflicted before Deny",
+        )),
+    }
 }
 
 /// Deny a worker that has been spawned but has not passed the start gate when
@@ -535,9 +553,6 @@ pub fn deny_unstarted(
     error_code: &str,
 ) -> Result<bool> {
     let dir = directory(data_dir, run_id)?;
-    if dir.join("go.json").try_exists()? {
-        return Ok(false);
-    }
     let launch_path = dir.join("launch.json");
     if !launch_path.try_exists()? {
         return Ok(true);
@@ -553,18 +568,80 @@ pub fn deny_unstarted(
             "launch receipt identifies another run",
         ));
     }
-    write_once(
-        &dir.join("deny.json"),
-        &model::canonical(&json!({"run_id":run_id,"operation_id":operation_id,"token":token,"error_code":error_code}))?.into_bytes(),
-    )?;
-    Ok(!dir.join("go.json").try_exists()?)
+    let decision = swarm_script_worker::ScriptStartDecision::Deny {
+        schema_version: 1,
+        run_id: run_id.to_owned(),
+        operation_id: operation_id.to_owned(),
+        token: token.to_owned(),
+        error_code: error_code.to_owned(),
+        decided_at_ms: model::now_ms()?,
+    };
+    let published = swarm_script_worker::publish_start_decision(&dir, decision)?;
+    match published {
+        swarm_script_worker::StartDecisionPublish::Retained(
+            swarm_script_worker::StartDecisionRead::Current(
+                swarm_script_worker::ScriptStartDecision::Deny {
+                    error_code: retained_code,
+                    ..
+                },
+            ),
+        )
+        | swarm_script_worker::StartDecisionPublish::Retained(
+            swarm_script_worker::StartDecisionRead::LegacyDeny {
+                error_code: retained_code,
+            },
+        ) if retained_code == error_code => Ok(true),
+        swarm_script_worker::StartDecisionPublish::Conflict(retained) => {
+            match start_decision_allows_start(&retained)? {
+                Some(true) => Err(Error::conflict(
+                    "script start was already allowed before the unstarted denial",
+                )),
+                Some(false) => Err(Error::conflict(
+                    "a different script denial is already retained",
+                )),
+                None => Err(Error::conflict(
+                    "script denial conflicted without a retained decision",
+                )),
+            }
+        }
+        _ => Err(Error::conflict(
+            "script denial did not retain the requested immutable decision",
+        )),
+    }
+}
+
+pub fn start_decision(work: &Work) -> Result<swarm_script_worker::StartDecisionRead> {
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    Ok(swarm_script_worker::read_start_decision(
+        &dir,
+        &work.run_id,
+        &work.operation_id,
+        &work.token,
+    )?)
+}
+
+pub fn start_decision_allows_start(
+    decision: &swarm_script_worker::StartDecisionRead,
+) -> Result<Option<bool>> {
+    match decision {
+        swarm_script_worker::StartDecisionRead::Current(
+            swarm_script_worker::ScriptStartDecision::Allow { .. },
+        )
+        | swarm_script_worker::StartDecisionRead::LegacyAllow => Ok(Some(true)),
+        swarm_script_worker::StartDecisionRead::Current(
+            swarm_script_worker::ScriptStartDecision::Deny { .. },
+        )
+        | swarm_script_worker::StartDecisionRead::LegacyDeny { .. } => Ok(Some(false)),
+        swarm_script_worker::StartDecisionRead::Pending => Ok(None),
+        swarm_script_worker::StartDecisionRead::Ambiguous => Err(Error::new(
+            "SCRIPT_START_DECISION_AMBIGUOUS",
+            "multiple start decisions are retained for this ScriptRun",
+        )),
+    }
 }
 
 pub fn has_start_gate(work: &Work) -> Result<bool> {
-    directory(&work.data_dir, &work.run_id)?
-        .join("go.json")
-        .try_exists()
-        .map_err(Into::into)
+    Ok(start_decision_allows_start(&start_decision(work)?)? == Some(true))
 }
 
 pub fn terminal_receipt_exists(data_dir: &Path, run_id: &str) -> Result<bool> {
@@ -638,6 +715,20 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
             "script completion identity or artifact types differ",
         ));
     }
+    if let Some(process_facts) = completion.process_facts.as_ref() {
+        validate_process_facts(process_facts, &worker["process"], false)?;
+        if !capture_fact_matches_length(
+            &process_facts["stdout_capture"],
+            completion.stdout.byte_length,
+        ) || !capture_fact_matches_length(
+            &process_facts["stderr_capture"],
+            completion.stderr.byte_length,
+        ) {
+            return Err(Error::conflict(
+                "script completion capture facts differ from retained output sizes",
+            ));
+        }
+    }
     files.verify(&completion.result)?;
     files.verify(&completion.stdout)?;
     files.verify(&completion.stderr)?;
@@ -680,6 +771,10 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         || result_value["stdout_ref"] != completion.stdout.artifact_id
         || result_value["stderr_ref"] != completion.stderr.artifact_id
         || result_value["controller_effects"] != json!(completion.controller_effects)
+        || completion
+            .process_facts
+            .as_ref()
+            .is_some_and(|facts| result_value["process_facts"] != *facts)
     {
         return Err(Error::conflict(
             "script result document differs from its completion receipt",
@@ -689,6 +784,194 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         work.bundle.result_schema.validate_value(value)?;
     }
     Ok(Some(completion))
+}
+
+/// Read and validate the standalone worker's retained cleanup fact. It keeps
+/// partial output and its capture facts available while family ownership is
+/// unresolved; this receipt never proves resource release.
+pub fn cleanup_pending(work: &Work, files: &ArtifactFiles) -> Result<Option<CleanupPending>> {
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    let path = dir.join("cleanup-pending.json");
+    if !receipt_exists(&path)? {
+        return Ok(None);
+    }
+    let pending: CleanupPending = serde_json::from_value(read_json(&path)?).map_err(|_| {
+        Error::new(
+            "SCRIPT_CLEANUP_PENDING_DAMAGED",
+            "script cleanup-pending receipt cannot be parsed",
+        )
+    })?;
+    let worker = read_json(&dir.join("worker.json"))?;
+    if pending.schema_version != 1
+        || pending.run_id != work.run_id
+        || pending.operation_id != work.operation_id
+        || pending.token != work.token
+        || pending.state != "cleanup_pending"
+        || pending.process != worker["process"]
+        || !pending.controller_effects.is_empty()
+        || pending.stdout.capture != pending.process_facts["stdout_capture"]
+        || pending.stderr.capture != pending.process_facts["stderr_capture"]
+    {
+        return Err(Error::conflict(
+            "script cleanup-pending identity or capture facts differ",
+        ));
+    }
+    validate_process_facts(&pending.process_facts, &worker["process"], true)?;
+    if !capture_fact_matches_length(&pending.stdout.capture, pending.stdout.artifact.byte_length)
+        || !capture_fact_matches_length(
+            &pending.stderr.capture,
+            pending.stderr.artifact.byte_length,
+        )
+        || !output_matches(work, "stdout", &pending.stdout.artifact)
+        || !output_matches(work, "stderr", &pending.stderr.artifact)
+    {
+        return Err(Error::conflict(
+            "script cleanup-pending output facts differ from retained artifacts",
+        ));
+    }
+    files.verify(&pending.stdout.artifact)?;
+    files.verify(&pending.stderr.artifact)?;
+    Ok(Some(pending))
+}
+
+/// Same-execution recovery after positive family departure. Captured bytes
+/// remain exact and no script or controller effect is replayed.
+pub fn recover_cleanup_pending(
+    work: &Work,
+    files: &ArtifactFiles,
+    pending: &CleanupPending,
+) -> Result<Option<Completion>> {
+    if !departed_empty(&pending.process, &work.token)? {
+        return Ok(None);
+    }
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    let proof_path = dir.join("cleanup-release.json");
+    if !receipt_exists(&proof_path)? {
+        let proof = json!({"run_id":work.run_id,"operation_id":work.operation_id,
+            "token":work.token,"process":pending.process,"method":"departed_empty",
+            "observed_at_ms":model::now_ms()?});
+        write_once(&proof_path, &model::canonical(&proof)?.into_bytes())?;
+    }
+    let proof = read_json(&proof_path)?;
+    if proof["run_id"] != work.run_id
+        || proof["operation_id"] != work.operation_id
+        || proof["token"] != work.token
+        || proof["process"] != pending.process
+        || proof["method"] != "departed_empty"
+        || proof["observed_at_ms"]
+            .as_i64()
+            .is_none_or(|time| time <= 0)
+    {
+        return Err(Error::conflict(
+            "script cleanup release proof differs from its exact execution",
+        ));
+    }
+    let mut facts = pending.process_facts.clone();
+    facts["resource_released"] = json!(true);
+    facts["cleanup_pending"] = json!(false);
+    facts["family_departure"]["state"] = json!("confirmed");
+    validate_process_facts(&facts, &pending.process, false)?;
+    let error_code = pending
+        .error_code
+        .clone()
+        .unwrap_or_else(|| "SCRIPT_CAPTURE_INCOMPLETE".to_owned());
+    let report = json!({"protocol_version":1,"run_id":work.run_id,
+        "operation_id":work.operation_id,"script_id":work.bundle.script_id,
+        "script_revision":work.invocation.script_revision,"state":"incomplete",
+        "started_at_ms":pending.started_at_ms,"exit_code":pending.exit_code,
+        "error_code":error_code,"result":null,"stdout_ref":pending.stdout.artifact.artifact_id,
+        "stderr_ref":pending.stderr.artifact.artifact_id,"controller_effects":[],
+        "process_facts":facts,"execution_process_facts":pending.process_facts,
+        "release_evidence":proof,"recovery":{"command_replayed":false,"effects_applied":false}});
+    let id = format!(
+        "scriptresult-{}",
+        model::digest(format!("cleanup-release:{}", work.operation_id).as_bytes())
+    );
+    let (result, bytes) = ArtifactFiles::document(
+        "script_result",
+        &id,
+        &report,
+        json!({"run_id":work.run_id,"operation_id":work.operation_id,
+            "script_id":work.bundle.script_id,"state":"incomplete"}),
+    )?;
+    files.publish(&result, &bytes)?;
+    Ok(Some(Completion {
+        run_id: work.run_id.clone(),
+        operation_id: work.operation_id.clone(),
+        token: work.token.clone(),
+        state: "incomplete".to_owned(),
+        started_at_ms: pending.started_at_ms,
+        exit_code: pending.exit_code,
+        process: pending.process.clone(),
+        result,
+        stdout: pending.stdout.artifact.clone(),
+        stderr: pending.stderr.artifact.clone(),
+        result_value: None,
+        controller_effects: Vec::new(),
+        error_code: Some(error_code),
+        process_facts: Some(facts),
+    }))
+}
+
+fn validate_process_facts(facts: &Value, process: &Value, cleanup_pending: bool) -> Result<()> {
+    let family = &facts["family_departure"];
+    let family_state = family["state"].as_str();
+    let direct_state = facts["direct_exit"]["state"].as_str();
+    let family_valid = match (cleanup_pending, facts["resource_released"].as_bool()) {
+        (false, Some(true)) => family_state == Some("confirmed"),
+        (true, Some(true)) => family_state == Some("confirmed"),
+        (true, Some(false)) => matches!(
+            family_state,
+            Some("confirmed" | "cleanup_pending" | "observation_unknown")
+        ),
+        _ => false,
+    };
+    if facts["schema_version"] != 1
+        || facts["cleanup_pending"] != cleanup_pending
+        || !family_valid
+        || family["process"] != *process
+        || !matches!(
+            direct_state,
+            Some("observed" | "observation_unknown" | "not_started")
+        )
+        || !capture_fact_matches_length(
+            &facts["stdout_capture"],
+            facts["stdout_capture"]["bytes_retained"]
+                .as_u64()
+                .unwrap_or(u64::MAX),
+        )
+        || !capture_fact_matches_length(
+            &facts["stderr_capture"],
+            facts["stderr_capture"]["bytes_retained"]
+                .as_u64()
+                .unwrap_or(u64::MAX),
+        )
+    {
+        return Err(Error::conflict(
+            "script process facts do not prove the declared cleanup state",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_fact_matches_length(fact: &Value, byte_length: u64) -> bool {
+    let bytes_retained = fact["bytes_retained"].as_u64();
+    let bytes_observed = fact["bytes_observed"].as_u64();
+    let capture_complete = fact["capture_complete"].as_bool();
+    let state = fact["state"].as_str();
+    let error_valid = fact["capture_error"].is_null() || fact["capture_error"].is_string();
+    matches!(state, Some("complete" | "incomplete" | "not_started"))
+        && bytes_retained == Some(byte_length)
+        && bytes_observed.is_some_and(|observed| observed >= byte_length)
+        && fact["truncated"].as_bool().is_some()
+        && capture_complete.is_some_and(|complete| {
+            if state == Some("complete") {
+                complete
+            } else {
+                !complete
+            }
+        })
+        && error_valid
 }
 
 /// A validated terminal receipt is written only after interpreter output has
@@ -767,10 +1050,12 @@ pub fn worker_departed(work: &Work, launch: &Value) -> Result<bool> {
         }
         let dir = directory(&work.data_dir, &work.run_id)?;
         if receipt_exists(&dir.join("worker.json"))?
+            || receipt_exists(&dir.join("start-decision.json"))?
             || receipt_exists(&dir.join("go.json"))?
             || receipt_exists(&dir.join("started.json"))?
             || receipt_exists(&dir.join("completion.json"))?
             || receipt_exists(&dir.join("terminal.json"))?
+            || receipt_exists(&dir.join("cleanup-pending.json"))?
         {
             return Ok(false);
         }
@@ -834,10 +1119,10 @@ pub fn worker_family_departed_from_identity(
     departed_empty(process, token)
 }
 
-/// Prove that a pre-Go worker is gone before Store settles its run. This path
-/// intentionally requires the exact persisted launch receipt and absence of
-/// Go, interpreter-start, and plan markers; a missing launch receipt is not
-/// proof that the launcher failed before creating a process.
+/// Prove that a pre-Allow worker is gone before Store settles its run. This
+/// path requires the exact launch receipt, a retained non-Allow decision or no
+/// decision, and no interpreter-start or plan markers. A missing launch receipt
+/// is not proof that the launcher failed before creating a process.
 pub fn prestart_worker_family_departed(
     data_dir: &Path,
     run_id: &str,
@@ -845,10 +1130,10 @@ pub fn prestart_worker_family_departed(
 ) -> Result<bool> {
     let dir = directory(data_dir, run_id)?;
     for marker in [
-        "go.json",
         "started.json",
         "execution-plan.json",
         "execution-plan-ready.json",
+        "cleanup-pending.json",
     ] {
         if receipt_exists(&dir.join(marker))? {
             return Ok(false);
@@ -868,6 +1153,15 @@ pub fn prestart_worker_family_departed(
             "SCRIPT_LAUNCH_DAMAGED",
             "pre-start launch receipt identifies another run or Operation",
         ));
+    }
+    if start_decision_allows_start(&swarm_script_worker::read_start_decision(
+        &dir,
+        run_id,
+        operation_id,
+        token,
+    )?)? == Some(true)
+    {
+        return Ok(false);
     }
     if let Some(receipt) = launch.get("early_exit").filter(|value| !value.is_null()) {
         let receipt: EarlyExitReceipt = serde_json::from_value(receipt.clone()).map_err(|_| {
@@ -916,627 +1210,10 @@ pub fn prestart_worker_family_departed(
     departed_empty(process, token)
 }
 
+/// Compatibility entry point for the hidden host CLI. The worker implementation
+/// lives only in the standalone worker crate.
 pub fn run_worker(receipt_path: &Path) -> Result<()> {
-    let work = read_work(receipt_path)?;
-    if work.executor.is_some() {
-        return Err(Error::new(
-            "SCRIPT_EXECUTOR_MISMATCH",
-            "a standalone-selected ScriptRun cannot use the legacy root worker",
-        ));
-    }
-    let dir = directory(&work.data_dir, &work.run_id)?;
-    let lock_path = dir.join("worker.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    lock.try_lock().map_err(|_| {
-        Error::new(
-            "SCRIPT_WORKER_EXISTS",
-            "this script already has an owning worker",
-        )
-    })?;
-    if dir.join("completion.json").exists() || dir.join("worker.json").exists() {
-        return Err(Error::new(
-            "SCRIPT_RECOVERY_REQUIRED",
-            "a previous script worker started; code will not be repeated",
-        ));
-    }
-    let group = Group::enter_script(&work.token)?;
-    let identity = json!({"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token,"ready_at_ms":model::now_ms()? ,"control_version":1,"process":group_identity(&group)?});
-    write_once(
-        &dir.join("worker.json"),
-        &model::canonical(&identity)?.into_bytes(),
-    )?;
-    if let Err(error) = stage_bundle(&work, &dir) {
-        return finish_without_spawn(&work, &group, &identity, error.code);
-    }
-    let gate = dir.join("go.json");
-    let gate_deadline = Instant::now() + START_GATE_TIMEOUT;
-    loop {
-        if gate.try_exists()? {
-            let go = match read_json(&gate) {
-                Ok(go) => go,
-                Err(_) => {
-                    return finish_without_spawn(
-                        &work,
-                        &group,
-                        &identity,
-                        "SCRIPT_START_GATE_INVALID".into(),
-                    );
-                }
-            };
-            if go["run_id"] != work.run_id
-                || go["operation_id"] != work.operation_id
-                || go["token"] != work.token
-            {
-                return finish_without_spawn(
-                    &work,
-                    &group,
-                    &identity,
-                    "SCRIPT_START_GATE_INVALID".into(),
-                );
-            }
-            break;
-        }
-        let denied = dir.join("deny.json");
-        if denied.try_exists()? {
-            let denial = match read_json(&denied) {
-                Ok(denial) => denial,
-                Err(_) => {
-                    return finish_without_spawn(
-                        &work,
-                        &group,
-                        &identity,
-                        "SCRIPT_START_DENIAL_INVALID".into(),
-                    );
-                }
-            };
-            if denial["run_id"] != work.run_id
-                || denial["operation_id"] != work.operation_id
-                || denial["token"] != work.token
-            {
-                return finish_without_spawn(
-                    &work,
-                    &group,
-                    &identity,
-                    "SCRIPT_START_DENIAL_INVALID".into(),
-                );
-            }
-            let code = denial["error_code"]
-                .as_str()
-                .unwrap_or("SCRIPT_START_DENIED");
-            return finish_without_spawn(&work, &group, &identity, code.to_owned());
-        }
-        if Instant::now() >= gate_deadline {
-            return finish_without_spawn(
-                &work,
-                &group,
-                &identity,
-                "SCRIPT_START_GATE_TIMEOUT".into(),
-            );
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    let current = match manifest::capture_interpreter(
-        &work.interpreter.canonical_path,
-        work.interpreter.kind,
-    ) {
-        Ok(current) => current,
-        Err(error) => return finish_without_spawn(&work, &group, &identity, error.code),
-    };
-    if current.sha256 != work.interpreter.sha256
-        || current.canonical_path != work.interpreter.canonical_path
-    {
-        return finish_without_spawn(
-            &work,
-            &group,
-            &identity,
-            "SCRIPT_INTERPRETER_CHANGED".into(),
-        );
-    }
-    if !environment_sha256(&work.environment).is_ok_and(|digest| digest == work.environment_sha256)
-    {
-        return finish_without_spawn(
-            &work,
-            &group,
-            &identity,
-            "SCRIPT_ENVIRONMENT_CHANGED".into(),
-        );
-    }
-    match execute(&work, &dir, &group, &identity) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let started = dir.join("started.json").try_exists()?;
-            let state = if started || error.code == "SCRIPT_CHILD_STARTED" {
-                "incomplete"
-            } else {
-                "failed"
-            };
-            finish_worker_error(&work, &group, &identity, error.code, state)
-        }
-    }
-}
-
-fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<()> {
-    let entrypoint = safe_stage_path(&dir.join("bundle"), &work.bundle.entrypoint)?;
-    let args = command_arguments(&work.bundle, &entrypoint);
-    let input = model::canonical(&json!(work.invocation))?.into_bytes();
-    if input.len() > MAX_INVOCATION_BYTES {
-        return Err(Error::invalid("script invocation exceeds 260 KiB"));
-    }
-    let mut command = Command::new(&work.interpreter.canonical_path);
-    command
-        .args(args)
-        .current_dir(dir.join("bundle"))
-        .env_clear()
-        .envs(&work.environment)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let started_at_ms = model::now_ms()?;
-    let mut child = command.spawn()?;
-    let mut cancellation_failure_reported = false;
-    if let Err(error) = write_once(
-        &dir.join("started.json"),
-        &model::canonical(&json!({"pid":child.id(),"started_at_ms":started_at_ms,"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}))?.into_bytes(),
-    ) {
-        cancel_children_and_record(
-            work,
-            group,
-            identity,
-            &mut cancellation_failure_reported,
-        );
-        return Err(Error::new("SCRIPT_CHILD_STARTED", error.to_string()));
-    }
-    let overflow = Arc::new(AtomicBool::new(false));
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("SCRIPT_PIPE_FAILED", "script stdout pipe is missing"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::new("SCRIPT_PIPE_FAILED", "script stderr pipe is missing"))?;
-    let stdout_flag = Arc::clone(&overflow);
-    let stdout_reader = thread::Builder::new()
-        .name("script-stdout".into())
-        .spawn(move || read_bounded(stdout, MAX_RESULT_BYTES, stdout_flag))?;
-    let stderr_flag = Arc::clone(&overflow);
-    let stderr_reader = thread::Builder::new()
-        .name("script-stderr".into())
-        .spawn(move || read_bounded(stderr, MAX_STDERR_BYTES, stderr_flag))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::new("SCRIPT_PIPE_FAILED", "script stdin pipe is missing"))?;
-    let input_writer = thread::Builder::new()
-        .name("script-stdin".into())
-        .spawn(move || stdin.write_all(&input))?;
-
-    let deadline = Instant::now() + Duration::from_millis(MAX_SCRIPT_DURATION_MS);
-    let mut timed_out = false;
-    let mut status = None;
-    loop {
-        if overflow.load(Ordering::Acquire) {
-            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
-            break;
-        }
-        match child.try_wait() {
-            Ok(Some(exit)) => {
-                status = Some(exit);
-                break;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                cancel_children_and_record(
-                    work,
-                    group,
-                    identity,
-                    &mut cancellation_failure_reported,
-                );
-                return Err(error.into());
-            }
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
-            break;
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    if status.is_none() {
-        status = Some(child.wait()?);
-    }
-    while !group.children_empty()? {
-        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
-        thread::sleep(POLL_INTERVAL);
-    }
-    group.disarm()?;
-    let writer_result = input_writer
-        .join()
-        .map_err(|_| Error::new("SCRIPT_PIPE_FAILED", "script stdin writer panicked"))?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| Error::new("SCRIPT_PIPE_FAILED", "script stdout reader panicked"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| Error::new("SCRIPT_PIPE_FAILED", "script stderr reader panicked"))?;
-    let exit_code = status.and_then(|status| status.code());
-    let mut error_code = if timed_out {
-        Some("SCRIPT_TIMEOUT".to_owned())
-    } else if stdout.overflow || stderr.overflow {
-        Some("SCRIPT_OUTPUT_LIMIT".to_owned())
-    } else if writer_result.is_err() {
-        Some("SCRIPT_INPUT_FAILED".to_owned())
-    } else if exit_code != Some(0) {
-        Some("SCRIPT_EXIT_NONZERO".to_owned())
-    } else {
-        None
-    };
-    let parsed = if error_code.is_none() {
-        match parse_script_result(&stdout.bytes, work) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                error_code = Some(error.code);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let result_value = parsed.as_ref().map(|parsed| parsed.result.clone());
-    let controller_effects = parsed.map(|parsed| parsed.effects).unwrap_or_default();
-    let state = if error_code.is_none() {
-        "completed"
-    } else {
-        "failed"
-    };
-    publish_completion(
-        work,
-        CompletionPublication {
-            stdout: &stdout.bytes,
-            stderr: &stderr.bytes,
-            result_value,
-            controller_effects: &controller_effects,
-            error_code,
-            state,
-            started_at_ms: Some(started_at_ms),
-            exit_code,
-            process: &identity["process"],
-        },
-    )
-}
-
-struct ParsedScriptResult {
-    result: Value,
-    effects: Vec<ScriptEffectRequest>,
-}
-
-fn parse_script_result(bytes: &[u8], work: &Work) -> Result<ParsedScriptResult> {
-    if bytes.is_empty() || bytes.len() > MAX_RESULT_BYTES {
-        return Err(Error::new(
-            "SCRIPT_RESULT_INVALID",
-            "script stdout must contain one bounded JSON result",
-        ));
-    }
-    let result: ScriptResult = serde_json::from_slice(bytes).map_err(|_| {
-        Error::new(
-            "SCRIPT_RESULT_INVALID",
-            "script stdout is not a valid ScriptResult",
-        )
-    })?;
-    if result.protocol_version != 1
-        || result.operation_id != work.operation_id
-        || result.run_id != work.run_id
-    {
-        return Err(Error::new(
-            "SCRIPT_RESULT_INVALID",
-            "script result identity differs from the admitted run",
-        ));
-    }
-    work.bundle.result_schema.validate_value(&result.result)?;
-    if result.effects.len() > manifest::MAX_CONTROLLER_EFFECTS {
-        return Err(Error::new(
-            "SCRIPT_EFFECTS_INVALID",
-            "script requested more controller effects than the invocation permits",
-        ));
-    }
-    for effect in &result.effects {
-        if !work.invocation.controller_effects.contains(&effect.effect) {
-            return Err(Error::new(
-                "SCRIPT_EFFECTS_UNGRANTED",
-                "script requested a controller effect outside this invocation grant",
-            ));
-        }
-        effect.validate().map_err(|_| {
-            Error::new(
-                "SCRIPT_EFFECTS_INVALID",
-                "script controller effect payload is invalid",
-            )
-        })?;
-    }
-    Ok(ParsedScriptResult {
-        result: result.result,
-        effects: result.effects,
-    })
-}
-
-fn publish_completion(work: &Work, publication: CompletionPublication<'_>) -> Result<()> {
-    let CompletionPublication {
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
-        result_value,
-        controller_effects,
-        error_code,
-        state,
-        started_at_ms,
-        exit_code,
-        process,
-    } = publication;
-    let files = ArtifactFiles::new(&work.data_dir)?;
-    let stdout = output_record(work, "stdout", stdout_bytes)?;
-    let stderr = output_record(work, "stderr", stderr_bytes)?;
-    files.publish(&stdout.0, &stdout.1)?;
-    files.publish(&stderr.0, &stderr.1)?;
-    let result_document = json!({
-        "protocol_version":1,
-        "run_id":work.run_id,
-        "operation_id":work.operation_id,
-        "script_id":work.bundle.script_id,
-        "script_revision":work.invocation.script_revision,
-        "state":state,
-        "started_at_ms":started_at_ms,
-        "exit_code":exit_code,
-        "error_code":error_code,
-        "result":result_value,
-        "stdout_ref":stdout.0.artifact_id,
-        "stderr_ref":stderr.0.artifact_id,
-        "controller_effects":controller_effects,
-    });
-    let result_id = format!(
-        "scriptresult-{}",
-        model::digest(work.operation_id.as_bytes())
-    );
-    let (result, result_bytes) = ArtifactFiles::document(
-        "script_result",
-        &result_id,
-        &result_document,
-        json!({"run_id":work.run_id,"operation_id":work.operation_id,"script_id":work.bundle.script_id,"state":state}),
-    )?;
-    files.publish(&result, &result_bytes)?;
-    let completion = Completion {
-        run_id: work.run_id.clone(),
-        operation_id: work.operation_id.clone(),
-        token: work.token.clone(),
-        state: state.into(),
-        started_at_ms,
-        exit_code,
-        process: process.clone(),
-        result,
-        stdout: stdout.0,
-        stderr: stderr.0,
-        result_value,
-        controller_effects: controller_effects.to_vec(),
-        error_code,
-    };
-    let dir = directory(&work.data_dir, &work.run_id)?;
-    write_once(
-        &dir.join("terminal.json"),
-        &model::canonical(&json!(completion))?.into_bytes(),
-    )?;
-    write_once(
-        &dir.join("completion.json"),
-        &model::canonical(&json!(completion))?.into_bytes(),
-    )?;
-    Ok(())
-}
-
-fn output_record(work: &Work, stream: &str, bytes: &[u8]) -> Result<(ArtifactRecord, Vec<u8>)> {
-    let mut identity = Vec::with_capacity(work.run_id.len() + stream.len() + 1);
-    identity.extend_from_slice(work.run_id.as_bytes());
-    identity.push(b':');
-    identity.extend_from_slice(stream.as_bytes());
-    let id = format!("scriptlog-{}", model::digest(&identity));
-    let record = ArtifactRecord {
-        kind: "script_output".into(),
-        artifact_id: id.clone(),
-        relative_path: format!("artifacts/{id}.bin"),
-        byte_length: bytes.len() as u64,
-        content_digest: model::digest(bytes),
-        metadata: json!({"run_id":work.run_id,"operation_id":work.operation_id,"stream":stream}),
-    };
-    Ok((record, bytes.to_vec()))
-}
-
-fn finish_without_spawn(
-    work: &Work,
-    group: &Group,
-    identity: &Value,
-    error_code: String,
-) -> Result<()> {
-    finish_worker_error(work, group, identity, error_code, "failed")
-}
-
-fn finish_worker_error(
-    work: &Work,
-    group: &Group,
-    identity: &Value,
-    error_code: String,
-    state: &str,
-) -> Result<()> {
-    let mut cancellation_failure_reported = false;
-    while !group.children_empty()? {
-        // A member can spawn another exact-group child while the previous
-        // cancellation scan is in progress. Keep rescanning until the same
-        // group is empty, as the normal execution drain path does.
-        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
-        thread::sleep(POLL_INTERVAL);
-    }
-    group.disarm()?;
-    let started_at_ms = directory(&work.data_dir, &work.run_id)
-        .ok()
-        .and_then(|dir| read_json(&dir.join("started.json")).ok())
-        .and_then(|value| value["started_at_ms"].as_i64());
-    publish_completion(
-        work,
-        CompletionPublication {
-            stdout: &[],
-            stderr: &[],
-            result_value: None,
-            controller_effects: &[],
-            error_code: Some(error_code),
-            state,
-            started_at_ms,
-            exit_code: None,
-            process: &identity["process"],
-        },
-    )
-}
-
-fn stage_bundle(work: &Work, run_dir: &Path) -> Result<()> {
-    let bundle_root = run_dir.join("bundle");
-    if bundle_root.exists() {
-        if fs::symlink_metadata(&bundle_root)?.file_type().is_symlink() {
-            return Err(Error::new(
-                "SCRIPT_STAGE_INVALID",
-                "script stage root is a symlink",
-            ));
-        }
-        return Err(Error::new(
-            "SCRIPT_STAGE_EXISTS",
-            "script stage already exists without a prior worker receipt",
-        ));
-    }
-    fs::create_dir_all(&bundle_root)?;
-    platform::private_permissions(&bundle_root, true)?;
-    let mut total = 0usize;
-    for file in &work.bundle.files {
-        manifest::validate_bundle_path(&file.path)?;
-        let bytes = manifest::decode_file(&file.content_base64)?;
-        if bytes.len() as u64 != file.byte_length || model::digest(&bytes) != file.sha256 {
-            return Err(Error::new(
-                "SCRIPT_BUNDLE_DAMAGED",
-                "staged script file differs from immutable digest",
-            ));
-        }
-        total = total
-            .checked_add(bytes.len())
-            .ok_or_else(|| Error::invalid("script bundle size overflow"))?;
-        if total > manifest::MAX_BUNDLE_BYTES {
-            return Err(Error::invalid("script bundle exceeds 512 KiB"));
-        }
-        let target = safe_stage_path(&bundle_root, &file.path)?;
-        if let Some(parent) = target.parent() {
-            ensure_private_tree(&bundle_root, parent)?;
-        }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        output.write_all(&bytes)?;
-        output.sync_all()?;
-        drop(output);
-        platform::private_permissions(&target, false)?;
-    }
-    Ok(())
-}
-
-fn safe_stage_path(root: &Path, relative: &str) -> Result<PathBuf> {
-    manifest::validate_bundle_path(relative)?;
-    let root = fs::canonicalize(root)?;
-    let mut target = root.clone();
-    for component in relative.split('/') {
-        target.push(component);
-    }
-    if !target.starts_with(&root) {
-        return Err(Error::new(
-            "SCRIPT_STAGE_INVALID",
-            "script file escaped the stage",
-        ));
-    }
-    Ok(target)
-}
-
-fn ensure_private_tree(root: &Path, destination: &Path) -> Result<()> {
-    let root = fs::canonicalize(root)?;
-    let relative = destination
-        .strip_prefix(&root)
-        .map_err(|_| Error::new("SCRIPT_STAGE_INVALID", "script directory escaped its stage"))?;
-    let mut current = root;
-    for component in relative.components() {
-        let std::path::Component::Normal(part) = component else {
-            return Err(Error::new(
-                "SCRIPT_STAGE_INVALID",
-                "script stage path is not normalized",
-            ));
-        };
-        current.push(part);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(Error::new(
-                    "SCRIPT_STAGE_INVALID",
-                    "script stage contains a link or non-directory",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)?;
-                platform::private_permissions(&current, true)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-fn command_arguments(bundle: &ScriptBundle, entrypoint: &Path) -> Vec<String> {
-    let mut args = match bundle.interpreter.kind {
-        manifest::InterpreterKind::Python => {
-            vec!["-I".to_owned(), entrypoint.to_string_lossy().into_owned()]
-        }
-        manifest::InterpreterKind::Powershell => vec![
-            "-NoLogo".into(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-File".into(),
-            entrypoint.to_string_lossy().into_owned(),
-        ],
-    };
-    args.extend(bundle.argv.iter().cloned());
-    args
-}
-
-fn read_bounded<R: Read>(mut input: R, limit: usize, overflow: Arc<AtomicBool>) -> Captured {
-    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-    let mut buffer = [0u8; 8192];
-    let mut local_overflow = false;
-    loop {
-        match input.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                let remaining = limit.saturating_sub(bytes.len());
-                bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-                if count > remaining {
-                    local_overflow = true;
-                    overflow.store(true, Ordering::Release);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    Captured {
-        bytes,
-        overflow: local_overflow,
-    }
+    swarm_script_worker::run_worker(receipt_path).map_err(Error::from)
 }
 
 fn ensure_private_directory(root: &Path, dir: &Path) -> Result<()> {
@@ -1605,80 +1282,6 @@ fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
         platform::private_permissions(path, false)?;
     }
     result
-}
-
-fn write_process_control_failure(work: &Work, identity: &Value, error_code: &str) -> Result<()> {
-    let failure = ProcessControlFailure::cancel_children(
-        work.run_id.clone(),
-        work.operation_id.clone(),
-        work.token.clone(),
-        identity["process"].clone(),
-        error_code,
-    );
-    failure
-        .validate_for(
-            &work.run_id,
-            &work.operation_id,
-            &work.token,
-            &identity["process"],
-        )
-        .map_err(|_| {
-            Error::new(
-                "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
-                "script worker process identity cannot be recorded",
-            )
-        })?;
-    let bytes = model::canonical(&json!(failure))?.into_bytes();
-    if bytes.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES {
-        return Err(Error::new(
-            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
-            "script cancellation diagnostic exceeds its size limit",
-        ));
-    }
-    let path = directory(&work.data_dir, &work.run_id)?.join(PROCESS_CONTROL_FAILURE_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES as u64 =>
-        {
-            Err(Error::new(
-                "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
-                "retained script cancellation diagnostic is not bounded and regular",
-            ))
-        }
-        Ok(_) => {
-            let mut retained = Vec::with_capacity(MAX_PROCESS_CONTROL_FAILURE_BYTES);
-            OpenOptions::new()
-                .read(true)
-                .open(&path)?
-                .take((MAX_PROCESS_CONTROL_FAILURE_BYTES + 1) as u64)
-                .read_to_end(&mut retained)?;
-            if retained.len() <= MAX_PROCESS_CONTROL_FAILURE_BYTES && retained == bytes {
-                Ok(())
-            } else {
-                Err(Error::conflict(
-                    "retained script cancellation diagnostic differs",
-                ))
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_once(&path, &bytes),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn cancel_children_and_record(
-    work: &Work,
-    group: &Group,
-    identity: &Value,
-    failure_reported: &mut bool,
-) {
-    if let Err(error) = group.cancel_children()
-        && !*failure_reported
-    {
-        *failure_reported = true;
-        let _ = write_process_control_failure(work, identity, &error.code);
-    }
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -1754,17 +1357,6 @@ fn validate_work(work: &Work) -> Result<()> {
     Ok(())
 }
 
-fn worker_environment() -> BTreeMap<String, String> {
-    let mut names = vec!["PATH"];
-    #[cfg(windows)]
-    names.extend(["SystemRoot", "WINDIR", "TEMP", "TMP"]);
-    #[cfg(unix)]
-    names.extend(["HOME", "TMPDIR", "LANG", "LC_ALL", "TMP", "TEMP"]);
-    std::env::vars()
-        .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
-        .collect()
-}
-
 fn standalone_worker_environment() -> BTreeMap<String, String> {
     #[cfg(windows)]
     let names = ["SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP"];
@@ -1773,8 +1365,4 @@ fn standalone_worker_environment() -> BTreeMap<String, String> {
     std::env::vars()
         .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
         .collect()
-}
-
-fn group_identity(group: &Group) -> Result<Value> {
-    Ok(group.identity.clone())
 }

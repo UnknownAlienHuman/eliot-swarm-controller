@@ -1,4 +1,5 @@
 use crate::journal::{DispatchIdentity, RunStore, digest};
+use crate::acp_prompt::PreparedAcpDispatch;
 use crate::{ARTIFACT_ID, EXECUTION_SHAPE};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -592,6 +593,7 @@ fn disposition(
         "native_session_id":result.and_then(|value| bounded_native_text(value.get("sessionId"), MAX_NATIVE_SESSION_ID_BYTES)).or_else(|| summary.session_id.clone()).map(Value::String).unwrap_or(Value::Null),
         "native_result":native_result.unwrap_or(Value::Null),
         "native_result_payload_sha256":summary.result_payload_sha256,
+        "result_sha256":summary.result_payload_sha256,
         "native_result_payload_bytes":summary.result_payload_bytes,
         "result_subtype":summary.result_subtype,
         "exit_code":exit_code,
@@ -1278,6 +1280,47 @@ pub fn prompt_for(command: &RuntimeCommand) -> Result<(String, DispatchIdentity)
         ));
     }
     Ok((prompt, identity))
+}
+
+/// Build the BatchV4 native identity from Store's exact TaskPrompt envelope.
+/// The legacy renderer remains available only to historical BatchV3 bindings.
+pub fn task_prompt_identity(
+    command: &RuntimeCommand,
+    dispatch: &PreparedAcpDispatch,
+) -> Result<DispatchIdentity> {
+    let prompt = dispatch.envelope.prompt.as_bytes();
+    let core_binding = &command.input["command_core_binding"];
+    let batch_run_id = core_binding["batch_run_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+        .ok_or_else(|| Error::new("NATIVE_IDENTITY_MISMATCH", "Store core binding omitted batch_run_id"))?;
+    let expected_prompt_bytes = u64::try_from(prompt.len()).ok();
+    if core_binding.as_object().is_none_or(|fields| {
+        fields.len() != 3
+            || !fields.contains_key("batch_run_id")
+            || !fields.contains_key("prompt_sha256")
+            || !fields.contains_key("prompt_bytes")
+    }) || core_binding["prompt_sha256"] != dispatch.identity.prompt_sha256
+        || core_binding["prompt_bytes"].as_u64() != expected_prompt_bytes
+        || digest(prompt) != dispatch.identity.prompt_sha256
+        || expected_prompt_bytes != Some(dispatch.identity.prompt_bytes)
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "Store core binding differs from exact TaskPrompt bytes",
+        ));
+    }
+    let prompt_bytes = usize::try_from(dispatch.identity.prompt_bytes)
+        .map_err(|_| Error::new("COMMAND_PROMPT_BOUNDARY", "TaskPrompt byte length is too large"))?;
+    Ok(DispatchIdentity {
+        operation_id: dispatch.identity.operation_id.clone(),
+        input_sha256: dispatch.identity.input_sha256.clone(),
+        batch_run_id: batch_run_id.to_owned(),
+        requested_model: dispatch.identity.requested_model.clone(),
+        prompt_sha256: dispatch.identity.prompt_sha256.clone(),
+        prompt_bytes,
+        task_snapshot_sha256: dispatch.identity.task_snapshot_sha256.clone(),
+    })
 }
 
 fn canonical_snapshot(snapshot: &Value) -> Result<String> {

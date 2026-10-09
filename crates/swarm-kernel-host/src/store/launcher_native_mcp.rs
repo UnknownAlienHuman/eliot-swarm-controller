@@ -753,7 +753,7 @@ fn validate_launch_snapshot(
             launcher::dispatch_launch_actor(db, &row.operation_id, Some(dispatch_operation_id))?
         }
     };
-    let current_gm = meta(db, "gm")?.unwrap_or(Value::Null);
+    let current_gm = super::gm::authority_facts(db)?;
     let local_operator = meta(db, "local_operator_client_id")?.unwrap_or(Value::Null);
     let task_id = text_at(&manifest["task"], "task_id")?;
     let task_revision = positive_at(&manifest["task"], "observed_revision")?;

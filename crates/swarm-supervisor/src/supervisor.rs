@@ -120,6 +120,8 @@ pub enum LifecycleState {
     },
     ProcessExited {
         exit_code: Option<i32>,
+        /// True only after the exact owner family is proved empty; direct
+        /// helper exit alone never sets this.
         #[serde(default)]
         exit_proven: bool,
     },
@@ -859,6 +861,18 @@ struct OwnerHelperExit {
     healthy_duration: Option<Duration>,
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedDepartedOwner {
+    receipt: Value,
+    token: String,
+}
+
+impl VerifiedDepartedOwner {
+    fn matches(&self, receipt: &Value, token: &str) -> bool {
+        self.receipt == *receipt && self.token.as_str() == token
+    }
+}
+
 impl Service {
     fn new(initialization: ServiceInitialization) -> Self {
         let prior_state = has_prior_module_state(&initialization.state_dir);
@@ -1038,13 +1052,29 @@ impl Service {
         {
             return false;
         }
-        let state = self.status.borrow().lifecycle.clone();
-        if !matches!(
-            state,
+        let status = self.status.borrow().clone();
+        let settled_lifecycle = matches!(
+            &status.lifecycle,
             LifecycleState::WaitingForDemand
                 | LifecycleState::Completed { .. }
                 | LifecycleState::Isolated { .. }
-        ) {
+        );
+        // exit_proven is sourced only from exact departed_empty evidence.
+        // Require that the same boot and both process identities remain with
+        // that transition; an exit code or helper PID alone is insufficient.
+        let exact_departed_exit = matches!(
+            &status.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ) && status.owner.is_some()
+            && status.worker.is_some()
+            && status
+                .worker_boot_id
+                .as_deref()
+                .is_some_and(|boot_id| Uuid::parse_str(boot_id).is_ok());
+        if !settled_lifecycle && !exact_departed_exit {
             return false;
         }
         self.runner
@@ -1109,25 +1139,69 @@ impl Service {
                 "module.hello belongs to a different worker boot",
             ));
         }
-        let worker = status.worker.as_ref().ok_or_else(|| {
+        let worker = status.worker.clone().ok_or_else(|| {
             Error::new(
                 "MODULE_WORKER_IDENTITY_UNKNOWN",
                 "module.hello cannot reconcile an unknown worker identity",
             )
         })?;
-        if !process_identity_is_live(worker)? {
+        if !process_identity_is_live(&worker)? {
             return Err(Error::new(
                 "MODULE_WORKER_EXITED",
                 "module.hello worker process is no longer the recorded live incarnation",
             ));
         }
-        self.readback_required.store(false, Ordering::Release);
-        self.update_status(|current| {
+        let mut transition_error = None;
+        let transitioned = self.status.send_if_modified(|current| {
+            if current.worker_boot_id.as_deref() != Some(boot_id) {
+                transition_error = Some((
+                    "MODULE_WORKER_BOOT_MISMATCH",
+                    "module.hello belongs to a different worker boot",
+                ));
+                return false;
+            }
+            let Some(current_worker) = current.worker.as_ref() else {
+                transition_error = Some((
+                    "MODULE_WORKER_IDENTITY_UNKNOWN",
+                    "module.hello cannot reconcile an unknown worker identity",
+                ));
+                return false;
+            };
+            if !same_process_identity(current_worker, &worker) {
+                transition_error = Some((
+                    "MODULE_WORKER_IDENTITY_MISMATCH",
+                    "module.hello worker changed before status confirmation",
+                ));
+                return false;
+            }
+            if !matches!(
+                &current.lifecycle,
+                LifecycleState::Starting {
+                    boot_id: current_boot
+                } | LifecycleState::ProcessRunning {
+                    boot_id: current_boot
+                } if current_boot == boot_id
+            ) {
+                transition_error = Some((
+                    "MODULE_WORKER_BOOT_MISMATCH",
+                    "module.hello cannot confirm a worker outside its starting lifecycle",
+                ));
+                return false;
+            }
             current.lifecycle = LifecycleState::ProcessRunning {
                 boot_id: boot_id.to_owned(),
             };
             current.readback_required = false;
+            true
         });
+        if !transitioned {
+            let (code, detail) = transition_error.unwrap_or((
+                "MODULE_WORKER_BOOT_MISMATCH",
+                "module.hello status changed before confirmation",
+            ));
+            return Err(Error::new(code, detail));
+        }
+        self.readback_required.store(false, Ordering::Release);
         self.bump(&self.recovery_epoch);
         Ok(())
     }
@@ -1274,18 +1348,21 @@ impl Service {
                 });
                 return;
             }
-            if let Err(error) = self.wait_for_prior_owner_to_depart().await {
-                self.record_failure(
-                    &error.code,
-                    "prior module owner identity is missing or unresolved",
-                );
-                self.update_status(|status| {
-                    status.lifecycle = LifecycleState::OwnerIdentityUnknown;
-                    status.readback_required = true;
-                });
-                self.readback_required.store(true, Ordering::Release);
-                return;
-            }
+            let departed_prior_owner = match self.wait_for_prior_owner_to_depart().await {
+                Ok(owner) => owner,
+                Err(error) => {
+                    self.record_failure(
+                        &error.code,
+                        "prior module owner identity is missing or unresolved",
+                    );
+                    self.update_status(|status| {
+                        status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+                        status.readback_required = true;
+                    });
+                    self.readback_required.store(true, Ordering::Release);
+                    return;
+                }
+            };
             if !self.has_demand()
                 || matches!(admission.borrow().clone(), AdmissionState::Closed { .. })
             {
@@ -1450,7 +1527,12 @@ impl Service {
                 };
             });
             let attempt = match self
-                .monitor_owner_helper(&mut helper, &boot_id, &helper_identity)
+                .monitor_owner_helper(
+                    &mut helper,
+                    &boot_id,
+                    &helper_identity,
+                    departed_prior_owner.as_ref(),
+                )
                 .await
             {
                 Ok(attempt) => attempt,
@@ -1933,6 +2015,7 @@ impl Service {
         helper: &mut Child,
         boot_id: &str,
         helper_identity: &ProcessIdentity,
+        departed_prior_owner: Option<&VerifiedDepartedOwner>,
     ) -> Result<OwnerHelperExit> {
         let owner_path = self.state_dir.join("owner.json");
         let worker_path = self.state_dir.join("worker.json");
@@ -1941,29 +2024,30 @@ impl Service {
         let mut owner_token = None::<String>;
         let mut worker_record = None::<Value>;
         let mut worker_identity = None::<ProcessIdentity>;
+        let mut worker_validated = false;
         let mut launch_result = None::<Value>;
         let mut worker_started_at = None::<Instant>;
         let mut worker_last_live_at = None::<Instant>;
 
         loop {
             if owner_record.is_none()
-                && let Some((owner, token)) = read_owner_receipt_optional(&owner_path)?
+                && let Some((owner, token)) = read_current_owner_receipt_optional(
+                    &owner_path,
+                    helper_identity,
+                    departed_prior_owner,
+                )?
             {
-                if !owner_matches_worker(&owner["process"], helper_identity) {
-                    return Err(Error::new(
-                        "MODULE_OWNER_IDENTITY_MISMATCH",
-                        "owner.json does not identify the exact spawned module-owner helper",
-                    ));
-                }
                 owner_record = Some(owner);
                 owner_token = Some(token);
             }
             if worker_record.is_none() {
                 worker_record = read_json_receipt_optional(&worker_path, OWNER_RECORD_LIMIT)?;
-                if let (Some(owner), Some(record)) = (owner_record.as_ref(), worker_record.as_ref())
-                {
-                    worker_identity = self.validate_worker_receipt(record, boot_id, owner)?;
-                }
+            }
+            if !worker_validated
+                && let (Some(owner), Some(record)) = (owner_record.as_ref(), worker_record.as_ref())
+            {
+                worker_identity = self.validate_worker_receipt(record, boot_id, owner)?;
+                worker_validated = true;
             }
             if launch_result.is_none() {
                 launch_result =
@@ -1982,24 +2066,23 @@ impl Service {
             if let Some(exit) = helper.try_wait()? {
                 // Close the receipt race after observing the exact helper exit.
                 if owner_record.is_none()
-                    && let Some((owner, token)) = read_owner_receipt_optional(&owner_path)?
+                    && let Some((owner, token)) = read_current_owner_receipt_optional(
+                        &owner_path,
+                        helper_identity,
+                        departed_prior_owner,
+                    )?
                 {
-                    if !owner_matches_worker(&owner["process"], helper_identity) {
-                        return Err(Error::new(
-                            "MODULE_OWNER_IDENTITY_MISMATCH",
-                            "owner.json does not identify the exact spawned module-owner helper",
-                        ));
-                    }
                     owner_record = Some(owner);
                     owner_token = Some(token);
                 }
                 if worker_record.is_none() {
                     worker_record = read_json_receipt_optional(&worker_path, OWNER_RECORD_LIMIT)?;
-                    if let (Some(owner), Some(record)) =
+                }
+                if !worker_validated
+                    && let (Some(owner), Some(record)) =
                         (owner_record.as_ref(), worker_record.as_ref())
-                    {
-                        worker_identity = self.validate_worker_receipt(record, boot_id, owner)?;
-                    }
+                {
+                    worker_identity = self.validate_worker_receipt(record, boot_id, owner)?;
                 }
                 if launch_result.is_none() {
                     launch_result =
@@ -2117,12 +2200,24 @@ impl Service {
                     worker_started_at.get_or_insert(now);
                     worker_last_live_at = Some(now);
                     self.update_status(|status| {
-                        // A live worker receipt proves process identity, not
-                        // successful protocol negotiation. Keep it Starting
-                        // until the host confirms Store-accepted module.hello.
-                        status.lifecycle = LifecycleState::Starting {
-                            boot_id: boot_id.to_owned(),
-                        };
+                        let hello_confirmed = matches!(
+                            &status.lifecycle,
+                            LifecycleState::ProcessRunning {
+                                boot_id: confirmed_boot
+                            } if confirmed_boot == boot_id
+                        ) && status.worker_boot_id.as_deref()
+                            == Some(boot_id)
+                            && status.worker.as_ref().is_some_and(|confirmed_worker| {
+                                same_process_identity(confirmed_worker, worker)
+                            });
+                        if !hello_confirmed {
+                            // A live receipt alone is not Ready. Preserve a
+                            // Store-confirmed ProcessRunning state for this
+                            // exact boot and worker instead of regressing it.
+                            status.lifecycle = LifecycleState::Starting {
+                                boot_id: boot_id.to_owned(),
+                            };
+                        }
                         status.owner = Some(helper_identity.clone());
                         status.worker = Some(worker.clone());
                         status.worker_boot_id = Some(boot_id.to_owned());
@@ -2306,7 +2401,7 @@ impl Service {
         Ok(())
     }
 
-    async fn wait_for_prior_owner_to_depart(&self) -> Result<()> {
+    async fn wait_for_prior_owner_to_depart(&self) -> Result<Option<VerifiedDepartedOwner>> {
         let attempt_path = self.state_dir.join("launch-attempt.json");
         let attempt = read_json_receipt_optional(&attempt_path, LAUNCH_RECORD_LIMIT)?;
         let mut attempt_boot_id = None::<String>;
@@ -2404,7 +2499,7 @@ impl Service {
                     "module state exists without its prior owner receipt; no process was started",
                 ));
             }
-            return Ok(());
+            return Ok(None);
         }
         if let (Some(helper), Some((owner, _))) = (attempted_helper.as_ref(), prior_owner.as_ref())
             && !owner_matches_worker(&owner["process"], helper)
@@ -2535,7 +2630,10 @@ impl Service {
                 prior_start_proved = true;
             }
             if departed_empty(&owner["process"], token)? {
-                return Ok(());
+                return Ok(Some(VerifiedDepartedOwner {
+                    receipt: owner.clone(),
+                    token: token.clone(),
+                }));
             }
             let owner_pid = prior_owner
                 .as_ref()
@@ -2766,9 +2864,12 @@ impl Service {
     }
 
     fn update_status(&self, update: impl FnOnce(&mut SupervisorStatus)) {
-        let mut value = self.status.borrow().clone();
-        update(&mut value);
-        self.status.send_replace(value);
+        // Mutate the current value under the watch sender's lock so concurrent
+        // lifecycle and hello updates cannot overwrite one another.
+        self.status.send_if_modified(|status| {
+            update(status);
+            true
+        });
     }
 
     fn current_status(&self) -> SupervisorStatus {
@@ -3010,6 +3111,28 @@ fn read_owner_receipt_optional(path: &Path) -> Result<Option<(Value, String)>> {
     }
 }
 
+fn read_current_owner_receipt_optional(
+    path: &Path,
+    helper_identity: &ProcessIdentity,
+    departed_prior_owner: Option<&VerifiedDepartedOwner>,
+) -> Result<Option<(Value, String)>> {
+    let Some((receipt, token)) = read_owner_receipt_optional(path)? else {
+        return Ok(None);
+    };
+    if owner_matches_worker(&receipt["process"], helper_identity) {
+        return Ok(Some((receipt, token)));
+    }
+    // Ignore only the exact prior receipt whose family departure was already
+    // proved. Any other owner identity remains a hard error.
+    if departed_prior_owner.is_some_and(|prior| prior.matches(&receipt, &token)) {
+        return Ok(None);
+    }
+    Err(Error::new(
+        "MODULE_OWNER_IDENTITY_MISMATCH",
+        "owner.json does not identify the exact spawned module-owner helper",
+    ))
+}
+
 fn owner_matches_worker(owner_process: &Value, worker: &ProcessIdentity) -> bool {
     if owner_process.get("purpose").and_then(Value::as_str) != Some("module")
         || owner_process.get("pid").and_then(Value::as_u64) != Some(u64::from(worker.pid))
@@ -3031,6 +3154,10 @@ fn owner_matches_worker(owner_process: &Value, worker: &ProcessIdentity) -> bool
         compared = true;
     }
     compared
+}
+
+fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
+    left.pid == right.pid && left.birth == right.birth && left.image == right.image
 }
 
 fn scalar_text(value: &Value) -> Option<String> {

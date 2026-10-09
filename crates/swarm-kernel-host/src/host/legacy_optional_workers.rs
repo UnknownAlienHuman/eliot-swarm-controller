@@ -286,17 +286,11 @@ async fn run_automation_scheduler_worker(
         }
     };
     let Some(pid) = child.id() else {
-        let _ = child.kill().await;
-        if child.wait().await.is_err() {
-            return Err(Error::new(
-                "AUTOMATION_WORKER_DEPARTURE_UNKNOWN",
-                "scheduler process exit could not be confirmed",
-            ));
-        }
-        return Err(Error::new(
+        let identity_error = Error::new(
             "AUTOMATION_WORKER_IDENTITY_UNKNOWN",
-            "standalone scheduler PID is unavailable; owner receipt remains held",
-        ));
+            "standalone scheduler PID is unavailable",
+        );
+        return Err(retain_unidentified_scheduler_owner(&mut child, identity_error).await);
     };
     let launched = swarm_process::spawned_identity(pid).map_err(|_| {
         Error::new(
@@ -315,9 +309,7 @@ async fn run_automation_scheduler_worker(
     }) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(error);
+            return Err(retain_unidentified_scheduler_owner(&mut child, error).await);
         }
     };
     let Some(stdout) = child.stdout.take() else {
@@ -416,6 +408,29 @@ async fn run_automation_scheduler_worker(
                 ))
             }
         }
+    }
+}
+
+/// A spawned child with no exact service-family identity cannot settle the
+/// durable owner receipt. Try to stop and reap the direct child, then report
+/// cleanup attention so the optional-worker supervisor persists it in
+/// `host.status`; the `launching` receipt remains held for exact recovery.
+async fn retain_unidentified_scheduler_owner(
+    child: &mut tokio::process::Child,
+    identity_error: Error,
+) -> Error {
+    let _ = child.kill().await;
+    match child.wait().await {
+        Ok(_) => Error::new(
+            "AUTOMATION_WORKER_CLEANUP_UNKNOWN",
+            "scheduler child exited, but its exact service-family departure is unproved; owner receipt remains held",
+        )
+        .with_secondary_error(identity_error),
+        Err(_) => Error::new(
+            "AUTOMATION_WORKER_DEPARTURE_UNKNOWN",
+            "scheduler child departure is unconfirmed; owner receipt remains held for cleanup",
+        )
+        .with_secondary_error(identity_error),
     }
 }
 

@@ -1414,7 +1414,7 @@ pub(super) fn cancel(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -
 pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     model::fields(v, &["check_id"])?;
     let id = model::text(v, "check_id")?;
-    let raw:Option<String>=db.query_row("SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'cached_from',cached_from_check_id,'state',state,'resource_key',resource_key,'resource_claimed_at_ms',resource_claimed_at_ms,'resource_released_at_ms',resource_released_at_ms,'process',json(process_identity_json),'coverage',json(coverage_json),'result_ref',result_ref,'exit_code',exit_code,'profile_id',json_extract(spec_json,'$.profile_id'),'profile_revision',json_extract(spec_json,'$.profile_revision'),'cancel_request',json_extract(spec_json,'$.cancel_request'),'cancellation',json_extract(spec_json,'$.cancellation'),'process_diagnostic',json(json_extract(spec_json,'$.process_diagnostic.public'))) FROM check_runs WHERE check_id=?1",[id],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'cached_from',cached_from_check_id,'state',state,'resource_key',resource_key,'resource_claimed_at_ms',resource_claimed_at_ms,'resource_released_at_ms',resource_released_at_ms,'process',json(process_identity_json),'coverage',json(coverage_json),'result_ref',result_ref,'exit_code',exit_code,'profile_id',json_extract(spec_json,'$.profile_id'),'profile_revision',json_extract(spec_json,'$.profile_revision'),'cancel_request',json_extract(spec_json,'$.cancel_request'),'cancellation',json_extract(spec_json,'$.cancellation'),'process_diagnostic',json(json_extract(spec_json,'$.process_diagnostic.public')),'cleanup_pending',json(CASE WHEN json_type(spec_json,'$.cleanup_pending') IS NOT NULL THEN 'true' ELSE 'false' END),'resource_released',json(CASE json_extract(spec_json,'$.completion_resource_released') WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END),'process_facts',json(json_extract(spec_json,'$.process_facts')),'release_evidence',json(json_extract(spec_json,'$.release_evidence'))) FROM check_runs WHERE check_id=?1",[id],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", "unknown CheckRun")
     })?)?)
@@ -1664,6 +1664,16 @@ fn ready(db: &mut Connection, w: &Work, identity: Value) -> Result<bool> {
     if !matches!(status["state"].as_str(), Some("running" | "reconciling")) {
         return Ok(false);
     }
+    let cleanup_retained: bool = tx.query_row(
+        "SELECT json_type(spec_json,'$.cleanup_pending') IS NOT NULL FROM check_runs WHERE check_id=?1",
+        [&w.check_id],
+        |row| row.get(0),
+    )?;
+    if cleanup_retained {
+        // Execution already produced a retained completion. A ready receipt
+        // cannot authorize a second go or regress it back to running.
+        return Ok(false);
+    }
     if !status["process"].is_null() && status["process"] != identity {
         return Err(Error::new(
             "CHECK_OWNER_CHANGED",
@@ -1747,11 +1757,7 @@ fn finish(db: &mut Connection, w: &Work, c: Completion) -> Result<()> {
     {
         return Ok(());
     }
-    if c.check_id != w.check_id
-        || c.operation_id != w.operation_id
-        || c.token != w.token
-        || !c.resource_released
-    {
+    if c.check_id != w.check_id || c.operation_id != w.operation_id || c.token != w.token {
         return Err(Error::conflict("check completion mismatched"));
     }
     artifact(&tx, &c.result)?;
@@ -1759,11 +1765,51 @@ fn finish(db: &mut Connection, w: &Work, c: Completion) -> Result<()> {
         artifact(&tx, out)?;
     }
     let now = model::now_ms()?;
+    if !c.resource_released {
+        // Capture is useful evidence even when process-family cleanup is still
+        // unknown. Retain it without publishing a completed check or releasing
+        // the exact resource claim. Reconciliation reads this same execution;
+        // it must never relaunch the command.
+        let retained = model::canonical(&json!(c))?;
+        let previous: Option<String> = tx.query_row(
+            "SELECT json_extract(spec_json,'$.cleanup_pending') FROM check_runs WHERE check_id=?1",
+            [&w.check_id],
+            |row| row.get(0),
+        )?;
+        if previous.as_deref() == Some(retained.as_str()) {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE check_runs SET state='reconciling',exit_code=?2,result_ref=?3,coverage_json=?4,spec_json=json_set(spec_json,'$.cleanup_pending',json(?5),'$.process_facts',json(?6),'$.completion_resource_released',json('false')) WHERE check_id=?1 AND resource_released_at_ms IS NULL",
+            params![w.check_id,c.exit_code,c.result.artifact_id,model::canonical(&c.coverage)?,retained,model::canonical(&json!(c.process_facts))?],
+        )?;
+        let report = json!({"operation_id":w.operation_id,"check_id":w.check_id,
+            "state":"reconciling","outcome":"unknown","resource_released":false,
+            "cleanup_pending":true,"result_ref":c.result.artifact_id,
+            "process_facts":c.process_facts,
+            "output_refs":c.outputs.iter().map(|output| &output.artifact_id).collect::<Vec<_>>(),
+            "task_accepted":false});
+        tx.execute(
+            "UPDATE operations SET state='outcome_unknown',result_json=?2,settled_at_ms=NULL,updated_at_ms=?3 WHERE operation_id=?1",
+            params![w.operation_id,model::canonical(&report)?,now],
+        )?;
+        incident(
+            &tx,
+            &format!("check:{}:CHECK_CLEANUP_PENDING", w.check_id),
+            Error::new(
+                "CHECK_CLEANUP_PENDING",
+                "exact process-family departure is not confirmed; captured output is retained and the resource remains held",
+            ),
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
     resolve_process_diagnostic(&tx, w, now)?;
-    tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancellation',json(?2)) WHERE check_id=?1",params![w.check_id,model::canonical(&json!(c.cancellation))?])?;
+    tx.execute("UPDATE check_runs SET spec_json=json_remove(json_set(spec_json,'$.cancellation',json(?2),'$.cleanup_history',json_extract(spec_json,'$.cleanup_pending'),'$.process_facts',json(?3),'$.release_evidence',json(?4),'$.completion_resource_released',json('true')),'$.cleanup_pending') WHERE check_id=?1",params![w.check_id,model::canonical(&json!(c.cancellation))?,model::canonical(&json!(c.process_facts))?,model::canonical(&json!(c.release_evidence))?])?;
     tx.execute("UPDATE check_runs SET state=?2,resource_released_at_ms=CASE WHEN resource_claimed_at_ms IS NOT NULL THEN ?3 ELSE NULL END,finished_at_ms=?3,exit_code=?4,result_ref=?5,coverage_json=?6 WHERE check_id=?1",params![w.check_id,c.state,now,c.exit_code,c.result.artifact_id,model::canonical(&c.coverage)?])?;
     let owner:String=tx.query_row("SELECT a.owner_id FROM attempts a JOIN check_runs c ON c.attempt_id=a.attempt_id WHERE c.check_id=?1",[&w.check_id],|r|r.get(0))?;
-    let report = json!({"operation_id":w.operation_id,"outcome":"applied","check_id":w.check_id,"state":c.state,"exit_code":c.exit_code,"result_ref":c.result.artifact_id,"recipient":owner,"source_checkout_verified":c.state=="passed","output_refs":c.outputs.iter().map(|o|&o.artifact_id).collect::<Vec<_>>(),"task_accepted":false});
+    let report = json!({"operation_id":w.operation_id,"outcome":"applied","check_id":w.check_id,"state":c.state,"exit_code":c.exit_code,"result_ref":c.result.artifact_id,"recipient":owner,"source_checkout_verified":c.state=="passed","output_refs":c.outputs.iter().map(|o|&o.artifact_id).collect::<Vec<_>>(),"resource_released":true,"cleanup_pending":false,"process_facts":c.process_facts,"release_evidence":c.release_evidence,"task_accepted":false});
     settle(&tx, &w.operation_id, &report)?;
     tx.execute("UPDATE incidents SET state='resolved',last_seen_at_ms=?2 WHERE state='open' AND dedup_key LIKE ?1", params![format!("check:{}:%", w.check_id), now])?;
     tx.commit()?;

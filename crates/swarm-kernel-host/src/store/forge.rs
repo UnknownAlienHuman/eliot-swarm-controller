@@ -373,16 +373,12 @@ fn require_direct_write_authority(db: &Connection, client_id: &str) -> Result<i6
     let role: Role = serde_json::from_value(registration["role"].clone())?;
     match role {
         Role::Operator => super::require_local_operator(db, client_id)?,
-        Role::Manager
-            if gm::record(db)?
-                .as_ref()
-                .is_some_and(|record| record["client_id"] == client_id) => {}
         Role::Manager => {
-            return Err(Error::new("FORBIDDEN", "current GM authority required"));
+            gm::require_current_manager(db, client_id)?;
         }
         _ => return Err(Error::new("FORBIDDEN", "operator or current GM required")),
     }
-    current_gm_epoch(db)
+    gm::current_epoch(db)
 }
 
 /// Authorize the current actor to read back an already confirmed publication
@@ -484,13 +480,6 @@ fn actor_for_operation(db: &Connection, id: &str, operation: &Value) -> Result<F
         Ok(ForgeActor::Direct {
             client_id: caller_id.to_owned(),
         })
-    }
-}
-
-fn current_gm_epoch(db: &Connection) -> Result<i64> {
-    match gm::record(db)? {
-        None => Ok(0),
-        Some(record) => model::positive(&record, "epoch"),
     }
 }
 
@@ -755,7 +744,7 @@ fn exact_slot_owner(
     operation_id: &str,
     intent: &PublicationIntent,
 ) -> Result<Option<String>> {
-    let current_epoch = current_gm_epoch(db)?;
+    let current_epoch = gm::current_epoch(db)?;
     let mut statement = db.prepare(
         "SELECT operation_id,effective_request_json,state,result_json FROM operations \
          WHERE method='forge.publish_ref' AND operation_id<>?1 \
@@ -1138,7 +1127,7 @@ fn begin(db: &mut Connection, id: &str, config: &Config) -> Result<Option<ForgeW
             let saved = saved_intent(&tx, id)?;
             actor.require_intent_matches(&saved)?;
             let transfer_continuation = actor.transfer_continuation(&tx)?;
-            let current_epoch = current_gm_epoch(&tx)?;
+            let current_epoch = gm::current_epoch(&tx)?;
             if saved.admitted_gm_epoch != current_epoch && transfer_continuation.is_none() {
                 settle_stale_gm_epoch(&tx, id, saved.admitted_gm_epoch, current_epoch)?;
                 tx.commit()?;
@@ -1310,7 +1299,7 @@ fn dispatch_authorized(
         return Ok(DispatchAuthorization::Coalesced { owner_operation_id });
     }
     let admitted_gm_epoch = saved.admitted_gm_epoch;
-    let current_epoch = current_gm_epoch(db)?;
+    let current_epoch = gm::current_epoch(db)?;
     if admitted_gm_epoch != current_epoch && work.transfer_continuation.is_none() {
         return Ok(DispatchAuthorization::StaleGmEpoch {
             admitted_gm_epoch,
@@ -1339,7 +1328,7 @@ fn dispatch_authorized(
     if let Some(continuation) = work.transfer_continuation.as_ref() {
         actor.require_prepared_transfer_write_authority(db, continuation)?;
     } else {
-        let final_epoch = current_gm_epoch(db)?;
+        let final_epoch = gm::current_epoch(db)?;
         if admitted_gm_epoch != final_epoch {
             return Ok(DispatchAuthorization::StaleGmEpoch {
                 admitted_gm_epoch,
@@ -3251,13 +3240,13 @@ mod tests {
     fn re_promoted_gm_does_not_make_an_old_queued_epoch_current_again() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
-        assert_eq!(current_gm_epoch(&db).unwrap(), 0);
+        assert_eq!(gm::current_epoch(&db).unwrap(), 0);
         super::super::set_meta(&db, "gm", &json!({"client_id":"manager-a","epoch":4})).unwrap();
-        let admitted_epoch = current_gm_epoch(&db).unwrap();
+        let admitted_epoch = gm::current_epoch(&db).unwrap();
 
         super::super::set_meta(&db, "gm", &json!({"client_id":"manager-b","epoch":5})).unwrap();
         super::super::set_meta(&db, "gm", &json!({"client_id":"manager-a","epoch":6})).unwrap();
-        let current_epoch = current_gm_epoch(&db).unwrap();
+        let current_epoch = gm::current_epoch(&db).unwrap();
 
         assert_eq!(admitted_epoch, 4);
         assert_eq!(current_epoch, 6);
@@ -4235,12 +4224,12 @@ impl super::Store {
             ForgePass::Dispatch => self.run(move |db| begin(db, &id, &config)).await?,
         };
         if let Some(work) = work {
-            self.drive_forge(work).await;
+            self.drive_forge(work).await?;
         }
         Ok(())
     }
 
-    async fn drive_forge(&self, work: ForgeWork) {
+    async fn drive_forge(&self, work: ForgeWork) -> Result<()> {
         let id = work.intent.operation_id.clone();
         let outcome = if work.mode == WorkMode::ReadbackOnly {
             match self.prior_native_worker_departed(&id).await {
@@ -4281,9 +4270,11 @@ impl super::Store {
                 }
             }
         };
-        let _ = self.run(move |db| finish(db, &id, outcome)).await;
+        let finish_result = self.run(move |db| finish(db, &id, outcome)).await;
         self.changed
             .send_modify(|value| *value = value.wrapping_add(1));
+        finish_result?;
+        Ok(())
     }
 
     async fn run_forge_worker(

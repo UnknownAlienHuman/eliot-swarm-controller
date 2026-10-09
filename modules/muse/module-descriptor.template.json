@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "module_id": "muse",
+  "artifact": {
+    "artifact_id": "muse-sdk-1.3.0-bridge.9",
+    "version": "9",
+    "build_id": null
+  },
+  "launch": {
+    "executable": "<INSTALLER_ABSOLUTE_NODE_PATH>",
+    "argv": [
+      { "kind": "literal", "value": "<INSTALLER_ABSOLUTE_BRIDGE_PATH>" },
+      { "kind": "literal", "value": "--config" },
+      { "kind": "module_host_config_path", "value": { "schema_version": 1 } }
+    ],
+    "environment": [],
+    "credential_ref": "host.module-binding-credential",
+    "working_directory": null,
+    "inherited_environment_allowlist": [],
+    "executable_sha256": null
+  },
+  "config_schema": null,
+  "workspace_option": {
+    "schema_version": 1,
+    "native_options_pointer": "/workspaceRoot",
+    "semantics": "replace_with_admitted_absolute_workspace"
+  },
+  "command_schemas": [
+    { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_dispatch_context", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_prompt", "version": "1", "sha256": null }
+  ],
+  "event_schemas": [
+    { "schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_dispatch_admission", "version": "1", "sha256": null }
+  ],
+  "protocol": {
+    "minimum": { "major": 1, "minor": 0 },
+    "maximum": { "major": 1, "minor": 0 }
+  },
+  "capabilities": [
+    "agent.configure",
+    "agent.goal",
+    "agent.open",
+    "agent.reconcile",
+    "agent.recover",
+    "agent.refresh",
+    "agent.reply",
+    "agent.result",
+    "agent.send",
+    "task.dispatch"
+  ],
+  "lifecycle": "owned_service",
+  "activation": "on_demand",
+  "enabled": false,
+  "restart": {
+    "max_starts": 5,
+    "window_ms": 60000,
+    "initial_backoff_ms": 250,
+    "max_backoff_ms": 30000,
+    "reset_after_healthy_ms": 60000,
+    "jitter": true
+  }
+}

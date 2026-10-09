@@ -7,8 +7,8 @@ Claude configuration or install, register, or launch the artifact.
 
 Install the built `swarm-adapter-claude` executable with the repository's
 standard `Install-ModuleArtifact.ps1` and this descriptor template. This is
-artifact version 4; versions 2 and 3 remain separate retained artifacts. The Rust
-binary embeds the pinned `bridge.mjs` and `prepared-query.mjs` bytes and writes
+artifact version 5; versions 2, 3, and 4 remain separate retained artifacts.
+The Rust binary embeds the pinned `bridge.mjs` and `prepared-query.mjs` bytes and writes
 them to the binding owner's private state directory on demand. Its typed
 `module_host_config_path` launch argument is preserved by the generic installer
 and resolved by the host at launch to a private, binding-scoped connection file
@@ -35,7 +35,7 @@ identity adoption, and bounded readback. The pinned JavaScript shim remains the
 SDK transport and `WarmQuery` driver. This is therefore a staged controller
 migration, not a full Rust implementation of the vendor SDK.
 
-Version 4 adds `agent.refresh` as an exact-session read of the Rust adapter's
+Version 4 added `agent.refresh` as an exact-session read of the Rust adapter's
 bounded SDK metadata cache. This private continuation also retains the pinned
 SDK's `task_started`, `task_progress`, `task_notification`, and
 `task_updated` frames, `SubagentStart` and `SubagentStop` hook observations,
@@ -52,5 +52,15 @@ The SDK metadata stream does not enumerate every native process or durable
 family member. Refresh records this snapshot; it does not establish Task or
 native turn completion. An absent cache is reported as unavailable.
 
-No build, installation, registration, route selection, native SDK startup, or
-model request was performed for this source-only candidate.
+Version 5 declares `swarm.task_prompt@1` and `agent.reply`. An initial
+`task.dispatch` requires the selected TaskPrompt envelope and matching
+Store-supplied task identity; the adapter validates its prompt digest and byte
+length, then sends the prompt unchanged as native input. Permission and
+`AskUserQuestion` callbacks remain pending until an exact `agent.reply` is
+persisted and acknowledged by the SDK bridge. A callback acknowledgement records
+that reply delivery; it does not claim native turn or task completion. Retention
+compacts only exact acknowledged terminal outcomes and preserves unknown,
+deferred, referenced, and damaged evidence.
+
+Installation, registration, route selection, native SDK startup, and model
+requests remain separate operator actions for this source candidate.

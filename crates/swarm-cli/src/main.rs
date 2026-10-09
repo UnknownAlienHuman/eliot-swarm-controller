@@ -1078,6 +1078,12 @@ enum LauncherExceptionsCommand {
 }
 #[derive(Subcommand)]
 enum AgentCommand {
+    /// Read retained subscription evidence for this binding; starts no native read.
+    Usage {
+        binding_id: String,
+        #[arg(long)]
+        generation: i64,
+    },
     /// Page known bindings and their observed state.
     List {
         #[arg(long, default_value_t = 0)]
@@ -1588,6 +1594,13 @@ fn map_command(command: Command) -> Result<(String, Value)> {
             },
         ),
         Command::Agent { command } => match command {
+            AgentCommand::Usage {
+                binding_id,
+                generation,
+            } => (
+                "agent.usage".into(),
+                json!({"binding_id":binding_id,"generation":generation}),
+            ),
             AgentCommand::List { after, limit } => {
                 ("agent.list".into(), json!({"after":after,"limit":limit}))
             }

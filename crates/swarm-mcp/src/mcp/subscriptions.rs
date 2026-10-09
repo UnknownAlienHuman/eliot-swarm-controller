@@ -107,7 +107,7 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
 };
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use uuid::Uuid;
 
 /// Extension identifier advertised in the server capabilities
@@ -123,6 +123,7 @@ pub const LAGGED_NOTIFICATION: &str = "notifications/eliot/lagged";
 /// 64 leaves headroom for a lagged marker plus a page in flight while
 /// keeping a dead consumer's facade-side footprint trivially small.
 pub const MAX_QUEUE_DEPTH: usize = 64;
+pub const MAX_QUEUE_BYTES: usize = 1_048_576;
 /// Subscriptions per MCP session. Each subscription costs two tasks
 /// and one bounded queue and nothing else, but the session is one
 /// manager client; 16 is far beyond any real fan-out.
@@ -218,12 +219,14 @@ fn is_concilium_fact(item: &Value) -> bool {
 }
 
 fn is_coordination_fact(item: &Value) -> bool {
-    const KINDS: [&str; 5] = [
+    const KINDS: [&str; 7] = [
         "coordination.thread_opened",
         "coordination.message",
         "coordination.thread_closed",
         "coordination.contract_proposed",
         "coordination.contract_response",
+        "coordination.contract_ratified",
+        "coordination.contract_rejected",
     ];
     let kind = item["kind"].as_str().unwrap_or_default();
     item["operation_id"]
@@ -235,7 +238,10 @@ fn is_coordination_fact(item: &Value) -> bool {
         && KINDS.contains(&kind)
         && (!matches!(
             kind,
-            "coordination.contract_proposed" | "coordination.contract_response"
+            "coordination.contract_proposed"
+                | "coordination.contract_response"
+                | "coordination.contract_ratified"
+                | "coordination.contract_rejected"
         ) || (item["payload"]["proposal_id"].as_str().is_some()
             && item["payload"]["proposal_revision_id"].as_str().is_some()))
 }
@@ -258,7 +264,12 @@ fn notification_item(item: &Value) -> Value {
         });
         if matches!(
             item["kind"].as_str(),
-            Some("coordination.contract_proposed" | "coordination.contract_response")
+            Some(
+                "coordination.contract_proposed"
+                    | "coordination.contract_response"
+                    | "coordination.contract_ratified"
+                    | "coordination.contract_rejected"
+            )
         ) {
             projected["proposal_id"] = item["payload"]["proposal_id"].clone();
             projected["proposal_revision_id"] = item["payload"]["proposal_revision_id"].clone();
@@ -294,7 +305,12 @@ fn resync_reads(categories: &[Category]) -> Vec<&'static str> {
     }) {
         reads.extend(CONCILIUM_RESYNC_READS);
     }
-    if categories.contains(&Category::Coordination) {
+    if categories.iter().any(|category| {
+        matches!(
+            category,
+            Category::Reports | Category::Operations | Category::Coordination
+        )
+    }) {
         reads.extend(COORDINATION_RESYNC_READS);
     }
     reads
@@ -315,6 +331,8 @@ pub struct LaggedGap {
     /// is only emitted once, when a queue slot frees, and entries past
     /// `through_cursor` are then delivered normally again.
     pub head_reached: bool,
+    pub cut_cursor: i64,
+    pub failure: Option<String>,
 }
 
 /// The notification for one committed stream entry. `frame` is the
@@ -343,8 +361,9 @@ fn lagged_notification_for_categories(
     subscription_id: &str,
     gap: &LaggedGap,
     categories: &[Category],
+    source: &PumpSource,
 ) -> CustomNotification {
-    let reads = resync_reads(categories);
+    let reads = source.resync_reads(categories);
     lagged_notification_with_reads(subscription_id, gap, &reads)
 }
 
@@ -360,6 +379,11 @@ fn lagged_notification_with_reads(
             "dropped_items": gap.dropped_items,
             "from_cursor": gap.from_cursor,
             "through_cursor": gap.through_cursor,
+            "examined_through": gap.through_cursor,
+            "matched_dropped": gap.dropped_items,
+            "cut_cursor": gap.cut_cursor,
+            "reached_cut": gap.head_reached,
+            "failure": gap.failure,
             "resync": {"after": gap.from_cursor, "reads": reads},
         })),
     )
@@ -375,6 +399,7 @@ pub struct PumpSource {
     ipc_config: Arc<Ipc>,
     client: Arc<Mutex<Option<Client>>>,
     client_id: String,
+    recovery_reads: Option<Vec<&'static str>>,
 }
 
 impl PumpSource {
@@ -391,6 +416,7 @@ impl PumpSource {
             ipc_config,
             client,
             client_id,
+            recovery_reads: None,
         }
     }
 
@@ -398,16 +424,100 @@ impl PumpSource {
         &self.client_id
     }
 
-    async fn delta_page(&self, after: i64) -> Result<Value> {
+    pub fn with_recovery_reads(mut self, reads: Vec<&'static str>) -> Self {
+        self.recovery_reads = Some(reads);
+        self
+    }
+
+    fn resync_reads(&self, categories: &[Category]) -> Vec<&'static str> {
+        resync_reads(categories)
+            .into_iter()
+            .filter(|read| {
+                self.recovery_reads
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(read))
+            })
+            .collect()
+    }
+
+    async fn start_position(&self) -> Result<i64> {
+        let value = super::request_on(
+            &self.client,
+            &self.root,
+            &self.credential,
+            &self.ipc_config,
+            "report.delta",
+            json!({"head":true}),
+        )
+        .await?;
+        value["cursor"]
+            .as_i64()
+            .filter(|cursor| *cursor >= 0)
+            .ok_or_else(|| {
+                Error::new(
+                    "SUBSCRIPTION_HEAD_INVALID",
+                    "timeline head returned no valid cursor",
+                )
+            })
+    }
+
+    async fn delta_page(&self, after: i64, through: Option<i64>) -> Result<Value> {
+        let mut params = json!({"after":after,"limit":PAGE_LIMIT});
+        if let Some(cut) = through {
+            params["through"] = json!(cut);
+        }
         super::request_on(
             &self.client,
             &self.root,
             &self.credential,
             &self.ipc_config,
             "report.delta",
-            json!({"after": after, "limit": PAGE_LIMIT}),
+            params,
         )
         .await
+    }
+}
+
+/// The byte permit remains held through transport send, so both queued data and
+/// the forwarder's in-flight notification share the same finite byte budget.
+pub struct QueuedNotification {
+    pub notification: CustomNotification,
+    _bytes: OwnedSemaphorePermit,
+}
+
+struct NotificationQueue {
+    sender: mpsc::Sender<QueuedNotification>,
+    bytes: Arc<Semaphore>,
+}
+
+enum QueueSendError {
+    Full,
+    Closed,
+}
+
+impl NotificationQueue {
+    fn try_send(
+        &self,
+        notification: CustomNotification,
+    ) -> std::result::Result<(), QueueSendError> {
+        let size = serde_json::to_vec(&notification)
+            .map_err(|_| QueueSendError::Full)?
+            .len();
+        let size = u32::try_from(size).map_err(|_| QueueSendError::Full)?;
+        let permit = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(size)
+            .map_err(|_| QueueSendError::Full)?;
+        self.sender
+            .try_send(QueuedNotification {
+                notification,
+                _bytes: permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => QueueSendError::Full,
+                mpsc::error::TrySendError::Closed(_) => QueueSendError::Closed,
+            })
     }
 }
 
@@ -433,7 +543,7 @@ pub struct SubscriptionHub {
 impl SubscriptionHub {
     pub fn new(queue_depth: usize, poll_interval: Duration) -> Self {
         Self {
-            queue_depth,
+            queue_depth: queue_depth.clamp(1, MAX_QUEUE_DEPTH),
             poll_interval,
             entries: StdMutex::new(HashMap::new()),
         }
@@ -444,35 +554,43 @@ impl SubscriptionHub {
     /// the client resyncs from. Whoever owns the receiver owns
     /// delivery from the queue; the facade attaches a forwarder that
     /// drains it onto the MCP transport.
-    pub fn open(
+    pub async fn open(
         self: &Arc<Self>,
         source: Arc<PumpSource>,
         categories: Vec<Category>,
         after: Option<i64>,
-    ) -> Result<(String, mpsc::Receiver<CustomNotification>, Value)> {
-        {
-            let entries = self.entries.lock().expect("subscription registry");
-            if entries.len() >= MAX_SUBSCRIPTIONS {
-                return Err(Error::new(
-                    "SUBSCRIPTION_LIMIT",
-                    "this session already holds the maximum number of subscriptions",
-                ));
-            }
+    ) -> Result<(String, mpsc::Receiver<QueuedNotification>, Value)> {
+        let starts_at_head = after.is_none();
+        let recovery_reads = source.resync_reads(&categories);
+        let cursor = match after {
+            Some(cursor) => cursor,
+            None => source.start_position().await?,
+        };
+        let mut entries = self.entries.lock().expect("subscription registry");
+        if entries.len() >= MAX_SUBSCRIPTIONS {
+            return Err(Error::new(
+                "SUBSCRIPTION_LIMIT",
+                "this session already holds the maximum number of subscriptions",
+            ));
         }
         let id = Uuid::new_v4().to_string();
-        let (queue_tx, queue_rx) = mpsc::channel::<CustomNotification>(self.queue_depth);
+        let (queue_tx, queue_rx) = mpsc::channel::<QueuedNotification>(self.queue_depth);
+        let queue = NotificationQueue {
+            sender: queue_tx,
+            bytes: Arc::new(Semaphore::new(MAX_QUEUE_BYTES)),
+        };
         let (stop_tx, stop_rx) = watch::channel(false);
         let poller = tokio::spawn(poll_loop(
             Arc::downgrade(self),
             id.clone(),
             source,
             categories.clone(),
-            after,
-            queue_tx,
+            cursor,
+            queue,
             stop_rx,
             self.poll_interval,
         ));
-        self.entries.lock().expect("subscription registry").insert(
+        entries.insert(
             id.clone(),
             Entry {
                 stop: stop_tx,
@@ -483,17 +601,18 @@ impl SubscriptionHub {
         let ack = json!({
             "subscription_id": id,
             "categories": categories.iter().map(|c| c.name()).collect::<Vec<_>>(),
-            "cursor": after,
-            "starts_at_head": after.is_none(),
+            "cursor": cursor,
+            "starts_at_head": starts_at_head,
             "queue_capacity": self.queue_depth,
+            "queue_byte_capacity": MAX_QUEUE_BYTES,
             "poll_interval_ms": self.poll_interval.as_millis() as u64,
             "notifications": {
                 "committed": COMMITTED_NOTIFICATION,
                 "lagged": LAGGED_NOTIFICATION,
             },
             "resync": {
-                "after": after,
-                "reads": resync_reads(&categories),
+                "after": cursor,
+                "reads": recovery_reads,
                 "note": "notifications are a bounded freshness hint over committed facts, \
                          never complete history; a lagged notification marks an explicit \
                          gap, and the exact reads from the last delivered cursor are the \
@@ -513,14 +632,14 @@ impl SubscriptionHub {
     /// forwarder — and only the forwarder. A dead transport ends the
     /// subscription: stop the poller and forget the entry. Nothing
     /// here touches the host or any Operation.
-    pub fn subscribe(
+    pub async fn subscribe(
         self: &Arc<Self>,
         source: Arc<PumpSource>,
         peer: Peer<RoleServer>,
         categories: Vec<Category>,
         after: Option<i64>,
     ) -> Result<Value> {
-        let (id, queue_rx, ack) = self.open(source, categories, after)?;
+        let (id, queue_rx, ack) = self.open(source, categories, after).await?;
         let stop = self
             .entries
             .lock()
@@ -535,9 +654,11 @@ impl SubscriptionHub {
             let id = id.clone();
             tokio::spawn(async move {
                 let mut queue_rx = queue_rx;
-                while let Some(notification) = queue_rx.recv().await {
+                while let Some(queued) = queue_rx.recv().await {
                     if peer
-                        .send_notification(ServerNotification::CustomNotification(notification))
+                        .send_notification(ServerNotification::CustomNotification(
+                            queued.notification,
+                        ))
                         .await
                         .is_err()
                     {
@@ -652,14 +773,13 @@ async fn poll_loop(
     id: String,
     source: Arc<PumpSource>,
     categories: Vec<Category>,
-    after: Option<i64>,
-    queue: mpsc::Sender<CustomNotification>,
+    after: i64,
+    queue: NotificationQueue,
     mut stop: watch::Receiver<bool>,
     poll_interval: Duration,
 ) {
-    let mut cursor: Option<i64> = after;
-    let mut establish_from: i64 = 0;
-    let mut delivered_through: i64 = after.unwrap_or(0);
+    let mut cursor = after;
+    let mut delivered_through = after;
     let mut lagged: Option<LaggedGap> = None;
     loop {
         if *stop.borrow() {
@@ -667,60 +787,35 @@ async fn poll_loop(
         }
         // A pending lagged marker precedes any newer item. Until it
         // is queued, no post-episode item is delivered ahead of it.
-        if lagged.is_some() {
-            match queue.try_send(lagged_notification_for_categories(
-                &id,
-                lagged.as_ref().expect("checked"),
-                &categories,
-            )) {
-                Ok(()) => lagged = None,
-                Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
+        if let Some(gap) = lagged.as_mut() {
+            if !gap.head_reached && gap.failure.is_none() {
+                let progress = scan_to_cut(&source, cursor, gap.cut_cursor, &categories).await;
+                cursor = progress.examined_through;
+                gap.through_cursor = cursor;
+                gap.dropped_items = gap.dropped_items.saturating_add(progress.matched_dropped);
+                gap.head_reached = progress.reached_cut;
+                gap.failure = progress.failure;
             }
-        }
-        if lagged.as_ref().is_some_and(|gap| !gap.head_reached) {
-            // The marker is still queued behind a full queue and the
-            // episode is still short of the head: keep fast-forwarding
-            // (counting drops) instead of delivering. The range in
-            // the eventual marker is exactly what was skipped; entries
-            // past it are delivered normally once polling resumes.
-            let mut gap = lagged.take().expect("episode checked above");
-            let mut dropped = 0_u64;
-            let scanned = scan_to_head(
-                &source,
-                cursor.unwrap_or(0),
-                &categories,
-                Some(&mut dropped),
-            )
-            .await;
-            gap.dropped_items += dropped;
-            if let Some((head, reached)) = scanned {
-                cursor = Some(head);
-                gap.through_cursor = head;
-                gap.head_reached = reached;
-            }
-            lagged = Some(gap);
-        } else if lagged.is_some() {
-            // Episode closed, marker still waiting for a queue slot:
-            // deliver nothing new this tick.
-        } else if cursor.is_none() {
-            // Cursor-less subscription: fast-forward to the current
-            // head, delivering and counting nothing — the
-            // pre-subscription past is not a gap. Delivery starts on
-            // a later tick, from the head.
-            match scan_to_head(&source, establish_from, &categories, None).await {
-                Some((head, true)) => {
-                    cursor = Some(head);
-                    delivered_through = head;
+            if gap.head_reached || gap.failure.is_some() {
+                match queue.try_send(lagged_notification_for_categories(
+                    &id,
+                    gap,
+                    &categories,
+                    &source,
+                )) {
+                    Ok(()) => {
+                        delivered_through = gap.through_cursor;
+                        lagged = None;
+                    }
+                    Err(QueueSendError::Full) => {}
+                    Err(QueueSendError::Closed) => break,
                 }
-                Some((advanced, false)) => establish_from = advanced,
-                None => {}
             }
         } else {
             match deliver_tick(
                 &source,
                 &categories,
-                cursor.expect("cursor established"),
+                cursor,
                 &mut delivered_through,
                 &mut lagged,
                 &queue,
@@ -728,7 +823,7 @@ async fn poll_loop(
             )
             .await
             {
-                Some(next) => cursor = Some(next),
+                Some(next) => cursor = next,
                 None => break, // queue closed: the forwarder is gone
             }
         }
@@ -755,23 +850,23 @@ async fn deliver_tick(
     mut cursor: i64,
     delivered_through: &mut i64,
     lagged: &mut Option<LaggedGap>,
-    queue: &mpsc::Sender<CustomNotification>,
+    queue: &NotificationQueue,
     id: &str,
 ) -> Option<i64> {
     for _ in 0..MAX_PAGES_PER_TICK {
-        let page = match source.delta_page(cursor).await {
+        let page = match source
+            .delta_page(cursor, None)
+            .await
+            .and_then(|page| parse_page(page, cursor, None))
+        {
             Ok(page) => page,
             // A failed read is not a closed delivery queue. Keep the
             // cursor at the last fully examined entry and retry next tick.
             Err(_) => return Some(cursor),
         };
-        let frame = page["projection"].clone();
-        let has_newer = frame["has_newer"] == json!(true);
-        let items = page["items"].as_array().cloned().unwrap_or_default();
         let mut episode: Option<LaggedGap> = None;
-        for item in &items {
-            let item_cursor = item["cursor"].as_i64().unwrap_or(cursor);
-            cursor = item_cursor;
+        for item in &page.items {
+            let item_cursor = item["cursor"].as_i64().expect("validated cursor");
             if let Some(gap) = &mut episode {
                 // Count-only mode for the rest of this page.
                 if !matched_categories(categories, item, source.client_id()).is_empty() {
@@ -782,62 +877,138 @@ async fn deliver_tick(
             }
             let matched = matched_categories(categories, item, source.client_id());
             if matched.is_empty() {
+                *delivered_through = item_cursor;
                 continue;
             }
-            match queue.try_send(committed_notification(id, &matched, item, &frame)) {
+            match queue.try_send(committed_notification(id, &matched, item, &page.frame)) {
                 Ok(()) => *delivered_through = item_cursor,
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(QueueSendError::Full) => {
                     episode = Some(LaggedGap {
                         dropped_items: 1,
                         from_cursor: *delivered_through,
                         through_cursor: item_cursor,
                         head_reached: false,
+                        cut_cursor: item_cursor,
+                        failure: None,
                     });
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => return None,
+                Err(QueueSendError::Closed) => return None,
             }
         }
+        cursor = page.next_cursor;
         if let Some(mut gap) = episode {
-            gap.head_reached = !has_newer;
+            gap.through_cursor = cursor;
+            match source.start_position().await {
+                Ok(cut) => {
+                    gap.cut_cursor = cut.max(cursor);
+                    gap.head_reached = cursor >= gap.cut_cursor;
+                }
+                Err(error) => {
+                    gap.cut_cursor = cursor;
+                    gap.failure = Some(error.code);
+                }
+            }
             *lagged = Some(gap);
             return Some(cursor);
         }
-        if !has_newer || items.is_empty() {
+        *delivered_through = cursor;
+        if !page.has_newer {
             return Some(cursor);
         }
     }
     Some(cursor)
 }
 
-/// Page from `from` toward the current stream head without
-/// delivering. With `dropped` set, matching entries are counted into
-/// it (a lagged episode's fast-forward); without it nothing is
-/// counted (head establishment for a cursor-less subscription).
-/// Returns `(cursor, reached_head)`, or None when a page read failed —
-/// the caller retries next tick from its saved position, so a failed
-/// read never moves any cursor.
-async fn scan_to_head(
+struct DeltaPage {
+    items: Vec<Value>,
+    frame: Value,
+    next_cursor: i64,
+    has_newer: bool,
+}
+
+fn parse_page(page: Value, after: i64, cut: Option<i64>) -> Result<DeltaPage> {
+    let invalid = || {
+        Error::new(
+            "SUBSCRIPTION_PAGE_INVALID",
+            "timeline page or scan cursor is invalid",
+        )
+    };
+    let items = page["items"].as_array().ok_or_else(invalid)?.clone();
+    if items.len() > PAGE_LIMIT as usize {
+        return Err(invalid());
+    }
+    let next_cursor = page["next_cursor"]
+        .as_i64()
+        .filter(|next| *next >= after)
+        .ok_or_else(invalid)?;
+    let has_newer = page["projection"]["has_newer"]
+        .as_bool()
+        .ok_or_else(invalid)?;
+    if cut.is_some_and(|cut| next_cursor > cut) || (has_newer && next_cursor == after) {
+        return Err(invalid());
+    }
+    let mut previous = after;
+    for item in &items {
+        let cursor = item["cursor"]
+            .as_i64()
+            .filter(|cursor| *cursor > previous && *cursor <= next_cursor)
+            .ok_or_else(invalid)?;
+        previous = cursor;
+    }
+    Ok(DeltaPage {
+        items,
+        frame: page["projection"].clone(),
+        next_cursor,
+        has_newer,
+    })
+}
+
+/// Cursor and count describe the same successfully examined rows even when a
+/// later page fails. The episode's immutable cut excludes new arrivals.
+struct ScanProgress {
+    examined_through: i64,
+    matched_dropped: u64,
+    reached_cut: bool,
+    failure: Option<String>,
+}
+
+async fn scan_to_cut(
     source: &PumpSource,
     from: i64,
+    cut: i64,
     categories: &[Category],
-    mut dropped: Option<&mut u64>,
-) -> Option<(i64, bool)> {
-    let mut cursor = from;
+) -> ScanProgress {
+    let mut progress = ScanProgress {
+        examined_through: from,
+        matched_dropped: 0,
+        reached_cut: from >= cut,
+        failure: None,
+    };
     for _ in 0..MAX_PAGES_PER_TICK {
-        let page = source.delta_page(cursor).await.ok()?;
-        let has_newer = page["projection"]["has_newer"] == json!(true);
-        let items = page["items"].as_array().cloned().unwrap_or_default();
-        for item in &items {
-            cursor = item["cursor"].as_i64().unwrap_or(cursor);
-            if let Some(counter) = dropped.as_deref_mut()
-                && !matched_categories(categories, item, source.client_id()).is_empty()
-            {
-                *counter += 1;
+        if progress.reached_cut {
+            break;
+        }
+        let page = match source
+            .delta_page(progress.examined_through, Some(cut))
+            .await
+            .and_then(|page| parse_page(page, progress.examined_through, Some(cut)))
+        {
+            Ok(page) => page,
+            Err(error) => {
+                progress.failure = Some(error.code);
+                break;
+            }
+        };
+        for item in &page.items {
+            if !matched_categories(categories, item, source.client_id()).is_empty() {
+                progress.matched_dropped = progress.matched_dropped.saturating_add(1);
             }
         }
-        if !has_newer || items.is_empty() {
-            return Some((cursor, true));
+        progress.examined_through = page.next_cursor;
+        if !page.has_newer || progress.examined_through >= cut {
+            progress.examined_through = cut;
+            progress.reached_cut = true;
         }
     }
-    Some((cursor, false))
+    progress
 }

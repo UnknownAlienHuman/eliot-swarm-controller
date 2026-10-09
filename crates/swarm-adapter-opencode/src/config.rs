@@ -1,3 +1,4 @@
+use crate::provider_auth::ProviderAuthOptions;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -10,10 +11,9 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
 };
-use crate::provider_auth::ProviderAuthOptions;
 
 pub const ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
-pub const ARTIFACT_VERSION: &str = "0.3.0";
+pub const ARTIFACT_VERSION: &str = "0.5.0";
 pub const MODULE_ID: &str = "eliot.opencode.v2";
 pub const RUNTIME: &str = "module";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -44,7 +44,6 @@ impl ModelRef {
 pub struct NativeOptions {
     pub service_id: String,
     pub connection_file: PathBuf,
-    pub expected_version: String,
     pub directory: PathBuf,
     pub model: ModelRef,
 }
@@ -116,12 +115,11 @@ impl NativeOptions {
             || !self.connection_file.is_absolute()
             || !self.directory.is_absolute()
             || self.directory.to_str().is_none()
-            || self.expected_version.trim().is_empty()
             || !self.model.valid()
         {
             return Err(Error::new(
                 "CONFIG_ERROR",
-                "OpenCode requires absolute paths, a service ID, exact version and explicit provider/model/variant",
+                "OpenCode requires absolute paths, a service ID and explicit provider/model/variant",
             ));
         }
         Ok(())
@@ -270,7 +268,10 @@ pub fn is_loopback_endpoint(url: &reqwest::Url) -> bool {
 fn absolute_plain_path(path: &Path) -> bool {
     path.is_absolute()
         && !path.components().any(|component| {
-            matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
         })
 }
 

@@ -35,9 +35,11 @@ import { fileURLToPath } from "node:url";
 export const RUNTIME = "command";
 export const ENTRYPOINT = "native_mod";
 export const TRANSPORT = "headless_ndjson";
-export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.4";
+export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.5";
+export const HISTORICAL_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.4";
 export const LEGACY_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.2";
 export const PREVIOUS_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.3";
+export const TASK_PROMPT_CONTRACT_REVISION = "task-prompt-v1";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_MOD_PATH = join(MODULE_DIR, "mod", "eliot-command.ts");
@@ -65,30 +67,177 @@ export function sha256Hex(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-export function buildTaskPrompt(taskSnapshot, text, canonicalSnapshot) {
-  if (taskSnapshot === null || typeof taskSnapshot !== "object" || Array.isArray(taskSnapshot)) {
-    throw new Error("TASK_SNAPSHOT_REQUIRED");
+const TASK_PROMPT_FIELDS = [
+  "schema_id",
+  "schema_version",
+  "task_id",
+  "task_revision",
+  "attempt_id",
+  "task_snapshot_sha256",
+  "prompt_sha256",
+  "prompt_bytes",
+  "prompt",
+];
+const TASK_DISPATCH_CONTEXT_FIELDS = [
+  "schema_version",
+  "operation_id",
+  "binding_id",
+  "binding_generation",
+  "worker_boot_id",
+  "attempt_id",
+  "task_id",
+  "task_revision",
+  "task_snapshot_sha256",
+  "source_text_sha256",
+  "source_text_bytes",
+];
+const LOWER_SHA256 = /^[0-9a-f]{64}$/;
+
+function exactFields(value, fields) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join(",") === [...fields].sort().join(",");
+}
+
+function validBoundedTaskIdentity(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= 512
+    && !/\p{Cc}/u.test(value);
+}
+
+function failTaskPrompt(code) {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
+}
+
+/** Validate the exact Store dispatch before admission or a native spawn. */
+export function validateTaskPromptDispatch(command, bootId, moduleContract) {
+  const operationId = command?.operation_id;
+  const bindingId = command?.binding_id;
+  const generation = command?.generation;
+  const inputSha256 = command?.input_sha256;
+  const input = command?.input;
+  if (command?.method !== "task.dispatch"
+      || typeof operationId !== "string" || operationId.trim() === ""
+      || typeof bindingId !== "string" || bindingId.trim() === ""
+      || !Number.isSafeInteger(generation) || generation <= 0
+      || !LOWER_SHA256.test(inputSha256 ?? "")
+      || typeof bootId !== "string" || bootId.trim() === ""
+      || input === null || typeof input !== "object" || Array.isArray(input)) {
+    failTaskPrompt("TASK_DISPATCH_CONTEXT_INVALID");
   }
-  if (typeof text !== "string" || text.trim() === "") {
-    throw new Error("DISPATCH_TEXT_INVALID");
+  if (Object.hasOwn(input, "task_snapshot") || Object.hasOwn(input, "task_snapshot_canonical")) {
+    failTaskPrompt("TASK_PROMPT_SNAPSHOT_FALLBACK_FORBIDDEN");
   }
-  if (typeof canonicalSnapshot !== "string") {
-    throw new Error("CANONICAL_TASK_SNAPSHOT_REQUIRED");
+  const envelope = input.task_prompt;
+  const context = input.task_dispatch_context;
+  if (!exactFields(envelope, TASK_PROMPT_FIELDS)
+      || envelope.schema_id !== "swarm.task_prompt"
+      || envelope.schema_version !== 1
+      || !validBoundedTaskIdentity(envelope.task_id)
+      || !Number.isSafeInteger(envelope.task_revision) || envelope.task_revision <= 0
+      || !validBoundedTaskIdentity(envelope.attempt_id)
+      || !LOWER_SHA256.test(envelope.task_snapshot_sha256 ?? "")
+      || !LOWER_SHA256.test(envelope.prompt_sha256 ?? "")
+      || typeof envelope.prompt !== "string" || envelope.prompt.trim() === ""
+      || !Number.isSafeInteger(envelope.prompt_bytes) || envelope.prompt_bytes <= 0
+      || Buffer.byteLength(envelope.prompt, "utf8") !== envelope.prompt_bytes) {
+    failTaskPrompt("TASK_PROMPT_INVALID");
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(canonicalSnapshot);
-  } catch {
-    throw new Error("CANONICAL_TASK_SNAPSHOT_INVALID");
+  if (input.attempt_id !== envelope.attempt_id) {
+    failTaskPrompt("TASK_PROMPT_IDENTITY_MISMATCH");
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
-      || !isDeepStrictEqual(parsed, taskSnapshot)) {
-    throw new Error("CANONICAL_TASK_SNAPSHOT_MISMATCH");
+  if (sha256Hex(envelope.prompt) !== envelope.prompt_sha256) {
+    failTaskPrompt("TASK_PROMPT_DIGEST_MISMATCH");
   }
-  // Rust batch::instruction is the canonical prompt contract. The canonical
-  // snapshot text is supplied by the controller; this module does not invent
-  // a second serializer that could disagree on Unicode or map ordering.
-  return `${text}\n\nELIOT immutable task snapshot:\n${canonicalSnapshot}`;
+  if (!exactFields(context, TASK_DISPATCH_CONTEXT_FIELDS)
+      || context.schema_version !== 1
+      || typeof context.operation_id !== "string" || context.operation_id.trim() === ""
+      || typeof context.binding_id !== "string" || context.binding_id.trim() === ""
+      || !Number.isSafeInteger(context.binding_generation) || context.binding_generation <= 0
+      || typeof context.worker_boot_id !== "string" || context.worker_boot_id.trim() === ""
+      || typeof context.attempt_id !== "string" || context.attempt_id.trim() === ""
+      || typeof context.task_id !== "string" || context.task_id.trim() === ""
+      || !Number.isSafeInteger(context.task_revision) || context.task_revision <= 0
+      || !LOWER_SHA256.test(context.task_snapshot_sha256 ?? "")
+      || !LOWER_SHA256.test(context.source_text_sha256 ?? "")
+      || !Number.isSafeInteger(context.source_text_bytes) || context.source_text_bytes < 0
+      || context.operation_id !== operationId
+      || context.binding_id !== bindingId
+      || context.binding_generation !== generation
+      || context.worker_boot_id !== bootId
+      || context.attempt_id !== envelope.attempt_id
+      || context.task_id !== envelope.task_id
+      || context.task_revision !== envelope.task_revision
+      || context.task_snapshot_sha256 !== envelope.task_snapshot_sha256) {
+    failTaskPrompt("TASK_DISPATCH_CONTEXT_INVALID");
+  }
+  const sourceText = input.text;
+  if (typeof sourceText !== "string" || sourceText.trim() === ""
+      || Buffer.byteLength(sourceText, "utf8") !== context.source_text_bytes
+      || sha256Hex(sourceText) !== context.source_text_sha256) {
+    failTaskPrompt("TASK_DISPATCH_CONTEXT_INVALID");
+  }
+  const coreBinding = commandReceiptFacts(operationId, envelope.prompt);
+  if (!coreBindingMatches(input.command_core_binding, coreBinding)) {
+    failTaskPrompt("CORE_PROMPT_BINDING_MISMATCH");
+  }
+  if (!moduleContract || moduleContract.module_id !== "runtime.command"
+      || moduleContract.artifact?.artifact_id !== MODULE_ARTIFACT_ID
+      || moduleContract.artifact?.version !== "5"
+      || moduleContract.protocol?.major !== 1 || moduleContract.protocol?.minor !== 0) {
+    failTaskPrompt("MODULE_CONTRACT_MISMATCH");
+  }
+  const moduleReceipt = {
+    schema_version: 1,
+    module_id: moduleContract.module_id,
+    artifact: moduleContract.artifact,
+    protocol: moduleContract.protocol,
+    binding_id: bindingId,
+    binding_generation: generation,
+    operation_id: operationId,
+    input_sha256: inputSha256,
+  };
+  const dispatchAdmission = {
+    schema_version: 1,
+    module_receipt: moduleReceipt,
+    operation_id: context.operation_id,
+    binding_id: context.binding_id,
+    binding_generation: context.binding_generation,
+    worker_boot_id: context.worker_boot_id,
+    attempt_id: context.attempt_id,
+    task_id: context.task_id,
+    task_revision: context.task_revision,
+    task_snapshot_sha256: context.task_snapshot_sha256,
+    source_text_sha256: context.source_text_sha256,
+    source_text_bytes: context.source_text_bytes,
+    native_payload_sha256: envelope.prompt_sha256,
+    native_payload_bytes: envelope.prompt_bytes,
+    native_input_id: null,
+  };
+  return {
+    operationId,
+    bindingId,
+    generation,
+    prompt: envelope.prompt,
+    coreBinding,
+    taskPrompt: {
+      schema_id: envelope.schema_id,
+      schema_version: envelope.schema_version,
+      task_id: envelope.task_id,
+      task_revision: envelope.task_revision,
+      attempt_id: envelope.attempt_id,
+      task_snapshot_sha256: envelope.task_snapshot_sha256,
+      prompt_sha256: envelope.prompt_sha256,
+      prompt_bytes: envelope.prompt_bytes,
+    },
+    taskDispatchContext: { ...context },
+    moduleReceipt,
+    dispatchAdmission,
+  };
 }
 
 function operationDigest(operationId) {
@@ -209,6 +358,13 @@ export function outcomeFromRun(run, evidence = run?.evidence_validation) {
       artifact_refs: Array.isArray(run?.artifact_refs) ? run.artifact_refs : [],
       result_text_sha256: typeof resultText === "string" ? sha256Hex(resultText) : null,
       result_text_bytes: typeof resultText === "string" ? Buffer.byteLength(resultText, "utf8") : null,
+      ...(typeof run?.task_prompt_contract_revision === "string" ? {
+        task_prompt_contract_revision: run.task_prompt_contract_revision,
+        prompt_contract_revision: run.task_prompt_contract_revision,
+        task_prompt: run.task_prompt,
+        task_dispatch_context: run.task_dispatch_context,
+      } : {}),
+      ...(applied && run?.dispatch_admission ? { dispatch_admission: run.dispatch_admission } : {}),
       ...(nativeFailureCode ? { diagnostic_code: nativeFailureCode } : {}),
       ...(!cleanEvidence ? {
         diagnostic_code: evidence?.diagnostic_code
@@ -225,8 +381,14 @@ function createAdmission(options) {
   if (!coreBindingMatches(coreBinding, expectedCoreBinding)) {
     throw new Error("CORE_PROMPT_BINDING_MISMATCH");
   }
+  const validated = validateTaskPromptDispatch(options.command, options.bootId, options.moduleContract);
+  if (validated.operationId !== options.operationId
+      || validated.prompt !== options.prompt
+      || !isDeepStrictEqual(validated.coreBinding, coreBinding)) {
+    throw new Error("TASK_PROMPT_DISPATCH_CHANGED");
+  }
   return {
-    schema: 2,
+    schema: 3,
     module_artifact_id: MODULE_ARTIFACT_ID,
     operation_id: options.operationId,
     execution_shape: "sessionless_batch",
@@ -235,6 +397,11 @@ function createAdmission(options) {
     prompt_sha256: coreBinding.prompt_sha256,
     prompt_bytes: coreBinding.prompt_bytes,
     core_binding: coreBinding,
+    task_prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    task_prompt: validated.taskPrompt,
+    task_dispatch_context: validated.taskDispatchContext,
+    dispatch_admission: validated.dispatchAdmission,
     control_record_ref: controlRecordRef(options.operationId),
     result_ref: resultRecordRef(options.operationId),
     artifact_refs: artifactRefs(options.operationId),
@@ -456,15 +623,55 @@ function expectedTerminalFacts(result, exit, timedOut, records) {
   return { anomalies, disposition, dispositionBasis, framesAfterResult };
 }
 
-function validateSavedEvidence(controlDir, admission, run, records) {
+function validSavedDispatchAdmission(receipt, context, taskPrompt, operationId) {
+  if (!exactFields(receipt, [
+    "schema_version", "module_receipt", "operation_id", "binding_id",
+    "binding_generation", "worker_boot_id", "attempt_id", "task_id",
+    "task_revision", "task_snapshot_sha256", "source_text_sha256",
+    "source_text_bytes", "native_payload_sha256", "native_payload_bytes",
+    "native_input_id",
+  ])) return false;
+  const moduleReceipt = receipt.module_receipt;
+  if (!exactFields(moduleReceipt, [
+    "schema_version", "module_id", "artifact", "protocol", "binding_id",
+    "binding_generation", "operation_id", "input_sha256",
+  ]) || !exactFields(moduleReceipt.artifact, ["artifact_id", "version"])
+      || !exactFields(moduleReceipt.protocol, ["major", "minor"])) return false;
+  return receipt.schema_version === 1
+    && receipt.operation_id === operationId
+    && receipt.binding_id === context.binding_id
+    && receipt.binding_generation === context.binding_generation
+    && receipt.worker_boot_id === context.worker_boot_id
+    && receipt.attempt_id === context.attempt_id
+    && receipt.task_id === context.task_id
+    && receipt.task_revision === context.task_revision
+    && receipt.task_snapshot_sha256 === context.task_snapshot_sha256
+    && receipt.source_text_sha256 === context.source_text_sha256
+    && receipt.source_text_bytes === context.source_text_bytes
+    && receipt.native_payload_sha256 === taskPrompt.prompt_sha256
+    && receipt.native_payload_bytes === taskPrompt.prompt_bytes
+    && receipt.native_input_id === null
+    && moduleReceipt.schema_version === 1
+    && moduleReceipt.module_id === "runtime.command"
+    && moduleReceipt.artifact.artifact_id === MODULE_ARTIFACT_ID
+    && moduleReceipt.artifact.version === "5"
+    && moduleReceipt.protocol.major === 1
+    && moduleReceipt.protocol.minor === 0
+    && moduleReceipt.binding_id === context.binding_id
+    && moduleReceipt.binding_generation === context.binding_generation
+    && moduleReceipt.operation_id === operationId
+    && LOWER_SHA256.test(moduleReceipt.input_sha256 ?? "");
+}
+
+function validateSavedEvidence(controlDir, admission, run, records, contract) {
   const invalid = (diagnostic_code) => ({ valid: false, diagnostic_code });
   if (!admission) return invalid("saved_admission_missing");
   if (admission.schema === 1 && run?.module_artifact_id === LEGACY_MODULE_ARTIFACT_ID) {
     return { valid: false, diagnostic_code: "legacy_artifact_read_only" };
   }
   if (!run) return invalid("saved_terminal_evidence_missing");
-  if (admission.schema !== 2 || admission.module_artifact_id !== MODULE_ARTIFACT_ID
-      || run.schema !== 2 || run.module_artifact_id !== MODULE_ARTIFACT_ID) {
+  if (admission.schema !== contract.schema || admission.module_artifact_id !== contract.artifactId
+      || run.schema !== contract.schema || run.module_artifact_id !== contract.artifactId) {
     return invalid("saved_artifact_identity_mismatch");
   }
   const operationId = admission.operation_id;
@@ -483,6 +690,39 @@ function validateSavedEvidence(controlDir, admission, run, records) {
       || admission.prompt_bytes < 1) {
     return invalid("saved_admission_identity_mismatch");
   }
+  if (contract.taskPrompt) {
+    const taskPrompt = admission.task_prompt;
+    const context = admission.task_dispatch_context;
+    if (admission.task_prompt_contract_revision !== TASK_PROMPT_CONTRACT_REVISION
+        || !exactFields(taskPrompt, [
+          "schema_id", "schema_version", "task_id", "task_revision", "attempt_id",
+          "task_snapshot_sha256", "prompt_sha256", "prompt_bytes",
+        ])
+        || taskPrompt.schema_id !== "swarm.task_prompt"
+        || taskPrompt.schema_version !== 1
+        || !validBoundedTaskIdentity(taskPrompt.task_id)
+        || !Number.isSafeInteger(taskPrompt.task_revision) || taskPrompt.task_revision <= 0
+        || !validBoundedTaskIdentity(taskPrompt.attempt_id)
+        || !LOWER_SHA256.test(taskPrompt.task_snapshot_sha256 ?? "")
+        || taskPrompt.prompt_sha256 !== admission.prompt_sha256
+        || taskPrompt.prompt_bytes !== admission.prompt_bytes
+        || !exactFields(context, TASK_DISPATCH_CONTEXT_FIELDS)
+        || context.schema_version !== 1
+        || context.operation_id !== operationId
+        || typeof context.binding_id !== "string" || context.binding_id.trim() === ""
+        || !Number.isSafeInteger(context.binding_generation) || context.binding_generation <= 0
+        || typeof context.worker_boot_id !== "string" || context.worker_boot_id.trim() === ""
+        || context.task_id !== taskPrompt.task_id
+        || context.task_revision !== taskPrompt.task_revision
+        || context.attempt_id !== taskPrompt.attempt_id
+        || context.task_snapshot_sha256 !== taskPrompt.task_snapshot_sha256
+        || !LOWER_SHA256.test(context.source_text_sha256 ?? "")
+        || !Number.isSafeInteger(context.source_text_bytes) || context.source_text_bytes < 0
+        || admission.prompt_contract_revision !== TASK_PROMPT_CONTRACT_REVISION
+        || !validSavedDispatchAdmission(admission.dispatch_admission, context, taskPrompt, operationId)) {
+      return invalid("saved_task_prompt_identity_mismatch");
+    }
+  }
   if (run.runtime !== RUNTIME || run.entrypoint !== ENTRYPOINT || run.transport !== TRANSPORT
       || run.execution_shape !== "sessionless_batch"
       || run.operation_id !== operationId
@@ -494,6 +734,13 @@ function validateSavedEvidence(controlDir, admission, run, records) {
       || run.control_record_ref !== admission.control_record_ref
       || run.result_ref !== admission.result_ref
       || JSON.stringify(run.artifact_refs) !== JSON.stringify(expectedArtifacts)
+      || (contract.taskPrompt && (
+        run.task_prompt_contract_revision !== admission.task_prompt_contract_revision
+        || run.prompt_contract_revision !== admission.prompt_contract_revision
+        || !isDeepStrictEqual(run.task_prompt, admission.task_prompt)
+        || !isDeepStrictEqual(run.task_dispatch_context, admission.task_dispatch_context)
+        || !isDeepStrictEqual(run.dispatch_admission, admission.dispatch_admission)
+      ))
       || resolve(run.control_dir ?? "") !== resolve(controlDir)) {
     return invalid("saved_run_identity_mismatch");
   }
@@ -696,12 +943,12 @@ export async function openRun(config, options) {
       || arg.startsWith("--output-format="))) {
     throw new Error("ARGS_PREFIX_CONFLICTS_WITH_GLUE_OWNED_FLAGS");
   }
-  mkdirSync(controlDir, { recursive: true });
   const expectedAdmission = createAdmission(options);
+  mkdirSync(controlDir, { recursive: true });
   const priorAdmission = readAdmission(controlDir);
   if (priorAdmission) {
     if (
-      priorAdmission.schema !== 2
+      priorAdmission.schema !== 3
       || priorAdmission.module_artifact_id !== MODULE_ARTIFACT_ID
       || priorAdmission.operation_id !== operationId
       || priorAdmission.batch_run_id !== expectedAdmission.batch_run_id
@@ -709,6 +956,11 @@ export async function openRun(config, options) {
       || priorAdmission.prompt_sha256 !== expectedAdmission.prompt_sha256
       || priorAdmission.prompt_bytes !== expectedAdmission.prompt_bytes
       || !isDeepStrictEqual(priorAdmission.core_binding, expectedAdmission.core_binding)
+      || priorAdmission.task_prompt_contract_revision !== expectedAdmission.task_prompt_contract_revision
+        || priorAdmission.prompt_contract_revision !== expectedAdmission.prompt_contract_revision
+      || !isDeepStrictEqual(priorAdmission.task_prompt, expectedAdmission.task_prompt)
+      || !isDeepStrictEqual(priorAdmission.task_dispatch_context, expectedAdmission.task_dispatch_context)
+        || !isDeepStrictEqual(priorAdmission.dispatch_admission, expectedAdmission.dispatch_admission)
       || priorAdmission.control_record_ref !== expectedAdmission.control_record_ref
       || priorAdmission.result_ref !== expectedAdmission.result_ref
       || JSON.stringify(priorAdmission.artifact_refs) !== JSON.stringify(expectedAdmission.artifact_refs)
@@ -724,7 +976,7 @@ export async function openRun(config, options) {
       };
     }
     return {
-      schema: 2,
+      schema: 3,
       runtime: RUNTIME,
       entrypoint: ENTRYPOINT,
       transport: TRANSPORT,
@@ -744,6 +996,11 @@ export async function openRun(config, options) {
       artifact_refs: artifactRefs(operationId),
       prompt_sha256: priorAdmission.prompt_sha256,
       prompt_bytes: priorAdmission.prompt_bytes,
+      task_prompt_contract_revision: priorAdmission.task_prompt_contract_revision,
+      prompt_contract_revision: priorAdmission.prompt_contract_revision,
+      task_prompt: priorAdmission.task_prompt,
+      task_dispatch_context: priorAdmission.task_dispatch_context,
+      dispatch_admission: priorAdmission.dispatch_admission,
       result: null,
       exit: { code: null, signal: null, spawn_error: null, meaning: null },
       spawn_error_observed: false,
@@ -924,7 +1181,7 @@ export async function openRun(config, options) {
   )?.sessionId;
 
   const record = {
-    schema: 2,
+    schema: 3,
     runtime: RUNTIME,
     entrypoint: ENTRYPOINT,
     transport: TRANSPORT,
@@ -950,6 +1207,11 @@ export async function openRun(config, options) {
     prompt_sha256: sha256Hex(options.prompt),
     prompt_bytes: Buffer.byteLength(options.prompt, "utf8"),
     prompt_length: options.prompt.length,
+    task_prompt_contract_revision: expectedAdmission.task_prompt_contract_revision,
+    prompt_contract_revision: expectedAdmission.prompt_contract_revision,
+    task_prompt: expectedAdmission.task_prompt,
+    task_dispatch_context: expectedAdmission.task_dispatch_context,
+    dispatch_admission: expectedAdmission.dispatch_admission,
     session_id:
       typeof result?.sessionId === "string"
         ? result.sessionId
@@ -1024,13 +1286,17 @@ export function snapshotRun(controlDir) {
     && admission.module_artifact_id === PREVIOUS_MODULE_ARTIFACT_ID
     && run?.schema === 2
     && run.module_artifact_id === PREVIOUS_MODULE_ARTIFACT_ID;
+  const historicalArtifact = admission?.schema === 2
+    && admission.module_artifact_id === HISTORICAL_MODULE_ARTIFACT_ID;
   const journal = readModJournal(resolved, { legacy });
   const eventRecords = readJsonLines(join(resolved, "events.ndjson"));
   const evidence = legacy
     ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
     : previousArtifact
       ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
-      : validateSavedEvidence(resolved, admission, run, eventRecords);
+      : validateSavedEvidence(resolved, admission, run, eventRecords, historicalArtifact
+        ? { schema: 2, artifactId: HISTORICAL_MODULE_ARTIFACT_ID, taskPrompt: false }
+        : { schema: 3, artifactId: MODULE_ARTIFACT_ID, taskPrompt: true });
   return {
     scope: "single_headless_run",
     completeness: "partial",
@@ -1073,35 +1339,7 @@ async function main(argv) {
     return;
   }
   if (command === "open") {
-    const config = loadConfig(flag("--config"));
-    const prompt = flag("--prompt");
-    if (!prompt) throw new Error("open requires --prompt");
-    const operationId = flag("--operation-id");
-    const requestedModel = flag("--model");
-    const cwd = flag("--cwd");
-    if (!operationId) throw new Error("open requires --operation-id");
-    if (!requestedModel) throw new Error("open requires --model");
-    if (!cwd) throw new Error("open requires --cwd");
-    let controlDir = flag("--control-dir");
-    if (!controlDir) {
-      if (!config.controlRoot) {
-        throw new Error("open requires --control-dir or config.controlRoot");
-      }
-      controlDir = join(
-        config.controlRoot,
-        `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`,
-      );
-    }
-    const record = await openRun(config, {
-      operationId,
-      requestedModel,
-      cwd,
-      prompt,
-      controlDir,
-      timeoutMs: Number(flag("--timeout-ms") ?? 0),
-    });
-    process.stdout.write(JSON.stringify(record, null, 2) + "\n");
-    return;
+    throw new Error("STORE_TASK_PROMPT_REQUIRED: dispatch is admitted only by the authenticated module bridge");
   }
   if (command === "snapshot") {
     const controlDir = flag("--control-dir");
@@ -1110,7 +1348,7 @@ async function main(argv) {
     return;
   }
   throw new Error(
-    "usage: glue.mjs describe --config FILE | open --config FILE --operation-id ID --model MODEL --cwd DIR --prompt TEXT [--control-dir DIR] | snapshot --control-dir DIR",
+    "usage: glue.mjs describe --config FILE | snapshot --control-dir DIR",
   );
 }
 

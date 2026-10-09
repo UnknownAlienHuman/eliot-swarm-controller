@@ -67,14 +67,12 @@ pub(crate) fn admit(
             "native MCP command does not match the shared DTO",
         )
     })?;
-    native_command
-        .validate_against(command)
-        .map_err(|_| {
-            Error::new(
-                "NATIVE_MCP_IDENTITY",
-                "native MCP command differs from its authenticated RuntimeCommand",
-            )
-        })?;
+    native_command.validate_against(command).map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_IDENTITY",
+            "native MCP command differs from its authenticated RuntimeCommand",
+        )
+    })?;
     validate_effect(&native_command, &effect)?;
 
     let mut effect_command = command.clone();
@@ -111,10 +109,9 @@ fn validate_effect(command: &NativeMcpCommand, effect: &Value) -> Result<()> {
     }
 
     let (field, reference) = match command.phase {
-        NativeMcpPhase::Install | NativeMcpPhase::Observe => (
-            "prepared",
-            command.prepared_command.as_ref(),
-        ),
+        NativeMcpPhase::Install | NativeMcpPhase::Observe => {
+            ("prepared", command.prepared_command.as_ref())
+        }
         NativeMcpPhase::Arm | NativeMcpPhase::Read => ("challenge", command.challenge.as_ref()),
     };
     let reference = reference.ok_or_else(|| {

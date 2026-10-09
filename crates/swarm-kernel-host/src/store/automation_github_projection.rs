@@ -2,6 +2,10 @@
 //! managed-Issue-label Operation. Remote reads/writes remain in
 //! `store::github_effects` after this transaction commits.
 
+use super::automation_reconcile::{
+    self, DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
+    SubjectErrorDisposition,
+};
 use super::{Store, capacity, github_effects};
 use crate::{
     automation::{
@@ -20,12 +24,28 @@ const STATE_SCHEMA_VERSION: u32 = 1;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:github-projection:global-cursor";
 const EFFECT_DRAIN_CURSOR_KEY: &str = "automation:v1:github-projection:effect-drain-cursor";
 const STATE_PREFIX: &str = "automation:v1:github-projection:state:";
+const QUARANTINE_PREFIX: &str = "automation:v1:github-projection:quarantine:";
 const ACCEPTANCE_STREAM: &str = "controller:acceptance";
 const METHOD: &str = "github.effect.managed_label";
 const MAX_ENTRIES_PER_PASS: usize = 16;
 const MAX_FACTS_PER_ENTRY: usize = 16;
 const MAX_EFFECTS_PER_PASS: usize = 16;
 const MAX_RECENT: usize = 32;
+
+/// Root may continue after these exact projection-state failures only after
+/// rolling back this domain transaction. All other errors stop.
+pub(super) fn classify_domain_error(error: Error) -> DomainErrorDisposition {
+    if matches!(
+        error.code.as_str(),
+        "AUTOMATION_GITHUB_PROJECTION_CURSOR_CORRUPT"
+            | "AUTOMATION_GITHUB_PROJECTION_CURSOR_MISMATCH"
+            | "AUTOMATION_GITHUB_PROJECTION_STATE_CORRUPT"
+    ) {
+        DomainErrorDisposition::Degraded { code: error.code }
+    } else {
+        DomainErrorDisposition::Fatal(error)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +78,7 @@ struct ProjectionState {
     updated_at_ms: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AcceptanceEvent {
     observation_id: i64,
     source_event_key: Option<String>,
@@ -153,13 +173,23 @@ pub(crate) fn reconcile(
             "status":"idle"
         }));
     }
-    let (entries, last_entry_key) = enabled_entry_page(tx, entry_budget)?;
+    let (entries, last_entry_key, malformed_entries) = enabled_entry_page(tx, entry_budget)?;
+    for malformed in &malformed_entries {
+        persist_malformed_entry(tx, malformed, now_ms)?;
+    }
     let mut results = Vec::with_capacity(entries.len());
     let mut total_processed = 0usize;
+    let mut total_quarantined = malformed_entries.len();
     for entry in &entries {
         let result = reconcile_entry(tx, entry, fact_budget, now_ms)?;
         total_processed = total_processed.saturating_add(
             result["processed"]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default(),
+        );
+        total_quarantined = total_quarantined.saturating_add(
+            result["quarantined"]
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or_default(),
@@ -176,6 +206,14 @@ pub(crate) fn reconcile(
     Ok(json!({
         "entries":results,
         "processed":total_processed,
+        "quarantined":total_quarantined,
+        "status":if total_quarantined > 0 {
+            "degraded"
+        } else if total_processed == 0 {
+            "idle"
+        } else {
+            "progressed"
+        },
         "entry_budget":entry_budget,
         "fact_budget_per_entry":fact_budget,
         "cursor":last_entry_key
@@ -374,7 +412,7 @@ fn reconcile_entry(
         None => {
             let state = empty_state(entry, high_water, now_ms, true);
             save_state(tx, &key, &state)?;
-            return Ok(state_projection_with_processed(&state, 0, high_water));
+            return Ok(state_projection_with_processed(&state, 0, 0, high_water));
         }
     };
     if state.configured_revision != entry.revision {
@@ -383,8 +421,14 @@ fn reconcile_entry(
             "GitHub projection activation cursor does not match the current automation revision",
         ));
     }
+    let mut quarantined = 0usize;
     if budget == 0 {
-        return Ok(state_projection_with_processed(&state, 0, high_water));
+        return Ok(state_projection_with_processed(
+            &state,
+            0,
+            quarantined,
+            high_water,
+        ));
     }
     let target = state
         .catch_up_until
@@ -395,7 +439,12 @@ fn reconcile_entry(
         }
         state.updated_at_ms = now_ms;
         save_state(tx, &key, &state)?;
-        return Ok(state_projection_with_processed(&state, 0, high_water));
+        return Ok(state_projection_with_processed(
+            &state,
+            0,
+            quarantined,
+            high_water,
+        ));
     }
     let limit = i64::try_from(budget.saturating_add(1))
         .map_err(|_| Error::invalid("GitHub projection page limit exceeds platform range"))?;
@@ -423,67 +472,34 @@ fn reconcile_entry(
     let mut processed = 0usize;
     let mut waiting = false;
     for event in events.iter().take(budget) {
-        let Some(accepted_operation_id) = event_identity(event)? else {
-            remember_recent(
-                &mut state,
-                json!({
-                    "observation_id":event.observation_id,
-                    "status":"skipped",
-                    "code":"acceptance_fact_not_applied",
-                    "effect_operation_id":null
-                }),
-            );
-            state.cursor = event.observation_id;
-            processed += 1;
-            continue;
-        };
         let replay = event.observation_id <= state.activation_cut
             && state.catch_up_until == Some(state.activation_cut);
-        let context = match GithubProjectionContext::from_acceptance_observation(
+        let evidence = projection_event_evidence(event);
+        let disposition = automation_reconcile::with_subject_savepoint(
             tx,
-            entry,
-            event.observation_id,
-            &accepted_operation_id,
-            state.activation_cut,
-            replay,
-        ) {
-            Ok(context) => context,
-            Err(error) if waiting_context_error(&error) => {
-                remember_recent(
-                    &mut state,
-                    json!({
-                        "observation_id":event.observation_id,
-                        "status":"pending",
-                        "code":error.code,
-                        "reason":"current source mapping or Manager authority is not ready",
-                        "effect_operation_id":null
-                    }),
-                );
-                waiting = true;
-                break;
-            }
-            Err(error) => {
-                remember_recent(
-                    &mut state,
-                    json!({
-                        "observation_id":event.observation_id,
-                        "status":"skipped",
-                        "code":error.code,
-                        "reason":"acceptance is not eligible for this exact current projection",
-                        "effect_operation_id":null
-                    }),
-                );
-                state.cursor = event.observation_id;
-                processed += 1;
-                continue;
-            }
-        };
-        tx.execute_batch("SAVEPOINT automation_github_projection_reserve")?;
-        let request = context.request_value()?;
-        let result = reserve_projection(tx, entry, &context, &request, now_ms);
-        match result {
-            Ok(value) => {
-                tx.execute_batch("RELEASE automation_github_projection_reserve")?;
+            || {
+                let Some(accepted_operation_id) = event_identity(event)? else {
+                    return Ok(SubjectDisposition::Skipped {
+                        code: "acceptance_fact_not_applied".to_owned(),
+                        reason: "acceptance Observation is not an applied candidate".to_owned(),
+                    });
+                };
+                let context = GithubProjectionContext::from_acceptance_observation(
+                    tx,
+                    entry,
+                    event.observation_id,
+                    &accepted_operation_id,
+                    state.activation_cut,
+                    replay,
+                )?;
+                let request = context.request_value()?;
+                let value = reserve_projection(tx, entry, &context, &request, now_ms)?;
+                Ok(SubjectDisposition::Applied((accepted_operation_id, value)))
+            },
+            |error| classify_projection_subject_error(error, evidence.clone()),
+        )?;
+        match disposition {
+            SubjectDisposition::Applied((accepted_operation_id, value)) => {
                 remember_recent(
                     &mut state,
                     json!({
@@ -498,28 +514,49 @@ fn reconcile_entry(
                 state.cursor = event.observation_id;
                 processed += 1;
             }
-            Err(error) if error.code == "GITHUB_EFFECT_SLOT_BUSY" => {
-                tx.execute_batch(
-                    "ROLLBACK TO automation_github_projection_reserve; RELEASE automation_github_projection_reserve",
-                )?;
+            SubjectDisposition::Pending { code, reason } => {
                 remember_recent(
                     &mut state,
                     json!({
                         "observation_id":event.observation_id,
                         "status":"pending",
-                        "code":error.code,
-                        "reason":"the exact Issue/label slot has an unresolved Operation",
+                        "code":code,
+                        "reason":reason,
                         "effect_operation_id":null
                     }),
                 );
                 waiting = true;
                 break;
             }
-            Err(error) => {
-                tx.execute_batch(
-                    "ROLLBACK TO automation_github_projection_reserve; RELEASE automation_github_projection_reserve",
-                )?;
-                return Err(error);
+            SubjectDisposition::Skipped { code, reason } => {
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "status":"skipped",
+                        "code":code,
+                        "reason":reason,
+                        "effect_operation_id":null
+                    }),
+                );
+                state.cursor = event.observation_id;
+                processed += 1;
+            }
+            SubjectDisposition::Quarantined { code, evidence } => {
+                persist_subject_quarantine(tx, &code, evidence, now_ms)?;
+                quarantined = quarantined.saturating_add(1);
+                remember_recent(
+                    &mut state,
+                    json!({
+                        "observation_id":event.observation_id,
+                        "status":"quarantined",
+                        "code":code,
+                        "effect_operation_id":null,
+                        "recorded_at_ms":now_ms
+                    }),
+                );
+                state.cursor = event.observation_id;
+                processed += 1;
             }
         }
     }
@@ -532,7 +569,10 @@ fn reconcile_entry(
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)?;
     Ok(state_projection_with_processed(
-        &state, processed, high_water,
+        &state,
+        processed,
+        quarantined,
+        high_water,
     ))
 }
 
@@ -660,29 +700,100 @@ fn event_identity(event: &AcceptanceEvent) -> Result<Option<String>> {
     Ok(Some(operation_id.to_owned()))
 }
 
-fn waiting_context_error(error: &Error) -> bool {
-    matches!(
-        error.code.as_str(),
-        "AUTOMATION_CURRENT_GM_REQUIRED"
-            | "AUTOMATION_ACTION_CHANGED"
-            | "AUTOMATION_GITHUB_PROJECTION_SETTINGS_REQUIRED"
-            | "GITHUB_EFFECT_TARGET_NOT_FOUND"
-            | "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE"
-            | "FORBIDDEN"
-    )
+fn classify_projection_subject_error(
+    error: &Error,
+    evidence: QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    match error.code.as_str() {
+        "AUTOMATION_CURRENT_GM_REQUIRED" | "GITHUB_EFFECT_TARGET_NOT_FOUND"
+        | "GITHUB_EFFECT_SLOT_BUSY" => Some(SubjectErrorDisposition::Pending {
+            code: error.code.clone(),
+            reason: "current Manager authority, source mapping, or exact effect slot may become available later".to_owned(),
+        }),
+        "AUTOMATION_ACTION_CHANGED"
+        | "AUTOMATION_GITHUB_PROJECTION_SETTINGS_REQUIRED"
+        | "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE"
+        | "FORBIDDEN" => Some(SubjectErrorDisposition::Skipped {
+            code: error.code.clone(),
+            reason: "the accepted candidate is no longer selected for this exact current projection".to_owned(),
+        }),
+        "AUTOMATION_FACT_CORRUPT"
+        | "AUTOMATION_FACT_MISSING"
+        | "AUTOMATION_LINK_CORRUPT"
+        | "AUTOMATION_OPERATION_CORRUPT"
+        | "AUTOMATION_RECORD_CORRUPT" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence,
+        }),
+        _ => None,
+    }
+}
+
+fn projection_event_evidence(event: &AcceptanceEvent) -> QuarantineEvidence {
+    let operation_digest = event
+        .operation_id
+        .as_deref()
+        .map(|value| model::digest(value.as_bytes()))
+        .unwrap_or_else(|| "missing".to_owned());
+    QuarantineEvidence {
+        subject_identity: format!(
+            "acceptance-observation:{}:operation:{}",
+            event.observation_id, operation_digest
+        ),
+        source_pointer: Some(format!("observations/{}", event.observation_id)),
+        source_digest: Some(model::digest(event.payload_json.as_bytes())),
+    }
+}
+
+fn persist_subject_quarantine(
+    tx: &Transaction<'_>,
+    code: &str,
+    evidence: QuarantineEvidence,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(tx, &record_key, code, evidence, now_ms)?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_GITHUB_PROJECTION_QUARANTINE_INVALID",
+            "projection subject did not produce durable quarantine evidence",
+        )),
+    }
 }
 
 fn enabled_entry_page(
     db: &Connection,
     limit: usize,
-) -> Result<(Vec<AutomationEntry>, Option<String>)> {
+) -> Result<(
+    Vec<AutomationEntry>,
+    Option<String>,
+    Vec<MalformedAutomationEntry>,
+)> {
     if limit == 0 {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Vec::new()));
     }
     let prefix = "automation:v1:entry:";
     let pattern = "automation:v1:entry:%";
     let cursor_value =
-        config::read_record(db, GLOBAL_CURSOR_KEY, "GitHub projection global cursor")?;
+        config::read_record(db, GLOBAL_CURSOR_KEY, "GitHub projection global cursor").map_err(
+            |error| {
+                if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                    Error::new(
+                        "AUTOMATION_GITHUB_PROJECTION_CURSOR_CORRUPT",
+                        "GitHub projection global cursor record is corrupt",
+                    )
+                } else {
+                    error
+                }
+            },
+        )?;
     let cursor = cursor_value
         .map(|value| {
             serde_json::from_value::<GlobalCursor>(value).map_err(|_| {
@@ -716,45 +827,78 @@ fn enabled_entry_page(
         )?);
     }
     if keys.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Vec::new()));
     }
     let last_key = keys.last().cloned();
     let mut entries = Vec::with_capacity(keys.len());
+    let mut malformed_entries = Vec::new();
     for key in keys {
         let raw: String =
             db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
                 row.get(0)
             })?;
-        let sealed: Value = serde_json::from_str(&raw).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry JSON is invalid",
-            )
-        })?;
-        let value = config::open_record(sealed, "automation entry")?;
-        let entry: AutomationEntry = serde_json::from_value(value).map_err(|_| {
-            Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry fields are invalid",
-            )
-        })?;
-        config::validate_entry(&entry)?;
+        let entry = match automation_reconcile::parse_automation_entry(&raw, "automation entry") {
+            Ok(entry) => entry,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_INVALID"
+                ) =>
+            {
+                malformed_entries.push(MalformedAutomationEntry {
+                    code: error.code,
+                    evidence: automation_reconcile::automation_entry_evidence(&key, &raw),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if config::entry_key(
             &entry.owner_manager_id,
             &entry.project_id,
             &entry.automation_id,
         )? != key
         {
-            return Err(Error::new(
-                "AUTOMATION_RECORD_CORRUPT",
-                "automation entry identity does not match its metadata key",
-            ));
+            malformed_entries.push(MalformedAutomationEntry {
+                code: "AUTOMATION_RECORD_INVALID".to_owned(),
+                evidence: automation_reconcile::automation_entry_evidence(&key, &raw),
+            });
+            continue;
         }
         if entry.enabled && entry.steps.contains(&AutomationStep::GithubProjection) {
             entries.push(entry);
         }
     }
-    Ok((entries, last_key))
+    Ok((entries, last_key, malformed_entries))
+}
+
+fn persist_malformed_entry(
+    tx: &Transaction<'_>,
+    malformed: &MalformedAutomationEntry,
+    now_ms: i64,
+) -> Result<()> {
+    let record_key =
+        automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &malformed.evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(
+                tx,
+                &record_key,
+                &malformed.code,
+                malformed.evidence.clone(),
+                now_ms,
+            )?;
+            Ok(SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "AUTOMATION_GITHUB_PROJECTION_QUARANTINE_INVALID",
+            "malformed GitHub projection entry did not produce a durable quarantine",
+        )),
+    }
 }
 
 fn select_entry_keys(
@@ -766,12 +910,8 @@ fn select_entry_keys(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step WHERE step.value='github_projection') \
-         ORDER BY key LIMIT ?3",
-    )?;
+    let mut statement =
+        db.prepare("SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 ORDER BY key LIMIT ?3")?;
     Ok(statement
         .query_map(params![pattern, after, limit as i64], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?)
@@ -788,10 +928,7 @@ fn select_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step WHERE step.value='github_projection') \
-         ORDER BY key LIMIT ?4",
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
         .query_map(params![pattern, prefix, before, limit as i64], |row| {
@@ -801,7 +938,17 @@ fn select_entry_keys_before(
 }
 
 fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<ProjectionState>> {
-    let Some(value) = config::read_record(db, &state_key(entry)?, "GitHub projection state")?
+    let Some(value) = config::read_record(db, &state_key(entry)?, "GitHub projection state")
+        .map_err(|error| {
+            if error.code == "AUTOMATION_RECORD_CORRUPT" {
+                Error::new(
+                    "AUTOMATION_GITHUB_PROJECTION_STATE_CORRUPT",
+                    "GitHub projection state record is corrupt",
+                )
+            } else {
+                error
+            }
+        })?
     else {
         return Ok(None);
     };
@@ -906,10 +1053,12 @@ fn state_projection(state: &ProjectionState) -> Value {
 fn state_projection_with_processed(
     state: &ProjectionState,
     processed: usize,
+    quarantined: usize,
     high_water: i64,
 ) -> Value {
     let mut result = state_projection(state);
     result["processed"] = json!(processed);
+    result["quarantined"] = json!(quarantined);
     result["high_water"] = json!(high_water);
     result
 }

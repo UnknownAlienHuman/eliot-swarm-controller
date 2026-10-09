@@ -12,14 +12,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use swarm_checks::{
-    CheckControl, CheckExecution, CheckIdentity, OwnedCheckProcess, ResolvedCheckPlan,
-    StartDecision, Termination,
+    CaptureDisposition, CheckControl, CheckExecution, CheckIdentity, DirectExit, FamilyDeparture,
+    OwnedCheckProcess, ResolvedCheckPlan, StartDecision, Termination,
 };
 use swarm_contracts::{Error, Result};
 
@@ -32,6 +32,7 @@ const EXECUTION_FILE: &str = "execution.json";
 const MAX_CONTROL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PLAN_BYTES: u64 = 4 * 1024 * 1024;
 const CONTROL_POLL: Duration = Duration::from_millis(100);
+const START_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 struct Bootstrap {
@@ -160,9 +161,13 @@ impl CheckControl for FileCheckControl {
         write_once(&self.bootstrap.job_dir.join("worker.json"), &identity)?;
         self.owner_process = Some(owner.process.clone());
 
+        let deadline = Instant::now() + START_GATE_TIMEOUT;
         loop {
             if self.cancellation_requested(owner)? {
                 return Ok(StartDecision::CancelBeforeStart);
+            }
+            if Instant::now() >= deadline {
+                return Ok(StartDecision::StartGateTimedOut);
             }
 
             let go_path = self.bootstrap.job_dir.join("go.json");
@@ -194,11 +199,14 @@ impl CheckControl for FileCheckControl {
                 let ready_path = self.bootstrap.job_dir.join(PLAN_READY_FILE);
                 let plan_path = self.bootstrap.job_dir.join(PLAN_FILE);
                 if ready_path.try_exists()? && plan_path.try_exists()? {
+                    if Instant::now() >= deadline {
+                        return Ok(StartDecision::StartGateTimedOut);
+                    }
                     self.started_at_ms = Some(now_ms()?);
                     return Ok(StartDecision::Start);
                 }
             }
-            thread::sleep(CONTROL_POLL);
+            thread::sleep(CONTROL_POLL.min(deadline.saturating_duration_since(Instant::now())));
         }
     }
 
@@ -759,6 +767,8 @@ fn execution_json(
             "process": execution.process,
             "child_pid": execution.child_pid,
             "termination": termination_name(execution.termination),
+            "direct_exit": direct_exit_json(execution.direct_exit),
+            "family_departure": family_departure_json(&execution.family_departure),
             "exit_code": execution.exit_code,
             "termination_requests": execution.termination_requests,
             "stdout": stream_json(&execution.stdout),
@@ -774,9 +784,42 @@ fn stream_json(stream: &swarm_checks::CapturedStream) -> Value {
     json!({
         "path": stream.path.to_string_lossy(),
         "bytes_written": stream.bytes_written,
+        "bytes_observed": stream.bytes_observed,
         "truncated": stream.truncated,
-        "capture_complete": stream.capture_complete
+        "capture_complete": stream.capture_complete,
+        "capture_disposition": capture_disposition_name(stream.capture_disposition),
+        "capture_error": stream.capture_error
     })
+}
+
+fn direct_exit_json(fact: DirectExit) -> Value {
+    match fact {
+        DirectExit::NotStarted => json!({"state":"not_started"}),
+        DirectExit::Observed { exit_code } => {
+            json!({"state":"observed","exit_code":exit_code})
+        }
+        DirectExit::ObservationUnknown => json!({"state":"observation_unknown"}),
+    }
+}
+
+fn family_departure_json(fact: &FamilyDeparture) -> Value {
+    match fact {
+        FamilyDeparture::Confirmed => json!({"state":"confirmed"}),
+        FamilyDeparture::CleanupPending { process } => {
+            json!({"state":"cleanup_pending","process":process})
+        }
+        FamilyDeparture::ObservationUnknown { process } => {
+            json!({"state":"observation_unknown","process":process})
+        }
+    }
+}
+
+fn capture_disposition_name(disposition: CaptureDisposition) -> &'static str {
+    match disposition {
+        CaptureDisposition::NotStarted => "not_started",
+        CaptureDisposition::Complete => "complete",
+        CaptureDisposition::Incomplete => "incomplete",
+    }
 }
 
 fn termination_name(termination: Termination) -> &'static str {
@@ -785,6 +828,7 @@ fn termination_name(termination: Termination) -> &'static str {
         Termination::Cancelled => "cancelled",
         Termination::TimedOut => "timed_out",
         Termination::CancelledBeforeStart => "cancelled_before_start",
+        Termination::StartGateTimedOut => "start_gate_timed_out",
         Termination::ControlReadUnknownBeforeStart => "control_read_unknown_before_start",
         Termination::ProcessObservationUnknown => "process_observation_unknown",
     }

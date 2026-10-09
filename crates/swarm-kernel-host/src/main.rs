@@ -1,15 +1,15 @@
 use clap::{Parser, Subcommand};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use swarm_kernel_host::{
     config::{Config, Ipc},
     error::{Error, Result},
     host, ipc,
     model::{self, Credential},
     platform,
-};
-use serde_json::{Value, json};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
 };
 
 #[derive(Parser)]
@@ -72,6 +72,12 @@ enum Command {
     /// Internal trusted-local script invocation worker; never opens the Store.
     #[command(hide = true)]
     ScriptWorker {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Internal isolated owner for one admitted Zed batch; opens no Store.
+    #[command(hide = true)]
+    ZedBatchWorker {
         #[arg(long)]
         file: PathBuf,
     },
@@ -780,6 +786,49 @@ fn main() {
     }
 }
 fn execute(cli: Cli) -> Result<()> {
+    if let Command::Mcp { profile } = &cli.command {
+        let mut executable = std::env::current_exe()?;
+        executable.set_file_name(if cfg!(windows) {
+            "swarm-mcp.exe"
+        } else {
+            "swarm-mcp"
+        });
+        let mut child = std::process::Command::new(&executable);
+        for (flag, value) in [
+            ("--config", cli.config.as_ref()),
+            ("--data-dir", cli.data_dir.as_ref()),
+            ("--credential", cli.credential.as_ref()),
+        ] {
+            if let Some(value) = value {
+                child.arg(flag).arg(value);
+            }
+        }
+        if let Some(profile) = profile {
+            child.arg("--profile").arg(profile);
+        }
+        let status = child
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .map_err(|error| {
+                Error::new(
+                    "MCP_FRONTEND_START_FAILED",
+                    format!("could not start '{}': {error}", executable.display()),
+                )
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::exit(
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+            );
+        }
+        #[cfg(not(unix))]
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if let Command::ModuleRun {
         state_dir,
         command,
@@ -796,6 +845,9 @@ fn execute(cli: Cli) -> Result<()> {
     }
     if let Command::ScriptWorker { file } = &cli.command {
         return swarm_kernel_host::scripts::runner::run_worker(file);
+    }
+    if let Command::ZedBatchWorker { file } = &cli.command {
+        return swarm_kernel_host::runtime::zed::worker::run_worker(file);
     }
     // The host and gateway are long-lived. CLI calls perform one local exchange
     // and must not create a CPU-sized pool for every status request.
@@ -940,10 +992,6 @@ async fn run(cli: Cli) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    if let Command::Mcp { profile } = &cli.command {
-        return swarm_kernel_host::mcp::run_profiled(config, credential, profile.as_deref())
-            .await;
-    }
     if let Command::Call { method, .. } = &cli.command
         && method == "hook.source.setup"
     {
@@ -986,6 +1034,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::CheckWorker { .. }
         | Command::OwnedOpencodeService { .. }
         | Command::ScriptWorker { .. }
+        | Command::ZedBatchWorker { .. }
         | Command::ModuleRun { .. } => {
             unreachable!("executor returned above")
         }

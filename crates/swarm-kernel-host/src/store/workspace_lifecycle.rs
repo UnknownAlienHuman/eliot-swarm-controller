@@ -234,7 +234,7 @@ fn transition_for(tx: &Transaction<'_>, lease: &LeaseCandidate) -> Result<Option
     let terminal = TERMINAL_ATTEMPT_STATES.contains(&attempt.state.as_str());
     let released = attempt.released_at_ms.is_some();
     if terminal && released {
-        let unresolved_native = has_unresolved_native_work(tx, lease, &attempt)?;
+        let unresolved_native = workspace_resource_use(tx, lease, &attempt)?.unresolved();
         let held_origin =
             lease.state == "held" || (lease.state == "stale" && stale_origin_was_held(lease));
         if !unresolved_native && held_origin {
@@ -330,39 +330,82 @@ fn attempt_facts(tx: &Transaction<'_>, attempt_id: &str) -> Result<Option<Attemp
     .map_err(Into::into)
 }
 
-fn has_unresolved_native_work(
+#[derive(Debug)]
+enum ResourceHold {
+    LeaseOperation,
+    AttemptStartOperation,
+    ExactAttemptOperation,
+    ExactBindingGeneration,
+    ExactOwnedServiceStart,
+    CheckResource,
+    ExactProducer,
+    EvidenceGap,
+}
+
+struct WorkspaceResourceUse {
+    holds: Vec<ResourceHold>,
+}
+
+impl WorkspaceResourceUse {
+    fn unresolved(&self) -> bool {
+        !self.holds.is_empty()
+    }
+}
+
+fn workspace_resource_use(
     tx: &Transaction<'_>,
     lease: &LeaseCandidate,
     attempt: &AttemptFacts,
-) -> Result<bool> {
+) -> Result<WorkspaceResourceUse> {
+    let mut holds = Vec::new();
+    for (operation_id, hold) in [
+        (
+            Some(lease.operation_id.as_str()),
+            ResourceHold::LeaseOperation,
+        ),
+        (
+            attempt.start_operation_id.as_deref(),
+            ResourceHold::AttemptStartOperation,
+        ),
+    ] {
+        let unresolved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND state IN ('queued','sending','native_accepted','outcome_unknown'))",
+            [operation_id], |row| row.get(0))?;
+        if unresolved {
+            holds.push(hold);
+        }
+    }
     let linked_operation: bool = tx.query_row(
         "SELECT EXISTS(
-           SELECT 1 FROM operations
-           WHERE operation_id=?1 AND state IN ('queued','sending','native_accepted','outcome_unknown')
-           UNION ALL
-           SELECT 1 FROM operations
-           WHERE operation_id=?2 AND state IN ('queued','sending','native_accepted','outcome_unknown')
-           UNION ALL
            SELECT 1 FROM operations INDEXED BY workspace_attempt_operation_state
-           WHERE attempt_id=?3 AND state IN ('queued','sending','native_accepted','outcome_unknown')
-           UNION ALL
-           SELECT 1 FROM operations INDEXED BY workspace_task_operation_state
-           WHERE task_id=?4 AND state IN ('queued','sending','native_accepted','outcome_unknown')
-           UNION ALL
-           SELECT 1 FROM operations INDEXED BY unresolved_target_operations
-           WHERE binding_id=?5 AND binding_generation=?6
+           WHERE attempt_id=?1
              AND state IN ('queued','sending','native_accepted','outcome_unknown')
+             AND ((?2 IS NOT NULL AND binding_id=?2 AND binding_generation=?3)
+                  OR CASE WHEN json_valid(effective_request_json) THEN
+                    json_extract(effective_request_json,'$.workspace_lease.lease_id')=?4
+                    AND json_extract(effective_request_json,'$.workspace_lease.generation')=?5
+                    AND json_extract(effective_request_json,'$.workspace_lease.binding_digest')=?6
+                  ELSE 0 END)
          )",
         params![
-            lease.operation_id,
-            attempt.start_operation_id,
             attempt.attempt_id,
-            lease.task_id,
             attempt.binding_id,
-            attempt.binding_generation
+            attempt.binding_generation,
+            lease.lease_id,
+            lease.generation,
+            lease.binding_digest,
         ],
         |row| row.get(0),
     )?;
+    if linked_operation {
+        holds.push(ResourceHold::ExactAttemptOperation);
+    }
+    let damaged_link: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations INDEXED BY workspace_attempt_operation_state WHERE attempt_id=?1 AND state IN ('queued','sending','native_accepted','outcome_unknown') AND NOT json_valid(effective_request_json))",
+        [&attempt.attempt_id], |row| row.get(0))?;
+    if damaged_link || attempt.binding_id.is_some() != attempt.binding_generation.is_some() {
+        holds.push(ResourceHold::EvidenceGap);
+    }
     let held_check_resource: bool = tx.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM check_runs
@@ -372,41 +415,20 @@ fn has_unresolved_native_work(
         [attempt.attempt_id.as_str()],
         |row| row.get(0),
     )?;
+    if held_check_resource {
+        holds.push(ResourceHold::CheckResource);
+    }
     let active_binding: bool = tx.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM bindings
            WHERE binding_id=?1 AND generation=?2 AND released_at_ms IS NULL
-           UNION ALL
-           SELECT 1 FROM operations o INDEXED BY workspace_task_operation_state
-           JOIN bindings b ON b.binding_id=o.binding_id AND b.generation=o.binding_generation
-           WHERE o.task_id=?3 AND o.state IN ('queued','sending','native_accepted','outcome_unknown')
-             AND b.released_at_ms IS NULL
-           UNION ALL
-           SELECT 1 FROM operations o INDEXED BY workspace_attempt_operation_state
-           JOIN bindings b ON b.binding_id=o.binding_id AND b.generation=o.binding_generation
-           WHERE o.attempt_id=?4 AND o.state IN ('queued','sending','native_accepted','outcome_unknown')
-             AND b.released_at_ms IS NULL
-           UNION ALL
-           SELECT 1 FROM operations o
-           JOIN bindings b ON b.binding_id=o.binding_id AND b.generation=o.binding_generation
-           WHERE o.operation_id=?5 AND o.state IN ('queued','sending','native_accepted','outcome_unknown')
-             AND b.released_at_ms IS NULL
-           UNION ALL
-           SELECT 1 FROM operations o
-           JOIN bindings b ON b.binding_id=o.binding_id AND b.generation=o.binding_generation
-           WHERE o.operation_id=?6 AND o.state IN ('queued','sending','native_accepted','outcome_unknown')
-             AND b.released_at_ms IS NULL
          )",
-        params![
-            attempt.binding_id,
-            attempt.binding_generation,
-            lease.task_id,
-            attempt.attempt_id,
-            lease.operation_id,
-            attempt.start_operation_id,
-        ],
+        params![attempt.binding_id, attempt.binding_generation,],
         |row| row.get(0),
     )?;
+    if active_binding {
+        holds.push(ResourceHold::ExactBindingGeneration);
+    }
     // A reserved service has not crossed the Store's one-shot start boundary;
     // its queued launch/open Operations fence it until cancellation CASes the
     // reservation to failed_no_effect. Unknown and observed starts are an
@@ -429,13 +451,13 @@ fn has_unresolved_native_work(
         ],
         |row| row.get(0),
     )?;
-    let unresolved_producer =
-        producers_are_unresolved(&attempt.producers_json, attempt.producers_oversized);
-    Ok(linked_operation
-        || held_check_resource
-        || active_binding
-        || owned_service_live
-        || unresolved_producer)
+    if owned_service_live {
+        holds.push(ResourceHold::ExactOwnedServiceStart);
+    }
+    if producers_are_unresolved(&attempt.producers_json, attempt.producers_oversized) {
+        holds.push(ResourceHold::ExactProducer);
+    }
+    Ok(WorkspaceResourceUse { holds })
 }
 
 fn producers_are_unresolved(raw: &str, oversized: bool) -> bool {
@@ -478,7 +500,7 @@ fn effect_status_for_lease(tx: &Transaction<'_>, lease: &LeaseCandidate) -> Resu
             {
                 return Ok("possible_or_unknown");
             }
-            if has_unresolved_native_work(tx, lease, &attempt)? {
+            if workspace_resource_use(tx, lease, &attempt)?.unresolved() {
                 Ok("active_or_unknown")
             } else {
                 Ok("not_reconciled")

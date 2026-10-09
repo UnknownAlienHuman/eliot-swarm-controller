@@ -10,11 +10,13 @@ use crate::{
     runtime::{EffectOutcome, RuntimeOutcome},
 };
 use serde_json::{Value, json};
+use swarm_contracts::{runtime::TaskDispatchContext, task_prompt::TaskPromptEnvelopeV1};
 
 pub const EXECUTION_SHAPE: &str = "sessionless_batch";
 pub const COMMAND_RUNTIME: &str = "command";
-pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.4";
-pub const COMMAND_PREVIOUS_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.3";
+pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.5";
+pub const COMMAND_PREVIOUS_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.4";
+pub const COMMAND_HISTORICAL_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.3";
 pub const COMMAND_LEGACY_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.2";
 pub const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 pub const BATCH_OUTPUTS: [&str; 3] = ["result.json", "thread.md", "thread.json"];
@@ -27,7 +29,20 @@ pub fn is_command_route(route: &Value) -> bool {
     route["runtime"] == COMMAND_RUNTIME
         && matches!(
             route["module_artifact_id"].as_str(),
-            Some(COMMAND_ARTIFACT_ID | COMMAND_PREVIOUS_ARTIFACT_ID | COMMAND_RUST_ARTIFACT_ID)
+            Some(
+                COMMAND_ARTIFACT_ID
+                    | COMMAND_PREVIOUS_ARTIFACT_ID
+                    | COMMAND_HISTORICAL_ARTIFACT_ID
+                    | COMMAND_RUST_ARTIFACT_ID
+            )
+        )
+}
+
+fn is_historical_command_route(route: &Value) -> bool {
+    route["runtime"] == COMMAND_RUNTIME
+        && matches!(
+            route["module_artifact_id"].as_str(),
+            Some(COMMAND_PREVIOUS_ARTIFACT_ID | COMMAND_HISTORICAL_ARTIFACT_ID)
         )
 }
 
@@ -36,8 +51,7 @@ pub fn is_legacy_command_route(route: &Value) -> bool {
 }
 
 pub fn is_sessionless_route(route: &Value) -> bool {
-    (route["runtime"] == crate::runtime::zed::RUNTIME
-        && route["module_artifact_id"] == crate::runtime::zed::ARTIFACT_ID)
+    crate::runtime::zed::is_route(route)
         || is_command_route(route)
         || is_legacy_command_route(route)
 }
@@ -46,7 +60,10 @@ pub fn supports(route: &Value, method: &str) -> bool {
     if !is_sessionless_route(route) {
         return false;
     }
-    if is_legacy_command_route(route) {
+    if crate::runtime::zed::is_legacy_route(route) {
+        return matches!(method, "agent.refresh" | "agent.reconcile" | "agent.result");
+    }
+    if is_legacy_command_route(route) || is_historical_command_route(route) {
         return false;
     }
     match method {
@@ -91,9 +108,81 @@ pub fn validate_command(route: &Value, method: &str, input: &Value) -> Result<()
     Ok(())
 }
 
-/// Compose the exact dispatch text with the immutable Task snapshot, matching
-/// the shared native instruction contract used by the session adapter.
+fn validate_task_prompt_envelope(envelope: &TaskPromptEnvelopeV1) -> Result<()> {
+    envelope
+        .validate_shape()
+        .map_err(|_| Error::new("TASK_PROMPT_INVALID", "TaskPrompt envelope is invalid"))?;
+    let prompt_bytes = u64::try_from(envelope.prompt.len())
+        .map_err(|_| Error::new("TASK_PROMPT_INVALID", "TaskPrompt length is out of range"))?;
+    if model::digest(envelope.prompt.as_bytes()) != envelope.prompt_sha256
+        || envelope.prompt_bytes != prompt_bytes
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt bytes differ from their retained digest or length",
+        ));
+    }
+    Ok(())
+}
+
+fn task_prompt_from_input(input: &Value) -> Result<TaskPromptEnvelopeV1> {
+    let raw = input
+        .get("task_prompt")
+        .ok_or_else(|| Error::new("TASK_PROMPT_INVALID", "TaskPrompt envelope is missing"))?;
+    let envelope: TaskPromptEnvelopeV1 = serde_json::from_value(raw.clone()).map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt envelope is malformed or has unknown fields",
+        )
+    })?;
+    validate_task_prompt_envelope(&envelope)?;
+
+    let raw_context = input.get("task_dispatch_context").ok_or_else(|| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt input requires its Store dispatch context",
+        )
+    })?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(raw_context.clone()).map_err(|_| {
+            Error::new(
+                "TASK_PROMPT_INVALID",
+                "TaskPrompt dispatch context is malformed",
+            )
+        })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt dispatch context is invalid",
+        )
+    })?;
+
+    let source_text = model::text(input, "text")?;
+    let source_text_bytes = u64::try_from(source_text.len())
+        .map_err(|_| Error::new("TASK_PROMPT_INVALID", "source text length is out of range"))?;
+    if model::text(input, "attempt_id")? != envelope.attempt_id
+        || context.attempt_id != envelope.attempt_id
+        || context.task_id != envelope.task_id
+        || context.task_revision != envelope.task_revision
+        || context.task_snapshot_sha256 != envelope.task_snapshot_sha256
+        || context.source_text_sha256 != model::digest(source_text.as_bytes())
+        || context.source_text_bytes != source_text_bytes
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt identity differs from its Store dispatch context",
+        ));
+    }
+    Ok(envelope)
+}
+
+/// Return Store-produced TaskPrompt bytes unchanged after validating their
+/// digest and identity against the Store dispatch context. Historical inputs
+/// continue to use the immutable snapshot renderer below.
 pub fn instruction(input: &Value) -> Result<String> {
+    if input.get("task_prompt").is_some() {
+        return Ok(task_prompt_from_input(input)?.prompt);
+    }
     let text = model::text(input, "text")?;
     let snapshot = input
         .get("task_snapshot")
@@ -132,6 +221,27 @@ pub fn command_receipt_facts(operation_id: &str, instruction: &str) -> CommandRe
         prompt_sha256: model::digest(instruction.as_bytes()),
         prompt_bytes: instruction.len(),
     }
+}
+
+/// Recompute the existing Command binding facts from an immutable retained
+/// TaskPrompt. Store callers must first validate the envelope against the
+/// retained Attempt; this helper verifies its own exact bytes and digest.
+pub fn command_receipt_facts_from_task_prompt(
+    operation_id: &str,
+    envelope: &TaskPromptEnvelopeV1,
+) -> Result<CommandReceiptFacts> {
+    validate_task_prompt_envelope(envelope)?;
+    Ok(command_receipt_facts(operation_id, &envelope.prompt))
+}
+
+/// Compute Command binding facts from a complete runtime input, preserving
+/// the TaskPrompt path when present and the historical renderer otherwise.
+pub fn command_receipt_facts_for_input(
+    operation_id: &str,
+    input: &Value,
+) -> Result<CommandReceiptFacts> {
+    let instruction = instruction(input)?;
+    Ok(command_receipt_facts(operation_id, &instruction))
 }
 
 impl CommandReceiptFacts {
@@ -411,10 +521,12 @@ mod tests {
             &json!({"runtime":"command","module_artifact_id":COMMAND_ARTIFACT_ID}),
             "agent.result"
         ));
-        assert!(supports(
-            &json!({"runtime":"command","module_artifact_id":COMMAND_PREVIOUS_ARTIFACT_ID}),
-            "agent.reconcile"
-        ));
+        let historical_command = json!({
+            "runtime":COMMAND_RUNTIME,
+            "module_artifact_id":COMMAND_PREVIOUS_ARTIFACT_ID
+        });
+        assert!(is_command_route(&historical_command));
+        assert!(!supports(&historical_command, "agent.reconcile"));
         let legacy_command = json!({
             "runtime":COMMAND_RUNTIME,
             "module_artifact_id":COMMAND_LEGACY_ARTIFACT_ID

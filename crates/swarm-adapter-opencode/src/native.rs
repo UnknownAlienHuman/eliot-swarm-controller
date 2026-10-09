@@ -32,6 +32,9 @@ const MAX_LOG_EVENTS: usize = 8192;
 const MAX_MESSAGE_PAGE: usize = 50;
 const MAX_MESSAGE_PAGES: usize = 32;
 const MAX_MESSAGE_SCAN_BYTES: usize = 8 * 1024 * 1024;
+const SESSION_HISTORY_PAGE_LIMIT: usize = 100;
+const SESSION_HISTORY_MAX_PAGES: usize = 32;
+const SESSION_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
@@ -63,10 +66,16 @@ pub struct NativeObservation {
     pub pid: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputEvidence {
+    pub admitted_sequence: Option<u64>,
+    pub prompted_sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
-pub enum InputEvidence {
-    InboxReadback,
-    ProjectedMessageReadback,
+pub struct InputAdmissionEvidence {
+    pub admitted_sequence: u64,
+    pub promoted_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +97,14 @@ pub struct AssistantResultEvidence {
 struct MessagePage {
     data: Vec<Value>,
     cursor: MessageCursor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionHistoryPage {
+    data: Vec<Value>,
+    #[serde(rename = "hasMore")]
+    has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,24 +160,27 @@ impl NativeClient {
         let client = builder
             .build()
             .map_err(|_| Error::new("NATIVE_TRANSPORT", "HTTP client initialization failed"))?;
-        let service = Self {
+        let mut service = Self {
             client,
             endpoint,
             pid: record.pid,
-            version: options.expected_version.clone(),
+            version: String::new(),
         };
         let info: ServerInfo = serde_json::from_value(service.get("/api/info", &[]).await?)
             .map_err(|_| Error::new("NATIVE_SCHEMA_ERROR", "native info response is invalid"))?;
         if info.pid != service.pid
-            || info.version != service.version
+            || info.version.trim().is_empty()
+            || info.version.len() > 256
+            || info.version.chars().any(char::is_control)
             || info.urls.is_empty()
             || info.paths.tmp.is_empty()
         {
             return Err(Error::new(
                 "NATIVE_INSTANCE_CHANGED",
-                "native service identity/version differs from its explicit connection record",
+                "native service identity or observed version is invalid",
             ));
         }
+        service.version = info.version.clone();
         Ok((
             service,
             NativeObservation {
@@ -244,8 +264,11 @@ impl NativeClient {
         if command.method == "agent.send" && command.input["delivery"] != "next_turn" {
             return Err(Error::new(
                 "UNSUPPORTED_EXACT_TURN_STEER",
-                "OpenCode V2 queue has no atomic expected-turn guard; exact-turn steering is unsupported",
+                "agent.send supports only next_turn on OpenCode's native queue",
             ));
+        }
+        if command.method == "native.opencode.loop_step" {
+            validate_loop_step_command(command)?;
         }
         if command.method == "task.dispatch"
             && let Some(packet) = command.input.get("launch_dispatch_packet")
@@ -262,13 +285,7 @@ impl NativeClient {
         self.require_durable_root_creation(root, command, options)
             .await?;
         let text = prompt(command)?;
-        let request = json!({
-            "id":input_id(&command.operation_id),
-            "text":text,
-            "metadata":{"eliot":marker(command)},
-            "delivery":"queue",
-            "resume":true
-        });
+        let request = input_payload(command, &input_id(&command.operation_id), &text)?;
         if serde_json::to_vec(&request)?.len() > MAX_NATIVE_REQUEST {
             return Err(Error::new(
                 "NATIVE_REQUEST_LIMIT",
@@ -314,21 +331,15 @@ impl NativeClient {
         root: &str,
         input_id: &str,
         prompt_text: &str,
-    ) -> Result<()> {
-        let body = input_payload(command, input_id, prompt_text);
+    ) -> Result<InputAdmissionEvidence> {
+        let body = input_payload(command, input_id, prompt_text)?;
         let value = self
             .post(&format!("/api/session/{root}/prompt"), body)
             .await?;
         let data = value
             .get("data")
             .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "prompt response lacks data"))?;
-        if !inbox_matches(data, root, input_id, prompt_text, command) {
-            return Err(Error::new(
-                "NATIVE_OUTCOME_UNKNOWN",
-                "prompt response did not prove exact inbox admission",
-            ));
-        }
-        Ok(())
+        admitted_input_matches(data, root, input_id, prompt_text, command)
     }
 
     pub async fn reconcile_open(
@@ -386,7 +397,6 @@ impl NativeClient {
             ));
         }
         valid_id(input, "msg_swarm_")?;
-        let marker = &intent.marker;
         let session = self.session(root).await?;
         let location = self.location(options).await?;
         if !session_identity_matches(
@@ -407,29 +417,14 @@ impl NativeClient {
         self.check_route_model_available(options).await?;
         self.require_durable_root_creation_for_intent(root, intent, options)
             .await?;
-        let inbox = self.get(&format!("/api/session/{root}/inbox"), &[]).await?;
-        let items = inbox["data"]
-            .as_array()
-            .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "native inbox response is invalid"))?;
-        if items
-            .iter()
-            .any(|item| saved_inbox_matches(item, root, input, marker, intent))
-        {
-            return Ok(InputEvidence::InboxReadback);
+        let evidence = self.read_input_history(root, input, intent, None).await?;
+        if evidence.admitted_sequence.is_none() && evidence.prompted_sequence.is_none() {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact saved input was not observed in durable session history",
+            ));
         }
-        let message = self
-            .get(&format!("/api/session/{root}/message/{input}"), &[])
-            .await?;
-        let message = message.get("data").ok_or_else(|| {
-            Error::new("NATIVE_SCHEMA_ERROR", "native message response lacks data")
-        })?;
-        if saved_message_matches(message, root, input, marker, intent) {
-            return Ok(InputEvidence::ProjectedMessageReadback);
-        }
-        Err(Error::new(
-            "NATIVE_EVIDENCE_UNAVAILABLE",
-            "exact saved input was not observed",
-        ))
+        Ok(evidence)
     }
 
     /// Prove only that the exact admitted user input was projected into its
@@ -439,7 +434,7 @@ impl NativeClient {
         intent: &OperationIntent,
         options: &NativeOptions,
     ) -> Result<InputStatusEvidence> {
-        if !matches!(intent.method.as_str(), "task.dispatch" | "agent.send")
+        if native_delivery_for_method(&intent.method).is_none()
             || intent.native_scope_key != options.scope_key()
             || intent.route_sha256 != digest_json(&serde_json::to_value(options)?)?
         {
@@ -492,6 +487,14 @@ impl NativeClient {
         self.require_durable_root_creation_for_intent(root, intent, options)
             .await?;
 
+        let history = self.read_input_history(root, input, intent, None).await?;
+        if history.admitted_sequence.is_none() && history.prompted_sequence.is_none() {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact input admission was not observed in durable session history",
+            ));
+        }
+
         let first = self
             .get(&format!("/api/session/{root}/message/{input}"), &[])
             .await?;
@@ -504,7 +507,7 @@ impl NativeClient {
         // V2's PublicSessionMessage omits sessionID. The GET route is scoped
         // to `root`; reject a sessionID only if the projection includes one
         // and it disagrees with that route scope.
-        if !saved_message_matches(message, root, input, &intent.marker, intent) {
+        if !saved_message_matches(message, root, input, intent) {
             return Err(Error::new(
                 "NATIVE_EVIDENCE_UNAVAILABLE",
                 "exact saved user input was not observed in its native session",
@@ -528,6 +531,205 @@ impl NativeClient {
         Ok(InputStatusEvidence {
             input_message_sha256: digest_json(message)?,
         })
+    }
+
+    async fn read_input_history(
+        &self,
+        session: &str,
+        input_id: &str,
+        intent: &OperationIntent,
+        after_sequence: Option<u64>,
+    ) -> Result<InputEvidence> {
+        let delivery = native_delivery_for_method(&intent.method).ok_or_else(|| {
+            Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved input method has no exact native delivery",
+            )
+        })?;
+        let mut after = after_sequence.unwrap_or(0);
+        let mut expected = after.checked_add(1).ok_or_else(|| {
+            Error::new(
+                "NATIVE_HISTORY_CURSOR",
+                "native history cursor is exhausted",
+            )
+        })?;
+        let mut pages = 0usize;
+        let mut scanned_bytes = 0usize;
+        let mut seen = BTreeMap::<u64, (String, String)>::new();
+        let mut evidence = InputEvidence::default();
+        let mut complete = false;
+
+        while pages < SESSION_HISTORY_MAX_PAGES {
+            pages += 1;
+            let raw = self
+                .get(
+                    &format!("/api/session/{session}/history"),
+                    &[
+                        ("after", after.to_string()),
+                        ("limit", SESSION_HISTORY_PAGE_LIMIT.to_string()),
+                    ],
+                )
+                .await?;
+            scanned_bytes = scanned_bytes.saturating_add(canonical_json(&raw)?.len());
+            if scanned_bytes > SESSION_HISTORY_MAX_BYTES {
+                return Err(Error::new(
+                    "NATIVE_HISTORY_LIMIT",
+                    "durable session history exceeds its configured read bound",
+                ));
+            }
+            let page: SessionHistoryPage = serde_json::from_value(raw).map_err(|_| {
+                Error::new(
+                    "NATIVE_HISTORY_SCHEMA",
+                    "durable session history page is outside the selected V2 schema",
+                )
+            })?;
+            if page.data.len() > SESSION_HISTORY_PAGE_LIMIT
+                || (page.has_more && page.data.is_empty())
+            {
+                return Err(Error::new(
+                    "NATIVE_HISTORY_SCHEMA",
+                    "durable session history page is empty or exceeds its bound",
+                ));
+            }
+
+            let page_start = after;
+            let mut gap_after_evidence = false;
+            for event in &page.data {
+                let event_id = required_text(event, "id")?;
+                valid_id(event_id, "evt")?;
+                let event_type = required_text(event, "type")?;
+                if event_type.len() > 128 {
+                    return Err(Error::new(
+                        "NATIVE_HISTORY_SCHEMA",
+                        "durable event type exceeds its protocol bound",
+                    ));
+                }
+                let durable = event
+                    .get("durable")
+                    .filter(|value| value.is_object())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "NATIVE_HISTORY_SCHEMA",
+                            "durable session event lacks its aggregate identity",
+                        )
+                    })?;
+                if required_text(durable, "aggregateID")? != session {
+                    return Err(Error::new(
+                        "NATIVE_HISTORY_SCOPE",
+                        "durable session event belongs to another aggregate",
+                    ));
+                }
+                let sequence = durable["seq"].as_u64().ok_or_else(|| {
+                    Error::new("NATIVE_HISTORY_SCHEMA", "durable event sequence is invalid")
+                })?;
+                if durable["version"]
+                    .as_u64()
+                    .is_none_or(|version| version == 0)
+                {
+                    return Err(Error::new(
+                        "NATIVE_HISTORY_SCHEMA",
+                        "durable event schema version is invalid",
+                    ));
+                }
+                let event_digest = digest_json(event)?;
+                if let Some((previous_id, previous_digest)) = seen.get(&sequence) {
+                    if previous_id != event_id || previous_digest != &event_digest {
+                        return Err(Error::new(
+                            "NATIVE_HISTORY_CONFLICT",
+                            "conflicting durable events share one aggregate sequence",
+                        ));
+                    }
+                    continue;
+                }
+                if sequence <= after {
+                    return Err(Error::new(
+                        "NATIVE_HISTORY_CURSOR",
+                        "exclusive history cursor returned an earlier event",
+                    ));
+                }
+                if sequence != expected {
+                    // A matching durable admission already proves this input;
+                    // a later history gap only prevents adding later evidence.
+                    if evidence.admitted_sequence.is_some() || evidence.prompted_sequence.is_some()
+                    {
+                        gap_after_evidence = true;
+                        break;
+                    }
+                    return Err(Error::new(
+                        "NATIVE_HISTORY_GAP",
+                        "durable session history does not cover the required sequence interval",
+                    ));
+                }
+                seen.insert(sequence, (event_id.to_owned(), event_digest));
+                let data = event
+                    .get("data")
+                    .filter(|value| value.is_object())
+                    .ok_or_else(|| {
+                        Error::new("NATIVE_HISTORY_SCHEMA", "durable event data is invalid")
+                    })?;
+                if matches!(
+                    event_type,
+                    "session.next.prompt.admitted" | "session.next.prompted"
+                ) && required_text(data, "messageID")? == input_id
+                {
+                    validate_prompt_history_event(
+                        event_type, data, session, input_id, delivery, intent,
+                    )?;
+                    if event_type == "session.next.prompt.admitted" {
+                        if evidence.admitted_sequence.replace(sequence).is_some() {
+                            return Err(Error::new(
+                                "NATIVE_HISTORY_CONFLICT",
+                                "the exact native input has more than one admission event",
+                            ));
+                        }
+                    } else if evidence.prompted_sequence.replace(sequence).is_some() {
+                        return Err(Error::new(
+                            "NATIVE_HISTORY_CONFLICT",
+                            "the exact native input has more than one promotion event",
+                        ));
+                    }
+                }
+                expected = sequence.checked_add(1).ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_HISTORY_CURSOR",
+                        "native history sequence is exhausted",
+                    )
+                })?;
+                after = sequence;
+            }
+            if gap_after_evidence {
+                break;
+            }
+            if page.has_more {
+                if after <= page_start {
+                    return Err(Error::new(
+                        "NATIVE_HISTORY_CURSOR",
+                        "history hasMore page did not advance its exclusive cursor",
+                    ));
+                }
+                continue;
+            }
+            complete = true;
+            break;
+        }
+
+        if !complete && evidence.admitted_sequence.is_none() && evidence.prompted_sequence.is_none()
+        {
+            return Err(Error::new(
+                "NATIVE_HISTORY_LIMIT",
+                "exact input was not found within the bounded durable history window",
+            ));
+        }
+        if let (Some(admitted), Some(prompted)) =
+            (evidence.admitted_sequence, evidence.prompted_sequence)
+            && prompted <= admitted
+        {
+            return Err(Error::new(
+                "NATIVE_HISTORY_CONFLICT",
+                "native input promotion does not follow its exact admission",
+            ));
+        }
+        Ok(evidence)
     }
 
     /// Read one exact assistant projection and require the native parent edge
@@ -600,6 +802,14 @@ impl NativeClient {
         self.check_route_model_available(options).await?;
         self.require_durable_root_creation_for_intent(root, intent, options)
             .await?;
+
+        let input_history = self.read_input_history(root, input, intent, None).await?;
+        if input_history.admitted_sequence.is_none() && input_history.prompted_sequence.is_none() {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact dispatch input is absent from durable session history",
+            ));
+        }
 
         let first = self
             .scan_assistant_result(root, input, assistant_message_id, intent)
@@ -676,7 +886,7 @@ impl NativeClient {
                     ));
                 }
                 if id == input_id {
-                    if !saved_message_matches(&message, session, input_id, &intent.marker, intent) {
+                    if !saved_message_matches(&message, session, input_id, intent) {
                         return Err(Error::new(
                             "NATIVE_INPUT_MISMATCH",
                             "native user message differs from the exact admitted input",
@@ -766,6 +976,52 @@ impl NativeClient {
             ));
         }
         self.check_route_model_available(options).await
+    }
+
+    /// Verify the deterministic root and prove a target is either that root
+    /// or an observed descendant. Child authority comes only from the native
+    /// parent chain; a caller-supplied session ID is never enough by itself.
+    pub async fn verify_control_scope(
+        &self,
+        command: &RuntimeCommand,
+        options: &NativeOptions,
+        target: &str,
+    ) -> Result<()> {
+        let root = command
+            .native_root_id
+            .as_deref()
+            .ok_or_else(|| Error::new("NATIVE_ROOT_MISSING", "native root is missing"))?;
+        valid_id(target, "ses")?;
+        if root != root_id(&command.binding_id, command.generation) {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "native root differs from this binding generation",
+            ));
+        }
+        self.verify_binding_model(root, options, command).await?;
+        self.require_durable_root_creation(root, command, options)
+            .await?;
+
+        let mut current = target.to_owned();
+        let mut visited = BTreeSet::new();
+        for _ in 0..64 {
+            if current == root {
+                return Ok(());
+            }
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            let session = self.session(&current).await?;
+            let Some(parent) = session["parentID"].as_str() else {
+                break;
+            };
+            valid_id(parent, "ses")?;
+            current = parent.to_owned();
+        }
+        Err(Error::new(
+            "NATIVE_SCOPE_MISMATCH",
+            "target session is not in the exact owned root's native parent chain",
+        ))
     }
 
     async fn session(&self, root: &str) -> Result<Value> {
@@ -1225,6 +1481,20 @@ impl NativeClient {
         self.post(path, body).await
     }
 
+    /// Internal native-control transport. Callers construct only fixed API
+    /// paths after validating every path segment; this is not a runtime RPC.
+    pub(crate) async fn control_get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
+        self.get(path, query).await
+    }
+
+    pub(crate) async fn control_post(&self, path: &str, body: Value) -> Result<Value> {
+        self.post(path, body).await
+    }
+
+    pub(crate) async fn control_post_empty(&self, path: &str) -> Result<Value> {
+        self.request(Method::POST, path, &[], None).await
+    }
+
     pub async fn verify_mcp_service(&self) -> Result<()> {
         let info: ServerInfo = serde_json::from_value(self.get("/api/info", &[]).await?)
             .map_err(|_| Error::new("NATIVE_SCHEMA_ERROR", "native info response is invalid"))?;
@@ -1335,14 +1605,55 @@ pub fn intent_for(
     })
 }
 
-pub fn input_payload(command: &RuntimeCommand, input_id: &str, prompt_text: &str) -> Value {
-    json!({
+pub fn input_payload(command: &RuntimeCommand, input_id: &str, prompt_text: &str) -> Result<Value> {
+    let delivery = native_delivery_for_method(&command.method).ok_or_else(|| {
+        Error::new(
+            "UNSUPPORTED_CAPABILITY",
+            "OpenCode input method has no declared native delivery",
+        )
+    })?;
+    Ok(json!({
         "id":input_id,
-        "text":prompt_text,
-        "metadata":{"eliot":marker(command)},
-        "delivery":"queue",
+        "prompt":{"text":prompt_text},
+        "delivery":delivery,
         "resume":true
-    })
+    }))
+}
+
+pub fn native_delivery_for_method(method: &str) -> Option<&'static str> {
+    match method {
+        "task.dispatch" | "agent.send" => Some("queue"),
+        "native.opencode.loop_step" => Some("steer"),
+        _ => None,
+    }
+}
+
+fn validate_loop_step_command(command: &RuntimeCommand) -> Result<()> {
+    strict_fields(
+        &command.input,
+        &["client_request_id", "binding_id", "generation", "text"],
+    )?;
+    if command
+        .input
+        .as_object()
+        .is_none_or(|input| input.len() != 4)
+        || command.input["client_request_id"]
+            .as_str()
+            .is_none_or(|id| {
+                id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+            })
+        || command.input["binding_id"].as_str() != Some(command.binding_id.as_str())
+        || command.input["generation"].as_i64() != Some(command.generation)
+        || command.input["text"]
+            .as_str()
+            .is_none_or(|text| text.trim().is_empty() || text.len() > 65_536)
+    {
+        return Err(Error::new(
+            "INVALID_OPENCODE_LOOP_STEP",
+            "loop-step input must contain a bounded caller request id, exact binding generation, and nonempty text",
+        ));
+    }
+    Ok(())
 }
 
 pub fn prompt(command: &RuntimeCommand) -> Result<String> {
@@ -1483,12 +1794,16 @@ fn required_text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn marker(command: &RuntimeCommand) -> Value {
-    json!({
+    let mut value = json!({
         "binding":command.binding_id,
         "generation":command.generation,
         "operation":command.operation_id,
         "input_sha256":command.input_sha256
-    })
+    });
+    if let Some(delivery) = native_delivery_for_method(&command.method) {
+        value["native_delivery"] = json!(delivery);
+    }
+    value
 }
 
 fn root_session_matches(
@@ -1526,53 +1841,107 @@ fn session_identity_matches(
         && session["metadata"]["eliot"]["generation"] == generation
 }
 
-fn inbox_matches(
+fn admitted_input_matches(
     item: &Value,
     root: &str,
     input_id: &str,
     text: &str,
     command: &RuntimeCommand,
-) -> bool {
-    item["id"] == input_id
-        && item["sessionID"] == root
-        && item["type"] == "user"
-        && item["delivery"] == "queue"
-        && item["payload"]["text"] == text
-        && item["payload"]["metadata"]["eliot"] == marker(command)
-        && no_attachments(&item["payload"])
-}
-
-fn saved_inbox_matches(
-    item: &Value,
-    root: &str,
-    input_id: &str,
-    marker: &Value,
-    intent: &OperationIntent,
-) -> bool {
-    item["id"] == input_id
-        && item["sessionID"] == root
-        && item["type"] == "user"
-        && item["delivery"] == "queue"
-        && item["payload"]["metadata"]["eliot"] == *marker
-        && item["payload"]["text"]
-            .as_str()
-            .is_some_and(|text| saved_text_matches(text, intent))
-        && no_attachments(&item["payload"])
+) -> Result<InputAdmissionEvidence> {
+    if !exact_fields(
+        item,
+        &[
+            "admittedSeq",
+            "id",
+            "sessionID",
+            "prompt",
+            "delivery",
+            "timeCreated",
+        ],
+        &["promotedSeq"],
+    ) {
+        return Err(Error::new(
+            "NATIVE_SCHEMA_ERROR",
+            "prompt response is outside the current SessionInput.Admitted schema",
+        ));
+    }
+    let admitted_sequence = item["admittedSeq"]
+        .as_u64()
+        .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "prompt admittedSeq is invalid"))?;
+    if item["timeCreated"]
+        .as_f64()
+        .is_none_or(|time| !time.is_finite())
+    {
+        return Err(Error::new(
+            "NATIVE_SCHEMA_ERROR",
+            "prompt timeCreated is invalid",
+        ));
+    }
+    let prompt = &item["prompt"];
+    if !exact_fields(prompt, &["text"], &["files", "agents"])
+        || prompt["text"].as_str() != Some(text)
+        || !no_attachments(prompt)
+    {
+        return Err(Error::new(
+            "NATIVE_OUTCOME_UNKNOWN",
+            "prompt response did not prove exact admitted text without attachments",
+        ));
+    }
+    let delivery = native_delivery_for_method(&command.method).ok_or_else(|| {
+        Error::new(
+            "UNSUPPORTED_CAPABILITY",
+            "OpenCode input delivery is unknown",
+        )
+    })?;
+    if item["id"] != input_id
+        || item["sessionID"] != root
+        || item["delivery"].as_str() != Some(delivery)
+    {
+        return Err(Error::new(
+            "NATIVE_OUTCOME_UNKNOWN",
+            "prompt response identity or delivery differs from the exact Operation",
+        ));
+    }
+    let promoted_sequence = item
+        .get("promotedSeq")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "prompt promotedSeq is invalid"))
+        })
+        .transpose()?;
+    if promoted_sequence.is_some_and(|sequence| sequence < admitted_sequence) {
+        return Err(Error::new(
+            "NATIVE_SCHEMA_ERROR",
+            "prompt promotedSeq precedes its admission sequence",
+        ));
+    }
+    Ok(InputAdmissionEvidence {
+        admitted_sequence,
+        promoted_sequence,
+    })
 }
 
 fn saved_message_matches(
     message: &Value,
     root: &str,
     input_id: &str,
-    marker: &Value,
     intent: &OperationIntent,
 ) -> bool {
-    message["id"] == input_id
+    exact_fields(
+        message,
+        &["id", "time", "text", "type"],
+        &["metadata", "files", "agents", "sessionID"],
+    ) && exact_fields(&message["time"], &["created"], &[])
+        && message["time"]["created"]
+            .as_f64()
+            .is_some_and(f64::is_finite)
+        && message.get("metadata").is_none_or(Value::is_object)
+        && message["id"] == input_id
         && message["type"] == "user"
         && message
             .get("sessionID")
             .is_none_or(|id| id.as_str() == Some(root))
-        && message["metadata"]["eliot"] == *marker
         && message["text"]
             .as_str()
             .is_some_and(|text| saved_text_matches(text, intent))
@@ -1668,6 +2037,57 @@ fn saved_text_matches(text: &str, intent: &OperationIntent) -> bool {
     let digest = sha256(text.as_bytes());
     intent.prompt_sha256.as_deref() == Some(digest.as_str())
         && intent.prompt_bytes == Some(text.len() as u64)
+}
+
+fn validate_prompt_history_event(
+    event_type: &str,
+    data: &Value,
+    session: &str,
+    input_id: &str,
+    expected_delivery: &str,
+    intent: &OperationIntent,
+) -> Result<()> {
+    if !matches!(
+        event_type,
+        "session.next.prompt.admitted" | "session.next.prompted"
+    ) || !exact_fields(
+        data,
+        &["timestamp", "sessionID", "messageID", "prompt", "delivery"],
+        &[],
+    ) || data["timestamp"]
+        .as_f64()
+        .is_none_or(|timestamp| !timestamp.is_finite())
+    {
+        return Err(Error::new(
+            "NATIVE_HISTORY_SCHEMA",
+            "prompt history event differs from the selected V2 schema",
+        ));
+    }
+    let prompt = &data["prompt"];
+    if !exact_fields(prompt, &["text"], &["files", "agents"])
+        || !prompt["text"]
+            .as_str()
+            .is_some_and(|text| saved_text_matches(text, intent))
+        || !no_attachments(prompt)
+        || data["sessionID"] != session
+        || data["messageID"] != input_id
+        || data["delivery"].as_str() != Some(expected_delivery)
+    {
+        return Err(Error::new(
+            "NATIVE_INPUT_MISMATCH",
+            "durable prompt event differs from the exact saved session, text or delivery",
+        ));
+    }
+    Ok(())
+}
+
+fn exact_fields(value: &Value, required: &[&str], optional: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        required.iter().all(|field| object.contains_key(*field))
+            && object.keys().all(|field| {
+                required.contains(&field.as_str()) || optional.contains(&field.as_str())
+            })
+    })
 }
 
 fn no_attachments(value: &Value) -> bool {

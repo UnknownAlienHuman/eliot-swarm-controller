@@ -350,7 +350,6 @@ fn validate_scope(
         "binding_generation",
         "native_scope_key",
         "service_id",
-        "expected_version",
         "service_pid",
         "directory",
         "assignment",
@@ -366,7 +365,6 @@ fn validate_scope(
         || scope["binding_generation"] != command.generation
         || scope["native_scope_key"] != options.scope_key()
         || scope["service_id"] != options.service_id
-        || scope["expected_version"] != options.expected_version
         || scope["service_pid"].as_u64().is_none_or(|pid| pid == 0)
         || scope["directory"] != options.directory.to_str().unwrap_or_default()
     {

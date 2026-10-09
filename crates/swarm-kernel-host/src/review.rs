@@ -128,7 +128,7 @@ pub(crate) enum ReviewCoverage {
     Partial,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReviewFinding {
     pub finding_id: String,
@@ -136,6 +136,103 @@ pub(crate) struct ReviewFinding {
     pub reason: String,
     pub evidence_refs: Vec<String>,
     pub requested_change: String,
+}
+
+/// The complete, ordered set of findings retained by one assigned review.
+/// Its digest binds the exact review cause, Task subject and finding order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewFindingsPackage {
+    pub(crate) schema_version: u32,
+    pub(crate) identity: ReviewSlotIdentity,
+    pub(crate) review_assignment_id: String,
+    pub(crate) review_result_operation_id: String,
+    pub(crate) findings: Vec<ReviewFinding>,
+    pub(crate) findings_digest: String,
+}
+
+impl ReviewFindingsPackage {
+    pub(crate) fn new(
+        identity: ReviewSlotIdentity,
+        review_assignment_id: String,
+        review_result_operation_id: String,
+        findings: Vec<ReviewFinding>,
+    ) -> Result<Self> {
+        let mut package = Self {
+            schema_version: 1,
+            identity,
+            review_assignment_id,
+            review_result_operation_id,
+            findings,
+            findings_digest: String::new(),
+        };
+        package.findings_digest = package.compute_digest()?;
+        package.validate()?;
+        Ok(package)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let damaged = || {
+            Error::new(
+                "REVIEW_FINDINGS_PACKAGE_DAMAGED",
+                "ordered review findings package is invalid or its digest does not match",
+            )
+        };
+        let mut finding_ids = BTreeSet::new();
+        if self.schema_version != 1
+            || self.review_assignment_id.trim().is_empty()
+            || self.review_result_operation_id.trim().is_empty()
+            || self.findings.is_empty()
+            || self.findings.iter().any(|finding| {
+                finding.finding_id.trim().is_empty()
+                    || !finding_ids.insert(finding.finding_id.as_str())
+                    || finding.reason.trim().is_empty()
+                    || finding.requested_change.trim().is_empty()
+                    || finding.requirement_ids.is_empty()
+                    || finding
+                        .requirement_ids
+                        .iter()
+                        .any(|id| id.trim().is_empty())
+                    || finding.evidence_refs.is_empty()
+                    || finding
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference.trim().is_empty())
+            })
+            || self.findings_digest != self.compute_digest()?
+        {
+            return Err(damaged());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finding_ids(&self) -> Vec<String> {
+        self.findings
+            .iter()
+            .map(|finding| finding.finding_id.clone())
+            .collect()
+    }
+
+    /// Preserve the historical semantic key for a one-finding package while
+    /// using the full package digest whenever order or membership is plural.
+    pub(crate) fn semantic_subject_key(&self) -> &str {
+        if self.findings.len() == 1 {
+            &self.findings[0].finding_id
+        } else {
+            &self.findings_digest
+        }
+    }
+
+    fn compute_digest(&self) -> Result<String> {
+        let value = json!({
+            "schema_version":self.schema_version,
+            "identity":self.identity,
+            "review_assignment_id":self.review_assignment_id,
+            "review_result_operation_id":self.review_result_operation_id,
+            "findings":self.findings
+        });
+        Ok(model::digest(model::canonical(&value)?.as_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,19 +262,19 @@ impl ReviewSubmitRequest {
             model::text(value, field)?;
         }
         review_contract::validate_submit_request(value).map_err(|error| match error {
-            review_contract::ReviewValidationError::Evidence => Error::invalid(
-                "review result needs nonempty retained evidence refs",
-            ),
+            review_contract::ReviewValidationError::Evidence => {
+                Error::invalid("review result needs nonempty retained evidence refs")
+            }
             review_contract::ReviewValidationError::Findings => Error::invalid(
                 "findings need unique IDs, reasons, requested changes, and evidence refs",
             ),
             review_contract::ReviewValidationError::Verdict => match request.verdict {
-                ReviewVerdict::Pass => Error::invalid(
-                    "pass requires complete coverage and no unresolved findings",
-                ),
-                ReviewVerdict::ChangesRequested => Error::invalid(
-                    "changes_requested requires at least one actionable finding",
-                ),
+                ReviewVerdict::Pass => {
+                    Error::invalid("pass requires complete coverage and no unresolved findings")
+                }
+                ReviewVerdict::ChangesRequested => {
+                    Error::invalid("changes_requested requires at least one actionable finding")
+                }
                 ReviewVerdict::Inconclusive => Error::invalid("review verdict is invalid"),
             },
             review_contract::ReviewValidationError::RequirementReviews => {
@@ -244,15 +341,15 @@ impl ReviewSubmitRequest {
             return Ok(());
         }
         let reviews = serde_json::to_value(&self.requirement_reviews)?;
-        review_contract::validate_requirement_coverage(&reviews, requirement_ids).map_err(
-            |error| match error {
+        review_contract::validate_requirement_coverage(&reviews, requirement_ids).map_err(|error| {
+            match error {
                 review_contract::ReviewValidationError::RequirementCoverage => Error::new(
                     "REVIEW_INCOMPLETE",
                     "structured review must address exactly the frozen Task requirements",
                 ),
                 _ => Error::new("REVIEW_RESULT_DAMAGED", error.to_string()),
-            },
-        )
+            }
+        })
     }
 }
 

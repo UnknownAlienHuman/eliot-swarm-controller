@@ -71,7 +71,6 @@ pub(crate) enum ConciliumRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProposeRequest {
-    pub client_request_id: String,
     pub task_id: String,
     pub attempt_id: String,
     pub failed_thread_id: String,
@@ -104,7 +103,6 @@ pub(crate) struct PreviewRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenRequest {
-    pub client_request_id: String,
     pub proposal_operation_id: String,
     pub plan_digest: String,
     pub confirmed_reasonable: bool,
@@ -113,7 +111,6 @@ pub(crate) struct OpenRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PositionSubmitRequest {
-    pub client_request_id: String,
     pub concilium_id: String,
     pub slot_id: String,
     pub packet_digest: String,
@@ -143,7 +140,6 @@ pub(crate) struct PositionClaim {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RoundAdvanceRequest {
-    pub client_request_id: String,
     pub concilium_id: String,
     pub expected_state_revision: i64,
     pub next_round: i64,
@@ -169,7 +165,6 @@ pub(crate) struct ListRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CloseRequest {
-    pub client_request_id: String,
     pub concilium_id: String,
     pub expected_state_revision: i64,
     pub result: String,
@@ -276,8 +271,8 @@ fn parse_propose(value: &Value) -> Result<ProposeRequest> {
         .cloned()
         .ok_or_else(|| Error::invalid("suggested_budget must be a JSON object"))?;
 
+    request_id(value)?;
     Ok(ProposeRequest {
-        client_request_id: request_id(value)?,
         task_id: bounded_identifier(value, "task_id", MAX_IDENTIFIER_BYTES)?,
         attempt_id: bounded_identifier(value, "attempt_id", MAX_IDENTIFIER_BYTES)?,
         failed_thread_id: bounded_identifier(value, "failed_thread_id", MAX_IDENTIFIER_BYTES)?,
@@ -329,8 +324,8 @@ fn parse_open(value: &Value) -> Result<OpenRequest> {
             "confirmed_reasonable must be true to open a Concilium",
         ));
     }
+    request_id(value)?;
     Ok(OpenRequest {
-        client_request_id: request_id(value)?,
         proposal_operation_id: bounded_identifier(
             value,
             "proposal_operation_id",
@@ -357,8 +352,8 @@ fn parse_position_submit(value: &Value) -> Result<PositionSubmitRequest> {
         .get("position")
         .ok_or_else(|| Error::invalid("position is required"))?;
     let position = parse_position(position_value)?;
+    request_id(value)?;
     Ok(PositionSubmitRequest {
-        client_request_id: request_id(value)?,
         concilium_id: bounded_identifier(value, "concilium_id", MAX_IDENTIFIER_BYTES)?,
         slot_id: bounded_identifier(value, "slot_id", MAX_IDENTIFIER_BYTES)?,
         packet_digest: digest(value, "packet_digest")?,
@@ -473,8 +468,8 @@ fn parse_round_advance(value: &Value) -> Result<RoundAdvanceRequest> {
         (3, Some(_)) => {}
         _ => unreachable!("next_round was validated above"),
     }
+    request_id(value)?;
     Ok(RoundAdvanceRequest {
-        client_request_id: request_id(value)?,
         concilium_id: bounded_identifier(value, "concilium_id", MAX_IDENTIFIER_BYTES)?,
         expected_state_revision: model::positive(value, "expected_state_revision")?,
         next_round,
@@ -536,8 +531,8 @@ fn parse_close(value: &Value) -> Result<CloseRequest> {
             "recommended close requires a recommendation reference",
         ));
     }
+    request_id(value)?;
     Ok(CloseRequest {
-        client_request_id: request_id(value)?,
         concilium_id: bounded_identifier(value, "concilium_id", MAX_IDENTIFIER_BYTES)?,
         expected_state_revision: model::positive(value, "expected_state_revision")?,
         result,

@@ -14,8 +14,8 @@ const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
 const CODEX_RUST_ARTIFACT_ID: &str = "codex-rust-controller.1";
 pub(crate) const OPENCODE_RUST_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
 const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
+const COMMAND_ACP_ARTIFACT_ID: &str = "eliot-command.acp-rust.1";
 const ANTIGRAVITY_RUST_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-const ANTIGRAVITY_RUST_MODEL_ID: &str = "gemini-3.8-flash-high";
 
 /// Trusted local recorder settings. This controls optional diagnostic
 /// metadata and explicitly selected redacted text; it never disables or
@@ -163,6 +163,14 @@ pub struct Route {
     /// remain unchanged; this declaration grants no process-start authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owned_service: Option<OwnedOpenCodeServiceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_policy: Option<RouteAdmissionPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteAdmissionPolicy {
+    pub max_concurrent_roots: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +229,16 @@ impl Route {
     }
 
     fn validate_activation_contract(&self) -> Result<()> {
+        if self
+            .admission_policy
+            .as_ref()
+            .is_some_and(|policy| policy.max_concurrent_roots == 0)
+        {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "route max_concurrent_roots must be positive",
+            ));
+        }
         if self.workspace_option.as_deref().is_some_and(|field| {
             let mut bytes = field.bytes();
             let first = bytes.next();
@@ -237,7 +255,7 @@ impl Route {
         let (runtime, workspace_field) = match self.module_artifact_id.as_str() {
             CODEX_RUST_ARTIFACT_ID => ("codex", "workspaceRoot"),
             OPENCODE_RUST_ARTIFACT_ID => ("module", "directory"),
-            COMMAND_RUST_ARTIFACT_ID => ("command", "workspaceRoot"),
+            COMMAND_RUST_ARTIFACT_ID | COMMAND_ACP_ARTIFACT_ID => ("command", "workspaceRoot"),
             ANTIGRAVITY_RUST_ARTIFACT_ID => ("antigravity", "workspaceRoot"),
             _ if self.workspace_option.is_some() => {
                 return Err(Error::new(
@@ -257,7 +275,9 @@ impl Route {
         match self.module_artifact_id.as_str() {
             CODEX_RUST_ARTIFACT_ID => validate_codex_rust_options(&self.native_options),
             OPENCODE_RUST_ARTIFACT_ID => validate_opencode_rust_options(&self.native_options),
-            COMMAND_RUST_ARTIFACT_ID => validate_command_rust_options(&self.native_options),
+            COMMAND_RUST_ARTIFACT_ID | COMMAND_ACP_ARTIFACT_ID => {
+                validate_command_rust_options(&self.native_options)
+            }
             ANTIGRAVITY_RUST_ARTIFACT_ID => validate_antigravity_rust_options(&self.native_options),
             _ => Ok(()),
         }
@@ -337,12 +357,7 @@ fn validate_antigravity_rust_options(value: &Value) -> Result<()> {
         &["modelId", "workspaceRoot"],
         &["reasoningEffort", "agent", "dangerouslySkipPermissions"],
     )?;
-    if required_option_string(options, "modelId", 256)? != ANTIGRAVITY_RUST_MODEL_ID {
-        return Err(Error::new(
-            "CONFIG_ERROR",
-            "Antigravity Rust route requires its exact supported model ID",
-        ));
-    }
+    required_option_string(options, "modelId", 256)?;
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     if let Some(value) = options.get("reasoningEffort") {
         let effort = option_string(value, "reasoningEffort", 32)?;

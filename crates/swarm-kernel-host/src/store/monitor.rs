@@ -48,7 +48,7 @@ pub(super) fn snapshot(
     // view; writes racing this call receive observation IDs after this cut.
     let cut = journal_cut(db)?;
     let host = super::read(db, p, "host.status", &json!({}), _config)?;
-    let dashboard = super::launcher::dashboard(db, p, params)?;
+    let dashboard = super::launcher::dashboard(db, p, params, _config)?;
     let captured_at_ms = model::now_ms()?;
 
     Ok(json!({
