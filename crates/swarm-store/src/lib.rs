@@ -24,6 +24,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("database identity or supplied base schema is invalid")]
     InvalidIdentity,
+    #[error("busy timeout exceeds SQLite's supported millisecond range")]
+    InvalidBusyTimeout,
     #[error("not this prototype's version-1 database; no automatic overwrite or downgrade")]
     SchemaMismatch,
     #[error("migration content differs; refusing to open a draft/reference database")]
@@ -34,7 +36,7 @@ pub enum Error {
     SqliteVersion { actual: i32, minimum: i32 },
     #[error("query-only mode could not be enabled for the status connection")]
     QueryOnlyUnavailable,
-    #[error("SQLite foreign-key, WAL, or FULL-sync settings were not applied")]
+    #[error("SQLite busy-timeout, foreign-key, WAL, or FULL-sync settings were not applied")]
     DurabilityConfiguration,
 }
 
@@ -44,9 +46,10 @@ impl Error {
         match self {
             Self::Sqlite(_) => "STORE_ERROR",
             Self::Json(_) => "INVALID_PARAMS",
-            Self::InvalidIdentity | Self::QueryOnlyUnavailable | Self::DurabilityConfiguration => {
-                "STORE_CONFIGURATION"
-            }
+            Self::InvalidIdentity
+            | Self::InvalidBusyTimeout
+            | Self::QueryOnlyUnavailable
+            | Self::DurabilityConfiguration => "STORE_CONFIGURATION",
             Self::SchemaMismatch | Self::SchemaDigestMismatch | Self::ReaderSchemaMismatch => {
                 "SCHEMA_MISMATCH"
             }
@@ -62,6 +65,9 @@ impl Error {
             Self::Sqlite(error) => error.to_string(),
             Self::Json(error) => error.to_string(),
             Self::InvalidIdentity => "database identity or base schema is invalid".to_owned(),
+            Self::InvalidBusyTimeout => {
+                "busy timeout exceeds SQLite's supported millisecond range".to_owned()
+            }
             Self::SchemaMismatch => {
                 "not this prototype's version-1 database; no automatic overwrite or downgrade"
                     .to_owned()
@@ -81,7 +87,9 @@ impl Error {
                 )
             }
             Self::QueryOnlyUnavailable => "status connection is not query-only".to_owned(),
-            Self::DurabilityConfiguration => "foreign_keys/WAL/FULL were not applied".to_owned(),
+            Self::DurabilityConfiguration => {
+                "busy_timeout/foreign_keys/WAL/FULL were not applied".to_owned()
+            }
         }
     }
 }
@@ -134,6 +142,11 @@ impl Default for ReaderOptions {
             busy_timeout: Duration::from_secs(5),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriterPragmaExpectation {
+    busy_timeout_ms: i32,
 }
 
 /// The initialization callback error remains kernel-owned; SQLite/opening
@@ -198,12 +211,18 @@ fn open_writer_inner<T, E>(
             .into());
         }
     }
+    let expected = WriterPragmaExpectation {
+        busy_timeout_ms: checked_timeout_ms(options.busy_timeout)?,
+    };
 
     let mut db = if create {
         Connection::open(path)?
     } else {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
     };
+    configure_writer_connection(&db, options.busy_timeout)?;
+    verify_writer_connection(&db, expected)?;
+
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let application_id: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let empty: bool = db.query_row(
@@ -222,11 +241,6 @@ fn open_writer_inner<T, E>(
         return Err(Error::SchemaMismatch.into());
     }
 
-    db.pragma_update(None, "foreign_keys", "ON")?;
-    db.pragma_update(None, "journal_mode", "WAL")?;
-    db.pragma_update(None, "synchronous", "FULL")?;
-    db.busy_timeout(options.busy_timeout)?;
-
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let digest = identity.digest();
     if is_new {
@@ -238,8 +252,8 @@ fn open_writer_inner<T, E>(
         verify_schema_digest(&tx, &digest)?;
     }
     let initialized = initialize(&tx, is_new).map_err(OpenError::Initializer)?;
+    verify_writer_connection(&tx, expected)?;
     tx.commit()?;
-    verify_writer_pragmas(&db)?;
     Ok((db, initialized))
 }
 
@@ -252,6 +266,7 @@ pub fn open_reader(
     options: ReaderOptions,
 ) -> Result<Connection, Error> {
     identity.validate()?;
+    checked_timeout_ms(options.busy_timeout)?;
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(options.busy_timeout)?;
     db.pragma_update(None, "query_only", "ON")?;
@@ -306,6 +321,37 @@ pub fn with_transaction<T, E>(
     Ok(value)
 }
 
+fn checked_timeout_ms(timeout: Duration) -> Result<i32, Error> {
+    i32::try_from(timeout.as_millis()).map_err(|_| Error::InvalidBusyTimeout)
+}
+
+fn configure_writer_connection(db: &Connection, busy_timeout: Duration) -> Result<(), Error> {
+    db.busy_timeout(busy_timeout)?;
+    db.pragma_update(None, "foreign_keys", "ON")?;
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+fn verify_writer_connection(
+    db: &Connection,
+    expected: WriterPragmaExpectation,
+) -> Result<(), Error> {
+    let busy_timeout_ms: i64 =
+        db.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    let foreign_keys: i64 = db.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let journal_mode: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    let synchronous: i64 = db.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+    if busy_timeout_ms != i64::from(expected.busy_timeout_ms)
+        || foreign_keys != 1
+        || !journal_mode.eq_ignore_ascii_case("wal")
+        || synchronous != 2
+    {
+        return Err(Error::DurabilityConfiguration);
+    }
+    Ok(())
+}
+
 fn write_schema_digest(tx: &Transaction<'_>, digest: &str) -> Result<(), Error> {
     let canonical_json = format!("\"{digest}\"");
     tx.execute(
@@ -340,14 +386,4 @@ fn read_schema_digest(db: &Connection) -> Result<Option<serde_json::Value>, Erro
     stored
         .map(|raw| serde_json::from_str(&raw).map_err(Error::Json))
         .transpose()
-}
-
-fn verify_writer_pragmas(db: &Connection) -> Result<(), Error> {
-    let foreign_keys: i64 = db.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
-    let journal_mode: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-    let synchronous: i64 = db.pragma_query_value(None, "synchronous", |row| row.get(0))?;
-    if foreign_keys != 1 || journal_mode != "wal" || synchronous != 2 {
-        return Err(Error::DurabilityConfiguration);
-    }
-    Ok(())
 }
