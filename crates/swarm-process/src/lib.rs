@@ -10,6 +10,7 @@ pub mod module_membership;
 pub mod module_owner;
 mod permissions;
 pub mod process_group;
+mod state_marker;
 
 pub use module_membership::module_child_belongs_to_owner;
 pub use permissions::{private_permissions, write_private_new};
@@ -17,3 +18,4 @@ pub use process_group::{
     Group, departed_empty, process_birth_identity, process_image_identity, service_owner_is_live,
     spawned_departed, spawned_identity,
 };
+pub use state_marker::{StateMarkerError, acquire_state_marker};
