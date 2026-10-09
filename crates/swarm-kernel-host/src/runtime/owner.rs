@@ -16,6 +16,7 @@ use std::{
     process::Command,
     time::Duration,
 };
+use swarm_process::{StateMarkerError, acquire_state_marker};
 
 pub fn verify_departed(owner: &Value) -> Result<()> {
     let token = model::text(owner, "token")?;
@@ -106,34 +107,23 @@ pub fn run(state_dir: &Path, executable: &Path, args: &[String]) -> Result<()> {
     }
     fs::create_dir_all(state_dir)?;
     let dir = fs::canonicalize(state_dir)?;
-    let marker = dir.join("module.lock");
-    let empty = fs::read_dir(&dir)?.next().transpose()?.is_none();
-    if !empty && !marker.is_file() {
-        return Err(Error::new(
-            "FOREIGN_STATE_DIRECTORY",
-            "use a dedicated empty module state directory",
-        ));
-    }
-    let mut lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(empty)
-        .truncate(false)
-        .open(&marker)?;
-    lock.try_lock()
-        .map_err(|e| Error::new("MODULE_OWNER_ACTIVE", e.to_string()))?;
-    let mut text = String::new();
-    (&mut lock).take(128).read_to_string(&mut text)?;
-    const MARKER: &str = "ELIOT_SWARM_MODULE_V1\n";
-    if text.is_empty() && empty {
-        lock.write_all(MARKER.as_bytes())?;
-        lock.sync_all()?;
-    } else if text != MARKER {
-        return Err(Error::new(
-            "FOREIGN_STATE_DIRECTORY",
-            "invalid module ownership marker",
-        ));
-    }
+    const MARKER: &[u8] = b"ELIOT_SWARM_MODULE_V1\n";
+    let lock = match acquire_state_marker(&dir, "module.lock", MARKER) {
+        Ok(lock) => lock,
+        Err(StateMarkerError::Busy) => {
+            return Err(Error::new(
+                "MODULE_OWNER_ACTIVE",
+                "module marker lock is already held",
+            ));
+        }
+        Err(StateMarkerError::ForeignDirectory | StateMarkerError::InvalidMarker) => {
+            return Err(Error::new(
+                "FOREIGN_STATE_DIRECTORY",
+                "use a dedicated empty module state directory",
+            ));
+        }
+        Err(StateMarkerError::System(error)) => return Err(error.into()),
+    };
     private_permissions(&dir, true)?;
     let record = dir.join("owner.json");
     if record.try_exists()? {

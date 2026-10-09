@@ -7,8 +7,8 @@
 //! policy knowledge.
 
 use crate::{
-    Group, departed_empty, module_child_belongs_to_owner, private_permissions,
-    process_image_identity, write_private_new,
+    Group, StateMarkerError, acquire_state_marker, departed_empty, module_child_belongs_to_owner,
+    private_permissions, process_image_identity, write_private_new,
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -341,33 +341,22 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     reject_link_components(&plan.executable, false)?;
     fs::create_dir_all(&plan.state_dir)?;
     let dir = fs::canonicalize(&plan.state_dir)?;
-    let marker = dir.join("module.lock");
-    let empty = fs::read_dir(&dir)?.next().transpose()?.is_none();
-    if !empty && !marker.is_file() {
-        return Err(Error::new(
-            "FOREIGN_STATE_DIRECTORY",
-            "use a dedicated empty module state directory",
-        ));
-    }
-    let mut lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(empty)
-        .truncate(false)
-        .open(&marker)?;
-    lock.try_lock()
-        .map_err(|error| Error::new("MODULE_OWNER_ACTIVE", error.to_string()))?;
-    let mut marker_text = String::new();
-    (&mut lock).take(128).read_to_string(&mut marker_text)?;
-    if marker_text.is_empty() && empty {
-        lock.write_all(MARKER.as_bytes())?;
-        lock.sync_all()?;
-    } else if marker_text != MARKER {
-        return Err(Error::new(
-            "FOREIGN_STATE_DIRECTORY",
-            "invalid module ownership marker",
-        ));
-    }
+    let lock = match acquire_state_marker(&dir, "module.lock", MARKER.as_bytes()) {
+        Ok(lock) => lock,
+        Err(StateMarkerError::Busy) => {
+            return Err(Error::new(
+                "MODULE_OWNER_ACTIVE",
+                "module marker lock is already held",
+            ));
+        }
+        Err(StateMarkerError::ForeignDirectory | StateMarkerError::InvalidMarker) => {
+            return Err(Error::new(
+                "FOREIGN_STATE_DIRECTORY",
+                "use a dedicated empty module state directory",
+            ));
+        }
+        Err(StateMarkerError::System(error)) => return Err(error),
+    };
     private_permissions(&dir, true)?;
 
     let record_path = dir.join("owner.json");

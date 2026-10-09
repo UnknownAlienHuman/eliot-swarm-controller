@@ -1,9 +1,9 @@
 pub mod process_group;
 use crate::error::{Error, Result};
 use crate::model::{Credential, new_id};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use swarm_process::StateMarkerError;
 
 #[cfg(windows)]
 pub mod windows;
@@ -17,36 +17,25 @@ impl DataRoot {
     pub fn acquire(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let path = std::fs::canonicalize(path)?;
-        let empty = std::fs::read_dir(&path)?.next().transpose()?.is_none();
-        let lock_path = path.join("host.lock");
-        // Never chmod/re-ACL an arbitrary existing folder because a caller mistyped
-        // --data-dir. The marker is coordination, not a malicious-user boundary.
-        if !empty && !lock_path.is_file() {
-            return Err(Error::new(
-                "FOREIGN_STATE_DIRECTORY",
-                "choose an empty directory or an existing Swarm state directory",
-            ));
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).truncate(false);
-        if empty {
-            options.create(true);
-        }
-        let mut lock = options.open(&lock_path)?;
-        lock.try_lock()
-            .map_err(|e| Error::new("HOST_ALREADY_RUNNING", e.to_string()))?;
-        let mut marker = String::new();
-        (&mut lock).take(128).read_to_string(&mut marker)?;
-        const MARKER: &str = "ELIOT_SWARM_STATE_V1\n";
-        if marker.is_empty() && empty {
-            lock.write_all(MARKER.as_bytes())?;
-            lock.sync_all()?;
-        } else if marker != MARKER {
-            return Err(Error::new(
-                "FOREIGN_STATE_DIRECTORY",
-                "host.lock is not this prototype's ownership marker",
-            ));
-        }
+        const MARKER: &[u8] = b"ELIOT_SWARM_STATE_V1\n";
+        let lock = match swarm_process::acquire_state_marker(&path, "host.lock", MARKER) {
+            Ok(lock) => lock,
+            Err(StateMarkerError::Busy) => {
+                return Err(Error::new(
+                    "HOST_ALREADY_RUNNING",
+                    "state marker lock is already held",
+                ));
+            }
+            Err(StateMarkerError::ForeignDirectory | StateMarkerError::InvalidMarker) => {
+                return Err(Error::new(
+                    "FOREIGN_STATE_DIRECTORY",
+                    "choose an empty directory or an existing Swarm state directory",
+                ));
+            }
+            Err(StateMarkerError::System(error)) => return Err(error.into()),
+        };
+        // Never chmod/re-ACL an arbitrary existing folder because a caller
+        // mistyped --data-dir. Marker validation succeeds before this call.
         private_permissions(&path, true)?;
         Ok(Self { path, lock })
     }
