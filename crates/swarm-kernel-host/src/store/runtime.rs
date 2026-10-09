@@ -1357,9 +1357,9 @@ fn next_internal(
         }
         if !uses_task_prompt
             && (crate::runtime::codex::is_controller_route(&b["route"])
-            || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
-            || pre_input_open.is_some()
-            || crate::runtime::batch::is_command_route(&b["route"]))
+                || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+                || pre_input_open.is_some()
+                || crate::runtime::batch::is_command_route(&b["route"]))
         {
             input["task_snapshot_canonical"] = json!(model::canonical(&a["task_snapshot"])?);
         }
