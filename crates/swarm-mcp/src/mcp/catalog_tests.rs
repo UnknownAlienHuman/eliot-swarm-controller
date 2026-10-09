@@ -25,6 +25,44 @@ fn pr_description_readback_reconcile_is_manual_and_current_manager_scoped() {
 }
 
 #[test]
+fn drifted_metadata_uses_exact_executable_input_fields() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "attempt.bind_producer",
+            &[
+                "attempt_id",
+                "assignment_id",
+                "native_session_id",
+                "native_run_id",
+                "observation_id",
+            ],
+            &[
+                "current Attempt manager authority",
+                "already observed exact producer evidence",
+            ],
+        ),
+        (
+            "gm.handover",
+            &["client_id"],
+            &[
+                "local Operator or exact current GM authority",
+                "registered eligible target client",
+            ],
+        ),
+    ];
+
+    for (method, expected_fields, expected_context) in cases {
+        let metadata = super::metadata_for(method).expect("method metadata exists");
+        let (_, spec) = super::find_spec(method).expect("method ToolSpec exists");
+        assert_eq!(metadata.required_input_fields, *expected_fields, "{method}");
+        assert_eq!(metadata.required_context, *expected_context, "{method}");
+        assert_eq!(metadata.required_input_fields, spec.required, "{method}");
+        assert!(super::metadata_input_contract_matches(metadata, spec));
+    }
+    super::validate_registry_metadata().expect("typed metadata matches executable schemas");
+}
+
+#[test]
 fn scoped_filter_precedes_search_and_stales_existing_page_cursor() {
     let profile = McpToolProfile::Full;
     let surface = Surface::role_default(profile);
