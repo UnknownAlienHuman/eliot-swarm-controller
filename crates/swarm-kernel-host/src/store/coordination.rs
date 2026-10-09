@@ -31,6 +31,7 @@ const RELEVANCE_SCAN_FACTOR: i64 = 4;
 
 #[derive(Clone)]
 struct ScopeData {
+    client_id: Option<String>,
     registration: Value,
     task: Value,
     attempt: Value,
@@ -422,6 +423,7 @@ pub(crate) fn watch_scope_for_creator(
                 return Ok(None);
             }
             Ok(Some(scope_projection(&ScopeData {
+                client_id: None,
                 registration: Value::Null,
                 task,
                 attempt,
@@ -825,6 +827,7 @@ fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<Sco
     validate_participation_basis(db, client_id, &registration, &task, &attempt, false)?;
     let scope_id = keys::scope_id(task_id, task_revision, attempt_id)?;
     Ok(ScopeData {
+        client_id: Some(client_id.to_owned()),
         registration,
         task,
         attempt,
@@ -1209,6 +1212,7 @@ fn manager_scope(
     validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
     authorize_attempt_manager(db, principal, &attempt)?;
     Ok(ScopeData {
+        client_id: None,
         registration: Value::Null,
         task,
         attempt,
@@ -1235,7 +1239,15 @@ pub(super) fn concilium_participant_scope_for_client(
             "Concilium participant must hold the exact current Task revision and Attempt",
         ));
     }
-    concilium_participant_scope_projection(&scope)
+    participant_authority_projection(&scope)
+}
+
+/// Private exact Participant authority used by code-scope and Concilium.
+/// Public context projections remain redacted and retain their existing wire shape.
+pub(super) fn participant_authority_scope(db: &Connection, principal: &Principal) -> Result<Value> {
+    principal.require_participant()?;
+    let scope = load_current_scope(db, principal)?;
+    participant_authority_projection(&scope)
 }
 
 /// Resolve a caller's current Participant grant for a Concilium proposal or
@@ -1244,18 +1256,31 @@ pub(super) fn concilium_current_participant_scope(
     db: &Connection,
     principal: &Principal,
 ) -> Result<Value> {
-    principal.require_participant()?;
-    let scope = load_current_scope(db, principal)?;
-    concilium_participant_scope_projection(&scope)
+    participant_authority_scope(db, principal)
 }
 
-fn concilium_participant_scope_projection(scope: &ScopeData) -> Result<Value> {
-    let registration = &scope.registration;
-    let client_id = registration["client_id"].as_str().unwrap_or_default();
-    let generation = registration
-        .get("binding_generation")
-        .cloned()
-        .unwrap_or(Value::Null);
+/// Concilium identity commits to the verified key/Principal client ID. The
+/// stored registration intentionally need not duplicate that ID. Thread uses
+/// a different versioned preimage and is not routed through this helper.
+pub(super) fn concilium_registration_fingerprint(
+    client_id: &str,
+    registration: &Value,
+) -> Result<String> {
+    if client_id.is_empty() {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "Participant authority has no verified client identity",
+        ));
+    }
+    if registration
+        .get("client_id")
+        .is_some_and(|retained| !retained.is_null() && retained.as_str() != Some(client_id))
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "Participant registration client identity differs from its verified key",
+        ));
+    }
     let authority = json!({
         "client_id":client_id,
         "role":registration.get("role").cloned().unwrap_or(Value::Null),
@@ -1265,10 +1290,27 @@ fn concilium_participant_scope_projection(scope: &ScopeData) -> Result<Value> {
         "attempt_id":registration.get("attempt_id").cloned().unwrap_or(Value::Null),
         "participation_basis":registration.get("participation_basis").cloned().unwrap_or(Value::Null),
         "binding_id":registration.get("binding_id").cloned().unwrap_or(Value::Null),
-        "binding_generation":generation,
+        "binding_generation":registration.get("binding_generation").cloned().unwrap_or(Value::Null),
     });
-    let canonical = model::canonical(&authority)?;
-    let fingerprint = format!("sha256:{}", model::digest(canonical.as_bytes()));
+    Ok(format!(
+        "sha256:{}",
+        model::digest(model::canonical(&authority)?.as_bytes())
+    ))
+}
+
+fn participant_authority_projection(scope: &ScopeData) -> Result<Value> {
+    let registration = &scope.registration;
+    let client_id = scope.client_id.as_deref().ok_or_else(|| {
+        Error::new(
+            "STORE_INVARIANT",
+            "Participant authority projection requires a verified client identity",
+        )
+    })?;
+    let generation = registration
+        .get("binding_generation")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let fingerprint = concilium_registration_fingerprint(client_id, registration)?;
     Ok(json!({
         "actor":{"client_id":client_id,"role":"participant","generation":generation},
         "scope":{

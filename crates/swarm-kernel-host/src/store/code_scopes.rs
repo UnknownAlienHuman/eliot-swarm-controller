@@ -347,7 +347,7 @@ fn propose(
     now: i64,
 ) -> Result<Value> {
     principal.require_participant()?;
-    let authority = coordination::current_scope(tx, principal)?;
+    let authority = coordination::participant_authority_scope(tx, principal)?;
     let task_id = model::text(&authority["scope"], "task_id")?;
     let task_revision = authority["scope"]["task_revision"]
         .as_i64()
@@ -386,7 +386,6 @@ fn propose(
             "assignment_id differs from the authenticated Attempt participation basis",
         ));
     }
-    tasks::get_attempt(tx, attempt_id)?;
     let scope_intent_id = format!("cscope-{}", model::new_id());
     let sequence = next_task_sequence(tx, task_id)?;
     let proposal = json!({
@@ -465,6 +464,7 @@ fn accept(
         .as_i64()
         .ok_or_else(|| damaged("scope record has no Task revision"))?;
     let attempt_id = model::text(&record, "attempt_id")?.to_owned();
+    require_current_scope_identity(tx, &record)?;
     coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;
     if request
         .expires_at_ms
@@ -721,7 +721,7 @@ fn authorize_read_scope(
 ) -> Result<(i64, String)> {
     match &principal.role {
         Role::Participant => {
-            let scope = coordination::current_scope(db, principal)?;
+            let scope = coordination::participant_authority_scope(db, principal)?;
             let current_task = model::text(&scope["scope"], "task_id")?;
             let current_revision = scope["scope"]["task_revision"]
                 .as_i64()
@@ -769,6 +769,32 @@ fn authorize_read_scope(
     }
 }
 
+fn require_current_scope_identity(db: &Connection, record: &Value) -> Result<()> {
+    let client_id = model::text(&record["actor"], "client_id")?;
+    let task_id = model::text(record, "task_id")?;
+    let task_revision = record["task_revision"]
+        .as_i64()
+        .ok_or_else(|| damaged("scope record has no Task revision"))?;
+    let attempt_id = model::text(record, "attempt_id")?;
+    let current = coordination::concilium_participant_scope_for_client(
+        db,
+        client_id,
+        task_id,
+        task_revision,
+        attempt_id,
+    )?;
+    if current["actor"] != record["actor"]
+        || current["participation_basis"] != record["participation_basis"]
+        || current["registration_fingerprint"] != record["registration_fingerprint"]
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "scope owner registration no longer matches the retained exact identity",
+        ));
+    }
+    Ok(())
+}
+
 fn require_exact_scope_owner(db: &Connection, principal: &Principal, record: &Value) -> Result<()> {
     principal.require_participant()?;
     if record["actor"]["client_id"] != principal.client_id {
@@ -777,18 +803,7 @@ fn require_exact_scope_owner(db: &Connection, principal: &Principal, record: &Va
             "only the exact code-scope owner or current Manager may release this scope",
         ));
     }
-    let current = coordination::current_scope(db, principal)?;
-    if current["scope"]["task_id"] != record["task_id"]
-        || current["scope"]["task_revision"] != record["task_revision"]
-        || current["scope"]["attempt_id"] != record["attempt_id"]
-        || current["registration_fingerprint"] != record["registration_fingerprint"]
-    {
-        return Err(Error::new(
-            "STALE_PARTICIPANT",
-            "scope owner registration no longer matches the accepted Attempt snapshot",
-        ));
-    }
-    Ok(())
+    require_current_scope_identity(db, record)
 }
 
 fn matches_read_terms(record: &Value, request: &wire::ReadRequest) -> bool {
