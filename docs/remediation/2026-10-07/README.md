@@ -2,18 +2,26 @@
 
 **Обновлено 8 октября 2026. База source review: `40591a295af94b1541ec2ba30afe8e3247701a71`.**
 
-Это единая навигация для исполнителей. Она не заменяет body и Markdown выбранного PR: перед кодом открыть **только** свой handoff, текущий diff и названные source symbols. Не читать весь master audit как рабочую инструкцию.
+Это единственная рабочая навигация для исполнителей. Она не заменяет handoff выбранного PR. Агент читает:
 
-Все ветки направлены в `main`. Один manager — один worktree. Writers получают непересекающиеся файлы, не запускают Cargo и не пушат самостоятельно. Новый DTO/helper считается поставленным только вместе с production caller в том же PR.
+```text
+этот index
+→ body своего PR
+→ один-два связанных handoff-файла
+→ текущий diff и названные source symbols
+```
 
-## 1. Текущий статус подготовки
+Не читать master audit как рабочий brief. Один manager — один worktree. Writers получают непересекающиеся файлы, не запускают Cargo и не пушат самостоятельно. Новый type/helper считается поставленным только вместе с production caller и удалением прежней ответственности.
 
-- Критический список из 22 пунктов повторно классифицирован: подтверждённые пункты имеют владельца PR; неверные формулировки Forge force-push, script.revise, generic module events и module-ready-without-hello сняты или сужены.
-- Production-код большинства блоков **ещё не изменён**. Docs CI не является Rust qualification.
-- Code-bearing candidates: compiler baseline #26, Muse #30, R10 #36 и terminal events #37. Их код нельзя объявлять готовым по старому PR body: смотреть exact current diff и CI.
-- Реестр остаточных HIGH/MED замечаний всё ещё проверяется. Аудит и подготовка **не объявлены завершёнными**; критерий завершения указан в §8.
+## 1. Текущий статус
 
-## 2. С чего начать агенту
+- Критический список повторно классифицирован: подтверждённые пункты имеют PR-владельца; неверные формулировки сняты или сужены.
+- Полный HIGH/MED appendix ещё проверяется. **Аудит и подготовка не объявлены завершёнными.**
+- Большинство веток — docs-only implementation handoff. Documentation CI не является Rust/runtime qualification.
+- Код уже есть только в отдельных старых кандидатах: #26, #30, #36, #37. Их состояние проверять по exact diff/head, а не по старому отчёту.
+- Независимые задачи Wave A/B можно реализовывать сейчас; ждать полного завершения аудита не требуется.
+
+## 2. Обязательный порядок работы агента
 
 ```sh
 git status --short
@@ -23,158 +31,210 @@ git diff --stat origin/main...HEAD
 
 Затем:
 
-1. Прочитать body своего PR и один связанный handoff-файл.
-2. Сверить названные symbols с текущим `main`; уже исправленное не переписывать.
-3. Построить один законченный producer → persisted fact → consumer путь.
-4. Подключить существующий donor/helper там, где он указан; не писать общий framework заранее.
-5. Удалить старый producer/renderer/state machine после переключения caller — не оставлять `legacy|compat|fallback` production fork без named historical reader.
-6. После полного кода manager выполняет только scoped formatting/Clippy из handoff. Broad/native/load qualification — финальная фаза.
+1. Сверить handoff с текущим `main`; уже исправленное не переписывать.
+2. Построить один законченный `producer → retained fact/intent → effect → readback → bounded projection`.
+3. Сначала использовать существующую ELIOT function/type. Donor применяется только в указанной узкой границе.
+4. Не писать общий framework до двух реальных connected callers.
+5. После переключения caller удалить прежний writer/renderer/state machine. Не оставлять постоянный `legacy/new/fallback` production fork.
+6. Unknown external effect никогда не replay-ить вслепую.
+7. Manager выполняет только scoped formatting/Clippy из handoff после полного code slice. Broad/native/load qualification — финальная фаза.
 
-## 3. Волна A — база сборки и малые shared primitives
+## 3. Wave 0 — восстановить проверяемую базу
 
-| PR | Владеет | Первый кодовый шаг | Не смешивать |
-|---|---|---|---|
-| [#26](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/26) | compiler baseline | Проверить exact текущий candidate и реальные diagnostics; один согласованный baseline | Не копировать fixes во все ветки |
-| [#63 / R39](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/63) | crash-repairable state marker | `swarm-process::state_marker` → DataRoot caller | Module lifecycle остаётся #27 |
-| [#61 / R35](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/61) | finite child, departure, bounded capture | CheckRun typed exit/departure/capture → Store cleanup-pending | Не добавлять PTY/process registry |
-| [#65 / R41](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/65) | durable file/journal primitives | torn-final-record scan verdict + atomic durable update | Retention policy остаётся #69 |
-| [#56 / R30](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/56) | one GM designation/epoch | typed current designation + Operation-derived epoch high-water | Не создавать новый IAM service |
-| [#57 / R31](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/57) | closed RuntimeCommand registry | classify known command/delivery/native-MCP phase; unknown fail closed | Application method registry #40 другой домен |
-
-Эти блоки можно вести параллельно **только** при непересекающихся files. `swarm-process` changes #61/#63/#65 интегрирует один manager последовательно.
-
-## 4. Волна B — core identity, provenance и чтения
-
-| PR | Владеет | Зависит / rebase |
+| PR | Состояние | Действие |
 |---|---|---|
-| [#53 / R27](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/53) | coalesced task.create/claim/release receipts; release CheckRun wake | До #49/#51 |
-| [#54 / R28](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/54) | `task.dispatch` start-slot reuse receipt | Один manager с #46 в `operations.rs` |
-| [#31 / R05](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/31) | result provenance, exact expected Attempt | До artifact/task read integration |
-| [#48 / R22](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/48) | requirement → exact review/check evidence | После stable CheckRun/result identities |
-| [#49 / R23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/49) | fail-closed Operation reads | Rebase after #53/#54/#56 |
-| [#51 / R25](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/51) | Task/Attempt/submission/acceptance graph reads | Reuse #49 relation resolver, no parallel IAM |
-| [#52 / R26](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/52) | artifact object grants | Reuse #31/#49/#51 provenance |
+| [#26](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/26) | code candidate | Перепроверить exact head, 18 compiler errors и текущий CI; получить один согласованный compiling baseline. Не копировать эти fixes во все ветки. |
+| [#36 / R10](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/36) | partial code | Закончить scoped Rust gate и behavior qualification exact impact/disable path. |
+| [#37 / R11](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/37) | partial code | Довести closed terminal event codec/aliases; не ослабить `authenticated_module_hello`. |
+| [#30 / R04](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/30) | partial Muse code | Исправить artifact/example mismatch, затем проверить pending inventory races. Не активировать несовпадающий package. |
+
+## 4. Wave A — малые shared primitives
+
+| PR | Владеет | Первый production seam | Не смешивать |
+|---|---|---|---|
+| [#75 / R52](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/75) | SQLite writer bootstrap | `swarm-store::open_writer_inner`: options before I/O, postconditions before commit | Не добавлять pool/retry/migration framework |
+| [#63 / R39](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/63) | crash-repairable state marker | shared `swarm-process::state_marker` → DataRoot | Module lifecycle остаётся #27 |
+| [#65 / R41](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/65) | durable create/replace/remove + torn-tail verdict | shared file primitives → OpenCode/Claude journals | Retention policy остаётся #69 |
+| [#61 / R35](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/61) | finite child/family/capture completion | CheckRun typed completion → Store cleanup-pending | Не добавлять PTY/process registry |
+| [#56 / R30](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/56) | one GM designation/epoch | typed designation + Operation-derived epoch high-water | Не создавать IAM service |
+| [#57 / R31](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/57) | closed RuntimeCommand registry | classify method/delivery/native-MCP phase; unknown fail closed | Application method registry #40 другой домен |
+
+`swarm-process` изменения #63/#65/#61 интегрирует один manager последовательно. После них rebased consumers удаляют локальные копии.
+
+## 5. Wave B — core identity, provenance и object reads
+
+| PR | Владеет | Порядок |
+|---|---|---|
+| [#53 / R27](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/53) | coalesced create/claim/release Operation scope; CheckRun release wake | До #49/#51 |
+| [#54 / R28](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/54) | `task.dispatch` start-slot reuse receipt | Один manager/rebase с #46 в `operations.rs` |
+| [#31 / R05](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/31) | result provenance, exact expected Attempt | До artifact/submission readers |
+| [#48 / R22](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/48) | Requirement → exact review/CheckRun evidence | После stable review/check identities |
+| [#49 / R23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/49) | fail-closed Operation get/list/delta | После #53/#54/#56 |
+| [#51 / R25](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/51) | Task/Attempt/submission/acceptance/check/family reads | Reuse #49 relation resolver; fleet dashboard stays bounded/global by design |
+| [#52 / R26](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/52) | artifact get/read/parts/assemble grant | Reuse #31/#49/#51 provenance |
 | [#50 / R24](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/50) | live MCP allowed-method gate | One manager/rebase with #55 |
-| [#55 / R29](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/55) | caller-owned request ID before MCP effect | Same predicate later reused by #40 |
+| [#55 / R29](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/55) | caller-owned logical request ID before effect | Same predicate later reused by #40 |
 
-Authoritative relation comes from retained columns/typed records, not handler `result_json`. Scope-specific readers do not invent a generic ACL engine.
+Authoritative object relation comes from retained columns/typed records, not handler `result_json`. Scope-specific readers do not invent a generic ACL engine.
 
-## 5. Волна C — coordination, review и frontend
+## 6. Wave C — coordination, review и frontend
 
-| PR | Владеет | Реализация |
+| PR | Владеет | Порядок/граница |
 |---|---|---|
 | [#32 / R06](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/32) | one work context, registration/fingerprint, code-scope | Existing `ScopeData`; no second context framework |
-| [#58 / R32](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/58) | canonical contract proposal + ratify/reject | After #56 and shared context #32 |
-| [#34 / R08](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/34) | delivery identity/order, mailbox cursor, watch, subscription cutoff | One digest producer; fail-closed delivery lookup; AUTOINCREMENT sequence |
-| [#35 / R09](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/35) | review assignment/replacement/late result + exact link | Correction package is #47 |
-| [#47 / R21](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/47) | multi-finding `CorrectionPackageV1` | Rebase after #35; one package → one feedback/send |
-| [#33 / R07](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/33) | Concilium terminal/advisory contract | No model-driven consensus/acceptance |
-| [#40 / R14](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/40) | data-only frontend/method/schema extraction | После method additions и #50/#55; cache schema bytes, not authority |
+| [#58 / R32](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/58) | canonical proposal digest + ratify/reject | После #56 and shared context #32 |
+| [#34 / R08](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/34) | delivery identity/order, mailbox cursor, watch, subscription cutoff | One digest producer; collision-safe lookup; monotonic sequence |
+| [#35 / R09](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/35) | review assignment replacement, late result, exact link | Correction package отдельно #47 |
+| [#47 / R21](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/47) | multi-finding `CorrectionPackageV1` | После #35; one package → one feedback/send |
+| [#33 / R07](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/33) | contract/Concilium terminal/advisory path and exact ScriptRun source proof | После #56/#58; no model consensus authority |
+| [#40 / R14](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/40) | data-only frontend/method/schema extraction | Последним после changing method forms and #50/#55 |
 
-File ownership:
+Shared-file serialization:
 
 ```text
-store/coordination.rs: #32 context, #58 contract decisions, #34 delivery seams, #35 review seams
-store/code_scopes.rs: #32 identity/accept, #39 resource collision consumers
-MCP/CLI schemas: domain PR first; extraction #40 last
+store/coordination.rs: #32 → #58 → #34/#35 narrow seams
+store/code_scopes.rs: #32 → #58/#39 consumers
+MCP/CLI schemas: domain PR first → #40 extraction last
 ```
 
-## 6. Волна D — automation, scheduler, resources и local effects
+## 7. Wave D — automation, scheduler, launcher и resources
 
-| PR | Владеет | Главное упрощение |
+| PR | Владеет | Главное удаление/переиспользование |
 |---|---|---|
-| [#60 / R34](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/60) | poison-fact isolation and per-domain transactions | One private `Applied/Pending/Skipped/Quarantined`; no second DLQ |
-| [#68 / R45](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/68) | truthful automatic-effect terminal states | One row/state loader; domain evidence remains domain-specific |
-| [#38 / R12](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/38) | due-source sequencing, pacing, issuance, DST instant boundary | UTC floor before timezone; no cron engine |
-| [#64 / R40](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/64) | typed provider condition + route launch gate | Native evidence → one Store fact → launch/WorkDispatch gate |
-| [#39 / R13](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/39) | capacity/resource/workspace fences | Malformed ≠ empty; exact lease/owner; no donor registry |
-| [#62 / R38](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/62) | resumable Git-hook install/revoke | One phased manifest; consume #61 finite process |
-| [#67 / R44](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/67) | ScriptRun start allow/deny race | One immutable start decision; remove competing files |
+| [#60 / R34](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/60) | poison-fact isolation, per-domain transactions | One private `Applied/Pending/Skipped/Quarantined`; no second DLQ |
+| [#68 / R45](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/68) | truthful automatic-effect states + exact Forge ref CAS | One lifecycle parser; delete divergent local state allowlists |
+| [#38 / R12](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/38) | due-source sequencing, pacing, issuance, DST | UTC floor before timezone; no cron engine |
+| [#74 / R51](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/74) | complete launch-plan authority separate from bounded preview | Delete preview-as-effect-authority and duplicate WorkDispatch plan |
+| [#64 / R40](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/64) | typed provider condition + route launch gate | Native fact → one Store row → one final admission helper |
+| [#39 / R13](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/39) | capacity/resource/workspace/owned-service fences | Malformed ≠ empty; exact lease lineage; delete broad Task-wide holds |
+| [#62 / R38](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/62) | resumable Git-hook install/revoke and reachable emit | One phased manifest; consume #61 finite process and #65 durable files |
+| [#67 / R44](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/67) | ScriptRun start allow/deny race | One immutable start decision; delete competing go/deny writers |
 
-Order inside shared automation files:
+Safe order in shared automation/launcher files:
 
 ```text
 #60 poison isolation
-→ #68 terminal classification
-→ #38 scheduler pacing/source integration
-→ #64 launch condition
+→ #68 terminal state vocabulary
+→ #38 scheduler pacing
+→ #74 complete plan authority
+→ #64 provider gate
+→ #39 resource/release predicates
 ```
 
-Do not run parallel writers in the same large Store file. Rebase one completed vertical slice at a time.
+One completed vertical slice at a time; no parallel global refactor in the same Store file.
 
-## 7. Волна E — module lifecycle and adapters
+## 8. Wave E — host/module lifecycle
 
-### Host/module lifecycle
+| PR | Владеет | Зависимости |
+|---|---|---|
+| [#27 / R01](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/27) | exact module owner handoff, worker/hello readiness, bounded replacement | Consume #63/#61 shared primitives |
+| [#71 / R48](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/71) | optional bus/scheduler supervisors, scoped isolation, receipt closure | Rebase on #27/#61 |
+| [#72 / R49](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/72) | Zed one-shot process ownership, durable controls, exhaustive command intake | Rebase on #61/#65; no persistent-session redesign |
+| [#37 / R11](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/37) | closed terminal event codec/aliases/secondary codes | Preserve exact hello-gated Ready proof |
 
-| PR | Владеет |
-|---|---|
-| [#27 / R01](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/27) | birth identity, prior owner, worker receipt fan-in, same-boot status, installed/source separation |
-| [#37 / R11](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/37) | closed terminal event codec, aliases, secondary codes |
-| [#63 / R39](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/63) | marker acquisition only |
+`ProcessRunning/Ready` remains gated by Store-confirmed exact `module.hello`. Spawn/process presence is never readiness proof.
 
-`ProcessRunning/Ready` remains gated by exact Store-confirmed `module.hello`; spawn/process presence is not Ready. Do not redesign this proof.
+## 9. Wave F — adapters and native services
 
 ### Codex
 
-| PR | Scope |
-|---|---|
-| [#29 / R03](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/29) | exact steer without full history preflight; ACK ≠ persisted input |
-| [#41 / R15](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/41) | continuous reader + Codex/Muse usage facts |
-| [#66 / R43](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/66) | one current Codex goal controller, historical decoder only |
+| PR | Scope | Order |
+|---|---|---|
+| [#29 / R03](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/29) | provisional thread candidate → exact Active root; steer without full-history preflight | Root classifier/adoption first |
+| [#41 / R15](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/41) | continuous read-pump + Codex/Muse usage facts | Must not project provisional root as live |
+| [#66 / R43](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/66) | one current Codex Goal controller | Reuse #29 Active-root predicate |
 
 ### OpenCode
 
+| PR | Scope | Order |
+|---|---|---|
+| [#65 / R41](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/65) | durable journal/file seam | First |
+| [#28 / R02](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/28) | recovery/outbox/IPC/result paging/owner lifetime | Rebase on #65/#27/#61 |
+| [#43 / R17](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/43) | queue/loop-step, forms, permissions, background, durable log | After recovery seam |
+| [#69 / R46](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/69) | acknowledged journal retention | Last; only exact releasable evidence |
+
+### Claude
+
+| PR | Scope | Order |
+|---|---|---|
+| [#65 / R41](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/65) | durable journal/file seam | First |
+| [#42 / R16](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/42) | permission/reply/defer + terminal harness retirement + intent-once result Unknown | Consume #27/#61; no same-process root reopen |
+| [#69 / R46](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/69) | acknowledged journal retention | After exact lifecycle semantics |
+
+### Muse / Command / Antigravity / OpenCodex
+
+| PR | Scope | Order |
+|---|---|---|
+| [#30 / R04](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/30) | Muse pending inventory freshness | Resolve artifact/example mismatch, then behavior qualification |
+| [#44 / R18](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/44) | Command ACP session/permissions/recovery | One manager with #70; consume #57/#61 |
+| [#70 / R47](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/70) | release Command captures only after result artifact persistence | After #44 and #65 |
+| [#45 / R19](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/45) | Antigravity warm stream/model/one-turn/cumulative usage | Adapter semantics first |
+| [#73 / R50](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/73) | OpenCodex positive effect verification | New artifact; no session/execution ownership |
+| [#46 / R20](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/46) | Store-owned compact Task prompt | Migrate each adapter only after its behavior branch stabilizes |
+
+## 10. Documentation/donor program
+
 | PR | Scope |
 |---|---|
-| [#28 / R02](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/28) | recovery/outbox/IPC/EOF/owner lifetime |
-| [#43 / R17](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/43) | queue/loop-step, forms, permissions, background, durable log |
-| [#65 / R41](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/65) | shared torn-tail/file seam |
-| [#69 / R46](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/69) | acknowledged journal retention |
+| [#59 / R33/R36/R37](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/59) | 31 verified donors, field failures, reuse boundaries and implementation cards. Docs only; no dependency is automatically approved. |
+| [#24](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/24) | Separate local-model/Kilo/vLLM design program on older base. Not part of the audit implementation order; rebase/re-evaluate separately before use. |
 
-### Muse / Claude / Command / Antigravity
+## 11. Shared-file locks and rebase rules
 
-| PR | Scope |
-|---|---|
-| [#30 / R04](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/30) | Muse pending-request freshness; existing code candidate requires exact recheck |
-| [#42 / R16](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/42) | Claude live callback/defer/reply, auth and permission semantics |
-| [#44 / R18](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/44) | Command ACP owned transport/session/permissions/subagents |
-| [#70 / R47](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/70) | Command capture release only after result artifact persistence |
-| [#45 / R19](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/45) | Antigravity warm stream/model/one-turn/cumulative usage |
-| [#46 / R20](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/46) | Store-owned compact Task prompt shared by new artifacts |
+```text
+swarm-process / process family:
+  #63 + #65 + #61 by one serialized manager
+  → #27
+  → #71/#72/#28/#42/#44 consumers
 
-Conflict rules:
+store/mod.rs and authority:
+  #56
+  → #53/#54
+  → #49/#51/#52
+  #50 + #55 by one manager
+  → #40 extraction
 
-- #46 migrates adapters only after each adapter branch stabilizes; adapter-local Task renderer is not improved independently.
-- #65 file primitives land before #28/#42 journal recovery; #69 retention follows both.
-- #44/#70 share Command files and one manager.
-- #61 owns finite child/capture; adapters and hook Git consume it, not copy it.
+coordination:
+  #32
+  → #58
+  → #33/#34/#35 narrow consumers
+  → #47 correction package
 
-## 8. Когда аудит и подготовка считаются завершёнными
+launcher/work-dispatch/resources:
+  #60 → #68 → #38 → #74 → #64 → #39
 
-Я сообщу владельцу о завершении только когда одновременно выполнено:
+adapter prompt migration:
+  #29/#28/#43/#42/#44/#45 behavior first
+  → #46 TaskPrompt migration
+```
 
-1. **Critical coverage:** каждый пункт критического списка имеет source verdict `confirmed/refuted/conditional`, точного владельца или explicit owner decision. Это сейчас выполнено на уровне аудита.
-2. **High coverage:** каждый HIGH из полного приложения повторно traced; он либо включён в существующий PR, либо опровергнут с producer→consumer evidence. Это ещё не закончено.
-3. **Systemic classes:** poison, transient/terminal slots, unbounded waits, retention, single-writer/load и method/schema duplication имеют одного владельца и test strategy. Single-writer/load qualification и часть test-vacuum defects ещё требуют handoff.
-4. **No orphan finding:** ни один confirmed material finding не остаётся только строкой master audit без PR/decision.
-5. **No contradictory handoffs:** совпадающие files/symbols имеют один order/rebase owner; stale instructions удалены, а не дополнены второй policy.
-6. **Implementation-ready shape:** каждый PR называет exact symbols, existing helpers/donors, минимальный новый type, deletion list, public-path tests и scoped gate.
-7. **Closure pass against current main:** после последнего audit change повторно проверить изменившийся `main`, закрытые/merged PR и source drift.
-8. **One current index:** эта карта и master audit отражают фактические открытые PR; obsolete private snapshots/duplicate source plans помечены к удалению после landed code.
+A blocked consumer rebases on the shared owner. It does not create a local duplicate to avoid waiting.
 
-До выполнения всех восьми условий аудит продолжается. Независимые Wave A/B задачи уже можно реализовывать — полное завершение аудита не является глобальной блокировкой.
+## 12. Когда аудит и подготовка завершены
 
-## 9. Проверка и сдача любого PR
+Я сообщу владельцу **«аудит и подготовка завершены»** только когда одновременно выполнено:
 
-Сдача в body/comment:
+1. Каждый critical имеет source verdict и PR/explicit decision — выполнено на уровне аудита.
+2. Каждый HIGH полного приложения повторно traced и owned/refuted — ещё не выполнено.
+3. Каждый systemic class имеет одного владельца и test strategy — single-writer/load и часть test-vacuum ещё проверяются.
+4. Ни один confirmed material finding не остаётся только в master audit.
+5. Нет противоречивых handoff на общих symbols/files.
+6. Каждый PR содержит exact symbols, reuse, минимальный type, deletion list, public-path tests и scoped gate.
+7. Выполнен финальный drift pass по актуальному `main` и состоянию merged/closed PR.
+8. Этот index и master audit соответствуют фактическим открытым PR.
+
+До выполнения восьми условий аудит продолжается. Wave A/B можно реализовывать сейчас.
+
+## 13. Сдача любого implementation PR
 
 ```text
 base SHA
 candidate SHA
 producer → persisted fact → consumer
-удалённые старые paths
-scoped command + exit/result
-не выполненные native/full/load checks
+existing helpers/donors reused
+old paths deleted
+scoped command + actual result
+native/full/load checks not executed
 ```
 
-Docs CI подтверждает только Markdown/diff. Rust implementation готова лишь после scoped warnings-denied Clippy указанного handoff. Broad tests/native/account calls — финальная фаза, не writer task.
+Docs CI подтверждает только Markdown/diff. Runtime implementation готова только после связанного production caller, scoped warnings-denied Clippy и названных public-path fixtures. Broad/native/account/load qualification — финальная фаза.
