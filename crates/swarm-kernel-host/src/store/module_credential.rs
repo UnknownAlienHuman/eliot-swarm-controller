@@ -19,30 +19,15 @@ use std::{
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
 };
-use swarm_contracts::module_catalog::{ArtifactIdentity, ModuleId, ProtectedRef, ProtocolVersion};
+use swarm_contracts::{
+    module_catalog::{ArtifactIdentity, ModuleId, ProtectedRef, ProtocolVersion},
+    module_command::MODULE_COMMAND_METHODS,
+};
 
 const PROVISION_KEY: &str = "module_credential_provision";
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 4 * 1024;
 const PENDING_OPERATION_STATES: [&str; 4] =
     ["queued", "sending", "native_accepted", "outcome_unknown"];
-const MODULE_OPERATIONS: [&str; 15] = [
-    "agent.open",
-    "task.dispatch",
-    "agent.send",
-    "agent.reply",
-    "agent.configure",
-    "agent.goal",
-    "agent.background",
-    "agent.refresh",
-    "agent.reconcile",
-    "agent.result",
-    "agent.recover",
-    "native.mcp.install",
-    "native.mcp.observe",
-    "native.mcp.arm",
-    "native.mcp.read",
-];
-
 /// A host-only proof that the exact retained binding credential exists and is
 /// registered. This DTO deliberately has no token or token-hash field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,7 +205,7 @@ fn resolve_scope(
     let method = operation["method"].as_str().unwrap_or_default();
     let state = operation["state"].as_str().unwrap_or_default();
     let settled_open_anchor = method == "agent.open" && state == "settled";
-    if !MODULE_OPERATIONS.contains(&method)
+    if !MODULE_COMMAND_METHODS.contains(&method)
         || (!PENDING_OPERATION_STATES.contains(&state) && !settled_open_anchor)
     {
         return Err(Error::new(

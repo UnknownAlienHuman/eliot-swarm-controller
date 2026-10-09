@@ -8,6 +8,7 @@ pub mod error;
 pub mod mcp_frontend;
 pub mod method_policy;
 pub mod module_catalog;
+pub mod module_command;
 
 pub mod module_contract;
 /// Store-admitted native MCP command DTO and method declarations.
