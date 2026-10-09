@@ -662,15 +662,12 @@ impl NativeClient {
                 ));
             }
             for message in page.data {
-                let id = message
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "NATIVE_MESSAGE_SCHEMA",
-                            "native message lacks its exact identity",
-                        )
-                    })?;
+                let id = message.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_MESSAGE_SCHEMA",
+                        "native message lacks its exact identity",
+                    )
+                })?;
                 valid_id(id, "msg_")?;
                 if !ids.insert(id.to_owned()) {
                     return Err(Error::new(
@@ -679,13 +676,7 @@ impl NativeClient {
                     ));
                 }
                 if id == input_id {
-                    if !saved_message_matches(
-                        &message,
-                        session,
-                        input_id,
-                        &intent.marker,
-                        intent,
-                    ) {
+                    if !saved_message_matches(&message, session, input_id, &intent.marker, intent) {
                         return Err(Error::new(
                             "NATIVE_INPUT_MISMATCH",
                             "native user message differs from the exact admitted input",
@@ -704,11 +695,15 @@ impl NativeClient {
                 }
             }
             match page.cursor.next {
-                None => break,
+                None => {
+                    // `cursor` names the page request, not unfinished work.
+                    // Clear a prior-page cursor when this page proves EOF so a
+                    // completed multi-page scan is not reported as limit exhaustion.
+                    cursor = None;
+                    break;
+                }
                 Some(next)
-                    if !next.is_empty()
-                        && next.len() <= 4096
-                        && cursors.insert(next.clone()) =>
+                    if !next.is_empty() && next.len() <= 4096 && cursors.insert(next.clone()) =>
                 {
                     cursor = Some(next);
                 }
@@ -1591,7 +1586,10 @@ fn validate_assistant_parent(message: &Value, session: &str, input_id: &str) -> 
             "selected native message is not an assistant projection",
         ));
     }
-    if message.get("sessionID").is_some_and(|value| value != session) {
+    if message
+        .get("sessionID")
+        .is_some_and(|value| value != session)
+    {
         return Err(Error::new(
             "NATIVE_ASSISTANT_SESSION_MISMATCH",
             "selected assistant message names another native session",
@@ -1616,7 +1614,10 @@ fn validate_assistant_parent(message: &Value, session: &str, input_id: &str) -> 
         .as_f64()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .ok_or_else(|| {
-            Error::new("NATIVE_ASSISTANT_SCHEMA", "assistant creation time is invalid")
+            Error::new(
+                "NATIVE_ASSISTANT_SCHEMA",
+                "assistant creation time is invalid",
+            )
         })?;
     message["time"]["completed"]
         .as_f64()
