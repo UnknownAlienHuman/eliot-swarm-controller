@@ -2107,7 +2107,7 @@ fn lower_hex_nibble(byte: u8) -> Option<u8> {
 fn participant_client_id_from_index_key(prefix: &str, key: &str) -> Result<String> {
     let encoded = key
         .strip_prefix(prefix)
-        .filter(|encoded| !encoded.is_empty() && encoded.len() % 2 == 0)
+        .filter(|encoded| !encoded.is_empty() && encoded.len().is_multiple_of(2))
         .ok_or_else(|| {
             Error::new(
                 "COORDINATION_INDEX_CORRUPT",
@@ -2160,7 +2160,7 @@ fn list_participant_page(
     let upper = format!("{prefix}g");
     let (lower, exclusive) = match after_client_id {
         Some(client_id) => (format!("{prefix}{}", keys::key_component(client_id)), true),
-        None => (prefix, false),
+        None => (prefix.clone(), false),
     };
     let comparison = if exclusive { ">" } else { ">=" };
     let sql = format!(
