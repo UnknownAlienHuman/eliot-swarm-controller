@@ -103,19 +103,18 @@ pub fn acquire_state_marker(
 
     let stored = read_bounded(&mut file, expected_marker.len() + 1)?;
     let marker_only = directory_contains_only(&directory, marker_name)?;
-    let repairable_prefix =
-        stored.len() < expected_marker.len() && expected_marker.starts_with(&stored) && marker_only;
-    let repaired = if stored == expected_marker {
-        false
-    } else if repairable_prefix {
+    let repairable_prefix = stored.len() < expected_marker.len()
+        && expected_marker.starts_with(&stored)
+        && marker_only;
+    if stored != expected_marker {
+        if !repairable_prefix {
+            return Err(StateMarkerError::InvalidMarker);
+        }
         repair_marker(&mut file, expected_marker)?;
-        true
-    } else {
-        return Err(StateMarkerError::InvalidMarker);
-    };
+    }
 
     private_permissions(&marker_path, false).map_err(StateMarkerError::System)?;
-    if fresh_candidate || repaired || marker_only {
+    if fresh_candidate || marker_only {
         // Syncing an exact marker-only directory also closes the window where
         // another process wrote the marker but died before syncing the parent.
         sync_directory(&directory)?;
@@ -140,7 +139,10 @@ fn validate_inputs(
         components.next(),
         Some(Component::Normal(name)) if !name.is_empty() && name_path.as_os_str() == name
     ) && components.next().is_none();
-    if !valid_name || expected_marker.is_empty() || expected_marker.len() > MAX_MARKER_BYTES {
+    if !valid_name
+        || expected_marker.is_empty()
+        || expected_marker.len() > MAX_MARKER_BYTES
+    {
         return Err(StateMarkerError::System(Error::invalid(
             "state marker name or bytes are invalid",
         )));
