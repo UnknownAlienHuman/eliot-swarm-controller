@@ -316,6 +316,10 @@ pub(crate) fn current_scope_revisions(
             .as_i64()
             .is_some_and(|expires| expires <= now)
         {
+            // Expiry makes an advisory scope unusable, but it does not prove
+            // the retained active writer was explicitly released or otherwise
+            // disposed. Omit the stale scope revision and fail coverage closed.
+            gaps.push("active_scope_expired_without_release".to_owned());
             continue;
         }
         items.push(scope_revision_ref(&record));
