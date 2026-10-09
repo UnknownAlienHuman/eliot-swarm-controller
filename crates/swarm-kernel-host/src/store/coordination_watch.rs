@@ -180,7 +180,10 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
             continue;
         }
         let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
-        let deadline_boundary = record["watch_kind"] == "exact_deadline_reached";
+        let deadline_boundary = record["watch_kind"] == "exact_deadline_reached"
+            && record["address"]["expected_deadline_ms"]
+                .as_i64()
+                .is_some_and(|deadline| expires_at_ms >= deadline);
         if !deadline_boundary && expires_at_ms <= now {
             settle_record(tx, &mut record, "expired", now)?;
             expired += 1;
