@@ -2,7 +2,7 @@
 
 use std::{env, path::PathBuf, time::Duration};
 use swarm_automation::{
-    ADMIT_METHOD, DuePage, PAGE_METHOD, READY_FRAME, WorkerConfig, has_due_source,
+    ADMIT_METHOD, DuePage, DueSourceKind, PAGE_METHOD, READY_FRAME, WorkerConfig, has_due_source,
     read_worker_config_file, wait_ms,
 };
 use swarm_client::{Client, IpcConfig};
@@ -11,6 +11,60 @@ use swarm_contracts::{
     error::{Error, Result},
 };
 use tokio::time::sleep;
+
+const INITIAL_NO_PROGRESS_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_NO_PROGRESS_BACKOFF: Duration = Duration::from_secs(30);
+
+/// One worker-local pacing state for page-read failures, stale admission and
+/// unchanged authoritative readback. Source cursor digests identify retained
+/// Store facts; wall-clock due transitions do not reset accumulated pacing.
+struct NoProgressBackoff {
+    delay: Duration,
+    last_source_progress: Option<Vec<(DueSourceKind, String)>>,
+    awaiting_readback_sha256: Option<String>,
+}
+
+impl NoProgressBackoff {
+    fn new() -> Self {
+        Self {
+            delay: INITIAL_NO_PROGRESS_BACKOFF,
+            last_source_progress: None,
+            awaiting_readback_sha256: None,
+        }
+    }
+
+    fn note_admission_attempt(&mut self, snapshot_sha256: &str) {
+        self.awaiting_readback_sha256 = Some(snapshot_sha256.to_owned());
+    }
+
+    /// Return a delay only when the authoritative page still represents the
+    /// exact cut submitted by the preceding admission attempt. A new cut can
+    /// be considered immediately, but only changed retained cursor identities
+    /// reset the accumulated delay.
+    fn observe_page(&mut self, page: &DuePage) -> Option<Duration> {
+        let mut source_progress = page
+            .sources
+            .iter()
+            .map(|source| (source.kind, source.cursor_digest.clone()))
+            .collect::<Vec<_>>();
+        source_progress.sort_by_key(|(kind, _)| *kind);
+        let progressed = self.last_source_progress.as_ref() != Some(&source_progress);
+        self.last_source_progress = Some(source_progress);
+        if progressed {
+            self.delay = INITIAL_NO_PROGRESS_BACKOFF;
+        }
+        match self.awaiting_readback_sha256.take() {
+            Some(expected) if expected == page.snapshot_sha256 => Some(self.next_delay()),
+            Some(_) | None => None,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let current = self.delay;
+        self.delay = self.delay.saturating_mul(2).min(MAX_NO_PROGRESS_BACKOFF);
+        current
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -67,6 +121,7 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
     // no action-specific task or client retry loop is created.
     let signal = tokio::signal::ctrl_c();
     tokio::pin!(signal);
+    let mut pacing = NoProgressBackoff::new();
     loop {
         let page_result = tokio::select! {
             result = &mut signal => {
@@ -78,11 +133,19 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
         let page = match page_result {
             Ok(page) => page,
             Err(error) if retryable(&error.code) => {
+                let delay = pacing.next_delay();
                 eprintln!(
-                    "swarm-automation-worker: {}; rereading Store page",
-                    error.code
+                    "swarm-automation-worker: {}; Store page retry in {} ms",
+                    error.code,
+                    delay.as_millis()
                 );
-                sleep(Duration::from_millis(1_000)).await;
+                tokio::select! {
+                    result = &mut signal => {
+                        result.map_err(|_| Error::new("AUTOMATION_WORKER_SIGNAL_FAILED", "shutdown signal could not be read"))?;
+                        return Ok(());
+                    }
+                    _ = sleep(delay) => {}
+                }
                 continue;
             }
             Err(error) => return Err(error),
@@ -93,6 +156,19 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
                 "Store returned an invalid scheduler page",
             )
         })?;
+        if let Some(delay) = pacing.observe_page(&page) {
+            eprintln!(
+                "swarm-automation-worker: Store cut unchanged; admission retry in {} ms",
+                delay.as_millis()
+            );
+            tokio::select! {
+                result = &mut signal => {
+                    result.map_err(|_| Error::new("AUTOMATION_WORKER_SIGNAL_FAILED", "shutdown signal could not be read"))?;
+                    return Ok(());
+                }
+                _ = sleep(delay) => {}
+            }
+        }
         if has_due_source(&page) {
             let params = page.admit_params().map_err(|_| {
                 Error::new(
@@ -100,6 +176,7 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
                     "scheduler page could not form a bounded admission request",
                 )
             })?;
+            pacing.note_admission_attempt(&page.snapshot_sha256);
             let result = tokio::select! {
                 signal_result = &mut signal => {
                     signal_result.map_err(|_| Error::new("AUTOMATION_WORKER_SIGNAL_FAILED", "shutdown signal could not be read"))?;
@@ -109,16 +186,9 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
             };
             match result {
                 Ok(value) if valid_admit_receipt(&value, &config.scope) => {
-                    if value["disposition"] == "reconcilers_completed"
-                        && value["next_due_at_ms"]
-                            .as_i64()
-                            .is_some_and(|due| due <= page.observed_at_ms)
-                    {
-                        // A retained pending cause can remain due after the
-                        // Store records its reason. Bound the shared pulse so
-                        // it does not spin while the legacy reader reconciles.
-                        sleep(Duration::from_millis(250)).await;
-                    }
+                    // Always read the authoritative page before another
+                    // admission. Source cursor progress resets pacing; an
+                    // unchanged exact cut receives the shared backoff.
                     continue;
                 }
                 Ok(_) => {
@@ -132,7 +202,7 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
                 // each domain's stable slot/receipt coalesces a committed cut.
                 Err(error) if retryable(&error.code) || error.code == "AUTOMATION_PAGE_STALE" => {
                     eprintln!(
-                        "swarm-automation-worker: {}; rereading Store page",
+                        "swarm-automation-worker: {}; rereading Store page before retry",
                         error.code
                     );
                     continue;
