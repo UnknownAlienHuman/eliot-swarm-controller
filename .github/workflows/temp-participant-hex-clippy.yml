@@ -1,0 +1,47 @@
+name: Temporary participant hex Clippy fix
+
+on:
+  push:
+    branches:
+      - fix/participant-page-scan-cursor
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/participant-page-scan-cursor
+          fetch-depth: 0
+      - name: Install pinned rustfmt
+        shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
+      - name: Use fixed-size byte chunks
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/swarm-kernel-host/src/store/coordination.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "    for pair in encoded.as_bytes().chunks_exact(2) {\n"
+          new = "    for pair in encoded.as_bytes().as_chunks::<2>().0 {\n"
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected one participant hex loop, found {count}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          rustfmt +1.98.1 --edition 2024 crates/swarm-kernel-host/src/store/coordination.rs
+      - name: Commit patch and remove temporary workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/temp-participant-hex-clippy.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/swarm-kernel-host/src/store/coordination.rs
+          git diff --cached --check
+          git commit -m "fix: use fixed-size participant key chunks"
+          git push origin HEAD:fix/participant-page-scan-cursor
