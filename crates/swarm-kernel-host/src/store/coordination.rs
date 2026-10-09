@@ -2136,6 +2136,12 @@ fn participant_client_id_from_index_key(prefix: &str, key: &str) -> Result<Strin
             "participant index key does not encode a UTF-8 client identity",
         )
     })?;
+    if client_id.len() > 256 {
+        return Err(Error::new(
+            "COORDINATION_INDEX_CORRUPT",
+            "participant index identity cannot be represented by after_client_id",
+        ));
+    }
     if keys::key_component(&client_id) != encoded {
         return Err(Error::new(
             "COORDINATION_INDEX_CORRUPT",
