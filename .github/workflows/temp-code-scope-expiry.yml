@@ -27,20 +27,22 @@ jobs:
 
           path = Path("crates/swarm-kernel-host/src/store/code_scopes.rs")
           text = path.read_text(encoding="utf-8")
-          old = '''    coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;
-    let accepted_mode = request
-'''
-          new = '''    coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;
-    if request
-        .expires_at_ms
-        .is_some_and(|expires_at_ms| expires_at_ms <= now)
-    {
-        return Err(Error::invalid(
-            "expires_at_ms must be later than the acceptance time",
-        ));
-    }
-    let accepted_mode = request
-'''
+          old = (
+              "    coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;\n"
+              "    let accepted_mode = request\n"
+          )
+          new = (
+              "    coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;\n"
+              "    if request\n"
+              "        .expires_at_ms\n"
+              "        .is_some_and(|expires_at_ms| expires_at_ms <= now)\n"
+              "    {\n"
+              "        return Err(Error::invalid(\n"
+              "            \"expires_at_ms must be later than the acceptance time\",\n"
+              "        ));\n"
+              "    }\n"
+              "    let accepted_mode = request\n"
+          )
           count = text.count(old)
           if count != 1:
               raise SystemExit(f"expected one accept boundary, found {count}")
