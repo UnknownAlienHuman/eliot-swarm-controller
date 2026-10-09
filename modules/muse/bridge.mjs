@@ -33,6 +33,7 @@ if (argv.length !== 2 || argv[0] !== '--config') {
 const config = JSON.parse(await readFile(argv[1], 'utf8'));
 const credential = JSON.parse(await readFile(required(config, 'credentialFile'), 'utf8'));
 required(config, 'endpoint'); required(config, 'command'); required(config, 'moduleArtifactId');
+if (config.moduleArtifactId !== 'muse-sdk-1.3.0-bridge.8') throw new Error('MODULE_ARTIFACT_MISMATCH');
 if (!path.isAbsolute(config.command)) throw new Error('NATIVE_EXECUTABLE_MUST_BE_ABSOLUTE');
 if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(config.command)) throw new Error('USE_NATIVE_EXE_NOT_SHELL_WRAPPER');
 if (!Array.isArray(config.args) || config.args.some(a => typeof a !== 'string')) throw new Error('EXPLICIT_ARGV_REQUIRED');
@@ -109,6 +110,46 @@ function invalidateChildSnapshot(id, reason) {
   changed();
   return true;
 }
+function sessionChanged(sessionId, reason = 'native_event_after_read') {
+  if (typeof sessionId !== 'string' || !sessionId) return;
+  sessionVersions.set(sessionId, (sessionVersions.get(sessionId)??0)+1);
+  invalidateChildSnapshot(sessionId, reason);
+}
+function pendingRequestKey(sessionId, kind, requestId) {
+  if (typeof sessionId !== 'string' || !sessionId) throw new Error('PENDING_REQUEST_SESSION_REQUIRED');
+  if (!['approval','input'].includes(kind)) throw new Error('PENDING_REQUEST_KIND_INVALID');
+  if (typeof requestId !== 'string' || !requestId) throw new Error('PENDING_REQUEST_ID_REQUIRED');
+  // Native request IDs are scoped by their session on every reply/read API.
+  // Do not let a root and child overwrite one another in the bridge inventory.
+  return JSON.stringify([sessionId,kind,requestId]);
+}
+function recordPendingRequestGap(gap) {
+  const retained=Array.isArray(latest.pending_request_gaps)?latest.pending_request_gaps:[];
+  latest.pending_request_gaps=[...retained.slice(-31),gap];
+  latest.gaps++;
+  changed();
+}
+function replacePendingInventory(sessionId, inventory, expectedVersion) {
+  if (!Array.isArray(inventory?.approvals) || !Array.isArray(inventory?.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
+  // Validate the entire point-in-time inventory before removing live facts.
+  // This synchronous commit cannot interleave with a native event handler.
+  const replacement = new Map();
+  for (const [items, prefix, idField, method] of [
+    [inventory.approvals, 'approval', 'approvalId', 'approval/request'],
+    [inventory.userInputs, 'input', 'userInputId', 'userInput/request'],
+  ]) {
+    for (const params of items) {
+      if (params?.sessionId !== sessionId) throw new Error('PENDING_INVENTORY_IDENTITY_MISMATCH');
+      const key = pendingRequestKey(sessionId, prefix, required(params,idField));
+      if (replacement.has(key)) throw new Error('PENDING_INVENTORY_DUPLICATE_ID');
+      replacement.set(key, {view:{method,params}});
+    }
+  }
+  if (expectedVersion !== (sessionVersions.get(sessionId)??0)) return false;
+  for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId === sessionId) pendingRequests.delete(key);
+  for (const [key, entry] of replacement) pendingRequests.set(key, entry);
+  return true;
+}
 function observation() {
   return { ...latest, native_root_id:rootId, native_scope_key:nativeScope,
     observed_children:[...children.values()], pending_requests:[...pendingRequests.values()].map(x=>x.view),
@@ -119,12 +160,9 @@ function onNotification(n) {
   // Do not duplicate token streams, tool output or the SDK's full transcript.
   if (n.method === 'item/delta') return;
   eventsSeen++;
-  if (p.sessionId) sessionVersions.set(p.sessionId, (sessionVersions.get(p.sessionId)??0)+1);
-  if (p.sessionId && children.has(p.sessionId)) {
-    invalidateChildSnapshot(p.sessionId,
-      n.method==='view/gap'||n.method==='session/viewHealthChanged'
-        ?'native_view_gap_after_read':'native_event_after_read');
-  }
+  sessionChanged(p.sessionId,
+    n.method==='view/gap'||n.method==='session/viewHealthChanged'
+      ?'native_view_gap_after_read':'native_event_after_read');
   // A correlated event can resolve a lost turn admission reply. It never
   // submits another prompt and never claims that the Task was accepted.
   const inputCommand = p.commandId ?? p.item?.commandId;
@@ -199,13 +237,30 @@ function onNotification(n) {
     for (const entry of nativePending.values()) acceptModel(entry, p, {method:n.method,viewCursor:p.viewCursor,sourceRange:p.sourceRange});
   }
   if (n.method === 'approval/requested' || n.method === 'approval/updated' || n.method === 'userInput/requested') {
-    const key = p.approvalId ? `approval:${p.approvalId}` : `input:${p.userInputId}`;
-    pendingRequests.set(key, {view:{method:n.method,params:p}});
+    const sessionId=required(p,'sessionId');
+    const kind=n.method.startsWith('approval/')?'approval':'input';
+    const requestId=kind==='approval'?required(p,'approvalId'):required(p,'userInputId');
+    const key=pendingRequestKey(sessionId,kind,requestId);
+    let params=p;
+    if (n.method === 'approval/updated') {
+      const previous=pendingRequests.get(key)?.view.params;
+      // An update contains stage fields, not the original actionable request.
+      // Preserve the gap rather than fabricating tool/request identity.
+      if (!previous || previous.sessionId !== sessionId) {
+        recordPendingRequestGap({code:'PENDING_APPROVAL_UPDATE_WITHOUT_REQUEST',session_id:sessionId,
+          approval_id:requestId,current_requirement_id:p.currentRequirementId??null,view_cursor:p.viewCursor??null});
+        return;
+      }
+      params={...previous,...p};
+      if (p.subagentOrigin === undefined) delete params.subagentOrigin;
+    }
+    pendingRequests.set(key,{view:{method:n.method,params}});
   }
   if (n.method === 'approval/resolved' || n.method === 'userInput/settled') {
-    for (const [key,entry] of pendingRequests) {
-      if (entry.view.params?.approvalId === p.approvalId && p.approvalId || entry.view.params?.userInputId === p.userInputId && p.userInputId) pendingRequests.delete(key);
-    }
+    const sessionId=required(p,'sessionId');
+    const kind=n.method==='approval/resolved'?'approval':'input';
+    const requestId=kind==='approval'?required(p,'approvalId'):required(p,'userInputId');
+    pendingRequests.delete(pendingRequestKey(sessionId,kind,requestId));
   }
   changed();
 }
@@ -227,13 +282,9 @@ async function refreshRoot() {
     }
     const pendingAt = sessionVersions.get(rootId)??0;
     const pending = await msp.connection.request('approval/listPending', {sessionId:rootId});
-    if (!Array.isArray(pending.approvals) || !Array.isArray(pending.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
-    if (pendingAt === (sessionVersions.get(rootId)??0)) {
-      for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId === rootId) pendingRequests.delete(key);
-      for (const params of pending.approvals) pendingRequests.set(`approval:${required(params,'approvalId')}`, {view:{method:'approval/request',params}});
-      for (const params of pending.userInputs) pendingRequests.set(`input:${required(params,'userInputId')}`, {view:{method:'userInput/request',params}});
-    }
-    latest.last_refresh = {at_ms:Date.now(),metadata_applied:fresh,viewCursor:r.viewCursor,coverage:'root_metadata_and_pending_requests'};
+    const pendingApplied = replacePendingInventory(rootId, pending, pendingAt);
+    latest.last_refresh = {at_ms:Date.now(),metadata_applied:fresh,pending_inventory_applied:pendingApplied,
+      viewCursor:r.viewCursor,coverage:'root_metadata_and_pending_requests'};
     changed();
     return latest.last_refresh;
   })();
@@ -340,14 +391,10 @@ async function refreshChild(id) {
       const pendingAt = sessionVersions.get(id)??0;
       stage='pending_inventory';
       const questions = await msp.connection.request('approval/listPending',{sessionId:id});
-      if (!Array.isArray(questions.approvals) || !Array.isArray(questions.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
-      if (pendingAt===(sessionVersions.get(id)??0)) {
-        for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId===id) pendingRequests.delete(key);
-        for (const params of questions.approvals) pendingRequests.set(`approval:${required(params,'approvalId')}`,{view:{method:'approval/request',params}});
-        for (const params of questions.userInputs) pendingRequests.set(`input:${required(params,'userInputId')}`,{view:{method:'userInput/request',params}});
-      }
+      const pendingApplied = replacePendingInventory(id, questions, pendingAt);
       const fresh = before===(sessionVersions.get(id)??0);
-      const refreshed={at_ms:Date.now(),session_id:id,metadata_applied:fresh,viewCursor:r.viewCursor,coverage:'observed_child_metadata_and_pending_requests'};
+      const refreshed={at_ms:Date.now(),session_id:id,metadata_applied:fresh,pending_inventory_applied:pendingApplied,
+        viewCursor:r.viewCursor,coverage:'observed_child_metadata_and_pending_requests'};
       const current=children.get(id);
       if (fresh) {
         children.set(id,{...current,snapshot,snapshot_freshness:'fresh',snapshot_freshness_reason:'stable_native_read',
@@ -397,7 +444,11 @@ async function launchConnection(options) {
       throw new MspError({code:-32601,message:'Unsupported server request',data:{kind:'methodNotFound'}});
     }
     const p=request.params ?? {};
-    const key=p.approvalId?`approval:${required(p,'approvalId')}`:`input:${required(p,'userInputId')}`;
+    const sessionId=required(p,'sessionId');
+    const kind=request.method==='approval/request'?'approval':'input';
+    const key=pendingRequestKey(sessionId,kind,kind==='approval'?required(p,'approvalId'):required(p,'userInputId'));
+    // Server requests and notifications invalidate the same read window.
+    sessionChanged(sessionId, 'native_request_after_read');
     pendingRequests.set(key,{view:{method:request.method,params:p}}); changed();
     return {};
   });
