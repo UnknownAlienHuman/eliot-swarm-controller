@@ -1,0 +1,69 @@
+name: Temporary PR75 documentation update
+
+on:
+  push:
+    branches: [task/audit-52-store-bootstrap]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: task/audit-52-store-bootstrap
+          fetch-depth: 0
+      - name: Update exact qualification status
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('docs/remediation/2026-10-09/52-store-bootstrap.md')
+          text = path.read_text(encoding='utf-8')
+          replacements = {
+            '**Status:** production slice implemented on this branch; qualification is blocked by the repository-wide formatting gate tracked in #76. Tests remain in the final product phase.': '**Status:** production slice implemented and qualified by rustfmt plus changed-line Clippy on Ubuntu and Windows. Tests remain in the final product phase.',
+            '- #76 owns the CI separation needed to obtain strict Clippy even while unrelated rustfmt debt exists.': '- #76 landed the independent rustfmt/Clippy attribution gate used for this qualification; it is no longer an implementation dependency.',
+            '''## 11. Gate and current evidence
+
+Required minimal code gate:
+
+```sh
+cargo clippy --locked \\
+  -p swarm-store \\
+  -p swarm-kernel-host \\
+  --lib --bins -- -D warnings
+```
+
+Current GitHub workflow reaches package classification and documentation validation, then fails package-wide rustfmt on unrelated historical `swarm-kernel-host` files before Clippy. The one rustfmt change reported in this branch's `swarm-store/src/lib.rs` was corrected in the next commit. Do not report Clippy as passed or failed until #76 makes that stage independent.
+
+Broad tests, locked-database behavior and cross-platform lock qualification remain the final phase.''': '''## 11. Gate and current evidence
+
+Exact head `f9cf53687335e3ea5962a44680738e8227ddafd0`, workflow run `37881420236`:
+
+- changed-path/package classification passed;
+- documentation and changed-file rustfmt validation passed;
+- the selected package plus its real local reverse-dependency closure compiled and completed Clippy on Ubuntu;
+- the same scoped compiler/Clippy gate passed on Windows;
+- no compiler error or warning owned by a changed Rust line remained;
+- unrelated historical warnings, if any, were reported separately rather than attributed to this slice.
+
+Changed integration tests were correctly skipped because this slice changes no integration test target. Broad tests, locked-database behavior and cross-platform lock qualification remain the final product phase.'''
+          }
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one documentation replacement, found {count}')
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8')
+          PY
+          git diff --check
+      - name: Commit and push
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/remediation/2026-10-09/52-store-bootstrap.md
+          git commit -m "docs: record qualified Store bootstrap slice"
+          git push origin HEAD:task/audit-52-store-bootstrap
