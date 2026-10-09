@@ -1755,7 +1755,8 @@ fn verify_retained_registration(
     snapshot: &Value,
 ) -> Result<()> {
     let registration = verify_registered_participant(db, client_id)?;
-    let current_fingerprint = registration_fingerprint(&registration)?;
+    let current_fingerprint =
+        coordination::concilium_registration_fingerprint(client_id, &registration)?;
     let actor_generation = registration
         .get("binding_generation")
         .cloned()
@@ -1773,21 +1774,6 @@ fn verify_retained_registration(
         ));
     }
     Ok(())
-}
-
-fn registration_fingerprint(registration: &Value) -> Result<String> {
-    let fields = json!({
-        "client_id":registration.get("client_id").cloned().unwrap_or(Value::Null),
-        "role":registration.get("role").cloned().unwrap_or(Value::Null),
-        "disabled":registration.get("disabled").cloned().unwrap_or(Value::Null),
-        "task_id":registration.get("task_id").cloned().unwrap_or(Value::Null),
-        "task_revision":registration.get("task_revision").cloned().unwrap_or(Value::Null),
-        "attempt_id":registration.get("attempt_id").cloned().unwrap_or(Value::Null),
-        "participation_basis":registration.get("participation_basis").cloned().unwrap_or(Value::Null),
-        "binding_id":registration.get("binding_id").cloned().unwrap_or(Value::Null),
-        "binding_generation":registration.get("binding_generation").cloned().unwrap_or(Value::Null),
-    });
-    Ok(sha256_digest(model::canonical(&fields)?.as_bytes()))
 }
 
 fn resolve_proposal_participants(
