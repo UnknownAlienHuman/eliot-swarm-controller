@@ -1,57 +1,78 @@
-# R11. События: host failure и точные runtime aliases
+# R11a. Host terminal safe payload: diagnostics remain in the retained receipt
 
-**Статус:** в PR #37 добавлено узкое исправление producer для AUD-035. AUD-036, общая типизация terminal payload и поведенческая квалификация остаются открыты. PR сохраняет Draft; целиком R11 не выполнен.
+**Статус: узкий producer-fix AUD-035 реализован в PR #37; rustfmt/Clippy qualification выполняется на текущем main. Общий terminal DTO и legacy runtime aliases вынесены в Issue #78.**
 
-Исследован `main` `40591a295af94b1541ec2ba30afe8e3247701a71`; работа продолжена поверх задания `5d503c4d969c5d9e2c18d3ea6a683e67fc22c16b`. Перед следующей правкой перечитать текущую ветку. Аудиты — доказательный материал, не новая owner policy.
+Основа исследования: `main` `40591a295af94b1541ec2ba30afe8e3247701a71`. Исторический SHA фиксирует доказательство и не является требованием версии.
 
-## Требуемый результат
+## Результат этого PR
 
-Отказ host с дополнительной диагностикой остаётся routable. Runtime outcomes проходят соответствующие проверенные codecs; два представления одного события не допускают два одинаковых действия. Права, происхождение события и exact scope проверяются при admission.
+`crates/swarm-kernel-host/src/store/host_lifecycle.rs::retain_exit` больше не добавляет `secondary_codes` только в нормализованный `host.exit`.
 
-## Читать адресно
+Полный validated `Exit` по-прежнему сохраняется в:
 
-- [Observability](../../agent-operations/observability.md), §1 и «Host terminal events and retained diagnostics»: durable fact отдельно от подробной диагностики; граница исправления старых записей.
-- [Architecture](../../agent-operations/architecture.md), разделы event intake и typed action consumers.
-- [Modularity](../../agent-operations/modularity.md), §2.1 и §3: одна транзакция event/cursor/action и descriptor-admitted module metadata.
-- [Owner decisions](../../owner-decisions.md), §1.2–1.4 и §2.2: manager/worktree, фаза проверки, live ownership и retention.
+```text
+host:last-exit:v1
+host:latest-failure:v1
+```
 
-## Участок и внесённый код
+и остаётся доступен через существующий lifecycle status readback.
 
-`crates/swarm-kernel-host/src/store/host_lifecycle.rs::retain_exit` больше не добавляет `secondary_codes` в нормализованный terminal `host.exit`. Полный validated `Exit` по-прежнему записывается в `host:last-exit:v1` / `host:latest-failure:v1`; `finish`, `exit_receipt` и status readback сохраняют коды.
+Парные `host.exit` / `host.failed` теперь используют одну уже существующую закрытую safe-форму:
 
-Это восстанавливает уже существующую форму `store/mod.rs::insert_safe_host_terminal_failure_event` и требования `automation_intake.rs::host_terminal_exit_projection`: закрытый набор полей, точные source/key/epoch, совпадение paired payload и времени. Allowlist не расширен, проверка парности не удалена. Изменение source — удаление трёх исполняемых строк и пояснение из двух строк; нет новых dependencies, таблиц, методов или другого event store.
+```text
+schema_version
+phase
+status
+occurrence_id
+host_epoch
+failure_category? 
+failed_supervisor?
+```
 
-**Не исправлено этой правкой:** старые наблюдения с лишним полем и уже продвинутые consumer cursors. Нельзя переписать immutable history либо перемотать cursor и автоматически повторить script/native effect под видом ремонта. Для исторического восстановления сначала нужен точный admission/readback-контракт.
+Detailed diagnostic codes не являются ScriptRun input и не должны менять safe event bytes.
 
-## Оставшаяся реализация в этом же PR
+## Почему это отдельный законченный срез
 
-1. Свести два terminal builders к одному closed DTO/codec, сохранив нынешние serialized bytes и существующие guards. Не переносить весь `store/mod.rs` ради небольшого типа. Producer-коррекция выше не выдаётся за завершённое устранение дублирования.
-2. В `automation_dispatch.rs::script_event_projections_with_alias` разделить ветви по source-family + event kind. Уже работающий `accepted runtime.outcome` оставить на direct `native_input_accepted` пути.
-3. Пропускать legacy applied/rejected/unknown в их provenance-validated alias path, а не в общий module-metadata return. Произвольный module event допускается только через заявленный descriptor envelope. `None` не разрешает общий fallback; `runtime.state` требует собственного доказанного codec.
-4. Сверить dedup/occurrence в source admission и consumer cursor. Не делать новые model calls, retry policy или изменения бизнес-правил автоматизации.
+Current consumer `automation_intake::host_terminal_exit_projection` требует:
 
-## Критерии итоговой квалификации
+- закрытый набор полей;
+- exact source/key/epoch;
+- одинаковый paired payload;
+- одинаковое observed time;
+- одну occurrence identity.
 
-- [ ] Failure с 0/1/2 secondary codes: оба safe terminal payload совпадают, diagnostic receipt сохраняет коды, одна семантическая occurrence на один consumer/action.
-- [ ] Graceful exit, startup/runtime/supervisor failure сохраняют свои исходы; graceful exit не стирает latest failure.
-- [ ] Неверный source/epoch, отсутствующий или несовпавший sibling и лишние поля не проходят проекцию.
-- [ ] Accepted direct path не регрессирует; legacy applied/rejected/unknown проходят только с правильным provenance. Незаявленное module-событие не получает fallback.
-- [ ] Старые malformed pairs не объявляются восстановленными; прошедший cursor не перематывается и эффект не повторяется автоматически.
+Раньше дополнительная диагностика расширяла только `host.exit`, поэтому обе safe-проекции одного реального failure отвергались. Удаление трёх producer-строк восстанавливает существующий consumer contract без нового event store, schema, method или dependency.
 
-## Проверка этой поставки
+## Не входит в этот PR
 
-Исходный `host_lifecycle.rs` восстановлен побайтово и сверен с blob `1b1ef44b1aecb70cd0876a83bd3a75b639d7b5cd`; изменённый source имеет blob `5cbaf1869c0ad3a9ebe7dd45459d325a5e6fabeb`. Это проверка точности исходника и диффа, не выполнения Rust.
+- два terminal builders всё ещё должны быть сведены к одному private `HostTerminalFact` constructor/codec;
+- legacy applied/rejected/unknown runtime aliases всё ещё затеняются generic `module:*` interception;
+- historical malformed pairs не переписываются;
+- consumer cursors не перематываются;
+- никакой внешний/native effect не повторяется автоматически.
 
-Минимальный gate был вызван:
+Этим остатком владеет [Issue #78](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/78). Он не должен расширять этот узкий producer PR.
+
+## Границы
+
+Allowlist и paired-payload checks не ослаблены. Secondary diagnostics не удалены из retained Exit. `host.failed` не становится вторым независимым failure. Event identity не предоставляет action authority сама по себе.
+
+CloudEvents 1.0.2 использован только как сравнительный принцип `source + id` для distinct event versus redelivery. ELIOT не получает новый wire format, SDK или broker.
+
+## Критерии итоговой тестовой фазы
+
+- Failure с 0/1/2 secondary codes: safe payloads совпадают, retained receipt сохраняет codes.
+- Startup/runtime/supervisor failures сохраняют свои category/name fields.
+- Graceful exit не стирает latest retained failure.
+- Неверный source/epoch, missing/mismatched sibling и лишние safe fields отвергаются.
+- Старые malformed pairs остаются historical gaps; replay отсутствует.
+
+## Квалификация поставки
+
+Минимальный gate текущего PR:
 
 ```sh
 cargo clippy --locked -p swarm-kernel-host --lib --bins -- -D warnings
 ```
 
-Результат локально: `cargo: command not found`, exit 127. Компиляция, Clippy, тесты и native-квалификация не подтверждены. Чекбоксы не отмечены по чтению кода. Исходные compiler fixes PR #26 здесь не копируются.
-
-## Донор и границы интеграции
-
-[CloudEvents 1.0.2, required id/source](https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md#id) использован как сравнительный контракт: distinct event получает уникальную пару source/id, повторная доставка может сохранить её. Это не гарантия exactly-once исполнения и не authority. ELIOT не переводится на CloudEvents wire format; SDK/брокер не добавлены.
-
-R11 независим от R10/R12. В `store/mod.rs` затрагивать только named terminal producer; R07 владеет своим contract-event family. Один manager/worktree, writers без Cargo; код интегрировать в этот же PR, затем scoped gate. Широкие tests/live — итоговая фаза.
+GitHub workflow выполняет changed-line rustfmt и Clippy на Ubuntu/Windows по текущему main. Full tests/native/live остаются итоговой продуктовой фазой по правилам проекта.
