@@ -123,7 +123,9 @@ pub fn task_prompt_selected<'a>(
     if !has_runtime
         || !has_context
         || !event_schemas.into_iter().any(|schema| *schema == admission)
-        || !capabilities.into_iter().any(|cap| cap.as_str() == "task.dispatch")
+        || !capabilities
+            .into_iter()
+            .any(|cap| cap.as_str() == "task.dispatch")
     {
         return Err("selected TaskPrompt requires task.dispatch and normalized admission pair");
     }
