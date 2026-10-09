@@ -1800,6 +1800,7 @@ impl Store {
             method.as_str(),
             "check.run"
                 | "check.cancel"
+                | "task.release"
                 | "operation.cancel"
                 | "agent.open"
                 | "task.dispatch"
