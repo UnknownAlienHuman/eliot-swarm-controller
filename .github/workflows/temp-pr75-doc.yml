@@ -18,46 +18,7 @@ jobs:
       - name: Update exact qualification status
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('docs/remediation/2026-10-09/52-store-bootstrap.md')
-          text = path.read_text(encoding='utf-8')
-          replacements = {
-            '**Status:** production slice implemented on this branch; qualification is blocked by the repository-wide formatting gate tracked in #76. Tests remain in the final product phase.': '**Status:** production slice implemented and qualified by rustfmt plus changed-line Clippy on Ubuntu and Windows. Tests remain in the final product phase.',
-            '- #76 owns the CI separation needed to obtain strict Clippy even while unrelated rustfmt debt exists.': '- #76 landed the independent rustfmt/Clippy attribution gate used for this qualification; it is no longer an implementation dependency.',
-            '''## 11. Gate and current evidence
-
-Required minimal code gate:
-
-```sh
-cargo clippy --locked \\
-  -p swarm-store \\
-  -p swarm-kernel-host \\
-  --lib --bins -- -D warnings
-```
-
-Current GitHub workflow reaches package classification and documentation validation, then fails package-wide rustfmt on unrelated historical `swarm-kernel-host` files before Clippy. The one rustfmt change reported in this branch's `swarm-store/src/lib.rs` was corrected in the next commit. Do not report Clippy as passed or failed until #76 makes that stage independent.
-
-Broad tests, locked-database behavior and cross-platform lock qualification remain the final phase.''': '''## 11. Gate and current evidence
-
-Exact head `f9cf53687335e3ea5962a44680738e8227ddafd0`, workflow run `37881420236`:
-
-- changed-path/package classification passed;
-- documentation and changed-file rustfmt validation passed;
-- the selected package plus its real local reverse-dependency closure compiled and completed Clippy on Ubuntu;
-- the same scoped compiler/Clippy gate passed on Windows;
-- no compiler error or warning owned by a changed Rust line remained;
-- unrelated historical warnings, if any, were reported separately rather than attributed to this slice.
-
-Changed integration tests were correctly skipped because this slice changes no integration test target. Broad tests, locked-database behavior and cross-platform lock qualification remain the final product phase.'''
-          }
-          for old, new in replacements.items():
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'expected one documentation replacement, found {count}')
-              text = text.replace(old, new)
-          path.write_text(text, encoding='utf-8')
-          PY
+          python -c 'from pathlib import Path; p=Path("docs/remediation/2026-10-09/52-store-bootstrap.md"); s=p.read_text(encoding="utf-8"); old="**Status:** production slice implemented on this branch; qualification is blocked by the repository-wide formatting gate tracked in #76. Tests remain in the final product phase."; new="**Status:** production slice implemented and qualified by rustfmt plus changed-line Clippy on Ubuntu and Windows. Tests remain in the final product phase."; assert s.count(old)==1; s=s.replace(old,new); old="- #76 owns the CI separation needed to obtain strict Clippy even while unrelated rustfmt debt exists."; new="- #76 landed the independent rustfmt/Clippy attribution gate used for this qualification; it is no longer an implementation dependency."; assert s.count(old)==1; s=s.replace(old,new); marker="## 11. Gate and current evidence"; assert s.count(marker)==1; tail="## 11. Gate and current evidence\n\nExact head `f9cf53687335e3ea5962a44680738e8227ddafd0`, workflow run `37881420236`:\n\n- changed-path/package classification passed;\n- documentation and changed-file rustfmt validation passed;\n- the selected package plus its real local reverse-dependency closure compiled and completed Clippy on Ubuntu;\n- the same scoped compiler/Clippy gate passed on Windows;\n- no compiler error or warning owned by a changed Rust line remained;\n- unrelated historical warnings, if any, were reported separately rather than attributed to this slice.\n\nChanged integration tests were correctly skipped because this slice changes no integration test target. Broad tests, locked-database behavior and cross-platform lock qualification remain the final product phase.\n"; s=s.split(marker,1)[0]+tail; p.write_text(s,encoding="utf-8")'
           git diff --check
       - name: Commit and push
         shell: bash
