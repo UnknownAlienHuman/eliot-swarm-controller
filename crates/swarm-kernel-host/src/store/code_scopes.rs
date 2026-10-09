@@ -466,6 +466,14 @@ fn accept(
         .ok_or_else(|| damaged("scope record has no Task revision"))?;
     let attempt_id = model::text(&record, "attempt_id")?.to_owned();
     coordination::concilium_manager_scope(tx, principal, &task_id, task_revision, &attempt_id)?;
+    if request
+        .expires_at_ms
+        .is_some_and(|expires_at_ms| expires_at_ms <= now)
+    {
+        return Err(Error::invalid(
+            "expires_at_ms must be later than the acceptance time",
+        ));
+    }
     let accepted_mode = request
         .mode
         .map(|mode| mode.as_str().to_owned())
