@@ -1,0 +1,82 @@
+{
+  "schema": "eliot.generator_security_repair.v1",
+  "date": "2026-10-10",
+  "final_status": "PARTIAL_PROGRESS",
+  "scope": "Codex donor dev/test dependency and required transitive version only",
+  "source_base_commit": "55006f4885ae4b169fca6bdc1f2792626dc5cdcc",
+  "upstream_base": "18194bfd3534ca567d886eac454028dafaa68b6c",
+  "package": "datamodel-code-generator",
+  "before": "0.64.0",
+  "after": "0.81.0",
+  "advisory": {
+    "ghsa_id": "GHSA-77xj-x4rm-935c",
+    "published_at": "2026-10-08T17:58:01Z",
+    "vulnerable_version_range": ">= 0.59.0, <= 0.80.0",
+    "first_patched_version": "0.81.0"
+  },
+  "original_pip_alerts": "Nine original alerts observed fixed after55006f4; intermediate0.64 update evidence is retained unchanged in GENERATOR-SECURITY-REPAIR.json",
+  "dependency_delta": {
+    "datamodel-code-generator": {
+      "before": "0.64.0",
+      "after": "0.81.0"
+    },
+    "typing-extensions": {
+      "before": "4.15.0",
+      "after": "4.16.0"
+    }
+  },
+  "transitive_requirement": {
+    "authoritative_distribution_requirement": "typing-extensions<5,>=4.16",
+    "old_locked_version": "4.15.0",
+    "stock_resolved_version": "4.16.0",
+    "explanation": "0.81.0 adds typing-extensions as a direct generator dependency. 4.15.0 does not meet >=4.16; stock uv selected 4.16.0. No manual typing-extensions pin or override was introduced."
+  },
+  "verification": {
+    "stock_uv_resolution_exit_code": 0,
+    "offline_lock_check_exit_code": 0,
+    "installed_version": "0.81.0",
+    "current_cli_argument_count": 16,
+    "actual_parser_pass": true,
+    "missing_options": [],
+    "probe_python": "3.13.15",
+    "release_requires_python": ">=3.10",
+    "project_requires_python": ">=3.10",
+    "python_3_10_runtime_executed": false,
+    "vendor_file_count": 89,
+    "vendor_verifier": "PASS",
+    "generated_sdk_output_unchanged": true,
+    "raw_files_already_lf": true
+  },
+  "reviewed_registry_observation": {
+    "package": "datamodel-code-generator",
+    "version": "0.81.0",
+    "api": "GET /advisories?ecosystem=pip&affects=datamodel-code-generator@0.81.0&type=reviewed",
+    "full_pagination": true,
+    "observed_at_utc": "2026-10-10T23:39:36.4946886Z",
+    "advisories": [],
+    "count": 0
+  },
+  "checksum_delta": [
+    {
+      "path": "pyproject.toml",
+      "upstream_sha256": "da5e5b8eca67f727c49befc1bec71ed72957c1358b3c055433af97a5c0bd4354",
+      "patched_sha256": "c9e5edab50ef054a99533857dc1e1046bf2b31a1736cbc39ea8f318e9a58cbf5"
+    },
+    {
+      "path": "uv.lock",
+      "upstream_sha256": "ca4f631445c81b74b11b05305cc580fa399f1f9bfe80b12acea610ce331e0354",
+      "patched_sha256": "41873846d00a9b5744cc12ad8efe776bdd0ce588c8923ab23790f38a05f1bee2"
+    }
+  ],
+  "worker_proof_sha256": "957c9d29cf2b2f78b26c3331222ddce611ad1216bdfed0a0b0dd43d3991db3f7",
+  "worker_verified_at_utc": "2026-10-10 23:42:22 UTC",
+  "parent_vendor_verifier_at_utc": "2026-10-10T23:45:35.0936634Z",
+  "independent_review": "pending",
+  "live_alert17_closure": "pending post-push",
+  "limitations": [
+    "Generated SDK output compatibility not verified",
+    "Actual Python3.10 runtime not executed",
+    "Four npm alerts retain separate upstream blockers",
+    "Historical native O used exact1ad4209; no qualification claim for this dependency change"
+  ]
+}

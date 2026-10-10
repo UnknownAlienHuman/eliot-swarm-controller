@@ -55,7 +55,8 @@ auxiliary-provider affinity remain unavailable.
 
 The legacy `.3` donor source and generated models retain the pinned upstream
 bytes. On 2026-10-10 the dev/test `datamodel-code-generator` pin and lockfile
-were updated to `0.64.0` to address nine security advisories. The binary pin
+were updated to `0.81.0` to address the audited security advisories, including
+the newly reported `GHSA-77xj-x4rm-935c`. The binary pin
 remains `openai-codex-cli-bin==0.153.4`. The
 [security patch record](VENDOR-SECURITY-PATCHES.md) retains the original and
 patched hashes; `verify_vendor.py` checks the complete patched unit.

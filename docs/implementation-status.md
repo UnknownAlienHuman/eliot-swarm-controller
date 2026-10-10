@@ -254,11 +254,14 @@ The 2026-10-06 dependency source audit found three unresolved dependencies in
 the optional installable OpenCode service bundle: `sprintf-js`,
 `http-cache-semantics`, and `braces`. Their current advisories publish no patched
 version, so the pinned bundle remains unchanged and is not dependency-qualified.
-This audit establishes package inclusion, not an exploit path. The nine Python
+This audit establishes package inclusion, not an exploit path. The Python
 alerts concern development-only `datamodel-code-generator` in the retained
-Codex SDK donor; the Rust adapter does not use that environment. Its fix belongs
-to a deliberate donor refresh with updated upstream identity and checksums,
-not an isolated edit that would invalidate the retained donor provenance.
+Codex SDK donor; the Rust adapter does not use that environment. Its documented
+dependency update preserves the original upstream identity, records the local
+delta and refreshes the complete vendor checksum manifest. See the
+[patch provenance](../modules/codex/VENDOR-SECURITY-PATCHES.md) for the current
+version and bounded validation; generated SDK output compatibility remains
+unverified.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility
