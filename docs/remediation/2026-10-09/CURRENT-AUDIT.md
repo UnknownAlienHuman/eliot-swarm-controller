@@ -1,5 +1,14 @@
 # Current-source audit and implementation ledger
 
+The [optional-worker recovery record](../2026-10-10/OPTIONAL-WORKER-RECOVERY-EVIDENCE.json)
+adds a real bounded installed contour: the exact N host observed missing-binary
+`retry_wait`, the existing installer applied its matching clean release package,
+and public `running` stayed stable for 13,068 ms across 47 observations with the
+same host PID and epoch. The initial premature-running harness failure remains
+retained. This verifies isolation and the supervisor restart marker; scheduler
+readiness/active owner identity and uncertain initial host receipt/no-replay
+remain unverified. R48 remains `not_qualified`; no native/model calls ran.
+
 The [completed host qualification record](../2026-10-10/HOST-QUALIFICATION-EVIDENCE.json)
 closes the remaining named host-library failures. Every current name has retained
 execution evidence: Windows 453 PASS / 1 ignored, Linux 466 PASS / 1 ignored.

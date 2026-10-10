@@ -19,11 +19,13 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedPublicCliBuildManifestSha256,
     [Parameter(Mandatory)][string] $HostConfigPath,
     [Parameter(Mandatory)][string] $OutputRoot,
-    [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._:-]{1,128}$')][string] $ProjectId,
-    [Parameter(Mandatory)][string] $TaskSpecPath,
+    [ValidatePattern('^[A-Za-z0-9._:-]{1,128}$')][string] $ProjectId,
+    [string] $TaskSpecPath,
     [ValidatePattern('^[A-Za-z0-9._:-]{1,128}$')][string] $HookProjectId,
     [ValidatePattern('^[A-Fa-f0-9]{40}([A-Fa-f0-9]{24})?$')][string] $HookCommitOid,
-    [ValidateRange(15, 180)][int] $TimeoutSeconds = 45
+    [ValidateRange(15, 180)][int] $TimeoutSeconds = 45,
+    [ValidateSet('all', 'optional-worker-recovery')][string] $ScenarioSelection = 'all',
+    [string] $AutomationWorkerPackageExecutable
 )
 
 Set-StrictMode -Version Latest
@@ -42,6 +44,10 @@ $script:HostSupervisorBuild = $null
 $script:HostLauncherBuild = $null
 $script:PublicCliBuild = $null
 $script:ConfigPath = $null
+$script:TaskSpecPath = $null
+$script:TaskSpecHash = $null
+$script:AutomationWorkerPackagePath = $null
+$script:WorkerInstallerPath = $null
 $script:PendingPublicCliPids = [System.Collections.Generic.List[int]]::new()
 $script:PendingHostPids = [System.Collections.Generic.List[int]]::new()
 $script:Scenarios = [System.Collections.Generic.List[object]]::new()
@@ -66,6 +72,12 @@ $script:Summary = [ordered]@{
         no_public_optional_worker_fault_trigger = $true
         source_effect_unknown_state = 'only claimed when exact Manager/HookSource readback proves the corresponding durable record'
     }
+}
+
+if ($ScenarioSelection -eq 'optional-worker-recovery') {
+    $script:Summary.scenario_selection = $ScenarioSelection
+    $script:Summary.limits.uncertain_receipt_no_replay = 'not_verified'
+    $script:Summary.limits.r48_qualification = 'not_qualified'
 }
 
 function Stop-Harness {
@@ -1108,6 +1120,152 @@ function Get-OptionalWorkerSummary {
     return $safe
 }
 
+function Get-FutureScheduleEvidence {
+    param([Parameter(Mandatory)] $HostStatus, [Parameter(Mandatory)][ValidateRange(1, 86400)][int] $MinimumLeadSeconds)
+    if ($HostStatus -isnot [System.Collections.IDictionary] -or
+        $HostStatus['schedules'] -isnot [System.Collections.IDictionary] -or
+        $HostStatus['schedules']['items'] -isnot [System.Collections.IList]) {
+        return [pscustomobject]@{ success = $false; code = 'PUBLIC_SCHEDULE_STATUS_INVALID'; schedule_ids = @(); minimum_lead_ms = $null }
+    }
+    $items = @($HostStatus['schedules']['items'])
+    $enabled = @($items | Where-Object {
+        $_ -is [System.Collections.IDictionary] -and $_['enabled'] -is [bool] -and $_['enabled']
+    })
+    if ($enabled.Count -eq 0) {
+        return [pscustomobject]@{ success = $false; code = 'NO_ENABLED_FUTURE_SCHEDULE'; schedule_ids = @(); minimum_lead_ms = $null }
+    }
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $requiredLeadMs = [long]$MinimumLeadSeconds * 1000
+    $minimumObservedLeadMs = [long]::MaxValue
+    $scheduleIds = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $enabled) {
+        if ($item['schedule_id'] -isnot [string] -or
+            [string]$item['schedule_id'] -notmatch '\A[a-z0-9_-]{1,64}\z' -or
+            $item['action'] -cne 'check_run') {
+            return [pscustomobject]@{ success = $false; code = 'PUBLIC_SCHEDULE_IDENTITY_INVALID'; schedule_ids = @(); minimum_lead_ms = $null }
+        }
+        $nextDue = ConvertTo-StrictInt64 -Value $item['next_due_ms']
+        if (-not $nextDue.valid -or $nextDue.value -le ($nowMs + $requiredLeadMs)) {
+            return [pscustomobject]@{ success = $false; code = 'FUTURE_SCHEDULE_WINDOW_TOO_SHORT'; schedule_ids = @(); minimum_lead_ms = $null }
+        }
+        if ($null -ne $item['last_operation'] -or $null -ne $item['last_considered_slot'] -or
+            $null -ne $item['last_observed_due_slot'] -or $item['identity_changed'] -eq $true) {
+            return [pscustomobject]@{ success = $false; code = 'CHECKRUN_ADMISSION_OR_SCHEDULE_CHANGE_OBSERVED'; schedule_ids = @(); minimum_lead_ms = $null }
+        }
+        $observedLeadMs = [long]$nextDue.value - $nowMs
+        if ($observedLeadMs -lt $minimumObservedLeadMs) { $minimumObservedLeadMs = $observedLeadMs }
+        $scheduleIds.Add([string]$item['schedule_id'])
+    }
+    return [pscustomobject]@{
+        success = $true
+        code = $null
+        schedule_ids = @($scheduleIds.ToArray())
+        minimum_lead_ms = $minimumObservedLeadMs
+    }
+}
+
+function Wait-OptionalWorkerStatus {
+    param(
+        [Parameter(Mandatory)] $Scenario,
+        [Parameter(Mandatory)][string] $CredentialPath,
+        [Parameter(Mandatory)][ValidateSet('retry_wait', 'running')][string] $ExpectedState,
+        [Parameter(Mandatory)][int] $ExpectedHostPid,
+        [Parameter(Mandatory)][long] $ExpectedHostEpoch,
+        [Parameter(Mandatory)][int] $MinimumScheduleLeadSeconds
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastCode = 'OPTIONAL_WORKER_STATUS_TIMEOUT'
+    # Allow the 10s ready-frame timeout and 2s coordinator tick, plus a 1s margin.
+    # Public running is a supervisor marker; this window does not prove readiness.
+    $stableRunningWindowMs = 13000L
+    $runningSince = $null
+    $runningSamples = 0
+    $runningFailureCount = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($null -eq $Scenario.host -or $Scenario.host.HasExited -or [int]$Scenario.host.Id -ne $ExpectedHostPid) {
+            return [pscustomobject]@{ success = $false; code = 'HOST_PROCESS_CHANGED_OR_EXITED'; status = $null; worker = $null; schedule = $null }
+        }
+        $remainingMs = [long][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remainingMs -le 0) { break }
+        $callTimeout = [int][Math]::Max(1, [Math]::Min(5000, $remainingMs))
+        $call = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $CredentialPath -Method 'host.status' `
+            -Params ([ordered]@{}) -TimeoutMilliseconds $callTimeout
+        if (-not $call.success) {
+            $lastCode = $(if ($call.code) { [string]$call.code } else { 'HOST_STATUS_READBACK_FAILED' })
+            $runningSince = $null
+            $runningSamples = 0
+            Start-Sleep -Milliseconds ([int][Math]::Min(250, [Math]::Max(1, $remainingMs)))
+            continue
+        }
+        $status = $call.value
+        if ($status -isnot [System.Collections.IDictionary]) {
+            return [pscustomobject]@{ success = $false; code = 'HOST_STATUS_SHAPE_INVALID'; status = $status; worker = $null; schedule = $null }
+        }
+        $epoch = ConvertTo-StrictInt64 -Value $status['host_epoch']
+        if (-not $epoch.valid -or $epoch.value -ne $ExpectedHostEpoch) {
+            return [pscustomobject]@{ success = $false; code = 'HOST_EPOCH_CHANGED'; status = $status; worker = $null; schedule = $null }
+        }
+        $scheduleEvidence = Get-FutureScheduleEvidence -HostStatus $status -MinimumLeadSeconds $MinimumScheduleLeadSeconds
+        if (-not $scheduleEvidence.success) {
+            return [pscustomobject]@{ success = $false; code = $scheduleEvidence.code; status = $status; worker = $null; schedule = $scheduleEvidence }
+        }
+        $workers = Get-OptionalWorkerSummary -HostStatus $status
+        if (-not $workers.Contains('automation-scheduler')) {
+            $lastCode = 'AUTOMATION_SCHEDULER_WORKER_STATUS_MISSING'
+            $runningSince = $null
+            $runningSamples = 0
+        } else {
+            $worker = $workers['automation-scheduler']
+            if ($ExpectedState -eq 'retry_wait' -and $worker.state -eq 'retry_wait') {
+                if ($worker.last_error_code -cne 'AUTOMATION_WORKER_NOT_INSTALLED') {
+                    return [pscustomobject]@{ success = $false; code = 'AUTOMATION_WORKER_FAILURE_CODE_MISMATCH'; status = $status; worker = $worker; schedule = $scheduleEvidence }
+                }
+                return [pscustomobject]@{ success = $true; code = $null; status = $status; worker = $worker; schedule = $scheduleEvidence }
+            }
+            if ($ExpectedState -eq 'retry_wait' -and $worker.state -eq 'running') {
+                # The supervisor records running before the asynchronous missing-resource check.
+                # Keep polling; only the exact retry_wait failure above permits installation.
+                $lastCode = 'AUTOMATION_WORKER_MISSING_FAILURE_NOT_OBSERVED'
+            }
+            if ($ExpectedState -eq 'running' -and $worker.state -eq 'running') {
+                if ($null -eq $runningSince -or $worker.consecutive_failures -ne $runningFailureCount) {
+                    $runningSince = [System.Diagnostics.Stopwatch]::StartNew()
+                    $runningSamples = 0
+                    $runningFailureCount = $worker.consecutive_failures
+                }
+                $runningSamples++
+                $observedWindowMs = [long]$runningSince.ElapsedMilliseconds
+                if ($observedWindowMs -ge $stableRunningWindowMs -and $runningSamples -ge 2 -and [DateTime]::UtcNow -lt $deadline) {
+                    return [pscustomobject]@{
+                        success = $true; code = $null; status = $status; worker = $worker; schedule = $scheduleEvidence
+                        running_observation = [ordered]@{
+                            scope = 'supervisor_restart_observed_only'
+                            source = 'host.status.host_lifecycle.optional_workers.automation-scheduler'
+                            minimum_window_ms = $stableRunningWindowMs
+                            observed_window_ms = $observedWindowMs
+                            samples = $runningSamples
+                            consecutive_failures = $runningFailureCount
+                        }
+                    }
+                }
+                $lastCode = 'AUTOMATION_WORKER_STABLE_RUNNING_NOT_OBSERVED'
+            } else {
+                $runningSince = $null
+                $runningSamples = 0
+            }
+            if ($worker.state -eq 'isolated') {
+                return [pscustomobject]@{ success = $false; code = 'AUTOMATION_WORKER_ISOLATED'; status = $status; worker = $worker; schedule = $scheduleEvidence }
+            }
+            if ($worker.state -eq 'retry_wait' -and $worker.last_error_code -cne 'AUTOMATION_WORKER_NOT_INSTALLED') {
+                return [pscustomobject]@{ success = $false; code = 'AUTOMATION_WORKER_FAILURE_CODE_MISMATCH'; status = $status; worker = $worker; schedule = $scheduleEvidence }
+            }
+        }
+        $remainingMs = [long][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remainingMs -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(250, $remainingMs)) }
+    }
+    return [pscustomobject]@{ success = $false; code = $lastCode; status = $null; worker = $null; schedule = $null }
+}
+
 function Invoke-ManagerDroppedAckScenario {
     $scenario = New-ScenarioDirectory -Name 'manager-dropped-ack-restart'
     $result = [ordered]@{ name = $scenario.name; run_id = (Split-Path -Leaf $scenario.path); status = 'blocked'; code = $null; facts = [ordered]@{} }
@@ -1459,6 +1617,170 @@ function Invoke-OptionalWorkerObservation {
     }
 }
 
+function Invoke-OptionalWorkerRecoveryScenario {
+    $scenario = New-ScenarioDirectory -Name 'optional-worker-missing-binary-recovery'
+    $result = [ordered]@{
+        name = $scenario.name
+        run_id = (Split-Path -Leaf $scenario.path)
+        status = 'blocked'
+        code = $null
+        facts = [ordered]@{
+            verification_scope = 'optional_worker_isolation_and_supervisor_restart_only'
+            scheduler_ready = 'not_verified'
+            scheduler_active_owner_identity = 'not_verified'
+            checkrun_target_eligibility = 'not_verified'
+            uncertain_receipt_no_replay = 'not_verified'
+            r48_qualification = 'not_qualified'
+        }
+    }
+    try {
+        $workerDestination = Join-Path ([System.IO.Path]::GetDirectoryName($script:HostPath)) 'swarm-automation-worker.exe'
+        $result.facts.host_executable = $script:HostPath
+        $result.facts.host_image_sha256 = $script:HostBuild.binary_sha256
+        $result.facts.host_config_sha256 = $script:Summary.host.host_config_sha256
+        $result.facts.worker_destination = $workerDestination
+        if (Test-Path -LiteralPath $workerDestination) {
+            $result.code = 'AUTOMATION_WORKER_ALREADY_INSTALLED'
+            $result.facts.install_was_refused = $true
+            return $result
+        }
+
+        $minimumScheduleLeadSeconds = [int][Math]::Max(900, (4 * $TimeoutSeconds) + 120)
+        $result.facts.minimum_future_schedule_lead_seconds = $minimumScheduleLeadSeconds
+        $hostStart = Start-IsolatedHost $scenario
+        if (-not $hostStart.ready) {
+            if ($null -ne $hostStart.host_pid) { $result.facts.host_pid = [int]$hostStart.host_pid }
+            $result.code = $hostStart.code
+            return $result
+        }
+        $hostPid = [int]$hostStart.host_pid
+        $hostEpoch = [long]$hostStart.epoch
+        $result.facts.host_pid = $hostPid
+        $result.facts.host_epoch_before = $hostEpoch
+
+        $manager = New-Manager $scenario
+        if (-not $manager.success) { $result.code = $manager.code; return $result }
+        $initialStatus = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'host.status' -Params ([ordered]@{})
+        if (-not $initialStatus.success -or $initialStatus.value -isnot [System.Collections.IDictionary]) {
+            $result.code = $(if ($initialStatus.code) { $initialStatus.code } else { 'HOST_STATUS_READBACK_FAILED' })
+            return $result
+        }
+        $initialEpoch = ConvertTo-StrictInt64 -Value $initialStatus.value['host_epoch']
+        if (-not $initialEpoch.valid -or $initialEpoch.value -ne $hostEpoch) {
+            $result.code = 'HOST_EPOCH_CHANGED'
+            return $result
+        }
+        $initialSchedule = Get-FutureScheduleEvidence -HostStatus $initialStatus.value -MinimumLeadSeconds $minimumScheduleLeadSeconds
+        if (-not $initialSchedule.success) {
+            $result.code = $initialSchedule.code
+            $result.facts.schedule_ids = @($initialSchedule.schedule_ids)
+            return $result
+        }
+        $result.facts.schedule_ids = @($initialSchedule.schedule_ids)
+        $result.facts.minimum_schedule_lead_ms_observed = [long]$initialSchedule.minimum_lead_ms
+        $result.facts.automation_scheduler_demand = 'public host.status reports enabled CheckRun schedule(s) with a safely future next_due_ms'
+
+        $missing = Wait-OptionalWorkerStatus -Scenario $scenario -CredentialPath $manager.path `
+            -ExpectedState 'retry_wait' -ExpectedHostPid $hostPid -ExpectedHostEpoch $hostEpoch `
+            -MinimumScheduleLeadSeconds $minimumScheduleLeadSeconds
+        if (-not $missing.success) {
+            $result.code = $missing.code
+            if ($null -ne $missing.worker) { $result.facts.worker_status_before_install = $missing.worker }
+            return $result
+        }
+        $result.facts.worker_status_before_install = $missing.worker
+        $result.facts.failure_code = 'AUTOMATION_WORKER_NOT_INSTALLED'
+        $result.facts.failure_state = 'retry_wait'
+
+        try {
+            $installerOutput = @(& $script:WorkerInstallerPath `
+                -WorkerCoordinate 'swarm-automation-worker' `
+                -HostExecutable $script:HostPath `
+                -PackageExecutable $script:AutomationWorkerPackagePath)
+        } catch {
+            $result.status = 'unknown'
+            $result.code = 'PUBLIC_WORKER_INSTALL_OUTCOME_UNKNOWN'
+            $result.facts.installer_exception_type = $_.Exception.GetType().Name
+            return $result
+        }
+        if ($installerOutput.Count -ne 1) {
+            $result.status = 'unknown'
+            $result.code = 'PUBLIC_WORKER_INSTALL_RESULT_INVALID'
+            return $result
+        }
+        $workerInstall = $installerOutput[0]
+        if ($workerInstall.status -cne 'installed') {
+            $result.code = $(if ($workerInstall.status -ceq 'unchanged') { 'AUTOMATION_WORKER_INSTALL_RACE' } else { 'PUBLIC_WORKER_INSTALL_NOT_APPLIED' })
+            if ($workerInstall.status -ceq 'unchanged') { $result.status = 'unknown' }
+            $result.facts.installer_status = [string]$workerInstall.status
+            return $result
+        }
+        $expectedDestination = [System.IO.Path]::GetFullPath($workerDestination)
+        $reportedDestination = [System.IO.Path]::GetFullPath([string]$workerInstall.executable)
+        $reportedHost = [System.IO.Path]::GetFullPath([string]$workerInstall.host_executable)
+        $packageHash = Get-Sha256 $script:AutomationWorkerPackagePath
+        if (-not [string]::Equals($reportedDestination, $expectedDestination, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($reportedHost, $script:HostPath, [StringComparison]::OrdinalIgnoreCase) -or
+            [string]$workerInstall.package_name -cne 'swarm-automation' -or
+            [string]$workerInstall.target_name -cne 'swarm-automation-worker' -or
+            [string]$workerInstall.build_profile -cne 'release' -or
+            [string]$workerInstall.source_commit -cne $script:HostBuild.source_commit -or
+            [string]$workerInstall.source_tree -cne $script:HostBuild.source_tree -or
+            [string]$workerInstall.artifact_sha256 -cne $packageHash -or
+            [string]$workerInstall.image_sha256 -cne $packageHash) {
+            $result.status = 'unknown'
+            $result.code = 'PUBLIC_WORKER_INSTALL_IDENTITY_MISMATCH'
+            return $result
+        }
+        $installedWorkerPath = Assert-SafeAbsolutePath -Path $expectedDestination -MustExist
+        $installedWorkerHash = Get-Sha256 $installedWorkerPath
+        if ($installedWorkerHash -cne $packageHash) {
+            $result.status = 'unknown'
+            $result.code = 'INSTALLED_WORKER_HASH_MISMATCH'
+            return $result
+        }
+        $result.facts.installer = [ordered]@{
+            script = $script:WorkerInstallerPath
+            status = [string]$workerInstall.status
+            coordinate = [string]$workerInstall.coordinate
+            package_name = [string]$workerInstall.package_name
+            target_name = [string]$workerInstall.target_name
+            version = [string]$workerInstall.version
+            source_commit = [string]$workerInstall.source_commit
+            source_tree = [string]$workerInstall.source_tree
+            executable = $installedWorkerPath
+            image_sha256 = $installedWorkerHash
+            build_manifest = [string]$workerInstall.build_manifest
+        }
+
+        $recovered = Wait-OptionalWorkerStatus -Scenario $scenario -CredentialPath $manager.path `
+            -ExpectedState 'running' -ExpectedHostPid $hostPid -ExpectedHostEpoch $hostEpoch `
+            -MinimumScheduleLeadSeconds $minimumScheduleLeadSeconds
+        if (-not $recovered.success) {
+            $result.code = $recovered.code
+            if ($null -ne $recovered.worker) { $result.facts.worker_status_after_install = $recovered.worker }
+            return $result
+        }
+        $result.status = 'observed'
+        $result.facts.worker_status_after_install = $recovered.worker
+        $result.facts.running_observation = $recovered.running_observation
+        $result.facts.host_pid_after = [int]$scenario.host.Id
+        $result.facts.host_epoch_after = [long]$recovered.status['host_epoch']
+        $result.facts.host_pid_unchanged = ([int]$scenario.host.Id -eq $hostPid)
+        $result.facts.host_epoch_unchanged = ($result.facts.host_epoch_after -eq $hostEpoch)
+        $result.facts.supervisor_restart_observed_without_host_restart = $result.facts.host_pid_unchanged -and $result.facts.host_epoch_unchanged
+        $result.facts.no_checkrun_admission_observed = $true
+        $result.facts.final_schedule_ids = @($recovered.schedule.schedule_ids)
+        $result.facts.final_minimum_schedule_lead_ms = [long]$recovered.schedule.minimum_lead_ms
+        return $result
+    }
+    finally {
+        $stopped = Stop-IsolatedHost $scenario
+        if (-not $stopped.stopped) { $result.facts.pending_host_pid = $stopped.pending_host_pid } else { Remove-OwnedCredentialFiles $scenario }
+        Add-Scenario $result
+    }
+}
+
 try {
     if (-not $IsWindows -or $PSVersionTable.PSVersion.Major -lt 7) { Stop-Harness 'POWERSHELL_7_WINDOWS_REQUIRED' }
     $script:HostPath = Assert-SafeAbsolutePath -Path $HostExecutable -MustExist
@@ -1480,8 +1802,22 @@ try {
     Assert-PublicCliHostSibling -PublicCliBuild $script:PublicCliBuild -HostLauncherBuild $script:HostLauncherBuild -HostBuild $script:HostBuild -HostSupervisorBuild $script:HostSupervisorBuild
     $script:ConfigPath = Assert-SafeAbsolutePath -Path $HostConfigPath -MustExist
     $output = Assert-SafeAbsolutePath -Path $OutputRoot -MustExist -Directory
-    $script:TaskSpecPath = Assert-SafeAbsolutePath -Path $TaskSpecPath -MustExist
-    $script:TaskSpecHash = Get-Sha256 $script:TaskSpecPath
+    if ($ScenarioSelection -eq 'all') {
+        if ([string]::IsNullOrWhiteSpace($ProjectId)) { Stop-Harness 'PROJECT_ID_REQUIRED_FOR_ALL_SCENARIOS' }
+        if ([string]::IsNullOrWhiteSpace($TaskSpecPath)) { Stop-Harness 'TASK_SPEC_PATH_REQUIRED_FOR_ALL_SCENARIOS' }
+        $script:TaskSpecPath = Assert-SafeAbsolutePath -Path $TaskSpecPath -MustExist
+        $script:TaskSpecHash = Get-Sha256 $script:TaskSpecPath
+    } else {
+        if ([string]::IsNullOrWhiteSpace($AutomationWorkerPackageExecutable)) { Stop-Harness 'AUTOMATION_WORKER_PACKAGE_REQUIRED' }
+        $script:AutomationWorkerPackagePath = Assert-SafeAbsolutePath -Path $AutomationWorkerPackageExecutable -MustExist
+        if ([System.IO.Path]::GetFileName($script:AutomationWorkerPackagePath) -cne 'swarm-automation-worker.exe') {
+            Stop-Harness 'AUTOMATION_WORKER_PACKAGE_NAME_INVALID'
+        }
+        $installerCandidate = Join-Path $PSScriptRoot '..\modules\Install-StandaloneWorker.ps1'
+        $script:WorkerInstallerPath = Assert-SafeAbsolutePath -Path $installerCandidate -MustExist
+        $script:TaskSpecPath = $null
+        $script:TaskSpecHash = $null
+    }
     $runDirectory = Join-Path $output ([Guid]::NewGuid().ToString('D'))
     New-PrivateDirectory -Path $runDirectory
     $script:RunDirectory = $runDirectory
@@ -1538,10 +1874,14 @@ try {
     }
     Save-Summary
 
-    $null = Invoke-ManagerDroppedAckScenario
-    $null = Invoke-ManagerConflictScenario
-    $null = Invoke-HookRestartDedupScenario
-    $null = Invoke-OptionalWorkerObservation
+    if ($ScenarioSelection -eq 'optional-worker-recovery') {
+        $null = Invoke-OptionalWorkerRecoveryScenario
+    } else {
+        $null = Invoke-ManagerDroppedAckScenario
+        $null = Invoke-ManagerConflictScenario
+        $null = Invoke-HookRestartDedupScenario
+        $null = Invoke-OptionalWorkerObservation
+    }
 
     $script:Summary.status = 'completed'
     $script:Summary.completed_at_utc = [DateTime]::UtcNow.ToString('o')

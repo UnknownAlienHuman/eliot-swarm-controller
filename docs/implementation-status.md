@@ -2,6 +2,25 @@
 
 ## Current state
 
+### Optional worker isolation and supervisor restart — 2026-10-10
+
+The existing core qualification harness now has an opt-in
+`optional-worker-recovery` selection. A real installed contour using the exact
+`481e7fd` host and matching clean release automation-worker package observed
+`retry_wait / AUTOMATION_WORKER_NOT_INSTALLED`, installed the package through
+the existing installer, then retained 47 public `running` observations over
+13,068 ms with the same host PID and epoch. The initial harness race and its
+failed receipt are preserved: the supervisor publishes `running` before its
+asynchronous missing-resource check, so that first marker cannot end the wait.
+
+The [evidence record](remediation/2026-10-10/OPTIONAL-WORKER-RECOVERY-EVIDENCE.json)
+qualifies isolation, installation and the public supervisor restart marker.
+Scheduler readiness/active owner identity, eventual CheckRun target eligibility
+and uncertain initial host-admission receipt/no-replay remain unverified; R48
+remains `not_qualified`. The future schedule admitted no CheckRun. This contour
+made zero native/model calls. PowerShell parsing and whitespace checks passed;
+the qualified Rust production source is unchanged.
+
 ### Host recovery and process custody qualification — 2026-10-10
 
 The process-custody source assembly was published on `main` at
