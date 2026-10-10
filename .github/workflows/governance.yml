@@ -1,0 +1,27 @@
+name: Governance
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+jobs:
+  guard:
+    name: Governance Guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted base only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Validate current metadata against trusted base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python tools/ci/pr-contract.py
+          --event "$GITHUB_EVENT_PATH"
+          --policy-root .
+          --repository "$GITHUB_REPOSITORY"
