@@ -176,10 +176,14 @@ CLI MCP commands use the separate installed `swarm-mcp` executable. The default
 build recipe uses one invocation for these five packages and one external
 shared target; it does not allocate checkout targets or worktrees.
 
-OpenCode's standalone Rust artifact is
-`eliot-opencode-v2.rust-http.1@0.3.0`, with native-options schema version `2`
+OpenCode's current standalone Rust artifact is
+`eliot-opencode-v2.rust-http.1@0.5.0`, with native-options schema version `3`
 and exact schema SHA-256
-`7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68`.
+`070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e`.
+Retained v1/v2 descriptors keep their historical schema digests and
+`expected_version` projections; current external v3 routes omit that inert
+caller field, while observed server version remains diagnostic. Fresh-owned
+routes retain their separate owner-contract version check.
 Its source owns fresh native service launch, selected-provider authorization,
 pinned plugin preparation, and the four typed native MCP methods
 (`install`, `observe`, `arm`, `read`). Store queues their retained C8 phase

@@ -442,15 +442,34 @@ fn open_code_route_config(
             "OpenCode route options must be an object",
         )
     })?;
-    let base_allowed = [
-        "service_id",
-        "connection_file",
-        "expected_version",
-        "directory",
-        "model",
-    ];
+    let schema_version = descriptor
+        .config_schema
+        .as_ref()
+        .map(|schema| schema.version.as_str())
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_SCHEMA_MISMATCH",
+                "OpenCode route values require the exact registered native-options schema",
+            )
+        })?;
     let has_owner_service = object.contains_key(OWNER_ROUTE_KEY);
     let has_owner_nonce = object.contains_key(OWNER_NONCE_KEY);
+    // External schema-v3 routes have no caller-supplied version pin. Retained
+    // v1/v2 routes keep theirs, and fresh-owner projections keep the version
+    // derived from the retained owner contract for its explicit compatibility check.
+    let carries_expected_version =
+        has_owner_service || schema_version != OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3;
+    let base_allowed: &[&str] = if carries_expected_version {
+        &[
+            "service_id",
+            "connection_file",
+            "expected_version",
+            "directory",
+            "model",
+        ]
+    } else {
+        &["service_id", "connection_file", "directory", "model"]
+    };
     if has_owner_service != has_owner_nonce
         || object.keys().any(|key| {
             !base_allowed.contains(&key.as_str())
@@ -489,8 +508,15 @@ fn open_code_route_config(
     let configured_service_id = required_config_string(&object["service_id"], "service_id", 128)?;
     let configured_connection_file =
         required_config_string(&object["connection_file"], "connection_file", 4096)?;
-    let expected_version =
-        required_config_string(&object["expected_version"], "expected_version", 256)?;
+    let expected_version = if carries_expected_version {
+        Some(required_config_string(
+            &object["expected_version"],
+            "expected_version",
+            256,
+        )?)
+    } else {
+        None
+    };
     let directory = required_config_string(&object["directory"], "directory", 4096)?;
     if !Path::new(&configured_connection_file).is_absolute() || !Path::new(&directory).is_absolute()
     {
@@ -531,11 +557,13 @@ fn open_code_route_config(
     ]);
 
     // Schema v3 intentionally removes expected_version from launch config.
-    if descriptor
-        .config_schema
-        .as_ref()
-        .is_some_and(|schema| schema.version != OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3)
-    {
+    if schema_version != OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3 {
+        let expected_version = expected_version.as_ref().ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                "retained OpenCode schema requires expected_version",
+            )
+        })?;
         values.insert(
             "OPENCODE_EXPECTED_VERSION".to_owned(),
             LaunchValue::Literal(expected_version.clone()),
@@ -565,7 +593,7 @@ fn open_code_route_config(
             || !absolute_plain_path(&owner.state_root)
             || !is_lower_sha256(&owner.bun_sha256)
             || !is_lower_sha256(&owner.server_program_sha256)
-            || expected_version != OPENCODE_OWNED_SERVICE_VERSION
+            || expected_version.as_deref() != Some(OPENCODE_OWNED_SERVICE_VERSION)
         {
             return Err(Error::new(
                 "MODULE_CONFIG_INVALID",
@@ -1649,6 +1677,12 @@ mod opencode_schema_projection_tests {
         })
     }
 
+    fn v3_external_options() -> Value {
+        let mut options = external_options();
+        let _ = options.as_object_mut().unwrap().remove("expected_version");
+        options
+    }
+
     fn owned_options(owner_nonce: &str) -> Value {
         let root = fixture_root();
         let state_root = root.join("owned-state");
@@ -1708,7 +1742,7 @@ mod opencode_schema_projection_tests {
     #[test]
     fn opencode_v3_external_projection_omits_undeclared_expected_version() {
         let descriptor = descriptor_for_schema("3");
-        let config = project(&descriptor, &external_options()).unwrap();
+        let config = project(&descriptor, &v3_external_options()).unwrap();
 
         assert!(!config.values.contains_key("OPENCODE_EXPECTED_VERSION"));
         assert_eq!(
@@ -1718,6 +1752,10 @@ mod opencode_schema_projection_tests {
         assert_eq!(
             literal(&config, "OPENCODE_DIRECTORY"),
             path_text(&fixture_root().join("workspace"))
+        );
+        assert_eq!(
+            project(&descriptor, &external_options()).unwrap_err().code,
+            "MODULE_CONFIG_INVALID"
         );
     }
 

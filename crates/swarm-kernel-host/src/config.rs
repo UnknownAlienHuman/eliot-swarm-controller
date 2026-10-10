@@ -335,13 +335,7 @@ fn validate_codex_rust_options(value: &Value) -> Result<()> {
 fn validate_opencode_rust_options(value: &Value) -> Result<()> {
     let options = exact_option_object(
         value,
-        &[
-            "service_id",
-            "connection_file",
-            "expected_version",
-            "directory",
-            "model",
-        ],
+        &["service_id", "connection_file", "directory", "model"],
         &[],
     )?;
     let service_id = required_option_string(options, "service_id", 128)?;
@@ -352,7 +346,6 @@ fn validate_opencode_rust_options(value: &Value) -> Result<()> {
         return Err(Error::new("CONFIG_ERROR", "OpenCode service_id is invalid"));
     }
     required_absolute_path(options, "connection_file", 4096)?;
-    required_option_string(options, "expected_version", 256)?;
     required_absolute_path(options, "directory", 4096)?;
     let model = options
         .get("model")
@@ -665,7 +658,6 @@ mod owned_opencode_route_validation_tests {
         let external_options = json!({
             "service_id": "external-opencode",
             "connection_file": absolute_fixture_path("external-connection.json"),
-            "expected_version": "2.0.7",
             "directory": absolute_fixture_path("external-opencode-workspace"),
             "model": {
                 "id": "step-5-preview-free",
@@ -677,6 +669,23 @@ mod owned_opencode_route_validation_tests {
             route(external_options, None)
                 .validate_activation_contract()
                 .is_ok()
+        );
+
+        let versioned_options = json!({
+            "service_id": "external-opencode",
+            "connection_file": absolute_fixture_path("external-connection.json"),
+            "expected_version": "2.0.7",
+            "directory": absolute_fixture_path("external-opencode-workspace"),
+            "model": {
+                "id": "step-5-preview-free",
+                "providerID": "opencode",
+                "variant": "high"
+            }
+        });
+        assert!(
+            route(versioned_options, None)
+                .validate_activation_contract()
+                .is_err()
         );
     }
 }
