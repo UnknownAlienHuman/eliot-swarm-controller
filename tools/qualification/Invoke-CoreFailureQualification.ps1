@@ -702,35 +702,365 @@ function New-Manager {
     return [pscustomobject]@{ success = $true; code = $null; id = $managerId; path = $credentialPath; credential = $credential; gm_epoch = [long]$status.value.gm['epoch'] }
 }
 
-function Read-TaskCreatedByOrigin {
-    param([Parameter(Mandatory)] $Scenario, [Parameter(Mandatory)] $Manager, [Parameter(Mandatory)][string] $OriginKey)
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        $listed = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'task.list' -Params ([ordered]@{ after = 0; limit = 50 }) -TimeoutMilliseconds 10000
-        if ($listed.success) {
-            if (@($listed.value.items | Where-Object { -not $_.Contains('origin_key') }).Count -gt 0) {
-                return [pscustomobject]@{ success = $false; code = 'PUBLIC_TASK_ORIGIN_UNAVAILABLE'; task = $null; operation = $null }
-            }
-            $matches = @($listed.value.items | Where-Object { $_.origin_key -ceq $OriginKey })
-            if ($matches.Count -gt 1) { return [pscustomobject]@{ success = $false; code = 'TASK_ORIGIN_NOT_UNIQUE'; task = $null; operation = $null } }
-            if ($matches.Count -eq 1) {
-                $task = $matches[0]
-                $ops = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'operation.list' -Params ([ordered]@{ after = 0; limit = 50 }) -TimeoutMilliseconds 10000
-                if ($ops.success) {
-                    $opMatches = @($ops.value.items | Where-Object { $_.method -ceq 'task.create' -and $_['diagnostic'] -is [Collections.IDictionary] -and $_.diagnostic['caller_id'] -ceq $Manager.id -and $_.task_id -ceq $task.task_id })
-                    if ($opMatches.Count -gt 1) { return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_OPERATION_NOT_UNIQUE'; task = $task; operation = $null } }
-                    if ($opMatches.Count -eq 1) {
-                        $read = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'operation.get' -Params ([ordered]@{ operation_id = [string]$opMatches[0].operation_id }) -TimeoutMilliseconds 10000
-                        if ($read.success -and $read.value.operation_id -ceq $opMatches[0].operation_id -and $read.value.task_id -ceq $task.task_id) {
-                            return [pscustomobject]@{ success = $true; code = $null; task = $task; operation = $read.value }
-                        }
-                    }
+function Test-JsonNumberValue {
+    param([Parameter(Mandatory)] $Value)
+    if ($Value -is [bool]) { return $false }
+    $typeCode = [System.Type]::GetTypeCode($Value.GetType())
+    return $typeCode -in @(
+        [System.TypeCode]::SByte, [System.TypeCode]::Byte,
+        [System.TypeCode]::Int16, [System.TypeCode]::UInt16,
+        [System.TypeCode]::Int32, [System.TypeCode]::UInt32,
+        [System.TypeCode]::Int64, [System.TypeCode]::UInt64,
+        [System.TypeCode]::Single, [System.TypeCode]::Double,
+        [System.TypeCode]::Decimal
+    )
+}
+
+function Test-JsonNumberEqual {
+    param([Parameter(Mandatory)] $Left, [Parameter(Mandatory)] $Right)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $leftText = [System.Convert]::ToString($Left, $invariant)
+    $rightText = [System.Convert]::ToString($Right, $invariant)
+    $leftDecimal = [decimal]::Zero
+    $rightDecimal = [decimal]::Zero
+    $leftFitsDecimal = [decimal]::TryParse($leftText, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$leftDecimal)
+    $rightFitsDecimal = [decimal]::TryParse($rightText, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$rightDecimal)
+    if ($leftFitsDecimal -and $rightFitsDecimal) { return $leftDecimal -eq $rightDecimal }
+    $leftDouble = [double]::NaN
+    $rightDouble = [double]::NaN
+    $leftFitsDouble = [double]::TryParse($leftText, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$leftDouble)
+    $rightFitsDouble = [double]::TryParse($rightText, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$rightDouble)
+    return $leftFitsDouble -and $rightFitsDouble -and -not [double]::IsNaN($leftDouble) -and
+        -not [double]::IsInfinity($leftDouble) -and -not [double]::IsNaN($rightDouble) -and
+        -not [double]::IsInfinity($rightDouble) -and $leftDouble -eq $rightDouble
+}
+
+function Test-JsonSemanticEqual {
+    param($Left, $Right)
+    if ($null -eq $Left -or $null -eq $Right) { return $null -eq $Left -and $null -eq $Right }
+    if ($Left -is [System.Collections.IDictionary] -or $Right -is [System.Collections.IDictionary]) {
+        if ($Left -isnot [System.Collections.IDictionary] -or $Right -isnot [System.Collections.IDictionary] -or
+            $Left.Count -ne $Right.Count) { return $false }
+        foreach ($leftKey in $Left.Keys) {
+            $rightKeyMatch = $null
+            $keyMatches = 0
+            foreach ($rightKey in $Right.Keys) {
+                if ([string]::Equals([string]$leftKey, [string]$rightKey, [StringComparison]::Ordinal)) {
+                    $rightKeyMatch = $rightKey
+                    $keyMatches++
                 }
             }
+            if ($keyMatches -ne 1 -or -not (Test-JsonSemanticEqual -Left $Left[$leftKey] -Right $Right[$rightKeyMatch])) { return $false }
+        }
+        return $true
+    }
+    if ($Left -is [System.Collections.IList] -or $Right -is [System.Collections.IList]) {
+        if ($Left -isnot [System.Collections.IList] -or $Right -isnot [System.Collections.IList] -or
+            $Left.Count -ne $Right.Count) { return $false }
+        for ($index = 0; $index -lt $Left.Count; $index++) {
+            if (-not (Test-JsonSemanticEqual -Left $Left[$index] -Right $Right[$index])) { return $false }
+        }
+        return $true
+    }
+    $leftIsNumber = Test-JsonNumberValue -Value $Left
+    $rightIsNumber = Test-JsonNumberValue -Value $Right
+    if ($leftIsNumber -or $rightIsNumber) {
+        return $leftIsNumber -and $rightIsNumber -and (Test-JsonNumberEqual -Left $Left -Right $Right)
+    }
+    if ($Left -is [string] -or $Right -is [string]) {
+        return $Left -is [string] -and $Right -is [string] -and [string]::Equals($Left, $Right, [StringComparison]::Ordinal)
+    }
+    if ($Left -is [bool] -or $Right -is [bool]) { return $Left -is [bool] -and $Right -is [bool] -and $Left -eq $Right }
+    return [object]::Equals($Left, $Right)
+}
+
+function ConvertTo-StrictInt64 {
+    param($Value)
+    if ($null -eq $Value -or $Value -is [bool]) { return [pscustomobject]@{ valid = $false; value = $null } }
+    $typeCode = [System.Type]::GetTypeCode($Value.GetType())
+    if ($typeCode -notin @(
+        [System.TypeCode]::SByte, [System.TypeCode]::Byte,
+        [System.TypeCode]::Int16, [System.TypeCode]::UInt16,
+        [System.TypeCode]::Int32, [System.TypeCode]::UInt32,
+        [System.TypeCode]::Int64, [System.TypeCode]::UInt64
+    )) { return [pscustomobject]@{ valid = $false; value = $null } }
+    try { return [pscustomobject]@{ valid = $true; value = [long]$Value } }
+    catch { return [pscustomobject]@{ valid = $false; value = $null } }
+}
+
+function Test-PublicTaskMatchesFixture {
+    param($Task, [Parameter(Mandatory)][string] $TaskId, [Parameter(Mandatory)][string] $ExpectedProjectId,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $ExpectedSpec)
+    if ($Task -isnot [System.Collections.IDictionary] -or
+        -not $Task.Contains('task_id') -or -not $Task.Contains('project_id') -or -not $Task.Contains('spec')) { return $false }
+    return $Task['task_id'] -is [string] -and $Task['task_id'] -ceq $TaskId -and
+        $Task['project_id'] -is [string] -and $Task['project_id'] -ceq $ExpectedProjectId -and
+        (Test-JsonSemanticEqual -Left $Task['spec'] -Right $ExpectedSpec)
+}
+
+function Read-PublicListPages {
+    param([Parameter(Mandatory)] $Scenario, [Parameter(Mandatory)][string] $CredentialPath,
+        [Parameter(Mandatory)][ValidateSet('task.list', 'operation.list')][string] $Method,
+        [Parameter(Mandatory)][ValidateSet('task_id', 'operation_id')][string] $IdentityField,
+        [datetime] $DeadlineUtc = [DateTime]::MinValue)
+    if ($DeadlineUtc -eq [DateTime]::MinValue) { $DeadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $seenIdentities = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $after = [long]0
+    $pageLimit = 50
+    $maximumPages = 512
+    for ($pageNumber = 1; $pageNumber -le $maximumPages; $pageNumber++) {
+        $remainingMilliseconds = ($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remainingMilliseconds -le 0) {
+            return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_PAGINATION_TIMEOUT'; items = @(); pages = $pageNumber - 1 }
+        }
+        $pageTimeoutMilliseconds = [int][Math]::Max(1, [Math]::Min(10000, [Math]::Floor($remainingMilliseconds)))
+        $call = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $CredentialPath -Method $Method `
+            -Params ([ordered]@{ after = $after; limit = $pageLimit }) -TimeoutMilliseconds $pageTimeoutMilliseconds
+        if (-not $call.success) {
+            return [pscustomobject]@{ success = $false; code = $(if ($call.code) { $call.code } else { 'PUBLIC_LIST_READ_FAILED' }); items = @(); pages = $pageNumber }
+        }
+        $page = $call.value
+        if ($page -isnot [System.Collections.IDictionary] -or
+            -not $page.Contains('items') -or -not $page.Contains('next_after') -or
+            -not $page.Contains('pagination') -or -not $page.Contains('examined_through') -or
+            -not $page.Contains('has_newer') -or -not $page.Contains('coverage_complete') -or
+            -not $page.Contains('gap_count') -or $page['items'] -isnot [System.Collections.IList] -or
+            $page['pagination'] -cne 'committed_observation_position' -or
+            $page['has_newer'] -isnot [bool] -or $page['coverage_complete'] -isnot [bool] -or
+            $page['coverage_complete'] -ne $true) {
+            return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_PAGE_MALFORMED'; items = @(); pages = $pageNumber }
+        }
+        $nextCursor = ConvertTo-StrictInt64 -Value $page['next_after']
+        $examinedCursor = ConvertTo-StrictInt64 -Value $page['examined_through']
+        $gapCount = ConvertTo-StrictInt64 -Value $page['gap_count']
+        if (-not $nextCursor.valid -or -not $examinedCursor.valid -or -not $gapCount.valid -or
+            $nextCursor.value -lt $after -or $examinedCursor.value -ne $nextCursor.value -or
+            $gapCount.value -ne 0) {
+            return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_CURSOR_OR_COVERAGE_INVALID'; items = @(); pages = $pageNumber }
+        }
+        $pageItems = $page['items']
+        if ($pageItems.Count -gt $pageLimit) {
+            return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_PAGE_OVERSIZED'; items = @(); pages = $pageNumber }
+        }
+        $previousItemCursor = $after
+        foreach ($item in $pageItems) {
+            if ($item -isnot [System.Collections.IDictionary] -or $item.Contains('gap') -or
+                -not $item.Contains('cursor') -or -not $item.Contains($IdentityField)) {
+                return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_ENTRY_MALFORMED'; items = @(); pages = $pageNumber }
+            }
+            $itemCursor = ConvertTo-StrictInt64 -Value $item['cursor']
+            $identity = $item[$IdentityField]
+            if (-not $itemCursor.valid -or $itemCursor.value -le $previousItemCursor -or
+                $itemCursor.value -gt $nextCursor.value -or $identity -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($identity) -or -not $seenIdentities.Add($identity)) {
+                return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_ENTRY_CURSOR_OR_IDENTITY_INVALID'; items = @(); pages = $pageNumber }
+            }
+            if ($Method -ceq 'operation.list' -and
+                (-not $item.Contains('method') -or $item['method'] -isnot [string] -or [string]::IsNullOrWhiteSpace($item['method']))) {
+                return [pscustomobject]@{ success = $false; code = 'PUBLIC_OPERATION_ENTRY_MALFORMED'; items = @(); pages = $pageNumber }
+            }
+            $previousItemCursor = $itemCursor.value
+            $items.Add($item)
+        }
+        if ($page['has_newer'] -eq $true) {
+            if ($nextCursor.value -le $after) {
+                return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_CURSOR_NO_PROGRESS'; items = @(); pages = $pageNumber }
+            }
+            $after = $nextCursor.value
+            continue
+        }
+        return [pscustomobject]@{ success = $true; code = $null; items = [object[]]$items.ToArray(); pages = $pageNumber }
+    }
+    return [pscustomobject]@{ success = $false; code = 'PUBLIC_LIST_PAGE_LIMIT_REACHED'; items = @(); pages = $maximumPages }
+}
+
+function Read-TaskCreateAdmission {
+    param([Parameter(Mandatory)] $Scenario, [Parameter(Mandatory)] $Manager,
+        [Parameter(Mandatory)][string] $ExpectedProjectId,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $ExpectedSpec)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $listed = Read-PublicListPages -Scenario $Scenario -CredentialPath $Manager.path -Method 'operation.list' `
+            -IdentityField 'operation_id' -DeadlineUtc $deadline
+        if (-not $listed.success) { return [pscustomobject]@{ success = $false; code = $listed.code; operation_id = $null; task_id = $null; operation = $null; task = $null } }
+        $matches = @($listed.items | Where-Object { $_['method'] -ceq 'task.create' })
+        if ($matches.Count -gt 1) {
+            return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_OPERATION_AMBIGUOUS'; operation_id = $null; task_id = $null; operation = $null; task = $null }
+        }
+        if ($matches.Count -eq 1) {
+            $listedOperation = $matches[0]
+            if (-not $listedOperation.Contains('task_id') -or $listedOperation['task_id'] -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($listedOperation['operation_id']) -or
+                [string]::IsNullOrWhiteSpace($listedOperation['task_id'])) {
+                return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_PUBLIC_IDENTITY_MISSING'; operation_id = $null; task_id = $null; operation = $null; task = $null }
+            }
+            $operationId = [string]$listedOperation['operation_id']
+            $taskId = [string]$listedOperation['task_id']
+            $remainingMilliseconds = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remainingMilliseconds -le 0) {
+                return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_EXACT_READ_TIMEOUT'; operation_id = $operationId; task_id = $taskId; operation = $null; task = $null }
+            }
+            $exactReadTimeoutMilliseconds = [int][Math]::Max(1, [Math]::Min(10000, [Math]::Floor($remainingMilliseconds)))
+            $operationRead = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'operation.get' `
+                -Params ([ordered]@{ operation_id = $operationId }) -TimeoutMilliseconds $exactReadTimeoutMilliseconds
+            $remainingMilliseconds = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remainingMilliseconds -le 0) {
+                return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_EXACT_READ_TIMEOUT'; operation_id = $operationId; task_id = $taskId; operation = $null; task = $null }
+            }
+            $exactReadTimeoutMilliseconds = [int][Math]::Max(1, [Math]::Min(10000, [Math]::Floor($remainingMilliseconds)))
+            $taskRead = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'task.get' `
+                -Params ([ordered]@{ task_id = $taskId }) -TimeoutMilliseconds $exactReadTimeoutMilliseconds
+            if (-not $operationRead.success -or -not $taskRead.success) {
+                return [pscustomobject]@{ success = $false; code = $(if ($operationRead.code) { $operationRead.code } elseif ($taskRead.code) { $taskRead.code } else { 'TASK_CREATE_EXACT_READ_FAILED' }); operation_id = $operationId; task_id = $taskId; operation = $null; task = $null }
+            }
+            $operation = $operationRead.value
+            $task = $taskRead.value
+            if ($operation -isnot [System.Collections.IDictionary] -or
+                -not $operation.Contains('operation_id') -or -not $operation.Contains('method') -or
+                -not $operation.Contains('state') -or -not $operation.Contains('task_id') -or
+                -not $operation.Contains('result') -or $operation['result'] -isnot [System.Collections.IDictionary] -or
+                $operation['operation_id'] -cne $operationId -or $operation['method'] -cne 'task.create' -or
+                $operation['state'] -cne 'settled' -or $operation['task_id'] -cne $taskId -or
+                $operation['result']['task_id'] -cne $taskId -or
+                -not (Test-PublicTaskMatchesFixture -Task $task -TaskId $taskId -ExpectedProjectId $ExpectedProjectId -ExpectedSpec $ExpectedSpec)) {
+                return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_PRE_RESTART_RECEIPT_OR_TASK_MISMATCH'; operation_id = $operationId; task_id = $taskId; operation = $operation; task = $task }
+            }
+            return [pscustomobject]@{ success = $true; code = $null; operation_id = $operationId; task_id = $taskId; operation = $operation; task = $task; pages = $listed.pages }
         }
         Start-Sleep -Milliseconds 300
     }
-    return [pscustomobject]@{ success = $false; code = 'DURABLE_READBACK_TIMEOUT'; task = $null; operation = $null }
+    return [pscustomobject]@{ success = $false; code = 'PRE_RESTART_TASK_CREATE_ADMISSION_NOT_OBSERVED'; operation_id = $null; task_id = $null; operation = $null; task = $null }
+}
+
+function Read-PublicHookSourceEvents {
+    param([Parameter(Mandatory)] $Scenario, [Parameter(Mandatory)][string] $CredentialPath,
+        [Parameter(Mandatory)][string] $SourceId, [datetime] $DeadlineUtc = [DateTime]::MinValue)
+    if ($DeadlineUtc -eq [DateTime]::MinValue) { $DeadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
+    $events = [System.Collections.Generic.List[object]]::new()
+    $seenObservationIds = [System.Collections.Generic.HashSet[long]]::new()
+    $after = [long]0
+    $pageLimit = 10
+    $maximumPages = 256
+    for ($pageNumber = 1; $pageNumber -le $maximumPages; $pageNumber++) {
+        $remainingMilliseconds = ($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remainingMilliseconds -le 0) {
+            return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_PAGINATION_TIMEOUT'; events = @(); pages = $pageNumber - 1 }
+        }
+        $pageTimeoutMilliseconds = [int][Math]::Max(1, [Math]::Min(10000, [Math]::Floor($remainingMilliseconds)))
+        $call = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $CredentialPath -Method 'hook.source.get' `
+            -Params ([ordered]@{ source_id = $SourceId; after = $after; limit = $pageLimit }) -TimeoutMilliseconds $pageTimeoutMilliseconds
+        if (-not $call.success) {
+            return [pscustomobject]@{ success = $false; code = $(if ($call.code) { $call.code } else { 'HOOK_SOURCE_READ_FAILED' }); events = @(); pages = $pageNumber }
+        }
+        $page = $call.value
+        if ($page -isnot [System.Collections.IDictionary] -or -not $page.Contains('events') -or
+            -not $page.Contains('after') -or -not $page.Contains('next_after_observation_id') -or
+            -not $page.Contains('has_more') -or $page['events'] -isnot [System.Collections.IList] -or
+            $page['has_more'] -isnot [bool]) {
+            return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_PAGE_MALFORMED'; events = @(); pages = $pageNumber }
+        }
+        $pageAfter = ConvertTo-StrictInt64 -Value $page['after']
+        if (-not $pageAfter.valid -or $pageAfter.value -ne $after -or $page['events'].Count -gt $pageLimit) {
+            return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_CURSOR_INVALID'; events = @(); pages = $pageNumber }
+        }
+        $pageEvents = $page['events']
+        $lastObservationId = $null
+        foreach ($event in $pageEvents) {
+            if ($event -isnot [System.Collections.IDictionary] -or -not $event.Contains('observation_id') -or
+                -not $event.Contains('source_event_key') -or -not $event.Contains('fact') -or
+                $event['fact'] -isnot [System.Collections.IDictionary]) {
+                return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_EVENT_MALFORMED'; events = @(); pages = $pageNumber }
+            }
+            $observation = ConvertTo-StrictInt64 -Value $event['observation_id']
+            $fact = $event['fact']
+            if (-not $observation.valid -or $observation.value -le $after -or
+                ($null -ne $lastObservationId -and $observation.value -le $lastObservationId) -or
+                -not $seenObservationIds.Add([long]$observation.value) -or
+                -not $fact.Contains('event') -or -not $fact.Contains('source_id') -or -not $fact.Contains('commit_oid') -or
+                -not $fact.Contains('readback_verified') -or $fact['source_id'] -cne $SourceId -or
+                $fact['event'] -cne 'git.post_commit' -or
+                $fact['commit_oid'] -isnot [string] -or [string]::IsNullOrWhiteSpace($fact['commit_oid']) -or
+                $fact['readback_verified'] -isnot [bool] -or $fact['readback_verified'] -ne $true -or
+                $event['source_event_key'] -cne ($SourceId + ':' + $fact['commit_oid'])) {
+                return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_EVENT_IDENTITY_INVALID'; events = @(); pages = $pageNumber }
+            }
+            $lastObservationId = [long]$observation.value
+            $events.Add($event)
+        }
+        $hasMore = [bool]$page['has_more']
+        if ($hasMore -ne ($pageEvents.Count -eq $pageLimit)) {
+            return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_PAGE_COMPLETENESS_INVALID'; events = @(); pages = $pageNumber }
+        }
+        if ($pageEvents.Count -eq 0) {
+            if ($null -ne $page['next_after_observation_id']) {
+                return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_EMPTY_PAGE_CURSOR_INVALID'; events = @(); pages = $pageNumber }
+            }
+            if ($hasMore) { return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_CURSOR_NO_PROGRESS'; events = @(); pages = $pageNumber } }
+            return [pscustomobject]@{ success = $true; code = $null; events = [object[]]$events.ToArray(); pages = $pageNumber }
+        }
+        $nextCursor = ConvertTo-StrictInt64 -Value $page['next_after_observation_id']
+        if (-not $nextCursor.valid -or $nextCursor.value -ne $lastObservationId -or $nextCursor.value -le $after) {
+            return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_CURSOR_NO_PROGRESS'; events = @(); pages = $pageNumber }
+        }
+        if (-not $hasMore) { return [pscustomobject]@{ success = $true; code = $null; events = [object[]]$events.ToArray(); pages = $pageNumber } }
+        $after = $nextCursor.value
+    }
+    return [pscustomobject]@{ success = $false; code = 'HOOK_SOURCE_PAGE_LIMIT_REACHED'; events = @(); pages = $maximumPages }
+}
+
+function Test-HookObservation {
+    param($Event, [Parameter(Mandatory)][string] $SourceId, [Parameter(Mandatory)][string] $CommitOid,
+        [Parameter(Mandatory)][long] $ObservationId)
+    if ($Event -isnot [System.Collections.IDictionary] -or -not $Event.Contains('fact') -or
+        $Event['fact'] -isnot [System.Collections.IDictionary] -or -not $Event.Contains('observation_id') -or
+        -not $Event.Contains('source_event_key')) { return $false }
+    $observation = ConvertTo-StrictInt64 -Value $Event['observation_id']
+    $fact = $Event['fact']
+    return $observation.valid -and $observation.value -eq $ObservationId -and
+        $fact['event'] -ceq 'git.post_commit' -and
+        $fact['source_id'] -ceq $SourceId -and $fact['commit_oid'] -ceq $CommitOid -and
+        $fact['readback_verified'] -is [bool] -and $fact['readback_verified'] -eq $true -and
+        $Event['source_event_key'] -ceq ($SourceId + ':' + $CommitOid)
+}
+
+function Test-HookDuplicateAcknowledgement {
+    param($Value, [Parameter(Mandatory)][string] $SourceId, [Parameter(Mandatory)][string] $CommitOid,
+        [Parameter(Mandatory)][long] $ObservationId)
+    if ($Value -isnot [System.Collections.IDictionary] -or
+        -not $Value.Contains('event') -or -not $Value.Contains('source_id') -or
+        -not $Value.Contains('commit_oid') -or -not $Value.Contains('readback_verified') -or
+        -not $Value.Contains('duplicate') -or -not $Value.Contains('recorded') -or
+        -not $Value.Contains('observation_id')) { return $false }
+    $observation = ConvertTo-StrictInt64 -Value $Value['observation_id']
+    return $Value['event'] -ceq 'git.post_commit' -and $Value['source_id'] -ceq $SourceId -and
+        $Value['commit_oid'] -ceq $CommitOid -and $Value['readback_verified'] -is [bool] -and
+        $Value['readback_verified'] -eq $true -and $Value['duplicate'] -is [bool] -and
+        $Value['duplicate'] -eq $true -and $Value['recorded'] -is [bool] -and
+        $Value['recorded'] -eq $false -and $observation.valid -and $observation.value -eq $ObservationId
+}
+
+function Wait-HookSourceAdmission {
+    param([Parameter(Mandatory)] $Scenario, [Parameter(Mandatory)][string] $CredentialPath,
+        [Parameter(Mandatory)][string] $SourceId, [Parameter(Mandatory)][string] $CommitOid)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $read = Read-PublicHookSourceEvents -Scenario $Scenario -CredentialPath $CredentialPath -SourceId $SourceId -DeadlineUtc $deadline
+        if (-not $read.success) { return [pscustomobject]@{ success = $false; code = $read.code; observation_id = $null; event = $null } }
+        if ($read.events.Count -gt 1) {
+            return [pscustomobject]@{ success = $false; code = 'HOOK_PRE_RESTART_EVENT_AMBIGUOUS'; observation_id = $null; event = $null }
+        }
+        if ($read.events.Count -eq 1) {
+            $event = $read.events[0]
+            $observation = ConvertTo-StrictInt64 -Value $event['observation_id']
+            if (-not $observation.valid -or -not (Test-HookObservation -Event $event -SourceId $SourceId -CommitOid $CommitOid -ObservationId $observation.value)) {
+                return [pscustomobject]@{ success = $false; code = 'HOOK_PRE_RESTART_EVENT_IDENTITY_MISMATCH'; observation_id = $null; event = $null }
+            }
+            return [pscustomobject]@{ success = $true; code = $null; observation_id = [long]$observation.value; event = $event }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return [pscustomobject]@{ success = $false; code = 'HOOK_PRE_RESTART_ADMISSION_NOT_OBSERVED'; observation_id = $null; event = $null }
 }
 
 function Assert-TaskSpecFixture {
@@ -795,6 +1125,27 @@ function Invoke-ManagerDroppedAckScenario {
         if (-not $manager.success) { $result.code = $manager.code; return $result }
         $taskSpec = Read-JsonFile $script:TaskSpecPath
         Assert-TaskSpecFixture $taskSpec
+        $taskBaseline = Read-PublicListPages -Scenario $scenario -CredentialPath $manager.path -Method 'task.list' -IdentityField 'task_id'
+        if (-not $taskBaseline.success) {
+            $result.status = 'unknown'; $result.code = $taskBaseline.code; $result.facts.public_task_baseline = 'unknown'; return $result
+        }
+        $result.facts.public_task_count_before = $taskBaseline.items.Count
+        $result.facts.public_task_list_pages_before = $taskBaseline.pages
+        if ($taskBaseline.items.Count -ne 0) {
+            $result.status = 'unknown'; $result.code = 'PRE_SEND_PUBLIC_TASK_BASELINE_NOT_EMPTY'; $result.facts.public_task_baseline = 'not_empty'; return $result
+        }
+        $operationBaseline = Read-PublicListPages -Scenario $scenario -CredentialPath $manager.path -Method 'operation.list' -IdentityField 'operation_id'
+        if (-not $operationBaseline.success) {
+            $result.status = 'unknown'; $result.code = $operationBaseline.code; $result.facts.task_create_operation_baseline = 'unknown'; return $result
+        }
+        $priorTaskCreateOperations = @($operationBaseline.items | Where-Object { $_['method'] -ceq 'task.create' })
+        $result.facts.task_create_operation_count_before = $priorTaskCreateOperations.Count
+        $result.facts.operation_list_pages_before = $operationBaseline.pages
+        if ($priorTaskCreateOperations.Count -ne 0) {
+            $result.status = 'unknown'; $result.code = 'PRE_SEND_TASK_CREATE_OPERATION_BASELINE_NOT_EMPTY'; $result.facts.task_create_operation_baseline = 'not_empty'; return $result
+        }
+        $result.facts.public_task_baseline = 'empty'
+        $result.facts.task_create_operation_baseline = 'empty'
         $origin = 'core-failure:' + [Guid]::NewGuid().ToString('N')
         $logicalId = 'core-failure:' + [Guid]::NewGuid().ToString('N')
         $params = [ordered]@{ client_request_id = $logicalId; project_id = $ProjectId; origin_key = $origin; spec = $taskSpec }
@@ -810,19 +1161,20 @@ function Invoke-ManagerDroppedAckScenario {
         }
         $result.facts.manager_ack = 'intentionally_not_read'
         $result.facts.logical_request_id = $logicalId
-        $admitted = Read-TaskCreatedByOrigin -Scenario $scenario -Manager $manager -OriginKey $origin
-        $admissionIdentityVerified = $admitted.success -and $admitted.operation.state -ceq 'settled' -and
-            $admitted.operation.result.task_id -ceq $admitted.task.task_id
-        if (-not $admissionIdentityVerified) {
+        $admitted = Read-TaskCreateAdmission -Scenario $scenario -Manager $manager -ExpectedProjectId $ProjectId -ExpectedSpec $taskSpec
+        if (-not $admitted.success) {
             $result.status = 'unknown'
             $result.code = $(if ($admitted.code) { $admitted.code } else { 'PRE_RESTART_ADMISSION_READBACK_MISMATCH' })
             $result.facts.public_task_identity_before_restart = 'unknown'
             $result.facts.public_task_identity_before_restart_code = $result.code
-        } else {
-            $result.facts.admitted_operation_before_restart = [string]$admitted.operation.operation_id
-            $result.facts.admitted_task_before_restart = [string]$admitted.task.task_id
-            $result.facts.public_task_identity_before_restart = 'verified'
+            return $result
         }
+        $admittedOperationId = [string]$admitted.operation_id
+        $admittedTaskId = [string]$admitted.task_id
+        $result.facts.admitted_operation_before_restart = $admittedOperationId
+        $result.facts.admitted_task_before_restart = $admittedTaskId
+        $result.facts.task_create_operation_list_pages_after_send = $admitted.pages
+        $result.facts.public_task_identity_before_restart = 'verified'
         $stopped = Stop-IsolatedHost $scenario
         if (-not $stopped.stopped) { $result.status = 'pending'; $result.code = 'OWN_HOST_STOP_PENDING'; $result.facts.pending_host_pid = $stopped.pending_host_pid; return $result }
         $restarted = Start-IsolatedHost $scenario
@@ -834,37 +1186,50 @@ function Invoke-ManagerDroppedAckScenario {
         $result.facts.host_restart_image_sha256 = $script:HostBuild.binary_sha256
         $result.facts.host_epoch_after = [long]$restarted.epoch
         if ($restarted.epoch -le $hostStart.epoch) { $result.status = 'unknown'; $result.code = 'HOST_EPOCH_DID_NOT_ADVANCE'; return $result }
-        $readback = Read-TaskCreatedByOrigin -Scenario $scenario -Manager $manager -OriginKey $origin
-        if (-not $readback.success) {
+        $operationAfterRestart = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'operation.get' `
+            -Params ([ordered]@{ operation_id = $admittedOperationId })
+        if (-not $operationAfterRestart.success) {
             $result.status = 'unknown'
-            if ($admissionIdentityVerified -or -not $result.code) { $result.code = $readback.code }
+            $result.code = $(if ($operationAfterRestart.code) { $operationAfterRestart.code } else { 'POST_RESTART_OPERATION_READ_FAILED' })
             $result.facts.public_task_identity_after_restart = 'unknown'
-            $result.facts.public_task_identity_after_restart_code = $readback.code
+            $result.facts.public_task_identity_after_restart_code = $result.code
             return $result
+        }
+        $taskAfterRestart = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'task.get' `
+            -Params ([ordered]@{ task_id = $admittedTaskId })
+        if (-not $taskAfterRestart.success) {
+            $result.status = 'unknown'
+            $result.code = $(if ($taskAfterRestart.code) { $taskAfterRestart.code } else { 'POST_RESTART_TASK_READ_FAILED' })
+            $result.facts.public_task_identity_after_restart = 'unknown'
+            return $result
+        }
+        $operationValueAfterRestart = $operationAfterRestart.value
+        $taskValueAfterRestart = $taskAfterRestart.value
+        if ($operationValueAfterRestart -isnot [System.Collections.IDictionary] -or
+            -not $operationValueAfterRestart.Contains('operation_id') -or -not $operationValueAfterRestart.Contains('method') -or
+            -not $operationValueAfterRestart.Contains('state') -or -not $operationValueAfterRestart.Contains('task_id') -or
+            -not $operationValueAfterRestart.Contains('result') -or $operationValueAfterRestart['result'] -isnot [System.Collections.IDictionary] -or
+            $operationValueAfterRestart['operation_id'] -cne $admittedOperationId -or
+            $operationValueAfterRestart['method'] -cne 'task.create' -or $operationValueAfterRestart['state'] -cne 'settled' -or
+            $operationValueAfterRestart['task_id'] -cne $admittedTaskId -or
+            $operationValueAfterRestart['result']['task_id'] -cne $admittedTaskId -or
+            -not (Test-PublicTaskMatchesFixture -Task $taskValueAfterRestart -TaskId $admittedTaskId -ExpectedProjectId $ProjectId -ExpectedSpec $taskSpec)) {
+            $result.status = 'unknown'; $result.code = 'POST_RESTART_TASK_CREATE_RECEIPT_OR_TASK_MISMATCH'; return $result
+        }
+        if (-not (Test-JsonSemanticEqual -Left $admitted.operation -Right $operationValueAfterRestart) -or
+            -not (Test-JsonSemanticEqual -Left $admitted.task -Right $taskValueAfterRestart)) {
+            $result.status = 'unknown'; $result.code = 'POST_RESTART_PUBLIC_RECEIPT_OR_TASK_CHANGED'; return $result
         }
         $result.facts.public_task_identity_after_restart = 'verified'
-        $result.facts.operation_id_after_restart = [string]$readback.operation.operation_id
-        $result.facts.task_id_after_restart = [string]$readback.task.task_id
-        if (-not $admissionIdentityVerified) {
-            $result.status = 'unknown'
-            return $result
-        }
-        if ($readback.operation.operation_id -cne $admitted.operation.operation_id -or
-            $readback.task.task_id -cne $admitted.task.task_id) {
-            $result.status = 'unknown'; $result.code = 'POST_RESTART_IDENTITY_CHANGED'; return $result
-        }
-        $result.facts.operation_id = [string]$readback.operation.operation_id
-        $result.facts.task_id = [string]$readback.task.task_id
-        if ($readback.operation.state -cne 'settled' -or $readback.operation.result.task_id -cne $readback.task.task_id) {
-            $result.status = 'unknown'; $result.code = 'TASK_CREATE_DURABLE_RECEIPT_MISMATCH'; return $result
-        }
-        $after = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'operation.get' -Params ([ordered]@{ operation_id = [string]$readback.operation.operation_id })
-        if (-not $after.success -or $after.value.operation_id -cne $readback.operation.operation_id -or $after.value.state -cne 'settled' -or $after.value.result.task_id -cne $readback.task.task_id) {
-            $result.status = 'unknown'; $result.code = $(if ($after.code) { $after.code } else { 'POST_RESTART_READBACK_MISMATCH' }); return $result
-        }
+        $result.facts.operation_id_after_restart = $admittedOperationId
+        $result.facts.task_id_after_restart = $admittedTaskId
+        $result.facts.operation_id = $admittedOperationId
+        $result.facts.task_id = $admittedTaskId
         $result.status = 'observed'
         $result.facts.manager_readback_after_restart = $true
-        $result.facts.operation_state_after_restart = [string]$after.value.state
+        $result.facts.operation_state_after_restart = [string]$operationValueAfterRestart['state']
+        $result.facts.public_receipt_stable_across_restart = $true
+        $result.facts.public_task_stable_across_restart = $true
         $result.facts.replayed = $false
         $result.facts.effect = 'one local Task create; caller acknowledgement was unknown until exact post-restart Manager readback'
         return $result
@@ -969,6 +1334,16 @@ function Invoke-HookRestartDedupScenario {
         if ($hookCredential.client_id -cne ('hook-source:' + $sourceId)) { $result.code = 'HOOK_CREDENTIAL_IDENTITY_MISMATCH'; return $result }
         Write-PrivateJson -Path $scenario.hook_credential_path -Value $hookCredential
         $eventParams = [ordered]@{ source_id = $sourceId; commit_oid = $HookCommitOid.ToLowerInvariant() }
+        $sourceBaseline = Read-PublicHookSourceEvents -Scenario $scenario -CredentialPath $scenario.hook_credential_path -SourceId $sourceId
+        if (-not $sourceBaseline.success) {
+            $result.status = 'unknown'; $result.code = $sourceBaseline.code; $result.facts.hook_source_baseline = 'unknown'; return $result
+        }
+        $result.facts.hook_source_event_count_before = $sourceBaseline.events.Count
+        $result.facts.hook_source_baseline_pages = $sourceBaseline.pages
+        if ($sourceBaseline.events.Count -ne 0) {
+            $result.status = 'unknown'; $result.code = 'HOOK_SOURCE_BASELINE_NOT_EMPTY'; $result.facts.hook_source_baseline = 'not_empty'; return $result
+        }
+        $result.facts.hook_source_baseline = 'empty_for_setup_issued_source'
         $dropped = Invoke-DroppedReplyRpc -DataDirectory $scenario.state -PipeName $scenario.pipe_name -Credential $hookCredential -Method 'hook.emit' -Params $eventParams
         $result.facts.rpc_transport_code = [string]$dropped.code
         $result.facts.application_effect_possible = [bool]$dropped.effect_possible
@@ -982,6 +1357,18 @@ function Invoke-HookRestartDedupScenario {
         $result.facts.callback_ack = 'intentionally_not_read'
         $result.facts.source_id = $sourceId
         $result.facts.commit_oid = $HookCommitOid.ToLowerInvariant()
+        $preRestartAdmission = Wait-HookSourceAdmission -Scenario $scenario -CredentialPath $scenario.hook_credential_path `
+            -SourceId $sourceId -CommitOid $eventParams.commit_oid
+        if (-not $preRestartAdmission.success) {
+            $result.status = 'unknown'
+            $result.code = $preRestartAdmission.code
+            $result.facts.verified_event_before_restart = 'unknown'
+            $result.facts.verified_event_before_restart_code = $preRestartAdmission.code
+            return $result
+        }
+        $firstId = [long]$preRestartAdmission.observation_id
+        $result.facts.observation_id_before_restart = $firstId
+        $result.facts.verified_event_before_restart = 'verified'
         $stopped = Stop-IsolatedHost $scenario
         if (-not $stopped.stopped) { $result.status = 'pending'; $result.code = 'OWN_HOST_STOP_PENDING'; $result.facts.pending_host_pid = $stopped.pending_host_pid; return $result }
         $restarted = Start-IsolatedHost $scenario
@@ -992,18 +1379,23 @@ function Invoke-HookRestartDedupScenario {
         $result.facts.host_restart_pid = [int]$restarted.host_pid
         $result.facts.host_restart_image_sha256 = $script:HostBuild.binary_sha256
         $result.facts.host_epoch_after = [long]$restarted.epoch
-        $read = Invoke-SwarmCall -Scenario $scenario -CredentialPath $scenario.hook_credential_path -Method 'hook.source.get' -Params ([ordered]@{ source_id = $sourceId; after = 0; limit = 10 })
+        $read = Read-PublicHookSourceEvents -Scenario $scenario -CredentialPath $scenario.hook_credential_path -SourceId $sourceId
         if (-not $read.success) { $result.status = 'unknown'; $result.code = $(if ($read.code) { $read.code } else { 'HOOK_READBACK_FAILED' }); return $result }
-        $events = @($read.value.events | Where-Object { $_.fact.source_id -ceq $sourceId -and $_.fact.commit_oid -ceq $eventParams.commit_oid })
-        if ($events.Count -ne 1 -or $events[0].fact.readback_verified -ne $true) { $result.status = 'unknown'; $result.code = 'HOOK_EVENT_NOT_UNIQUE_AFTER_RESTART'; return $result }
-        $firstId = [long]$events[0].observation_id
+        $events = @($read.events)
+        if ($events.Count -ne 1 -or -not (Test-HookObservation -Event $events[0] -SourceId $sourceId `
+            -CommitOid $eventParams.commit_oid -ObservationId $firstId)) {
+            $result.status = 'unknown'; $result.code = 'HOOK_EVENT_NOT_UNIQUE_AFTER_RESTART'; return $result
+        }
+        $result.facts.observation_id_after_restart = [long]$events[0].observation_id
         $duplicate = Invoke-SwarmCall -Scenario $scenario -CredentialPath $scenario.hook_credential_path -Method 'hook.emit' -Params $eventParams
-        if (-not $duplicate.success -or $duplicate.value.duplicate -ne $true -or $duplicate.value.recorded -ne $false -or [long]$duplicate.value.observation_id -ne $firstId) {
+        if (-not $duplicate.success -or -not (Test-HookDuplicateAcknowledgement -Value $duplicate.value `
+            -SourceId $sourceId -CommitOid $eventParams.commit_oid -ObservationId $firstId)) {
             $result.status = 'unknown'; $result.code = $(if ($duplicate.code) { $duplicate.code } else { 'HOOK_DUPLICATE_ACK_MISMATCH' }); return $result
         }
-        $finalRead = Invoke-SwarmCall -Scenario $scenario -CredentialPath $scenario.hook_credential_path -Method 'hook.source.get' -Params ([ordered]@{ source_id = $sourceId; after = 0; limit = 10 })
-        $finalEvents = if ($finalRead.success) { @($finalRead.value.events | Where-Object { $_.fact.commit_oid -ceq $eventParams.commit_oid }) } else { @() }
-        if (-not $finalRead.success -or $finalEvents.Count -ne 1 -or [long]$finalEvents[0].observation_id -ne $firstId) {
+        $finalRead = Read-PublicHookSourceEvents -Scenario $scenario -CredentialPath $scenario.hook_credential_path -SourceId $sourceId
+        $finalEvents = if ($finalRead.success) { @($finalRead.events) } else { @() }
+        if (-not $finalRead.success -or $finalEvents.Count -ne 1 -or
+            -not (Test-HookObservation -Event $finalEvents[0] -SourceId $sourceId -CommitOid $eventParams.commit_oid -ObservationId $firstId)) {
             $result.status = 'unknown'; $result.code = 'HOOK_DEDUP_READBACK_MISMATCH'; return $result
         }
         $result.status = 'observed'

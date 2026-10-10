@@ -211,6 +211,53 @@ fn retained_manifest(db: &Connection) -> Value {
 }
 
 #[test]
+fn stale_module_readback_retains_reserved_child_and_never_schedules_replay() {
+    let mut db = invalid_scope_db();
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let (row, mut manifest) = load_launch_manifest(&tx, LAUNCH_ID).unwrap();
+    manifest["native_mcp_readback"] = json!({
+        "state":"reading", "attempts":1, "started_at_ms":1,
+        "next_retry_at_ms":2, "module_operation_id":"uncertain-module-readback",
+        "dispatch_permitted":false,
+    });
+    persist_manifest(&tx, &row, &manifest, 2).unwrap();
+    tx.commit().unwrap();
+
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let ClaimOutcome::Deferred(result) = claim_next_readback(&tx, 100, &Config::default()).unwrap()
+    else {
+        panic!("revoked launch must hold its reserved child");
+    };
+    assert_eq!(result["state"], "module_readback_failed");
+    assert!(result["next_retry_at_ms"].is_null());
+    tx.commit().unwrap();
+    let retained = retained_manifest(&db);
+    assert_eq!(
+        retained["native_mcp_readback"]["module_operation_id"],
+        "uncertain-module-readback"
+    );
+    assert_eq!(retained["runtime"]["dispatch_permitted"], false);
+
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(
+        claim_next_readback(&tx, 1_000_000, &Config::default()).unwrap(),
+        ClaimOutcome::Idle(_)
+    ));
+    assert_eq!(
+        tx.query_row("SELECT count(*) FROM operations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn invalid_scope_readback_persists_safe_code_and_stage_across_marker_update() {
     let mut db = invalid_scope_db();
     let tx = db

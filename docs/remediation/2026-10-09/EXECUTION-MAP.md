@@ -4,6 +4,8 @@
 **Status:** actionable research and implementation plan; NOT a claim of release readiness.
 **Source of evidence:** full Master Audit v26, accepted owner decisions, existing R01–R51 handoffs, and GitHub PR/Issue status checked on 2026-10-09.
 
+**Current execution, 2026-10-10:** [C7 standalone handoff](C7-MCP-REPAIR-EVIDENCE.json) and [public ACK/restart harness](CORE-ACK-HARNESS-REPAIR-EVIDENCE.json) source repairs are verified at their recorded scope. Affected production Clippy passes on Windows/Linux; affected library cohorts retain 399/412 unique passing tests. Fresh M installed core and exact Step 5 free / Gemini 3.8 native execution remain pending. Historical receipts, the two audit evidence gaps and upstream result/dependency limits are not promoted by source review.
+
 ## Supplied source input: HIGH appendix
 
 The phrase **"full HIGH appendix"** in the master audit refers to **section 8, "Приложение: полный реестр доказанных дефектов, не вошедших в §1–§4"**, of the owner's source document **"Что чинить + полный реестр.md"** (historical source baseline `40591a2`). That section contains 61 source-labelled **[HIGH]** entries, 136 [MED], 82 [LOW] and 128 ungraded entries. The original source was retained outside this repository and has now been supplied locally. The companion **"Реестр подозрений.md"** is a different, explicitly **НЕ доказано** hypothesis inventory. The audit v26/v27 and this map do not replace the original sources.

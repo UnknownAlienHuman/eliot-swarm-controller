@@ -898,6 +898,122 @@ fn process_scoped_system_event(
     Ok(())
 }
 
+#[cfg(test)]
+mod native_mcp_phase_contract_tests {
+    use super::*;
+
+    #[test]
+    fn native_mcp_phase_map_rejects_cross_pairs() {
+        let phase_contract = crate::store::launcher_mcp_tools::native_mcp_phase_contract;
+        assert_eq!(
+            phase_contract("native.mcp.observe", "observe_assignment"),
+            Some(("observe", Some("assigned_session")))
+        );
+        assert_eq!(
+            phase_contract("native.mcp.observe", "observe_refresh"),
+            Some(("observe", Some("installed_server")))
+        );
+        assert_eq!(
+            phase_contract("native.mcp.install", "observe_assignment"),
+            None
+        );
+        assert_eq!(phase_contract("native.mcp.observe", "install"), None);
+        assert_eq!(phase_contract("native.mcp.arm", "read"), None);
+        assert_eq!(phase_contract("native.mcp.read", "arm"), None);
+        assert_eq!(
+            phase_contract("native.mcp.unknown", "observe_assignment"),
+            None
+        );
+    }
+
+    #[test]
+    fn retained_observation_purpose_and_schema_are_bound_to_phase() {
+        let phase_contract = crate::store::launcher_mcp_tools::native_mcp_phase_contract;
+        let (_, assigned_kind) = phase_contract("native.mcp.observe", "observe_assignment")
+            .expect("assigned-session phase is explicit");
+        assert!(native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_assignment",
+            assigned_kind,
+            assigned_kind,
+            assigned_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(1),
+            "observe_assignment",
+            None,
+            None,
+            assigned_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_assignment",
+            Some("installed_server"),
+            Some("installed_server"),
+            assigned_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_assignment",
+            assigned_kind,
+            Some("installed_server"),
+            assigned_kind,
+        ));
+
+        let (_, installed_kind) = phase_contract("native.mcp.observe", "observe_unknown")
+            .expect("C8 installed-server phase remains explicit");
+        assert!(native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_unknown",
+            installed_kind,
+            installed_kind,
+            installed_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_unknown",
+            Some("assigned_session"),
+            Some("assigned_session"),
+            installed_kind,
+        ));
+        assert!(native_mcp_phase_observation_matches(
+            Some(1),
+            "observe_refresh",
+            None,
+            None,
+            installed_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(1),
+            "observe_refresh",
+            installed_kind,
+            installed_kind,
+            installed_kind,
+        ));
+        assert!(native_mcp_phase_observation_matches(
+            Some(2),
+            "install",
+            None,
+            None,
+            None,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "install",
+            Some("assigned_session"),
+            Some("assigned_session"),
+            None,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(3),
+            "observe_assignment",
+            assigned_kind,
+            assigned_kind,
+            assigned_kind,
+        ));
+    }
+}
+
 pub(super) fn current_submission_scope_matches_for_owner(
     db: &Connection,
     owner_manager_id: &str,
@@ -1343,7 +1459,28 @@ fn module_event_operation_link_owner(
 
 const NATIVE_MCP_PHASE_OPERATION_CALLER: &str = "swarm.internal.c8.native_mcp";
 
-/// Read the retained parent of a C8 native MCP phase Operation. The child
+fn native_mcp_phase_observation_matches(
+    original_schema_version: Option<i64>,
+    phase: &str,
+    original_observation_kind: Option<&str>,
+    effect_observation_kind: Option<&str>,
+    expected_observation_kind: Option<&str>,
+) -> bool {
+    match original_schema_version {
+        Some(2) => {
+            original_observation_kind == expected_observation_kind
+                && effect_observation_kind == expected_observation_kind
+        }
+        Some(1) => {
+            phase != "observe_assignment"
+                && original_observation_kind.is_none()
+                && effect_observation_kind.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Read the retained parent of a C7/C8 native MCP phase Operation. The child
 /// Operation stores this link in its immutable native_mcp envelope; no live
 /// AssignmentContext, Task, participant lease, or supervisor record is read.
 #[expect(
@@ -1360,13 +1497,12 @@ fn module_event_native_mcp_phase_parent(
     binding_id: Option<&str>,
     binding_generation: Option<i64>,
 ) -> Result<Option<String>> {
-    let expected_original_phase = match method {
-        "native.mcp.install" => "install",
-        "native.mcp.observe" => "observe",
-        "native.mcp.arm" => "arm",
-        "native.mcp.read" => "read",
-        _ => return Ok(None),
-    };
+    if !matches!(
+        method,
+        "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read"
+    ) {
+        return Ok(None);
+    }
     let unauthorized = || {
         Error::new(
             "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
@@ -1397,6 +1533,8 @@ fn module_event_native_mcp_phase_parent(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
     );
     let phase_operation: Option<PhaseOperationRow> = db
         .query_row(
@@ -1416,7 +1554,9 @@ fn module_event_native_mcp_phase_parent(
                     json_extract(effective_request_json,'$.native_mcp.task_id'),\
                     json_extract(effective_request_json,'$.native_mcp.attempt_id'),\
                     json_extract(effective_request_json,'$.native_mcp.binding_id'),\
-                    json_extract(effective_request_json,'$.native_mcp.child_operation_id') \
+                    json_extract(effective_request_json,'$.native_mcp.child_operation_id'),\
+                    json_extract(original_request_json,'$.observation_kind'),\
+                    json_extract(effective_request_json,'$.native_mcp.effect.observation_kind') \
              FROM operations WHERE operation_id=?1",
             [operation_id],
             |row| {
@@ -1440,6 +1580,8 @@ fn module_event_native_mcp_phase_parent(
                     row.get(16)?,
                     row.get(17)?,
                     row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
                 ))
             },
         )
@@ -1464,21 +1606,30 @@ fn module_event_native_mcp_phase_parent(
         native_attempt_id,
         native_binding_id,
         native_child_operation_id,
+        original_observation_kind,
+        effect_observation_kind,
     )) = phase_operation
     else {
         return Err(unauthorized());
     };
 
-    let native_phase_matches = matches!(
-        (method, native_phase.as_deref()),
-        ("native.mcp.install", Some("install"))
-            | (
-                "native.mcp.observe",
-                Some("observe_unknown" | "observe_refresh")
-            )
-            | ("native.mcp.arm", Some("arm"))
-            | ("native.mcp.read", Some("read"))
-    );
+    let Some(native_phase_value) = native_phase.as_deref() else {
+        return Err(unauthorized());
+    };
+    let Some((expected_original_phase, expected_observation_kind)) =
+        crate::store::launcher_mcp_tools::native_mcp_phase_contract(method, native_phase_value)
+    else {
+        return Err(unauthorized());
+    };
+    if !native_mcp_phase_observation_matches(
+        original_schema_version,
+        native_phase_value,
+        original_observation_kind.as_deref(),
+        effect_observation_kind.as_deref(),
+        expected_observation_kind,
+    ) {
+        return Err(unauthorized());
+    }
     let valid_launch_digest = launch_identity_digest
         .as_deref()
         .and_then(|value| value.strip_prefix("sha256:"))
@@ -1501,14 +1652,12 @@ fn module_event_native_mcp_phase_parent(
     if retained_method != method
         || retained_caller_id != caller_id
         || client_request_id != format!("native-mcp:{operation_id}")
-        || original_schema_version != Some(1)
         || original_operation_id.as_deref() != Some(operation_id)
         || original_phase.as_deref() != Some(expected_original_phase)
         || original_binding_id.as_deref() != Some(binding_id)
         || original_binding_generation != Some(binding_generation)
         || native_schema_version != Some(1)
         || !valid_launch_digest
-        || !native_phase_matches
         || native_method.as_deref() != Some(method)
         || native_task_id.as_deref() != Some(task_id)
         || native_task_revision.is_none_or(|revision| revision <= 0)

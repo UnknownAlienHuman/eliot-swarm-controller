@@ -1,12 +1,13 @@
 //! Bounded host-side readback for launches awaiting native MCP evidence.
 //!
 //! The Store validates the retained launch and authenticates the scoped
-//! Participant before the native adapter is contacted. This path only records
+//! Participant before the native adapter is contacted. Standalone observations
+//! use the same descriptor-bound child Operations as C8. This path only records
 //! the facts exposed by OpenCode's public read API; it cannot permit dispatch.
 
 use super::{Store, meta};
 use crate::{
-    config::{Config, McpConfig, McpToolProfile},
+    config::{Config, McpConfig, McpToolProfile, OpenCodeRouteKind, opencode_route_kind},
     error::{Error, Result},
     model::{self, Credential, Role},
     participant_credentials, platform,
@@ -44,6 +45,7 @@ struct LaunchSnapshot {
     current_authority_facts: Value,
     lease_facts: Value,
     route_json: String,
+    route_kind: OpenCodeRouteKind,
     options: Options,
     owned_service: Option<OwnedServiceExpectation>,
 }
@@ -173,6 +175,7 @@ struct ReadbackClaim {
     previous_observation_id: Option<i64>,
     previous_semantic_digest: Option<String>,
     first_observed_at_ms: Option<i64>,
+    module_operation_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -324,31 +327,47 @@ impl Store {
             Err(error) => return self.finish_readback_failure(&claim, &error).await,
         };
 
-        let observation = tokio::time::timeout(NATIVE_READBACK_TIMEOUT, async {
-            let service = match owned_service.as_ref() {
-                Some(expected) => {
-                    Service::connect_owned(
-                        &options,
-                        expected.process_id(),
-                        expected.process_birth_token(),
-                        expected.executable_sha256(),
-                    )
-                    .await?
+        let observation = if claim.snapshot.route_kind == OpenCodeRouteKind::Standalone {
+            match self
+                .observe_module_assignment(&claim, &principal, &assignment)
+                .await
+            {
+                Ok(Some(observation)) => observation,
+                Ok(None) => {
+                    return Ok(json!({
+                        "operation_id":claim.snapshot.operation_id,
+                        "state":"reading", "capability_state":"unknown", "dispatch_permitted":false,
+                    }));
                 }
-                None => Service::connect(&options).await?,
-            };
-            crate::runtime::opencode_v2::observe_mcp(&service, &options, assignment).await
-        })
-        .await;
-        let observation = match observation {
-            Ok(Ok(observation)) => observation,
-            Ok(Err(error)) => return self.finish_readback_failure(&claim, &error).await,
-            Err(_) => {
-                let error = Error::new(
-                    "NATIVE_MCP_READBACK_TIMEOUT",
-                    "native MCP readback exceeded its bounded time window",
-                );
-                return self.finish_readback_failure(&claim, &error).await;
+                Err(error) => return self.finish_readback_failure(&claim, &error).await,
+            }
+        } else {
+            let observation = tokio::time::timeout(NATIVE_READBACK_TIMEOUT, async {
+                let service = match owned_service.as_ref() {
+                    Some(expected) => {
+                        Service::connect_owned(
+                            &options,
+                            expected.process_id(),
+                            expected.process_birth_token(),
+                            expected.executable_sha256(),
+                        )
+                        .await?
+                    }
+                    None => Service::connect(&options).await?,
+                };
+                crate::runtime::opencode_v2::observe_mcp(&service, &options, assignment).await
+            })
+            .await;
+            match observation {
+                Ok(Ok(observation)) => observation,
+                Ok(Err(error)) => return self.finish_readback_failure(&claim, &error).await,
+                Err(_) => {
+                    let error = Error::new(
+                        "NATIVE_MCP_READBACK_TIMEOUT",
+                        "native MCP readback exceeded its bounded time window",
+                    );
+                    return self.finish_readback_failure(&claim, &error).await;
+                }
             }
         };
 
@@ -409,6 +428,7 @@ impl Store {
                     "state":"observed_partial",
                     "attempts":record_claim.attempt,
                     "first_observed_at_ms":first_observed_at_ms,
+                    "module_operation_id":record_claim.module_operation_id,
                     "last_observed_at_ms":observation_at,
                     "next_retry_at_ms":observation_at.saturating_add(SUCCESS_REFRESH_MS),
                     "observation_id":observation_id,
@@ -436,6 +456,142 @@ impl Store {
             }
             Err(error) => self.finish_readback_failure(&claim, &error).await,
         }
+    }
+
+    /// Reserve one read-only C7 child in the existing module queue, then
+    /// consume that same identity on later ticks. No wait blocks module
+    /// delivery, and an uncertain child is never replaced or replayed.
+    async fn observe_module_assignment(
+        &self,
+        claim: &ReadbackClaim,
+        principal: &model::Principal,
+        assignment: &crate::native_mcp::AssignmentContext,
+    ) -> Result<Option<crate::native_mcp::NativeMcpReadback>> {
+        let options = &claim.snapshot.options;
+        let service = tokio::time::timeout(NATIVE_READBACK_TIMEOUT, async {
+            match claim.snapshot.owned_service.as_ref() {
+                Some(expected) => {
+                    Service::connect_owned(
+                        options,
+                        expected.process_id(),
+                        expected.process_birth_token(),
+                        expected.executable_sha256(),
+                    )
+                    .await
+                }
+                None => Service::connect(options).await,
+            }
+        })
+        .await
+        .map_err(|_| {
+            Error::new(
+                "NATIVE_MCP_READBACK_TIMEOUT",
+                "module readback service verification exceeded its time window",
+            )
+        })??;
+        let command = module_assignment_command(&claim.snapshot, assignment, service.pid)?;
+        let service_pid = service.pid;
+        let participant = principal.clone();
+        let assignment = assignment.clone();
+        let scope = assignment.clone();
+        let claim = clone_claim(claim);
+        let started_at_ms = claim.started_at_ms;
+        let config = self.config.clone();
+        let operation = self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (row, mut manifest) = load_launch_manifest(&tx, &claim.snapshot.operation_id)?;
+            verify_claim(&row, &manifest, &claim)?;
+            let current = validate_launch_snapshot(&tx, &row, &manifest, &config,
+                LaunchSnapshotPhase::PreDispatch)?;
+            if snapshot_identity(&current) != snapshot_identity(&claim.snapshot)
+                || native_mcp::current_assignment_context(&tx, &participant)? != scope {
+                return Err(stale_readback());
+            }
+            let now = model::now_ms()?;
+            let operation = if let Some(child_id) = claim.module_operation_id.as_deref() {
+                let operation = super::operations::get_operation(&tx, child_id)?;
+                let (original, effective): (String, String) = tx.query_row(
+                    "SELECT original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+                    [child_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let original: Value = serde_json::from_str(&original)?;
+                let effective: Value = serde_json::from_str(&effective)?;
+                validate_module_assignment_child(&operation, &original, &effective,
+                    &claim.snapshot, &scope, service_pid)?;
+                Some(operation)
+            } else {
+                let child_id = super::launcher_mcp_tools::queue_native_mcp_operation(
+                    &tx, &current.operation_id, &launch_identity_digest(&current)?,
+                    &scope, "native.mcp.observe", "observe_assignment", command)?;
+                manifest["native_mcp_readback"]["module_operation_id"] = json!(child_id);
+                None
+            };
+            manifest["native_mcp_readback"]["next_retry_at_ms"] = json!(now.saturating_add(1_000));
+            persist_manifest(&tx, &row, &manifest, now)?;
+            tx.commit()?;
+            Ok(operation)
+        }).await?;
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        let Some(operation) = operation else {
+            return Ok(None);
+        };
+        if matches!(
+            operation["state"].as_str(),
+            Some("queued" | "sending" | "native_accepted")
+        ) {
+            if model::now_ms()?.saturating_sub(started_at_ms)
+                >= NATIVE_READBACK_TIMEOUT.as_millis() as i64
+            {
+                return Err(Error::new(
+                    "NATIVE_MCP_READBACK_TIMEOUT",
+                    "retained module readback did not settle in its time window",
+                ));
+            }
+            return Ok(None);
+        }
+        let receipt = &operation["result"]["details"]["native_mcp"];
+        if operation["state"] != "settled"
+            || operation["result"]["outcome"] != "applied"
+            || receipt["schema_version"] != 1
+            || receipt["kind"] != "native_mcp_effect_receipt"
+            || receipt["action"] != "observe"
+            || receipt["observation_kind"] != "assigned_session"
+            || receipt["native_replay"] != false
+        {
+            return Err(Error::new(
+                "NATIVE_MCP_RECEIPT_INVALID",
+                "C7 requires the exact applied non-replayed assigned-session receipt",
+            ));
+        }
+        let readback: swarm_contracts::native_mcp::NativeMcpAssignmentReadback =
+            serde_json::from_value(receipt["readback"].clone()).map_err(|_| {
+                Error::new(
+                    "NATIVE_MCP_SCHEMA",
+                    "C7 module readback has an invalid schema",
+                )
+            })?;
+        if readback.service_pid != service_pid
+            || readback.service_version != service.version
+            || readback.service_id != options.service_id
+            || readback.location_sha256.as_str()
+                != model::digest(
+                    options
+                        .directory
+                        .to_str()
+                        .ok_or_else(stale_readback)?
+                        .as_bytes(),
+                )
+        {
+            return Err(stale_readback());
+        }
+        crate::native_mcp::NativeMcpReadback::from_module_opencode(
+            assignment,
+            operation["operation_id"]
+                .as_str()
+                .ok_or_else(stale_readback)?,
+            readback,
+        )
+        .map(Some)
     }
 
     async fn load_scoped_artifacts(&self, snapshot: &LaunchSnapshot) -> Result<LoadedArtifacts> {
@@ -556,6 +712,7 @@ impl Store {
             previous_observation_id: claim.previous_observation_id,
             previous_semantic_digest: claim.previous_semantic_digest.clone(),
             first_observed_at_ms: claim.first_observed_at_ms,
+            module_operation_id: claim.module_operation_id.clone(),
         };
         let failure =
             ReadbackFailure::new(&error.code, ReadbackFailureStage::NativeCapabilityReadback);
@@ -584,6 +741,108 @@ impl Store {
     }
 }
 
+fn module_assignment_command(
+    snapshot: &LaunchSnapshot,
+    assignment: &crate::native_mcp::AssignmentContext,
+    service_pid: u32,
+) -> Result<Value> {
+    let options = &snapshot.options;
+    let directory = options.directory.to_str().ok_or_else(stale_readback)?;
+    let scope = assignment.as_value();
+    let location_sha256 = model::digest(directory.as_bytes());
+    let assignment_sha256 = model::digest(model::canonical(&scope)?.as_bytes());
+    let path = |resource: &str| -> Result<String> {
+        let mut url = reqwest::Url::parse(&format!("http://127.0.0.1{resource}"))
+            .map_err(|_| stale_readback())?;
+        url.query_pairs_mut()
+            .append_pair("location[directory]", directory);
+        Ok(format!(
+            "{}?{}",
+            url.path(),
+            url.query().ok_or_else(stale_readback)?
+        ))
+    };
+    Ok(json!({
+        "schema_version":1,
+        "kind":"swarm.native_mcp_command", "action":"observe",
+        "observation_kind":"assigned_session",
+        "scope":{
+            "binding_id":snapshot.binding_id, "binding_generation":snapshot.binding_generation,
+            "native_scope_key":options.scope(), "service_id":options.service_id,
+            "service_pid":service_pid, "expected_version":options.expected_version,
+            "directory":directory, "assignment":scope,
+        },
+        "prepared":{
+            "schema_version":1, "kind":"swarm.native_mcp_assignment_observation",
+            "assignment":scope, "assignment_sha256":assignment_sha256,
+            "native_session_id":assignment.native_session_id(),
+            "location_sha256":location_sha256, "service_id":options.service_id,
+            "service_pid":service_pid, "service_version":options.expected_version,
+        },
+        "request":{"method":"GET", "path":path("/api/mcp")?},
+        "readback":{"method":"GET", "path":path(&format!("/api/session/{}", assignment.native_session_id()))?},
+    }))
+}
+
+fn validate_module_assignment_child(
+    operation: &Value,
+    original: &Value,
+    effective: &Value,
+    snapshot: &LaunchSnapshot,
+    assignment: &crate::native_mcp::AssignmentContext,
+    service_pid: u32,
+) -> Result<()> {
+    let scope = assignment.as_value();
+    let envelope = &effective["native_mcp"];
+    if operation["operation_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .is_none()
+        || operation["caller_id"] != "swarm.internal.c8.native_mcp"
+        || operation["method"] != "native.mcp.observe"
+        || operation["native_mcp_parent_launch_operation_id"] != snapshot.operation_id
+        || operation["native_mcp_phase"] != "observe_assignment"
+        || operation["binding_id"] != snapshot.binding_id
+        || operation["binding_generation"] != snapshot.binding_generation
+        || operation["task_id"] != snapshot.task_id
+        || operation["attempt_id"] != snapshot.attempt_id
+        || original["schema_version"] != 2
+        || original["phase"] != "observe"
+        || original["observation_kind"] != "assigned_session"
+        || original["operation_id"] != operation["operation_id"]
+        || original["binding_id"] != snapshot.binding_id
+        || original["binding_generation"] != snapshot.binding_generation
+        || original["native_session_id"] != assignment.native_session_id()
+        || original["assignment_sha256"] != model::digest(model::canonical(&scope)?.as_bytes())
+        || original["service_id"] != snapshot.options.service_id
+        || original["service_version"] != snapshot.options.expected_version
+        || original["service_pid"] != service_pid
+        || original["location_sha256"]
+            != model::digest(
+                snapshot
+                    .options
+                    .directory
+                    .to_str()
+                    .ok_or_else(stale_readback)?
+                    .as_bytes(),
+            )
+        || envelope["schema_version"] != 1
+        || envelope["child_operation_id"] != operation["operation_id"]
+        || envelope["parent_launch_operation_id"] != snapshot.operation_id
+        || envelope["launch_identity_digest"] != launch_identity_digest(snapshot)?
+        || envelope["input_sha256"] != model::digest(model::canonical(original)?.as_bytes())
+        || envelope["command_sha256"]
+            != model::digest(model::canonical(&envelope["effect"])?.as_bytes())
+        || envelope["phase"] != "observe_assignment"
+        || envelope["method"] != "native.mcp.observe"
+        || envelope["assignment_digest"] != original["assignment_sha256"]
+        || envelope["effect"]["scope"]["assignment"] != scope
+    {
+        return Err(stale_readback());
+    }
+    Ok(())
+}
+
 fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<ClaimOutcome> {
     let cutoff = now.saturating_sub(INFLIGHT_STALE_MS);
     let ids = {
@@ -597,7 +856,9 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                        IN ('retry_wait','observed_partial') \
                      AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms')<=?1) \
                  OR (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
-                     AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')<=?2) \
+                     AND (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')<=?2 \
+                          OR (json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.module_operation_id')='text' \
+                              AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms')<=?1))) \
                ) \
              ORDER BY updated_at_ms,operation_id LIMIT ?3",
         )?;
@@ -652,10 +913,26 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
         );
         match validation {
             Ok(snapshot) => {
+                let retained_module_operation = previous
+                    .filter(|marker| marker["state"] == "reading")
+                    .and_then(|marker| marker["module_operation_id"].as_str())
+                    .map(str::to_owned);
+                let resuming_module = retained_module_operation.is_some();
                 let claim = ReadbackClaim {
                     snapshot,
-                    attempt,
-                    started_at_ms: now,
+                    attempt: if resuming_module {
+                        marker_attempts(previous)
+                    } else {
+                        attempt
+                    },
+                    started_at_ms: if resuming_module {
+                        previous
+                            .and_then(|marker| marker["started_at_ms"].as_i64())
+                            .filter(|started| *started > 0)
+                            .ok_or_else(stale_readback)?
+                    } else {
+                        now
+                    },
                     previous_observation_id: previous
                         .and_then(|marker| marker["observation_id"].as_i64()),
                     previous_semantic_digest: previous
@@ -663,7 +940,11 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                         .map(str::to_owned),
                     first_observed_at_ms: previous
                         .and_then(|marker| marker["first_observed_at_ms"].as_i64()),
+                    module_operation_id: retained_module_operation,
                 };
+                if resuming_module {
+                    return Ok(ClaimOutcome::Claimed(Box::new(claim)));
+                }
                 let mut next_manifest = manifest;
                 next_manifest["native_mcp_readback"] = json!({
                     "state":"reading",
@@ -692,8 +973,16 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                         .and_then(|old| old["semantic_digest"].as_str())
                         .map(str::to_owned),
                 );
+                let previous_module_operation = previous
+                    .and_then(|marker| marker["module_operation_id"].as_str())
+                    .map(str::to_owned);
                 let mut next_manifest = manifest;
                 next_manifest["native_mcp_readback"] = marker;
+                if let Some(child_id) = previous_module_operation {
+                    next_manifest["native_mcp_readback"]["state"] = json!("module_readback_failed");
+                    next_manifest["native_mcp_readback"]["module_operation_id"] = json!(child_id);
+                    next_manifest["native_mcp_readback"]["next_retry_at_ms"] = Value::Null;
+                }
                 next_manifest["native_mcp_latest_failure"] = latest_failure(&failure, now);
                 let next_retry_at_ms =
                     next_manifest["native_mcp_readback"]["next_retry_at_ms"].as_i64();
@@ -709,7 +998,7 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                 )?;
                 return Ok(ClaimOutcome::Deferred(json!({
                     "operation_id":operation_id,
-                    "state":"retry_wait",
+                    "state":next_manifest["native_mcp_readback"]["state"],
                     "attempt":attempt,
                     "failure_category":failure.category,
                     "last_error_code":failure.code,
@@ -875,17 +1164,31 @@ fn validate_launch_snapshot(
         return Err(stale_readback());
     };
     let route: Value = serde_json::from_str(&route_json).map_err(|_| stale_readback())?;
+    let route_kind =
+        opencode_route_kind(route["runtime"].as_str().unwrap_or_default(), &artifact_id)
+            .filter(|_| route["module_artifact_id"].as_str() == Some(artifact_id.as_str()))
+            .ok_or_else(stale_readback)?;
     if state != "ready"
         || released_at_ms.is_some()
-        || artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
-        || route["runtime"] != crate::runtime::opencode_v2::RUNTIME
-        || route["module_artifact_id"] != crate::runtime::opencode_v2::ARTIFACT_ID
         || native_root_id.as_deref().is_none_or(|root| {
             crate::runtime::opencode_v2::valid_id(root, "ses").is_err()
                 || manifest["binding"]["native_root_id"].as_str() != Some(root)
         })
     {
         return Err(stale_readback());
+    }
+    if route_kind == OpenCodeRouteKind::Standalone {
+        let binding = super::operations::get_binding(db, binding_id, binding_generation)?;
+        if super::module_handshake::selected_native_command_supported(
+            db,
+            &artifact_id,
+            binding["observation"].get("module_contract_selector"),
+            "native.mcp.observe",
+            &json!({}),
+        )? != Some(true)
+        {
+            return Err(stale_readback());
+        }
     }
 
     let lease: crate::workspace::LeaseAuthorityRef =
@@ -1028,6 +1331,7 @@ fn validate_launch_snapshot(
         current_authority_facts,
         lease_facts: lease_view,
         route_json,
+        route_kind,
         options,
         owned_service,
     })
@@ -1264,6 +1568,13 @@ fn record_retry(
     let next_retry_at_ms = marker["next_retry_at_ms"].as_i64();
     let mut next_manifest = manifest;
     next_manifest["native_mcp_readback"] = marker;
+    if let Some(child_id) = claim.module_operation_id.as_deref() {
+        // A reserved module command cannot be replaced after any uncertain
+        // failure. Retain its identity for diagnosis and hold dispatch.
+        next_manifest["native_mcp_readback"]["state"] = json!("module_readback_failed");
+        next_manifest["native_mcp_readback"]["module_operation_id"] = json!(child_id);
+        next_manifest["native_mcp_readback"]["next_retry_at_ms"] = Value::Null;
+    }
     next_manifest["native_mcp_latest_failure"] = latest_failure(failure, now);
     persist_manifest(tx, &row, &next_manifest, now)?;
     insert_safe_failure_observation(
@@ -1275,7 +1586,12 @@ fn record_retry(
         &failure.code,
         now,
     )?;
-    Ok(retry_summary(claim, now, next_retry_at_ms, "retry_wait"))
+    let (next_retry_at_ms, state) = if claim.module_operation_id.is_some() {
+        (None, "module_readback_failed")
+    } else {
+        (next_retry_at_ms, "retry_wait")
+    };
+    Ok(retry_summary(claim, now, next_retry_at_ms, state))
 }
 
 fn retry_summary(
@@ -1328,6 +1644,9 @@ fn retry_delay_ms(attempts: i64) -> i64 {
 fn next_retry_at(db: &Connection, now: i64) -> Result<Option<i64>> {
     let next: Option<i64> = db.query_row(
         "SELECT min(CASE \
+           WHEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
+             AND json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.module_operation_id')='text' \
+             THEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
            WHEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
              THEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')+?1 \
            ELSE json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
@@ -1615,6 +1934,7 @@ fn clone_snapshot(snapshot: &LaunchSnapshot) -> LaunchSnapshot {
         current_authority_facts: snapshot.current_authority_facts.clone(),
         lease_facts: snapshot.lease_facts.clone(),
         route_json: snapshot.route_json.clone(),
+        route_kind: snapshot.route_kind,
         options: snapshot.options.clone(),
         owned_service: snapshot.owned_service.clone(),
     }
@@ -1628,6 +1948,7 @@ fn clone_claim(claim: &ReadbackClaim) -> ReadbackClaim {
         previous_observation_id: claim.previous_observation_id,
         previous_semantic_digest: claim.previous_semantic_digest.clone(),
         first_observed_at_ms: claim.first_observed_at_ms,
+        module_operation_id: claim.module_operation_id.clone(),
     }
 }
 

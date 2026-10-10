@@ -1,0 +1,94 @@
+{
+  "schema": "eliot.v27_standalone_c7_repair.v1",
+  "recorded_at_utc": "2026-10-10T11:02:01.2003329Z",
+  "source_parent_commit": "f69d37d51291ed22417a8aef64a3095cb277b73f",
+  "source_sha256": {
+    "crates/swarm-adapter-opencode/README.md": "033536c38d52c6755188df557ba4218543651eb936d7c6cbe49089904c7b89e5",
+    "crates/swarm-adapter-opencode/registration/descriptor.template.json": "5a8d8d43cb8c266cc9ea9b5c2e1f4f3fc7063a8fbd2902aefc4b322bb87706e3",
+    "crates/swarm-adapter-opencode/src/module_runtime.rs": "7e3704850a9be1bd14a22f1725f41e1b8be9f5e1df33301ddb1afb2831b020f1",
+    "crates/swarm-adapter-opencode/src/native_mcp.rs": "ffbc4cb56e664e2137be2a042deaca8d1ba085b52da6ed0b0aee168d179d0b5a",
+    "crates/swarm-adapter-opencode/src/native_mcp_intake.rs": "96e8a8c15ac1f5f1e961901b4148db573fcc245ce2a35f2dab4f7eaf88b993b0",
+    "crates/swarm-contracts/src/native_mcp.rs": "4e1cac4ffc69af3869d15270c2f725c0b0cda350dca0f78c6839d11424be5fc2",
+    "crates/swarm-kernel-host/src/config.rs": "ca82f5613f0d15131ba5e604aa38df29dc10d2966c4bb75da06f4c9ceac3c923",
+    "crates/swarm-kernel-host/src/native_mcp.rs": "13134ac4756f71bae83e527cfa637aafe1fd3ec1a5f2ffaa1646eddbcbef54f6",
+    "crates/swarm-kernel-host/src/store/automation_dispatch_bus.rs": "39be8ea27b53f54a13189ba37fe44da560c5ebc5331dec4f9f9416134dcf7042",
+    "crates/swarm-kernel-host/src/store/launcher_mcp_tools.rs": "fbb76756a9db24e939f0a2c397b6939ed66980480528036f5110c4365fa680d5",
+    "crates/swarm-kernel-host/src/store/launcher_native_mcp.rs": "8aa6889ae3bb04e91315e51a0e5c520c43a87bb6a55e645b16aedea9f69bda79",
+    "crates/swarm-kernel-host/src/store/launcher_native_mcp_failure_tests.rs": "1206a04219c63b982b60d6b5d73fa9dd998d12affcdffd1874021fd1c08f7076",
+    "crates/swarm-kernel-host/src/store/launcher_owned_service.rs": "dbe5a784dc4b37c611f438272e4ce5fd4db302282fabeb00b95b4beda222382b",
+    "crates/swarm-kernel-host/src/store/module_handshake.rs": "e343bef827e4a774c882f51e4ba3105875665133d025c174536135f5250aad78",
+    "crates/swarm-kernel-host/src/store/native_mcp.rs": "f082b052e47e0dfb1ce64977027708f567ebfa2070f0bbab956ef21f73ab0ac4",
+    "crates/swarm-kernel-host/src/store/native_mcp_route_tests.rs": "a4d76bafbfdb7f0353fe15ec01d02a8ccb91a25e6141c8d701c54a7f9e45a116",
+    "tools/qualification/Invoke-CoreFailureQualification.ps1": "ff5dd10a0bd38c03bf4f1f0e14ade5369cf1a80f8566fa54c22e8e02278e0f56",
+    "tools/qualification/New-NativeQualification.ps1": "167650ec94bacfbe7b58fde208485bc16af8fd64a030390a70bd6e5475404cd1",
+    "crates/swarm-kernel-host/src/store/automation_dispatch.rs": "aab39589d9afa40c4ca46722d1ab778b877b51be8f956fb7d444ceb54c77613e"
+  },
+  "historical_execution": "EXECUTION-RESULTS-L.json; unchanged",
+  "repair": [
+    "Exact Builtin opencode_v2/http.1 and Standalone module/rust-http.1 route pairs; cross pairs rejected",
+    "Standalone C7 reserves one observe child in the existing Store Operations queue, polls that retained ID on later ticks, and holds uncertain/stale/expired outcomes without replacement",
+    "NativeMcpCommand schema2 requires explicit AssignedSession or InstalledServer purpose for observe; installed-server C8 receipts cannot satisfy C7",
+    "Adapter checks current service identity around two location-scoped GETs and returns bounded sanitized typed assignment readback",
+    "Current actor, GM, Task/revision, Attempt/owner, Participant, grant/private references, binding/root/generation, lease, owned process and route/options guards retained",
+    "Applied assigned-session receipt has native_replay=false and permits only existing observed_partial; dispatch requires separate C8 proof"
+  ],
+  "fixture_repair": "Only cfg(test) HookSource admin event fixture changed: unique private existing canonical checkout/worktree directories; no production guard relaxed",
+  "verification": {
+    "rust": "1.98.1",
+    "production_clippy": "Windows/Linux affected3 --locked --lib --bins --no-deps -- -D warnings PASS; refreshed host production gates after fixture-only edit PASS",
+    "affected_lib_tests": {
+      "windows": {
+        "adapter": 10,
+        "contracts": 5,
+        "host_retained_passed": 365,
+        "host_fixed_cohort_passed": 19,
+        "host_ignored": 1,
+        "unique_passed": 399
+      },
+      "linux": {
+        "adapter": 10,
+        "contracts": 5,
+        "host_retained_passed": 380,
+        "host_fixed_cohort_passed": 17,
+        "host_ignored": 1,
+        "unique_passed": 412
+      }
+    },
+    "rerun_scope": "Only original failed names; source resources, absolute freshly built Zed host, hash-verified Forge sibling, four test threads. Passing broad cohorts retained. Windows Git failures disappeared under this runner; original silent nonzero cause remains UNKNOWN",
+    "formatting": "Three owned crates and git diff --check PASS; workspace --all formatting reports unchanged vendor/atlas files, not reformatted",
+    "log_sha256": {
+      "windows-c7-production-clippy.log": "f8007dd6743884e0d8f9eb00c2a5f8302ddf5ac9e5812574cf333ebacec46852",
+      "linux-c7-production-clippy.log": "e861ad66de4486cd28a2e44a0630e1fc01c38d07591f05677715f64ba10ce6be",
+      "windows-c7-fixture-production-clippy.log": "4f7235600326d5ff83b72304637617d964e4cc726c0262c911a7578fdc5795c4",
+      "linux-c7-fixture-production-clippy.log": "492ff964e1ed7c93265f2a4723479c35506086e35caa823c24f74686d67925da",
+      "windows-c7-affected-tests.log": "f683a00c5d2a2bd8d4ed2f9d98762095ca80246142afc60edf59bc7e4d6fd1d2",
+      "linux-c7-affected-tests.log": "f61d123d4b3c62c6d1c3e999265da3572cfea7af81e2004545bbce0798493ca4",
+      "windows-c7-remaining-host-tests.log": "d020fd9c9b89e540a0834c0553a53c5957a15043bb494539c8fa953dd01056b5",
+      "linux-c7-remaining-host-tests.log": "82f15358912837c4d982f7a867ef1838834a34bd6fde9c6de6ccada09cd2b8bc",
+      "windows-c7-remaining-host-command.json": "001e2a1cd2e71a04fdb5f5ba58163010af480a7acc7175845f54fb0c40cfbb32",
+      "linux-c7-remaining-host-command.json": "ad4b4550eef013ac676fecf3462d4ce0574c565156ca78d53423ffa817378e36",
+      "c7-owned-format-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_gate_sha256": "cd0c9fd67e500b2fb675d72a831b06617d00471baf653fa57af5a52712879b5e"
+  },
+  "independent_review": {
+    "status": "PASS; no confirmed source defect",
+    "scope": "18 original hashes checked before/after; additional fixture-only correction locally verified",
+    "provider": "openai",
+    "model": "gpt-6-luna",
+    "effort": "max",
+    "session_id": "01a12540-6316-7ed0-a2d3-f0c8c458de4c",
+    "report_sha256": "7e071a534108441588a7038be0f2ab63a1dc72a2545eaf2325e05b2eeb7c5bc0",
+    "model_readback_sha256": "cbba04f810c8245a4d71deede2ebd556216337f532a7fc4166734abac07561f9",
+    "limit": "No installed response bodies reviewed; exact session location query acceptance pending live qualification"
+  },
+  "next_gate": "Clean pushed candidate, exact eight-package provenance build/install, one fresh core contour and one native invocation per adapter in M",
+  "qualification": "SOURCE_VERIFIED; installed/native qualification pending",
+  "remaining_limits": [
+    "Tools/model consumption remains unknown until native C8 execution evidence",
+    "OpenCode2.0.7 exact assistant/input parent unavailable",
+    "Antigravity RESULT_BODY_UNAVAILABLE",
+    "13 upstream dependency alerts remain open; no supported patch verified",
+    "ELIOT connection absent; documented standalone mode; Codebase Memory explicit project CLI used"
+  ]
+}

@@ -208,18 +208,19 @@ fn attempt_owner_root_session(
             "current attempt-owner binding is missing",
         ));
     };
-    if state != "ready"
-        || released_at_ms.is_some()
-        || artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
-    {
+    if state != "ready" || released_at_ms.is_some() {
         return Err(Error::new(
             "NATIVE_MCP_BINDING_STALE",
             "initial attempt-owner readback requires the exact ready OpenCode binding",
         ));
     }
     let route: Value = serde_json::from_str(&route_json)?;
-    if route["runtime"] != crate::runtime::opencode_v2::RUNTIME
-        || route["module_artifact_id"] != crate::runtime::opencode_v2::ARTIFACT_ID
+    if crate::config::opencode_route_kind(
+        route["runtime"].as_str().unwrap_or_default(),
+        &artifact_id,
+    )
+    .is_none()
+        || route["module_artifact_id"].as_str() != Some(artifact_id.as_str())
     {
         return Err(Error::new(
             "NATIVE_MCP_BINDING_STALE",
@@ -445,10 +446,32 @@ fn validate_readback_source_identity(
         None => source["service_pid"].as_u64().is_some_and(|pid| pid > 0),
     };
     let directory_digest = format!("sha256:{}", model::digest(identity.directory.as_bytes()));
-    if route["runtime"] != crate::runtime::opencode_v2::RUNTIME
-        || route["module_artifact_id"] != crate::runtime::opencode_v2::ARTIFACT_ID
+    let kind = crate::config::opencode_route_kind(
+        route["runtime"].as_str().unwrap_or_default(),
+        route["module_artifact_id"].as_str().unwrap_or_default(),
+    )
+    .ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "unsupported OpenCode route pair",
+        )
+    })?;
+    let source_matches = match kind {
+        crate::config::OpenCodeRouteKind::Builtin => {
+            source["runtime"] == crate::runtime::opencode_v2::RUNTIME
+                && source.get("module_artifact_id").is_none()
+                && source.get("module_operation_id").is_none()
+        }
+        crate::config::OpenCodeRouteKind::Standalone => {
+            source["runtime"] == "module"
+                && source["module_artifact_id"] == "eliot-opencode-v2.rust-http.1"
+                && source["module_operation_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && id.len() <= 256)
+        }
+    };
+    if !source_matches
         || identity.expected_version != OPENCODE_VERSION
-        || source["runtime"] != crate::runtime::opencode_v2::RUNTIME
         || source["api_contract"] != MCP_API_CONTRACT
         || source["api_method"] != "GET /api/mcp"
         || source["api_scope"] != "configured_server_connection_status_only"
@@ -487,16 +510,25 @@ fn validate_readback_payload(
             "current participant binding no longer exists",
         ));
     };
-    if released_at_ms.is_some()
-        || !matches!(state.as_str(), "ready" | "reconciling")
-        || module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
-    {
+    if released_at_ms.is_some() || !matches!(state.as_str(), "ready" | "reconciling") {
         return Err(Error::new(
             "NATIVE_MCP_BINDING_STALE",
             "native MCP readback requires a live OpenCode V2 binding",
         ));
     }
     let route: Value = serde_json::from_str(&route_json)?;
+    if crate::config::opencode_route_kind(
+        route["runtime"].as_str().unwrap_or_default(),
+        &module_artifact_id,
+    )
+    .is_none()
+        || route["module_artifact_id"].as_str() != Some(module_artifact_id.as_str())
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_BINDING_STALE",
+            "readback route differs from the exact binding artifact",
+        ));
+    }
     let identity = match super::opencode::owned_service_for_binding(
         tx,
         config,

@@ -1,0 +1,22 @@
+{
+  "schema": "eliot.v27_core_ack_harness_repair.v1",
+  "recorded_at_utc": "2026-10-10T11:02:01.2434223Z",
+  "source_parent_commit": "f69d37d51291ed22417a8aef64a3095cb277b73f",
+  "script_sha256": "ff5dd10a0bd38c03bf4f1f0e14ade5369cf1a80f8566fa54c22e8e02278e0f56",
+  "understanding_sha256": "70003d25d66dc6f38e9a4a5e6ce97187b33188d675cd349b121de66d7e5ca88c",
+  "worker_report_sha256": "22953ed03512a136d063140494e71cce77accdd86723d42883cf1c70e2a0d0c2",
+  "repair": [
+    "Require fully paginated empty public Tasks and task.create Operations before sole dropped-ACK admission",
+    "Identify exact singleton public Operation and Task, verify fixture semantics and settled receipt before restart",
+    "Persist IDs before stop and compare same public receipts and Task after restart; no origin_key/caller_id/time/newest heuristic or replay",
+    "Require exact singleton verified HookSource commit observation before stop, then same observation ID after restart and exact duplicate acknowledgment"
+  ],
+  "parse": {
+    "core_errors": 0,
+    "core_tokens": 17437,
+    "native_errors": 0
+  },
+  "runtime_execution": "not_run; one fresh M contour required",
+  "historical_core": "C gaps stay UNKNOWN until new evidence",
+  "qualification": "SOURCE_REPAIRED; runtime pending"
+}

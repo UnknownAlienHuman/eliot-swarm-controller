@@ -4,6 +4,8 @@
 
 The descriptor declares `agent.open`, `task.dispatch`, `agent.send/next_turn`, `native.opencode.loop_step`, `agent.reply`, `agent.background`, `agent.refresh`, `agent.reconcile`, and `agent.result`, along with the four `native.mcp.*` commands. Loop-step is a vendor command with its own `swarm.opencode_loop_step_command@1` schema; ordinary `agent.send/next_turn` remains native queue delivery. Reply commands use `swarm.opencode_reply_command@1`. Unknown OpenCode-native methods stay unsupported.
 
+The descriptor opts into `swarm.native_mcp_command@2`. Native MCP observe commands carry an explicit `installed_server` purpose for C8 install readback or `assigned_session` for the C7 assignment observation. Assigned-session readback is pinned to OpenCode 2.0.7, uses location-scoped GETs for the MCP list and exact assigned session, and returns only bounded identity/status facts with server errors and integration IDs removed or hashed. Other command and event schemas remain at version 1.
+
 ## Service lifecycle
 
 External attach uses the exact service ID, connection file, workspace, and provider/model/variant from the selected route. The observed OpenCode version is diagnostic data, not an admission gate. The adapter never starts, stops, adopts, or restarts an externally attached service.

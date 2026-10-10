@@ -144,3 +144,41 @@ fn external_route_keeps_configured_service_identity_and_positive_pid_contract() 
     missing_pid["service_pid"] = json!(0);
     assert!(validate_readback_source_identity(&route, &missing_pid, &identity).is_err());
 }
+
+#[test]
+fn standalone_route_requires_module_readback_provenance_and_rejects_cross_pairs() {
+    let mut standalone = route(native_options(Some(SERVICE_ID), Some(SERVICE_VERSION)));
+    standalone["runtime"] = json!("module");
+    standalone["module_artifact_id"] = json!("eliot-opencode-v2.rust-http.1");
+    let identity = external_readback_route_identity(&standalone).unwrap();
+    let builtin_source = source(&identity, EXPECTED_PID);
+    assert!(validate_readback_source_identity(&standalone, &builtin_source, &identity).is_err());
+    let mut module_source = builtin_source;
+    module_source["runtime"] = json!("module");
+    module_source["module_artifact_id"] = json!("eliot-opencode-v2.rust-http.1");
+    assert!(validate_readback_source_identity(&standalone, &module_source, &identity).is_err());
+    module_source["module_operation_id"] = json!("assigned-session-readback-child");
+    validate_readback_source_identity(&standalone, &module_source, &identity).unwrap();
+    for field in [
+        "service_pid",
+        "service_version",
+        "directory_sha256",
+        "module_artifact_id",
+    ] {
+        let mut stale = module_source.clone();
+        stale[field] = Value::Null;
+        assert!(
+            validate_readback_source_identity(&standalone, &stale, &identity).is_err(),
+            "{field}"
+        );
+    }
+    for (runtime, artifact) in [
+        ("opencode_v2", "eliot-opencode-v2.rust-http.1"),
+        ("module", crate::runtime::opencode_v2::ARTIFACT_ID),
+    ] {
+        let mut cross = standalone.clone();
+        cross["runtime"] = json!(runtime);
+        cross["module_artifact_id"] = json!(artifact);
+        assert!(validate_readback_source_identity(&cross, &module_source, &identity).is_err());
+    }
+}

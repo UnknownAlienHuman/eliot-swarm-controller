@@ -6720,6 +6720,28 @@ mod hook_source_admin_event_tests {
     const AUTOMATION_ID: &str = "hook_admin_event_route";
     const SCRIPT_ID: &str = "hook_admin_event_fixture";
 
+    struct FixtureRoot(std::path::PathBuf);
+
+    impl FixtureRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("swarm-hook-admin-{}", model::new_id()));
+            std::fs::create_dir(&root).unwrap();
+            swarm_process::private_permissions(&root, true).unwrap();
+            for name in ["repository", "worktrees"] {
+                let path = root.join(name);
+                std::fs::create_dir(&path).unwrap();
+                swarm_process::private_permissions(&path, true).unwrap();
+            }
+            Self(root)
+        }
+    }
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn event_rule(event_kind: &str) -> EventRule {
         EventRule {
             source: None,
@@ -6731,14 +6753,14 @@ mod hook_source_admin_event_tests {
         }
     }
 
-    fn app_config() -> Config {
+    fn app_config(root: &FixtureRoot) -> Config {
         let mut config = Config::default();
         config.forge.enabled = true;
         config.forge.projects.insert(
             PROJECT_ID.to_owned(),
             crate::forge::ForgeProject {
                 canonical_repository: "github.com/owner/hook-admin-fixture".to_owned(),
-                repository_path: std::env::temp_dir().join("hook-admin-fixture-repository"),
+                repository_path: std::fs::canonicalize(root.0.join("repository")).unwrap(),
                 remote_name: "origin".to_owned(),
                 policy_revision: crate::policy::OWNER_POLICY_V2_ID.to_owned(),
                 target_refs: vec!["refs/heads/main".to_owned()],
@@ -6747,13 +6769,14 @@ mod hook_source_admin_event_tests {
         config.workspace.projects.insert(
             PROJECT_ID.to_owned(),
             crate::workspace::WorkspaceProjectConfig {
-                allowed_roots: vec![std::env::temp_dir().join("hook-admin-fixture-workspaces")],
+                allowed_roots: vec![std::fs::canonicalize(root.0.join("worktrees")).unwrap()],
             },
         );
         config
     }
 
-    fn fixture() -> (Connection, Config, AutomationEntry, Principal) {
+    fn fixture() -> (FixtureRoot, Connection, Config, AutomationEntry, Principal) {
+        let root = FixtureRoot::new();
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
@@ -6779,7 +6802,7 @@ mod hook_source_admin_event_tests {
         )
         .unwrap();
 
-        let app_config = app_config();
+        let app_config = app_config(&root);
         let mut entry = AutomationEntry::new(MANAGER_ID, PROJECT_ID, AUTOMATION_ID, 1);
         entry.enabled = true;
         entry.steps = vec![AutomationStep::ScriptRun];
@@ -6804,7 +6827,7 @@ mod hook_source_admin_event_tests {
             client_id: MANAGER_ID.to_owned(),
             role: Role::Manager,
         };
-        (db, app_config, entry, manager)
+        (root, db, app_config, entry, manager)
     }
 
     fn drain_events(
@@ -6843,7 +6866,7 @@ mod hook_source_admin_event_tests {
 
     #[test]
     fn real_hook_setup_and_revoke_writers_drain_through_statusless_script_rules() {
-        let (mut db, app_config, entry, manager) = fixture();
+        let (_root, mut db, app_config, entry, manager) = fixture();
         let source_id = model::new_id();
         let credential = Credential {
             client_id: format!("hook-source:{source_id}"),

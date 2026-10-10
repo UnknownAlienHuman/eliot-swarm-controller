@@ -17,6 +17,24 @@ const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const COMMAND_ACP_ARTIFACT_ID: &str = "eliot-command.acp-rust.1";
 const ANTIGRAVITY_RUST_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenCodeRouteKind {
+    Builtin,
+    Standalone,
+}
+
+pub(crate) fn opencode_route_kind(runtime: &str, artifact_id: &str) -> Option<OpenCodeRouteKind> {
+    if runtime == crate::runtime::opencode_v2::RUNTIME
+        && artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID
+    {
+        Some(OpenCodeRouteKind::Builtin)
+    } else if runtime == "module" && artifact_id == OPENCODE_RUST_ARTIFACT_ID {
+        Some(OpenCodeRouteKind::Standalone)
+    } else {
+        None
+    }
+}
+
 /// Trusted local recorder settings. This controls optional diagnostic
 /// metadata and explicitly selected redacted text; it never disables or
 /// redirects Store/business receipts.
@@ -295,10 +313,7 @@ impl Route {
         let Some(definition) = &self.owned_service else {
             return Ok(None);
         };
-        let supported_route = (self.runtime == crate::runtime::opencode_v2::RUNTIME
-            && self.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-            || (self.runtime == "module" && self.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
-        if !supported_route {
+        if opencode_route_kind(&self.runtime, &self.module_artifact_id).is_none() {
             return Err(Error::new(
                 "CONFIG_ERROR",
                 "owned service requires an OpenCode V2 route",
@@ -508,7 +523,10 @@ impl Config {
 
 #[cfg(test)]
 mod owned_opencode_route_validation_tests {
-    use super::{OPENCODE_RUST_ARTIFACT_ID, OwnedOpenCodeServiceConfig, Route};
+    use super::{
+        OPENCODE_RUST_ARTIFACT_ID, OpenCodeRouteKind, OwnedOpenCodeServiceConfig, Route,
+        opencode_route_kind,
+    };
     use serde_json::{Value, json};
 
     fn absolute_fixture_path(name: &str) -> String {
@@ -548,6 +566,39 @@ mod owned_opencode_route_validation_tests {
             workspace_option: Some("directory".to_owned()),
             owned_service,
             admission_policy: None,
+        }
+    }
+
+    #[test]
+    fn opencode_route_kind_accepts_only_exact_runtime_artifact_pairs() {
+        let cases = [
+            (
+                crate::runtime::opencode_v2::RUNTIME,
+                crate::runtime::opencode_v2::ARTIFACT_ID,
+                Some(OpenCodeRouteKind::Builtin),
+            ),
+            (
+                "module",
+                OPENCODE_RUST_ARTIFACT_ID,
+                Some(OpenCodeRouteKind::Standalone),
+            ),
+            (
+                crate::runtime::opencode_v2::RUNTIME,
+                OPENCODE_RUST_ARTIFACT_ID,
+                None,
+            ),
+            ("module", crate::runtime::opencode_v2::ARTIFACT_ID, None),
+            ("module", "eliot-opencode-v2.rust-http.1.extra", None),
+            ("MODULE", OPENCODE_RUST_ARTIFACT_ID, None),
+            ("unknown", "unknown-artifact", None),
+        ];
+
+        for (runtime, artifact_id, expected) in cases {
+            assert_eq!(
+                opencode_route_kind(runtime, artifact_id),
+                expected,
+                "unexpected classification for runtime={runtime:?}, artifact={artifact_id:?}"
+            );
         }
     }
 
@@ -904,11 +955,7 @@ impl Config {
                 && (r.runtime == crate::runtime::opencode_v2::RUNTIME
                     || (r.runtime == "module" && r.owned_service.is_some()))
         }) {
-            let supported_route = (route.runtime == crate::runtime::opencode_v2::RUNTIME
-                && route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-                || (route.runtime == "module"
-                    && route.module_artifact_id == OPENCODE_RUST_ARTIFACT_ID);
-            if !supported_route {
+            if opencode_route_kind(&route.runtime, &route.module_artifact_id).is_none() {
                 return Err(Error::new(
                     "CONFIG_ERROR",
                     "unsupported builtin OpenCode module artifact",

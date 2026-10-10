@@ -912,7 +912,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-adapter-opencode'; build_target = 'swarm-adapter-opencode';
                 build_manifest = 'crates/swarm-adapter-opencode/Cargo.toml';
                 capabilities = @('agent.background', 'agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.result', 'agent.send/next_turn', 'native.mcp.arm', 'native.mcp.install', 'native.mcp.observe', 'native.mcp.read', 'native.opencode.loop_step', 'task.dispatch');
-                command_schemas = @('swarm.native_mcp_command@1:', 'swarm.normalized_result_context@1:', 'swarm.opencode_loop_step_command@1:', 'swarm.opencode_reply_command@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
+                command_schemas = @('swarm.native_mcp_command@2:', 'swarm.normalized_result_context@1:', 'swarm.opencode_loop_step_command@1:', 'swarm.opencode_reply_command@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.opencode_interaction_observation@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '3'; expected_config_schema_sha256 = '070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e';
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';

@@ -2500,10 +2500,9 @@ fn departure_source(
         .owned_service
         .clone()
         .ok_or_else(|| corrupt("departure binding has no explicit owned service route"))?;
-    let supported_route_artifact = (stored_route.runtime == crate::runtime::opencode_v2::RUNTIME
-        && stored_route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-        || (stored_route.runtime == "module"
-            && stored_route.module_artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID);
+    let supported_route_artifact =
+        crate::config::opencode_route_kind(&stored_route.runtime, &stored_route.module_artifact_id)
+            .is_some();
     if binding.lane_id != format!("launch-{}", row.lease_id)
         || !owned_opencode_artifact(&binding.module_artifact_id)
         || binding.module_artifact_id != stored_route.module_artifact_id
@@ -3212,11 +3211,9 @@ fn current_owned_route(
     expected_workspace_directory: &std::path::Path,
 ) -> Result<Route> {
     let mut current = config.route(&stored.alias)?;
-    let supported_route = (current.runtime == crate::runtime::opencode_v2::RUNTIME
-        && current.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-        || (current.runtime == "module"
-            && current.module_artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID);
-    if !supported_route || current.owned_service.is_none() {
+    if crate::config::opencode_route_kind(&current.runtime, &current.module_artifact_id).is_none()
+        || current.owned_service.is_none()
+    {
         return Err(scope_changed());
     }
     let workspace_directory = expected_workspace_directory

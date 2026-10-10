@@ -349,6 +349,73 @@ pub(crate) struct OpenCodeV2ReadbackInput {
 }
 
 impl NativeMcpReadback {
+    /// Restore only the distinct, sanitized C7 observation admitted through
+    /// the selected module's applied RuntimeOutcome. The Store validates the
+    /// child Operation identity and current assignment before this call.
+    pub(crate) fn from_module_opencode(
+        scope: AssignmentContext,
+        operation_id: &str,
+        input: swarm_contracts::native_mcp::NativeMcpAssignmentReadback,
+    ) -> Result<Self> {
+        use swarm_contracts::native_mcp::NativeMcpServerStatus;
+
+        input.validate().map_err(|_| {
+            Error::new("NATIVE_MCP_SCHEMA", "module assignment readback is invalid")
+        })?;
+        validate_identifier(operation_id, "module operation ID", 256)?;
+        if input.assignment_sha256.as_str()
+            != model::digest(model::canonical(&scope.as_value())?.as_bytes())
+        {
+            return Err(Error::new(
+                "NATIVE_MCP_SCOPE_MISMATCH",
+                "module readback differs from the exact current assignment",
+            ));
+        }
+        let servers = input
+            .mcp_servers
+            .into_iter()
+            .map(|server| McpServerFact {
+                name: server.name,
+                status: match server.status {
+                    NativeMcpServerStatus::Connected => McpServerStatus::Connected,
+                    NativeMcpServerStatus::Pending => McpServerStatus::Pending,
+                    NativeMcpServerStatus::Disabled => McpServerStatus::Disabled,
+                    NativeMcpServerStatus::Failed => McpServerStatus::Failed,
+                    NativeMcpServerStatus::NeedsAuth => McpServerStatus::NeedsAuth,
+                },
+                integration_id_sha256: server
+                    .integration_id_sha256
+                    .map(|digest| format!("sha256:{}", digest.as_str())),
+                error_present: server.error_present,
+            })
+            .collect();
+        let session = input.native_session;
+        let mut observed = Self::from_opencode_v2(
+            scope,
+            OpenCodeV2ReadbackInput {
+                service_id: input.service_id,
+                service_pid: input.service_pid,
+                service_version: input.service_version,
+                directory_sha256: format!("sha256:{}", input.location_sha256.as_str()),
+                session: NativeSessionFact::new(
+                    session.id,
+                    session.project_id,
+                    session.parent_id,
+                    session.agent,
+                    session.created_at_ms,
+                    session.updated_at_ms,
+                )?,
+                servers,
+                observed_at_ms: input.observed_at_ms,
+            },
+        )?;
+        observed.payload["source"]["runtime"] = json!("module");
+        observed.payload["source"]["module_artifact_id"] = json!("eliot-opencode-v2.rust-http.1");
+        observed.payload["source"]["module_operation_id"] = json!(operation_id);
+        observed.evidence_digest = digest_value(&observed.payload)?;
+        Ok(observed)
+    }
+
     pub(crate) fn from_opencode_v2(
         scope: AssignmentContext,
         input: OpenCodeV2ReadbackInput,

@@ -2,6 +2,26 @@
 
 ## Current state
 
+### V27 audit and installed qualification — 2026-10-10
+
+The owner resumed development with the V27 audit and supplied HIGH appendix.
+The finite 62-row source ledger is classified; two historical runtime evidence
+gaps remain. Source repairs include the standalone OpenCode C7 observation
+handoff, separate C7/C8 purposes, retained-child no-replay guards, and the public
+admission/same-ID restart harness. Affected strict production Clippy passes on
+Windows and Linux. The affected library cohorts retain 399/412 unique passing
+tests, with one ignored case on each platform; independent native GPT-6 Luna Max
+source review found no confirmed C7 defect.
+
+Fresh installed core and native qualification on the latest clean candidate
+remains pending. The exact requested models are OpenCode Step 5 free with high
+reasoning and Antigravity Gemini 3.8. Historical L dispatch counts remain zero;
+source checks do not establish native consumption or a causal result. The
+unsupported result contracts and 13 upstream dependency alerts remain open.
+Current evidence and limits are recorded in the
+[V27 audit ledger](remediation/2026-10-09/CURRENT-AUDIT.md). Product status remains
+`PARTIAL_PROGRESS`; the dated closeout below is historical.
+
 ### Current queue source closeout — 2026-10-06
 
 The owner requested stopping development and saving/pushing the current work.

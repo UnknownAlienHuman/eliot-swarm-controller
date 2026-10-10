@@ -929,7 +929,8 @@ impl Store {
                 }
                 let operation_id = queue_native_mcp_operation(
                     &tx,
-                    &facts,
+                    &facts.operation_id,
+                    &facts.identity_digest,
                     &assignment,
                     "native.mcp.install",
                     "install",
@@ -1150,7 +1151,8 @@ impl Store {
             if record["install"]["module_operation_id"].is_null() {
                 let operation_id = queue_native_mcp_operation(
                     &tx,
-                    &facts,
+                    &facts.operation_id,
+                    &facts.identity_digest,
                     &assignment,
                     "native.mcp.observe",
                     &phase,
@@ -1190,7 +1192,8 @@ impl Store {
             if record["challenge"]["module_operation_id"].is_null() {
                 let operation_id = queue_native_mcp_operation(
                     &tx,
-                    &facts,
+                    &facts.operation_id,
+                    &facts.identity_digest,
                     &assignment,
                     "native.mcp.read",
                     "read",
@@ -1619,7 +1622,8 @@ impl Store {
                 }
                 let operation_id = queue_native_mcp_operation(
                     &tx,
-                    &facts,
+                    &facts.operation_id,
+                    &facts.identity_digest,
                     &assignment,
                     "native.mcp.arm",
                     "arm",
@@ -1879,31 +1883,95 @@ fn operation_error_code(operation: &Value, fallback: &str) -> String {
         .to_owned()
 }
 
+/// Map one exact method/phase pair to its original DTO phase and observation
+/// purpose. C7 assigned-session observation and C8 installed-server
+/// observations deliberately share a method while retaining distinct phases.
+pub(super) fn native_mcp_phase_contract(
+    method: &str,
+    phase: &str,
+) -> Option<(&'static str, Option<&'static str>)> {
+    match (method, phase) {
+        ("native.mcp.install", "install") => Some(("install", None)),
+        ("native.mcp.observe", "observe_unknown" | "observe_refresh") => {
+            Some(("observe", Some("installed_server")))
+        }
+        ("native.mcp.observe", "observe_assignment") => Some(("observe", Some("assigned_session"))),
+        ("native.mcp.arm", "arm") => Some(("arm", None)),
+        ("native.mcp.read", "read") => Some(("read", None)),
+        _ => None,
+    }
+}
+
+fn bind_native_mcp_observation_kind(command: &mut Value, expected: Option<&str>) -> Result<()> {
+    let object = command
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid("native MCP command is not an object"))?;
+    match (expected, object.get("observation_kind").cloned()) {
+        (Some(expected), None | Some(Value::Null)) => {
+            object.insert("observation_kind".to_owned(), json!(expected));
+        }
+        (Some(expected), Some(Value::String(actual))) if actual.as_str() == expected => {}
+        (None, None | Some(Value::Null)) => {
+            object.remove("observation_kind");
+        }
+        _ => {
+            return Err(Error::invalid(
+                "native MCP observation kind differs from its exact phase",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_mcp_queue_contract_tests {
+    use super::*;
+
+    #[test]
+    fn queue_enriches_only_the_exact_observe_purpose() {
+        let mut c7_command = json!({});
+        bind_native_mcp_observation_kind(&mut c7_command, Some("assigned_session")).unwrap();
+        assert_eq!(c7_command["observation_kind"], "assigned_session");
+
+        let mut c8_command = json!({});
+        bind_native_mcp_observation_kind(&mut c8_command, Some("installed_server")).unwrap();
+        assert_eq!(c8_command["observation_kind"], "installed_server");
+
+        let mut wrong_purpose = json!({"observation_kind":"installed_server"});
+        assert!(
+            bind_native_mcp_observation_kind(&mut wrong_purpose, Some("assigned_session")).is_err()
+        );
+        let mut non_observe_purpose = json!({"observation_kind":"assigned_session"});
+        assert!(bind_native_mcp_observation_kind(&mut non_observe_purpose, None).is_err());
+    }
+
+    #[test]
+    fn queue_omits_none_observation_kind() {
+        let mut command = json!({"observation_kind":null});
+        bind_native_mcp_observation_kind(&mut command, None).unwrap();
+        assert!(command.get("observation_kind").is_none());
+    }
+}
+
 /// Insert one descriptor-bound native command in the existing Operations
-/// queue. The caller is an internal Store linkage, never a public credential;
-/// the immutable row stores the descriptor DTO template while its actual
-/// prepared command/challenge remains in the private effective handoff. The
-/// surrounding C8 reservation updates its retained phase marker in the same
-/// transaction as this insert.
-fn queue_native_mcp_operation(
+/// queue. C7 and C8 callers supply their retained launch identity and share
+/// this transaction with their phase reservation. The caller is an internal
+/// Store linkage, never a public credential; the immutable row stores the
+/// descriptor DTO template while its prepared command/challenge remains in
+/// the private effective handoff.
+pub(super) fn queue_native_mcp_operation(
     tx: &Transaction<'_>,
-    facts: &LaunchFacts,
+    parent_operation_id: &str,
+    launch_identity_digest: &str,
     assignment: &crate::native_mcp::AssignmentContext,
     method: &str,
     phase: &str,
-    command: Value,
+    mut command: Value,
 ) -> Result<String> {
-    if !matches!(
-        method,
-        "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read"
-    ) || !matches!(
-        phase,
-        "install" | "observe_unknown" | "observe_refresh" | "arm" | "read"
-    ) {
-        return Err(Error::invalid(
-            "native MCP module operation phase is invalid",
-        ));
-    }
+    let (action, observation_kind) = native_mcp_phase_contract(method, phase).ok_or_else(|| {
+        Error::invalid("native MCP module operation method and phase are invalid")
+    })?;
+    bind_native_mcp_observation_kind(&mut command, observation_kind)?;
     require_internal_native_mcp_client(tx)?;
     let scope = assignment.as_value();
     let task_id = model::text(&scope, "task_id")?;
@@ -1917,13 +1985,6 @@ fn queue_native_mcp_operation(
             "native MCP module command exceeds its private handoff bound",
         ));
     }
-    let action = match method {
-        "native.mcp.install" => "install",
-        "native.mcp.observe" => "observe",
-        "native.mcp.arm" => "arm",
-        "native.mcp.read" => "read",
-        _ => unreachable!("native MCP method was checked above"),
-    };
     let command_scope = command
         .get("scope")
         .filter(|scope| scope.is_object())
@@ -1965,7 +2026,7 @@ fn queue_native_mcp_operation(
         operation_id, action, artifact_key
     );
     let mut original = json!({
-        "schema_version":1,
+        "schema_version":2,
         "operation_id":operation_id.clone(),
         "binding_id":binding_id,
         "binding_generation":binding_generation,
@@ -1981,6 +2042,9 @@ fn queue_native_mcp_operation(
         "location_sha256":location_sha256.clone(),
         "phase":action,
     });
+    if let Some(observation_kind) = observation_kind {
+        original["observation_kind"] = json!(observation_kind);
+    }
     original
         .as_object_mut()
         .ok_or_else(|| Error::invalid("native MCP DTO is not an object"))?
@@ -1996,8 +2060,8 @@ fn queue_native_mcp_operation(
         "native_mcp":{
             "schema_version":1,
             "child_operation_id":operation_id,
-            "parent_launch_operation_id":facts.operation_id,
-            "launch_identity_digest":facts.identity_digest,
+            "parent_launch_operation_id":parent_operation_id,
+            "launch_identity_digest":launch_identity_digest,
             "phase":phase,
             "method":method,
             "task_id":task_id,

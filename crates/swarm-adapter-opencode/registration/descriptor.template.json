@@ -29,7 +29,7 @@
     "semantics": "replace_with_admitted_absolute_workspace"
   },
   "command_schemas": [
-    {"schema_id": "swarm.native_mcp_command", "version": "1"},
+    {"schema_id": "swarm.native_mcp_command", "version": "2"},
     {"schema_id": "swarm.normalized_result_context", "version": "1"},
     {"schema_id": "swarm.opencode_loop_step_command", "version": "1"},
     {"schema_id": "swarm.opencode_reply_command", "version": "1"},

@@ -1,4 +1,5 @@
-//! Consumer for the Store-admitted `swarm.native_mcp_command@1` envelope.
+//! Consumer for the schema-1 private effect carried by the
+//! Store-admitted `swarm.native_mcp_command@2` DTO.
 //!
 //! This module owns only the OpenCode HTTP effects.  The Store constructs the
 //! envelope after C8 reservation and remains the authority for assignment,
@@ -8,11 +9,17 @@
 
 use crate::{config::NativeOptions, native::NativeClient};
 use reqwest::Url;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::time::{SystemTime, UNIX_EPOCH};
 use swarm_contracts::{
     error::{Error, Result},
+    module_catalog::Sha256Digest,
+    native_mcp::{
+        NativeMcpAssignmentReadback, NativeMcpObservationKind, NativeMcpServerObservation,
+        NativeMcpServerStatus, NativeMcpSessionObservation,
+    },
     runtime::{EffectOutcome, RuntimeCommand},
 };
 
@@ -24,6 +31,7 @@ const MAX_ID_BYTES: usize = 256;
 const MAX_COMMAND_ARGS: usize = 64;
 const MAX_ARG_BYTES: usize = 32 * 1024;
 const MAX_SERVER_ENTRIES: usize = 256;
+const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 const RPC_ID: &str = "eliot.native-mcp-proof.v1";
 
 /// A native request failure carries the outcome classification that the
@@ -45,12 +53,65 @@ struct RequestSpec {
 
 struct ParsedCommand {
     action: String,
+    observation_kind: Option<NativeMcpObservationKind>,
     service_pid: u32,
     request: RequestSpec,
     precondition: Option<RequestSpec>,
     readback: Option<RequestSpec>,
     prepared: Value,
     challenge: Option<Value>,
+    assignment_observation: Option<NativeMcpAssignmentObservationArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMcpAssignmentObservationArtifact {
+    schema_version: u16,
+    kind: String,
+    assignment: Value,
+    assignment_sha256: Sha256Digest,
+    native_session_id: String,
+    location_sha256: Sha256Digest,
+    service_id: String,
+    service_pid: u32,
+    service_version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocationEnvelope<T> {
+    location: LocationRef,
+    data: T,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocationRef {
+    directory: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMcpServerResponse {
+    name: String,
+    status: NativeMcpStatusResponse,
+    #[serde(rename = "integrationID", default)]
+    integration_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", deny_unknown_fields)]
+enum NativeMcpStatusResponse {
+    #[serde(rename = "connected")]
+    Connected,
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "disabled")]
+    Disabled,
+    #[serde(rename = "failed")]
+    Failed { error: String },
+    #[serde(rename = "needs_auth")]
+    NeedsAuth { error: String },
 }
 
 /// Execute exactly one Store-admitted action.  Install performs one GET
@@ -72,6 +133,21 @@ pub async fn execute(
         return Err(reject(
             "NATIVE_INSTANCE_CHANGED",
             "native MCP command targets another retained service process",
+        ));
+    }
+    if parsed
+        .assignment_observation
+        .as_ref()
+        .is_some_and(|observation| {
+            observation.service_id != options.service_id
+                || observation.service_pid != native.process_id()
+                || observation.service_version != PINNED_OPENCODE_VERSION
+                || observation.service_version != native.process_version()
+        })
+    {
+        return Err(reject(
+            "NATIVE_INSTANCE_CHANGED",
+            "assigned-session observation targets another OpenCode service identity",
         ));
     }
 
@@ -150,6 +226,25 @@ async fn execute_observe(
     options: &NativeOptions,
     parsed: &ParsedCommand,
 ) -> EffectResult {
+    match parsed.observation_kind {
+        Some(NativeMcpObservationKind::InstalledServer) => {
+            execute_installed_server_observe(native, options, parsed).await
+        }
+        Some(NativeMcpObservationKind::AssignedSession) => {
+            execute_assigned_session_observe(native, options, parsed).await
+        }
+        None => Err(reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "observe command has no admitted observation purpose",
+        )),
+    }
+}
+
+async fn execute_installed_server_observe(
+    native: &NativeClient,
+    options: &NativeOptions,
+    parsed: &ParsedCommand,
+) -> EffectResult {
     let response = native
         .mcp_get(&parsed.request.path)
         .await
@@ -159,6 +254,51 @@ async fn execute_observe(
         "schema_version": SCHEMA_VERSION,
         "kind": "native_mcp_effect_receipt",
         "action": "observe",
+        "observation_kind": "installed_server",
+        "readback": readback,
+        "native_replay": false,
+    }))
+}
+
+async fn execute_assigned_session_observe(
+    native: &NativeClient,
+    options: &NativeOptions,
+    parsed: &ParsedCommand,
+) -> EffectResult {
+    let readback_request = parsed.readback.as_ref().ok_or_else(|| {
+        reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "assigned-session observe has no exact session GET",
+        )
+    })?;
+    let mcp_response = native
+        .mcp_get(&parsed.request.path)
+        .await
+        .map_err(|error| read_failure(error, false))?;
+    // The first verification is in execute() before this MCP GET. This check
+    // separates both reads so a replaced service cannot supply a mixed proof.
+    native
+        .verify_mcp_service()
+        .await
+        .map_err(|error| read_failure(error, false))?;
+    let session_response = native
+        .mcp_get(&readback_request.path)
+        .await
+        .map_err(|error| read_failure(error, false))?;
+    // Verify after the session GET as well; execute() performs a final check
+    // after the typed receipt has been projected.
+    native
+        .verify_mcp_service()
+        .await
+        .map_err(|error| read_failure(error, false))?;
+
+    let readback =
+        project_assignment_readback(&mcp_response, session_response, parsed, native, options)?;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "native_mcp_effect_receipt",
+        "action": "observe",
+        "observation_kind": "assigned_session",
         "readback": readback,
         "native_replay": false,
     }))
@@ -242,7 +382,7 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
     {
         return Err(reject(
             "NATIVE_MCP_COMMAND_SCHEMA",
-            "native MCP command schema is not swarm.native_mcp_command@1",
+            "native MCP private effect schema is not swarm.native_mcp_command@1",
         ));
     }
     let action = input
@@ -256,6 +396,28 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
             )
         })?
         .to_owned();
+    let observation_kind = if action == "observe" {
+        Some(
+            match input.get("observation_kind").and_then(Value::as_str) {
+                Some("installed_server") => NativeMcpObservationKind::InstalledServer,
+                Some("assigned_session") => NativeMcpObservationKind::AssignedSession,
+                _ => {
+                    return Err(reject(
+                        "NATIVE_MCP_COMMAND_INPUT",
+                        "observe command has no supported observation purpose",
+                    ));
+                }
+            },
+        )
+    } else {
+        if input.contains_key("observation_kind") {
+            return Err(reject(
+                "NATIVE_MCP_COMMAND_INPUT",
+                "non-observe command cannot carry an observation purpose",
+            ));
+        }
+        None
+    };
     let scope = input.get("scope").cloned().ok_or_else(|| {
         reject(
             "NATIVE_MCP_COMMAND_SCOPE",
@@ -278,13 +440,18 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
     let request = parse_request(input.get("request"), options, &action)?;
     let precondition = input
         .get("precondition")
+        .filter(|value| !value.is_null())
         .map(|value| parse_request(Some(value), options, "observe"))
         .transpose()?;
     let readback = input
         .get("readback")
+        .filter(|value| !value.is_null())
         .map(|value| parse_request(Some(value), options, "observe"))
         .transpose()?;
-    let challenge = input.get("challenge").cloned();
+    let challenge = input
+        .get("challenge")
+        .filter(|value| !value.is_null())
+        .cloned();
     if matches!(action.as_str(), "arm" | "read") {
         let challenge = challenge.as_ref().ok_or_else(|| {
             reject(
@@ -304,10 +471,42 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
             ));
         }
     } else if action == "observe" {
-        validate_observe_request(&request, &prepared, options)?;
+        match observation_kind {
+            Some(NativeMcpObservationKind::InstalledServer) => {
+                validate_observe_request(&request, &prepared, options)?;
+            }
+            Some(NativeMcpObservationKind::AssignedSession) => {
+                if input.contains_key("precondition") || input.contains_key("challenge") {
+                    return Err(reject(
+                        "NATIVE_MCP_COMMAND_INPUT",
+                        "assigned-session observe cannot carry a precondition or challenge",
+                    ));
+                }
+            }
+            None => {
+                return Err(reject(
+                    "NATIVE_MCP_COMMAND_INPUT",
+                    "observe command has no admitted observation purpose",
+                ));
+            }
+        }
     } else {
         validate_rpc_request(&request, &action, &challenge, options)?;
     }
+    let assignment_observation =
+        if observation_kind == Some(NativeMcpObservationKind::AssignedSession) {
+            Some(validate_assignment_observe_request(
+                &request,
+                precondition.as_ref(),
+                readback.as_ref(),
+                &prepared,
+                challenge.as_ref(),
+                &scope,
+                options,
+            )?)
+        } else {
+            None
+        };
     let serialized = serde_json::to_vec(&command.input).map_err(|_| {
         reject(
             "NATIVE_MCP_COMMAND_INPUT",
@@ -322,6 +521,7 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
     }
     Ok(ParsedCommand {
         action,
+        observation_kind,
         service_pid: scope["service_pid"]
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
@@ -331,6 +531,7 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
         readback,
         prepared,
         challenge,
+        assignment_observation,
     })
 }
 
@@ -577,6 +778,105 @@ fn validate_observe_request(
     Ok(())
 }
 
+fn validate_assignment_observe_request(
+    request: &RequestSpec,
+    precondition: Option<&RequestSpec>,
+    readback: Option<&RequestSpec>,
+    prepared: &Value,
+    challenge: Option<&Value>,
+    scope: &Value,
+    options: &NativeOptions,
+) -> EffectResult<NativeMcpAssignmentObservationArtifact> {
+    if precondition.is_some() || challenge.is_some() {
+        return Err(reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "assigned-session observe cannot carry a precondition or challenge",
+        ));
+    }
+    let observation: NativeMcpAssignmentObservationArtifact =
+        serde_json::from_value(prepared.clone()).map_err(|_| {
+            reject(
+                "NATIVE_MCP_COMMAND_INPUT",
+                "assigned-session prepared artifact schema is invalid",
+            )
+        })?;
+    let readback = readback.ok_or_else(|| {
+        reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "assigned-session observe has no exact session readback GET",
+        )
+    })?;
+    let directory = options.directory.to_str().unwrap_or_default();
+    let expected_session_path = format!("/api/session/{}", observation.native_session_id);
+    let request_url = Url::parse(&format!("http://127.0.0.1{}", request.path))
+        .map_err(|_| reject("NATIVE_MCP_COMMAND_INPUT", "observe path is invalid"))?;
+    let readback_url = Url::parse(&format!("http://127.0.0.1{}", readback.path)).map_err(|_| {
+        reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "session readback path is invalid",
+        )
+    })?;
+    let assignment = scope.get("assignment").ok_or_else(|| {
+        reject(
+            "NATIVE_MCP_COMMAND_SCOPE",
+            "assigned-session observation has no assignment scope",
+        )
+    })?;
+    let service_pid = scope["service_pid"].as_u64();
+    let assignment_digest = digest_value_raw(assignment)?;
+    let location_digest = format!("{:x}", sha2::Sha256::digest(directory.as_bytes()));
+
+    if observation.schema_version != 1
+        || observation.kind != "swarm.native_mcp_assignment_observation"
+        || observation.assignment != *assignment
+        || observation.assignment_sha256.as_str() != assignment_digest
+        || observation.location_sha256.as_str() != location_digest
+        || observation.service_id != options.service_id
+        || scope.get("service_id").and_then(Value::as_str) != Some(observation.service_id.as_str())
+        || service_pid != Some(u64::from(observation.service_pid))
+        || observation.service_version != PINNED_OPENCODE_VERSION
+        || scope.get("expected_version").and_then(Value::as_str)
+            != Some(observation.service_version.as_str())
+        || observation.native_session_id
+            != assignment["native_session_id"].as_str().unwrap_or_default()
+        || !valid_session_path_segment(&observation.native_session_id)
+        || request.method != "GET"
+        || request.body.is_some()
+        || request.path != request.path.trim()
+        || request_url.path() != "/api/mcp"
+        || request_url.fragment().is_some()
+        || readback.method != "GET"
+        || readback.body.is_some()
+        || readback.path != readback.path.trim()
+        || readback_url.path() != expected_session_path
+        || readback_url.fragment().is_some()
+        || scope.get("directory").and_then(Value::as_str) != Some(directory)
+    {
+        return Err(reject(
+            "NATIVE_MCP_SCOPE_MISMATCH",
+            "assigned-session observation differs from its exact service, assignment, or routes",
+        ));
+    }
+    Ok(observation)
+}
+
+fn valid_session_path_segment(value: &str) -> bool {
+    value.starts_with("ses_")
+        && value.len() <= MAX_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+fn digest_value_raw(value: &Value) -> EffectResult<String> {
+    crate::native_mcp_intake::digest_json(value).map_err(|_| {
+        reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "native MCP identity could not be canonicalized",
+        )
+    })
+}
+
 fn validate_rpc_request(
     request: &RequestSpec,
     action: &str,
@@ -783,6 +1083,192 @@ fn project_install_readback(
     }))
 }
 
+fn project_assignment_readback(
+    mcp_value: &Value,
+    session_value: Value,
+    parsed: &ParsedCommand,
+    native: &NativeClient,
+    options: &NativeOptions,
+) -> EffectResult<NativeMcpAssignmentReadback> {
+    let observation = parsed.assignment_observation.as_ref().ok_or_else(|| {
+        reject(
+            "NATIVE_MCP_COMMAND_INPUT",
+            "assigned-session observation metadata is missing",
+        )
+    })?;
+    let response: LocationEnvelope<Vec<NativeMcpServerResponse>> =
+        serde_json::from_value(mcp_value.clone()).map_err(|_| {
+            reject(
+                "NATIVE_MCP_SCHEMA",
+                "OpenCode MCP response does not match the pinned 2.0.7 contract",
+            )
+        })?;
+    let directory = options.directory.to_str().unwrap_or_default();
+    if response.location.directory != directory
+        || response.data.len() > MAX_SERVER_ENTRIES
+        || native.process_version() != PINNED_OPENCODE_VERSION
+        || native.process_id() != observation.service_pid
+    {
+        return Err(reject(
+            "NATIVE_MCP_SCOPE_MISMATCH",
+            "OpenCode MCP readback is outside the admitted service or location",
+        ));
+    }
+
+    // The pinned session GET has the same `data` envelope consumed by
+    // NativeClient::session; its body is not a flat session object.
+    let session_data = session_value
+        .get("data")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            reject(
+                "NATIVE_MCP_SCHEMA",
+                "OpenCode session readback lacks its data object",
+            )
+        })?;
+    let native_session = session_observation(session_data)?;
+    if native_session.id != observation.native_session_id {
+        return Err(reject(
+            "NATIVE_MCP_SCOPE_MISMATCH",
+            "OpenCode returned another native session",
+        ));
+    }
+
+    let mut mcp_servers = response
+        .data
+        .into_iter()
+        .map(|server| {
+            if server.name.is_empty()
+                || server.name.len() > MAX_ID_BYTES
+                || server.name.trim().is_empty()
+                || server.name.chars().any(char::is_control)
+                || server.integration_id.as_deref().is_some_and(|value| {
+                    value.is_empty()
+                        || value.trim().is_empty()
+                        || value.len() > MAX_ID_BYTES
+                        || value.chars().any(char::is_control)
+                })
+            {
+                return Err(reject(
+                    "NATIVE_MCP_SCHEMA",
+                    "OpenCode MCP server identity is outside its bounded schema",
+                ));
+            }
+            let (status, error_present) = match server.status {
+                NativeMcpStatusResponse::Connected => (NativeMcpServerStatus::Connected, false),
+                NativeMcpStatusResponse::Pending => (NativeMcpServerStatus::Pending, false),
+                NativeMcpStatusResponse::Disabled => (NativeMcpServerStatus::Disabled, false),
+                NativeMcpStatusResponse::Failed { error } => {
+                    drop(error);
+                    (NativeMcpServerStatus::Failed, true)
+                }
+                NativeMcpStatusResponse::NeedsAuth { error } => {
+                    drop(error);
+                    (NativeMcpServerStatus::NeedsAuth, true)
+                }
+            };
+            let integration_id_sha256 = server
+                .integration_id
+                .map(|integration_id| {
+                    Sha256Digest::new(format!(
+                        "{:x}",
+                        sha2::Sha256::digest(integration_id.as_bytes())
+                    ))
+                })
+                .transpose()
+                .map_err(|_| {
+                    reject(
+                        "NATIVE_MCP_SCHEMA",
+                        "OpenCode MCP integration identity could not be sanitized",
+                    )
+                })?;
+            Ok(NativeMcpServerObservation {
+                name: server.name,
+                status,
+                integration_id_sha256,
+                error_present,
+            })
+        })
+        .collect::<EffectResult<Vec<_>>>()?;
+    mcp_servers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let readback = NativeMcpAssignmentReadback {
+        schema_version: 1,
+        kind: "native_mcp_assignment_readback".into(),
+        assignment_sha256: observation.assignment_sha256.clone(),
+        service_id: observation.service_id.clone(),
+        service_pid: observation.service_pid,
+        service_version: observation.service_version.clone(),
+        location_sha256: observation.location_sha256.clone(),
+        native_session,
+        mcp_servers,
+        observed_at_ms: now_ms(),
+    };
+    readback.validate().map_err(|_| {
+        reject(
+            "NATIVE_MCP_SCHEMA",
+            "native MCP assignment readback is invalid",
+        )
+    })?;
+    Ok(readback)
+}
+
+fn session_observation(value: Value) -> EffectResult<NativeMcpSessionObservation> {
+    let id = required_session_text(&value, "id")?;
+    let project_id = required_session_text(&value, "projectID")?;
+    let parent_id = optional_session_text(&value, "parentID")?;
+    let agent = optional_session_text(&value, "agent")?;
+    let created_at_ms = value["time"]["created"].as_u64().ok_or_else(|| {
+        reject(
+            "NATIVE_MCP_SCHEMA",
+            "OpenCode session creation time is invalid",
+        )
+    })?;
+    let updated_at_ms = value["time"]["updated"].as_u64().ok_or_else(|| {
+        reject(
+            "NATIVE_MCP_SCHEMA",
+            "OpenCode session update time is invalid",
+        )
+    })?;
+    Ok(NativeMcpSessionObservation {
+        id,
+        project_id,
+        parent_id,
+        agent,
+        created_at_ms,
+        updated_at_ms,
+    })
+}
+
+fn required_session_text(value: &Value, field: &str) -> EffectResult<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_ID_BYTES
+                && !text.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| reject("NATIVE_MCP_SCHEMA", "OpenCode session fact is invalid"))
+}
+
+fn optional_session_text(value: &Value, field: &str) -> EffectResult<Option<String>> {
+    match value.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|text| {
+                !text.trim().is_empty()
+                    && text.len() <= MAX_ID_BYTES
+                    && !text.chars().any(char::is_control)
+            })
+            .map(|text| Some(text.to_owned()))
+            .ok_or_else(|| reject("NATIVE_MCP_SCHEMA", "OpenCode session fact is invalid")),
+    }
+}
+
 fn validate_arm_ack(output: &Value, challenge: Option<&Value>) -> EffectResult<()> {
     let challenge =
         challenge.ok_or_else(|| reject("NATIVE_MCP_COMMAND_SCOPE", "arm challenge is missing"))?;
@@ -870,5 +1356,408 @@ fn read_failure(error: Error, effect_already_attempted: bool) -> EffectFailure {
             EffectOutcome::Rejected
         },
         error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelRef;
+    use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    fn canonical(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let sorted = object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonical(value)))
+                    .collect::<BTreeMap<_, _>>();
+                Value::Object(sorted.into_iter().collect())
+            }
+            Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
+            value => value.clone(),
+        }
+    }
+
+    fn digest_json_for_test(value: &Value) -> String {
+        raw_sha256(&serde_json::to_vec(&canonical(value)).unwrap())
+    }
+
+    fn test_options(
+        directory: PathBuf,
+        connection_file: PathBuf,
+        service_id: &str,
+    ) -> NativeOptions {
+        NativeOptions {
+            service_id: service_id.to_owned(),
+            connection_file,
+            directory,
+            model: ModelRef {
+                id: "model".into(),
+                provider_id: "provider".into(),
+                variant: "default".into(),
+            },
+        }
+    }
+
+    fn assigned_value(directory: &str, session_id: &str) -> Value {
+        json!({
+            "task_id":"task_1",
+            "task_revision":1,
+            "attempt_id":"attempt_1",
+            "binding_id":"binding_1",
+            "binding_generation":4,
+            "native_session_id":session_id,
+            "participant_id":"participant_1",
+            "mcp_profile":"participant",
+            "grant_revision":1,
+            "participation_basis":"attempt_owner",
+            "assignment_id":null,
+            "review_assignment_id":null
+        })
+    }
+
+    fn scoped_path(path: &str, directory: &str) -> String {
+        let mut url = Url::parse("http://127.0.0.1/").unwrap();
+        url.set_path(path);
+        url.query_pairs_mut()
+            .append_pair("location[directory]", directory);
+        format!("{}?{}", url.path(), url.query().unwrap())
+    }
+
+    fn assigned_effect(options: &NativeOptions, service_pid: u32) -> Value {
+        let directory = options.directory.to_str().unwrap();
+        let session_id = "ses_123";
+        let assignment = assigned_value(directory, session_id);
+        let assignment_sha256 = digest_json_for_test(&assignment);
+        let location_sha256 = raw_sha256(directory.as_bytes());
+        json!({
+            "schema_version":1,
+            "kind":"swarm.native_mcp_command",
+            "action":"observe",
+            "observation_kind":"assigned_session",
+            "scope":{
+                "binding_id":"binding_1",
+                "binding_generation":4,
+                "native_scope_key":format!("opencode-v2:{}", options.service_id),
+                "service_id":options.service_id,
+                "service_pid":service_pid,
+                "expected_version":PINNED_OPENCODE_VERSION,
+                "directory":directory,
+                "assignment":assignment,
+            },
+            "prepared":{
+                "schema_version":1,
+                "kind":"swarm.native_mcp_assignment_observation",
+                "assignment":assignment,
+                "assignment_sha256":assignment_sha256,
+                "native_session_id":session_id,
+                "location_sha256":location_sha256,
+                "service_id":options.service_id,
+                "service_pid":service_pid,
+                "service_version":PINNED_OPENCODE_VERSION,
+            },
+            "request":{
+                "method":"GET",
+                "path":scoped_path("/api/mcp", directory),
+            },
+            "readback":{
+                "method":"GET",
+                "path":scoped_path("/api/session/ses_123", directory),
+            },
+        })
+    }
+
+    fn installed_server_effect(options: &NativeOptions, service_pid: u32) -> Value {
+        let directory = options.directory.to_str().unwrap();
+        let assignment = assigned_value(directory, "ses_123");
+        json!({
+            "schema_version":1,
+            "kind":"swarm.native_mcp_command",
+            "action":"observe",
+            "observation_kind":"installed_server",
+            "scope":{
+                "binding_id":"binding_1",
+                "binding_generation":4,
+                "native_scope_key":format!("opencode-v2:{}", options.service_id),
+                "service_id":options.service_id,
+                "service_pid":service_pid,
+                "expected_version":PINNED_OPENCODE_VERSION,
+                "directory":directory,
+                "assignment":assignment,
+            },
+            "prepared":{
+                "server_name":"eliot_test",
+                "install_intent":{"schema_version":1,"kind":"test"},
+            },
+            "request":{
+                "method":"GET",
+                "path":scoped_path("/api/mcp", directory),
+            },
+            "precondition":null,
+            "readback":null,
+        })
+    }
+
+    fn runtime_command(input: Value) -> RuntimeCommand {
+        RuntimeCommand {
+            operation_id: "operation_1".into(),
+            method: "native.mcp.observe".into(),
+            created_at_ms: 1,
+            binding_id: "binding_1".into(),
+            generation: 4,
+            native_root_id: None,
+            route: Value::Null,
+            input,
+            input_sha256: Some("a".repeat(64)),
+            target_input_sha256: None,
+        }
+    }
+
+    fn parse_effect(input: Value, options: &NativeOptions) -> EffectResult<ParsedCommand> {
+        parse(&runtime_command(input), options)
+    }
+
+    #[test]
+    fn assigned_session_observe_requires_the_exact_two_get_routes() {
+        let directory = std::env::current_dir().unwrap();
+        let options = test_options(
+            directory,
+            PathBuf::from("unused-connection.json"),
+            "service",
+        );
+        let input = assigned_effect(&options, 42);
+        let parsed = match parse_effect(input.clone(), &options) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("unexpected parse rejection: {}", error.error.code),
+        };
+        assert_eq!(
+            parsed.observation_kind,
+            Some(NativeMcpObservationKind::AssignedSession)
+        );
+        assert_eq!(
+            parsed
+                .readback
+                .as_ref()
+                .map(|request| request.method.as_str()),
+            Some("GET")
+        );
+        assert_eq!(
+            parsed
+                .assignment_observation
+                .as_ref()
+                .map(|observation| observation.native_session_id.as_str()),
+            Some("ses_123")
+        );
+
+        let mut body = input.clone();
+        body["request"]["body"] = json!({"unexpected":true});
+        assert!(parse_effect(body, &options).is_err());
+
+        let mut wrong_session = input.clone();
+        wrong_session["readback"]["path"] = json!(scoped_path(
+            "/api/session/ses_other",
+            options.directory.to_str().unwrap()
+        ));
+        assert!(parse_effect(wrong_session, &options).is_err());
+
+        let mut wrong_location = input.clone();
+        wrong_location["request"]["path"] = json!(scoped_path("/api/mcp", "C:/another/location"));
+        assert!(parse_effect(wrong_location, &options).is_err());
+
+        let mut with_precondition = input.clone();
+        with_precondition["precondition"] = json!({
+            "method":"GET",
+            "path":scoped_path("/api/mcp", options.directory.to_str().unwrap()),
+        });
+        assert!(parse_effect(with_precondition, &options).is_err());
+
+        let mut with_challenge = input.clone();
+        with_challenge["challenge"] = json!({"challenge_id":"challenge_1"});
+        assert!(parse_effect(with_challenge, &options).is_err());
+
+        let mut private_schema_v2 = input;
+        private_schema_v2["schema_version"] = json!(2);
+        assert!(parse_effect(private_schema_v2, &options).is_err());
+    }
+
+    #[test]
+    fn installed_server_observe_keeps_its_prepared_install_projection() {
+        let options = test_options(
+            std::env::current_dir().unwrap(),
+            PathBuf::from("unused-connection.json"),
+            "service",
+        );
+        let parsed = match parse_effect(installed_server_effect(&options, 42), &options) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("unexpected parse rejection: {}", error.error.code),
+        };
+        assert_eq!(
+            parsed.observation_kind,
+            Some(NativeMcpObservationKind::InstalledServer)
+        );
+        assert_eq!(parsed.prepared["server_name"], "eliot_test");
+        assert!(parsed.readback.is_none());
+    }
+
+    struct TempConnectionFile(PathBuf);
+
+    impl Drop for TempConnectionFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> (String, String) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0 && request.len() + count <= 16 * 1024);
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_end = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        assert_eq!(request.len(), header_end + 4, "GET unexpectedly had a body");
+        let header = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let mut request_line = header.lines().next().unwrap().split_whitespace();
+        (
+            request_line.next().unwrap().to_owned(),
+            request_line.next().unwrap().to_owned(),
+        )
+    }
+
+    async fn respond(stream: &mut TcpStream, value: Value) {
+        let body = serde_json::to_vec(&value).unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn assigned_session_observe_uses_two_scoped_gets_and_sanitizes_receipt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let directory = std::env::current_dir().unwrap();
+        let directory_text = directory.to_str().unwrap().to_owned();
+        let service_pid = std::process::id();
+        let options = test_options(
+            directory,
+            std::env::temp_dir().join(format!("native-mcp-{}.json", uuid::Uuid::new_v4())),
+            "service",
+        );
+        let connection_file = TempConnectionFile(options.connection_file.clone());
+        tokio::fs::write(
+            &connection_file.0,
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "endpoint":endpoint,
+                "pid":service_pid,
+                "username":"fixture",
+                "password":"fixture-secret",
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let expected_mcp_path = scoped_path("/api/mcp", &directory_text);
+        let expected_session_path = scoped_path("/api/session/ses_123", &directory_text);
+        let server = tokio::spawn(async move {
+            for index in 0..7 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (method, path) = read_request(&mut stream).await;
+                assert_eq!(method, "GET");
+                let response = match index {
+                    2 => {
+                        assert_eq!(path, expected_mcp_path);
+                        json!({
+                            "location":{"directory":directory_text},
+                            "data":[
+                                {"name":"zeta","status":{"status":"connected"},"integrationID":"integration-zeta"},
+                                {"name":"alpha","status":{"status":"failed","error":"private server error"},"integrationID":"integration-alpha"}
+                            ]
+                        })
+                    }
+                    4 => {
+                        assert_eq!(path, expected_session_path);
+                        json!({"data":{
+                            "id":"ses_123",
+                            "projectID":"native-project-without-prefix",
+                            "parentID":"ses_parent",
+                            "agent":"build",
+                            "time":{"created":10,"updated":11},
+                            "title":"private session payload"
+                        }})
+                    }
+                    _ => {
+                        assert_eq!(path, "/api/info");
+                        json!({
+                            "version":PINNED_OPENCODE_VERSION,
+                            "pid":service_pid,
+                            "urls":["http://127.0.0.1/"],
+                            "paths":{"tmp":"fixture"}
+                        })
+                    }
+                };
+                respond(&mut stream, response).await;
+            }
+        });
+
+        let (native, _) = NativeClient::connect(&options).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute(
+                &native,
+                &runtime_command(assigned_effect(&options, service_pid)),
+                &options,
+            ),
+        )
+        .await
+        .unwrap();
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => panic!("unexpected execution failure: {}", error.error.code),
+        };
+        assert_eq!(receipt["action"], "observe");
+        assert_eq!(receipt["observation_kind"], "assigned_session");
+        assert_eq!(receipt["native_replay"], false);
+        assert_eq!(
+            receipt["readback"]["kind"],
+            "native_mcp_assignment_readback"
+        );
+        assert_eq!(receipt["readback"]["service_version"], "2.0.7");
+        assert_eq!(receipt["readback"]["native_session"]["id"], "ses_123");
+        assert_eq!(receipt["readback"]["mcp_servers"][0]["name"], "alpha");
+        assert_eq!(receipt["readback"]["mcp_servers"][0]["status"], "failed");
+        assert_eq!(receipt["readback"]["mcp_servers"][0]["error_present"], true);
+        assert_eq!(
+            receipt["readback"]["mcp_servers"][0]["integration_id_sha256"],
+            raw_sha256(b"integration-alpha")
+        );
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains("private server error"));
+        assert!(!serialized.contains("integration-alpha"));
+        assert!(!serialized.contains("private session payload"));
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

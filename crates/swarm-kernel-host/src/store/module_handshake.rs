@@ -952,6 +952,48 @@ mod tests {
         }
     }
 
+    fn native_mcp_schema_admission(schema_version: &str) -> Option<bool> {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let mut native_descriptor = descriptor();
+        native_descriptor
+            .capabilities
+            .insert(CapabilityId::new("native.mcp.observe").unwrap());
+        let mut schema = native_mcp_command_schema();
+        schema.version = schema_version.to_owned();
+        native_descriptor.command_schemas.insert(schema);
+        register_trusted_descriptor(&tx, native_descriptor.clone()).unwrap();
+        let registry = load_registry(&tx).unwrap();
+        let entry = &registry.descriptors[0];
+        let selector = serde_json::to_value(RouteSelection {
+            schema_version: 1,
+            module_id: native_descriptor.module_id.clone(),
+            artifact: native_descriptor.artifact.clone(),
+            registered_revision: entry.registered_revision,
+            selected_revision: entry.registered_revision,
+        })
+        .unwrap();
+        selected_native_command_supported(
+            &tx,
+            native_descriptor.artifact.artifact_id.as_str(),
+            Some(&selector),
+            "native.mcp.observe",
+            &json!({}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn native_mcp_descriptor_selection_requires_shared_schema_v2() {
+        let schema = native_mcp_command_schema();
+        assert_eq!(schema.schema_id, "swarm.native_mcp_command");
+        assert_eq!(schema.version, "2");
+        assert_eq!(native_mcp_schema_admission("1"), Some(false));
+        assert_eq!(native_mcp_schema_admission("2"), Some(true));
+    }
+
     #[test]
     fn exact_registered_claim_negotiates_but_never_grants_effect_rights() {
         let db = Connection::open_in_memory().unwrap();
