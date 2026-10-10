@@ -6,31 +6,36 @@
         "item": "Finite 62-row source audit",
         "status": "verified",
         "evidence": "docs/remediation/2026-10-09/HIGH-VERDICTS.json",
-        "residual_uncertainty": "Historical two UNKNOWN rows retain bounded execution scope"
+        "residual_uncertainty": "Historical two UNKNOWN rows retain bounded execution scope",
+        "verifier": "Finite exact source-row ledger; HIGH-VERDICTS.json"
       },
       {
         "item": "Connected code and strict production Clippy",
         "status": "verified",
-        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
-        "residual_uncertainty": "Retained 24-package gate plus changed-package gates"
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json",
+        "residual_uncertainty": "Retained 24-package gate plus changed-package gates",
+        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates and 34 actual-function harness cases; focused real-Git registration regression and nine route-reader cases"
       },
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
-        "evidence": "A/B/C installed receipts preserved; fresh D native-only candidate pending",
-        "residual_uncertainty": "No model calls proven yet"
+        "evidence": "EXECUTION-RESULTS-D.json; new workspace/model-reader installed E qualification pending",
+        "residual_uncertainty": "Per-stage native receipts determine scope; core ACK origin and hook admission remain historical UNKNOWN",
+        "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
       {
         "item": "Full exact causal native result",
         "status": "blocked",
         "evidence": "OpenCode2.0.7 missing exact assistant/input parent; Antigravity RESULT_BODY_UNAVAILABLE",
-        "residual_uncertainty": "Unsupported public native identity/body contract"
+        "residual_uncertainty": "Unsupported public native identity/body contract",
+        "verifier": "Public adapter/native identity and result contract; no newest/order/timestamp substitution"
       },
       {
         "item": "Observed GitHub dependency alerts",
         "status": "blocked",
         "evidence": "DEPENDENCY-ALERTS.json: 13 open alerts, exact upstream pins and immutable donor; no verified supported patch",
-        "residual_uncertainty": "Immutable donor/exact pins and unpatched advisories"
+        "residual_uncertainty": "Immutable donor/exact pins and unpatched advisories",
+        "verifier": "GitHub alerts and supported upstream package/immutable-donor checks, 2026-10-10"
       }
     ],
     "changed_files": [
@@ -40,20 +45,30 @@
       "docs/remediation/2026-10-09/QUALIFICATION-PLAN.md",
       "docs/remediation/2026-10-09/EXECUTION-RESULTS-C.json",
       "docs/remediation/2026-10-09/IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
-      "docs/remediation/2026-10-09/DESCRIPTOR-REPAIR-EVIDENCE.json"
+      "docs/remediation/2026-10-09/DESCRIPTOR-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-D.json",
+      "crates/swarm-kernel-host/src/workspace.rs",
+      "docs/remediation/2026-10-09/WORKSPACE-ROUTE-REPAIR-EVIDENCE.json"
     ],
     "checks_run": [
       "Windows/Linux strict host production Clippy",
       "Actual-function StrictMode descriptor/readiness verifier",
       "408-source baseline readback:405 unchanged and 3 changed with fresh affected gates",
       "Retained prior real-child custody fixture",
-      "git diff --check"
+      "git diff --check",
+      "Eight exact clean c645064 provenance builds",
+      "Fresh genuine D install and locked OpenCode resource closure",
+      "One native qualification invocation per adapter with separate run ids",
+      "Ordinary main push and remote SHA readback",
+      "Windows/Linux fresh strict host Clippy for canonical workspace registration",
+      "Focused real-Git disabled-Forge registration/readback regression on Windows/Linux",
+      "Nine actual-function owned/external route reader cases"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "Fresh installed native D execution pending; retained dropped-ACK origin, hook fact, exact result body and dependency blockers remain",
+    "remaining_uncertainty": "Fresh E installed native qualification; full native result, retained dropped-ACK/hook facts and dependency advisory blockers remain",
     "final_status": "PARTIAL_PROGRESS"
   }
 }

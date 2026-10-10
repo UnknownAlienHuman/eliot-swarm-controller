@@ -1,0 +1,101 @@
+{
+  "schema": "eliot.v27_workspace_route_repair.v1",
+  "observed_at_utc": "2026-10-10T06:38:16.4440567Z",
+  "prior_candidate": "c645064b6dad9a831140f25a75cd381b8f438d05",
+  "prior_execution": "EXECUTION-RESULTS-D.json",
+  "diagnosis": [
+    "Disabled Forge skips repository path resolution; workspace registration cloned ordinary Windows path but exact trusted readback compares canonical path",
+    "Owned OpenCode model belongs to owned_service.model; its closed native_options contains directory only"
+  ],
+  "changed_source": {
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+    },
+    "crates/swarm-kernel-host/src/workspace.rs": {
+      "baseline_sha256": "03d1d805b0d49e88e1d22daaac77405b200e03ae26b58692d5daf949edf14549",
+      "current_sha256": "30b0609583f16907486a06d69bd8a5e3af82e779458d86289413b8614722643a"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    },
+    "crates/swarm-supervisor/src/descriptor.rs": {
+      "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+      "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+    }
+  },
+  "unchanged_baseline_source_count": 404,
+  "harness_source_sha256": "9bd7a7d5b8891e56f5d499578cfa0839864a328a52f51eb508b7a2310b32a89f",
+  "logs": {
+    "windows-workspace-registration-clippy.log": "0511924c49295052b4ec8bc85ff1d92b98fdcc5ffb0d5d79bd3de4ce64aa7155",
+    "windows-disabled-forge-registration-test.log": "2540d096eec992805b17f9dce78a530b3a427616225659e58a08c1048385a5e3",
+    "linux-workspace-registration-clippy.log": "01b2195bf643169375ca8b32767841b1dda5cdf645f89585e62b7e4a33eceee4",
+    "linux-disabled-forge-registration-test.log": "4a482f16f8d36a8371a770a93d51c772d8c678d1eaaac24b9948977d94ac2ef2"
+  },
+  "route_verifier": {
+    "status": "PASS",
+    "case_count": 9,
+    "cases": [
+      {
+        "name": "Actual D owned model source",
+        "status": "PASS"
+      },
+      {
+        "name": "External model source remains supported",
+        "status": "PASS"
+      },
+      {
+        "name": "missing-owned-model",
+        "status": "PASS",
+        "refusal": "ROUTE_MODEL_MISMATCH"
+      },
+      {
+        "name": "wrong-provider",
+        "status": "PASS",
+        "refusal": "ROUTE_MODEL_MISMATCH"
+      },
+      {
+        "name": "wrong-model",
+        "status": "PASS",
+        "refusal": "ROUTE_MODEL_MISMATCH"
+      },
+      {
+        "name": "invalid-origin",
+        "status": "PASS",
+        "refusal": "OPENCODE_ROUTE_CONFIG_INCOMPLETE"
+      },
+      {
+        "name": "mixed-source",
+        "status": "PASS",
+        "refusal": "OPENCODE_ROUTE_CONFIG_INCOMPLETE"
+      },
+      {
+        "name": "Explicit effort mismatch",
+        "status": "PASS",
+        "refusal": "ROUTE_VARIANT_MISMATCH"
+      },
+      {
+        "name": "Actual D Antigravity model unchanged",
+        "status": "PASS"
+      }
+    ],
+    "harness_sha256": "9bd7a7d5b8891e56f5d499578cfa0839864a328a52f51eb508b7a2310b32a89f",
+    "input_sha256": "4f71b359b13dc6219bb5a7075c28e9999073a91857e159cac370d79c49f2e8c4",
+    "scope": "Actual AST function bodies under StrictMode; projection of already-consumed D TOML route facts; no auth material, native starts or dispatch",
+    "observed_at_utc": "2026-10-10T06:33:21.3196187Z"
+  },
+  "route_verifier_receipt_sha256": "05763fc5c942ae7eedc5dddab68ae5920b722d4c6897516031fbd9690ac1a6fd",
+  "understanding_proof_sha256": "115ff4cfaf8c91c61d8bf18e7514f28e426bbe35dc8d57340acefcb282403282",
+  "invariants": [
+    "Original absolute path and raw link/traversal checks precede canonicalization",
+    "Registration digest binds canonical repository path independent of publication activation",
+    "Trusted Git root, canonical repository identity, remote and ACL checks remain mandatory",
+    "Changed registration digest still refused by actual regression",
+    "Owned model never falls back to external options or permits mixed model sources",
+    "D outcome_unknown is retained and never replayed; existing workspace reservation and no-binding diagnosis remain separate from qualification"
+  ],
+  "production_clippy": "Fresh affected host library+binaries strict Windows/Linux PASS; unchanged 24-package baseline retained",
+  "regression": "One focused real-Git disabled-Forge registration/readback regression on each platform; previous fixture compile error corrected without broad suite repetition",
+  "installed_verification": "Fresh candidate E native execution pending; D initial readiness/trusted descriptor PASS and later failures remain historical"
+}

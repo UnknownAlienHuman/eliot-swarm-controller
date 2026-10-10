@@ -1345,10 +1345,16 @@ function Get-RouteModelFacts {
     $provider = $null
     $effort = $null
     if ($Contract.module_id -eq 'eliot.opencode.v2') {
-        $model = $options.model
-        $provider = [string]$model.providerID
-        $modelId = [string]$model.id
-        $effort = [string]$model.variant
+        $ownedService = Get-OptionalField $Route 'owned_service'
+        if ($null -ne $ownedService) {
+            if ((Get-OptionalField $ownedService 'origin') -cne 'fresh_owned_service' -or
+                (Test-ObjectFieldPresent $options 'model')) { Stop-Qualification 'OPENCODE_ROUTE_CONFIG_INCOMPLETE' }
+            $model = Get-OptionalField $ownedService 'model'
+        }
+        else { $model = Get-OptionalField $options 'model' }
+        $provider = [string](Get-OptionalField $model 'providerID')
+        $modelId = [string](Get-OptionalField $model 'id')
+        $effort = [string](Get-OptionalField $model 'variant')
         if ([string]::IsNullOrWhiteSpace($provider) -or [string]::IsNullOrWhiteSpace($modelId) -or
             -not [string]::Equals($provider, [string]$Contract.expected_provider, [StringComparison]::Ordinal) -or
             -not [string]::Equals($modelId, [string]$Contract.expected_model, [StringComparison]::Ordinal)) {

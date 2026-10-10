@@ -186,8 +186,7 @@ impl WorkspaceRegistration {
             )
         })?;
         let trusted_repository = forge::canonical_repository(&forge_project.canonical_repository)?;
-        let repository_path = forge_project.repository_path.clone();
-        if !repository_path.is_absolute()
+        if !forge_project.repository_path.is_absolute()
             || workspace_project
                 .allowed_roots
                 .iter()
@@ -198,6 +197,10 @@ impl WorkspaceRegistration {
                 "workspace paths must be resolved before registration sync",
             ));
         }
+        // Workspace registration also runs with Forge publication disabled,
+        // when ForgeConfig deliberately leaves its project paths unresolved.
+        reject_reparse_components(&forge_project.repository_path)?;
+        let repository_path = fs::canonicalize(&forge_project.repository_path)?;
         let allowed_roots = workspace_project.allowed_roots.clone();
         let registration_digest = registration_digest(
             project_id,
@@ -1288,6 +1291,113 @@ fn reject_reparse_components(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_forge_registration_passes_trusted_repository_readback() {
+        let root = std::env::temp_dir().join(format!("swarm-wr-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).expect("fresh test directory");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        swarm_process::private_permissions(&root, true).expect("private test root");
+        let repository = root.join("repository");
+        let allowed = root.join("worktrees");
+        for directory in [&repository, &allowed] {
+            fs::create_dir(directory).expect("fresh child directory");
+            swarm_process::private_permissions(directory, true).expect("private child directory");
+        }
+        let executable = if cfg!(windows) { "git.exe" } else { "git" };
+        let git = std::env::split_paths(&std::env::var_os("PATH").expect("Git search path"))
+            .map(|path| path.join(executable))
+            .find(|path| path.is_file())
+            .and_then(|path| fs::canonicalize(path).ok())
+            .expect("installed Git executable");
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/fixture.git",
+            ],
+        ] {
+            let mut command = std::process::Command::new(&git);
+            for variable in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            ] {
+                command.env_remove(variable);
+            }
+            assert!(
+                command
+                    .args(arguments)
+                    .current_dir(&repository)
+                    .status()
+                    .expect("fixture Git command")
+                    .success()
+            );
+        }
+        let project = ForgeProject {
+            repository_path: repository.clone(),
+            canonical_repository: "github.com/example/fixture".into(),
+            remote_name: "origin".into(),
+            policy_revision: "fixture-policy-v1".into(),
+            target_refs: vec![],
+        };
+        let mut forge = ForgeConfig {
+            enabled: false,
+            git_executable: git,
+            ..ForgeConfig::default()
+        };
+        forge.projects.insert("fixture".into(), project.clone());
+        let mut workspace = WorkspaceConfig::default();
+        workspace.projects.insert(
+            "fixture".into(),
+            WorkspaceProjectConfig {
+                allowed_roots: vec![allowed],
+            },
+        );
+        forge
+            .resolve_paths(&root)
+            .expect("disabled publication remains disabled");
+        workspace
+            .resolve_paths(&root)
+            .expect("canonical workspace roots");
+        workspace
+            .validate(&forge)
+            .expect("workspace project remains valid");
+        let registration = WorkspaceRegistration::from_config(
+            "fixture",
+            &workspace,
+            &forge,
+            "registration".into(),
+            1,
+        )
+        .expect("workspace registration");
+        assert!(!forge.enabled);
+        assert_eq!(
+            registration.repository_path,
+            fs::canonicalize(&repository).expect("canonical repository")
+        );
+        verify_registration_binding(&registration, "fixture").expect("exact registration digest");
+        verify_trusted_repository(&forge, &project, &registration)
+            .expect("actual trusted Git root and remote readback");
+        let mut damaged = registration;
+        damaged.registration_digest = "damaged".into();
+        assert_eq!(
+            verify_registration_binding(&damaged, "fixture")
+                .expect_err("changed registration refused")
+                .code,
+            "WORKSPACE_REGISTRATION_CHANGED"
+        );
+    }
 
     #[test]
     fn absolute_root_is_assembled_before_component_metadata_checks() {
