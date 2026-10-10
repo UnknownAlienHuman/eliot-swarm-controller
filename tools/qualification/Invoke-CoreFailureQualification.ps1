@@ -222,7 +222,7 @@ function Get-PinnedBuildProvenance {
         $artifacts[0].artifact_sha256 -cne $binaryHash -or $artifacts[0].source_sha256 -cne $binaryHash) {
         Stop-Harness 'BUILD_ARTIFACT_IDENTITY_MISMATCH'
     }
-    $builtBinary = Assert-SafeAbsolutePath -Path (Join-Path (Split-Path -LiteralPath $manifestFile -Parent) ('bin\' + $ExpectedTarget + '.exe')) -MustExist
+    $builtBinary = Assert-SafeAbsolutePath -Path (Join-Path (Split-Path -LiteralPath $manifestFile) ('bin\' + $ExpectedTarget + '.exe')) -MustExist
     if ((Get-Sha256 $builtBinary) -cne $binaryHash -or
         (Get-Item -LiteralPath $builtBinary).Length -ne (Get-Item -LiteralPath $binary).Length) {
         Stop-Harness 'BUILD_IMAGE_IS_NOT_BUILD_OUTPUT'
@@ -268,9 +268,9 @@ function Assert-PublicCliHostSibling {
         [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild,
         [Parameter(Mandatory)][System.Collections.IDictionary] $HostSupervisorBuild
     )
-    $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-host.exe'))
-    $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-kernel-host.exe'))
-    $expectedSupervisor = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-supervisor.exe'))
+    $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath) 'swarm-host.exe'))
+    $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath) 'swarm-kernel-host.exe'))
+    $expectedSupervisor = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath) 'swarm-supervisor.exe'))
     if ([System.IO.Path]::GetFileName($script:PublicCliPath) -cne 'swarm.exe' -or
         -not [string]::Equals($expectedLauncher, $script:HostLauncherPath, [StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals($expectedRuntime, $script:HostPath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -390,7 +390,7 @@ function Start-BoundedProcess {
     $start = [System.Diagnostics.ProcessStartInfo]::new()
     if ([string]::IsNullOrWhiteSpace($ExecutablePath)) { Stop-Harness 'QUALIFICATION_BINARY_PATH_UNSET' }
     $start.FileName = $ExecutablePath
-    $start.WorkingDirectory = Split-Path -LiteralPath $ExecutablePath -Parent
+    $start.WorkingDirectory = Split-Path -LiteralPath $ExecutablePath
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true

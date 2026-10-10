@@ -231,7 +231,7 @@ function Get-BuildProvenance {
         $artifacts[0].source_sha256 -cne $binaryHash -or $artifacts[0].artifact_sha256 -cne $binaryHash) {
         Stop-Qualification 'BUILD_ARTIFACT_IDENTITY_MISMATCH'
     }
-    $builtBinary = Assert-ExistingFile (Join-Path (Split-Path -LiteralPath $manifestFile -Parent) ('bin\' + $ExpectedTarget + '.exe'))
+    $builtBinary = Assert-ExistingFile (Join-Path (Split-Path -LiteralPath $manifestFile) ('bin\' + $ExpectedTarget + '.exe'))
     if ((Get-FileSha256 $builtBinary) -cne $binaryHash -or
         (Get-Item -LiteralPath $builtBinary).Length -ne (Get-Item -LiteralPath $binary).Length) {
         Stop-Qualification 'BUILD_OUTPUT_BINARY_MISMATCH'
@@ -368,7 +368,7 @@ function Get-PublicCliBuildProvenance {
         $artifacts[0].source_sha256 -cne $binaryHash -or $artifacts[0].artifact_sha256 -cne $binaryHash) {
         Stop-Qualification 'PUBLIC_CLI_ARTIFACT_IDENTITY_MISMATCH'
     }
-    $builtBinary = Assert-ExistingFile (Join-Path (Split-Path -LiteralPath $manifestFile -Parent) 'bin\swarm.exe')
+    $builtBinary = Assert-ExistingFile (Join-Path (Split-Path -LiteralPath $manifestFile) 'bin\swarm.exe')
     if ((Get-FileSha256 $builtBinary) -cne $binaryHash -or
         (Get-Item -LiteralPath $builtBinary).Length -ne (Get-Item -LiteralPath $binary).Length) {
         Stop-Qualification 'PUBLIC_CLI_IMAGE_IS_NOT_BUILD_OUTPUT'
@@ -416,9 +416,9 @@ function Assert-PublicCliHostSibling {
         [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild,
         [Parameter(Mandatory)][System.Collections.IDictionary] $HostSupervisorBuild
     )
-    $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-host.exe'))
-    $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-kernel-host.exe'))
-    $expectedSupervisor = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath -Parent) 'swarm-supervisor.exe'))
+    $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath) 'swarm-host.exe'))
+    $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath) 'swarm-kernel-host.exe'))
+    $expectedSupervisor = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $script:PublicCliPath) 'swarm-supervisor.exe'))
     if ([System.IO.Path]::GetFileName($script:PublicCliPath) -cne 'swarm.exe' -or
         -not [string]::Equals($expectedLauncher, $script:HostLauncherPath, [StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals($expectedRuntime, $script:HostPath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -583,7 +583,7 @@ function Invoke-SwarmProcess {
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     $start.RedirectStandardInput = [bool]$HostProcess
-    $start.WorkingDirectory = Split-Path -LiteralPath $executablePath -Parent
+    $start.WorkingDirectory = Split-Path -LiteralPath $executablePath
     foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add([string]$argument) }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $start
@@ -924,7 +924,7 @@ function Get-InstalledModuleFacts {
     if ($descriptor.lifecycle -notin @('external_attach', 'owned_service') -or $descriptor.activation -ne 'on_demand') {
         Stop-Qualification 'MODULE_LIFECYCLE_UNSUPPORTED'
     }
-    $parent = Split-Path -LiteralPath $descriptorFile -Parent
+    $parent = Split-Path -LiteralPath $descriptorFile
     $receiptPath = Join-Path $parent 'install-receipt.json'
     $coordinatePath = Join-Path $parent 'install-coordinate.json'
     [void](Assert-ExistingFile $receiptPath)
