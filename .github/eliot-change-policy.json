@@ -75,5 +75,5 @@
   ],
   "generated": [],
   "canonical_docs": {"change_control": "docs/agent-operations/change-control.md", "owner_decisions": "docs/owner-decisions.md", "owner_policy_v2": "docs/owner-policy-v2.md", "task_policy": "docs/task-policy.md"},
-  "activation_note": "Only #110 governance is enabled. After main ruleset activation, a separately reviewed governance PR must enable source-reviewed exact scopes/owners; the locked entries are scheduling reservations, not implementation claims. #112 resolves canonical document content. A-F legacy tracks remain locked/unmapped pending #113/#111 reconciliation."
+  "activation_note": "Only #110 governance is enabled. Main remains unprotected by explicit owner instruction. After bootstrap installation, a separately reviewed governance PR must enable source-reviewed exact scopes/owners; the locked entries are scheduling reservations, not implementation claims. #112 resolves canonical document content. A-F legacy tracks remain locked/unmapped pending #113/#111 reconciliation."
 }
