@@ -665,10 +665,11 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
     ),
     read(
         "agent.family",
-        "A retained family observation; not a live query or a complete inventory claim.",
+        "A retained family observation scoped to one exact Attempt. Managers supply attempt_id; Participants may use their current or review scope. Pin observation_id across pages.",
         &[
             f("binding_id", S),
             f("generation", I),
+            f("attempt_id", S),
             f("observation_id", I),
             f("after", I),
             f("limit", I),
@@ -707,7 +708,13 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
     read(
         "report.delta",
         "Incremental report entries after a cursor.",
-        &[f("after", I), f("limit", I), f("head", B), f("through", I)],
+        &[
+            f("after", I),
+            f("limit", I),
+            f("head", B),
+            f("through", I),
+            f("head_continuation", S),
+        ],
         &[],
     ),
     read(

@@ -4,8 +4,9 @@ use crate::{
     error::{Error, Result},
     model::{self, Principal},
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 fn missing() -> Error {
     Error::new(
@@ -214,6 +215,7 @@ pub(super) fn family(db: &Connection, p: &Principal, v: &Value) -> Result<Value>
         &[
             "binding_id",
             "generation",
+            "attempt_id",
             "observation_id",
             "after",
             "limit",
@@ -221,35 +223,361 @@ pub(super) fn family(db: &Connection, p: &Principal, v: &Value) -> Result<Value>
     )?;
     if p.role == crate::model::Role::Operator {
         super::require_local_operator(db, &p.client_id)?;
-    } else {
-        let binding_id = model::text(v, "binding_id")?;
-        let generation = model::positive(v, "generation")?;
-        let mut statement = db.prepare("SELECT attempt_id FROM attempts WHERE binding_id=?1 AND binding_generation=?2 ORDER BY created_at_ms,attempt_id LIMIT ?3")?;
-        let ids = statement
-            .query_map(
-                params![
-                    binding_id,
-                    generation,
-                    projection::MAX_PROJECTED_ITEMS as i64 + 1
-                ],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if ids.is_empty() || ids.len() > projection::MAX_PROJECTED_ITEMS {
-            return Err(missing());
+        let mut projection_request = v.clone();
+        if let Some(fields) = projection_request.as_object_mut() {
+            fields.remove("attempt_id");
         }
-        // A reused binding can retain several Attempts. The family projection
-        // crosses all of them, so every retained relation needs an evidence grant.
-        for attempt_id in ids {
-            let identity =
-                object_scope::identity_for_attempt(db, &attempt_id)?.ok_or_else(missing)?;
-            let grant = require_task(db, p, &identity, object_scope::TaskReadLevel::Evidence)?;
-            if grant.level < object_scope::TaskReadLevel::Evidence {
-                return Err(missing());
+        return super::producers::family(db, &projection_request);
+    }
+
+    let binding_id = model::text(v, "binding_id")?;
+    let generation = model::positive(v, "generation")?;
+    let attempt_id = family_attempt_id(db, p, v)?;
+    let identity = object_scope::identity_for_attempt(db, &attempt_id)?.ok_or_else(missing)?;
+    if identity.binding_id.as_deref() != Some(binding_id)
+        || identity.binding_generation != Some(generation)
+    {
+        return Err(missing());
+    }
+    let grant = require_task(db, p, &identity, object_scope::TaskReadLevel::Evidence)?;
+    if grant.level < object_scope::TaskReadLevel::Evidence {
+        return Err(missing());
+    }
+
+    // Resolve one exact retained Attempt by its primary key. This keeps both
+    // current and historical Task grants addressable without enumerating the
+    // binding's lifetime Attempt history.
+    let attempt = tasks::get_attempt(db, &attempt_id)?;
+    let mut projection_request = v.clone();
+    if let Some(fields) = projection_request.as_object_mut() {
+        fields.remove("attempt_id");
+    }
+    let mut result = super::producers::family(db, &projection_request)?;
+    if result["available"] != true {
+        return Ok(result);
+    }
+
+    let observation_id = result["observation_id"].as_i64().ok_or_else(|| {
+        Error::new(
+            "OBJECT_SCOPE_DAMAGED",
+            "family page has no exact observation ID",
+        )
+    })?;
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT payload_json FROM observations \
+             WHERE observation_id=?1 AND binding_id=?2 AND binding_generation=?3 \
+               AND kind='runtime.state'",
+            params![observation_id, binding_id, generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let raw = raw.ok_or_else(|| {
+        Error::new(
+            "OBSERVATION_NOT_FOUND",
+            "the selected family observation is no longer retained for this binding generation",
+        )
+    })?;
+    let state: Value = serde_json::from_str(&raw)?;
+    let binding = operations::get_binding(db, binding_id, generation)?;
+    scope_family_projection(&mut result, &state, &attempt, &identity, &binding)?;
+    Ok(result)
+}
+
+const FAMILY_SCOPE_GAP_REASON: &str = "family_member_outside_task_scope";
+const FAMILY_SCOPE_GAP_CODE: &str = "FAMILY_SCOPE_FILTERED";
+
+fn family_attempt_id(db: &Connection, p: &Principal, v: &Value) -> Result<String> {
+    if v.get("attempt_id").is_some() {
+        return Ok(model::text(v, "attempt_id")?.to_owned());
+    }
+    if p.role == crate::model::Role::Participant {
+        let registration =
+            super::meta(db, &format!("client:{}", p.client_id))?.ok_or_else(missing)?;
+        if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
+            return registration["participation_basis"]["review_scope"]["attempt_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(missing);
+        }
+        let scope = super::coordination::current_scope(db, p)?;
+        return scope["attempt"]["attempt_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(missing);
+    }
+    // Managers must select the exact Task Attempt whose native projection they
+    // are entitled to read. Binding identity alone is shared across reused Tasks.
+    Err(missing())
+}
+
+fn scope_family_projection(
+    result: &mut Value,
+    state: &Value,
+    attempt: &Value,
+    identity: &object_scope::TaskGraphIdentity,
+    binding: &Value,
+) -> Result<()> {
+    let children = state["observed_children"].as_array().ok_or_else(|| {
+        Error::new(
+            "OBSERVATION_INCOMPLETE",
+            "selected family observation has no child inventory",
+        )
+    })?;
+    let root_id = state["native_root_id"]
+        .as_str()
+        .or_else(|| state["session"]["sessionId"].as_str());
+    if state["native_root_id"].as_str().is_some_and(|root| {
+        binding["native_root_id"]
+            .as_str()
+            .is_some_and(|retained| root != retained)
+    }) || state["native_scope_key"].as_str().is_some_and(|scope| {
+        binding["native_scope_key"]
+            .as_str()
+            .is_some_and(|retained| scope != retained)
+    }) {
+        return Err(Error::new(
+            "OBJECT_SCOPE_DAMAGED",
+            "family observation native identity differs from its retained binding",
+        ));
+    }
+    let producers = attempt["producers"].as_array().ok_or_else(|| {
+        Error::new(
+            "OBJECT_SCOPE_DAMAGED",
+            "retained Attempt producer history is not an array",
+        )
+    })?;
+
+    let mut producer_members = BTreeSet::new();
+    let mut allowed_runs = BTreeSet::new();
+    let attempt_id = model::text(attempt, "attempt_id")?;
+    for producer in producers {
+        if producer
+            .get("attempt_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != attempt_id)
+            || producer
+                .get("task_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != identity.task_id)
+            || producer
+                .get("task_revision")
+                .and_then(Value::as_i64)
+                .is_some_and(|revision| Some(revision) != identity.task_revision)
+            || producer
+                .get("binding_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| Some(id) != identity.binding_id.as_deref())
+            || producer
+                .get("binding_generation")
+                .and_then(Value::as_i64)
+                .is_some_and(|generation| Some(generation) != identity.binding_generation)
+        {
+            return Err(Error::new(
+                "OBJECT_SCOPE_DAMAGED",
+                "retained family producer differs from its exact Attempt identity",
+            ));
+        }
+        let Some(session_id) = producer
+            .get("native_session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if let Some(run_id) = producer
+            .get("native_run_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            allowed_runs.insert((session_id.to_owned(), run_id.to_owned()));
+        }
+        // The binding root is shared when a module is reused. A producer on
+        // that root authorizes only its exact run; it does not authorize every
+        // child or turn retained by the root's family observation.
+        if Some(session_id) != root_id {
+            producer_members.insert(session_id.to_owned());
+        }
+    }
+
+    let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
+    let mut observed_members = BTreeSet::new();
+    for child in children {
+        let Some(session_id) = child["sessionId"].as_str() else {
+            continue;
+        };
+        if !observed_members.insert(session_id.to_owned()) {
+            return Err(Error::new(
+                "OBSERVATION_INCOMPLETE",
+                "selected family observation repeats a child identity",
+            ));
+        }
+        if let Some(parent_id) = child["parentSessionId"].as_str() {
+            children_by_parent
+                .entry(parent_id.to_owned())
+                .or_default()
+                .push(session_id.to_owned());
+        }
+    }
+    let mut authorized_members = producer_members.clone();
+    let mut pending = VecDeque::from_iter(producer_members);
+    while let Some(parent_id) = pending.pop_front() {
+        if let Some(children) = children_by_parent.get(&parent_id) {
+            for child_id in children {
+                if authorized_members.insert(child_id.clone()) {
+                    pending.push_back(child_id.clone());
+                }
             }
         }
     }
-    super::producers::family(db, v)
+    let has_hidden_members = children.iter().any(|child| {
+        child["sessionId"]
+            .as_str()
+            .is_none_or(|session_id| !authorized_members.contains(session_id))
+    });
+
+    let after = result["projection"]["range"]["after"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            Error::new(
+                "OBJECT_SCOPE_DAMAGED",
+                "family projection has no valid source cursor",
+            )
+        })?;
+    let mut items = result["items"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| Error::new("OBJECT_SCOPE_DAMAGED", "family projection has no item page"))?;
+    let mut filtered = has_hidden_members;
+    let mut added_gap_count = 0usize;
+    let mut scoped_gap_count = 0usize;
+    for (offset, item) in items.iter_mut().enumerate() {
+        let source = children.get(after + offset).ok_or_else(|| {
+            Error::new(
+                "OBJECT_SCOPE_DAMAGED",
+                "family projection cursor exceeds its selected observation",
+            )
+        })?;
+        if item["sessionId"] != source["sessionId"] {
+            return Err(Error::new(
+                "OBJECT_SCOPE_DAMAGED",
+                "family page member differs from its exact observation position",
+            ));
+        }
+        let Some(session_id) = source["sessionId"].as_str() else {
+            filtered = true;
+            scoped_gap_count += 1;
+            let was_gap = item["gap"].is_object();
+            let serialized = model::canonical(source)?;
+            *item = projection::family_gap_reference(
+                source,
+                FAMILY_SCOPE_GAP_REASON,
+                serialized.len(),
+            )?;
+            if !was_gap {
+                added_gap_count += 1;
+            }
+            continue;
+        };
+        if !authorized_members.contains(session_id) {
+            filtered = true;
+            scoped_gap_count += 1;
+            let was_gap = item["gap"].is_object();
+            let serialized = model::canonical(source)?;
+            *item = projection::family_gap_reference(
+                source,
+                FAMILY_SCOPE_GAP_REASON,
+                serialized.len(),
+            )?;
+            if !was_gap {
+                added_gap_count += 1;
+            }
+        }
+    }
+
+    if let Some(turns) = result["turns"].as_array_mut() {
+        let original_len = turns.len();
+        turns.retain(|turn| {
+            let (Some(session_id), Some(run_id)) =
+                (turn["sessionId"].as_str(), turn["turnId"].as_str())
+            else {
+                return false;
+            };
+            if Some(session_id) == root_id {
+                allowed_runs.contains(&(session_id.to_owned(), run_id.to_owned()))
+            } else {
+                authorized_members.contains(session_id)
+                    || allowed_runs.contains(&(session_id.to_owned(), run_id.to_owned()))
+            }
+        });
+        filtered |= turns.len() != original_len;
+    }
+
+    if let Some(gaps) = result["gaps"].as_array_mut() {
+        let original_len = gaps.len();
+        gaps.retain(|gap| {
+            gap["session_id"].as_str().is_none_or(|session_id| {
+                Some(session_id) == root_id || authorized_members.contains(session_id)
+            })
+        });
+        filtered |= gaps.len() != original_len;
+    }
+
+    let projection_frame = result["projection"].as_object_mut().ok_or_else(|| {
+        Error::new(
+            "OBJECT_SCOPE_DAMAGED",
+            "family projection frame is malformed",
+        )
+    })?;
+    if let Some(stale) = projection_frame
+        .get_mut("retained_stale_members")
+        .and_then(Value::as_array_mut)
+    {
+        let original_len = stale.len();
+        stale.retain(|session| {
+            session
+                .as_str()
+                .is_some_and(|session_id| authorized_members.contains(session_id))
+        });
+        filtered |= stale.len() != original_len;
+    }
+
+    if added_gap_count > 0 {
+        let previous = projection_frame
+            .get("gap_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        projection_frame.insert(
+            "gap_count".to_owned(),
+            json!(previous.saturating_add(added_gap_count)),
+        );
+    }
+    if scoped_gap_count > 0 {
+        projection_frame.insert("gap_reason".to_owned(), json!(FAMILY_SCOPE_GAP_REASON));
+    }
+    let items_json = Value::Array(items.clone());
+    let serialized_items = model::canonical(&items_json)?;
+    projection_frame.insert(
+        "projection_revision".to_owned(),
+        json!(model::digest(serialized_items.as_bytes())),
+    );
+    projection_frame.insert(
+        "serialized_byte_length".to_owned(),
+        json!(serialized_items.len()),
+    );
+    if filtered {
+        projection_frame.insert("coverage_complete".to_owned(), json!(false));
+        projection_frame.insert(
+            "scope_filter".to_owned(),
+            json!({"code":FAMILY_SCOPE_GAP_CODE,"source":"task_scope"}),
+        );
+        result["family_completeness"] = json!("partial");
+    }
+    result["items"] = items_json;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -367,33 +695,234 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
     )
 }
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 const TIMELINE_CANDIDATE_SQL: &str = "WHERE o.observation_id>?1 AND o.observation_id<=?6 \
+    AND (?7 IS NULL OR o.observation_id<?7) \
     AND o.source_stream_id NOT IN ('controller:messages','controller:read-position:operation','controller:read-position:task') \
     AND ((?2=1 AND o.kind IN ('message.send','coordination.message.send','task.feedback','check.completed') AND json_extract(o.payload_json,'$.recipient')=?3) \
       OR (?2=0 AND (o.operation_id IS NOT NULL OR ?4=1 \
         OR (o.kind NOT IN ('message.send','message.cancel','coordination.send','coordination.message.send','task.feedback','task.review_stale','check.completed') \
           AND o.kind NOT LIKE 'coordination.%' AND o.kind NOT LIKE 'review.%' AND o.kind NOT LIKE 'automation.%'))))";
 
+const TIMELINE_HEAD_SCAN_LIMIT: usize = 200;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TimelineHeadContinuation {
+    version: u8,
+    client_id: String,
+    role: crate::model::Role,
+    mailbox_only: bool,
+    authorization_revision: String,
+    cut: i64,
+    before: i64,
+}
+
+fn timeline_head_authorization_revision(db: &Connection, p: &Principal) -> Result<String> {
+    let method_scope = match super::mcp_authorization(db, p, &json!({})) {
+        Ok(value) => value,
+        Err(error) if error.code == "FORBIDDEN" => json!({"role":p.role}),
+        Err(error) => return Err(error),
+    };
+    let registration = super::meta(db, &format!("client:{}", p.client_id))?;
+    let mut context = json!({
+        "client_id":p.client_id,
+        "role":p.role,
+        "method_scope":method_scope,
+        "client_registration":registration,
+    });
+    if p.role == crate::model::Role::Manager {
+        // Current Task ownership changes Manager Operation visibility without
+        // changing the MCP method grant, so bind continuations to that scope too.
+        let mut statement = db.prepare(
+            "SELECT a.task_id,t.project_id,a.attempt_id,a.task_revision \
+             FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id \
+             WHERE a.owner_id=?1 AND a.released_at_ms IS NULL \
+             ORDER BY a.task_id,a.attempt_id",
+        )?;
+        let scopes = statement
+            .query_map([&p.client_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        context["current_manager_attempt_scopes"] = json!(scopes);
+    }
+    Ok(model::digest(model::canonical(&context)?.as_bytes()))
+}
+
+fn timeline_head_signing_key(db: &Connection) -> Result<String> {
+    let operator_id = super::meta(db, super::LOCAL_OPERATOR_CLIENT_ID_KEY)?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            Error::new(
+                "TIMELINE_HEAD_UNAVAILABLE",
+                "Store has no local continuation signing identity",
+            )
+        })?;
+    let registration = super::meta(db, &format!("client:{operator_id}"))?
+        .ok_or_else(|| Error::new("TIMELINE_HEAD_UNAVAILABLE", "signing identity is missing"))?;
+    registration["token_hash"]
+        .as_str()
+        .filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::new(
+                "TIMELINE_HEAD_UNAVAILABLE",
+                "subscription principal has no valid continuation key",
+            )
+        })
+}
+
+fn timeline_head_mac(key: &str, payload: &[u8]) -> [u8; 32] {
+    let mut inner_pad = [0x36; 64];
+    let mut outer_pad = [0x5c; 64];
+    for (index, byte) in key.as_bytes().iter().enumerate() {
+        inner_pad[index] ^= *byte;
+        outer_pad[index] ^= *byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(payload);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn encode_timeline_head_continuation(
+    key: &str,
+    claims: &TimelineHeadContinuation,
+) -> Result<String> {
+    let payload = serde_json::to_vec(claims).map_err(|_| {
+        Error::new(
+            "TIMELINE_HEAD_UNAVAILABLE",
+            "could not encode the bounded timeline continuation",
+        )
+    })?;
+    let signature = timeline_head_mac(key, &payload);
+    Ok(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(payload),
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
+}
+
+fn decode_timeline_head_continuation(
+    key: &str,
+    p: &Principal,
+    mailbox_only: bool,
+    authorization_revision: &str,
+    token: &str,
+) -> Result<TimelineHeadContinuation> {
+    let invalid = || Error::invalid("head_continuation is invalid");
+    if token.len() > 2048 {
+        return Err(invalid());
+    }
+    let (encoded_payload, encoded_signature) = token.split_once('.').ok_or_else(invalid)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded_payload)
+        .map_err(|_| invalid())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .map_err(|_| invalid())?;
+    let expected = timeline_head_mac(key, &payload);
+    if signature.len() != expected.len()
+        || signature
+            .iter()
+            .zip(expected.iter())
+            .fold(0_u8, |difference, (actual, expected)| {
+                difference | (*actual ^ *expected)
+            })
+            != 0
+    {
+        return Err(invalid());
+    }
+    let claims: TimelineHeadContinuation =
+        serde_json::from_slice(&payload).map_err(|_| invalid())?;
+    if claims.version != 1
+        || claims.client_id != p.client_id
+        || claims.role != p.role
+        || claims.mailbox_only != mailbox_only
+        || claims.cut <= 0
+        || claims.before <= 0
+        || claims.before >= claims.cut
+    {
+        return Err(Error::new(
+            "TIMELINE_HEAD_STALE",
+            "subscription head continuation no longer matches this principal or cut",
+        ));
+    }
+    if claims.authorization_revision != authorization_revision {
+        return Err(Error::new(
+            "TIMELINE_HEAD_STALE",
+            "subscription authorization changed during head scan; restart admission",
+        ));
+    }
+    Ok(claims)
+}
+
 /// Establish a concrete authorized boundary before a live subscriber starts.
-/// Only bounded metadata is scanned; payloads are never materialized. If the
-/// exact resolver cannot establish a boundary within this budget, admission
-/// fails explicitly instead of silently starting at zero or a global cut.
-fn timeline_head(db: &Connection, p: &Principal, mailbox_only: bool) -> Result<Value> {
+/// Each call examines one bounded keyset page and never materializes payloads.
+/// The first page fixes a committed finite cut; signed continuations bind
+/// later pages to that cut and the same principal authorization revision.
+fn timeline_head(
+    db: &Connection,
+    p: &Principal,
+    mailbox_only: bool,
+    continuation: Option<&str>,
+) -> Result<Value> {
     let operator = p.role == crate::model::Role::Operator;
     if operator {
         super::require_local_operator(db, &p.client_id)?;
     }
+    let authorization_revision = timeline_head_authorization_revision(db, p)?;
+    let signing_key = timeline_head_signing_key(db)?;
+    let claims = continuation
+        .map(|token| {
+            decode_timeline_head_continuation(
+                &signing_key,
+                p,
+                mailbox_only,
+                &authorization_revision,
+                token,
+            )
+        })
+        .transpose()?;
+    let cut_bound = claims.as_ref().map_or(i64::MAX, |claims| claims.cut);
+    let before = claims.as_ref().map(|claims| claims.before);
     let sql = format!(
         "SELECT o.observation_id,o.operation_id FROM observations AS o {TIMELINE_CANDIDATE_SQL} ORDER BY o.observation_id DESC LIMIT ?5"
     );
     let mut statement = db.prepare(&sql)?;
     let rows = statement
         .query_map(
-            params![0, mailbox_only, p.client_id, operator, 201, i64::MAX],
+            params![
+                0,
+                mailbox_only,
+                p.client_id,
+                operator,
+                TIMELINE_HEAD_SCAN_LIMIT as i64 + 1,
+                cut_bound,
+                before
+            ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (cursor, operation_id) in rows.iter().take(200) {
+    let cut = claims
+        .as_ref()
+        .map(|claims| claims.cut)
+        .or_else(|| rows.first().map(|(cursor, _)| *cursor))
+        .unwrap_or(0);
+    for (cursor, operation_id) in rows.iter().take(TIMELINE_HEAD_SCAN_LIMIT) {
         if let Some(id) = operation_id {
             match object_scope::resolve_operation_read(db, p, id) {
                 Ok(Some(_)) => {}
@@ -412,15 +941,32 @@ fn timeline_head(db: &Connection, p: &Principal, mailbox_only: bool) -> Result<V
                 Err(error) => return Err(error),
             }
         }
-        return Ok(json!({"cursor":cursor,"source_kind":"observation_timeline","head":true}));
+        return Ok(
+            json!({"cursor":cursor,"source_kind":"observation_timeline","head":true,
+            "admission":{"state":"established","empty":false}}),
+        );
     }
-    if rows.len() > 200 {
-        return Err(Error::new(
-            "TIMELINE_HEAD_UNAVAILABLE",
-            "authorized timeline boundary exceeds the bounded metadata scan",
-        ));
+    if rows.len() > TIMELINE_HEAD_SCAN_LIMIT {
+        let before = rows[TIMELINE_HEAD_SCAN_LIMIT - 1].0;
+        let token = encode_timeline_head_continuation(
+            &signing_key,
+            &TimelineHeadContinuation {
+                version: 1,
+                client_id: p.client_id.clone(),
+                role: p.role.clone(),
+                mailbox_only,
+                authorization_revision,
+                cut,
+                before,
+            },
+        )?;
+        return Ok(json!({"source_kind":"observation_timeline","head":true,
+            "admission":{"state":"continuation","continuation":token}}));
     }
-    Ok(json!({"cursor":0,"source_kind":"observation_timeline","head":true}))
+    Ok(
+        json!({"cursor":cut,"source_kind":"observation_timeline","head":true,
+        "admission":{"state":"established","empty":true}}),
+    )
 }
 
 /// Linked observations pass the same grant resolver as get/list. Candidate
@@ -431,7 +977,15 @@ pub(super) fn timeline(
     mailbox_only: bool,
     v: &Value,
 ) -> Result<Value> {
-    model::fields(v, &["after", "limit", "head", "through"])?;
+    model::fields(
+        v,
+        &["after", "limit", "head", "through", "head_continuation"],
+    )?;
+    let head_continuation = match v.get("head_continuation") {
+        None => None,
+        Some(Value::String(token)) => Some(token.as_str()),
+        Some(_) => return Err(Error::invalid("head_continuation must be text")),
+    };
     if let Some(head) = v.get("head") {
         if head.as_bool().is_none() {
             return Err(Error::invalid("head must be boolean"));
@@ -445,8 +999,11 @@ pub(super) fn timeline(
                     "head is a separate metadata read and cannot be combined with page bounds",
                 ));
             }
-            return timeline_head(db, p, mailbox_only);
+            return timeline_head(db, p, mailbox_only, head_continuation);
         }
+    }
+    if head_continuation.is_some() {
+        return Err(Error::invalid("head_continuation requires head=true"));
     }
     let (limit, after) = super::page(v)?;
     let through = match v.get("through") {
@@ -473,7 +1030,8 @@ pub(super) fn timeline(
                 p.client_id,
                 operator,
                 scan_limit + 1,
-                through
+                through,
+                None::<i64>
             ],
             |row| {
                 Ok((
@@ -693,3 +1251,7 @@ fn project_scoped_observation(
     };
     Ok(crate::redaction::value(select(payload, fields)))
 }
+
+#[cfg(test)]
+#[path = "object_reads_family_tests.rs"]
+mod family_tests;

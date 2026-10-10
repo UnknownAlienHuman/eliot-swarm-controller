@@ -406,6 +406,11 @@ pub struct PumpSource {
     recovery_reads: Option<Vec<&'static str>>,
 }
 
+struct HeadPosition {
+    cursor: i64,
+    empty: bool,
+}
+
 impl PumpSource {
     pub fn new(
         root: PathBuf,
@@ -444,25 +449,62 @@ impl PumpSource {
             .collect()
     }
 
-    async fn start_position(&self) -> Result<i64> {
-        let value = super::request_on(
-            &self.client,
-            &self.root,
-            &self.credential,
-            &self.ipc_config,
-            "report.delta",
-            json!({"head":true}),
-        )
-        .await?;
-        value["cursor"]
-            .as_i64()
-            .filter(|cursor| *cursor >= 0)
-            .ok_or_else(|| {
-                Error::new(
-                    "SUBSCRIPTION_HEAD_INVALID",
-                    "timeline head returned no valid cursor",
-                )
-            })
+    async fn start_position(&self) -> Result<HeadPosition> {
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut params = json!({"head":true});
+            if let Some(token) = continuation.take() {
+                params["head_continuation"] = json!(token);
+            }
+            let value = super::request_on(
+                &self.client,
+                &self.root,
+                &self.credential,
+                &self.ipc_config,
+                "report.delta",
+                params,
+            )
+            .await?;
+            match value["admission"]["state"].as_str() {
+                Some("continuation") => {
+                    let token = value["admission"]["continuation"]
+                        .as_str()
+                        .filter(|token| !token.is_empty())
+                        .ok_or_else(|| {
+                            Error::new(
+                                "SUBSCRIPTION_HEAD_INVALID",
+                                "timeline head continuation is missing",
+                            )
+                        })?;
+                    continuation = Some(token.to_owned());
+                    tokio::task::yield_now().await;
+                }
+                Some("established") => {
+                    let cursor = value["cursor"]
+                        .as_i64()
+                        .filter(|cursor| *cursor >= 0)
+                        .ok_or_else(|| {
+                            Error::new(
+                                "SUBSCRIPTION_HEAD_INVALID",
+                                "established timeline head returned no valid cursor",
+                            )
+                        })?;
+                    let empty = value["admission"]["empty"].as_bool().ok_or_else(|| {
+                        Error::new(
+                            "SUBSCRIPTION_HEAD_INVALID",
+                            "established timeline head did not identify an empty cut",
+                        )
+                    })?;
+                    return Ok(HeadPosition { cursor, empty });
+                }
+                _ => {
+                    return Err(Error::new(
+                        "SUBSCRIPTION_HEAD_INVALID",
+                        "timeline head returned no admission state",
+                    ));
+                }
+            }
+        }
     }
 
     async fn delta_page(&self, after: i64, through: Option<i64>) -> Result<Value> {
@@ -566,9 +608,15 @@ impl SubscriptionHub {
     ) -> Result<(String, mpsc::Receiver<QueuedNotification>, Value)> {
         let starts_at_head = after.is_none();
         let recovery_reads = source.resync_reads(&categories);
-        let cursor = match after {
-            Some(cursor) => cursor,
-            None => source.start_position().await?,
+        let (cursor, admission) = match after {
+            Some(cursor) => (cursor, json!({"state":"resumed"})),
+            None => {
+                let head = source.start_position().await?;
+                (
+                    head.cursor,
+                    json!({"state":"established","empty":head.empty}),
+                )
+            }
         };
         let mut entries = self.entries.lock().expect("subscription registry");
         if entries.len() >= MAX_SUBSCRIPTIONS {
@@ -607,6 +655,7 @@ impl SubscriptionHub {
             "categories": categories.iter().map(|c| c.name()).collect::<Vec<_>>(),
             "cursor": cursor,
             "starts_at_head": starts_at_head,
+            "admission": admission,
             "queue_capacity": self.queue_depth,
             "queue_byte_capacity": MAX_QUEUE_BYTES,
             "poll_interval_ms": self.poll_interval.as_millis() as u64,
@@ -903,8 +952,8 @@ async fn deliver_tick(
         if let Some(mut gap) = episode {
             gap.through_cursor = cursor;
             match source.start_position().await {
-                Ok(cut) => {
-                    gap.cut_cursor = cut.max(cursor);
+                Ok(head) => {
+                    gap.cut_cursor = head.cursor.max(cursor);
                     gap.head_reached = cursor >= gap.cut_cursor;
                 }
                 Err(error) => {

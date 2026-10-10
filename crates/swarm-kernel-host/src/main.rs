@@ -173,6 +173,9 @@ enum Command {
         binding_id: String,
         #[arg(long)]
         generation: i64,
+        /// Exact Task Attempt scope, required for Manager reads.
+        #[arg(long)]
+        attempt_id: Option<String>,
         #[arg(long)]
         observation_id: Option<i64>,
         #[arg(long, default_value_t = 0)]
@@ -1087,11 +1090,15 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Family {
             binding_id,
             generation,
+            attempt_id,
             observation_id,
             after,
             limit,
         } => {
             let mut value = json!({"binding_id":binding_id,"generation":generation,"after":after,"limit":limit});
+            if let Some(id) = attempt_id {
+                value["attempt_id"] = json!(id);
+            }
             if let Some(id) = observation_id {
                 value["observation_id"] = json!(id);
             }

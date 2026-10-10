@@ -58,6 +58,138 @@ async fn read(store: &Store, p: &Principal, method: &str, input: Value) -> Value
 }
 
 #[tokio::test]
+async fn report_delta_head_pages_past_invisible_operations_without_cross_scope_disclosure() {
+    const FOREIGN_EVENTS: usize = 205;
+
+    let (owner, operator) = start().await;
+    let authorized =
+        register_with_role(&owner.store, &operator, "head-authorized", "observer").await;
+    let empty = register_with_role(&owner.store, &operator, "head-empty", "observer").await;
+    let visible_operation_id = model::new_id();
+    let foreign_operation_ids = (0..FOREIGN_EVENTS)
+        .map(|_| model::new_id())
+        .collect::<Vec<_>>();
+    let inserted_foreign_operation_ids = foreign_operation_ids.clone();
+    let visible_id = visible_operation_id.clone();
+    let visible_caller = authorized.client_id.clone();
+    let (visible_cursor, latest_foreign_cursor) = owner
+        .store
+        .run(move |db| {
+            let visible_result = json!({"operation_id":visible_id,"fixture":"authorized"});
+            insert_legacy_operation(
+                db,
+                &visible_id,
+                &visible_caller,
+                "head-visible-request",
+                "fixture.subscription_event",
+                &json!({}),
+                &visible_result,
+            )?;
+            let visible_payload = json!({"operation_id":visible_id,"fixture":"authorized"});
+            db.execute(
+                "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+                 VALUES('fixture:subscription-head',?1,?1,'fixture.visible_event',?2,1000)",
+                params![visible_id, model::canonical(&visible_payload)?],
+            )?;
+            let visible_cursor = db.last_insert_rowid();
+
+            let mut latest_foreign_cursor = 0;
+            for (index, operation_id) in inserted_foreign_operation_ids.iter().enumerate() {
+                let result = json!({"operation_id":operation_id,"fixture":"foreign"});
+                insert_legacy_operation(
+                    db,
+                    operation_id,
+                    "unrelated-manager",
+                    &format!("head-foreign-request-{index}"),
+                    "fixture.subscription_event",
+                    &json!({}),
+                    &result,
+                )?;
+                let payload = json!({
+                    "operation_id":operation_id,
+                    "secret":"foreign subscription payload"
+                });
+                db.execute(
+                    "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+                     VALUES('fixture:subscription-head',?1,?1,'fixture.foreign_event',?2,1000)",
+                    params![operation_id, model::canonical(&payload)?],
+                )?;
+                latest_foreign_cursor = db.last_insert_rowid();
+            }
+            Ok((visible_cursor, latest_foreign_cursor))
+        })
+        .await
+        .unwrap();
+
+    let first = read(
+        &owner.store,
+        &authorized,
+        "report.delta",
+        json!({"head":true}),
+    )
+    .await;
+    assert_eq!(first["admission"]["state"], "continuation");
+    assert!(first["cursor"].is_null());
+    let first_wire = serde_json::to_string(&first).unwrap();
+    assert!(!first_wire.contains("fixture.foreign_event"));
+    assert!(!first_wire.contains("foreign subscription payload"));
+    assert!(
+        foreign_operation_ids
+            .iter()
+            .all(|operation_id| !first_wire.contains(operation_id))
+    );
+
+    let second = read(
+        &owner.store,
+        &authorized,
+        "report.delta",
+        json!({
+            "head":true,
+            "head_continuation":first["admission"]["continuation"]
+        }),
+    )
+    .await;
+    assert_eq!(second["admission"]["state"], "established");
+    assert_eq!(second["admission"]["empty"], false);
+    assert_eq!(second["cursor"], json!(visible_cursor));
+
+    let cross_scope = read(
+        &owner.store,
+        &authorized,
+        "report.delta",
+        json!({"after":visible_cursor,"limit":200}),
+    )
+    .await;
+    assert_eq!(cross_scope["items"], json!([]));
+    let cross_scope_wire = serde_json::to_string(&cross_scope).unwrap();
+    assert!(!cross_scope_wire.contains("fixture.foreign_event"));
+    assert!(!cross_scope_wire.contains("foreign subscription payload"));
+    assert!(
+        foreign_operation_ids
+            .iter()
+            .all(|operation_id| !cross_scope_wire.contains(operation_id))
+    );
+
+    let empty_first = read(&owner.store, &empty, "report.delta", json!({"head":true})).await;
+    assert_eq!(empty_first["admission"]["state"], "continuation");
+    assert!(empty_first["cursor"].is_null());
+    let empty_second = read(
+        &owner.store,
+        &empty,
+        "report.delta",
+        json!({
+            "head":true,
+            "head_continuation":empty_first["admission"]["continuation"]
+        }),
+    )
+    .await;
+    assert_eq!(empty_second["admission"]["state"], "established");
+    assert_eq!(empty_second["admission"]["empty"], true);
+    assert_eq!(empty_second["cursor"], json!(latest_foreign_cursor));
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn send_records_the_full_communication_identity() {
     let (owner, operator) = start().await;
     let alice = register(&owner.store, &operator, "alice").await;
