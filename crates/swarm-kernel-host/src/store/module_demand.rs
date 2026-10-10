@@ -11,7 +11,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
 };
-use rusqlite::{Connection, TransactionBehavior, params, types::Type};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -21,10 +21,22 @@ use swarm_contracts::{
 };
 
 const MAX_DEMAND_OPERATIONS: usize = 4096;
-const MAX_SCOPE_OPERATIONS: usize = 4096;
+const MAX_SCOPE_UNRESOLVED_OPERATIONS: usize = 4096;
+// Keep this vocabulary lexicographically sorted for indexed gap probes below.
+const VALID_OPERATION_STATES: [&str; 7] = [
+    "cancelled",
+    "native_accepted",
+    "outcome_unknown",
+    "queued",
+    "rejected",
+    "sending",
+    "settled",
+];
+const UNRESOLVED_OPERATION_STATES: [&str; 3] = ["sending", "native_accepted", "outcome_unknown"];
 
-/// Exact status-only Operation data used for scoped recovery readback. Inputs,
-/// results, identities of callers, and native payloads are deliberately absent.
+/// Exact status-only unresolved Operation data used for scoped recovery
+/// readback. Inputs, results, identities of callers, and native payloads are
+/// deliberately absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredOperation {
@@ -75,9 +87,10 @@ pub(crate) struct ModuleDemandSnapshot {
     pub(crate) next_cursor: Option<ModuleDemandCursor>,
 }
 
-/// Complete status-only readback used before releasing the last host demand
-/// lease for a service scope. `native_identity_retained` is a conservative
-/// Store fact, not proof that an external/native process is currently alive.
+/// Complete status-only unresolved Operation readback used before releasing
+/// the last host demand lease for a service scope. `native_identity_retained`
+/// is a conservative Store fact, not proof that an external/native process is
+/// currently alive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModuleScopeReadback {
@@ -211,39 +224,135 @@ fn scoped_operation_readback(
     binding_id: &str,
     generation: i64,
 ) -> Result<Vec<StoredOperation>> {
-    let mut statement = db.prepare(
+    if generation <= 0 {
+        return Err(Error::new(
+            "MODULE_READBACK_SCOPE_INVALID",
+            "module Operation readback requires a positive binding generation",
+        ));
+    }
+
+    // Keep the state-integrity probe and unresolved projection on one SQLite
+    // snapshot. The scope/state index lets the probe seek the fixed gaps in
+    // the Store's state vocabulary without walking terminal lifetime history.
+    let tx = db.unchecked_transaction()?;
+    if let Some(state) = unknown_operation_state(&tx, binding_id, generation)? {
+        return Err(Error::new(
+            "MODULE_READBACK_STATE_UNKNOWN",
+            format!("binding Operation has an unrecognized state: {state:?}"),
+        ));
+    }
+
+    let mut statement = tx.prepare(
         "SELECT operation_id,method,state,binding_id,binding_generation FROM operations \
+         INDEXED BY unresolved_target_operations \
          WHERE binding_id=?1 AND binding_generation=?2 \
+           AND state IN ('sending','native_accepted','outcome_unknown') \
          ORDER BY created_at_ms,operation_id LIMIT ?3",
     )?;
     let rows = statement
         .query_map(
-            params![binding_id, generation, MAX_SCOPE_OPERATIONS as i64 + 1],
+            params![
+                binding_id,
+                generation,
+                MAX_SCOPE_UNRESOLVED_OPERATIONS as i64 + 1
+            ],
             |row| {
                 let operation_generation: i64 = row.get(4)?;
+                let operation_generation =
+                    u64::try_from(operation_generation).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
+                    })?;
                 Ok(StoredOperation {
                     operation_id: row.get(0)?,
                     method: row.get(1)?,
                     state: row.get(2)?,
                     binding_id: row.get(3)?,
-                    generation: u64::try_from(operation_generation).unwrap_or(0),
+                    generation: operation_generation,
                 })
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.len() > MAX_SCOPE_OPERATIONS {
+    drop(statement);
+    if rows.len() > MAX_SCOPE_UNRESOLVED_OPERATIONS {
         return Err(Error::new(
-            "MODULE_READBACK_LIMIT",
-            "binding has more retained Operations than the bounded module readback supports",
+            "MODULE_READBACK_UNRESOLVED_OVERFLOW",
+            format!(
+                "exact binding scope exceeds the bounded unresolved Operation readback of {MAX_SCOPE_UNRESOLVED_OPERATIONS}"
+            ),
         ));
     }
-    if rows.iter().any(|row| row.generation == 0) {
+    if rows.iter().any(|row| {
+        row.binding_id != binding_id
+            || row.generation != generation as u64
+            || !UNRESOLVED_OPERATION_STATES.contains(&row.state.as_str())
+    }) {
         return Err(Error::new(
             "MODULE_READBACK_CORRUPT",
-            "binding Operation has an invalid generation",
+            "binding unresolved Operation snapshot contains invalid scope or state data",
         ));
     }
+
+    tx.commit()?;
     Ok(rows)
+}
+
+fn unknown_operation_state(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+) -> Result<Option<String>> {
+    let mut lower = None;
+    for upper in VALID_OPERATION_STATES {
+        if let Some(state) = operation_state_in_gap(db, binding_id, generation, lower, Some(upper))?
+        {
+            return Ok(Some(state));
+        }
+        lower = Some(upper);
+    }
+    operation_state_in_gap(db, binding_id, generation, lower, None)
+}
+
+fn operation_state_in_gap(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    lower: Option<&str>,
+    upper: Option<&str>,
+) -> Result<Option<String>> {
+    let state = match (lower, upper) {
+        (None, Some(upper)) => db
+            .query_row(
+                "SELECT state FROM operations INDEXED BY unresolved_target_operations \
+                 WHERE binding_id=?1 AND binding_generation=?2 AND state<?3 LIMIT 1",
+                params![binding_id, generation, upper],
+                |row| row.get(0),
+            )
+            .optional()?,
+        (Some(lower), Some(upper)) => db
+            .query_row(
+                "SELECT state FROM operations INDEXED BY unresolved_target_operations \
+                 WHERE binding_id=?1 AND binding_generation=?2 \
+                   AND state>?3 AND state<?4 LIMIT 1",
+                params![binding_id, generation, lower, upper],
+                |row| row.get(0),
+            )
+            .optional()?,
+        (Some(lower), None) => db
+            .query_row(
+                "SELECT state FROM operations INDEXED BY unresolved_target_operations \
+                 WHERE binding_id=?1 AND binding_generation=?2 AND state>?3 LIMIT 1",
+                params![binding_id, generation, lower],
+                |row| row.get(0),
+            )
+            .optional()?,
+        (None, None) => {
+            return Err(Error::new(
+                "MODULE_READBACK_STATE_UNKNOWN",
+                "operation state vocabulary is empty",
+            ));
+        }
+    };
+    Ok(state)
 }
 
 /// Reconcile one already-held module scope before its final demand lease can
@@ -537,4 +646,168 @@ pub(super) fn pending(
         });
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operations_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE operations(
+                 operation_id TEXT PRIMARY KEY NOT NULL,
+                 method TEXT NOT NULL,
+                 binding_id TEXT NOT NULL,
+                 binding_generation INTEGER NOT NULL,
+                 state TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL
+             ) STRICT;
+             CREATE INDEX unresolved_target_operations
+                 ON operations(binding_id,binding_generation,state);",
+        )
+        .unwrap();
+        db
+    }
+
+    fn insert_operation(
+        db: &Connection,
+        operation_id: &str,
+        binding_id: &str,
+        generation: i64,
+        state: &str,
+        created_at_ms: i64,
+    ) {
+        db.execute(
+            "INSERT INTO operations(
+                 operation_id,method,binding_id,binding_generation,state,created_at_ms
+             ) VALUES(?1,'agent.send',?2,?3,?4,?5)",
+            params![operation_id, binding_id, generation, state, created_at_ms],
+        )
+        .unwrap();
+    }
+
+    fn insert_many(
+        db: &Connection,
+        prefix: &str,
+        count: usize,
+        binding_id: &str,
+        generation: i64,
+        state: &str,
+    ) {
+        let tx = db.unchecked_transaction().unwrap();
+        for index in 0..count {
+            insert_operation(
+                &tx,
+                &format!("{prefix}-{index:05}"),
+                binding_id,
+                generation,
+                state,
+                index as i64,
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn terminal_lifetime_history_does_not_limit_empty_unresolved_readback() {
+        let db = operations_db();
+        insert_many(
+            &db,
+            "terminal",
+            MAX_SCOPE_UNRESOLVED_OPERATIONS + 1,
+            "binding-a",
+            1,
+            "settled",
+        );
+
+        let readback = scoped_operation_readback(&db, "binding-a", 1).unwrap();
+        assert!(readback.is_empty());
+    }
+
+    #[test]
+    fn unresolved_readback_is_complete_and_exact_after_terminal_history() {
+        let db = operations_db();
+        insert_many(&db, "terminal", 5000, "binding-a", 1, "settled");
+        insert_many(&db, "active", 255, "binding-a", 1, "sending");
+        insert_operation(
+            &db,
+            "active-native-accepted",
+            "binding-a",
+            1,
+            "native_accepted",
+            6000,
+        );
+        insert_operation(
+            &db,
+            "active-outcome-unknown",
+            "binding-a",
+            1,
+            "outcome_unknown",
+            6001,
+        );
+        insert_operation(&db, "queued", "binding-a", 1, "queued", 6002);
+        insert_operation(&db, "other-binding", "binding-b", 1, "sending", 6003);
+        insert_operation(
+            &db,
+            "other-generation",
+            "binding-a",
+            2,
+            "outcome_unknown",
+            6004,
+        );
+
+        let readback = scoped_operation_readback(&db, "binding-a", 1).unwrap();
+        assert_eq!(readback.len(), 257);
+        assert!(readback.iter().all(|operation| {
+            operation.binding_id == "binding-a"
+                && operation.generation == 1
+                && UNRESOLVED_OPERATION_STATES.contains(&operation.state.as_str())
+        }));
+        assert!(
+            readback
+                .iter()
+                .any(|operation| operation.operation_id == "active-native-accepted")
+        );
+        assert!(
+            readback
+                .iter()
+                .any(|operation| operation.operation_id == "active-outcome-unknown")
+        );
+        assert!(!readback.iter().any(|operation| {
+            matches!(
+                operation.operation_id.as_str(),
+                "queued" | "other-binding" | "other-generation"
+            )
+        }));
+    }
+
+    #[test]
+    fn unresolved_overflow_is_explicit_and_fails_closed() {
+        let db = operations_db();
+        insert_many(
+            &db,
+            "active",
+            MAX_SCOPE_UNRESOLVED_OPERATIONS + 1,
+            "binding-a",
+            1,
+            "outcome_unknown",
+        );
+
+        let error = scoped_operation_readback(&db, "binding-a", 1).unwrap_err();
+        assert_eq!(error.code, "MODULE_READBACK_UNRESOLVED_OVERFLOW");
+    }
+
+    #[test]
+    fn unknown_state_and_database_errors_are_not_projected_as_empty() {
+        let db = operations_db();
+        insert_many(&db, "terminal", 5000, "binding-a", 1, "settled");
+        insert_operation(&db, "corrupt", "binding-a", 1, "unknown-state", 6000);
+
+        let error = scoped_operation_readback(&db, "binding-a", 1).unwrap_err();
+        assert_eq!(error.code, "MODULE_READBACK_STATE_UNKNOWN");
+
+        let missing_table = Connection::open_in_memory().unwrap();
+        assert!(scoped_operation_readback(&missing_table, "binding-a", 1).is_err());
+    }
 }
