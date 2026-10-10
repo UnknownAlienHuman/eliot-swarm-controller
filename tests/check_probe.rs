@@ -11,11 +11,16 @@ const MAGIC: &[u8; 8] = b"SWPRB01\0";
 
 fn kernel_host_executable() -> PathBuf {
     let compatibility_launcher = PathBuf::from(env!("CARGO_BIN_EXE_swarm-host"));
-    compatibility_launcher.with_file_name(if cfg!(windows) {
+    let host = compatibility_launcher.with_file_name(if cfg!(windows) {
         "swarm-kernel-host.exe"
     } else {
         "swarm-kernel-host"
-    })
+    });
+    assert!(
+        host.is_file(),
+        "build the swarm-kernel-host binary in the same target directory before running the probe fixture"
+    );
+    host
 }
 
 struct Response {

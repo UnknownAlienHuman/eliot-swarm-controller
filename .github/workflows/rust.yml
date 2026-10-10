@@ -300,6 +300,15 @@ jobs:
         run: |
           $targets = @($env:TEST_TARGETS | ConvertFrom-Json)
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          $rootHostTargets = @($targets | Where-Object {
+            ([string]$_.package).Split('@')[0] -ceq 'eliot-swarm-controller' -and
+            $_.target -cin @('check_probe', 'host_recovery')
+          })
+          if ($rootHostTargets.Count -gt 0) {
+            # The compatibility launcher's tests execute the real host sibling.
+            & cargo build --locked --package swarm-kernel-host --bin swarm-kernel-host --target-dir $sharedTargetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           foreach ($target in $targets) {
             & cargo test --locked --package $target.package --test $target.target --target-dir $sharedTargetDir
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
