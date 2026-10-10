@@ -71,12 +71,35 @@
   "worker_proof_sha256": "957c9d29cf2b2f78b26c3331222ddce611ad1216bdfed0a0b0dd43d3991db3f7",
   "worker_verified_at_utc": "2026-10-10 23:42:22 UTC",
   "parent_vendor_verifier_at_utc": "2026-10-10T23:45:35.0936634Z",
-  "independent_review": "pending",
-  "live_alert17_closure": "pending post-push",
+  "independent_review": {
+    "decision": "ACCEPT",
+    "reviewed_at_utc": "2026-10-11T00:00:00Z",
+    "review_sha256": "230a35102f471b638c4977b3f9c96febbb187418b701754c90e97789cbabbd91",
+    "exact_dependency_hashes_unchanged": true
+  },
+  "live_alert17_closure": {
+    "state": "fixed",
+    "fixed_at_utc": "2026-10-10T23:48:18Z",
+    "observed_at_utc": "2026-10-10T23:54:52.9303770Z",
+    "readback_sha256": "378cdcc3a5244e02e84ff885881320f37fcb62945882ef521338061b27467f45"
+  },
   "limitations": [
     "Generated SDK output compatibility not verified",
     "Actual Python3.10 runtime not executed",
     "Four npm alerts retain separate upstream blockers",
     "Historical native O used exact1ad4209; no qualification claim for this dependency change"
+  ],
+  "delivery_commit": "3d39a0d4567011a33c5b153e0856ee512c068590",
+  "delivery_ci": [
+    {
+      "workflow": "Rust",
+      "conclusion": "success",
+      "url": "https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/38096222499"
+    },
+    {
+      "workflow": "Dependency Graph",
+      "conclusion": "success",
+      "url": "https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/38096225317"
+    }
   ]
 }

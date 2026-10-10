@@ -11,8 +11,9 @@ Observer CLI operations:
   only when the caller supplies it (filters are an installed-schema
   qualification point, not a documented guarantee).
 
-The vendored pinned Python SDK under ``vendor_bridge/`` is byte-identical
-to upstream (see ``vendor_bridge/SHA256SUMS``). Its ``CodexClient`` speaks
+The vendored Python SDK source and generated models retain the pinned upstream
+bytes. Its dev/test dependency delta is recorded in ``VENDOR-SECURITY-PATCHES.md``
+and verified by ``vendor_bridge/SHA256SUMS``. Its ``CodexClient`` speaks
 JSONL over the stdio of a process it spawns itself; that transport cannot
 attach to a shared server. The adaptation therefore lives here, in
 ELIOT-owned code: ``SharedCodexClient`` subclasses the pinned client and
