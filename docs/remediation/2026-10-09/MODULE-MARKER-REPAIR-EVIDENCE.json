@@ -1,0 +1,73 @@
+{
+  "schema": "eliot.v27_module_marker_repair.v1",
+  "observed_at_utc": "2026-10-10T07:22:07.7358772Z",
+  "prior_candidate": "03ed4d31108537e11caf7cb2c01397339deb7dea",
+  "prior_execution": "EXECUTION-RESULTS-F.json",
+  "observed_f": "Fresh scope initialization and exact helper spawn progressed; both modules isolated MODULE_LAUNCH_RESULT_MISSING before owner publication; dispatch zero and graceful host exit",
+  "diagnosis": "Supervisor bookkeeping was materialized in an unmarked directory, violating the helper common ownership marker contract. Root reproduced ForeignDirectory on that layout. The exact early helper stderr error was not retained and is not asserted as an observed F error code.",
+  "changed_source": {
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+    },
+    "crates/swarm-kernel-host/src/workspace.rs": {
+      "baseline_sha256": "03d1d805b0d49e88e1d22daaac77405b200e03ae26b58692d5daf949edf14549",
+      "current_sha256": "30b0609583f16907486a06d69bd8a5e3af82e779458d86289413b8614722643a"
+    },
+    "crates/swarm-process/src/module_owner.rs": {
+      "baseline_sha256": "07e1c05a5993f5005941fc66a097d10927a7a7ecf1da3f8138a78e7653226b17",
+      "current_sha256": "5f0e4833c3194717b24e669d3a86e2716908c8aeb76c6468b59bd395219c9fcf"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    },
+    "crates/swarm-supervisor/src/descriptor.rs": {
+      "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+      "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+    },
+    "crates/swarm-supervisor/src/supervisor.rs": {
+      "baseline_sha256": "d81cfef59a1730a7a957d887c923da99c107c2cbb9a9fb27a9cac16efc6aa676",
+      "current_sha256": "3c34c960acccc673ff81543aa6bda0ccf5ceea29e9cd7c0d047d1b897cb929d0"
+    }
+  },
+  "unchanged_baseline_source_count": 402,
+  "logs": {
+    "windows-module-marker-clippy.log": "8be84613082f4ee8e7281e94022eca3565b510f8445727003374aa92bd45f72e",
+    "windows-module-marker-tests.log": "5bd77c0e9e93bd8ea6dddc96a013516a0871345b89a621d079b19631c6b56301",
+    "linux-module-marker-clippy.log": "42233f8544caea0a16c22b91a6ad5cd6f9aab68dd23a23bca5483e5333d6e5b3",
+    "linux-module-marker-tests.log": "f13ceb8cced86f389ba6d053b500df1109bace2b5ebc89dc85e18e9fc7048dff"
+  },
+  "understanding_proof_sha256": "ac5a18c35bee5dfd80323dd132e1c0fba8ef3df2424b59b3772104eff4d8158a",
+  "offline_probe": {
+    "result": "PASS: both exact F resolver maps parsed without resolving credentials; bookkeeping-only layout refused by actual common marker primitive",
+    "log_sha256": "d61dd4dc38d391c069bc8a719dc109d9184bdbf6c28e97acd5f31b3f437a5303",
+    "source_sha256": "29462dc44679940ad7eeacb56e1c8aca856df7888583c542a637c6d935f49365",
+    "linkage_receipt_sha256": "763c962c9f834823517797c14a5dfa2b9b9643ba4ee8bab408a7a4e6cd7a7625",
+    "native_process_started": false,
+    "retained_f_state_mutated": false
+  },
+  "review": {
+    "model": "gpt-6-luna",
+    "reasoning_effort": "max",
+    "provider": "openai",
+    "session_id": "01a1249c-8c7c-7863-ada0-f04ff76093e7",
+    "classification": "AuditFindingCandidate",
+    "result": "**PASS** — Marker handling preserves custody. In the ownerless path, only the marker and validated restart history are accepted; a present marker must also pass the shared OS-lock check (supervisor lines 2507–30; history validation at 2777–2810). Malformed, linked, or busy markers fail closed through the shared wrapper (module_owner.rs lines 339–353), whose error mapping matches the helper’s previous behavior (lines 356–365).\n\nThe supervisor initializes the marker only after prior-owner departure and helper-result cleanup, then durably writes the start budget before launch intent or helper spawn (supervisor.rs lines 1379–93, 1408–34). The nine startup tests cover the fresh path, unmarked-state rejection, orphan entries, foreign history, null intent, and incomplete or busy markers. I found no introduced replay path.",
+    "output_sha256": "5d3b1c439edfd6232ae86f07fc45710b57f1613af0ee415e91a391d70944c8cd",
+    "source_delivery": "Exact root-supplied diff and bounded source; no tools or native calls by reviewer",
+    "identity_readback_sha256": "74f37fc293f6a25851c253b360d82ba5ffeecd20a0c71b4ea41b1ad0562d5595"
+  },
+  "invariants": [
+    "Same strict common marker primitive and error mapping for supervisor and helper",
+    "Marker is initialized after exact prior family departure and before first budget/intent",
+    "Supervisor drops coordination lock before helper takes owner lifetime lock",
+    "Starts remain durable before every helper attempt; restart budget is never substituted for custody",
+    "Only validated budget and exact lock-verified marker allowed without owner; orphan files and null launch intent remain refused",
+    "Unmarked retained F scopes cannot be adopted; incomplete marker plus bookkeeping cannot be repaired",
+    "Busy marker cannot authorize ownerless start; path/identity/no-replay gates preserved"
+  ],
+  "production_clippy": "Fresh process and supervisor library+binaries strict Windows/Linux PASS; unaffected baseline and preceding changed-package gates retained",
+  "regression": "Nine actual lifecycle/marker/custody cases PASS on each platform: previous six plus unmarked bookkeeping, incomplete marker with budget and busy marker",
+  "installed_verification": "Fresh G candidate pending; F historical failures are not promoted"
+}

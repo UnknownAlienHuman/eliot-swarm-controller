@@ -332,6 +332,27 @@ pub fn run_module(plan: ModuleOwnerPlan, resolver: ProtectedResolverMap) -> Resu
     run_module_with_resolver(plan, &resolver)
 }
 
+/// Claim the existing module marker under its OS lock. A supervisor may use
+/// this before publishing its first bookkeeping files, then release the lock
+/// before the helper takes it for the owner lifetime. The marker does not prove
+/// process departure and never permits adoption of an unmarked nonempty scope.
+pub fn acquire_module_state_marker(canonical_directory: &Path) -> Result<File> {
+    match acquire_state_marker(canonical_directory, "module.lock", MARKER.as_bytes()) {
+        Ok(lock) => Ok(lock),
+        Err(StateMarkerError::Busy) => Err(Error::new(
+            "MODULE_OWNER_ACTIVE",
+            "module marker lock is already held",
+        )),
+        Err(StateMarkerError::ForeignDirectory | StateMarkerError::InvalidMarker) => {
+            Err(Error::new(
+                "FOREIGN_STATE_DIRECTORY",
+                "use a dedicated empty module state directory",
+            ))
+        }
+        Err(StateMarkerError::System(error)) => Err(error),
+    }
+}
+
 pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     plan: ModuleOwnerPlan,
     resolver: &R,
@@ -341,22 +362,7 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     reject_link_components(&plan.executable, false)?;
     fs::create_dir_all(&plan.state_dir)?;
     let dir = fs::canonicalize(&plan.state_dir)?;
-    let lock = match acquire_state_marker(&dir, "module.lock", MARKER.as_bytes()) {
-        Ok(lock) => lock,
-        Err(StateMarkerError::Busy) => {
-            return Err(Error::new(
-                "MODULE_OWNER_ACTIVE",
-                "module marker lock is already held",
-            ));
-        }
-        Err(StateMarkerError::ForeignDirectory | StateMarkerError::InvalidMarker) => {
-            return Err(Error::new(
-                "FOREIGN_STATE_DIRECTORY",
-                "use a dedicated empty module state directory",
-            ));
-        }
-        Err(StateMarkerError::System(error)) => return Err(error),
-    };
+    let lock = acquire_module_state_marker(&dir)?;
     private_permissions(&dir, true)?;
 
     let record_path = dir.join("owner.json");

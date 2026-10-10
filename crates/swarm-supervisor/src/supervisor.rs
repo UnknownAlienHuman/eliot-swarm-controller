@@ -1279,16 +1279,6 @@ impl Service {
                 }
             };
             prune_starts(&mut starts, policy.window_ms, now);
-            if let Err(error) = self.write_restart_history(&starts) {
-                self.record_failure(&error.code, "restart budget could not be persisted safely");
-                self.update_status(|status| {
-                    status.lifecycle = LifecycleState::Isolated {
-                        reason: "restart history persistence failed".to_owned(),
-                    };
-                    status.restart.exhausted = true;
-                });
-                return;
-            }
             if starts.len() >= usize::from(policy.max_starts) {
                 self.update_status(|status| {
                     status.restart.starts_in_window = starts.len();
@@ -1384,6 +1374,23 @@ impl Service {
                 });
                 self.readback_required.store(true, Ordering::Release);
                 return;
+            }
+
+            // The helper requires the same ownership marker before any other
+            // scope files exist. Initialize it only after exact prior departure,
+            // then let the helper acquire its own lifetime lock at process start.
+            match swarm_process::module_owner::acquire_module_state_marker(&self.state_dir) {
+                Ok(marker) => drop(marker),
+                Err(error) => {
+                    self.record_failure(&error.code, "module state marker could not be verified");
+                    self.update_status(|status| {
+                        status.lifecycle = LifecycleState::Isolated {
+                            reason: "module state marker initialization failed".to_owned(),
+                        };
+                        status.restart.exhausted = true;
+                    });
+                    return;
+                }
             }
 
             let boot_id = Uuid::new_v4().to_string();
@@ -2498,16 +2505,27 @@ impl Service {
         let owner_path = self.state_dir.join("owner.json");
         let mut prior_owner = read_owner_receipt_optional(&owner_path)?;
         if attempted_helper.is_none() && prior_owner.is_none() {
+            let mut marker_present = false;
             for entry in fs::read_dir(&self.state_dir)? {
-                if entry?.file_name() != "restart-history.json" {
+                let name = entry?.file_name();
+                if name == "module.lock" {
+                    marker_present = true;
+                } else if name == "restart-history.json" {
+                    // Accounting is written before any launch intent. It is not
+                    // process custody; accept only its exact validated shape/scope.
+                    self.read_restart_history()?;
+                } else {
                     return Err(Error::new(
                         "MODULE_OWNER_IDENTITY_MISSING",
                         "module state exists without its prior owner receipt; no process was started",
                     ));
                 }
-                // Accounting is written before any launch intent. It is not
-                // process custody; accept only its exact validated shape/scope.
-                self.read_restart_history()?;
+            }
+            if marker_present {
+                // A busy, malformed or linked marker is not evidence of an
+                // ownerless scope, even when no owner envelope is available.
+                let _marker =
+                    swarm_process::module_owner::acquire_module_state_marker(&self.state_dir)?;
             }
             return Ok(None);
         }
@@ -3289,6 +3307,14 @@ mod tests {
     }
 
     impl StartupFixture {
+        fn prepare_accounting(&self) {
+            self.service.prepare_state_dir().unwrap();
+            drop(
+                swarm_process::module_owner::acquire_module_state_marker(&self.service.state_dir)
+                    .unwrap(),
+            );
+        }
+
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!("swarm-startup-{}", Uuid::new_v4()));
             fs::create_dir(&root).unwrap();
@@ -3365,6 +3391,7 @@ mod tests {
         );
         assert!(status.restart.exhausted);
         assert_eq!(service.read_restart_history().unwrap().len(), 1);
+        assert!(service.state_dir.join("module.lock").is_file());
         assert!(
             service
                 .wait_for_prior_owner_to_depart()
@@ -3380,7 +3407,7 @@ mod tests {
     async fn startup_valid_budget_alone_does_not_invent_prior_owner() {
         let fixture = StartupFixture::new();
         let service = &fixture.service;
-        service.prepare_state_dir().unwrap();
+        fixture.prepare_accounting();
         service
             .write_restart_history(&VecDeque::from([unix_time_ms().unwrap()]))
             .unwrap();
@@ -3397,7 +3424,7 @@ mod tests {
     async fn startup_orphan_receipts_and_unknown_entries_remain_closed() {
         let fixture = StartupFixture::new();
         let service = &fixture.service;
-        service.prepare_state_dir().unwrap();
+        fixture.prepare_accounting();
         service.write_restart_history(&VecDeque::new()).unwrap();
         for name in [
             "worker.json",
@@ -3424,7 +3451,7 @@ mod tests {
     async fn startup_budget_from_another_scope_remains_closed() {
         let fixture = StartupFixture::new();
         let service = &fixture.service;
-        service.prepare_state_dir().unwrap();
+        fixture.prepare_accounting();
         service.write_restart_history(&VecDeque::new()).unwrap();
         let path = service.state_dir.join("restart-history.json");
         let mut history: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -3444,7 +3471,7 @@ mod tests {
     async fn startup_launch_intent_without_helper_identity_remains_unknown() {
         let fixture = StartupFixture::new();
         let service = &fixture.service;
-        service.prepare_state_dir().unwrap();
+        fixture.prepare_accounting();
         service.write_restart_history(&VecDeque::new()).unwrap();
         service
             .write_launch_attempt(&Uuid::new_v4().to_string(), None)
@@ -3478,6 +3505,61 @@ mod tests {
             "MODULE_STATE_PATH_UNSAFE"
         );
         assert!(!service.state_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_unmarked_bookkeeping_is_not_adopted() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        service.prepare_state_dir().unwrap();
+        service.write_restart_history(&VecDeque::new()).unwrap();
+        lock(&service.demands).insert("fixture-demand".to_owned(), 1);
+        service.clone().run_lifecycle().await;
+        assert_eq!(
+            service.current_status().last_failure.unwrap().code,
+            "FOREIGN_STATE_DIRECTORY"
+        );
+        assert!(!service.state_dir.join("module.lock").exists());
+        assert!(!service.state_dir.join("launch-attempt.json").exists());
+        assert!(service.read_restart_history().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_incomplete_marker_with_budget_is_not_repaired() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        service.prepare_state_dir().unwrap();
+        let marker = service.state_dir.join("module.lock");
+        fs::write(&marker, b"ELIOT_SWARM_MODULE_").unwrap();
+        service.write_restart_history(&VecDeque::new()).unwrap();
+        assert_eq!(
+            service
+                .wait_for_prior_owner_to_depart()
+                .await
+                .unwrap_err()
+                .code,
+            "FOREIGN_STATE_DIRECTORY"
+        );
+        assert_eq!(fs::read(marker).unwrap(), b"ELIOT_SWARM_MODULE_");
+    }
+
+    #[tokio::test]
+    async fn startup_busy_marker_does_not_grant_ownerless_start() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        fixture.prepare_accounting();
+        service.write_restart_history(&VecDeque::new()).unwrap();
+        let _marker =
+            swarm_process::module_owner::acquire_module_state_marker(&service.state_dir).unwrap();
+        assert_eq!(
+            service
+                .wait_for_prior_owner_to_depart()
+                .await
+                .unwrap_err()
+                .code,
+            "MODULE_OWNER_ACTIVE"
+        );
+        assert!(!service.state_dir.join("launch-attempt.json").exists());
     }
 }
 
