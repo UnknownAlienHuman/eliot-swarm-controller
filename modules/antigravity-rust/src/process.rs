@@ -3,7 +3,9 @@ use std::{env, path::PathBuf, process::Stdio};
 use serde_json::Value;
 use swarm_contracts::error::{Error, Result};
 use swarm_process::{
-    module_child_belongs_to_owner, module_owner::verify_current_adapter, process_image_identity,
+    module_child_belongs_to_owner,
+    module_owner::{VerifiedModuleWorker, verify_current_adapter},
+    process_image_identity,
 };
 use tokio::process::{Child, Command};
 
@@ -15,6 +17,7 @@ use crate::launch::NativeLaunchSpec;
 pub struct CandidateManagedOwner {
     record: Value,
     token: String,
+    boot_id: String,
     adapter_image: Value,
 }
 
@@ -44,13 +47,18 @@ impl CandidateManagedOwner {
         // and checks Windows Job/Linux process-group membership; it does not
         // treat the owner PID as the adapter or prove family departure.
         let proof = verify_current_adapter(&canonical_owner)?;
+        Self::from_verified_worker(proof)
+    }
+
+    fn from_verified_worker(proof: VerifiedModuleWorker) -> Result<Self> {
         let token = validate_owner_record(&proof.owner_record)?.to_owned();
-        if token != proof.boot_id {
+        if !valid_owner_token(&proof.boot_id) {
             return Err(Error::invalid("MANAGED_MODULE_OWNER_IDENTITY_INVALID"));
         }
         Ok(Self {
             record: proof.owner_record,
             token,
+            boot_id: proof.boot_id,
             adapter_image: proof.process_image_identity,
         })
     }
@@ -59,12 +67,18 @@ impl CandidateManagedOwner {
         Self {
             record: self.record.clone(),
             token: self.token.clone(),
+            boot_id: self.boot_id.clone(),
             adapter_image: self.adapter_image.clone(),
         }
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Supervisor-assigned worker identity, independent of the group token.
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
     }
 
     pub fn record(&self) -> &Value {
@@ -93,21 +107,15 @@ impl VerifiedManagedOwner {
     /// This checks the same owner envelope the manager verifies against its
     /// live process group before it records a module boot.
     pub(crate) fn accepted_module_hello(
-        boot_id: &str,
-        record: Value,
-        adapter_image: Value,
+        candidate: CandidateManagedOwner,
         recovery_required: bool,
-    ) -> Result<Self> {
-        let token = validate_owner_record(&record)?.to_owned();
-        if token != boot_id {
-            return Err(Error::invalid("MANAGED_MODULE_OWNER_IDENTITY_INVALID"));
-        }
-        Ok(Self {
-            _record: record,
-            _adapter_image: adapter_image,
-            token,
+    ) -> Self {
+        Self {
+            _record: candidate.record,
+            _adapter_image: candidate.adapter_image,
+            token: candidate.token,
             native_launch_allowed: !recovery_required,
-        })
+        }
     }
 
     pub fn token(&self) -> &str {
@@ -374,5 +382,48 @@ fn same_executable_path(observed: Option<&str>, expected: &std::path::Path) -> b
     #[cfg(not(windows))]
     {
         observed == expected
+    }
+}
+
+#[cfg(test)]
+mod worker_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    const GROUP_TOKEN: &str = "12345678-1234-4234-8234-1234567890ab";
+    const WORKER_BOOT: &str = "87654321-4321-4321-8321-ba0987654321";
+
+    // Membership/image verification is supplied at this data handoff seam;
+    // real OS group checks remain in verify_current_adapter, before it.
+    fn proof(boot_id: &str) -> VerifiedModuleWorker {
+        VerifiedModuleWorker {
+            owner_record: json!({"version":1,"token":GROUP_TOKEN,"process":{"pid":42,"purpose":"module","scope":"linux_process_group"}}),
+            boot_id: boot_id.to_owned(),
+            process_image_identity: json!({"pid":43}),
+        }
+    }
+
+    #[test]
+    fn worker_boot_and_group_token_stay_distinct_through_accepted_hello() {
+        let candidate = CandidateManagedOwner::from_verified_worker(proof(WORKER_BOOT)).unwrap();
+        assert_eq!(candidate.boot_id(), WORKER_BOOT);
+        assert_eq!(candidate.token(), GROUP_TOKEN);
+        let reconnect = candidate.clone_for_reconnect();
+        assert_eq!(reconnect.boot_id(), WORKER_BOOT);
+        assert_eq!(reconnect.record(), candidate.record());
+        let verified = VerifiedManagedOwner::accepted_module_hello(candidate, false);
+        assert_eq!(verified.token(), GROUP_TOKEN);
+        assert!(verified.native_launch_allowed());
+        let recovery = VerifiedManagedOwner::accepted_module_hello(reconnect, true);
+        assert_eq!(recovery.token(), GROUP_TOKEN);
+        assert!(!recovery.native_launch_allowed());
+    }
+
+    #[test]
+    fn invalid_worker_boot_or_owner_record_stays_refused() {
+        assert!(CandidateManagedOwner::from_verified_worker(proof("not-a-boot")).is_err());
+        let mut missing_owner = proof(WORKER_BOOT);
+        missing_owner.owner_record["token"] = Value::Null;
+        assert!(CandidateManagedOwner::from_verified_worker(missing_owner).is_err());
     }
 }

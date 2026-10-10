@@ -684,11 +684,32 @@ pub(super) fn hello_plan(db: &Connection, p: &Principal, v: &Value) -> Result<Va
         "module_contract_negotiation":module_contract_negotiation}))
 }
 
+#[cfg(test)]
 pub(super) fn hello(
     db: &mut Connection,
     p: &Principal,
     v: &Value,
     verified: &Value,
+) -> Result<Value> {
+    hello_internal(db, p, v, verified, None)
+}
+
+pub(super) fn hello_with_config(
+    db: &mut Connection,
+    p: &Principal,
+    v: &Value,
+    verified: &Value,
+    config: &crate::config::Config,
+) -> Result<Value> {
+    hello_internal(db, p, v, verified, Some(config))
+}
+
+fn hello_internal(
+    db: &mut Connection,
+    p: &Principal,
+    v: &Value,
+    verified: &Value,
+    config: Option<&crate::config::Config>,
 ) -> Result<Value> {
     model::fields(
         v,
@@ -848,8 +869,13 @@ pub(super) fn hello(
     } else {
         false
     };
+    let reply_route = if standalone_opencode_route(&b["route"]) {
+        module_route_projection(&tx, config, &b)?
+    } else {
+        b["route"].clone()
+    };
     tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connected','$.connected_at_ms',?5),state=CASE WHEN state='reconciling' AND ?6 AND COALESCE(json_extract(state_json,'$.recovery_required'),0)=0 AND (native_root_id IS NOT NULL OR ?7 OR ?8) THEN 'ready' ELSE state END WHERE binding_id=?1 AND generation=?2", params![id,generation,boot,p.link_id,model::now_ms()?,v["native_ready"]==true,sessionless_batch,prepared_rootless_resume])?;
-    let result = json!({"binding_id":id,"generation":generation,"route":b["route"],"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true,"module_contract_negotiation":module_contract_negotiation});
+    let result = json!({"binding_id":id,"generation":generation,"route":reply_route,"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true,"module_contract_negotiation":module_contract_negotiation});
     tx.commit()?;
     Ok(result)
 }
@@ -863,6 +889,59 @@ fn optional_identity_text<'a>(value: &'a Value, field: &str) -> Result<Option<&'
             "native identity fields must be nonempty strings or absent",
         )),
     }
+}
+
+fn standalone_opencode_route(route: &Value) -> bool {
+    route["runtime"] == "module"
+        && route["module_artifact_id"] == crate::config::OPENCODE_RUST_ARTIFACT_ID
+}
+
+/// Hello and commands share the same authenticated route projection. The
+/// standalone v3 schema carries four native fields; the built-in adapter's
+/// expected_version is not a field in that module contract. This changes only
+/// the reply, never the retained binding route or original Operation digest.
+fn module_route_projection(
+    db: &Connection,
+    config: Option<&crate::config::Config>,
+    binding: &Value,
+) -> Result<Value> {
+    let mut route = binding["route"].clone();
+    let standalone_opencode = standalone_opencode_route(&route);
+    if route.get("owned_service").is_some_and(|v| !v.is_null()) {
+        let config = config.ok_or_else(|| {
+            Error::new(
+                "OWNED_SERVICE_SCOPE",
+                "owned module projection requires the current controller configuration",
+            )
+        })?;
+        let id = model::text(binding, "binding_id")?;
+        let generation = model::positive(binding, "generation")?;
+        route["native_options"] = if standalone_opencode {
+            super::launcher_owned_service::module_owned_native_options(
+                db,
+                config,
+                id,
+                generation,
+                route["native_options"].clone(),
+            )?
+        } else {
+            json!(
+                super::launcher_owned_service::effective_options_for_binding(
+                    db, config, id, generation,
+                )?
+            )
+        };
+    }
+    if standalone_opencode {
+        let options = crate::runtime::opencode_v2::Options::parse(&route["native_options"])?;
+        route["native_options"] = json!({
+            "service_id":options.service_id,
+            "connection_file":options.connection_file,
+            "directory":options.directory,
+            "model":options.model,
+        });
+    }
+    Ok(route)
 }
 
 pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
@@ -1466,35 +1545,7 @@ fn next_internal(
     if let Some(packet) = trusted_launch_dispatch_packet {
         input["launch_dispatch_packet"] = packet;
     }
-    let mut command_route = b["route"].clone();
-    if command_route
-        .get("owned_service")
-        .is_some_and(|v| !v.is_null())
-    {
-        let config = config.ok_or_else(|| {
-            Error::new(
-                "OWNED_SERVICE_SCOPE",
-                "owned command requires the current controller configuration",
-            )
-        })?;
-        let module_owned = command_route["runtime"] == "module"
-            && command_route["module_artifact_id"] == crate::config::OPENCODE_RUST_ARTIFACT_ID;
-        command_route["native_options"] = if module_owned {
-            super::launcher_owned_service::module_owned_native_options(
-                &tx,
-                config,
-                &id,
-                generation,
-                command_route["native_options"].clone(),
-            )?
-        } else {
-            json!(
-                super::launcher_owned_service::effective_options_for_binding(
-                    &tx, config, &id, generation,
-                )?
-            )
-        };
-    }
+    let command_route = module_route_projection(&tx, config, &b)?;
     let now = model::now_ms()?;
     let won=tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND state='queued'",params![op,now])?;
     if won != 1 {

@@ -1895,17 +1895,11 @@ impl Service {
         command
             .arg(&plan_path)
             .arg(&resolver_map)
-            .env_clear()
             .kill_on_drop(false)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        for key in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
+        swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
         let child = command.spawn().map_err(|error| {
             Error::new(
                 "MODULE_OWNER_SPAWN_FAILED",

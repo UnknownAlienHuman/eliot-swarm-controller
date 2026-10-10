@@ -1853,8 +1853,9 @@ impl Store {
             })
             .await?;
             plan["departed"] = json!(plan["changed"] == true && !plan["owner"].is_null());
+            let config = self.config.clone();
             return self
-                .run(move |db| runtime::hello(db, &principal, &params, &plan))
+                .run(move |db| runtime::hello_with_config(db, &principal, &params, &plan, &config))
                 .await;
         }
         if method == "source.capture" {

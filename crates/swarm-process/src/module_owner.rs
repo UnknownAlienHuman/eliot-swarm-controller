@@ -510,12 +510,12 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     }
 }
 
-/// Start the adapter from a deliberately bounded environment. The Windows
+/// Prepare the owner helper or adapter with the same bounded environment. The Windows
 /// baseline is limited to OS launch, home, and configuration discovery values;
 /// all module-specific literals and protected-reference file paths come from
 /// the validated plan/resolver below. This is an environment boundary, not a
 /// same-user sandbox or a provider/account authorization boundary.
-fn apply_launch_environment(command: &mut Command) {
+pub fn apply_launch_environment(command: &mut Command) {
     command.env_clear();
     #[cfg(windows)]
     for name in WINDOWS_LAUNCH_ENVIRONMENT {
@@ -1264,6 +1264,81 @@ fn canonical_json(value: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_environment_survives_both_hops_without_ambient_values() {
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "module_owner::tests::launch_environment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ELIOT_ENV_TEST_HOP", "supervisor")
+            .env("ELIOT_ENV_TEST_SENTINEL", "not-a-secret")
+            .env("USERPROFILE", env::temp_dir())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ENV_BOTH_HOPS_VERIFIED"));
+    }
+
+    #[test]
+    #[ignore = "child entry point exercised by the two-hop environment regression"]
+    fn launch_environment_child() {
+        let hop = env::var("ELIOT_ENV_TEST_HOP").unwrap();
+        if hop == "adapter" {
+            assert!(env::var_os("ELIOT_ENV_TEST_SENTINEL").is_none());
+            #[cfg(windows)]
+            assert_eq!(
+                env::var_os("USERPROFILE"),
+                env::var_os("ELIOT_ENV_TEST_PROFILE")
+            );
+            #[cfg(unix)]
+            assert!(
+                env::vars_os()
+                    .all(|(key, _)| key == "ELIOT_ENV_TEST_HOP" || key == "ELIOT_ENV_TEST_PROFILE")
+            );
+            println!("ENV_BOTH_HOPS_VERIFIED");
+            return;
+        }
+        assert!(matches!(hop.as_str(), "supervisor" | "helper"));
+        let expected_profile = if hop == "supervisor" {
+            env::var_os("USERPROFILE").unwrap()
+        } else {
+            env::var_os("ELIOT_ENV_TEST_PROFILE").unwrap()
+        };
+        let mut child = Command::new(env::current_exe().unwrap());
+        apply_launch_environment(&mut child);
+        child
+            .args([
+                "--exact",
+                "module_owner::tests::launch_environment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "ELIOT_ENV_TEST_HOP",
+                if hop == "supervisor" {
+                    "helper"
+                } else {
+                    "adapter"
+                },
+            )
+            .env("ELIOT_ENV_TEST_PROFILE", expected_profile);
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ENV_BOTH_HOPS_VERIFIED"));
+        println!("ENV_BOTH_HOPS_VERIFIED");
+    }
 
     struct PathFixture {
         directory: PathBuf,

@@ -48,7 +48,7 @@ async fn run() -> Result<()> {
     let config_path = config_argument()?;
     let owner = CandidateManagedOwner::from_environment()?;
     let (config, credential) = AdapterConfig::read(&config_path)?;
-    let boot_id = owner.token().to_owned();
+    let boot_id = owner.boot_id().to_owned();
     let native_scope_key = native_scope_key()?;
 
     let mut host = HostSession::new(config, credential, owner, boot_id, native_scope_key);

@@ -1,0 +1,157 @@
+{
+  "schema": "eliot.v27_module_route_environment_repair.v1",
+  "recorded_at_utc": "2026-10-10T08:18:58.9677589Z",
+  "source_parent_commit": "3200fc94af6ab972417007d6d2239a97d06c71ce",
+  "source_sha256": {
+    "crates/swarm-process/src/module_owner.rs": "4905e6eec8cc5736c827434e4d1415b67852025917992876685d6c6bfa9565fa",
+    "crates/swarm-supervisor/src/supervisor.rs": "059fa0ba5746ee98eedb69c048b213a00ca94504c565f9970d73e2b5206aea6b",
+    "crates/swarm-kernel-host/src/store/runtime.rs": "f6a93a46745f10370980ec7cce66f065b37bb56233a49b642ee800214636b183",
+    "crates/swarm-kernel-host/src/store/mod.rs": "447dbc9c4cb7b0fc31011b9c85e91c4be792bbe8c7d7b4be5a370048d8367f26",
+    "crates/swarm-kernel-host/src/store/runtime_admission_tests.rs": "1b6b98559eb6c3d7dda020f8766b1b0c3d86027db368d1805c2974cf62608a5c",
+    "modules/antigravity-rust/src/process.rs": "c4ba5b92a249ded3fe1b4c1c475fbb2a32cd0eb4315294b5205c4698d9563d8c",
+    "modules/antigravity-rust/src/ipc.rs": "23029a748dfb24c104c046d449d11cad188228fdce8f5a0df844551457aecb2e",
+    "modules/antigravity-rust/src/main.rs": "b64b80302e17d8151ab477cc1662017f30ee0af1ee1d7252151d38a4d52d35b1"
+  },
+  "diagnosis": {
+    "historic_execution": "EXECUTION-RESULTS-H.json",
+    "exact_binding_sha256": "c9ca404050c9546a3c474b8e285e71189403756c9b5d7555c693c5cf80111547",
+    "OpenCode": "Retained hello route contains only directory; adapter launch config requires full exact options, while old command projection adds expected_version outside strict v3 schema",
+    "Antigravity": "Actual H group token differs from worker boot; old adapter rejects equality before native scope/hello. Supervisor also drops required home environment before helper can forward it",
+    "early_worker_stderr": "Not retained; exact runtime exit diagnostic remains UNKNOWN",
+    "safe_binding_readback_sha256": "239e929000803850721a12b78db55667c2b33ef03389f15b4f8e6478a00f2be2",
+    "safe_owner_boot_readback": [
+      {
+        "run_id": "5a56978e-a31c-42d6-8a7e-ed45e9c5a097",
+        "module_id": "eliot.opencode.v2",
+        "binding_id": "2efbbe60-76fa-4b70-b3a3-a01910790a68",
+        "worker_boot_id": "30b40560-8a93-4cab-8f5e-027b41c03cbc",
+        "owner_token_equals_worker_boot": false,
+        "owner_version": 1,
+        "worker_version": 1
+      },
+      {
+        "run_id": "47b6b110-9045-4b7c-b162-b975e8a01ad4",
+        "module_id": "antigravity",
+        "binding_id": "00fcc3c9-e58e-4359-83ee-8a4a4ad5c051",
+        "worker_boot_id": "d4971a04-3817-4344-98c6-9cb4bbf254db",
+        "owner_token_equals_worker_boot": false,
+        "owner_version": 1,
+        "worker_version": 1
+      }
+    ]
+  },
+  "repair": {
+    "environment": "One existing13-key Windows allowlist used at supervisor/helper and helper/adapter hops, no extension; Unix clearing preserved",
+    "host_projection": "One hello/command projection on cloned route uses existing exact retained owned-service start validation and four-field standalone v3 options; retained binding/request unchanged",
+    "antigravity": "Candidate retains OS-verified owner token and independently validated worker boot; main/IPC carry boot; post-authenticated negotiated hello consumes Candidate into Verified custody with recovery guard preserved"
+  },
+  "gates": {
+    "strict_production_clippy": "Windows/Linux: process+supervisor+host, Antigravity; lib+bins/no-deps/-D warnings",
+    "focused_tests": "Four cases per platform: real two-hop environment, Store hello options+retained route+missing-intent rollback, valid/invalid Antigravity identity handoff; process child entry is explicitly exercised by parent",
+    "test_compilation_warnings": "21 existing host test-only warnings; no all-targets Clippy claim",
+    "logs_sha256": {
+      "windows-module-route-env-clippy.log": "11cfc40ca430b5264a1b36d1cb560205798f6bc19c6d4bd70209970db4ed2b77",
+      "windows-antigravity-worker-boot-clippy.log": "20891dacc5cb99369eede91ff800c3c1e81acf966351c8ea35924c3a735989d7",
+      "windows-module-route-env-process-tests.log": "d53ec33ee01adce4ddf9ec0419ee39114e2d0770c61bdf8dbf22fbba31ea2d83",
+      "windows-module-route-env-host-final-tests.log": "5852ac2b8022b4041b30004fe2416efc258191a1d38acf0cf910d4d84da5267d",
+      "windows-antigravity-worker-boot-tests.log": "4c7b9dfd29c807f00b446e4a22cd269e77ed69a13e11c3b9afb1d56319bdcdad",
+      "linux-module-route-env-clippy.log": "76c5c251052801edb3a846974309f204bba723e5f7a1945a1a4728d6cf414e66",
+      "linux-antigravity-worker-boot-clippy.log": "000c3018543897df5ffa1cb5fd6529b5aea4cc1a0ede2f8aa53d1986071f225d",
+      "linux-module-route-env-process-tests.log": "cba380da6eaf837605ff3a4521cadc3ec5e33a81f31a4f2a21251efac68ae6af",
+      "linux-module-route-env-host-final-tests.log": "29a77b612933e0ed68f36f67e00c23199ab3b382ba6f19586af46c761d09a2db",
+      "linux-antigravity-worker-boot-tests.log": "ad5058dc99f17ed56be4839731373a89c4f3af8cad9b3e7e39b18f8d387f1480"
+    },
+    "initial_test_failure": "Missing managed_owner fixture fact triggered existing recovery guard; fixture repaired, production unchanged; initial logs retained"
+  },
+  "reviews": [
+    {
+      "model": "gpt-6-luna",
+      "reasoning_effort": "max",
+      "provider": "openai",
+      "source_delivery": "Exact current diff and bounded source via stdin, no reviewer tools/native calls",
+      "classification": "AuditFindingCandidate",
+      "result": "**PASS** — I withdraw my prior finding; I conflated two distinct projections. Bootstrap uses `module_owned_route_options`, which adds the owner fields. Hello and command RPCs use `module_owned_native_options`, which validates the retained owned-service start and returns the built-in options including `expected_version`. The four-field projection then removes `expected_version` to match the adapter’s strict `NativeOptions` hello and command equality checks.\n\nThe helper modifies a cloned route, so the retained route and operation state are not rewritten. Projection errors occur inside the hello transaction and roll back its pending updates. I found no introduced mutation, replay, or custody widening in the supplied source.",
+      "output_sha256": "edfb9b08939e244838388dee7900b8b839f06bd9fb9eb208b38d1713351aabc1"
+    },
+    {
+      "model": "gpt-6-luna",
+      "reasoning_effort": "max",
+      "provider": "openai",
+      "source_delivery": "Exact current diff and bounded source via stdin, no reviewer tools/native calls",
+      "classification": "AuditFindingCandidate",
+      "result": "**PASS** — The candidate keeps the group token and supervisor-assigned boot UUID as separate identities. It is built only after `verify_current_adapter` supplies the OS membership and image proof, and rejects an invalid boot UUID (`process.rs`). Hello sends that boot UUID while retaining the owner record; only after acknowledgement and negotiation validation does it consume the candidate into the verified capability (`ipc.rs`). The main process also uses the candidate’s boot UUID.\n\nThe group token remains the verified owner token, and recovery still disables native launch. I found no authority widening or identity/API regression in the supplied diff.",
+      "output_sha256": "c215c36e7b6ea37bb6462e3fa5d690c8a14511ddba921a91e31b9560a224eade"
+    }
+  ],
+  "review_initial_finding": "Initial route review conflated bootstrap owner options and plain RPC native options. Full producer/consumer source supplied; reviewer withdrew the finding. Both outputs retained; no adapter schema relaxed.",
+  "retained_source_gate": {
+    "baseline_hashes": 408,
+    "unchanged": 393,
+    "changed": {
+      "crates/swarm-bus/src/managed_worker_config.rs": {
+        "baseline_sha256": "26fa8b6f8437998e55e5e650dd3fa96a5fad520570e61071d3c5e9cdea99b43f",
+        "current_sha256": "b20093732eedad40b20be8e3620d5241c8ad033b63496c4cb4a1ad4abf48730d"
+      },
+      "crates/swarm-kernel-host/src/host_bus_supervisor.rs": {
+        "baseline_sha256": "67407990154ef57f1e21ec3dd5a261c88322391d634e84760e70ee76d54ee4e3",
+        "current_sha256": "07018a3cc27ef318b5795accd0977605ae1508670da9e8a60679500845110b5e"
+      },
+      "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+        "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+        "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+      },
+      "crates/swarm-kernel-host/src/store/mod.rs": {
+        "baseline_sha256": "e078997a23c4db1116f84d1fa7841138c7564f96fe9fc8a5e2670da1c6e461ba",
+        "current_sha256": "447dbc9c4cb7b0fc31011b9c85e91c4be792bbe8c7d7b4be5a370048d8367f26"
+      },
+      "crates/swarm-kernel-host/src/store/runtime_admission_tests.rs": {
+        "baseline_sha256": "d1d0e3e2a24e39f43b6b851e99644ee8f299fa8e45761b1ab2a8b28d132a8b34",
+        "current_sha256": "1b6b98559eb6c3d7dda020f8766b1b0c3d86027db368d1805c2974cf62608a5c"
+      },
+      "crates/swarm-kernel-host/src/store/runtime.rs": {
+        "baseline_sha256": "71cdcef58ffa35a0517dea7ad111ebe35b994ed81312d155956d249ac08baefa",
+        "current_sha256": "f6a93a46745f10370980ec7cce66f065b37bb56233a49b642ee800214636b183"
+      },
+      "crates/swarm-kernel-host/src/workspace.rs": {
+        "baseline_sha256": "03d1d805b0d49e88e1d22daaac77405b200e03ae26b58692d5daf949edf14549",
+        "current_sha256": "30b0609583f16907486a06d69bd8a5e3af82e779458d86289413b8614722643a"
+      },
+      "crates/swarm-observer/src/metrics_cli.rs": {
+        "baseline_sha256": "db6edbde6920c9d578b14c0a32bb0c129546eab55cd06d56d668c690c647ffba",
+        "current_sha256": "211d7445414a9813d4f251d788a8b2030de8adda184914c18279bddae4432bc8"
+      },
+      "crates/swarm-process/src/module_owner.rs": {
+        "baseline_sha256": "07e1c05a5993f5005941fc66a097d10927a7a7ecf1da3f8138a78e7653226b17",
+        "current_sha256": "4905e6eec8cc5736c827434e4d1415b67852025917992876685d6c6bfa9565fa"
+      },
+      "crates/swarm-process/src/permissions.rs": {
+        "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+        "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+      },
+      "crates/swarm-supervisor/src/descriptor.rs": {
+        "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+        "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+      },
+      "crates/swarm-supervisor/src/supervisor.rs": {
+        "baseline_sha256": "d81cfef59a1730a7a957d887c923da99c107c2cbb9a9fb27a9cac16efc6aa676",
+        "current_sha256": "059fa0ba5746ee98eedb69c048b213a00ca94504c565f9970d73e2b5206aea6b"
+      },
+      "modules/antigravity-rust/src/ipc.rs": {
+        "baseline_sha256": "17229e367bc79535ff85c38543eb0d23d59bb68a540d525b22e92ce9e51f65ef",
+        "current_sha256": "23029a748dfb24c104c046d449d11cad188228fdce8f5a0df844551457aecb2e"
+      },
+      "modules/antigravity-rust/src/main.rs": {
+        "baseline_sha256": "c85655d5c99b133689d71574a0c003e9da3296d51e9e080ac5d8e17cd9d519fc",
+        "current_sha256": "b64b80302e17d8151ab477cc1662017f30ee0af1ee1d7252151d38a4d52d35b1"
+      },
+      "modules/antigravity-rust/src/process.rs": {
+        "baseline_sha256": "e76c90798e6ba8093ad5a208e597f4142ed693971a7dadd093d4bf2af24563b9",
+        "current_sha256": "c4ba5b92a249ded3fe1b4c1c475fbb2a32cd0eb4315294b5205c4698d9563d8c"
+      }
+    },
+    "qualification": "Retained24-package gate plus exact affected-source union; not a new full final-SHA suite"
+  },
+  "native_qualification": "Fresh exact candidate I pending; H/prior launches and input never replayed",
+  "core_load": "Retained C not repeated and not upgraded",
+  "final_status": "PARTIAL_PROGRESS"
+}

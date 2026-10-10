@@ -44,8 +44,8 @@ impl ManagerLink {
     /// Send the module handshake through the existing authenticated client.
     /// The manager checks that `managed_owner` names a live local module group
     /// before recording this boot. A successful typed response is the only
-    /// path to a spawner capability; a boot id is process-owner identity, not
-    /// Task identity.
+    /// path to a spawner capability. Worker boot identity and process-group
+    /// custody token remain separate from Task identity.
     pub async fn hello(
         &mut self,
         native_ready: bool,
@@ -53,9 +53,8 @@ impl ManagerLink {
         native_scope_key: Option<&str>,
         managed_owner: CandidateManagedOwner,
     ) -> Result<VerifiedModuleHello> {
-        let boot_id = managed_owner.token().to_owned();
+        let boot_id = managed_owner.boot_id().to_owned();
         let owner_record = managed_owner.record().clone();
-        let adapter_image = managed_owner.adapter_image().clone();
         let module_contract = contract::claim()?;
         let response = self
             .client
@@ -92,16 +91,14 @@ impl ManagerLink {
         }
         validate_negotiation(&response, &module_contract)?;
         let managed_owner = VerifiedManagedOwner::accepted_module_hello(
-            &boot_id,
-            owner_record,
-            adapter_image,
+            managed_owner,
             recovery_required.ok_or_else(|| {
                 swarm_contracts::error::Error::new(
                     "MODULE_HELLO_ACK_INVALID",
                     "manager omitted recovery disposition",
                 )
             })?,
-        )?;
+        );
         Ok(VerifiedModuleHello {
             response,
             managed_owner,

@@ -227,3 +227,82 @@ fn idle_poll_stays_a_noop_and_store_errors_propagate() {
     let error = runtime::next(&mut db, &module_principal()).unwrap_err();
     assert_eq!(error.code, "STORE_ERROR");
 }
+
+#[test]
+fn standalone_opencode_hello_projects_v3_options_and_preserves_retained_route() {
+    let mut db = fixture();
+    let directory = std::env::temp_dir();
+    let options = json!({
+        "service_id":"hello-external",
+        "connection_file":directory.join("hello-connection.json"),
+        "expected_version":"2.0.7",
+        "directory":directory,
+        "model":{"id":"step-5-preview-free","providerID":"opencode","variant":"high"},
+    });
+    let route = json!({
+        "alias":"runtime-admission-opencode",
+        "runtime":"module",
+        "module_artifact_id":crate::config::OPENCODE_RUST_ARTIFACT_ID,
+        "workspace_option":"directory",
+        "enabled":true,
+        "native_options":options,
+    });
+    db.execute(
+        "UPDATE bindings SET module_artifact_id=?2,route_json=?3 WHERE binding_id=?1",
+        params![
+            BINDING_ID,
+            crate::config::OPENCODE_RUST_ARTIFACT_ID,
+            model::canonical(&route).unwrap()
+        ],
+    )
+    .unwrap();
+    let hello = json!({"boot_id":"hello-projection-boot","module_artifact_id":crate::config::OPENCODE_RUST_ARTIFACT_ID,"native_ready":false});
+    let plan = runtime::hello_plan(&db, &module_principal(), &hello).unwrap();
+    let reply = runtime::hello_with_config(
+        &mut db,
+        &module_principal(),
+        &hello,
+        &plan,
+        &Config::default(),
+    )
+    .unwrap();
+    let mut expected = options;
+    expected.as_object_mut().unwrap().remove("expected_version");
+    assert_eq!(reply["route"]["native_options"], expected);
+    assert_eq!(
+        operations::get_binding(&db, BINDING_ID, 1).unwrap()["route"],
+        route
+    );
+
+    let before = operations::get_binding(&db, BINDING_ID, 1).unwrap();
+    let mut owned_route = route;
+    owned_route["owned_service"] = json!({"origin":"fresh_owned_service"});
+    owned_route["native_options"] = json!({"directory":directory});
+    db.execute(
+        "UPDATE bindings SET route_json=?2 WHERE binding_id=?1",
+        params![BINDING_ID, model::canonical(&owned_route).unwrap()],
+    )
+    .unwrap();
+    let mut replacement = hello;
+    replacement["boot_id"] = json!("hello-projection-replacement");
+    // OS custody preflight is a supplied fixture fact at this Store seam.
+    replacement["managed_owner"] =
+        json!({"token":"12345678-1234-4234-8234-1234567890ab","process":{"purpose":"module"}});
+    let mut plan = runtime::hello_plan(&db, &module_principal(), &replacement).unwrap();
+    plan["departed"] = json!(true);
+    assert_eq!(
+        runtime::hello_with_config(
+            &mut db,
+            &module_principal(),
+            &replacement,
+            &plan,
+            &Config::default()
+        )
+        .unwrap_err()
+        .code,
+        "OWNED_SERVICE_INTENT_MISSING"
+    );
+    let after = operations::get_binding(&db, BINDING_ID, 1).unwrap();
+    assert_eq!(after["observation"], before["observation"]);
+    assert_eq!(after["state"], before["state"]);
+}

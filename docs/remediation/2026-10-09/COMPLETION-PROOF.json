@@ -12,14 +12,14 @@
       {
         "item": "Connected code and strict production Clippy",
         "status": "verified",
-        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json",
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json",
         "residual_uncertainty": "Retained 24-package gate plus changed-package gates",
-        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases on each platform; four canonical path Windows regressions, process traversal and Linux symlink cases; actual G map loader before/after"
+        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases and five Windows/two Linux path cases on each platform; four new route/environment/boot cases per platform"
       },
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
-        "evidence": "EXECUTION-RESULTS-G.json; canonical bootstrap repair installed H qualification pending",
+        "evidence": "EXECUTION-RESULTS-H.json; exact eight clean3200fc9 packages and genuine H installed execution; later route/environment/boot repair awaiting fresh I",
         "residual_uncertainty": "Per-stage native receipts determine scope; core ACK origin and hook admission remain historical UNKNOWN",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
@@ -39,27 +39,35 @@
       }
     ],
     "changed_files": [
-      "crates/swarm-kernel-host/src/host_module_supervisor.rs",
-      "tools/qualification/New-NativeQualification.ps1",
-      "docs/remediation/2026-10-09/CURRENT-AUDIT.md",
-      "docs/remediation/2026-10-09/QUALIFICATION-PLAN.md",
-      "docs/remediation/2026-10-09/EXECUTION-RESULTS-C.json",
-      "docs/remediation/2026-10-09/IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
-      "docs/remediation/2026-10-09/DESCRIPTOR-REPAIR-EVIDENCE.json",
-      "docs/remediation/2026-10-09/EXECUTION-RESULTS-D.json",
-      "crates/swarm-kernel-host/src/workspace.rs",
-      "docs/remediation/2026-10-09/WORKSPACE-ROUTE-REPAIR-EVIDENCE.json",
-      "docs/remediation/2026-10-09/EXECUTION-RESULTS-E.json",
-      "crates/swarm-supervisor/src/supervisor.rs",
-      "docs/remediation/2026-10-09/MODULE-STARTUP-REPAIR-EVIDENCE.json",
-      "docs/remediation/2026-10-09/EXECUTION-RESULTS-F.json",
-      "crates/swarm-process/src/module_owner.rs",
-      "docs/remediation/2026-10-09/MODULE-MARKER-REPAIR-EVIDENCE.json",
-      "docs/remediation/2026-10-09/EXECUTION-RESULTS-G.json",
       "crates/swarm-bus/src/managed_worker_config.rs",
-      "crates/swarm-observer/src/metrics_cli.rs",
       "crates/swarm-kernel-host/src/host_bus_supervisor.rs",
-      "docs/remediation/2026-10-09/BOOTSTRAP-PATH-REPAIR-EVIDENCE.json"
+      "crates/swarm-kernel-host/src/host_module_supervisor.rs",
+      "crates/swarm-kernel-host/src/store/mod.rs",
+      "crates/swarm-kernel-host/src/store/runtime_admission_tests.rs",
+      "crates/swarm-kernel-host/src/store/runtime.rs",
+      "crates/swarm-kernel-host/src/workspace.rs",
+      "crates/swarm-observer/src/metrics_cli.rs",
+      "crates/swarm-process/src/module_owner.rs",
+      "crates/swarm-supervisor/src/supervisor.rs",
+      "docs/remediation/2026-10-09/BOOTSTRAP-PATH-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/CURRENT-AUDIT.md",
+      "docs/remediation/2026-10-09/DESCRIPTOR-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-C.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-D.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-E.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-F.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-G.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-H.json",
+      "docs/remediation/2026-10-09/IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/MODULE-MARKER-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/MODULE-STARTUP-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/QUALIFICATION-PLAN.md",
+      "docs/remediation/2026-10-09/WORKSPACE-ROUTE-REPAIR-EVIDENCE.json",
+      "modules/antigravity-rust/src/ipc.rs",
+      "modules/antigravity-rust/src/main.rs",
+      "modules/antigravity-rust/src/process.rs",
+      "tools/qualification/New-NativeQualification.ps1"
     ],
     "checks_run": [
       "Windows/Linux strict host production Clippy",
@@ -99,13 +107,21 @@
       "Five Windows and two Linux focused path cases",
       "Actual G ordinary/canonical resolver-map loader before/after without credential resolution",
       "Native OpenAI GPT-6 Luna Max exact path repair review",
-      "408-source baseline readback:399 unchanged and9 changed with affected gates"
+      "408-source baseline readback:399 unchanged and9 changed with affected gates",
+      "Eight exact clean 3200fc9 provenance builds",
+      "Fresh genuine H install and locked OpenCode resource closure",
+      "One H native qualification invocation per adapter with separate run ids",
+      "Ordinary main push and remote SHA readback",
+      "Windows/Linux strict process+supervisor+host and Antigravity production Clippy",
+      "Four focused route/environment/worker-identity cases per platform",
+      "Native OpenAI GPT6 Luna Max bounded source reviews, exact provider/model/effort verified",
+      "H safe worker/owner/binding readbacks without credential/token output"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "Fresh H installed bootstrap; full causal native result, retained dropped-ACK/hook facts and dependency advisory blockers remain",
+    "remaining_uncertainty": "Fresh I installed hello/input; full causal native result, retained C ACK/hook and supported upstream dependency patches remain",
     "final_status": "PARTIAL_PROGRESS"
   }
 }
