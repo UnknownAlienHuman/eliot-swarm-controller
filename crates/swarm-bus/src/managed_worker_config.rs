@@ -150,6 +150,9 @@ fn reject_link_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in absolute.components() {
         current.push(component.as_os_str());
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if is_link_or_reparse(&metadata) => {
                 return Err(Error::new(
@@ -182,4 +185,26 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_path_canonical_managed_config_is_readable() {
+        let path =
+            std::env::temp_dir().join(format!("bus-config-path-{}.json", uuid::Uuid::new_v4()));
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
+        swarm_process::private_permissions(&path, false).unwrap();
+        reject_link_components(&path).unwrap();
+        reject_link_components(&fs::canonicalize(&path).unwrap()).unwrap();
+        fs::remove_file(path).unwrap();
+    }
 }

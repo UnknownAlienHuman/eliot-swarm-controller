@@ -66,6 +66,11 @@ fn reject_link_components(path: &Path, allow_missing_tail: bool) -> Result<()> {
             return Err(Error::invalid("path contains traversal components"));
         }
         current.push(component.as_os_str());
+        // A Windows drive/UNC prefix needs its following root separator before
+        // it names a filesystem object. Check that full root on the next step.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || is_reparse(&metadata) {
@@ -1253,5 +1258,67 @@ fn canonical_json(value: &Value) -> Result<String> {
             }
             Ok(format!("{{{}}}", fields.join(",")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PathFixture {
+        directory: PathBuf,
+        file: PathBuf,
+    }
+
+    impl PathFixture {
+        fn new() -> Self {
+            let directory = env::temp_dir().join(format!("module-path-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&directory).unwrap();
+            private_permissions(&directory, true).unwrap();
+            let file = directory.join("fixture.json");
+            fs::write(&file, b"{}").unwrap();
+            private_permissions(&file, false).unwrap();
+            Self { directory, file }
+        }
+    }
+
+    impl Drop for PathFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_path_canonical_file_passes_the_same_guard_as_ordinary_file() {
+        let fixture = PathFixture::new();
+        reject_link_components(&fixture.file, false).unwrap();
+        reject_link_components(&fs::canonicalize(&fixture.file).unwrap(), false).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_path_parent_traversal_remains_refused() {
+        let fixture = PathFixture::new();
+        let path = fixture
+            .file
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("fixture.json");
+        assert!(reject_link_components(&path, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_path_symlink_ancestor_remains_refused() {
+        let fixture = PathFixture::new();
+        let link = fixture.directory.join("link");
+        std::os::unix::fs::symlink(&fixture.directory, &link).unwrap();
+        assert_eq!(
+            reject_link_components(&link.join("fixture.json"), false)
+                .unwrap_err()
+                .code,
+            "MODULE_OWNER_PATH_LINK"
+        );
     }
 }

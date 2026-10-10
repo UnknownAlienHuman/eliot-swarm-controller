@@ -329,6 +329,9 @@ fn reject_link_components(path: &Path) -> Result<()> {
             return Err(input_error());
         }
         current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&current).map_err(|_| input_error())?;
         if metadata.file_type().is_symlink() || is_reparse(&metadata) {
             return Err(input_error());
@@ -471,4 +474,30 @@ fn input_error() -> Error {
         "OBSERVER_METRICS_INPUT_INVALID",
         "a selected private process receipt is outside the bounded supported schema",
     )
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_path_canonical_metrics_receipt_is_readable() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("observer-path-{}-{nonce}.json", std::process::id()));
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
+        swarm_process::private_permissions(&path, false).unwrap();
+        reject_link_components(&path).unwrap();
+        reject_link_components(&std::fs::canonicalize(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }

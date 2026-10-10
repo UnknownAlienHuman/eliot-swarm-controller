@@ -1,0 +1,88 @@
+{
+  "schema": "eliot.v27_bootstrap_path_repair.v1",
+  "observed_at_utc": "2026-10-10T07:43:20.7685422Z",
+  "prior_candidate": "fe248d7a4447fc6e65a75a6d21ce485eb20b962f",
+  "prior_execution": "EXECUTION-RESULTS-G.json",
+  "observed_g": "Shared scope marker exists, but exact owner helpers exit before owner publication; modules isolated MODULE_LAUNCH_RESULT_MISSING, dispatch0 and graceful host exit. Early helper stderr code is not claimed as received.",
+  "diagnosis": "Module bootstrap link guard probes the bare canonical Windows prefix before RootDir. Actual ordinary resolver map load passes; canonical load returns IO_ERROR, with bare-prefix OS error1. Three other absolute-path guards had the same metadata loop.",
+  "changed_source": {
+    "crates/swarm-bus/src/managed_worker_config.rs": {
+      "baseline_sha256": "26fa8b6f8437998e55e5e650dd3fa96a5fad520570e61071d3c5e9cdea99b43f",
+      "current_sha256": "b20093732eedad40b20be8e3620d5241c8ad033b63496c4cb4a1ad4abf48730d"
+    },
+    "crates/swarm-kernel-host/src/host_bus_supervisor.rs": {
+      "baseline_sha256": "67407990154ef57f1e21ec3dd5a261c88322391d634e84760e70ee76d54ee4e3",
+      "current_sha256": "07018a3cc27ef318b5795accd0977605ae1508670da9e8a60679500845110b5e"
+    },
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+    },
+    "crates/swarm-kernel-host/src/workspace.rs": {
+      "baseline_sha256": "03d1d805b0d49e88e1d22daaac77405b200e03ae26b58692d5daf949edf14549",
+      "current_sha256": "30b0609583f16907486a06d69bd8a5e3af82e779458d86289413b8614722643a"
+    },
+    "crates/swarm-observer/src/metrics_cli.rs": {
+      "baseline_sha256": "db6edbde6920c9d578b14c0a32bb0c129546eab55cd06d56d668c690c647ffba",
+      "current_sha256": "211d7445414a9813d4f251d788a8b2030de8adda184914c18279bddae4432bc8"
+    },
+    "crates/swarm-process/src/module_owner.rs": {
+      "baseline_sha256": "07e1c05a5993f5005941fc66a097d10927a7a7ecf1da3f8138a78e7653226b17",
+      "current_sha256": "78e8580809c4e3237f62135ecc7da511612dbdf5cdad3b1649ab6417a399acea"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    },
+    "crates/swarm-supervisor/src/descriptor.rs": {
+      "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+      "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+    },
+    "crates/swarm-supervisor/src/supervisor.rs": {
+      "baseline_sha256": "d81cfef59a1730a7a957d887c923da99c107c2cbb9a9fb27a9cac16efc6aa676",
+      "current_sha256": "3c34c960acccc673ff81543aa6bda0ccf5ceea29e9cd7c0d047d1b897cb929d0"
+    }
+  },
+  "unchanged_baseline_source_count": 399,
+  "logs": {
+    "windows-bootstrap-path-clippy.log": "af4804e5abf3f46f4dab47b9a8a468bdec17e31f2852c073907f23f1d26ce2c9",
+    "windows-bootstrap-path-final-core-clippy.log": "68834e1c2948cef9a4f946343be5532d5c11b9a2c2da6c2e5fc03b75296a235f",
+    "windows-bootstrap-path-tests.log": "ee01a867d0fcff8e8d16c80430a70d2847a674d1b830e344a03482a7b2404dbd",
+    "linux-bootstrap-path-clippy.log": "6ba259fb72bb9664b98c25f052c68894f46cf3644e20c7ca1a62b383ac047fac",
+    "linux-bootstrap-path-final-core-clippy.log": "91d757e8c94d2affeb5b6176be122261c3035e9bfc2bda8a5377dc98753a9357",
+    "linux-bootstrap-path-tests.log": "6bbf6cc2d38a0b8120a1968dbd3f8ef6df2ea02f7401355108f96e5a3e67bdb4"
+  },
+  "understanding_proof_sha256": "ed97669b9c0a78b919f44d7c90dcbc6ff3901eac85f5a378ba118f587466823b",
+  "exact_map_probe": {
+    "before_log_sha256": "45d1a8ea2431be27e27e0e74d07010ffafa157955a1fd82b9cc2e4d1d8e6cad5",
+    "after_log_sha256": "7e4373261b56bde29880ba65d252e29c0365725651d640981a84b4ee7806a97c",
+    "source_sha256": "144106fa09c6b796799e03650bab92a1a9eae5534fd468fd30e39f59a5ed698c",
+    "before_linkage_sha256": "78cb64178e7b0a00fc58aed033f059514ddc0f8bbc719fb2436ae8169e220ec7",
+    "after_linkage_sha256": "7d02ab3261e022a36e6943cb3e66457f107378e8b290de1c1b4af7ec11c3a5b7",
+    "after": "Both exact G resolver maps PASS in ordinary/canonical spellings",
+    "credentials_resolved": false,
+    "native_process_started": false,
+    "retained_g_state_mutated": false
+  },
+  "review": {
+    "model": "gpt-6-luna",
+    "reasoning_effort": "max",
+    "provider": "openai",
+    "classification": "AuditFindingCandidate",
+    "result": "**PASS** — Each guard now defers metadata lookup for the Windows prefix, then checks the rooted path and following components. The existing traversal, link/reparse, and missing-tail policies remain intact: see `module_owner.rs:68–86`, `managed_worker_config.rs:152–166`, `metrics_cli.rs:331–338`, and `host_bus_supervisor.rs:1886–1900`. The prefix handling matches the existing private-permissions loop at `permissions.rs:155–169`.\n\nThe supplied tests cover ordinary and canonical Windows paths, plus parent traversal and Unix symlink refusal in the process core. I found no introduced path-admission or custody risk.",
+    "output_sha256": "93e3d95d61c1c77bd506b8d58e8f6ef0ce6a4e828bcff1d577f4bc6434a39adb",
+    "identity_readback_sha256": "a8bece87ec5e1e43c81b10d8702050577762f133fdf554d26c89cd5083b42051",
+    "source_delivery": "Exact current diff and bounded source; no reviewer tools or native calls"
+  },
+  "invariants": [
+    "Only unfinished Prefix metadata is deferred; RootDir and each following component remain checked",
+    "Absolute/traversal/link/reparse/missing-tail and error policies retained",
+    "Typed Path components, no raw prefix stripping or textual path normalization",
+    "Shared marker, exact owner family departure, durable attempt and input no-replay gates preserved",
+    "Relative private-tree loops unchanged",
+    "G operation/state is historical and never replayed"
+  ],
+  "production_clippy": "Fresh Windows/Linux strict process+bus+observer+host library/binaries PASS; final process gate repeated only after test fixture cleanup; prior unaffected source gates retained",
+  "regression": "Windows5 focused cases across four guards; Linux2 process parent/symlink cases. Host test compilation retains21 pre-existing warnings; production strict Clippy is clean, not an all-targets claim.",
+  "installed_verification": "Fresh H candidate pending; G failure not promoted by static repair"
+}

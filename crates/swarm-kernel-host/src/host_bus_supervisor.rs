@@ -1885,6 +1885,9 @@ fn reject_reparse_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if is_link_or_reparse(&metadata) => {
                 return Err(Error::new(
@@ -2004,6 +2007,17 @@ mod tests {
     const MISSING_RECEIPT_SCOPE: &str = "bus-script-no-receipt";
     const CHILD_RELEASE_ENV: &str = "ELIOT_SWARM_BUS_SUPERVISOR_CHILD_RELEASE";
     const CHILD_TEST: &str = "host_bus_supervisor::tests::child_waits_for_release";
+
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_path_canonical_dispatcher_pin_is_readable() {
+        let root = test_root("canonical-dispatcher-path");
+        let file = root.join("dispatcher.exe");
+        fs::write(&file, b"fixture").unwrap();
+        reject_reparse_components(&file).unwrap();
+        reject_reparse_components(&fs::canonicalize(&file).unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     type FailedSlotConstruction = (DeclaredServiceScope, PathBuf);
 

@@ -12,14 +12,14 @@
       {
         "item": "Connected code and strict production Clippy",
         "status": "verified",
-        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json",
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json",
         "residual_uncertainty": "Retained 24-package gate plus changed-package gates",
-        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and six actual lifecycle/custody cases on each platform; nine marker/lifecycle/custody regressions on each platform"
+        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases on each platform; four canonical path Windows regressions, process traversal and Linux symlink cases; actual G map loader before/after"
       },
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
-        "evidence": "EXECUTION-RESULTS-F.json; shared module marker repair installed G qualification pending",
+        "evidence": "EXECUTION-RESULTS-G.json; canonical bootstrap repair installed H qualification pending",
         "residual_uncertainty": "Per-stage native receipts determine scope; core ACK origin and hook admission remain historical UNKNOWN",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
@@ -54,7 +54,12 @@
       "docs/remediation/2026-10-09/MODULE-STARTUP-REPAIR-EVIDENCE.json",
       "docs/remediation/2026-10-09/EXECUTION-RESULTS-F.json",
       "crates/swarm-process/src/module_owner.rs",
-      "docs/remediation/2026-10-09/MODULE-MARKER-REPAIR-EVIDENCE.json"
+      "docs/remediation/2026-10-09/MODULE-MARKER-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-G.json",
+      "crates/swarm-bus/src/managed_worker_config.rs",
+      "crates/swarm-observer/src/metrics_cli.rs",
+      "crates/swarm-kernel-host/src/host_bus_supervisor.rs",
+      "docs/remediation/2026-10-09/BOOTSTRAP-PATH-REPAIR-EVIDENCE.json"
     ],
     "checks_run": [
       "Windows/Linux strict host production Clippy",
@@ -85,13 +90,22 @@
       "Nine actual marker/lifecycle/custody cases on Windows/Linux",
       "Exact F resolver-map parse and common marker refusal offline probe without credential resolution",
       "Native OpenAI GPT-6 Luna Max exact marker repair review",
-      "408-source baseline readback:402 unchanged and 6 changed with affected gates"
+      "408-source baseline readback:402 unchanged and 6 changed with affected gates",
+      "Eight exact clean fe248d7 provenance builds",
+      "Fresh genuine G install and locked OpenCode resource closure",
+      "One G native qualification invocation per adapter with separate run ids",
+      "Ordinary main push and remote SHA readback",
+      "Windows/Linux strict process+bus+observer+host production Clippy for canonical path guards",
+      "Five Windows and two Linux focused path cases",
+      "Actual G ordinary/canonical resolver-map loader before/after without credential resolution",
+      "Native OpenAI GPT-6 Luna Max exact path repair review",
+      "408-source baseline readback:399 unchanged and9 changed with affected gates"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "Fresh G installed native startup; full causal native result, retained dropped-ACK/hook facts and dependency advisory blockers remain",
+    "remaining_uncertainty": "Fresh H installed bootstrap; full causal native result, retained dropped-ACK/hook facts and dependency advisory blockers remain",
     "final_status": "PARTIAL_PROGRESS"
   }
 }
