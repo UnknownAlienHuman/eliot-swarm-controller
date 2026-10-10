@@ -263,7 +263,12 @@ fn is_reparse(_metadata: &fs::Metadata) -> bool {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+    use std::{
+        ffi::c_void,
+        os::windows::ffi::OsStrExt,
+        path::{Component, Prefix},
+        ptr,
+    };
     use swarm_contracts::error::Error;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, LocalFree},
@@ -318,6 +323,56 @@ mod windows {
         }
     }
 
+    pub(super) fn win32_path(path: &Path) -> Result<Vec<u16>> {
+        let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let prefix = path
+            .components()
+            .next()
+            .and_then(|component| match component {
+                Component::Prefix(prefix) => Some(prefix.kind()),
+                _ => None,
+            });
+        let mut encoded = Vec::with_capacity(raw.len() + 8);
+        let mut normalize_separators = false;
+        match prefix {
+            Some(Prefix::Disk(_)) if path.is_absolute() => {
+                encoded.extend("\\\\?\\".encode_utf16());
+                encoded.extend_from_slice(&raw);
+                normalize_separators = true;
+            }
+            Some(Prefix::UNC(..)) if path.is_absolute() => {
+                if raw.len() < 2 || !is_separator(raw[0]) || !is_separator(raw[1]) {
+                    return Err(Error::invalid("invalid absolute UNC path for Win32 API"));
+                }
+                encoded.extend("\\\\?\\UNC\\".encode_utf16());
+                encoded.extend_from_slice(&raw[2..]);
+                normalize_separators = true;
+            }
+            Some(Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..) | Prefix::Verbatim(_)) => {
+                encoded.extend_from_slice(&raw);
+            }
+            Some(Prefix::DeviceNS(_)) | Some(Prefix::Disk(_)) | Some(Prefix::UNC(..)) | None => {
+                encoded.extend_from_slice(&raw)
+            }
+        }
+        if normalize_separators {
+            for unit in &mut encoded {
+                if *unit == b'/' as u16 {
+                    *unit = b'\\' as u16;
+                }
+            }
+        }
+        if encoded.contains(&0) {
+            return Err(Error::invalid("Windows API path contains a NUL character"));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    fn is_separator(unit: u16) -> bool {
+        unit == b'\\' as u16 || unit == b'/' as u16
+    }
+
     fn with_descriptor<T>(inherit: bool, f: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
         let flags = if inherit { "OICI" } else { "" };
         let sddl: Vec<u16> = format!("D:P(A;{flags};GA;;;{})", current_sid()?)
@@ -347,12 +402,8 @@ mod windows {
         use windows_sys::Win32::Storage::FileSystem::{
             MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
         };
-        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+        let source = win32_path(source)?;
+        let destination = win32_path(destination)?;
         let mut flags = MOVEFILE_WRITE_THROUGH;
         if replace {
             flags |= MOVEFILE_REPLACE_EXISTING;
@@ -367,7 +418,7 @@ mod windows {
         use windows_sys::Win32::Security::{
             DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
         };
-        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path = win32_path(path)?;
         with_descriptor(directory, |descriptor| {
             // SAFETY: path is NUL-terminated and descriptor lives throughout
             // the SetFileSecurityW call.
@@ -380,5 +431,79 @@ mod windows {
             };
             if ok == 0 { Err(last_error()) } else { Ok(()) }
         })
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    struct RemoveTestDirectory(PathBuf);
+
+    impl Drop for RemoveTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_private_new_supports_long_windows_paths() {
+        fn path_string(path: &Path) -> String {
+            let encoded = super::windows::win32_path(path).expect("encode Win32 path");
+            String::from_utf16(&encoded[..encoded.len() - 1]).expect("decode Win32 path")
+        }
+
+        assert_eq!(
+            path_string(Path::new(r"C:\runtime\credentials.json")),
+            r"\\?\C:\runtime\credentials.json"
+        );
+        assert_eq!(
+            path_string(Path::new(r"C:/runtime/credentials.json")),
+            r"\\?\C:\runtime\credentials.json"
+        );
+        assert_eq!(
+            path_string(Path::new(r"\\server\share\credentials.json")),
+            r"\\?\UNC\server\share\credentials.json"
+        );
+        assert_eq!(
+            path_string(Path::new(r"C:runtime\credentials.json")),
+            r"C:runtime\credentials.json"
+        );
+        assert_eq!(
+            path_string(Path::new(r"relative/credentials.json")),
+            r"relative/credentials.json"
+        );
+        assert_eq!(
+            path_string(Path::new(r"\\?\C:\runtime/credentials.json")),
+            r"\\?\C:\runtime/credentials.json"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "swarm-process-permissions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _cleanup = RemoveTestDirectory(root.clone());
+        let parent = root.join("p".repeat(160));
+        fs::create_dir_all(&parent).expect("create long-path test directory");
+        let target = parent.join("credentials.json");
+        let temp = private_temp_path(&target).expect("build private temporary path");
+        let temp_path_length = temp.as_os_str().encode_wide().count();
+        assert!(
+            temp_path_length > 260,
+            "expected a path over MAX_PATH, got {temp_path_length} UTF-16 code units"
+        );
+
+        write_private_new(&target, b"private credentials")
+            .expect("write private file at a long Windows path");
+        assert_eq!(
+            fs::read(&target).expect("read published private file"),
+            b"private credentials"
+        );
+        assert!(write_private_new(&target, b"replacement").is_err());
+        assert_eq!(
+            fs::read(&target).expect("read file after rejected replacement"),
+            b"private credentials"
+        );
     }
 }

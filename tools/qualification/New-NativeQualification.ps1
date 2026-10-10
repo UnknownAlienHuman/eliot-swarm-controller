@@ -984,8 +984,8 @@ function Get-InstalledModuleFacts {
             Stop-Qualification 'MODULE_CONFIG_SCHEMA_MISMATCH'
         }
     }
-    $commandSchemas = @($descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
-    $eventSchemas = @($descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
+    $commandSchemas = @($descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $eventSchemas = @($descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
     $expectedCommandSchemas = @($Contract.command_schemas | Sort-Object)
     $expectedEventSchemas = @($Contract.event_schemas | Sort-Object)
     if (($commandSchemas -join ',') -cne ($expectedCommandSchemas -join ',') -or
@@ -1553,10 +1553,10 @@ try {
     $expectedCaps = @($contract.capabilities | Sort-Object)
     $expectedCommands = @($contract.command_schemas | Sort-Object)
     $expectedEvents = @($contract.event_schemas | Sort-Object)
-    $catalogCommands = @($descriptorEntry[0].command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
-    $catalogEvents = @($descriptorEntry[0].event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
-    $localCommands = @($module.descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
-    $localEvents = @($module.descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, $_.sha256 } | Sort-Object)
+    $catalogCommands = @($descriptorEntry[0].command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $catalogEvents = @($descriptorEntry[0].event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $localCommands = @($module.descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $localEvents = @($module.descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
     $configSchemaMatches = (ConvertTo-Json -InputObject $descriptorEntry[0].config_schema -Depth 16 -Compress) -ceq (ConvertTo-Json -InputObject $module.descriptor.config_schema -Depth 16 -Compress)
     $protocolMatches = (ConvertTo-Json -InputObject $descriptorEntry[0].protocol -Depth 16 -Compress) -ceq (ConvertTo-Json -InputObject $module.descriptor.protocol -Depth 16 -Compress)
     if (($catalogCaps -join ',') -cne ($expectedCaps -join ',') -or
@@ -1827,6 +1827,13 @@ try {
     }
 }
 catch {
+    $failure = $_
+    if (-not [string]::IsNullOrWhiteSpace($script:RunDirectory)) {
+        try {
+            Write-PrivateJson -Path (Join-Path $script:RunDirectory 'harness-error.json') -Value ([ordered]@{ message = $failure.Exception.Message; position = $failure.InvocationInfo.PositionMessage; stack = $failure.ScriptStackTrace })
+            $script:Report.limits.private_harness_diagnostic = 'saved'
+        } catch { $script:Report.limits.private_harness_diagnostic = 'write_failed' }
+    }
     if ($null -eq $script:FailureCode) { $script:FailureCode = 'HARNESS_FAILED' }
     if ($script:Report.status -eq 'running') { $script:Report.status = 'blocked' }
     if ($script:Stages.Count -eq 0 -or $script:Stages[$script:Stages.Count - 1].status -notin @('blocked', 'unknown')) {

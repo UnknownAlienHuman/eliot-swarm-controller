@@ -1,0 +1,253 @@
+{
+  "schema": "eliot.v27_execution_results.v1",
+  "observed_at_utc": "2026-10-10T04:57:25.7757663Z",
+  "candidate_commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+  "binding_receipt_sha256": "8e023b624eb21607e3c73992d5fc18a408a1d48953c1872611cb6a73cffc6108",
+  "build_packages": [
+    {
+      "package": "antigravity-module",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "121411ac7ee07e57feee65d16f393846310b082391796d4d7faaa3d4c2c0c7db"
+    },
+    {
+      "package": "host-launcher",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "6812935ae2994876b20c8f7db8cdcb021c341e0a8f969d1c05b7328fbcf1fb8b"
+    },
+    {
+      "package": "host-runtime",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "ac361c749e0ebd1f4725767d7da4c7fb7666f8b1593804c1b317e24172e8af74"
+    },
+    {
+      "package": "host-supervisor",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "79caab8597ad599820d1969840b68aee9d397e9f45a24dd1fba36e07df8033d3"
+    },
+    {
+      "package": "opencode-module",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "a2699099445253158c6141f94d65bc54f36a6143c3a847070c4d37f26c1125a0"
+    },
+    {
+      "package": "process-owner",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "e340613d1445ac170cdf98ceb74a8afdee0d9841531ac7df6498289152139a18"
+    },
+    {
+      "package": "public-cli",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "67d568182e9483937f2d8463f139cec9ab76cb7ba2df936d8c70539506440fba"
+    },
+    {
+      "package": "swarm-mcp",
+      "commit": "b0ebe264a94d785136d85f467403eb23abce15b0",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "1745f512a9e6831301169b2057268b1efc2ca1c2000cb6b5f0ce1126fd9aea5e"
+    }
+  ],
+  "host_resource_install": {
+    "receipt_sha256": "1afe3a73c740a829abeabdf421f52872c6049419b62bbea858576e8407765290",
+    "dependency_tree_sha256": "396ef448a1494e29ae8a599ceee7827afeb88787487f88394cbf22e90e9fd486",
+    "dependency_file_count": 34060,
+    "unchanged_after_runner": true
+  },
+  "host_load": {
+    "status": "PASS",
+    "receipt_sha256": "e160380acdb6e268bb8d1340875c17fab2f0676e63f38d00ce356b151838518d",
+    "scope": "host-only fixture load; no native runtimes, bridges or model calls",
+    "host_image_sha256": "ea9caf4818a0a2706f084a3f759e80336805223da793cba64749a8c8de98b9d7",
+    "parameters": {
+      "clients": 200,
+      "senders": 32,
+      "duration_seconds": 20.0,
+      "tasks": 200,
+      "ipc_defaults": "max_connections=256, max_inflight_per_connection=8, max_frame_bytes=1048576 (config.rs defaults; no --config passed)"
+    },
+    "registration": {
+      "clients": 200,
+      "seconds": 0.425
+    },
+    "event_load": {
+      "seconds": 24.214,
+      "senders": 32,
+      "consumers": 168,
+      "message_send_ok": 3165,
+      "message_send_errors": 0,
+      "error_codes": {},
+      "events_per_second": 130.7,
+      "consumer_message_read_calls": 1947,
+      "consumer_items_read": 2543
+    },
+    "verification_drain": {
+      "events_after_baseline": 3165,
+      "message_send_events": 3165,
+      "matches_admissions": true,
+      "seconds": 0.277,
+      "events_per_second": 11408.6
+    },
+    "status_latency_under_load": {
+      "count": 350,
+      "min_ms": 0.449,
+      "p50_ms": 0.912,
+      "p95_ms": 1.239,
+      "p99_ms": 1.44,
+      "max_ms": 3.844,
+      "mean_ms": 0.932
+    },
+    "host_rss": {
+      "idle_bytes": 18591744,
+      "peak_bytes": 54919168,
+      "final_bytes": 40906752
+    },
+    "shutdown_disposition": "owned_fixture_host_stdin_eof",
+    "host_exit_code": 0
+  },
+  "core_failure": {
+    "receipt_sha256": "f5c3b7653ff04b02ce77610914673b587d5e22505cb73113d9712e39d5ec8f69",
+    "execution_status": "completed",
+    "qualification": "not_qualified",
+    "scenarios": [
+      {
+        "name": "manager-dropped-ack-restart",
+        "run_id": "manager-dropped-ack-restart-ad7e523dbd294a3098201a4cf3d5a65a",
+        "status": "blocked",
+        "code": "IO_ERROR",
+        "facts": {
+          "host_pid": 53092,
+          "host_image_sha256": "ea9caf4818a0a2706f084a3f759e80336805223da793cba64749a8c8de98b9d7",
+          "host_epoch_before": 1
+        }
+      },
+      {
+        "name": "manager-durable-request-conflict",
+        "run_id": "manager-durable-request-conflict-23e82a5bbfa74a558f174b95d6048ff2",
+        "status": "blocked",
+        "code": "IO_ERROR",
+        "facts": {
+          "host_pid": 63184,
+          "host_image_sha256": "ea9caf4818a0a2706f084a3f759e80336805223da793cba64749a8c8de98b9d7"
+        }
+      },
+      {
+        "name": "hook-callback-restart-dedup",
+        "run_id": "hook-callback-restart-dedup-6182bba289b74a75a5d8bf38757ff19f",
+        "status": "unknown",
+        "code": "HOOK_EVENT_NOT_UNIQUE_AFTER_RESTART",
+        "facts": {
+          "host_pid": 70200,
+          "host_image_sha256": "ea9caf4818a0a2706f084a3f759e80336805223da793cba64749a8c8de98b9d7",
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "callback_ack": "intentionally_not_read",
+          "source_id": "8ead3a59-d34e-4be4-a7b8-8e3aa00961d1",
+          "commit_oid": "4196f52796c9867b9161bac216c77cf28eb5e41e",
+          "host_restart_pid": 81268,
+          "host_restart_image_sha256": "ea9caf4818a0a2706f084a3f759e80336805223da793cba64749a8c8de98b9d7",
+          "host_epoch_after": 2,
+          "fixture_hook_revoked_and_restored": true
+        }
+      },
+      {
+        "name": "optional-worker-observation",
+        "run_id": "optional-worker-observation-5e71f43d318e446e8ebbef59e9032c75",
+        "status": "blocked",
+        "code": "IO_ERROR",
+        "facts": {
+          "host_pid": 86616,
+          "host_image_sha256": "ea9caf4818a0a2706f084a3f759e80336805223da793cba64749a8c8de98b9d7"
+        }
+      }
+    ]
+  },
+  "native": [
+    {
+      "adapter": "OpenCode",
+      "run_id": "e5a7f4fd-507d-46d2-9aa9-7316781397c6",
+      "receipt_sha256": "809839787bb0600df87fcd44ca6482661abce1b98510dd81bab01c1c092890e2",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "blocked",
+          "code": "HARNESS_FAILED"
+        }
+      ]
+    },
+    {
+      "adapter": "Antigravity",
+      "run_id": "4d404b18-d1ba-46bc-90ed-a5efb6ffba43",
+      "receipt_sha256": "0f15509b9fcccfde63410d3eff4d4628ad72736451c3bf48a357e77aaaf8b21c",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "isolated_host",
+          "status": "blocked",
+          "code": "HOST_SUPERVISOR_NOT_READY"
+        }
+      ]
+    }
+  ],
+  "interpretation": "First current harness/installed execution of b0ebe26. Host load verified; fault and native qualification remain open. No native task dispatch or model invocation proved; subsequent repairs require separate execution evidence.",
+  "follow_up_verifiers": {
+    "windows_private_file_publication": {
+      "status": "PASS_FOR_OWNED_SCOPE",
+      "source_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b",
+      "test": "permissions::tests::write_private_new_supports_long_windows_paths",
+      "regression": "real Windows ACL/private temp/publication path exceeds MAX_PATH; repeat publication rejected without replacing bytes; relative/verbatim distinctions preserved",
+      "production_clippy": {
+        "package": "swarm-process",
+        "status": "PASS",
+        "exit_code": 0,
+        "source_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b",
+        "source_unchanged": true,
+        "log_sha256": "82523ecdeefe029962a365f30b6aabc02af8548b153c85f1de2a0528fbaf2419",
+        "flags": "--locked --lib --bins --no-deps -- -D warnings",
+        "observed_at_utc": "2026-10-10T05:08:30.2913686Z"
+      },
+      "qualification": "fresh installed core/native execution pending"
+    },
+    "native_optional_schema_digest": {
+      "status": "PASS",
+      "strict_mode": "Latest",
+      "module_id": "eliot.opencode.v2",
+      "descriptor_sha256": "e11c1045e5b81e5b88d825164dff722efcebb6cfdc54b49eb840f537c8400475",
+      "verified": "Actual installed OpenCode descriptor with absent optional schema sha256; mandatory config schema hash, coordinate, receipt, capabilities and exact schema sets retained",
+      "source_sha256": "1d9c4baaad28c635b35ac578e71aa35bd4af0a812832825bb4c357a1eba42178",
+      "parser": "PASS",
+      "native_calls": 0,
+      "recorded_at_utc": "2026-10-10T04:56:08.9795825Z"
+    },
+    "hook_fact_readback": {
+      "status": "UNKNOWN",
+      "report_sha256": "e474b72dc795e859abca6e1afff16ba65957fe9ab24d8c65c66a0b2dda43ab87",
+      "exact_source_commit_rows": 0,
+      "consumer_contract_mismatch_proved": false,
+      "models_or_hosts_started_by_reviewer": false
+    }
+  }
+}
