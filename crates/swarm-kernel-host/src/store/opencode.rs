@@ -21,11 +21,12 @@ use std::{
 use tokio::{sync::watch, task::JoinHandle};
 
 fn bindings(db: &Connection, service: Option<&str>) -> Result<Vec<Value>> {
-    let mut stmt=db.prepare("SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id=?2 ORDER BY created_at_ms,binding_id")?;
+    let mut stmt=db.prepare("SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id IN (?2,?3) ORDER BY created_at_ms,binding_id")?;
     let ids = stmt
-        .query_map(params![oc::RUNTIME, oc::ARTIFACT_ID], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?
+        .query_map(
+            params![oc::RUNTIME, oc::ARTIFACT_ID, oc::TASK_PROMPT_ARTIFACT_ID],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut result = Vec::new();
     for (id, generation) in ids {
@@ -41,13 +42,14 @@ fn bindings(db: &Connection, service: Option<&str>) -> Result<Vec<Value>> {
 
 fn owned_bindings(db: &Connection) -> Result<Vec<Value>> {
     let mut stmt = db.prepare(
-        "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id IN (?2,?3) AND json_type(route_json,'$.owned_service')='object' ORDER BY created_at_ms,binding_id,generation",
+        "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id IN (?2,?3,?4) AND json_type(route_json,'$.owned_service')='object' ORDER BY created_at_ms,binding_id,generation",
     )?;
     let ids = stmt
         .query_map(
             params![
                 oc::RUNTIME,
                 oc::ARTIFACT_ID,
+                oc::TASK_PROMPT_ARTIFACT_ID,
                 crate::config::OPENCODE_RUST_ARTIFACT_ID
             ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
@@ -72,7 +74,7 @@ fn active_owned_binding(db: &Connection, id: &str, generation: i64) -> Result<Op
     let active: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE binding_id=?1 AND generation=?2
           AND released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?3
-          AND module_artifact_id IN (?4,?5)
+          AND module_artifact_id IN (?4,?5,?6)
           AND json_type(route_json,'$.owned_service')='object'
           AND json_type(state_json,'$.module_contract_selector') IS NULL)",
         params![
@@ -80,6 +82,7 @@ fn active_owned_binding(db: &Connection, id: &str, generation: i64) -> Result<Op
             generation,
             oc::RUNTIME,
             oc::ARTIFACT_ID,
+            oc::TASK_PROMPT_ARTIFACT_ID,
             crate::config::OPENCODE_RUST_ARTIFACT_ID
         ],
         |row| row.get(0),
@@ -131,8 +134,12 @@ fn attach(
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let b = operations::get_binding(&tx, id, generation)?;
     if !b["released_at_ms"].is_null()
-        || b["route"]["runtime"] != oc::RUNTIME
-        || b["route"]["module_artifact_id"] != oc::ARTIFACT_ID
+        || crate::config::opencode_route_kind(
+            b["route"]["runtime"].as_str().unwrap_or_default(),
+            b["route"]["module_artifact_id"]
+                .as_str()
+                .unwrap_or_default(),
+        ) != Some(crate::config::OpenCodeRouteKind::Builtin)
     {
         return Err(Error::new(
             "BINDING_CLOSED",

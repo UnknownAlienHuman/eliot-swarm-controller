@@ -47,12 +47,14 @@ workspaceRoot = 'C:\Projects\YourRepository'
 modelId = 'gemini-3.8-flash-high'
 reasoningEffort = 'high'
 
-# Disabled, built-in Rust attach-only route. See modules/opencode/README.md.
+# Disabled, built-in Rust attach-only route for new TaskPrompt bindings.
+# Artifact .1 remains available only to retained bindings and Operations.
+# See modules/opencode/README.md.
 # Replace every placeholder, keeping credentials in the private connection file.
 [[routes]]
 alias = 'opencode-manager'
 runtime = 'opencode_v2'
-module_artifact_id = 'eliot-opencode-v2.http.1'
+module_artifact_id = 'eliot-opencode-v2.http.2'
 enabled = false
 [routes.native_options]
 service_id = 'my-local-opencode-store'

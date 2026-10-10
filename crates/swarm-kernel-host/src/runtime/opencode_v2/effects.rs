@@ -10,6 +10,11 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
+use swarm_contracts::{
+    module_catalog::{ArtifactId, ArtifactIdentity, ArtifactVersion, ModuleId, ProtocolVersion},
+    runtime::{ModuleReceiptIdentity, TaskDispatchAdmissionReceipt, TaskDispatchContext},
+    task_prompt::TaskPromptEnvelopeV1,
+};
 
 pub(super) fn outcome(
     command: &RuntimeCommand,
@@ -81,7 +86,162 @@ fn validate_loop_step(command: &RuntimeCommand) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn prompt(command: &RuntimeCommand) -> Result<String> {
+struct ValidatedTaskPrompt {
+    envelope: TaskPromptEnvelopeV1,
+    context: TaskDispatchContext,
+    module_receipt: ModuleReceiptIdentity,
+}
+
+fn validated_task_prompt(command: &RuntimeCommand) -> Result<ValidatedTaskPrompt> {
+    if command.input.get("task_snapshot").is_some()
+        || command.input.get("task_snapshot_canonical").is_some()
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt dispatch must not include a raw Task snapshot",
+        ));
+    }
+    let envelope: TaskPromptEnvelopeV1 =
+        serde_json::from_value(command.input["task_prompt"].clone()).map_err(|_| {
+            Error::new(
+                "TASK_PROMPT_INVALID",
+                "Store TaskPrompt envelope is missing or malformed",
+            )
+        })?;
+    envelope.validate_shape().map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "Store TaskPrompt envelope is invalid",
+        )
+    })?;
+    let prompt_sha256 = model::digest(envelope.prompt.as_bytes());
+    let prompt_bytes = u64::try_from(envelope.prompt.len()).map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt byte length is out of range",
+        )
+    })?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(command.input["task_dispatch_context"].clone()).map_err(|_| {
+            Error::new(
+                "TASK_PROMPT_INVALID",
+                "Store TaskDispatchContext is missing or malformed",
+            )
+        })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "Store TaskDispatchContext is invalid",
+        )
+    })?;
+    let source_text = model::text(&command.input, "text")?;
+    let source_text_bytes = u64::try_from(source_text.len()).map_err(|_| {
+        Error::new(
+            "TASK_PROMPT_INVALID",
+            "source text byte length is out of range",
+        )
+    })?;
+    let attempt_id = model::text(&command.input, "attempt_id")?;
+    if envelope.prompt_sha256 != prompt_sha256
+        || envelope.prompt_bytes != prompt_bytes
+        || context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.attempt_id != attempt_id
+        || context.task_id != envelope.task_id
+        || context.task_revision != envelope.task_revision
+        || context.attempt_id != envelope.attempt_id
+        || context.task_snapshot_sha256 != envelope.task_snapshot_sha256
+        || context.source_text_sha256 != model::digest(source_text.as_bytes())
+        || context.source_text_bytes != source_text_bytes
+    {
+        return Err(Error::new(
+            "TASK_PROMPT_INVALID",
+            "TaskPrompt bytes or identity differ from the Store dispatch context",
+        ));
+    }
+
+    let input_sha256 = command.input_sha256.as_deref().ok_or_else(|| {
+        Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "TaskPrompt dispatch has no immutable Operation digest",
+        )
+    })?;
+    let module_receipt = ModuleReceiptIdentity {
+        schema_version: 1,
+        module_id: ModuleId::new(super::TASK_PROMPT_MODULE_ID).map_err(|_| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "built-in OpenCode module identity is invalid",
+            )
+        })?,
+        artifact: ArtifactIdentity {
+            artifact_id: ArtifactId::new(super::TASK_PROMPT_ARTIFACT_ID).map_err(|_| {
+                Error::new(
+                    "MODULE_RECEIPT_INVALID",
+                    "TaskPrompt artifact identity is invalid",
+                )
+            })?,
+            version: ArtifactVersion::new(super::TASK_PROMPT_ARTIFACT_VERSION).map_err(|_| {
+                Error::new(
+                    "MODULE_RECEIPT_INVALID",
+                    "TaskPrompt artifact version is invalid",
+                )
+            })?,
+            build_id: None,
+        },
+        protocol: ProtocolVersion { major: 1, minor: 0 },
+        binding_id: command.binding_id.clone(),
+        binding_generation: command.generation,
+        operation_id: command.operation_id.clone(),
+        input_sha256: input_sha256.to_owned(),
+    };
+    module_receipt.validate().map_err(|_| {
+        Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "built-in OpenCode TaskPrompt receipt identity is invalid",
+        )
+    })?;
+    Ok(ValidatedTaskPrompt {
+        envelope,
+        context,
+        module_receipt,
+    })
+}
+
+fn task_prompt_admission_receipt(
+    dispatch: &ValidatedTaskPrompt,
+    native_input_id: &str,
+) -> Result<Value> {
+    let context = &dispatch.context;
+    let receipt = TaskDispatchAdmissionReceipt {
+        schema_version: context.schema_version,
+        module_receipt: dispatch.module_receipt.clone(),
+        operation_id: context.operation_id.clone(),
+        binding_id: context.binding_id.clone(),
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id.clone(),
+        attempt_id: context.attempt_id.clone(),
+        task_id: context.task_id.clone(),
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256.clone(),
+        source_text_sha256: context.source_text_sha256.clone(),
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: dispatch.envelope.prompt_sha256.clone(),
+        native_payload_bytes: dispatch.envelope.prompt_bytes,
+        native_input_id: Some(native_input_id.to_owned()),
+    };
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "built-in OpenCode TaskPrompt admission receipt is invalid",
+        )
+    })?;
+    serde_json::to_value(receipt)
+        .map_err(|error| Error::new("TASK_DISPATCH_ADMISSION_INVALID", error.to_string()))
+}
+
+fn legacy_prompt(command: &RuntimeCommand) -> Result<String> {
     let text = model::text(&command.input, "text")?;
     if command.method == "task.dispatch" {
         if !command.input["task_snapshot"].is_object() {
@@ -102,6 +262,69 @@ pub(super) fn prompt(command: &RuntimeCommand) -> Result<String> {
     } else {
         Ok(text.to_owned())
     }
+}
+
+fn prompt_and_task_prompt(
+    command: &RuntimeCommand,
+) -> Result<(String, Option<ValidatedTaskPrompt>)> {
+    let runtime = command.route["runtime"].as_str().unwrap_or_default();
+    let artifact_id = command.route["module_artifact_id"]
+        .as_str()
+        .unwrap_or_default();
+    if crate::config::is_task_prompt_builtin_route(runtime, artifact_id) {
+        if command.method == "task.dispatch" {
+            let dispatch = validated_task_prompt(command)?;
+            return Ok((dispatch.envelope.prompt.clone(), Some(dispatch)));
+        }
+        if command.input.get("task_prompt").is_some()
+            || command.input.get("task_dispatch_context").is_some()
+        {
+            return Err(Error::new(
+                "TASK_PROMPT_INVALID",
+                "TaskPrompt is valid only on task.dispatch",
+            ));
+        }
+        return Ok((model::text(&command.input, "text")?.to_owned(), None));
+    }
+    if runtime == super::RUNTIME && artifact_id == super::ARTIFACT_ID {
+        return Ok((legacy_prompt(command)?, None));
+    }
+    Err(Error::new(
+        "UNSUPPORTED_CAPABILITY",
+        "OpenCode built-in command has an unsupported artifact identity",
+    ))
+}
+
+pub(super) fn prompt(command: &RuntimeCommand) -> Result<String> {
+    prompt_and_task_prompt(command).map(|(text, _)| text)
+}
+
+#[cfg(test)]
+pub(super) fn task_prompt_migration_fixture_projection(
+    command: &RuntimeCommand,
+) -> Result<(String, Option<Value>)> {
+    let (text, dispatch) = prompt_and_task_prompt(command)?;
+    let receipt = dispatch
+        .as_ref()
+        .map(|dispatch| task_prompt_admission_receipt(dispatch, &input_id(&command.operation_id)))
+        .transpose()?;
+    Ok((text, receipt))
+}
+
+#[cfg(test)]
+pub(super) fn task_prompt_migration_fixture_inbox_matches(
+    command: &RuntimeCommand,
+    root: &str,
+    item: &Value,
+) -> Result<bool> {
+    let (text, _) = prompt_and_task_prompt(command)?;
+    Ok(inbox_matches(
+        item,
+        root,
+        &input_id(&command.operation_id),
+        &text,
+        command,
+    ))
 }
 
 fn validate_launch_dispatch_packet(packet: &Value) -> Result<()> {
@@ -476,24 +699,30 @@ impl Service {
                 options,
             )
             .await?;
-            Ok((root,prompt(command)?,delivery))
+            let (text, task_prompt) = prompt_and_task_prompt(command)?;
+            let id = input_id(&command.operation_id);
+            let dispatch_admission = task_prompt
+                .as_ref()
+                .map(|dispatch| task_prompt_admission_receipt(dispatch, &id))
+                .transpose()?;
+            Ok((root, text, delivery, id, dispatch_admission))
         }.await;
-        let (root, text, delivery) = match prepare {
+        let (root, text, delivery, id, dispatch_admission) = match prepare {
             Ok(v) => v,
             Err(e) => return failed(command, options, &e, false),
         };
-        let id = input_id(&command.operation_id);
         let body = json!({"id":id,"text":text,"metadata":{"eliot":marker(command)},"delivery":delivery,"resume":true});
         let reply = self
             .post(&format!("/api/session/{root}/prompt"), body)
             .await;
         let mut result = match reply.and_then(decode::<Data<Value>>) {
-            Ok(v) if inbox_matches(&v.data, root, &id, &text, command) => outcome(
-                command,
-                EffectOutcome::Applied,
-                options,
-                json!({"completion_condition":"native_input_admitted","delivery":delivery,"execution_boundary":if delivery == "steer" { "native_safe_next_loop_step" } else { "queued_next_turn" },"evidence":"prompt_response","assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}),
-            ),
+            Ok(v) if inbox_matches(&v.data, root, &id, &text, command) => {
+                let mut details = json!({"completion_condition":"native_input_admitted","delivery":delivery,"execution_boundary":if delivery == "steer" { "native_safe_next_loop_step" } else { "queued_next_turn" },"evidence":"prompt_response","assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false});
+                if let Some(receipt) = dispatch_admission {
+                    details["dispatch_admission"] = receipt;
+                }
+                outcome(command, EffectOutcome::Applied, options, details)
+            }
             Ok(_) => failed(
                 command,
                 options,
@@ -643,7 +872,8 @@ impl Service {
             if !matches!(original.method.as_str(),"agent.send"|"task.dispatch"|"native.opencode.loop_step") {return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","no exact readback contract for this operation"));}
             let root=original.native_root_id.as_deref().ok_or_else(||Error::invalid("missing root"))?;
             self.verify_binding(root,options,&original.binding_id,original.generation).await?;
-            let id=input_id(&original.operation_id);let text=prompt(original)?;
+            let id=input_id(&original.operation_id);let (text,task_prompt)=prompt_and_task_prompt(original)?;
+            let dispatch_admission=task_prompt.as_ref().map(|dispatch|task_prompt_admission_receipt(dispatch,&id)).transpose()?;
             let delivery=native_delivery_for_method(&original.method).ok_or_else(||Error::new("NATIVE_EVIDENCE_UNAVAILABLE","saved input has no native delivery"))?;
             let inbox:Data<Vec<Value>>=decode(self.get(&format!("/api/session/{root}/inbox"),&[]).await?)?;
             let queued=inbox.data.iter().any(|item|inbox_matches(item,root,&id,&text,original));
@@ -653,7 +883,9 @@ impl Service {
                     return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","exact delivered input was not observed"));
                 }
             }
-            let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_input_admitted","delivery":delivery,"evidence":if queued{"inbox_readback"}else{"projected_message_readback"},"assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}));r.native_input_id=Some(id);Ok(r)
+            let mut details=json!({"completion_condition":"native_input_admitted","delivery":delivery,"evidence":if queued{"inbox_readback"}else{"projected_message_readback"},"assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false});
+            if let Some(receipt)=dispatch_admission {details["dispatch_admission"]=receipt;}
+            let mut r=outcome(original,EffectOutcome::Applied,options,details);r.native_input_id=Some(id);Ok(r)
         }.await;
         match readback {
             Ok(r) => r,

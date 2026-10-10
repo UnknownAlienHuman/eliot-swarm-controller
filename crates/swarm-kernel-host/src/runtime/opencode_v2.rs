@@ -35,7 +35,13 @@ pub(crate) use prerequisites::Validator as PrerequisiteValidator;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Retained selector-less artifact. Its raw-snapshot prompt remains immutable
+/// for existing bindings and Operations.
 pub const ARTIFACT_ID: &str = "eliot-opencode-v2.http.1";
+/// Current built-in artifact that consumes Store-produced TaskPrompt bytes.
+pub const TASK_PROMPT_ARTIFACT_ID: &str = "eliot-opencode-v2.http.2";
+pub const TASK_PROMPT_ARTIFACT_VERSION: &str = "2";
+pub const TASK_PROMPT_MODULE_ID: &str = "builtin.opencode-v2";
 pub const RUNTIME: &str = "opencode_v2";
 
 /// Internal foreground owner entry used by the controller's dedicated helper.
@@ -140,6 +146,22 @@ pub(crate) fn root_id(binding: &str, generation: i64) -> String {
 }
 pub(crate) fn input_id(operation: &str) -> String {
     format!("msg_swarm_{}", crate::model::digest(operation.as_bytes()))
+}
+
+#[cfg(test)]
+pub(crate) fn task_prompt_migration_fixture_projection(
+    command: &crate::runtime::RuntimeCommand,
+) -> Result<(String, Option<serde_json::Value>)> {
+    effects::task_prompt_migration_fixture_projection(command)
+}
+
+#[cfg(test)]
+pub(crate) fn task_prompt_migration_fixture_inbox_matches(
+    command: &crate::runtime::RuntimeCommand,
+    root: &str,
+    item: &serde_json::Value,
+) -> Result<bool> {
+    effects::task_prompt_migration_fixture_inbox_matches(command, root, item)
 }
 
 /// Keep diagnostics useful without persisting reflected prompts, credentials or URLs.

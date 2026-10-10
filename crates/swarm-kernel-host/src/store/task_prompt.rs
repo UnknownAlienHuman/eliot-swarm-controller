@@ -16,6 +16,12 @@ use swarm_contracts::{
 };
 
 pub(super) fn selected(db: &Connection, binding: &Value) -> Result<bool> {
+    if crate::config::is_task_prompt_builtin_route(
+        binding["route"]["runtime"].as_str().unwrap_or_default(),
+        binding["module_artifact_id"].as_str().unwrap_or_default(),
+    ) {
+        return Ok(true);
+    }
     if binding["route"]["runtime"] == "zed"
         && binding["module_artifact_id"] == "eliot-zed.eval-cli.2"
     {
@@ -55,6 +61,23 @@ pub(super) fn require_new_binding(
     selector: Option<&Value>,
 ) -> Result<()> {
     let selector = selector.filter(|value| !value.is_null());
+    // The old built-in `.1` and Command BatchV3 decoders remain available to
+    // existing bindings. New Command selectors come from the trusted Store
+    // selection resolver and carry the immutable artifact identity/version.
+    let retained_opencode_builtin = route.runtime == crate::runtime::opencode_v2::RUNTIME
+        && route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID;
+    let retained_command_batch_v3 = route.runtime == "module"
+        && route.module_artifact_id == "eliot-command.rust-headless.1"
+        && selector.is_some_and(|selected| {
+            selected["artifact"]["artifact_id"].as_str() == Some(route.module_artifact_id.as_str())
+                && selected["artifact"]["version"].as_str() == Some("3")
+        });
+    if retained_opencode_builtin || retained_command_batch_v3 {
+        return Err(Error::new(
+            "ARTIFACT_RETIRED",
+            "this retained artifact is unavailable for new bindings",
+        ));
+    }
     if matches!(
         route.module_artifact_id.as_str(),
         "eliot-zed.eval-cli.1"
@@ -239,6 +262,10 @@ fn validate_launch_dispatch_identity(
 fn invalid_prompt(message: &str) -> Error {
     Error::new("TASK_PROMPT_INVALID", message)
 }
+
+#[cfg(test)]
+#[path = "task_prompt_migration_fixtures.rs"]
+mod migration_fixtures;
 
 #[cfg(test)]
 mod tests {

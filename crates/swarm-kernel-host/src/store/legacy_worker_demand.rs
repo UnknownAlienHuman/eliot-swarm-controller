@@ -35,11 +35,11 @@ fn route_enabled(config: &Config, runtime: &str, artifact: &str) -> bool {
 pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerDemand> {
     let mut demand = LegacyWorkerDemand {
         checks: config.checks.enabled,
-        opencode: route_enabled(
-            config,
-            crate::runtime::opencode_v2::RUNTIME,
-            crate::runtime::opencode_v2::ARTIFACT_ID,
-        ),
+        opencode: config.routes.iter().any(|route| {
+            route.enabled
+                && crate::config::opencode_route_kind(&route.runtime, &route.module_artifact_id)
+                    == Some(crate::config::OpenCodeRouteKind::Builtin)
+        }),
         zed: route_enabled(
             config,
             crate::runtime::zed::RUNTIME,
@@ -70,10 +70,11 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
     // owned by the isolated module supervisor, never this built-in worker.
     demand.opencode |= db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE released_at_ms IS NULL \
-         AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id=?2)",
+         AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id IN (?2,?3))",
         params![
             crate::runtime::opencode_v2::RUNTIME,
-            crate::runtime::opencode_v2::ARTIFACT_ID
+            crate::runtime::opencode_v2::ARTIFACT_ID,
+            crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID
         ],
         |row| row.get::<_, bool>(0),
     )?;

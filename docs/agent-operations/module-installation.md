@@ -149,7 +149,9 @@ and schema-aware projection, so the immutable descriptor, schema digest and
 artifact coordinate remain unchanged. Retained v1/v2 descriptors continue to
 decode their historical version field, and fresh-owned routes keep the exact
 owner-contract version check. The separate built-in
-`eliot-opencode-v2.http.1` route retains its own version contract.
+`eliot-opencode-v2.http.2` route is current for new TaskPrompt bindings and keeps
+its own native service version contract. Built-in `.1` remains available only
+for retained bindings and Operations; new `.1` bindings are rejected.
 
 The standalone Rust Codex source descriptor template declares version `4` under the stable artifact ID `codex-rust-controller.1`. Keep that ID in the route; choose version `4` as the exact catalog coordinate in `module.route.select`. Version 4 retains the normalized dispatch contract and opts new bindings into normalized result pages with `swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`. The result selector is exactly `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity. Older selected descriptor versions and existing bindings are not upgraded by this selection. The generic installer copies the supplied descriptor version without translating or enabling it.
 

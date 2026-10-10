@@ -1544,7 +1544,9 @@ fn retained_start_route(
 fn owned_opencode_artifact(artifact: &str) -> bool {
     matches!(
         artifact,
-        crate::runtime::opencode_v2::ARTIFACT_ID | crate::config::OPENCODE_RUST_ARTIFACT_ID
+        crate::runtime::opencode_v2::ARTIFACT_ID
+            | crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID
+            | crate::config::OPENCODE_RUST_ARTIFACT_ID
     )
 }
 
@@ -3195,8 +3197,8 @@ fn launch_manifest_route_alias(manifest: &Value) -> Result<&str> {
 
 fn current_route(config: &Config, stored: &Route) -> Result<Route> {
     let current = config.route(&stored.alias)?;
-    if current.runtime != crate::runtime::opencode_v2::RUNTIME
-        || current.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
+    if crate::config::opencode_route_kind(&current.runtime, &current.module_artifact_id)
+        != Some(crate::config::OpenCodeRouteKind::Builtin)
         || model::canonical(&serde_json::to_value(&current)?)?
             != model::canonical(&serde_json::to_value(stored)?)?
     {

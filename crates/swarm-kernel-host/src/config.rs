@@ -25,7 +25,8 @@ pub(crate) enum OpenCodeRouteKind {
 
 pub(crate) fn opencode_route_kind(runtime: &str, artifact_id: &str) -> Option<OpenCodeRouteKind> {
     if runtime == crate::runtime::opencode_v2::RUNTIME
-        && artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID
+        && (artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID
+            || artifact_id == crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID)
     {
         Some(OpenCodeRouteKind::Builtin)
     } else if runtime == "module" && artifact_id == OPENCODE_RUST_ARTIFACT_ID {
@@ -33,6 +34,13 @@ pub(crate) fn opencode_route_kind(runtime: &str, artifact_id: &str) -> Option<Op
     } else {
         None
     }
+}
+
+/// The current built-in OpenCode artifact uses the Store-owned TaskPrompt
+/// contract. The retained `.1` decoder intentionally does not select it.
+pub(crate) fn is_task_prompt_builtin_route(runtime: &str, artifact_id: &str) -> bool {
+    runtime == crate::runtime::opencode_v2::RUNTIME
+        && artifact_id == crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID
 }
 
 /// The built-in OpenCode and Zed decoders retain their bounded selector-less
@@ -594,6 +602,11 @@ mod owned_opencode_route_validation_tests {
                 Some(OpenCodeRouteKind::Builtin),
             ),
             (
+                crate::runtime::opencode_v2::RUNTIME,
+                crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID,
+                Some(OpenCodeRouteKind::Builtin),
+            ),
+            (
                 "module",
                 OPENCODE_RUST_ARTIFACT_ID,
                 Some(OpenCodeRouteKind::Standalone),
@@ -604,6 +617,11 @@ mod owned_opencode_route_validation_tests {
                 None,
             ),
             ("module", crate::runtime::opencode_v2::ARTIFACT_ID, None),
+            (
+                "module",
+                crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID,
+                None,
+            ),
             ("module", "eliot-opencode-v2.rust-http.1.extra", None),
             ("MODULE", OPENCODE_RUST_ARTIFACT_ID, None),
             ("unknown", "unknown-artifact", None),

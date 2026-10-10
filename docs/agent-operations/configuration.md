@@ -644,7 +644,7 @@ This host/operator route is separate from a manager-owned automation definition.
 [[routes]]
 alias = "opencode-owned"
 runtime = "opencode_v2"
-module_artifact_id = "eliot-opencode-v2.http.1"
+module_artifact_id = "eliot-opencode-v2.http.2"
 enabled = true
 native_options = {}
 

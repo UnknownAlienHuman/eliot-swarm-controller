@@ -39,7 +39,13 @@ fn descriptor_pre_input_open(
 /// both halves of the additive contract.  Legacy descriptors retain their
 /// existing runtime-specific codec and receipt path.
 fn selected_task_dispatch_admission(db: &Connection, binding: &Value) -> Result<bool> {
-    if zed::is_current_route(&binding["route"]) && binding["module_artifact_id"] == zed::ARTIFACT_ID
+    let builtin_opencode = crate::config::is_task_prompt_builtin_route(
+        binding["route"]["runtime"].as_str().unwrap_or_default(),
+        binding["module_artifact_id"].as_str().unwrap_or_default(),
+    );
+    if (zed::is_current_route(&binding["route"])
+        && binding["module_artifact_id"] == zed::ARTIFACT_ID)
+        || builtin_opencode
     {
         return Ok(true);
     }
@@ -2028,7 +2034,11 @@ pub(super) fn validate_module_receipt_for_operation(
 ) -> Result<swarm_contracts::runtime::ModuleReceiptIdentity> {
     let builtin_zed = zed::is_current_route(&binding["route"])
         && binding["module_artifact_id"] == zed::ARTIFACT_ID;
-    let receipt_value = if builtin_zed {
+    let builtin_opencode = crate::config::is_task_prompt_builtin_route(
+        binding["route"]["runtime"].as_str().unwrap_or_default(),
+        binding["module_artifact_id"].as_str().unwrap_or_default(),
+    );
+    let receipt_value = if builtin_zed || builtin_opencode {
         outcome.details["dispatch_admission"].get("module_receipt")
     } else {
         outcome.details.get("module_receipt")
@@ -2069,6 +2079,21 @@ pub(super) fn validate_module_receipt_for_operation(
             return Err(Error::new(
                 "MODULE_RECEIPT_INVALID",
                 "receipt differs from the exact built-in Zed contract",
+            ));
+        }
+    } else if builtin_opencode {
+        if receipt.module_id.as_str() != crate::runtime::opencode_v2::TASK_PROMPT_MODULE_ID
+            || receipt.artifact.artifact_id.as_str()
+                != crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID
+            || receipt.artifact.version.as_str()
+                != crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_VERSION
+            || receipt.artifact.build_id.is_some()
+            || receipt.protocol
+                != (swarm_contracts::module_catalog::ProtocolVersion { major: 1, minor: 0 })
+        {
+            return Err(Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "receipt differs from the exact built-in OpenCode TaskPrompt contract",
             ));
         }
     } else {
@@ -2462,7 +2487,13 @@ pub(super) fn outcome_with_artifacts(
     }
     // Versioned bindings require a typed receipt for every outcome. Legacy
     // unversioned bindings retain their existing validators and wire contract.
+    let builtin_opencode_dispatch = crate::config::is_task_prompt_builtin_route(
+        b["route"]["runtime"].as_str().unwrap_or_default(),
+        b["module_artifact_id"].as_str().unwrap_or_default(),
+    ) && o["method"] == "task.dispatch"
+        && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted);
     let module_receipt = if b["observation"].get("module_contract_selector").is_some()
+        || builtin_opencode_dispatch
         || (zed::is_current_route(&b["route"])
             && o["method"] == "task.dispatch"
             && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted))

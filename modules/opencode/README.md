@@ -1,6 +1,8 @@
-# Direct OpenCode V2 — `eliot-opencode-v2.http.1`
+# Direct OpenCode V2 — `eliot-opencode-v2.http.2`
 
 Built-in Rust adapter for an **already running, externally owned** OpenCode V2 HTTP service. No Node bridge, CLI invocation, process launch, service restart, hidden inference fallback or extra task store. Disabling the route does not terminate native work.
+
+New bindings use `.2`, which submits the exact Store-produced `TaskPromptEnvelopeV1` bytes. The selectorless `.1` decoder remains available only to existing bindings and Operations, preserving their original raw-snapshot prompts and readback identity.
 
 ## Contract and exact scope
 
@@ -16,7 +18,7 @@ Keep the shipped route disabled until these values are filled for the intended i
 [[routes]]
 alias = 'opencode-manager'
 runtime = 'opencode_v2'
-module_artifact_id = 'eliot-opencode-v2.http.1'
+module_artifact_id = 'eliot-opencode-v2.http.2'
 enabled = false
 [routes.native_options]
 service_id = 'my-local-opencode-store'

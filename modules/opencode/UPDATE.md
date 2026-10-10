@@ -10,7 +10,8 @@ new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Adapter artifact | `eliot-opencode-v2.http.1` — the compiled `ARTIFACT_ID` constant in `src/runtime/opencode_v2.rs`; the route `module_artifact_id` must equal it exactly or the host rejects the configuration |
+| Current adapter artifact | `eliot-opencode-v2.http.2` — the compiled `TASK_PROMPT_ARTIFACT_ID` constant in `src/runtime/opencode_v2.rs`; new route bindings must select it exactly |
+| Retained adapter artifact | `eliot-opencode-v2.http.1` — the compiled `ARTIFACT_ID` constant; existing bindings and Operations retain its immutable raw-snapshot prompt and readback contract, and new bindings are rejected |
 | Contract basis | Official [V2 API](https://opencode.ai/v2/docs/api) and [OpenAPI document](https://opencode.ai/v2/openapi.json), captured 2026-10-01 |
 | Reviewed upstream | `anomalyco/opencode@4c0d0ff478ca9150c163fb8b04a76395e4dccafe`; the exact reviewed files are enumerated in the module README |
 | Server | External and operator-owned. The route's `expected_version` must equal the installed server's `/api/info` version exactly. Server version, adapter artifact and controller version are three separate facts |

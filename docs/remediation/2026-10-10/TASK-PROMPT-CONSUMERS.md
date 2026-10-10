@@ -6,6 +6,12 @@ callers; it does not establish native model consumption or close R20 / PR #46.
 The duplicate `source_refs` admission and historical first-occurrence projection
 repairs are already included in this commit.
 
+The subsequent source migration selects exact Store-produced TaskPrompt bytes
+for the built-in OpenCode `.2` artifact and retires new `.1` and trusted Rust
+Command BatchV3 bindings. Their historical decoders remain for retained
+Operations. The current boundaries are recorded below; native qualification
+and fixture execution remain separate acceptance items.
+
 ## Store producer and projection
 
 `store/task_prompt.rs::build` renders the frozen Attempt brief once and retains
@@ -32,6 +38,7 @@ the selected descriptor declares `swarm.task_prompt@1`.
 | Command glue | `command-mod-0.1.0-glue.5`, version `5` | `modules/command/glue.mjs` rejects raw snapshot fields and checks the envelope before native prompt and admission. |
 | Rust Command | `eliot-command.rust-headless.1`, version `4`; ACP profile | `adapter.rs` uses `acp_prompt::prepare` for BatchV4. The ACP path also consumes that validated envelope. BatchV3 remains a separate raw-snapshot path. |
 | Built-in Zed | `eliot-zed.eval-cli.2` | Store explicitly selects TaskPrompt for this exact built-in route. Zed dispatch validates it and publishes the corresponding receipt. |
+| Built-in OpenCode | `opencode_v2` / `eliot-opencode-v2.http.2` | Store selects the exact envelope and dispatch context. The effect and readback validate and preserve its UTF-8 bytes and typed admission receipt; invalid or missing envelopes have no raw-snapshot fallback. |
 
 These are source facts. Their native receipt/model qualification remains a
 separate acceptance item.
@@ -40,8 +47,8 @@ separate acceptance item.
 
 | Renderer / late enrichment | Live caller or retained contract | Disposition and removal condition |
 | --- | --- | --- |
-| `runtime/opencode_v2/effects.rs::prompt` | Built-in `opencode_v2` / `eliot-opencode-v2.http.1` | **Current remainder.** This exact built-in topology permits new bindings without a descriptor and uses the raw snapshot. Migrate it with a distinct prompt contract while preserving existing Operations; it is not established as historical-only. |
-| `swarm-adapter-command::native::prompt_for` | `adapter.rs` BatchV3 branch, artifact `eliot-command.rust-headless.1`, version `3` | **Current remainder.** The module profile accepts version 3. The new-binding guard does not retire this version. Establish its retained-only admission boundary or migrate new work, then remove the renderer only after retained bindings/Operations are drained. |
+| `runtime/opencode_v2/effects.rs::legacy_prompt` | Built-in `opencode_v2` / `eliot-opencode-v2.http.1` | Historical decoder. New `.1` bindings are rejected; `.2` uses TaskPrompt. Remove only after retained `.1` bindings and unresolved Operations no longer need exact old prompt/readback identity. |
+| `swarm-adapter-command::native::prompt_for` | `adapter.rs` BatchV3 branch, artifact `eliot-command.rust-headless.1`, version `3` | Historical decoder. New bindings with this exact trusted version are rejected. V4 and ACP retain their TaskPrompt paths. Remove the renderer only after retained V3 bindings and Operations are drained. |
 | `runtime/batch.rs::instruction` fallback | Command receipt/reconcile paths when input has no TaskPrompt | Keep exact historical prompt identity for old Operations. Delete only after every live caller uses a retained envelope and no retained raw operation requires reconciliation. |
 | `runtime/codex.rs::dispatch_instruction`; `modules/codex/controller.py` | `codex-sdk-18194bf-bridge.3` | Named retained SDK bridge. `require_new_binding` rejects this artifact. Delete together after its retained bindings, input receipts and unresolved Operations no longer require readback. The frozen vendor donor is not a migrated Rust consumer. |
 | `runtime/prepared.rs` legacy receipt renderers; `modules/claude/bridge.mjs` | `claude-agent-sdk-0.3.287-bridge.3` | Named retained prepared-executor contract. New binding is rejected. Keep until exact first-input identity and retained reconciliation no longer need its old receipt format. |
@@ -55,7 +62,8 @@ Task snapshot renderer was found in `modules/opencodex`.
 
 ## Remaining acceptance
 
-1. Resolve new-work semantics for built-in OpenCode and Rust Command BatchV3.
+1. Execute the migration fixtures for current built-in OpenCode and retained
+   Rust Command BatchV3 boundaries.
 2. Prove the migration boundary for earlier versions under stable artifact IDs;
    exact descriptor identity alone is not an artifact-version retirement rule.
 3. Remove unreachable local renderers without rewriting retained prompt or
