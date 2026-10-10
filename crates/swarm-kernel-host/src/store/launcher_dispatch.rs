@@ -1642,3 +1642,6 @@ fn name_is_bounded(value: &str) -> bool {
 fn stale_capability(message: &str) -> Error {
     Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", message)
 }
+
+#[cfg(test)]
+mod preinput_contract_tests;
