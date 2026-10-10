@@ -289,21 +289,32 @@ await withServer('happy', async (fake, adapter) => {
   console.log('PASS protocol-dependency: OAuth-without-native refused locally, no write');
 });
 
-// 14. Model settings for one routed provider: receipt (saved) and
-// readback (declared fields + per-client integration states) are
-// separate facts; a no-op answers saved:false honestly.
+// 14. Model settings for one routed provider: the stored receipt covers
+// every requested axis, but only declared model fields have exact GET
+// readback. Effective reasoning fields stay unverified; a no-op answers
+// saved:false honestly.
 await withServer('happy', async (fake, adapter) => {
   const record = await adapter.configure({
     kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
     contextWindow: 262144, reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
   });
-  assert.equal(record.outcome, 'applied');
+  assert.equal(record.outcome, 'unknown', 'effective reasoning fields lack exact declared readback');
+  assert.equal(record.reason, 'configuration_readback_incomplete');
   assert.equal(record.receipt.saved, true);
   assert.equal(record.receipt.changed, true);
+  assert.deepEqual(record.receipt.reasoningEfforts, ['low', 'high']);
+  assert.equal(record.receipt.defaultReasoningEffort, 'high');
   assert.equal(record.savedVsApplied.saved, true);
   assert.equal(record.savedVsApplied.clientIntegrationsObserved, true);
   assert.equal(record.readback.model.contextWindowDeclared, 262144);
-  assert.equal(record.verification.state, 'verified');
+  assert.deepEqual(record.readback.model.reasoningEfforts, ['low', 'high']);
+  assert.equal(record.readback.model.defaultReasoningEffort, 'high');
+  assert.deepEqual(record.verification.fields, {
+    contextWindow: 'verified',
+    reasoningEfforts: 'not_checked',
+    defaultReasoningEffort: 'not_checked',
+  });
+  assert.equal(record.verification.state, 'observed');
   assert.equal(mutations(fake, 'PUT', '/api/model-settings').length, 1);
   assertNoToken(record, 'model-settings');
 
@@ -315,37 +326,45 @@ await withServer('happy', async (fake, adapter) => {
   assert.equal(noop.receipt.changed, false);
   assert.equal(noop.receipt.saved, false, 'a no-op publishes nothing and says so');
   assert.equal(noop.receipt.hasOverrides, true, 'stored declarations remain reported');
-  console.log('PASS model-settings: saved receipt + declared readback verified; no-op saved:false');
+  console.log('PASS model-settings: saved receipt separated from incomplete declared readback; no-op saved:false');
 });
 
 // 15. Lost mutation response: the write landed but the answer never
-// arrived. The Operation is unknown, reconciled by reading — the PUT
-// is sent exactly once.
+// arrived. Exact GET readback verifies the requested state as applied,
+// while the mutation evidence preserves the lost response; the PUT is
+// sent exactly once.
 await withServer('lost_response', async (fake, adapter) => {
   const record = await adapter.configure({
     kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
     contextWindow: 300000,
   });
-  assert.equal(record.outcome, 'unknown');
-  assert.equal(record.reason, 'mutation_response_lost');
+  assert.equal(record.outcome, 'applied', 'exact GET readback verifies the requested state');
+  assert.equal(record.mutation.reason, 'mutation_response_lost');
+  assert.ok(record.evidence.some((entry) => entry.read === 'PUT /api/model-settings'
+    && entry.state === 'unknown' && entry.reason === 'mutation_response_lost'));
   assert.equal(record.verification.reconciledByRead, true);
   assert.equal(record.verification.state, 'verified', 'readback proves the landed value');
   assert.equal(record.readback.model.contextWindowDeclared, 300000);
   assert.equal(mutations(fake, 'PUT', '/api/model-settings').length, 1, 'never re-sent');
-  console.log('PASS lost-response: unknown outcome reconciled by readback, mutation sent once');
+  console.log('PASS lost-response: exact readback applied, lost mutation response retained, PUT sent once');
 });
 
-// 16. Saved but catalog refresh failed: the record is partial, the
-// saved fact is not inflated into applied.
+// 16. Saved but catalog refresh failed: declared readback is retained,
+// while incomplete catalog convergence keeps the Operation unknown.
 await withServer('refresh_failed', async (fake, adapter) => {
   const record = await adapter.configure({
     kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
     contextWindow: 262144,
   });
-  assert.equal(record.outcome, 'partial');
+  assert.equal(record.outcome, 'unknown');
+  assert.equal(record.reason, 'model_settings_followup_incomplete');
   assert.equal(record.receipt.saved, true);
   assert.equal(record.receipt.catalogRefresh.status, 'failed');
-  console.log('PASS refresh-failed: saved=true with failed convergence is partial, not applied');
+  assert.equal(record.verification.state, 'verified', 'the declared model field still reads back exactly');
+  assert.equal(record.readback.model.contextWindowDeclared, 262144);
+  assert.equal(record.savedVsApplied.catalogRefresh.status, 'failed');
+  assert.equal(mutations(fake, 'PUT', '/api/model-settings').length, 1, 'no mutation replay');
+  console.log('PASS refresh-failed: save and exact declaration readback retained; failed convergence remains unknown');
 });
 
 // 17. Sub-agent v2 surface: mode change applies at the new-sessions

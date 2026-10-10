@@ -35,7 +35,11 @@ pub(super) fn parse(
     let matching = match snapshot.service {
         UsageService::Codex => artifact == "codex-rust-controller.1",
         UsageService::Muse => {
-            artifact == "muse-sdk-1.3.0-bridge.9" && binding["route"]["runtime"] == "module"
+            artifact == "muse-sdk-1.3.0-bridge.9"
+                && matches!(
+                    binding["route"]["runtime"].as_str(),
+                    Some("muse" | "module")
+                )
         }
     };
     if !matching
@@ -154,4 +158,133 @@ pub(super) fn read(db: &Connection, principal: &Principal, value: &Value) -> Res
         "module_artifact_id":binding["module_artifact_id"],"boot_id":retained["boot_id"],"snapshot":snapshot,
         "account_overlap":"unknown_unless_auth_context_proved"}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+    use serde_json::{Value, json};
+    use swarm_contracts::native_usage::UsageService;
+
+    // This is the current producer-shaped Muse snapshot emitted by
+    // modules/muse/native-usage.mjs::nativeUsageSnapshot for a valid usage/read
+    // result. Keep one exact snapshot across the runtime/artifact admission cases.
+    const MUSE_USAGE_SNAPSHOT: &str = r#"{
+        "schema_version": 1,
+        "service": "muse",
+        "connection_id": "muse-fixture-connection",
+        "auth_context_ref": null,
+        "collected_at_ms": 1780000000123,
+        "freshness": "current",
+        "completeness": "full",
+        "collection_issue": null,
+        "evidence": {
+            "method": "usage/read",
+            "revision": 4,
+            "native_observed_at_ms": 1780000000000
+        },
+        "ordinary_usage_allowed": null,
+        "buckets": [{
+            "id": "subscription",
+            "name": null,
+            "normal_model_slug": null,
+            "plan_type": {"value": "max", "collected_at_ms": 1780000000123},
+            "primary": {
+                "collected_at_ms": 1780000000123,
+                "used_percent": 37,
+                "resets_at_ms": 1780003600000,
+                "window_duration_mins": 60
+            },
+            "secondary": {
+                "collected_at_ms": 1780000000123,
+                "used_percent": 12,
+                "resets_at_ms": 1780600000000,
+                "window_duration_mins": null
+            },
+            "credits": null,
+            "individual_limit": null,
+            "spend_control_reached": null,
+            "rate_limit_reached_type": null,
+            "provider_condition": null
+        }]
+    }"#;
+
+    fn snapshot() -> Value {
+        serde_json::from_str(MUSE_USAGE_SNAPSHOT).expect("Muse usage fixture is valid JSON")
+    }
+
+    fn observation(snapshot: Value) -> Value {
+        json!({
+            "module_artifact_id": "muse-sdk-1.3.0-bridge.9",
+            "native_usage": snapshot
+        })
+    }
+
+    fn binding(runtime: &str, artifact: &str) -> Value {
+        json!({
+            "module_artifact_id": artifact,
+            "route": {"runtime": runtime}
+        })
+    }
+
+    #[test]
+    fn muse_usage_accepts_documented_muse_runtime() {
+        let result = parse(
+            &observation(snapshot()),
+            &binding("muse", "muse-sdk-1.3.0-bridge.9"),
+            Some(1),
+        )
+        .expect("the documented Muse runtime accepts its current artifact");
+        let result = result.expect("the ordered observation contains native usage");
+        assert_eq!(result.service, UsageService::Muse);
+        assert_eq!(result.evidence.method, "usage/read");
+        assert_eq!(result.buckets.len(), 1);
+    }
+
+    #[test]
+    fn muse_usage_accepts_module_runtime() {
+        let result = parse(
+            &observation(snapshot()),
+            &binding("module", "muse-sdk-1.3.0-bridge.9"),
+            Some(1),
+        )
+        .expect("the existing module runtime accepts the same current artifact");
+        assert_eq!(
+            result.expect("ordered usage is returned").service,
+            UsageService::Muse
+        );
+    }
+
+    #[test]
+    fn muse_usage_rejects_unrelated_runtime() {
+        let error = parse(
+            &observation(snapshot()),
+            &binding("codex", "muse-sdk-1.3.0-bridge.9"),
+            Some(1),
+        )
+        .expect_err("the Muse artifact is not admitted on an unrelated runtime");
+        assert_eq!(error.code, "NATIVE_USAGE_SOURCE_MISMATCH");
+    }
+
+    #[test]
+    fn muse_usage_rejects_wrong_artifact() {
+        let error = parse(
+            &observation(snapshot()),
+            &binding("muse", "muse-sdk-1.3.0-bridge.8"),
+            Some(1),
+        )
+        .expect_err("Muse runtime does not admit a different artifact version");
+        assert_eq!(error.code, "NATIVE_USAGE_SOURCE_MISMATCH");
+    }
+
+    #[test]
+    fn muse_usage_requires_observation_sequence() {
+        let error = parse(
+            &observation(snapshot()),
+            &binding("muse", "muse-sdk-1.3.0-bridge.9"),
+            None,
+        )
+        .expect_err("native usage requires an ordered observation");
+        assert_eq!(error.code, "USAGE_SEQUENCE_REQUIRED");
+    }
 }

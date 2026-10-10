@@ -221,7 +221,8 @@ fn require_retained_reviewer_scope(
         ));
     };
     let scope = exact_scope(identity, assignment_id);
-    if current_assignment_id == assignment_id {
+    if current_assignment_id == assignment_id && current_applicability(db, identity, assignment_id)?
+    {
         coordination::require_review_scope(db, principal, assignment_id, &scope)
     } else {
         coordination::require_historical_review_result_scope(db, principal, assignment_id, &scope)

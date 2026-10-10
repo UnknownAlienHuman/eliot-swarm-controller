@@ -117,9 +117,8 @@ fn run_probe(program: &Path, args: &[&str], timeout_ms: u64, stdout_limit: usize
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // Match the production input resolver's windowless helper. A console
-        // allocated for the fixture is not part of the command being probed.
-        helper.creation_flags(0x08000000);
+        // Match the production pipe-only helper without allocating a console.
+        helper.creation_flags(0x00000008); // DETACHED_PROCESS
     }
     let output = helper.spawn().unwrap().wait_with_output().unwrap();
     let _ = fs::remove_file(&request_path);

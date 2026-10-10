@@ -231,7 +231,27 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
         json!({"operation_id":own_first["operation_id"]}),
     )
     .await;
-    assert_eq!(own_operation["result"]["text"], "first for recipient");
+    assert_eq!(
+        own_operation["result"]["operation_id"],
+        own_first["operation_id"]
+    );
+    assert_eq!(
+        own_operation["result"]["delivery_id"],
+        own_first["delivery_id"]
+    );
+    assert_eq!(
+        own_operation["result"]["payload_digest"],
+        own_first["payload_digest"]
+    );
+    assert!(own_operation["result"].get("text").is_none());
+    let mailbox = read(&owner.store, &recipient, "message.read", json!({})).await;
+    let own_message = mailbox["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["payload"]["delivery_id"] == own_first["delivery_id"])
+        .expect("the recipient mailbox contains the exact addressed delivery");
+    assert_eq!(own_message["payload"]["text"], "first for recipient");
     let sender_operation = read(
         &owner.store,
         &sender,
@@ -257,14 +277,40 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
         &owner.store,
         &recipient,
         "operation.list",
-        json!({"state":"settled","limit":4}),
+        json!({"state":"settled","limit":1}),
     )
     .await;
-    assert_eq!(first_operation_page["items"].as_array().unwrap().len(), 4);
+    assert_eq!(first_operation_page["items"].as_array().unwrap().len(), 1);
     assert_eq!(
-        first_operation_page["items"][3]["operation_id"],
+        first_operation_page["items"][0]["operation_id"],
         own_first["operation_id"]
     );
+    assert_eq!(first_operation_page["has_newer"], true);
+    let second_operation_page = read(
+        &owner.store,
+        &recipient,
+        "operation.list",
+        json!({"state":"settled","after":first_operation_page["next_after"],"limit":1}),
+    )
+    .await;
+    assert_eq!(second_operation_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        second_operation_page["items"][0]["operation_id"],
+        own_second["operation_id"]
+    );
+    assert_ne!(
+        second_operation_page["items"][0]["operation_id"],
+        first_operation_page["items"][0]["operation_id"]
+    );
+    assert_eq!(second_operation_page["has_newer"], false);
+    let operation_pages_json = json!([&first_operation_page, &second_operation_page]).to_string();
+    for hidden in [&hidden_before, &hidden_middle, &hidden_tail] {
+        assert!(!operation_pages_json.contains(hidden["operation_id"].as_str().unwrap()));
+        assert!(!operation_pages_json.contains(hidden["delivery_id"].as_str().unwrap()));
+        assert!(!operation_pages_json.contains(hidden["payload_digest"].as_str().unwrap()));
+    }
+    assert!(!operation_pages_json.contains(cancellation["operation_id"].as_str().unwrap()));
+    assert!(!operation_pages_json.contains("private cancellation reason"));
     let recipient_operations = read(
         &owner.store,
         &recipient,
@@ -284,7 +330,7 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
     let other_operations_json = other_operations.to_string();
     assert!(other_operations_json.contains(hidden_before["operation_id"].as_str().unwrap()));
     assert!(other_operations_json.contains(cancellation["operation_id"].as_str().unwrap()));
-    assert!(other_operations_json.contains("private cancellation reason"));
+    assert!(!other_operations_json.contains("private cancellation reason"));
     assert!(other_operations_json.contains(hidden_before["payload_digest"].as_str().unwrap()));
 
     let foreign_cancel = owner
@@ -305,13 +351,11 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
     )
     .await;
     assert_eq!(
-        recipient_cancel["result"]["reason"],
-        "private cancellation reason"
+        recipient_cancel["result"]["operation_id"],
+        cancellation["operation_id"]
     );
-    assert_eq!(
-        recipient_cancel["result"]["cancellation"]["payload_digest"],
-        hidden_before["payload_digest"]
-    );
+    assert!(recipient_cancel["result"].get("reason").is_none());
+    assert!(recipient_cancel["result"].get("cancellation").is_none());
     let sender_cancel = read(
         &owner.store,
         &sender,
@@ -329,9 +373,18 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
     )
     .await;
     assert_eq!(
-        operator_receipt["result"]["text"],
-        "private to other before"
+        operator_receipt["result"]["operation_id"],
+        hidden_before["operation_id"]
     );
+    assert_eq!(
+        operator_receipt["result"]["delivery_id"],
+        hidden_before["delivery_id"]
+    );
+    assert_eq!(
+        operator_receipt["result"]["payload_digest"],
+        hidden_before["payload_digest"]
+    );
+    assert!(operator_receipt["result"].get("text").is_none());
 
     let first = read(
         &owner.store,
@@ -418,7 +471,7 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
     assert!(other_items.iter().any(|item| {
         item["kind"] == "message.cancel"
             && item["operation_id"] == cancellation["operation_id"]
-            && item["payload"]["reason"] == "private cancellation reason"
+            && item["payload"].get("reason").is_none()
             && item["payload"]["cancellation"]["payload_digest"] == hidden_before["payload_digest"]
     }));
 
@@ -629,19 +682,13 @@ async fn malformed_legacy_cancel_links_fail_closed_for_recipients() {
             )
             .await;
             assert_eq!(receipt["result"]["operation_id"], cancel_id.as_str());
-            assert_eq!(
-                receipt["result"]["cancellation"]["delivery_id"],
-                delivery_id.as_str()
-            );
-            assert_eq!(
-                receipt["result"]["cancellation"]["payload_digest"],
-                digest.as_str()
-            );
+            assert!(receipt["result"].get("cancellation").is_none());
+            assert!(receipt["result"].get("reason").is_none());
             assert!(events_json.contains(cancel_id));
             assert!(events_json.contains(delivery_id));
             assert!(events_json.contains(digest));
         }
-        assert!(events_json.contains("legacy cancel diagnostic"));
+        assert!(!events_json.contains("legacy cancel diagnostic"));
     }
     owner.close().await.unwrap();
 }

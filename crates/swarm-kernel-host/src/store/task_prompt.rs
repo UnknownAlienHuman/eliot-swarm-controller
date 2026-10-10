@@ -242,3 +242,204 @@ fn validate_launch_dispatch_identity(
 fn invalid_prompt(message: &str) -> Error {
     Error::new("TASK_PROMPT_INVALID", message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::{Requirement, SourceIndexStatus, TaskSourceIndexEntry, TaskSpec},
+        policy::OWNER_POLICY_V1_ID,
+    };
+    use rusqlite::params;
+    use serde_json::json;
+
+    const TASK_ID: &str = "task-prompt-retained";
+    const ATTEMPT_ID: &str = "attempt-task-prompt-retained";
+    const OPERATION_ID: &str = "dispatch-task-prompt-retained";
+    const SOURCE_TEXT: &str = "Implement the pinned Task source: café 🐇";
+
+    fn frozen_snapshot() -> Value {
+        let selected_text = "Issue body selected for this frozen Task revision.";
+        let spec = TaskSpec {
+            acceptance: None,
+            objective: "Use the exact retained source in the dispatch prompt".to_owned(),
+            phase: "implementation".to_owned(),
+            requirements: vec![Requirement {
+                id: "R1".to_owned(),
+                statement: "Preserve the selected source text and Task identity".to_owned(),
+            }],
+            dependencies: Vec::new(),
+            scope: None,
+            source_refs: vec!["issue:14/body".to_owned()],
+            owner_policy_id: Some(OWNER_POLICY_V1_ID.to_owned()),
+            source_index: vec![TaskSourceIndexEntry {
+                source_ref: "issue:14/body".to_owned(),
+                revision: Some("issue-revision-3".to_owned()),
+                content_sha256: Some(model::digest(selected_text.as_bytes())),
+                text: Some(selected_text.to_owned()),
+                status: SourceIndexStatus::Selected,
+                gap_reason: None,
+            }],
+            baseline_candidate_ref: None,
+        };
+        spec.validate().unwrap();
+        let owner_policy =
+            crate::policy::accepted_edition(spec.owner_policy_id.as_deref()).unwrap();
+        json!({
+            "spec":serde_json::to_value(&spec).unwrap(),
+            "revision":3,
+            "dependency_acceptances":[],
+            "baseline_candidate":{"status":"wide","reason":"baseline_not_configured"},
+            "owner_policy":serde_json::to_value(owner_policy).unwrap(),
+            "brief":serde_json::to_value(spec.brief()).unwrap(),
+        })
+    }
+
+    fn assert_retained_prompt_rejected(effective: &Value, attempt: &Value, source_text: &str) {
+        let error = load(effective, attempt, source_text).unwrap_err();
+        assert_eq!(error.code, "TASK_PROMPT_INVALID", "{error}");
+    }
+
+    #[test]
+    fn retained_task_prompt_is_deterministic_across_restart_and_rejects_mutations() {
+        let database_path = std::env::temp_dir().join(format!(
+            "eliot-task-prompt-retained-{}.sqlite",
+            model::new_id()
+        ));
+
+        let expected = {
+            let db = Connection::open(&database_path).unwrap();
+            db.execute_batch(super::super::SCHEMA).unwrap();
+            db.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+            let snapshot = frozen_snapshot();
+            let spec = snapshot["spec"].clone();
+            db.execute(
+                "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) \
+                 VALUES(?1,'task-prompt-project',3,'open',?2,1,1)",
+                params![TASK_ID, model::canonical(&spec).unwrap()],
+            )
+            .unwrap();
+            let route = json!({
+                "alias":"command",
+                "runtime":"command",
+                "module_artifact_id":"command-mod-0.1.0-glue.5",
+                "enabled":true,
+                "native_options":{"modelId":"provider/model"}
+            });
+            db.execute(
+                "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
+                 VALUES('binding-task-prompt',1,'lane-task-prompt','instance-task-prompt','command-mod-0.1.0-glue.5','ready',?1,'{}',1)",
+                [model::canonical(&route).unwrap()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,producers_json,created_at_ms,updated_at_ms) \
+                 VALUES(?1,?2,3,?3,'owner-task-prompt','controller','binding-task-prompt',1,'reserved','[]',1,1)",
+                params![ATTEMPT_ID, TASK_ID, model::canonical(&snapshot).unwrap()],
+            )
+            .unwrap();
+
+            // Use the Store's projected retained Attempt as the build input,
+            // then persist the resulting envelope on the real Operation row.
+            let attempt = super::super::tasks::get_attempt(&db, ATTEMPT_ID).unwrap();
+            let first = build(&attempt, SOURCE_TEXT, None).unwrap();
+            let second = build(&attempt, SOURCE_TEXT, None).unwrap();
+            assert_eq!(first, second);
+            assert!(first.prompt.contains(SOURCE_TEXT));
+            assert!(
+                first
+                    .prompt
+                    .contains("Issue body selected for this frozen Task revision.")
+            );
+
+            let effective = json!({
+                "route":route,
+                "input":SOURCE_TEXT,
+                "task_snapshot":snapshot,
+                "task_prompt":serde_json::to_value(&first).unwrap(),
+                "operation_contract":{"task_prompt":{"contract_revision":TASK_PROMPT_CONTRACT_REVISION}},
+            });
+            let original = json!({
+                "client_request_id":"task-prompt-retained-request",
+                "attempt_id":ATTEMPT_ID,
+                "text":SOURCE_TEXT,
+            });
+            db.execute(
+                "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,due_at_ms,created_at_ms,updated_at_ms) \
+                 VALUES(?1,'task-prompt-caller','task-prompt-retained-request','task.dispatch',?2,?3,?4,?5,'binding-task-prompt',1,'queued',1,1,1)",
+                params![
+                    OPERATION_ID,
+                    model::canonical(&original).unwrap(),
+                    model::canonical(&effective).unwrap(),
+                    TASK_ID,
+                    ATTEMPT_ID,
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE attempts SET start_operation_id=?2 WHERE attempt_id=?1",
+                params![ATTEMPT_ID, OPERATION_ID],
+            )
+            .unwrap();
+            first
+        };
+
+        // A second SQLite connection models Store restart: the source request,
+        // Attempt snapshot and TaskPrompt envelope all come back from rows.
+        let db = Connection::open(&database_path).unwrap();
+        let attempt = super::super::tasks::get_attempt(&db, ATTEMPT_ID).unwrap();
+        let (original_raw, effective_raw): (String, String) = db
+            .query_row(
+                "SELECT original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+                [OPERATION_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let original: Value = serde_json::from_str(&original_raw).unwrap();
+        let effective: Value = serde_json::from_str(&effective_raw).unwrap();
+        let source_text = model::text(&original, "text").unwrap().to_owned();
+        let loaded = load(&effective, &attempt, &source_text).unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded.prompt_sha256,
+            model::digest(loaded.prompt.as_bytes())
+        );
+        assert_eq!(loaded.prompt_bytes, loaded.prompt.len() as u64);
+
+        for (field, value) in [
+            ("task_id", json!("other-task")),
+            ("task_revision", json!(loaded.task_revision + 1)),
+            ("attempt_id", json!("other-attempt")),
+            (
+                "task_snapshot_sha256",
+                json!(model::digest(b"different frozen snapshot")),
+            ),
+            ("prompt_sha256", json!(model::digest(b"different prompt"))),
+        ] {
+            let mut changed = effective.clone();
+            changed["task_prompt"][field] = value;
+            assert_retained_prompt_rejected(&changed, &attempt, &source_text);
+        }
+
+        let mut changed_prompt = effective.clone();
+        let prompt = loaded.prompt.replace("Implement", "Inspect");
+        changed_prompt["task_prompt"]["prompt"] = json!(prompt);
+        changed_prompt["task_prompt"]["prompt_sha256"] = json!(model::digest(prompt.as_bytes()));
+        changed_prompt["task_prompt"]["prompt_bytes"] = json!(prompt.len() as u64);
+        assert_retained_prompt_rejected(&changed_prompt, &attempt, &source_text);
+        assert_retained_prompt_rejected(&effective, &attempt, "changed retained source text");
+
+        let mut changed_attempt = attempt.clone();
+        changed_attempt["task_snapshot"]["brief"]["objective"] = json!("changed frozen brief");
+        assert_retained_prompt_rejected(&effective, &changed_attempt, &source_text);
+
+        let mut changed_contract = effective.clone();
+        changed_contract["operation_contract"]["task_prompt"]["contract_revision"] =
+            json!("task-prompt-old");
+        assert_retained_prompt_rejected(&changed_contract, &attempt, &source_text);
+
+        drop(db);
+        let _ = std::fs::remove_file(database_path);
+    }
+}

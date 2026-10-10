@@ -1,5 +1,5 @@
-use crate::journal::{DispatchIdentity, RunStore, digest};
 use crate::acp_prompt::PreparedAcpDispatch;
+use crate::journal::{DispatchIdentity, RunStore, digest};
 use crate::{ARTIFACT_ID, EXECUTION_SHAPE};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1293,7 +1293,12 @@ pub fn task_prompt_identity(
     let batch_run_id = core_binding["batch_run_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty() && value.len() <= 256)
-        .ok_or_else(|| Error::new("NATIVE_IDENTITY_MISMATCH", "Store core binding omitted batch_run_id"))?;
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "Store core binding omitted batch_run_id",
+            )
+        })?;
     let expected_prompt_bytes = u64::try_from(prompt.len()).ok();
     if core_binding.as_object().is_none_or(|fields| {
         fields.len() != 3
@@ -1310,8 +1315,12 @@ pub fn task_prompt_identity(
             "Store core binding differs from exact TaskPrompt bytes",
         ));
     }
-    let prompt_bytes = usize::try_from(dispatch.identity.prompt_bytes)
-        .map_err(|_| Error::new("COMMAND_PROMPT_BOUNDARY", "TaskPrompt byte length is too large"))?;
+    let prompt_bytes = usize::try_from(dispatch.identity.prompt_bytes).map_err(|_| {
+        Error::new(
+            "COMMAND_PROMPT_BOUNDARY",
+            "TaskPrompt byte length is too large",
+        )
+    })?;
     Ok(DispatchIdentity {
         operation_id: dispatch.identity.operation_id.clone(),
         input_sha256: dispatch.identity.input_sha256.clone(),

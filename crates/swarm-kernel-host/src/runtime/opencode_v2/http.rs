@@ -422,9 +422,7 @@ impl Service {
     ) -> Result<()> {
         let mut url = self
             .endpoint
-            .join(&format!(
-                "/api/integration/{integration_id}/connect/key"
-            ))
+            .join(&format!("/api/integration/{integration_id}/connect/key"))
             .map_err(|_| Error::new("NATIVE_ENDPOINT", "invalid provider integration route"))?;
         // OpenCode 2.0.7's LocationMiddleware defaults an omitted directory to
         // the server's process.cwd(). Bind this mutation to the same explicit

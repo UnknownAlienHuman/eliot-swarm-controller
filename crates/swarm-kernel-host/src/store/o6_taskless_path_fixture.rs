@@ -5,6 +5,30 @@
 //! the pending cursor. It prepares and verifies a retained bundle but never
 //! calls the script worker or launches the configured interpreter.
 
+/// A content-pinned file for Store-only tests that exercise new ScriptRun
+/// admission. These tests do not start the ScriptRun supervisor, so the host
+/// test image is never executed as a worker and this does not qualify the
+/// standalone worker runtime.
+#[cfg(test)]
+pub(crate) fn store_only_script_executor_pin() -> swarm_script_worker::ExecutorPin {
+    static PIN: std::sync::OnceLock<swarm_script_worker::ExecutorPin> = std::sync::OnceLock::new();
+    PIN.get_or_init(|| {
+        let executable =
+            std::env::current_exe().expect("resolve test executable for Store fixture");
+        let bytes = std::fs::read(&executable).expect("read exact Store fixture executable bytes");
+        let pin = swarm_script_worker::ExecutorPin {
+            executable,
+            sha256: crate::model::digest(&bytes),
+            artifact_id: "script-store-only-test-pin".to_owned(),
+            version: "0.0.0-test-fixture".to_owned(),
+        };
+        swarm_script_worker::verify_pinned_executor_file(&pin)
+            .expect("Store-only executor fixture matches its exact content pin");
+        pin
+    })
+    .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -32,6 +56,7 @@ mod tests {
         let credential = bootstrap_credential(&root.path).expect("create Operator credential");
         let mut config = Config::default();
         config.storage.data_dir = directory.clone();
+        config.scripts.executor = Some(super::store_only_script_executor_pin());
         let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
             .await
             .expect("start Store");
@@ -393,13 +418,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // The pending intent precedes immutable revision capture at admission.
-        // History retains that intent; the Operation link adds script_revision.
+        // The pending intent is the source-only public cause. Admission adds
+        // consumer attribution and the immutable script revision to its link.
         let mut staged_cause = cause.clone();
-        staged_cause
-            .as_object_mut()
-            .unwrap()
-            .remove("script_revision");
+        let staged_cause_fields = staged_cause.as_object_mut().unwrap();
+        staged_cause_fields.remove("automation_consumer");
+        staged_cause_fields.remove("script_revision");
         assert!(
             snapshot["dispatch"]["recent"]
                 .as_array()

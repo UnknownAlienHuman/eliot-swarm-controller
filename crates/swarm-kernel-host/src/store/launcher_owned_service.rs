@@ -169,6 +169,22 @@ struct DepartureCandidate {
     row: OwnedStartRow,
     service_config: Option<OwnedOpenCodeServiceConfig>,
     workspace_directory: Option<PathBuf>,
+    source_error_code: Option<String>,
+}
+
+struct DepartureProof {
+    process_id: i64,
+    birth_token: String,
+    binary_sha256: String,
+    canonical: String,
+}
+
+struct DepartureIssueObservation {
+    operation_id: Option<String>,
+    binding_id: Option<String>,
+    generation: Option<i64>,
+    kind: String,
+    payload_json: String,
 }
 
 impl Store {
@@ -620,72 +636,45 @@ impl Store {
                 )
                 .ok_or_else(|| corrupt("departure cursor overflow"))?;
             let row = candidate.row;
-            let mut committed = false;
-            if let (Some(service_config), Some(workspace_directory)) =
-                (candidate.service_config, candidate.workspace_directory)
-                && let Ok(base_route) = OwnedServiceRoute::from_config(&service_config)
-                && let Ok(route) = base_route.for_launch(&row.owner_nonce, &workspace_directory)
-                && route.service_id() == row.service_id
-                && route.version() == row.service_version
-                && let Ok(route_digest) = route.route_digest()
-                && route_digest == row.route_digest
-            {
-                let stored_proof = serde_json::from_str::<Value>(&row.proof_json);
-                if let Ok(stored_proof) = stored_proof
-                    && (row.state != "service_observed"
-                        || verify_readback_value(&stored_proof, &route, &row).is_ok())
-                    && (row.state != "outcome_unknown"
-                        || stored_proof
-                            .as_object()
-                            .is_some_and(serde_json::Map::is_empty))
-                    && let Ok(Some(evidence)) =
-                        crate::runtime::opencode_v2::owned_service::observe_departure(
-                            &route,
-                            &stored_proof,
-                        )
-                {
-                    let departure_proof = evidence.store_proof();
-                    if let Ok((process_id, birth_token, binary_sha256)) =
-                        validate_departure_proof(&departure_proof, &route, &row, &stored_proof)
-                    {
-                        let envelope = json!({
-                            "schema_version":1,
-                            "status":"service_departed",
-                            "service_proof":stored_proof,
-                            "departure":departure_proof,
-                        });
-                        if let Ok(canonical) = model::canonical(&envelope)
-                            && canonical.len() <= MAX_PROOF_BYTES
-                        {
-                            let expected_row = row.clone();
-                            let expected_proof_json = row.proof_json.clone();
-                            let departed_proof_json = canonical;
-                            let updated = self
-                                .run(move |db| {
-                                    persist_departure(
-                                        db,
-                                        &expected_row,
-                                        &expected_proof_json,
-                                        &departed_proof_json,
-                                        process_id,
-                                        &birth_token,
-                                        &binary_sha256,
-                                        cursor_ms,
-                                    )
-                                })
-                                .await?;
-                            if updated {
-                                departed_count += 1;
-                                committed = true;
-                            }
+            let failure_code = match candidate.source_error_code {
+                Some(code) => Some(code),
+                None => match build_departure_proof(
+                    &row,
+                    candidate.service_config.as_ref(),
+                    candidate.workspace_directory.as_deref(),
+                ) {
+                    Ok(Some(proof)) => {
+                        let expected_row = row.clone();
+                        let expected_proof_json = row.proof_json.clone();
+                        let updated = self
+                            .run(move |db| {
+                                persist_departure(
+                                    db,
+                                    &expected_row,
+                                    &expected_proof_json,
+                                    &proof.canonical,
+                                    proof.process_id,
+                                    &proof.birth_token,
+                                    &proof.binary_sha256,
+                                    cursor_ms,
+                                )
+                            })
+                            .await?;
+                        if updated {
+                            departed_count += 1;
                         }
+                        // A lost row CAS means another exact transition won.
+                        // Do not attach this stale candidate's diagnostic.
+                        continue;
                     }
-                }
-            }
-            if !committed {
-                let row = row.clone();
-                let proof_json = row.proof_json.clone();
-                self.run(move |db| touch_departure_candidate(db, &row, &proof_json, cursor_ms))
+                    Ok(None) => Some("OWNED_SERVICE_DEPARTURE_NOT_PROVED".to_owned()),
+                    Err(error) if error.code.starts_with("STORE_") => return Err(error),
+                    Err(error) => Some(departure_issue_code(&error).to_owned()),
+                },
+            };
+            if let Some(code) = failure_code {
+                let expected_row = row.clone();
+                self.run(move |db| persist_departure_issue(db, &expected_row, &code, cursor_ms))
                     .await?;
             }
         }
@@ -2427,14 +2416,17 @@ fn departure_batch(db: &Connection) -> Result<(Vec<DepartureCandidate>, i64)> {
         let Some(row) = load_start_row(db, &binding_id, generation)? else {
             continue;
         };
-        let source = departure_source(db, &row).ok();
-        let (service_config, workspace_directory) = source
-            .map(|(config, path)| (Some(config), Some(path)))
-            .unwrap_or((None, None));
+        let (service_config, workspace_directory, source_error_code) =
+            match departure_source(db, &row) {
+                Ok((config, path)) => (Some(config), Some(path), None),
+                Err(error) if error.code.starts_with("STORE_") => return Err(error),
+                Err(error) => (None, None, Some(departure_issue_code(&error).to_owned())),
+            };
         candidates.push(DepartureCandidate {
             row,
             service_config,
             workspace_directory,
+            source_error_code,
         });
     }
     Ok((candidates, cursor_base))
@@ -2457,8 +2449,14 @@ fn departure_source(
         .owned_service
         .clone()
         .ok_or_else(|| corrupt("departure binding has no explicit owned service route"))?;
+    let supported_route_artifact = (stored_route.runtime == crate::runtime::opencode_v2::RUNTIME
+        && stored_route.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+        || (stored_route.runtime == "module"
+            && stored_route.module_artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID);
     if binding.lane_id != format!("launch-{}", row.lease_id)
-        || binding.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
+        || !owned_opencode_artifact(&binding.module_artifact_id)
+        || binding.module_artifact_id != stored_route.module_artifact_id
+        || !supported_route_artifact
     {
         return Err(corrupt(
             "departure binding is outside the retained launch scope",
@@ -2607,6 +2605,72 @@ fn departure_source(
         ));
     }
     Ok((service_config, workspace_directory))
+}
+
+fn build_departure_proof(
+    row: &OwnedStartRow,
+    service_config: Option<&OwnedOpenCodeServiceConfig>,
+    workspace_directory: Option<&Path>,
+) -> Result<Option<DepartureProof>> {
+    let service_config = service_config
+        .ok_or_else(|| corrupt("departure candidate has no validated owned-service route"))?;
+    let workspace_directory = workspace_directory
+        .ok_or_else(|| corrupt("departure candidate has no validated workspace path"))?;
+    let base_route = OwnedServiceRoute::from_config(service_config)?;
+    let route = base_route.for_launch(&row.owner_nonce, workspace_directory)?;
+    if route.service_id() != row.service_id
+        || route.version() != row.service_version
+        || route.route_digest()? != row.route_digest
+    {
+        return Err(corrupt(
+            "departure route differs from its exact retained start intent",
+        ));
+    }
+
+    let stored_proof = serde_json::from_str::<Value>(&row.proof_json)
+        .map_err(|_| corrupt("retained owned-service proof is invalid JSON"))?;
+    match row.state.as_str() {
+        "service_observed" => {
+            verify_readback_value(&stored_proof, &route, row)?;
+        }
+        "outcome_unknown"
+            if stored_proof
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty) => {}
+        "outcome_unknown" => {
+            return Err(corrupt(
+                "unknown owned-service row contains unexpected process proof",
+            ));
+        }
+        _ => return Err(recovery_required(&row.state)),
+    }
+
+    let Some(evidence) =
+        crate::runtime::opencode_v2::owned_service::observe_departure(&route, &stored_proof)?
+    else {
+        return Ok(None);
+    };
+    let departure_proof = evidence.store_proof();
+    let (process_id, birth_token, binary_sha256) =
+        validate_departure_proof(&departure_proof, &route, row, &stored_proof)?;
+    let envelope = json!({
+        "schema_version":1,
+        "status":"service_departed",
+        "service_proof":stored_proof,
+        "departure":departure_proof,
+    });
+    let canonical = model::canonical(&envelope)?;
+    if canonical.len() > MAX_PROOF_BYTES {
+        return Err(corrupt(
+            "owned service departure envelope exceeds its storage bound",
+        ));
+    }
+    Ok(Some(DepartureProof {
+        process_id,
+        birth_token,
+        binary_sha256,
+        canonical,
+    }))
 }
 
 fn historical_workspace_path(db: &Connection, lease: &LeaseAuthorityRef) -> Result<PathBuf> {
@@ -2834,13 +2898,64 @@ fn persist_departure(
     Ok(changed == 1)
 }
 
-fn touch_departure_candidate(
+fn departure_issue_code(error: &Error) -> &'static str {
+    match error.code.as_str() {
+        "OWNED_SERVICE_SCOPE_STALE" => "OWNED_SERVICE_SCOPE_STALE",
+        "OWNED_SERVICE_RECEIPT_CORRUPT" => "OWNED_SERVICE_RECEIPT_CORRUPT",
+        "OWNED_SERVICE_RECOVERY_REQUIRED" => "OWNED_SERVICE_RECOVERY_REQUIRED",
+        _ => "OWNED_SERVICE_DEPARTURE_OBSERVATION_FAILED",
+    }
+}
+
+fn is_departure_issue_code(code: &str) -> bool {
+    matches!(
+        code,
+        "OWNED_SERVICE_SCOPE_STALE"
+            | "OWNED_SERVICE_RECEIPT_CORRUPT"
+            | "OWNED_SERVICE_RECOVERY_REQUIRED"
+            | "OWNED_SERVICE_DEPARTURE_NOT_PROVED"
+            | "OWNED_SERVICE_DEPARTURE_OBSERVATION_FAILED"
+    )
+}
+
+fn departure_candidate_digest(row: &OwnedStartRow) -> Result<String> {
+    let identity = json!([
+        "owned-service-departure-candidate-v1",
+        &row.launch_operation_id,
+        &row.open_operation_id,
+        &row.binding_id,
+        row.binding_generation,
+        &row.task_id,
+        row.task_revision,
+        &row.attempt_id,
+        &row.lease_id,
+        row.lease_generation,
+        &row.technical_requester_id,
+        &row.effective_manager_id,
+        &row.service_id,
+        &row.service_version,
+        &row.route_digest,
+        &row.binding_digest,
+        &row.owner_nonce,
+        &row.intent_digest,
+    ]);
+    Ok(model::digest(model::canonical(&identity)?.as_bytes()))
+}
+
+/// Advance only the exact still-uncertain candidate and retain one bounded,
+/// idempotent controller observation for its semantic/proof failure.
+fn persist_departure_issue(
     db: &mut Connection,
     row: &OwnedStartRow,
-    proof_json: &str,
+    failure_code: &str,
     cursor_ms: i64,
-) -> Result<()> {
-    db.execute(
+) -> Result<bool> {
+    if !is_departure_issue_code(failure_code) {
+        return Err(corrupt("owned service departure issue code is invalid"));
+    }
+
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
         "UPDATE owned_service_starts SET updated_at_ms=?1
          WHERE launch_operation_id=?2 AND binding_id=?3 AND binding_generation=?4
            AND state=?5 AND intent_nonce=?6 AND route_digest=?7 AND intent_digest=?8
@@ -2854,11 +2969,106 @@ fn touch_departure_candidate(
             row.owner_nonce,
             row.route_digest,
             row.intent_digest,
-            proof_json,
+            row.proof_json,
             row.updated_at_ms,
         ],
     )?;
-    Ok(())
+    if changed != 1 {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let candidate_sha256 = departure_candidate_digest(row)?;
+    let source_proof_sha256 = model::digest(row.proof_json.as_bytes());
+    let event_key = format!("owned-service-departure-issue:{candidate_sha256}");
+    let diagnostic = json!({
+        "schema_version":1,
+        "disposition":"retained_uncertain",
+        "failure_code":failure_code,
+        "candidate_sha256":&candidate_sha256,
+        "source_proof_sha256":&source_proof_sha256,
+        "route_digest":&row.route_digest,
+        "intent_digest":&row.intent_digest,
+    });
+    let canonical = model::canonical(&diagnostic)?;
+    if canonical.len() > MAX_START_FAILURE_DIAGNOSTIC_BYTES {
+        return Err(corrupt(
+            "owned service departure diagnostic exceeds its storage bound",
+        ));
+    }
+
+    let existing: Option<DepartureIssueObservation> = tx
+        .query_row(
+            "SELECT operation_id,binding_id,binding_generation,kind,payload_json
+             FROM observations WHERE source_stream_id='controller:owned-service'
+               AND source_event_key=?1",
+            [&event_key],
+            |record| {
+                Ok(DepartureIssueObservation {
+                    operation_id: record.get(0)?,
+                    binding_id: record.get(1)?,
+                    generation: record.get(2)?,
+                    kind: record.get(3)?,
+                    payload_json: record.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(DepartureIssueObservation {
+        operation_id,
+        binding_id,
+        generation,
+        kind,
+        payload_json,
+    }) = existing
+    {
+        if operation_id.as_deref() != Some(row.launch_operation_id.as_str())
+            || binding_id.as_deref() != Some(row.binding_id.as_str())
+            || generation != Some(row.binding_generation)
+            || kind != "owned_service.departure_issue"
+        {
+            return Err(corrupt(
+                "owned service departure diagnostic conflicts with retained evidence",
+            ));
+        }
+        let existing_payload: Value = serde_json::from_str(&payload_json)
+            .map_err(|_| corrupt("retained owned service departure diagnostic is invalid JSON"))?;
+        if model::canonical(&existing_payload)? != payload_json
+            || existing_payload["schema_version"] != 1
+            || existing_payload["disposition"] != "retained_uncertain"
+            || existing_payload["candidate_sha256"] != candidate_sha256
+            || existing_payload["route_digest"] != row.route_digest
+            || existing_payload["intent_digest"] != row.intent_digest
+            || !existing_payload["source_proof_sha256"]
+                .as_str()
+                .is_some_and(is_sha256)
+            || !existing_payload["failure_code"]
+                .as_str()
+                .is_some_and(is_departure_issue_code)
+        {
+            return Err(corrupt(
+                "retained owned service departure diagnostic differs from its candidate",
+            ));
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO observations(
+                 source_stream_id,source_event_key,binding_id,binding_generation,
+                 operation_id,kind,payload_json,recorded_at_ms
+             ) VALUES('controller:owned-service',?1,?2,?3,?4,
+                      'owned_service.departure_issue',?5,?6)",
+            params![
+                event_key,
+                row.binding_id,
+                row.binding_generation,
+                row.launch_operation_id,
+                canonical,
+                model::now_ms()?,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 fn held_workspace_path(db: &Connection, lease: &LeaseAuthorityRef) -> Result<PathBuf> {

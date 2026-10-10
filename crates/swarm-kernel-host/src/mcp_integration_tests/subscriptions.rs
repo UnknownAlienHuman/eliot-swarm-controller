@@ -36,6 +36,7 @@ async fn start_stack() -> Stack {
     let mut cfg = Config::default();
     cfg.storage.data_dir = dir.clone();
     cfg.routes.push(Route {
+        admission_policy: Default::default(),
         workspace_option: None,
         owned_service: None,
         alias: "fixture".into(),
@@ -258,6 +259,9 @@ impl SubClient {
         seen: &mut Vec<Value>,
         pred: impl Fn(&Value) -> bool,
     ) -> Option<Value> {
+        if let Some(index) = seen.iter().position(|message| pred(message)) {
+            return Some(seen.remove(index));
+        }
         let deadline = tokio::time::Instant::now() + dur;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

@@ -48,10 +48,15 @@ const MODULE_SUPERVISOR_CLIENT_ID: &str = "eliot-module-supervisor-v1";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_ID: &str = "opencode-v2-native-options";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY: &str = "1";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER: &str = "2";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3: &str = "3";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY: &str =
     "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER: &str =
     "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V3: &str =
+    "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e";
+const OPENCODE_MODULE_ID: &str = "eliot.opencode.v2";
+const OPENCODE_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
 const OPENCODE_OWNED_SERVICE_VERSION: &str = "2.0.7";
 const OWNER_ROUTE_KEY: &str = "__eliot_owned_service";
 const OWNER_NONCE_KEY: &str = "__eliot_owner_nonce";
@@ -392,23 +397,30 @@ struct OwnedRouteConfig {
 }
 
 fn opencode_schema_supported(descriptor: &ModuleDescriptor) -> bool {
-    descriptor.config_schema.as_ref().is_some_and(|schema| {
-        schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
-            && schema.sha256.as_ref().is_some_and(|digest| {
-                (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY
-                    && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY)
-                    || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
-                        && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER)
-            })
-    })
+    // These schema digests are registered for this exact module artifact.
+    descriptor.module_id.as_str() == OPENCODE_MODULE_ID
+        && descriptor.artifact.artifact_id.as_str() == OPENCODE_ARTIFACT_ID
+        && descriptor.config_schema.as_ref().is_some_and(|schema| {
+            schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
+                && schema.sha256.as_ref().is_some_and(|digest| {
+                    (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY
+                        && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY)
+                        || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
+                            && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER)
+                        || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3
+                            && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V3)
+                })
+        })
 }
 
 fn opencode_owner_schema(descriptor: &ModuleDescriptor) -> bool {
     descriptor.config_schema.as_ref().is_some_and(|schema| {
         schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
-            && schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
             && schema.sha256.as_ref().is_some_and(|digest| {
-                digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER
+                (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
+                    && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER)
+                    || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3
+                        && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V3)
             })
     })
 }
@@ -501,10 +513,6 @@ fn open_code_route_config(
             LaunchValue::Literal(configured_connection_file.clone()),
         ),
         (
-            "OPENCODE_EXPECTED_VERSION".to_owned(),
-            LaunchValue::Literal(expected_version.clone()),
-        ),
-        (
             "OPENCODE_DIRECTORY".to_owned(),
             LaunchValue::Literal(directory.clone()),
         ),
@@ -521,6 +529,18 @@ fn open_code_route_config(
             LaunchValue::Literal(variant.clone()),
         ),
     ]);
+
+    // Schema v3 intentionally removes expected_version from launch config.
+    if descriptor
+        .config_schema
+        .as_ref()
+        .is_some_and(|schema| schema.version != OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3)
+    {
+        values.insert(
+            "OPENCODE_EXPECTED_VERSION".to_owned(),
+            LaunchValue::Literal(expected_version.clone()),
+        );
+    }
 
     if has_owner_service {
         let owner: OwnedRouteConfig = serde_json::from_value(object[OWNER_ROUTE_KEY].clone())
@@ -1561,4 +1581,229 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod opencode_schema_projection_tests {
+    use super::{
+        BindingLaunchConfig, Error, LaunchValue, ModuleDescriptor, OWNER_NONCE_KEY,
+        OWNER_ROUTE_KEY, StandaloneRouteConfigMapper, map_route_config, sha256_hex,
+    };
+    use serde_json::{Value, json};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
+
+    const OWNER_NONCE: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER_OWNER_NONCE: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn descriptor_for_schema(version: &str) -> ModuleDescriptor {
+        let (artifact_version, digest) = match version {
+            "1" => (
+                "0.1.0",
+                "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662",
+            ),
+            "2" => (
+                "0.3.0",
+                "7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68",
+            ),
+            "3" => (
+                "0.5.0",
+                "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e",
+            ),
+            _ => panic!("unsupported test schema version"),
+        };
+        let mut descriptor: Value = serde_json::from_str(include_str!(
+            "../../swarm-adapter-opencode/registration/descriptor.template.json"
+        ))
+        .unwrap();
+        descriptor["artifact"]["version"] = json!(artifact_version);
+        descriptor["config_schema"]["version"] = json!(version);
+        descriptor["config_schema"]["sha256"] = json!(digest);
+        serde_json::from_value(descriptor).unwrap()
+    }
+
+    fn fixture_root() -> PathBuf {
+        std::env::temp_dir().join("eliot-swarm-supervisor-opencode-schema-tests")
+    }
+
+    fn path_text(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    fn external_options() -> Value {
+        let root = fixture_root();
+        json!({
+            "service_id": "opencode-external-fixture",
+            "connection_file": path_text(&root.join("external/connection.json")),
+            "expected_version": "2.0.7",
+            "directory": path_text(&root.join("workspace")),
+            "model": {
+                "id": "openai/gpt-5",
+                "providerID": "openai",
+                "variant": "high"
+            }
+        })
+    }
+
+    fn owned_options(owner_nonce: &str) -> Value {
+        let root = fixture_root();
+        let state_root = root.join("owned-state");
+        let owner_service_id = format!(
+            "opencode-owned-fixture-{}",
+            &sha256_hex(owner_nonce.as_bytes())[..16]
+        );
+        let connection_file = state_root
+            .join("launches")
+            .join(owner_nonce)
+            .join("connection.json");
+        let mut options = external_options();
+        options["service_id"] = json!(owner_service_id);
+        options["connection_file"] = json!(path_text(&connection_file));
+
+        let owner = json!({
+            "origin": "fresh_owned_service",
+            "service_id": "opencode-owned-fixture",
+            "model": {
+                "id": "openai/gpt-5",
+                "providerID": "openai",
+                "variant": "high"
+            },
+            "model_catalog": "offline",
+            "bun_executable": path_text(&root.join("runtime/bun")),
+            "bun_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "server_program": path_text(&root.join("runtime/server.js")),
+            "server_program_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state_root": path_text(&state_root),
+            "port": 4317
+        });
+        let object = options.as_object_mut().unwrap();
+        object.insert(OWNER_ROUTE_KEY.to_owned(), owner);
+        object.insert(OWNER_NONCE_KEY.to_owned(), json!(owner_nonce));
+        options
+    }
+
+    fn project(
+        descriptor: &ModuleDescriptor,
+        options: &Value,
+    ) -> std::result::Result<BindingLaunchConfig, Error> {
+        map_route_config(
+            StandaloneRouteConfigMapper::DescriptorSchema,
+            descriptor,
+            options,
+            &BTreeMap::new(),
+        )
+    }
+
+    fn literal<'a>(config: &'a BindingLaunchConfig, key: &str) -> &'a str {
+        match &config.values[key] {
+            LaunchValue::Literal(value) => value,
+            other => panic!("{key} was not projected as a literal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_v3_external_projection_omits_undeclared_expected_version() {
+        let descriptor = descriptor_for_schema("3");
+        let config = project(&descriptor, &external_options()).unwrap();
+
+        assert!(!config.values.contains_key("OPENCODE_EXPECTED_VERSION"));
+        assert_eq!(
+            literal(&config, "OPENCODE_CONNECTION_FILE"),
+            path_text(&fixture_root().join("external/connection.json"))
+        );
+        assert_eq!(
+            literal(&config, "OPENCODE_DIRECTORY"),
+            path_text(&fixture_root().join("workspace"))
+        );
+    }
+
+    #[test]
+    fn opencode_v3_owned_projection_omits_version_and_retains_owner_pin() {
+        let descriptor = descriptor_for_schema("3");
+        let options = owned_options(OWNER_NONCE);
+        let config = project(&descriptor, &options).unwrap();
+        let state_root = fixture_root()
+            .join("owned-state")
+            .join("launches")
+            .join(OWNER_NONCE);
+
+        assert!(!config.values.contains_key("OPENCODE_EXPECTED_VERSION"));
+        assert_eq!(
+            literal(&config, "OPENCODE_OWNER_ORIGIN"),
+            "fresh_owned_service"
+        );
+        assert_eq!(literal(&config, "OPENCODE_OWNER_NONCE"), OWNER_NONCE);
+        assert_eq!(
+            literal(&config, "OPENCODE_SERVICE_ID"),
+            options["service_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            literal(&config, "OPENCODE_CONNECTION_FILE"),
+            options["connection_file"].as_str().unwrap()
+        );
+        assert_eq!(
+            literal(&config, "OPENCODE_OWNER_STATE_ROOT"),
+            path_text(&state_root)
+        );
+    }
+
+    #[test]
+    fn opencode_v3_mapper_rejects_wrong_schema_digest_and_artifact() {
+        let options = external_options();
+
+        let mut wrong_digest: Value = serde_json::from_str(include_str!(
+            "../../swarm-adapter-opencode/registration/descriptor.template.json"
+        ))
+        .unwrap();
+        wrong_digest["config_schema"]["sha256"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
+        let wrong_digest: ModuleDescriptor = serde_json::from_value(wrong_digest).unwrap();
+        assert_eq!(
+            project(&wrong_digest, &options).unwrap_err().code,
+            "MODULE_CONFIG_SCHEMA_UNSUPPORTED"
+        );
+
+        let mut wrong_artifact: Value = serde_json::from_str(include_str!(
+            "../../swarm-adapter-opencode/registration/descriptor.template.json"
+        ))
+        .unwrap();
+        wrong_artifact["artifact"]["artifact_id"] = json!("eliot-opencode-v2.rust-http.2");
+        let wrong_artifact: ModuleDescriptor = serde_json::from_value(wrong_artifact).unwrap();
+        assert_eq!(
+            project(&wrong_artifact, &options).unwrap_err().code,
+            "MODULE_CONFIG_SCHEMA_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn opencode_v1_and_v2_projections_preserve_expected_version() {
+        for version in ["1", "2"] {
+            let descriptor = descriptor_for_schema(version);
+            let config = project(&descriptor, &external_options()).unwrap();
+            assert_eq!(
+                literal(&config, "OPENCODE_EXPECTED_VERSION"),
+                "2.0.7",
+                "schema version {version}"
+            );
+        }
+
+        let descriptor = descriptor_for_schema("2");
+        let config = project(&descriptor, &owned_options(OWNER_NONCE)).unwrap();
+        assert_eq!(literal(&config, "OPENCODE_EXPECTED_VERSION"), "2.0.7");
+        assert_eq!(literal(&config, "OPENCODE_OWNER_NONCE"), OWNER_NONCE);
+    }
+
+    #[test]
+    fn opencode_owned_projection_rejects_route_nonce_mismatch() {
+        let descriptor = descriptor_for_schema("3");
+        let mut options = owned_options(OWNER_NONCE);
+        options[OWNER_NONCE_KEY] = json!(OTHER_OWNER_NONCE);
+
+        assert_eq!(
+            project(&descriptor, &options).unwrap_err().code,
+            "MODULE_CONFIG_SCOPE_MISMATCH"
+        );
+    }
 }

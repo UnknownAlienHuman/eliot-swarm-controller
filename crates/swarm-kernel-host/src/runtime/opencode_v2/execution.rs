@@ -22,7 +22,7 @@ use crate::{
     runtime::RuntimeCommand,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 pub(crate) const READER_REVISION: &str = "opencode-execution-log-v1";
 
@@ -681,8 +681,9 @@ impl ExecutionScan {
 }
 
 pub(crate) const SESSION_READER_REVISION: &str = "opencode-session-log-v1";
-/// Busy periods retained per child session. The open period is never dropped;
-/// older terminal periods fall off first so the checkpoint stays bounded.
+/// Busy periods retained per child session. Older terminal periods may fall
+/// off first; if every slot is unresolved, overflow is explicit and the scan
+/// remains unknown while raw native logs remain the source evidence.
 const MAX_SESSION_PERIODS: usize = 16;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -737,6 +738,10 @@ pub(crate) struct SessionScan {
     creation: Option<EventRef>,
     periods: Vec<SessionPeriod>,
     uncertainty: Option<String>,
+    /// Once the bounded checkpoint cannot retain every unresolved start,
+    /// remain unknown while the native source log continues to be scanned.
+    #[serde(default)]
+    overflowed: bool,
 }
 
 pub(crate) struct SessionRead {
@@ -754,8 +759,57 @@ impl SessionScan {
         valid_id(session_id, "ses")?;
         valid_id(parent_id, "ses")?;
         if let Some(saved) = saved {
-            let scan: Self = serde_json::from_value(saved.clone())
-                .map_err(|_| gap("NATIVE_LOG_CHECKPOINT_SCHEMA"))?;
+            let oversized = saved
+                .get("periods")
+                .and_then(Value::as_array)
+                .is_some_and(|periods| periods.len() > MAX_SESSION_PERIODS);
+            let saved = if oversized {
+                let object = saved
+                    .as_object()
+                    .ok_or_else(|| gap("NATIVE_LOG_CHECKPOINT_SCHEMA"))?;
+                const FIELDS: &[&str] = &[
+                    "revision",
+                    "session_id",
+                    "parent_id",
+                    "after",
+                    "anchor",
+                    "watermark",
+                    "creation",
+                    "periods",
+                    "uncertainty",
+                    "overflowed",
+                ];
+                if object.keys().any(|field| !FIELDS.contains(&field.as_str())) {
+                    return Err(gap("NATIVE_LOG_CHECKPOINT_SCHEMA"));
+                }
+                let periods = object
+                    .get("periods")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| gap("NATIVE_LOG_CHECKPOINT_SCHEMA"))?;
+                let mut bounded = Map::new();
+                for (field, value) in object {
+                    if field == "periods" {
+                        bounded.insert(
+                            field.clone(),
+                            Value::Array(
+                                periods.iter().take(MAX_SESSION_PERIODS).cloned().collect(),
+                            ),
+                        );
+                    } else if field == "overflowed" {
+                        bounded.insert(field.clone(), Value::Bool(true));
+                    } else {
+                        bounded.insert(field.clone(), value.clone());
+                    }
+                }
+                if !object.contains_key("overflowed") {
+                    bounded.insert("overflowed".into(), Value::Bool(true));
+                }
+                Value::Object(bounded)
+            } else {
+                saved.clone()
+            };
+            let mut scan: Self =
+                serde_json::from_value(saved).map_err(|_| gap("NATIVE_LOG_CHECKPOINT_SCHEMA"))?;
             if scan.revision != SESSION_READER_REVISION
                 || scan.session_id != session_id
                 || scan.parent_id != parent_id
@@ -765,9 +819,13 @@ impl SessionScan {
                     .zip(scan.anchor.as_ref().map(|a| a.seq))
                     .is_some_and(|(a, b)| a >= b)
                 || scan.anchor.is_some() != scan.creation.is_some()
-                || scan.periods.len() > MAX_SESSION_PERIODS
             {
                 return Err(gap("NATIVE_LOG_CHECKPOINT_SCOPE"));
+            }
+            if scan.overflowed || scan.periods.len() > MAX_SESSION_PERIODS {
+                scan.overflowed = true;
+                scan.mark_uncertain("NATIVE_EXECUTION_PERIOD_LIMIT");
+                scan.periods.truncate(MAX_SESSION_PERIODS);
             }
             return Ok(scan);
         }
@@ -781,6 +839,7 @@ impl SessionScan {
             creation: None,
             periods: Vec::new(),
             uncertainty: None,
+            overflowed: false,
         })
     }
     pub(crate) fn after(&self) -> Option<u64> {
@@ -839,21 +898,28 @@ impl SessionScan {
         match kind {
             "session.created" => {}
             "session.execution.started" => {
-                if self.periods.last().is_some_and(|p| p.terminal.is_none()) {
+                if !self.overflowed && self.periods.last().is_some_and(|p| p.terminal.is_none()) {
                     self.mark_uncertain("NATIVE_EXECUTION_RESTART_GAP");
                 }
-                self.periods.push(SessionPeriod {
-                    started: event.clone(),
-                    terminal: None,
-                    recovery_reason: None,
-                });
-                while self.periods.len() > MAX_SESSION_PERIODS {
-                    let Some(oldest_terminal) =
-                        self.periods.iter().position(|p| p.terminal.is_some())
-                    else {
-                        break;
-                    };
-                    self.periods.remove(oldest_terminal);
+                if !self.overflowed {
+                    while self.periods.len() >= MAX_SESSION_PERIODS {
+                        if let Some(oldest_terminal) =
+                            self.periods.iter().position(|p| p.terminal.is_some())
+                        {
+                            self.periods.remove(oldest_terminal);
+                        } else {
+                            self.overflowed = true;
+                            self.mark_uncertain("NATIVE_EXECUTION_PERIOD_LIMIT");
+                            break;
+                        }
+                    }
+                }
+                if !self.overflowed {
+                    self.periods.push(SessionPeriod {
+                        started: event.clone(),
+                        terminal: None,
+                        recovery_reason: None,
+                    });
                 }
             }
             "session.execution.succeeded"
@@ -875,26 +941,28 @@ impl SessionScan {
                 let stage = terminal_stage(kind);
                 let error_code =
                     (kind == "session.execution.failed").then(|| safe_native_error_code(data));
-                if let Some(period) = self
-                    .periods
-                    .last_mut()
-                    .filter(|p| p.terminal.is_none() && p.recovery_reason.is_none())
+                if !self.overflowed
+                    && let Some(period) = self
+                        .periods
+                        .last_mut()
+                        .filter(|p| p.terminal.is_none() && p.recovery_reason.is_none())
                 {
-                    if matches!(reason.as_deref(), Some("shutdown" | "superseded")) {
-                        period.recovery_reason = reason;
-                    } else {
-                        period.terminal = Some(Terminal {
-                            event: event.clone(),
-                            outcome: match kind {
-                                "session.execution.succeeded" => "completed",
-                                "session.execution.failed" => "failed",
-                                _ => "cancelled",
-                            }
-                            .into(),
-                            reason,
-                            stage: Some(stage.into()),
-                            error_code,
-                        });
+                    match matches!(reason.as_deref(), Some("shutdown" | "superseded")) {
+                        true => period.recovery_reason = reason,
+                        false => {
+                            period.terminal = Some(Terminal {
+                                event: event.clone(),
+                                outcome: match kind {
+                                    "session.execution.succeeded" => "completed",
+                                    "session.execution.failed" => "failed",
+                                    _ => "cancelled",
+                                }
+                                .into(),
+                                reason,
+                                stage: Some(stage.into()),
+                                error_code,
+                            });
+                        }
                     }
                 }
             }
@@ -1055,5 +1123,132 @@ impl Service {
             return Err(gap("NATIVE_LOG_SCOPE_CHANGED"));
         }
         Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod session_overflow_tests {
+    use super::*;
+    use serde_json::json;
+
+    const CHILD: &str = "ses_overflow_child";
+    const PARENT: &str = "ses_overflow_parent";
+
+    fn event(seq: u64, id: &str, kind: &str, data: Value) -> Value {
+        json!({
+            "id": id,
+            "type": kind,
+            "version": 1,
+            "created": 1.0,
+            "durable": {"aggregateID": CHILD, "seq": seq, "version": 1},
+            "data": data
+        })
+    }
+
+    fn created() -> Value {
+        event(
+            1,
+            "evt_overflow_created",
+            "session.created",
+            json!({"sessionID": CHILD, "parentID": PARENT}),
+        )
+    }
+
+    fn started(seq: u64, run: &str) -> Value {
+        event(
+            seq,
+            &format!("evt_{run}_started"),
+            "session.execution.started",
+            json!({"sessionID": CHILD}),
+        )
+    }
+
+    fn succeeded(seq: u64) -> Value {
+        event(
+            seq,
+            "evt_overflow_late_terminal",
+            "session.execution.succeeded",
+            json!({"sessionID": CHILD}),
+        )
+    }
+
+    #[test]
+    fn unresolved_overflow_round_trips_and_advances_without_terminal_inference() {
+        let mut scan = SessionScan::restore(CHILD, PARENT, None).unwrap();
+        scan.consume(&created()).unwrap();
+        for index in 0..17 {
+            scan.consume(&started(index + 2, &format!("overflow_run_{index}")))
+                .unwrap();
+        }
+
+        assert!(scan.overflowed);
+        assert_eq!(scan.periods.len(), MAX_SESSION_PERIODS);
+        assert_eq!(scan.disposition(), "unknown");
+        assert!(!scan.is_terminal());
+        assert!(scan.turns().is_empty());
+        assert!(scan.last_turn().is_none());
+
+        let checkpoint = serde_json::to_value(&scan).unwrap();
+        assert_eq!(
+            checkpoint["periods"].as_array().unwrap().len(),
+            MAX_SESSION_PERIODS
+        );
+        let mut restored = SessionScan::restore(CHILD, PARENT, Some(&checkpoint)).unwrap();
+        assert!(restored.overflowed);
+
+        // A later native terminal and start advance the real log cursor, but
+        // cannot settle any of the starts omitted after the bounded overflow.
+        restored.consume(&succeeded(19)).unwrap();
+        restored
+            .consume(&started(20, "overflow_run_after_limit"))
+            .unwrap();
+        assert_eq!(restored.anchor().map(|anchor| anchor.seq), Some(20));
+        assert_eq!(restored.after(), Some(19));
+        assert_eq!(restored.disposition(), "unknown");
+        assert!(!restored.is_terminal());
+        assert!(restored.turns().is_empty());
+        assert!(restored.last_turn().is_none());
+
+        let advanced = serde_json::to_value(&restored).unwrap();
+        assert_eq!(
+            advanced["periods"].as_array().unwrap().len(),
+            MAX_SESSION_PERIODS
+        );
+        let resumed = SessionScan::restore(CHILD, PARENT, Some(&advanced)).unwrap();
+        assert!(resumed.overflowed);
+        assert_eq!(resumed.anchor().map(|anchor| anchor.seq), Some(20));
+        assert_eq!(resumed.disposition(), "unknown");
+        assert!(resumed.turns().is_empty());
+    }
+
+    #[test]
+    fn oversized_legacy_checkpoint_becomes_sticky_unknown() {
+        let mut scan = SessionScan::restore(CHILD, PARENT, None).unwrap();
+        scan.consume(&created()).unwrap();
+        for index in 0..16 {
+            scan.consume(&started(index + 2, &format!("legacy_run_{index}")))
+                .unwrap();
+        }
+        let mut legacy = serde_json::to_value(&scan).unwrap();
+        legacy.as_object_mut().unwrap().remove("overflowed");
+        legacy["uncertainty"] = Value::Null;
+        let extra_period = legacy["periods"][0].clone();
+        legacy["periods"].as_array_mut().unwrap().push(extra_period);
+        assert_eq!(legacy["periods"].as_array().unwrap().len(), 17);
+
+        let mut restored = SessionScan::restore(CHILD, PARENT, Some(&legacy)).unwrap();
+        assert!(restored.overflowed);
+        assert_eq!(restored.periods.len(), MAX_SESSION_PERIODS);
+        assert_eq!(restored.disposition(), "unknown");
+        assert_eq!(
+            restored.uncertainty.as_deref(),
+            Some("NATIVE_EXECUTION_PERIOD_LIMIT")
+        );
+
+        restored.consume(&succeeded(18)).unwrap();
+        assert_eq!(restored.anchor().map(|anchor| anchor.seq), Some(18));
+        assert_eq!(restored.disposition(), "unknown");
+        assert!(!restored.is_terminal());
+        assert!(restored.last_turn().is_none());
     }
 }

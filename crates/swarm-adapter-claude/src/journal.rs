@@ -349,6 +349,41 @@ impl OperationJournal {
         self.append(operation_id, &record)
     }
 
+    /// Re-read and retain an exact existing marker while recovering a result
+    /// outcome. This path is deliberately separate from `write_intent`, whose
+    /// rejection of existing markers prevents ordinary command handling from
+    /// treating a duplicate as permission to repeat a native effect.
+    pub fn retain_exact_intent_for_recovery(
+        &self,
+        operation_id: &str,
+        receipt: &ModuleReceiptIdentity,
+        method: &str,
+        intent: &Value,
+    ) -> Result<()> {
+        let state = self.get(operation_id)?.ok_or_else(|| {
+            Error::new(
+                "ADAPTER_INTENT_MISSING",
+                "result recovery has no retained operation intent",
+            )
+        })?;
+        if state.torn_tail_evidence.is_some() {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+                "result recovery cannot extend a torn operation journal",
+            ));
+        }
+        if state.receipt.as_ref() != Some(receipt)
+            || state.method.as_deref() != Some(method)
+            || state.intent.as_ref() != Some(intent)
+        {
+            return Err(Error::new(
+                "ADAPTER_INTENT_CONFLICT",
+                "result recovery differs from the exact retained operation marker",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn save_outcome(&self, operation_id: &str, outcome: &RuntimeOutcome) -> Result<()> {
         self.save_outcome_value(operation_id, &serde_json::to_value(outcome)?)
     }
@@ -2669,6 +2704,90 @@ pub fn digest_json(value: &Value) -> Result<String> {
 
 pub fn digest_bytes(bytes: &[u8]) -> String {
     hex_digest(bytes)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn lost_result_ack_recovery_retains_exact_intent_and_never_allows_native_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-result-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version":1,"module_id":"eliot.claude",
+            "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+            "protocol":{"major":1,"minor":0},"binding_id":"binding-result",
+            "binding_generation":1,"operation_id":"result-operation","input_sha256":"a".repeat(64)
+        }))
+        .unwrap();
+        receipt.validate().unwrap();
+        let intent = json!({"kind":"result","target_operation_id":"dispatch-operation"});
+        let journal =
+            OperationJournal::open(&root, "binding-result", 1, "fixture-scope", &"b".repeat(64))
+                .unwrap();
+        journal
+            .write_intent("result-operation", &receipt, "agent.result", &intent)
+            .unwrap();
+        let retained = std::fs::read(journal.path("result-operation").unwrap()).unwrap();
+        drop(journal);
+        let journal =
+            OperationJournal::open(&root, "binding-result", 1, "fixture-scope", &"b".repeat(64))
+                .unwrap();
+        journal
+            .retain_exact_intent_for_recovery("result-operation", &receipt, "agent.result", &intent)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(journal.path("result-operation").unwrap()).unwrap(),
+            retained
+        );
+        let changed = json!({"kind":"result","target_operation_id":"foreign-dispatch"});
+        assert_eq!(
+            journal
+                .retain_exact_intent_for_recovery(
+                    "result-operation",
+                    &receipt,
+                    "agent.result",
+                    &changed
+                )
+                .unwrap_err()
+                .code,
+            "ADAPTER_INTENT_CONFLICT"
+        );
+        assert_eq!(
+            journal
+                .write_intent("result-operation", &receipt, "agent.result", &intent)
+                .unwrap_err()
+                .code,
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+        );
+        let unknown = json!({"operation_id":"result-operation","outcome":"unknown","details":{"reason":"RESULT_ACK_LOST"}});
+        journal
+            .save_outcome_value("result-operation", &unknown)
+            .unwrap();
+        journal
+            .save_outcome_value("result-operation", &unknown)
+            .unwrap();
+        let state = journal.get("result-operation").unwrap().unwrap();
+        assert!(!state.native_replay_permitted());
+        assert_eq!(state.intent.as_ref(), Some(&intent));
+        assert_eq!(journal.pending_outcomes().unwrap().len(), 1);
+        let different = json!({"operation_id":"result-operation","outcome":"completed"});
+        assert_eq!(
+            journal
+                .save_outcome_value("result-operation", &different)
+                .unwrap_err()
+                .code,
+            "ADAPTER_OUTCOME_CONFLICT"
+        );
+        journal.acknowledge("result-operation", &unknown).unwrap();
+        assert!(journal.pending_outcomes().unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

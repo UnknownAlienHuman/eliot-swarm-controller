@@ -1078,6 +1078,7 @@ mod tests {
 
         let config = Config {
             routes: vec![Route {
+                admission_policy: Default::default(),
                 workspace_option: None,
                 alias: "default".to_owned(),
                 runtime: first.module_id.to_string(),

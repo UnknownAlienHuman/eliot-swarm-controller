@@ -346,7 +346,7 @@ pub fn materialize_after_go(receipt_path: &Path) -> Result<String> {
         process,
         invocation: work.invocation.clone(),
         result_schema: work.bundle.result_schema.clone(),
-        granted_effects: work.bundle.controller_effects.clone(),
+        granted_effects: work.invocation.controller_effects.clone(),
     };
     validate_plan_against_work(&plan, &work, &work_sha256, &dir)?;
     let plan_bytes = canonical_json(&serde_json::to_value(&plan)?)?.into_bytes();
@@ -534,7 +534,11 @@ fn validate_work(work: &ScriptWork) -> Result<()> {
         || work.bundle.interpreter != work.interpreter
         || work.invocation.operation_id != work.operation_id
         || work.invocation.run_id != work.run_id
-        || work.invocation.controller_effects != work.bundle.controller_effects
+        || work
+            .invocation
+            .controller_effects
+            .iter()
+            .any(|effect| !work.bundle.controller_effects.contains(effect))
         || work.bundle_record.metadata["script_id"] != work.bundle.script_id
         || work.bundle_record.metadata["revision"] != work.invocation.script_revision
         || work.bundle_record.metadata["bundle_sha256"] != work.bundle_record.content_digest
@@ -1156,7 +1160,7 @@ fn make_plan(work: &ScriptWork, work_sha256: &str, dir: &Path) -> Result<ScriptW
         process,
         invocation: work.invocation.clone(),
         result_schema: work.bundle.result_schema.clone(),
-        granted_effects: work.bundle.controller_effects.clone(),
+        granted_effects: work.invocation.controller_effects.clone(),
     })
 }
 
@@ -1840,7 +1844,6 @@ enum PipeRead {
 #[cfg(target_os = "linux")]
 impl<T: Read + std::os::fd::AsRawFd> PollableRead for T {
     fn make_nonblocking(&self) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
         const F_GETFL: i32 = 3;
         const F_SETFL: i32 = 4;
         const O_NONBLOCK: i32 = 0x800;

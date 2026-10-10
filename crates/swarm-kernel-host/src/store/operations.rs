@@ -37,6 +37,48 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 
+mod execution_diagnostic;
+
+fn operation_for_public_projection(db: &Connection, id: &str) -> Result<(Value, bool)> {
+    use rusqlite::types::Value as SqlValue;
+    let raw: Option<(String, SqlValue)> = db
+        .query_row(
+            r#"SELECT json_object(
+                'operation_id',operation_id,'caller_id',caller_id,'method',method,
+                'state',state,'task_id',task_id,'attempt_id',attempt_id,
+                'binding_id',binding_id,'binding_generation',binding_generation,
+                'prerequisite_operation_id',prerequisite_operation_id,
+                'operation_contract',json_extract(effective_request_json,'$.operation_contract'),
+                'native_mcp_parent_launch_operation_id',json_extract(effective_request_json,'$.native_mcp.parent_launch_operation_id'),
+                'native_mcp_phase',json_extract(effective_request_json,'$.native_mcp.phase'),
+                'native_refs',NULL,'result',json(result_json),
+                'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms
+              ),native_refs_json FROM operations WHERE operation_id=?1"#,
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((raw, native_refs)) = raw else {
+        return Err(Error::new("NOT_FOUND", format!("Operation {id}")));
+    };
+    let mut operation: Value = serde_json::from_str(&raw)?;
+    let damaged = match native_refs {
+        SqlValue::Null => false,
+        SqlValue::Text(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(value) if value.is_object() => {
+                operation["native_refs"] = value;
+                false
+            }
+            _ => true,
+        },
+        _ => true,
+    };
+    if damaged {
+        operation["native_refs"] = Value::Null;
+    }
+    Ok((operation, damaged))
+}
+
 /// Public projection consumes the resolved object grant. Internal fact loaders
 /// remain available to Store transitions, never to an unauthorised reader.
 pub(super) fn project_operation(
@@ -45,7 +87,7 @@ pub(super) fn project_operation(
     id: &str,
     grant: super::object_scope::OperationReadGrant,
 ) -> Result<Value> {
-    let retained = get_operation(db, id)?;
+    let (retained, native_refs_damaged) = operation_for_public_projection(db, id)?;
     use super::object_scope::OperationReadLevel;
     let diagnostic = grant.level == OperationReadLevel::Diagnostic;
     let mut operation = json!({
@@ -84,10 +126,14 @@ pub(super) fn project_operation(
             ],
             &mut details,
         );
-        details.insert(
-            "native_refs".into(),
-            public_receipt(&retained["native_refs"]),
-        );
+        if native_refs_damaged {
+            push_diagnostic_gap(&mut operation, "native_refs", "OBJECT_SCOPE_DAMAGED");
+        } else {
+            details.insert(
+                "native_refs".into(),
+                public_receipt(&retained["native_refs"]),
+            );
+        }
         operation["diagnostic"] = crate::redaction::value(Value::Object(details));
     }
     let launch_diagnostic = if diagnostic {
@@ -103,6 +149,25 @@ pub(super) fn project_operation(
             Err(error) => return Err(error),
         }
     };
+    let task_dispatch_diagnostic = if !diagnostic && retained["method"] == "task.dispatch" {
+        match super::object_scope::resolve_task_dispatch_diagnostic_read(db, p, id) {
+            Ok(allowed) => allowed,
+            Err(error) if optional_diagnostic_damage(&error) => {
+                push_diagnostic_gap(&mut operation, "execution_diagnostic", &error.code);
+                false
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
+    if task_dispatch_diagnostic {
+        optional_diagnostic_card(
+            &mut operation,
+            "execution_diagnostic",
+            execution_diagnostic::for_operation(db, id, &retained, native_refs_damaged),
+        )?;
+    }
     let current_manager = match p.role {
         Role::Operator => {
             super::require_local_operator(db, &p.client_id)?;
@@ -117,11 +182,26 @@ pub(super) fn project_operation(
     if current_manager && let Some(action) = owned_service_dispatch_action_for_operation(db, id)? {
         operation["runtime_dispatch_action_required"] = action;
     }
-    if current_manager && let Some(action) = module_bridge_recovery_action_for_operation(db, id)? {
-        operation["module_recovery_action_required"] = action;
-    }
-    if current_manager && let Some(action) = module_outcome_readback_action_for_operation(db, id)? {
-        operation["module_outcome_readback_required"] = action;
+    if current_manager {
+        if native_refs_damaged {
+            push_diagnostic_gap(
+                &mut operation,
+                "module_recovery_action_required",
+                "OBJECT_SCOPE_DAMAGED",
+            );
+            push_diagnostic_gap(
+                &mut operation,
+                "module_outcome_readback_required",
+                "OBJECT_SCOPE_DAMAGED",
+            );
+        } else {
+            if let Some(action) = module_bridge_recovery_action_for_operation(db, id)? {
+                operation["module_recovery_action_required"] = action;
+            }
+            if let Some(action) = module_outcome_readback_action_for_operation(db, id)? {
+                operation["module_outcome_readback_required"] = action;
+            }
+        }
     }
     if launch_diagnostic {
         optional_diagnostic_card(
@@ -171,6 +251,15 @@ fn optional_diagnostic_card(
     Ok(())
 }
 
+fn push_diagnostic_gap(operation: &mut Value, card: &str, reason_code: &str) {
+    if operation.get("diagnostic_gaps").is_none() {
+        operation["diagnostic_gaps"] = json!([]);
+    }
+    if let Some(gaps) = operation["diagnostic_gaps"].as_array_mut() {
+        gaps.push(json!({"card":card,"reason_code":reason_code}));
+    }
+}
+
 fn optional_diagnostic_damage(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
@@ -191,7 +280,7 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
         | "task.revise"
         | "task.cancel"
         | "task.claim"
-        | "task.release"
+        | "attempt.release"
         | "task.dispatch"
         | "task.submit"
         | "task.submit.recover"

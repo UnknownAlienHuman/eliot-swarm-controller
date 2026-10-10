@@ -29,6 +29,7 @@ mod coordination;
 mod coordination_threads;
 mod coordination_watch;
 mod forge;
+pub(crate) use forge::validate_publication_effective_request;
 mod github;
 #[cfg(test)]
 mod github_effect_tests;
@@ -1929,7 +1930,7 @@ impl Store {
             method.as_str(),
             "check.run"
                 | "check.cancel"
-                | "task.release"
+                | "attempt.release"
                 | "operation.cancel"
                 | "agent.open"
                 | "task.dispatch"

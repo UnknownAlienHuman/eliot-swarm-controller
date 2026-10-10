@@ -8,13 +8,21 @@ use crate::{
 };
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::Duration,
+};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadBuf},
     sync::watch,
 };
 
-use super::public_facade;
+use super::{public_facade, public_facade_with_expected_client_id};
 
 struct ProfileClient {
     reader: BufReader<tokio::io::ReadHalf<DuplexStream>>,
@@ -111,6 +119,100 @@ impl ProfileClient {
     }
 }
 
+#[test]
+fn distinct_expected_client_id_rejects_profile_binding() {
+    let credential = crate::model::Credential {
+        client_id: "credential-under-test".into(),
+        token: "unused-by-profile-construction".into(),
+    };
+    let expected_client_id = "profile-bound-to-another-client";
+    assert_ne!(credential.client_id, expected_client_id);
+
+    let error = match public_facade_with_expected_client_id(
+        std::env::temp_dir().join("eliot-mcp-profile-mismatch-test"),
+        credential,
+        Config::default().ipc,
+        McpToolProfile::Observer,
+        expected_client_id.to_owned(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a profile bound to another client must fail construction"),
+    };
+    assert_eq!(error, "PROFILE_MISMATCH");
+}
+
+fn observer_registry_tool_names() -> BTreeSet<String> {
+    let surface =
+        swarm_mcp::launch_profile_surface(McpToolProfile::Observer, "role-core", &[], &[])
+            .expect("the Observer core is a valid registry surface");
+    surface["core_methods"]
+        .as_array()
+        .expect("the registry surface has core methods")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|method| {
+            swarm_contracts::mcp_catalog::exposes_method(McpToolProfile::Observer, method)
+                && (*method == "swarm.tools.search"
+                    || swarm_mcp::application_method_read_only(method) == Some(true))
+        })
+        .map(swarm_contracts::mcp_catalog::tool_name)
+        .collect()
+}
+
+struct IpcRequestRecorder {
+    inner: ipc::Stream,
+    pending: Vec<u8>,
+    methods: Arc<Mutex<Vec<String>>>,
+}
+
+impl IpcRequestRecorder {
+    fn record_bytes(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            if let Ok(request) = serde_json::from_slice::<Value>(&line[..newline])
+                && let Some(method) = request.get("method").and_then(Value::as_str)
+            {
+                self.methods.lock().unwrap().push(method.to_owned());
+            }
+        }
+    }
+}
+
+impl AsyncRead for IpcRequestRecorder {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled_before = output.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(context, output);
+        if let Poll::Ready(Ok(())) = &result {
+            this.record_bytes(&output.filled()[filled_before..]);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for IpcRequestRecorder {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(context, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
 #[tokio::test]
 async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_ipc() {
     let host = start_manager_host().await;
@@ -123,29 +225,61 @@ async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_
     );
     let mut client = ProfileClient::connect(facade, true).await;
 
-    let listing = client.request("tools/list", json!({})).await.unwrap();
-    let tools = listing["tools"].as_array().unwrap();
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == json!("swarm_tools_search"))
+    let expected_names = observer_registry_tool_names();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut all_tools = Vec::new();
+    loop {
+        let mut params = json!({});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = client.request("tools/list", params).await.unwrap();
+        all_tools.extend(
+            page["tools"]
+                .as_array()
+                .expect("each Observer page contains a tool array")
+                .iter()
+                .cloned(),
+        );
+        cursor = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(next_cursor) = &cursor {
+            assert!(
+                seen_cursors.insert(next_cursor.clone()),
+                "Observer tools/list repeated a pagination cursor"
+            );
+        } else {
+            break;
+        }
+    }
+    let observed_names: BTreeSet<String> = all_tools
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("every listed Observer tool has a name")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        observed_names.len(),
+        all_tools.len(),
+        "duplicate tool across pages"
     );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == json!("operation_get"))
-    );
-    assert!(
-        tools
-            .iter()
-            .all(|tool| tool["annotations"]["readOnlyHint"] == true)
-    );
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool["name"] == json!("message_cancel"))
-    );
+    assert_eq!(observed_names, expected_names);
+    for tool in &all_tools {
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            json!(true),
+            "{} must be advertised read-only",
+            tool["name"]
+        );
+    }
 
+    let before_manual_call = host.request_count();
     let manually_addressed = client
         .request(
             "tools/call",
@@ -157,12 +291,31 @@ async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_
         .await
         .expect_err("hidden mutation must be rejected before attempting IPC");
     assert_eq!(manually_addressed["code"], json!(-32601));
+    assert_eq!(
+        host.request_methods_since(before_manual_call),
+        Vec::<String>::new()
+    );
+    assert_eq!(host.authorization_reads_since(before_manual_call), 0);
+    assert!(
+        host.application_methods_since(before_manual_call)
+            .is_empty()
+    );
 
+    let before_task_cancel = host.request_count();
     let task_cancel = client
         .request("tasks/cancel", json!({"taskId": "op-1"}))
         .await
         .expect_err("observer cannot cancel through the Tasks protocol");
     assert_eq!(task_cancel["code"], json!(-32601));
+    assert_eq!(
+        host.request_methods_since(before_task_cancel),
+        Vec::<String>::new()
+    );
+    assert_eq!(host.authorization_reads_since(before_task_cancel), 0);
+    assert!(
+        host.application_methods_since(before_task_cancel)
+            .is_empty()
+    );
     client.close().await;
     host.close().await;
 }
@@ -196,6 +349,7 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
         );
     }
 
+    let before_missing_tool_id = host.request_count();
     let missing_tool_id = manager
         .request(
             "tools/call",
@@ -207,12 +361,23 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
         .await
         .expect_err("restricted mutation without a caller ID must fail at MCP boundary");
     assert_eq!(missing_tool_id["code"], json!(-32602));
+    assert_eq!(host.authorization_reads_since(before_missing_tool_id), 1);
+    assert!(
+        host.application_methods_since(before_missing_tool_id)
+            .is_empty()
+    );
 
+    let before_missing_task_id = host.request_count();
     let missing_task_id = manager
         .request("tasks/cancel", json!({"taskId": "op-1"}))
         .await
         .expect_err("restricted tasks/cancel without caller ID must fail before IPC");
     assert_eq!(missing_task_id["code"], json!(-32602));
+    assert_eq!(host.authorization_reads_since(before_missing_task_id), 1);
+    assert!(
+        host.application_methods_since(before_missing_task_id)
+            .is_empty()
+    );
     manager.close().await;
 
     let mut full = ProfileClient::connect(
@@ -250,6 +415,37 @@ struct ManagerHost {
     dir: PathBuf,
     stop: watch::Sender<bool>,
     accept: tokio::task::JoinHandle<()>,
+    request_methods: Arc<Mutex<Vec<String>>>,
+}
+
+impl ManagerHost {
+    fn request_count(&self) -> usize {
+        self.request_methods.lock().unwrap().len()
+    }
+
+    fn request_methods_since(&self, previous_count: usize) -> Vec<String> {
+        self.request_methods
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(previous_count)
+            .cloned()
+            .collect()
+    }
+
+    fn authorization_reads_since(&self, previous_count: usize) -> usize {
+        self.request_methods_since(previous_count)
+            .iter()
+            .filter(|method| method.as_str() == "mcp.authorization")
+            .count()
+    }
+
+    fn application_methods_since(&self, previous_count: usize) -> Vec<String> {
+        self.request_methods_since(previous_count)
+            .into_iter()
+            .filter(|method| !matches!(method.as_str(), "client.hello" | "mcp.authorization"))
+            .collect()
+    }
 }
 
 async fn start_manager_host() -> ManagerHost {
@@ -289,6 +485,8 @@ async fn start_manager_host() -> ManagerHost {
 
     let (stop, stopping) = watch::channel(false);
     let mut listener = ipc::Listener::bind(&dir).unwrap();
+    let request_methods = Arc::new(Mutex::new(Vec::new()));
+    let server_request_methods = request_methods.clone();
     let store = owner.store.clone();
     let ipc_config = Arc::new(config.ipc.clone());
     let accept = tokio::spawn(async move {
@@ -301,6 +499,12 @@ async fn start_manager_host() -> ManagerHost {
                         let store = store.clone();
                         let config = ipc_config.clone();
                         let stopping = stopping.clone();
+                        let request_methods = server_request_methods.clone();
+                        let stream: ipc::Stream = Box::new(IpcRequestRecorder {
+                            inner: stream,
+                            pending: Vec::new(),
+                            methods: request_methods,
+                        });
                         tokio::spawn(async move {
                             let _ = ipc::serve(stream, store, config, stopping).await;
                         });
@@ -316,6 +520,7 @@ async fn start_manager_host() -> ManagerHost {
         dir,
         stop,
         accept,
+        request_methods,
     }
 }
 
@@ -423,7 +628,31 @@ async fn gm_profile_does_not_elevate_a_manager_credential() {
         serde_json::from_str(cancelled["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(digest_error["error"]["code"], json!("DIGEST_MISMATCH"));
 
-    let result = client
+    // host.mode is a GM-only manual tool and is not loaded on the default
+    // profile surface. The live Store gate independently denies this
+    // manager credential even when called directly.
+    let manager_principal = host
+        .owner
+        .store
+        .authenticate(host.manager_credential.clone())
+        .await
+        .unwrap();
+    let direct_error = host
+        .owner
+        .store
+        .call(
+            manager_principal,
+            "host.mode".into(),
+            json!({
+                "client_request_id": crate::model::new_id(),
+                "new_work": "disabled",
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(direct_error.code, "FORBIDDEN");
+
+    let method_not_found = client
         .request(
             "tools/call",
             json!({
@@ -435,11 +664,9 @@ async fn gm_profile_does_not_elevate_a_manager_credential() {
             }),
         )
         .await
-        .unwrap();
-    assert_eq!(result["isError"], json!(true));
-    let error: Value =
-        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(error["error"]["code"], json!("FORBIDDEN"));
+        .unwrap_err();
+    assert_eq!(method_not_found["code"], json!(-32601));
+    assert_eq!(method_not_found["message"], json!("host.mode"));
 
     let owner_principal = host
         .owner

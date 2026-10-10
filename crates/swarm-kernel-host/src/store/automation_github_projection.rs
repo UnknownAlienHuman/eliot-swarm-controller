@@ -20,6 +20,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+mod watermark_tests;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:github-projection:global-cursor";
 const EFFECT_DRAIN_CURSOR_KEY: &str = "automation:v1:github-projection:effect-drain-cursor";
@@ -406,7 +409,7 @@ fn reconcile_entry(
         }));
     }
     let key = state_key(entry)?;
-    let high_water = acceptance_high_water(tx)?;
+    let high_water = super::automation::observation_cut(tx)?;
     let mut state = match load_state(tx, entry)? {
         Some(state) => state,
         None => {
@@ -1016,14 +1019,6 @@ fn empty_state(
 
 fn entry_projection_active(entry: &AutomationEntry) -> bool {
     entry.github_projection_ready()
-}
-
-fn acceptance_high_water(db: &Connection) -> Result<i64> {
-    Ok(db.query_row(
-        "SELECT COALESCE(MAX(observation_id),0) FROM observations WHERE source_stream_id=?1 AND kind='task.acceptance'",
-        [ACCEPTANCE_STREAM],
-        |row| row.get(0),
-    )?)
 }
 
 fn save_state(db: &Connection, key: &str, state: &ProjectionState) -> Result<()> {

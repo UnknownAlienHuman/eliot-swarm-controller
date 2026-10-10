@@ -58,7 +58,7 @@ fn seed_subject(db: &Connection, files: &ArtifactFiles, suffix: &str) -> Subject
     let attempt_id = format!("attempt-recovery-{suffix}");
     let candidate_bytes = format!("candidate bytes for {suffix}").into_bytes();
     let candidate_ref = format!("source-{}", model::digest(&candidate_bytes));
-    let candidate_metadata = json!({"attempt_id":attempt_id,"task_revision":1});
+    let candidate_metadata = json!({"task_id":task_id,"attempt_id":attempt_id,"task_revision":1});
     let candidate = ArtifactRecord {
         kind: "source_snapshot".into(),
         artifact_id: candidate_ref.clone(),

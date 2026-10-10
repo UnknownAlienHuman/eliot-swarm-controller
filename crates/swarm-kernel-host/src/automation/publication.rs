@@ -303,11 +303,7 @@ impl PublicationContext {
                 "publication Operation effective request is invalid",
             )
         })?;
-        model::fields(
-            &effective,
-            &["publication_intent", "automation_on_behalf", "receipt"],
-        )
-        .map_err(|_| {
+        crate::store::validate_publication_effective_request(&effective).map_err(|_| {
             Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "publication Operation effective request has unexpected fields",

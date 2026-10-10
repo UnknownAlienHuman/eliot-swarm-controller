@@ -1284,7 +1284,14 @@ impl Store {
                 let mut cause = intent_for_prepare.cause.clone();
                 cause["script_id"] = json!(intent_for_prepare.script_id);
                 cause["script_revision"] = json!(expected_script_revision);
-                if let (Some(task), Some(attempt)) = (task.as_ref(), attempt.as_ref()) {
+                if cause["kind"] == "system_event" {
+                    // The event already retained its exact source scope when
+                    // staged. Validate it instead of rebuilding it from the
+                    // current Task or treating its semantic ID as a submission.
+                    automation_dispatch::validate_retained_script_event_cause(
+                        db, &entry.project_id, &cause,
+                    )?;
+                } else if let (Some(task), Some(attempt)) = (task.as_ref(), attempt.as_ref()) {
                     cause["task_id"] = task["task_id"].clone();
                     cause["task_revision"] = task["revision"].clone();
                     cause["attempt_id"] = attempt["attempt_id"].clone();
@@ -4589,6 +4596,21 @@ mod controller_effect_tests {
     const RUN_ID: &str = "script-effect-run";
     const OPERATION_ID: &str = "script-effect-run-operation";
 
+    fn store_only_script_process() -> Value {
+        json!({"fixture":"store-only","purpose":"script"})
+    }
+
+    fn store_only_worker_identity(run_id: &str, operation_id: &str, token: &str) -> Value {
+        json!({
+            "run_id":run_id,
+            "operation_id":operation_id,
+            "token":token,
+            "ready_at_ms":1,
+            "control_version":1,
+            "process":store_only_script_process(),
+        })
+    }
+
     struct Fixture {
         db: Connection,
         config: Config,
@@ -4704,7 +4726,7 @@ mod controller_effect_tests {
         )
         .unwrap();
         db.execute(
-            "INSERT INTO script_runs(run_id,operation_id,script_id,revision,bundle_ref,task_id,task_revision,attempt_id,work_digest,spec_json,state,process_identity_json,started_at_ms,created_at_ms) VALUES(?1,?2,?3,1,?4,?5,1,?6,?7,?8,'running','{}',1,1)",
+            "INSERT INTO script_runs(run_id,operation_id,script_id,revision,bundle_ref,task_id,task_revision,attempt_id,work_digest,spec_json,state,process_identity_json,started_at_ms,created_at_ms) VALUES(?1,?2,?3,1,?4,?5,1,?6,?7,?8,'running',?9,1,1)",
             params![
                 RUN_ID,
                 OPERATION_ID,
@@ -4714,6 +4736,12 @@ mod controller_effect_tests {
                 ATTEMPT_ID,
                 "c".repeat(64),
                 model::canonical(&json!({"capabilities":grants,"invocation":invocation})).unwrap(),
+                model::canonical(&store_only_worker_identity(
+                    RUN_ID,
+                    OPERATION_ID,
+                    "fixture-token",
+                ))
+                .unwrap(),
             ],
         )
         .unwrap();
@@ -4781,7 +4809,8 @@ mod controller_effect_tests {
             state: "completed".to_owned(),
             started_at_ms: Some(1),
             exit_code: Some(0),
-            process: json!({"fixture":"store-only"}),
+            process: store_only_script_process(),
+            process_facts: None,
             result: make_artifact(
                 "script_result",
                 format!("scriptresult-{}", "1".repeat(64)),
@@ -5104,6 +5133,14 @@ mod controller_effect_tests {
         };
         let request_id = format!("{operation_id}-request");
         let bundle_ref = format!("script-{}", "d".repeat(64));
+        let process_identity = (run_state == "running").then(|| {
+            model::canonical(&store_only_worker_identity(
+                run_id,
+                operation_id,
+                "fixture-token",
+            ))
+            .unwrap()
+        });
         fixture.db.execute(
             "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,due_at_ms,created_at_ms,updated_at_ms) \
              VALUES(?1,?2,?3,'script.run','{}','{}',?4,?5,?6,1,1,1)",
@@ -5111,7 +5148,7 @@ mod controller_effect_tests {
         ).unwrap();
         fixture.db.execute(
             "INSERT INTO script_runs(run_id,operation_id,script_id,revision,bundle_ref,task_id,task_revision,attempt_id,work_digest,spec_json,state,process_identity_json,started_at_ms,created_at_ms) \
-             VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,'{}',?9,CASE WHEN ?9='running' THEN '{}' ELSE NULL END,CASE WHEN ?9='running' THEN 1 ELSE NULL END,1)",
+             VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,'{}',?9,?10,CASE WHEN ?9='running' THEN 1 ELSE NULL END,1)",
             params![
                 run_id,
                 operation_id,
@@ -5122,6 +5159,7 @@ mod controller_effect_tests {
                 attempt_id,
                 "f".repeat(64),
                 run_state,
+                process_identity,
             ],
         ).unwrap();
     }
@@ -5187,11 +5225,12 @@ mod controller_effect_tests {
         runner::Completion {
             run_id: run_id.to_owned(),
             operation_id: operation_id.to_owned(),
-            token: "fixture-terminal-token".to_owned(),
+            token: "fixture-token".to_owned(),
             state: state.to_owned(),
             started_at_ms: Some(1),
             exit_code: if completed { Some(0) } else { Some(1) },
-            process: json!({"fixture":"actual_store_writer"}),
+            process: store_only_script_process(),
+            process_facts: None,
             result: make_artifact(
                 "script_result",
                 format!("scriptresult-{}", model::digest(operation_id.as_bytes())),
@@ -5568,7 +5607,7 @@ mod script_trigger_admission_isolation_tests {
     const DAMAGED_SCRIPT_ID: &str = "a_script_trigger_isolation_damaged";
     const HEALTHY_SCRIPT_ID: &str = "b_script_trigger_isolation_healthy";
 
-    async fn start_store() -> (StoreOwner, PathBuf, Principal) {
+    async fn start_store(with_script_executor: bool) -> (StoreOwner, PathBuf, Principal) {
         let directory = std::env::temp_dir().join(format!(
             "swarm-script-trigger-isolation-{}",
             model::new_id()
@@ -5578,6 +5617,10 @@ mod script_trigger_admission_isolation_tests {
         let credential = bootstrap_credential(&root.path).expect("create Operator credential");
         let mut config = Config::default();
         config.storage.data_dir = directory.clone();
+        if with_script_executor {
+            config.scripts.executor =
+                Some(crate::store::o6_taskless_path_fixture::store_only_script_executor_pin());
+        }
         let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
             .await
             .expect("start Store");
@@ -5786,8 +5829,165 @@ mod script_trigger_admission_isolation_tests {
     }
 
     #[tokio::test]
+    async fn retained_concilium_cause_admits_one_script_run_and_rejects_scope_mutations() {
+        // Seed the exact historical Concilium receipt, then exercise the real
+        // event reconciler and ScriptRun admission. This does not qualify the
+        // Concilium proposal writer or execute the interpreter.
+        let (owner, directory, operator) = start_store(true).await;
+        let manager = register_manager(&owner.store, &operator).await;
+        register_active_script(&owner.store, &manager, HEALTHY_SCRIPT_ID).await;
+        let changes = json!([{
+            "automation_id":HEALTHY_AUTOMATION_ID,"expected_revision":0,"include_existing":false,
+            "patch":{"enabled":true,"steps":["script_run"],
+                "script_run":{"script_id":HEALTHY_SCRIPT_ID},
+                "event_rules":[{"source_id":"controller","event_kind":"concilium.propose","action":"script_run"}]}
+        }]);
+        let preview = owner
+            .store
+            .call(
+                manager.clone(),
+                "automation.config.preview".into(),
+                json!({"project_id":PROJECT_ID,"changes":changes}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview["valid"], true, "{preview}");
+        owner
+            .store
+            .call(
+                manager.clone(),
+                "automation.config.apply".into(),
+                json!({"client_request_id":"concilium-trigger-config","project_id":PROJECT_ID,
+                "changes":changes,"preview_digest":preview["plan_sha256"]}),
+            )
+            .await
+            .unwrap();
+
+        owner.store.run(|db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = model::now_ms()?;
+            let spec = json!({"objective":"Retain exact Concilium source",
+                "phase":"implementation","requirements":[{"id":"R1","statement":"One ScriptRun"}],
+                "scope":{"initial_paths":["fixture.txt"]},"owner_policy_id":"owner-policy-v1"});
+            tx.execute("INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('concilium-source-task',?1,1,'open',?2,?3,?3)",
+                params![PROJECT_ID,model::canonical(&spec)?,now])?;
+            tx.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,state,producers_json,created_at_ms,updated_at_ms) VALUES('concilium-source-attempt','concilium-source-task',1,'{}',?1,'controller','running','[]',?2,?2)", params![OWNER_ID,now])?;
+            let receipt = json!({"operation_id":"concilium-source-operation","concilium_id":"concilium-source",
+                "proposal_operation_id":"concilium-source-operation","task_id":"concilium-source-task",
+                "task_revision":1,"attempt_id":"concilium-source-attempt","status":"proposed",
+                "state_revision":1,"changed":true});
+            let serialized = model::canonical(&receipt)?;
+            tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES('concilium-source-operation',?1,'concilium-source-request','concilium.propose','{}','{}','concilium-source-task','concilium-source-attempt','settled',?2,?3,?3,?3,?3)",params![OWNER_ID,serialized,now])?;
+            tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller','concilium-source-operation','concilium-source-operation','concilium.propose',?1,?2)",params![serialized,now])?;
+            crate::store::set_meta(&tx,"concilium:v1:operation:concilium-source-operation",&json!({
+                "schema_version":1,"concilium_id":"concilium-source","proposal_operation_id":"concilium-source-operation",
+                "manager_id":OWNER_ID,"task_id":"concilium-source-task","attempt_id":"concilium-source-attempt"}))?;
+            crate::store::automation_dispatch::reconcile(&tx,&Config::default(),16,64,now)?;
+            tx.commit()?;
+            Ok(())
+        }).await.unwrap();
+        let pending = owner
+            .store
+            .run(|db| crate::store::automation_dispatch::pending_script_triggers(db, 16))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "the source stages one retained intent");
+        let intent = pending.into_iter().next().unwrap();
+        assert_eq!(intent.cause["task_id"], "concilium-source-task");
+        assert_eq!(intent.cause["task_revision"], 1);
+        assert_eq!(intent.cause["attempt_id"], "concilium-source-attempt");
+        for (field, changed) in [
+            ("operation_id", json!("foreign-operation")),
+            ("task_id", json!("foreign-task")),
+            ("task_revision", json!(2)),
+            ("attempt_id", json!("foreign-attempt")),
+        ] {
+            let mut altered = intent.clone();
+            altered.cause[field] = changed;
+            let failure = owner
+                .store
+                .admit_script_trigger(altered)
+                .await
+                .expect_err(field);
+            assert!(
+                matches!(
+                    failure.error.code.as_str(),
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED"
+                        | "AUTOMATION_LINK_CORRUPT"
+                        | "SCRIPT_SCOPE_CHANGED"
+                ),
+                "{field}: {}",
+                failure.error.code
+            );
+            let count = owner
+                .store
+                .run(|db| {
+                    Ok(db.query_row("SELECT COUNT(*) FROM script_runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "altered {field} cannot create a ScriptRun");
+        }
+        let admitted = owner
+            .store
+            .admit_script_trigger(intent.clone())
+            .await
+            .unwrap_or_else(|failure| panic!("exact source: {}", failure.error.code));
+        let original_cause = intent.cause.clone();
+        let retry = owner
+            .store
+            .admit_script_trigger(intent)
+            .await
+            .unwrap_or_else(|failure| panic!("exact retry: {}", failure.error.code));
+        assert_eq!(admitted["operation_id"], retry["operation_id"]);
+        let admitted_id = admitted["operation_id"].as_str().unwrap().to_owned();
+        let saved_link = owner
+            .store
+            .run(move |db| {
+                crate::automation::config::read_record(
+                    db,
+                    &crate::automation::config::operation_link_key(&admitted_id)?,
+                    "retained Concilium ScriptRun link",
+                )?
+                .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "ScriptRun link"))
+            })
+            .await
+            .unwrap();
+        for field in [
+            "kind",
+            "id",
+            "operation_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "projection",
+        ] {
+            assert_eq!(
+                saved_link["cause"][field], original_cause[field],
+                "retained {field}"
+            );
+        }
+        let (count, started) = owner
+            .store
+            .run(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*),COUNT(started_at_ms) FROM script_runs",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((count, started), (1, 0));
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn ordinary_manager_script_api_is_owner_scoped_without_gm() {
-        let (owner, directory, operator) = start_store().await;
+        let (owner, directory, operator) = start_store(false).await;
         let manager = register_manager(&owner.store, &operator).await;
         let foreign = register_named_manager(
             &owner.store,
@@ -5911,7 +6111,7 @@ mod script_trigger_admission_isolation_tests {
 
     #[tokio::test]
     async fn corrupt_retained_event_link_is_held_while_healthy_neighbor_is_admitted() {
-        let (owner, directory, operator) = start_store().await;
+        let (owner, directory, operator) = start_store(true).await;
         let manager = register_manager(&owner.store, &operator).await;
         owner
             .store
@@ -6141,7 +6341,7 @@ mod script_trigger_admission_isolation_tests {
     async fn assert_damaged_script_trigger_isolated(damage: Damage) {
         // This fixture exercises Store admission only. The host's separate
         // `supervise_scripts` worker is not started, so no interpreter launches.
-        let (owner, directory, operator) = start_store().await;
+        let (owner, directory, operator) = start_store(true).await;
         let manager = register_manager(&owner.store, &operator).await;
         owner
             .store

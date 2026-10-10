@@ -353,7 +353,18 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
                     let input = r.body["id"].as_str().unwrap().to_owned();
                     let item = json!({"id":input,"sessionID":id,"type":"user","time":{"created":1},"delivery":r.body["delivery"],"payload":{"text":r.body["text"],"metadata":r.body["metadata"]}});
                     if w.consume_prompt {
-                        w.messages.insert(input.clone(),json!({"id":input,"type":"user","time":{"created":1},"text":r.body["text"],"metadata":r.body["metadata"]}));
+                        w.messages.insert(
+                            input.clone(),
+                            json!({
+                                "id":input,
+                                "sessionID":id,
+                                "type":"user",
+                                "time":{"created":1},
+                                "delivery":r.body["delivery"],
+                                "text":r.body["text"],
+                                "metadata":r.body["metadata"]
+                            }),
+                        );
                     } else {
                         w.inbox.insert(input, item.clone());
                     }

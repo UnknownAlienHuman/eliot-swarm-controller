@@ -97,6 +97,8 @@ exit 9
     }
     impl Fixture {
         fn new(mode: &str) -> Self {
+            batch_worker_executable()
+                .expect("root runner must supply the absolute host executable for Zed tests");
             let root = std::env::temp_dir().join(format!("eliot-zed-test-{}", model::new_id()));
             let bin_dir = root.join("bin");
             let workdir = root.join("work");
@@ -334,9 +336,44 @@ exit 9
                 "env_keys":["ANTHROPIC_API_KEY"]
             }
         });
+        let source_text = "Fix the fixture bug";
+        let task_snapshot_sha256 = model::digest(
+            model::canonical(&json!({
+                "task_id":"task-1",
+                "revision":4,
+                "requirements":[]
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let task_prompt = TaskPromptEnvelopeV1 {
+            schema_id: TASK_PROMPT_SCHEMA_ID.to_owned(),
+            schema_version: TASK_PROMPT_SCHEMA_VERSION,
+            task_id: "task-1".to_owned(),
+            task_revision: 4,
+            attempt_id: "attempt-1".to_owned(),
+            task_snapshot_sha256: task_snapshot_sha256.clone(),
+            prompt_sha256: model::digest(source_text.as_bytes()),
+            prompt_bytes: source_text.len() as u64,
+            prompt: source_text.to_owned(),
+        };
+        let task_dispatch_context = TaskDispatchContext {
+            schema_version: 1,
+            operation_id: "op-zed-receipt".to_owned(),
+            binding_id: "binding-1".to_owned(),
+            binding_generation: 1,
+            worker_boot_id: "worker-boot-zed-test".to_owned(),
+            attempt_id: task_prompt.attempt_id.clone(),
+            task_id: task_prompt.task_id.clone(),
+            task_revision: task_prompt.task_revision,
+            task_snapshot_sha256,
+            source_text_sha256: model::digest(source_text.as_bytes()),
+            source_text_bytes: source_text.len() as u64,
+        };
         let input = json!({
-            "text":"Fix the fixture bug",
-            "task_snapshot":{"task_id":"task-1","revision":4,"requirements":[]}
+            "text":source_text,
+            "task_prompt":task_prompt.clone(),
+            "task_dispatch_context":task_dispatch_context.clone()
         });
         let command = RuntimeCommand {
             operation_id: "op-zed-receipt".into(),
@@ -350,7 +387,7 @@ exit 9
             input_sha256: None,
             target_input_sha256: None,
         };
-        let instruction = crate::runtime::batch::instruction(&input).unwrap();
+        let instruction = task_prompt.prompt.as_str();
         let artifact_files = ArtifactFiles::new(&fixture.data_dir).unwrap();
         let (batch, intent) = run_batch_command(
             &options,
@@ -421,15 +458,16 @@ exit 9
         };
         persist_receipt(&fixture.out_root, &artifact_files, &route, &receipt).unwrap();
         persist_receipt(&fixture.out_root, &artifact_files, &route, &receipt).unwrap();
-        let saved = read_receipt(
+        let saved = read_task_prompt_receipt(
             &fixture.out_root,
-            BatchReadContext {
+            TaskPromptReadContext {
                 operation_id: &command.operation_id,
                 binding_id: &command.binding_id,
                 generation: command.generation,
                 route: &route,
-                instruction: &instruction,
-                task_snapshot: &input["task_snapshot"],
+                source_text,
+                envelope: &task_prompt,
+                task_dispatch_context: &task_dispatch_context,
             },
             &artifact_files,
         )
@@ -450,15 +488,16 @@ exit 9
             );
             std::fs::write(&terminal_path, model::canonical(&value).unwrap()).unwrap();
             assert_eq!(
-                read_receipt(
+                read_task_prompt_receipt(
                     &fixture.out_root,
-                    BatchReadContext {
+                    TaskPromptReadContext {
                         operation_id: &command.operation_id,
                         binding_id: &command.binding_id,
                         generation: command.generation,
                         route: &route,
-                        instruction: &instruction,
-                        task_snapshot: &input["task_snapshot"],
+                        source_text,
+                        envelope: &task_prompt,
+                        task_dispatch_context: &task_dispatch_context,
                     },
                     &artifact_files,
                 )
@@ -529,16 +568,21 @@ exit 9
         reject_tampered_receipt(relabelled_pages);
 
         std::fs::write(&terminal_path, model::canonical(&original).unwrap()).unwrap();
+        let mut changed_prompt = task_prompt.clone();
+        changed_prompt.prompt.push_str(" changed");
+        changed_prompt.prompt_bytes = changed_prompt.prompt.len() as u64;
+        changed_prompt.prompt_sha256 = model::digest(changed_prompt.prompt.as_bytes());
         assert_eq!(
-            read_receipt(
+            read_task_prompt_receipt(
                 &fixture.out_root,
-                BatchReadContext {
+                TaskPromptReadContext {
                     operation_id: &command.operation_id,
                     binding_id: &command.binding_id,
                     generation: command.generation,
                     route: &route,
-                    instruction: "different frozen text",
-                    task_snapshot: &input["task_snapshot"],
+                    source_text,
+                    envelope: &changed_prompt,
+                    task_dispatch_context: &task_dispatch_context,
                 },
                 &artifact_files,
             )

@@ -82,10 +82,21 @@ impl HookInstallPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InstallPhase {
+    Installing,
+    #[default]
+    Installed,
+    Revoking,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallManifest {
     schema_version: u32,
+    #[serde(default)]
+    phase: InstallPhase,
     source_id: String,
     event: String,
     repository_path: String,
@@ -482,6 +493,15 @@ pub fn apply_post_commit(
     }
 
     let existing = readback_post_commit(&plan.repository_path, &plan.git_executable, source_id)?;
+    if existing.state == "installing" {
+        return resume_install_post_commit(
+            &current,
+            source_id,
+            swarm_executable,
+            &source_dir,
+            &credential_path,
+        );
+    }
     if existing.state != "absent" {
         if existing.wrapper_matches && existing.state == "installed" {
             return Ok(existing);
@@ -537,6 +557,7 @@ pub fn apply_post_commit(
     let wrapper_digest = model::digest(&wrapper);
     let manifest = InstallManifest {
         schema_version: INSTALL_SCHEMA_VERSION,
+        phase: InstallPhase::Installing,
         source_id: source_id.to_owned(),
         event: EVENT_NAME.to_owned(),
         repository_path: path_string(&plan.repository_path)?,
@@ -566,25 +587,165 @@ pub fn apply_post_commit(
         Some(0o600),
     )?;
 
-    let wrapper_tmp = plan
-        .hooks_dir
-        .join(format!("post-commit.eliot-tmp-{}", model::new_id()));
-    ensure_hook_directory(&plan.hooks_dir)?;
-    let install_result = (|| {
-        write_new(&wrapper_tmp, &wrapper, Some(0o755))?;
-        atomic_replace(&wrapper_tmp, &plan.hook_path)?;
-        Ok(())
-    })();
-    if let Err(error) = install_result {
+    publish_wrapper(&plan.hooks_dir, &plan.hook_path, &wrapper)?;
+    finalize_installation(
+        &plan.repository_path,
+        &plan.git_executable,
+        source_id,
+        &manifest_path,
+        &wrapper_digest,
+    )
+}
+
+fn resume_install_post_commit(
+    plan: &HookInstallPlan,
+    source_id: &str,
+    swarm_executable: &Path,
+    source_dir: &Path,
+    credential_path: &Path,
+) -> Result<HookInstallReadback> {
+    let manifest_path = source_dir.join("install.json");
+    let manifest = read_install_manifest(&manifest_path)?;
+    validate_install_manifest(
+        &manifest,
+        source_id,
+        &plan.repository_path,
+        &plan.git_executable,
+        &plan.git_dir,
+        source_dir,
+    )?;
+    if manifest.phase != InstallPhase::Installing {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "source manifest is not in an install-recovery phase",
+        ));
+    }
+    if manifest.source_id != source_id
+        || manifest.credential_path != path_string(credential_path)?
+        || manifest.hook_path != path_string(&plan.hook_path)?
+        || plan.hook_path != plan.hooks_dir.join(HOOK_NAME)
+    {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "install recovery does not match the retained source identity",
+        ));
+    }
+    let readback = readback_post_commit(&plan.repository_path, &plan.git_executable, source_id)?;
+    if readback.state != "installing"
+        || (manifest.previous_hook_path.is_some() && readback.backup_matches != Some(true))
+    {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "install recovery no longer matches the retained wrapper and backup evidence",
+        ));
+    }
+
+    let current = read_optional_regular_file(&plan.hook_path)?;
+    if current
+        .as_ref()
+        .is_some_and(|hook| hook.sha256 == manifest.wrapper_sha256)
+    {
+        return finalize_installation(
+            &plan.repository_path,
+            &plan.git_executable,
+            source_id,
+            &manifest_path,
+            &manifest.wrapper_sha256,
+        );
+    }
+
+    let wrapper = wrapper_script(
+        source_id,
+        &plan.repository_path,
+        &plan.git_executable,
+        credential_path,
+        swarm_executable,
+        manifest.chained_hook_path.as_deref().map(Path::new),
+    )?;
+    if model::digest(&wrapper) != manifest.wrapper_sha256 {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "current executable does not reproduce the retained wrapper identity",
+        ));
+    }
+
+    let target_is_resumable = match manifest.previous_hook_sha256.as_deref() {
+        Some(previous_digest) => current.as_ref().is_some_and(|hook| {
+            (hook.sha256 == previous_digest && hook.mode == manifest.previous_hook_mode)
+                || hook.sha256 == manifest.wrapper_sha256
+        }),
+        None => current
+            .as_ref()
+            .is_none_or(|hook| hook.sha256 == manifest.wrapper_sha256),
+    };
+    if !target_is_resumable {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "hook path changed outside the exact retained install transition",
+        ));
+    }
+    if !current
+        .as_ref()
+        .is_some_and(|hook| hook.sha256 == manifest.wrapper_sha256)
+    {
+        publish_wrapper(&plan.hooks_dir, &plan.hook_path, &wrapper)?;
+    }
+
+    finalize_installation(
+        &plan.repository_path,
+        &plan.git_executable,
+        source_id,
+        &manifest_path,
+        &manifest.wrapper_sha256,
+    )
+}
+
+fn publish_wrapper(hooks_dir: &Path, hook_path: &Path, wrapper: &[u8]) -> Result<()> {
+    let wrapper_tmp = hooks_dir.join(format!("post-commit.eliot-tmp-{}", model::new_id()));
+    ensure_hook_directory(hooks_dir)?;
+    if let Err(error) = write_new(&wrapper_tmp, wrapper, Some(0o755))
+        .and_then(|()| atomic_replace(&wrapper_tmp, hook_path))
+    {
         let _ = fs::remove_file(&wrapper_tmp);
         return Err(error);
     }
+    Ok(())
+}
 
-    let readback = readback_post_commit(&plan.repository_path, &plan.git_executable, source_id)?;
+fn finalize_installation(
+    repository_path: &Path,
+    git_executable: &Path,
+    source_id: &str,
+    manifest_path: &Path,
+    expected_wrapper_sha256: &str,
+) -> Result<HookInstallReadback> {
+    let readback = readback_post_commit(repository_path, git_executable, source_id)?;
+    if readback.state != "installing"
+        || !readback.wrapper_matches
+        || readback.wrapper_sha256.as_deref() != Some(expected_wrapper_sha256)
+    {
+        return Err(Error::new(
+            "HOOK_INSTALL_READBACK_FAILED",
+            "Git hook wrapper did not match the retained installing manifest",
+        ));
+    }
+    let mut manifest = read_install_manifest(manifest_path)?;
+    if manifest.phase != InstallPhase::Installing
+        || manifest.source_id != source_id
+        || manifest.wrapper_sha256 != expected_wrapper_sha256
+    {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "install completion no longer matches the retained source manifest",
+        ));
+    }
+    manifest.phase = InstallPhase::Installed;
+    private_replace_json(manifest_path, &manifest)?;
+    let readback = readback_post_commit(repository_path, git_executable, source_id)?;
     if readback.state != "installed" || !readback.wrapper_matches {
         return Err(Error::new(
             "HOOK_INSTALL_READBACK_FAILED",
-            "Git hook wrapper did not match the installed source manifest",
+            "Git hook wrapper did not match the completed install manifest",
         ));
     }
     Ok(readback)
@@ -625,53 +786,49 @@ pub fn readback_post_commit(
         Err(error) => return Err(error.into()),
     }
     let manifest_path = source_dir.join("install.json");
-    if !manifest_path.is_file() {
-        let hooks_dir = git_dir.join("hooks");
-        return Ok(HookInstallReadback {
-            source_id: source_id.to_owned(),
-            event: EVENT_NAME.to_owned(),
-            state: "absent".to_owned(),
-            repository_root: path_string(&canonical)?,
-            hook_path: path_string(&hooks_dir.join(HOOK_NAME))?,
-            wrapper_sha256: None,
-            wrapper_matches: false,
-            backup_matches: None,
-            credential_file_present: source_dir.join("credential.json").is_file(),
-            message: "no source installation manifest is present".to_owned(),
-        });
-    }
-    let manifest: InstallManifest = serde_json::from_slice(&read_bounded(&manifest_path)?)
-        .map_err(|_| {
-            Error::new(
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(Error::new(
                 "HOOK_INSTALL_MANIFEST_INVALID",
-                "hook install manifest is invalid",
-            )
-        })?;
-    if manifest.schema_version != INSTALL_SCHEMA_VERSION
-        || manifest.source_id != source_id
-        || manifest.event != EVENT_NAME
-        || manifest.repository_path != path_string(&canonical)?
-        || manifest.git_dir != path_string(&git_dir)?
-        || manifest.git_executable != path_string(git_executable)?
-        || manifest.hook_path != path_string(&git_dir.join("hooks").join(HOOK_NAME))?
-        || manifest.installed_at_ms < 0
-        || !valid_sha256(&manifest.wrapper_sha256)
-    {
-        return Err(Error::new(
-            "HOOK_INSTALL_MANIFEST_INVALID",
-            "hook install manifest scope or digest is invalid",
-        ));
+                "hook install manifest is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let hooks_dir = git_dir.join("hooks");
+            return Ok(HookInstallReadback {
+                source_id: source_id.to_owned(),
+                event: EVENT_NAME.to_owned(),
+                state: "absent".to_owned(),
+                repository_root: path_string(&canonical)?,
+                hook_path: path_string(&hooks_dir.join(HOOK_NAME))?,
+                wrapper_sha256: None,
+                wrapper_matches: false,
+                backup_matches: None,
+                credential_file_present: source_dir.join("credential.json").is_file(),
+                message: "no source installation manifest is present".to_owned(),
+            });
+        }
+        Err(error) => return Err(error.into()),
     }
-    validate_manifest_paths(&manifest, &source_dir, &git_dir)?;
+    let manifest = read_install_manifest(&manifest_path)?;
+    validate_install_manifest(
+        &manifest,
+        source_id,
+        &canonical,
+        git_executable,
+        &git_dir,
+        &source_dir,
+    )?;
     let hook_path = PathBuf::from(&manifest.hook_path);
     let current_wrapper = read_optional_regular_file(&hook_path)?;
     let wrapper_matches = current_wrapper
         .as_ref()
         .is_some_and(|hook| hook.sha256 == manifest.wrapper_sha256);
     let backup_matches = match (&manifest.previous_hook_path, &manifest.previous_hook_sha256) {
-        (Some(path), Some(expected)) => fs::read(path)
-            .ok()
-            .map(|bytes| model::digest(&bytes) == *expected),
+        (Some(path), Some(_)) => read_optional_regular_file(Path::new(path))?
+            .as_ref()
+            .map(|backup| matches_saved_previous(backup, &manifest)),
         (None, None) => None,
         _ => {
             return Err(Error::new(
@@ -679,6 +836,15 @@ pub fn readback_post_commit(
                 "hook backup fields are incomplete",
             ));
         }
+    };
+    let original_hook_matches = current_wrapper
+        .as_ref()
+        .is_some_and(|hook| matches_saved_previous(hook, &manifest));
+    let no_original_hook = manifest.previous_hook_path.is_none();
+    let backup_is_exact = if no_original_hook {
+        backup_matches.is_none()
+    } else {
+        backup_matches == Some(true)
     };
     let hooks_path_is_custom = match run_git(
         git_executable,
@@ -694,12 +860,44 @@ pub fn readback_post_commit(
             ));
         }
     };
-    let state = if wrapper_matches && backup_matches != Some(false) && !hooks_path_is_custom {
-        "installed"
-    } else if wrapper_matches && backup_matches != Some(false) && hooks_path_is_custom {
-        "inactive"
-    } else {
-        "modified"
+    let state = match manifest.phase {
+        InstallPhase::Installing => {
+            let target_is_exact = if no_original_hook {
+                current_wrapper.is_none() || wrapper_matches
+            } else {
+                original_hook_matches || wrapper_matches
+            };
+            if backup_is_exact && target_is_exact {
+                "installing"
+            } else {
+                "modified"
+            }
+        }
+        InstallPhase::Installed => {
+            if wrapper_matches && backup_is_exact && !hooks_path_is_custom {
+                "installed"
+            } else if wrapper_matches && backup_is_exact {
+                "inactive"
+            } else {
+                "modified"
+            }
+        }
+        InstallPhase::Revoking => {
+            let target_is_exact = if no_original_hook {
+                current_wrapper.is_none() || wrapper_matches
+            } else {
+                let backup_can_restore = backup_matches == Some(true);
+                let backup_already_consumed = backup_matches.is_none() && original_hook_matches;
+                backup_already_consumed
+                    || (backup_can_restore
+                        && (current_wrapper.is_none() || wrapper_matches || original_hook_matches))
+            };
+            if target_is_exact && backup_is_exact_for_revocation(backup_matches, &manifest) {
+                "revoking"
+            } else {
+                "modified"
+            }
+        }
     };
     Ok(HookInstallReadback {
         source_id: source_id.to_owned(),
@@ -718,6 +916,11 @@ pub fn readback_post_commit(
             "inactive" => {
                 "wrapper bytes match, but core.hooksPath redirects Git elsewhere".to_owned()
             }
+            "installing" => {
+                "installation is durably pending exact wrapper publication or finalization"
+                    .to_owned()
+            }
+            "revoking" => "revocation is durably pending exact restoration or cleanup".to_owned(),
             _ => "hook or preserved user hook changed; automatic restoration is refused".to_owned(),
         },
     })
@@ -740,10 +943,6 @@ pub fn revoke_post_commit(
             return Err(error);
         }
     };
-    if before.state == "absent" || before.state == "modified" {
-        remove_source_credential(repository_path, git_executable, source_id)?;
-        return readback_post_commit(repository_path, git_executable, source_id);
-    }
     let canonical = fs::canonicalize(repository_path)?;
     let git_dir = canonical_output_path(&git_stdout(
         git_executable,
@@ -751,58 +950,179 @@ pub fn revoke_post_commit(
         &["rev-parse", "--absolute-git-dir"],
     )?)?;
     let source_dir = source_dir(&git_dir, source_id);
-    ensure_existing_directory(&source_dir)?;
-    let manifest_path = source_dir.join("install.json");
-    let manifest: InstallManifest = serde_json::from_slice(&read_bounded(&manifest_path)?)
-        .map_err(|_| {
-            Error::new(
-                "HOOK_INSTALL_MANIFEST_INVALID",
-                "hook install manifest is invalid",
-            )
-        })?;
-    let target = PathBuf::from(&manifest.hook_path);
-    let current = read_optional_regular_file(&target)?.ok_or_else(|| {
-        Error::new(
-            "HOOK_INSTALL_MODIFIED",
-            "installed wrapper cannot be read safely",
-        )
-    })?;
-    if current.sha256 != manifest.wrapper_sha256 {
+    if before.state == "absent" {
+        remove_source_credential(repository_path, git_executable, source_id)?;
+        remove_empty_source_dir_if_present(&source_dir)?;
         return readback_post_commit(repository_path, git_executable, source_id);
     }
-
-    if let (Some(previous), Some(expected)) =
-        (&manifest.previous_hook_path, &manifest.previous_hook_sha256)
-    {
-        let previous_path = PathBuf::from(previous);
-        let bytes = read_bounded(&previous_path)?;
-        if model::digest(&bytes) != *expected {
-            return Ok(HookInstallReadback {
-                state: "modified".to_owned(),
-                wrapper_matches: true,
-                backup_matches: Some(false),
-                message: "preserved user hook changed; automatic restoration is refused".to_owned(),
-                ..before
-            });
+    ensure_existing_directory(&source_dir)?;
+    let manifest_path = source_dir.join("install.json");
+    let mut manifest = read_install_manifest(&manifest_path)?;
+    validate_install_manifest(
+        &manifest,
+        source_id,
+        &canonical,
+        git_executable,
+        &git_dir,
+        &source_dir,
+    )?;
+    if manifest.phase != InstallPhase::Revoking {
+        if before.state == "modified" {
+            remove_source_credential(repository_path, git_executable, source_id)?;
+            return readback_post_commit(repository_path, git_executable, source_id);
         }
-        atomic_replace_bytes(&target, &bytes, manifest.previous_hook_mode)?;
-        fs::remove_file(previous_path)?;
-    } else {
-        fs::remove_file(&target)?;
+        let resumable_phase = (manifest.phase == InstallPhase::Installing
+            && before.state == "installing")
+            || (manifest.phase == InstallPhase::Installed
+                && matches!(before.state.as_str(), "installed" | "inactive"));
+        if !resumable_phase {
+            return Err(Error::new(
+                "HOOK_INSTALL_STATE_CONFLICT",
+                "local hook state does not authorize revocation recovery",
+            ));
+        }
+        manifest.phase = InstallPhase::Revoking;
+        private_replace_json(&manifest_path, &manifest)?;
+    }
+    finish_revocation(
+        repository_path,
+        git_executable,
+        source_id,
+        &source_dir,
+        &manifest,
+        before,
+    )
+}
+
+fn finish_revocation(
+    repository_path: &Path,
+    git_executable: &Path,
+    source_id: &str,
+    source_dir: &Path,
+    manifest: &InstallManifest,
+    before: HookInstallReadback,
+) -> Result<HookInstallReadback> {
+    if manifest.phase != InstallPhase::Revoking {
+        return Err(Error::new(
+            "HOOK_INSTALL_STATE_CONFLICT",
+            "local hook manifest is not in a revocation-recovery phase",
+        ));
+    }
+    let manifest_path = source_dir.join("install.json");
+    let target = PathBuf::from(&manifest.hook_path);
+    let current = read_optional_regular_file(&target)?;
+    match (
+        manifest.previous_hook_path.as_deref(),
+        manifest.previous_hook_sha256.as_deref(),
+    ) {
+        (Some(previous), Some(_)) => {
+            let previous_path = PathBuf::from(previous);
+            let backup = read_optional_regular_file(&previous_path)?;
+            if backup
+                .as_ref()
+                .is_some_and(|hook| !matches_saved_previous(hook, manifest))
+            {
+                return revocation_conflict(repository_path, git_executable, source_id);
+            }
+            let target_is_original = current
+                .as_ref()
+                .is_some_and(|hook| matches_saved_previous(hook, manifest));
+            let target_is_wrapper = current
+                .as_ref()
+                .is_some_and(|hook| hook.sha256 == manifest.wrapper_sha256);
+            match (backup.as_ref(), current.as_ref()) {
+                (Some(_), Some(_)) if target_is_original => {}
+                (Some(backup), Some(_)) if target_is_wrapper => {
+                    atomic_replace_bytes(&target, &backup.bytes, manifest.previous_hook_mode)?;
+                }
+                (Some(backup), None) => {
+                    atomic_replace_bytes(&target, &backup.bytes, manifest.previous_hook_mode)?;
+                }
+                (None, Some(_)) if target_is_original => {}
+                _ => return revocation_conflict(repository_path, git_executable, source_id),
+            }
+            let restored = read_optional_regular_file(&target)?;
+            if !restored
+                .as_ref()
+                .is_some_and(|hook| matches_saved_previous(hook, manifest))
+            {
+                return revocation_conflict(repository_path, git_executable, source_id);
+            }
+            if backup.is_some() {
+                let retained = read_optional_regular_file(&previous_path)?;
+                if !retained
+                    .as_ref()
+                    .is_some_and(|hook| matches_saved_previous(hook, manifest))
+                {
+                    return revocation_conflict(repository_path, git_executable, source_id);
+                }
+                fs::remove_file(previous_path)?;
+            }
+        }
+        (None, None) => match current.as_ref() {
+            Some(hook) if hook.sha256 == manifest.wrapper_sha256 => fs::remove_file(&target)?,
+            None => {}
+            Some(_) => return revocation_conflict(repository_path, git_executable, source_id),
+        },
+        _ => {
+            return Err(Error::new(
+                "HOOK_INSTALL_MANIFEST_INVALID",
+                "hook backup fields are incomplete",
+            ));
+        }
     }
 
-    remove_credential_file(Path::new(&manifest.credential_path))?;
-    fs::remove_file(manifest_path)?;
-    fs::remove_dir(source_dir)?;
+    remove_source_credential(repository_path, git_executable, source_id)?;
+    ensure_source_dir_contains_only_manifest(source_dir, &manifest_path)?;
+    fs::remove_file(&manifest_path)?;
+    remove_empty_source_dir_if_present(source_dir)?;
     Ok(HookInstallReadback {
         state: "restored".to_owned(),
         wrapper_matches: false,
         credential_file_present: false,
         backup_matches: None,
-        wrapper_sha256: Some(before.wrapper_sha256.unwrap_or_default()),
+        wrapper_sha256: before.wrapper_sha256,
         message: "the original hook was restored and the setup credential file removed".to_owned(),
         ..before
     })
+}
+
+fn revocation_conflict(
+    repository_path: &Path,
+    git_executable: &Path,
+    source_id: &str,
+) -> Result<HookInstallReadback> {
+    remove_source_credential(repository_path, git_executable, source_id)?;
+    readback_post_commit(repository_path, git_executable, source_id)
+}
+
+fn ensure_source_dir_contains_only_manifest(source_dir: &Path, manifest_path: &Path) -> Result<()> {
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        if entry.path().as_path() != manifest_path {
+            return Err(Error::new(
+                "HOOK_INSTALL_CLEANUP_PENDING",
+                "unexpected source files remain; retained revocation state was preserved",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_source_dir_if_present(source_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(source_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(Error::new(
+            "HOOK_DIRECTORY_INVALID",
+            "hook source storage path is not a regular directory",
+        )),
+        Ok(_) => match fs::remove_dir(source_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Verify the exact captured commit against the setup-bound checkout. This is
@@ -1391,6 +1711,57 @@ fn validate_manifest_paths(
     Ok(())
 }
 
+fn read_install_manifest(path: &Path) -> Result<InstallManifest> {
+    serde_json::from_slice(&read_bounded(path)?).map_err(|_| {
+        Error::new(
+            "HOOK_INSTALL_MANIFEST_INVALID",
+            "hook install manifest is invalid",
+        )
+    })
+}
+
+fn validate_install_manifest(
+    manifest: &InstallManifest,
+    source_id: &str,
+    repository_path: &Path,
+    git_executable: &Path,
+    git_dir: &Path,
+    source_dir: &Path,
+) -> Result<()> {
+    if manifest.schema_version != INSTALL_SCHEMA_VERSION
+        || manifest.source_id != source_id
+        || manifest.event != EVENT_NAME
+        || manifest.repository_path != path_string(repository_path)?
+        || manifest.git_dir != path_string(git_dir)?
+        || manifest.git_executable != path_string(git_executable)?
+        || manifest.hook_path != path_string(&git_dir.join("hooks").join(HOOK_NAME))?
+        || manifest.installed_at_ms < 0
+        || !valid_sha256(&manifest.wrapper_sha256)
+    {
+        return Err(Error::new(
+            "HOOK_INSTALL_MANIFEST_INVALID",
+            "hook install manifest scope or digest is invalid",
+        ));
+    }
+    validate_manifest_paths(manifest, source_dir, git_dir)
+}
+
+fn matches_saved_previous(hook: &PreviousHook, manifest: &InstallManifest) -> bool {
+    manifest.previous_hook_sha256.as_deref() == Some(hook.sha256.as_str())
+        && manifest.previous_hook_mode == hook.mode
+}
+
+fn backup_is_exact_for_revocation(
+    backup_matches: Option<bool>,
+    manifest: &InstallManifest,
+) -> bool {
+    if manifest.previous_hook_path.is_some() {
+        backup_matches != Some(false)
+    } else {
+        backup_matches.is_none()
+    }
+}
+
 fn source_dir(git_dir: &Path, source_id: &str) -> PathBuf {
     git_dir.join(SOURCE_DIRECTORY).join(source_id)
 }
@@ -1610,4 +1981,533 @@ fn path_string(path: &Path) -> Result<String> {
 fn wide_nul(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    const ORIGINAL_HOOK: &[u8] = b"#!/bin/sh\n# retained user post-commit hook\nexit 0\n";
+    const MODIFIED_HOOK: &[u8] = b"#!/bin/sh\n# user changed this hook\nexit 0\n";
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("swarm-hook-recovery-{}", model::new_id()));
+            fs::create_dir_all(&path).expect("create isolated hook test root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct TestRepository {
+        _root: TestRoot,
+        repository_path: PathBuf,
+        git_executable: PathBuf,
+        swarm_executable: PathBuf,
+    }
+
+    impl TestRepository {
+        fn new(previous_hook: Option<&[u8]>) -> Self {
+            let root = TestRoot::new();
+            let repository_path = root.0.join("repository");
+            let empty_hooks = root.0.join("empty-hooks");
+            fs::create_dir_all(&repository_path).expect("create test repository");
+            fs::create_dir_all(&empty_hooks).expect("create isolated Git hooks directory");
+            let git_executable = find_git_executable();
+            run_fixture_git(
+                &git_executable,
+                &repository_path,
+                &empty_hooks,
+                &["init", "--quiet"],
+            );
+            run_fixture_git(
+                &git_executable,
+                &repository_path,
+                &empty_hooks,
+                &["config", "user.name", "Hook Recovery Fixture"],
+            );
+            run_fixture_git(
+                &git_executable,
+                &repository_path,
+                &empty_hooks,
+                &["config", "user.email", "hook-recovery@example.invalid"],
+            );
+            run_fixture_git(
+                &git_executable,
+                &repository_path,
+                &empty_hooks,
+                &["config", "commit.gpgsign", "false"],
+            );
+            fs::write(repository_path.join("seed.txt"), b"hook recovery fixture\n")
+                .expect("write seed file");
+            run_fixture_git(
+                &git_executable,
+                &repository_path,
+                &empty_hooks,
+                &["add", "seed.txt"],
+            );
+            run_fixture_git(
+                &git_executable,
+                &repository_path,
+                &empty_hooks,
+                &["commit", "--quiet", "-m", "hook recovery fixture"],
+            );
+
+            let swarm_executable = std::env::current_exe().expect("test executable path");
+            let repository = Self {
+                _root: root,
+                repository_path,
+                git_executable,
+                swarm_executable,
+            };
+            if let Some(previous_hook) = previous_hook {
+                let plan = repository.plan();
+                write_new(&plan.hook_path, previous_hook, Some(0o755))
+                    .expect("write previous hook fixture");
+            }
+            repository
+        }
+
+        fn plan(&self) -> HookInstallPlan {
+            preview_post_commit(&self.repository_path, &self.git_executable)
+                .expect("preview isolated test repository")
+        }
+
+        fn git_dir(&self) -> PathBuf {
+            canonical_output_path(
+                &git_stdout(
+                    &self.git_executable,
+                    &self.repository_path,
+                    &["rev-parse", "--absolute-git-dir"],
+                )
+                .expect("read test repository Git directory"),
+            )
+            .expect("canonical test repository Git directory")
+        }
+    }
+
+    struct HookFixture {
+        repository: TestRepository,
+        source_id: String,
+        credential: Credential,
+    }
+
+    impl HookFixture {
+        fn new(previous_hook: Option<&[u8]>) -> Self {
+            let repository = TestRepository::new(previous_hook);
+            let source_id = model::new_id();
+            let credential = test_credential(&source_id);
+            store_test_credential(&repository, &source_id, &credential);
+            Self {
+                repository,
+                source_id,
+                credential,
+            }
+        }
+
+        fn from_prepared(repository: TestRepository, prepared: &PreparedHookSource) -> Self {
+            Self {
+                repository,
+                source_id: prepared.source_id.clone(),
+                credential: prepared.credential.clone(),
+            }
+        }
+
+        fn source_dir(&self) -> PathBuf {
+            source_dir(&self.repository.git_dir(), &self.source_id)
+        }
+
+        fn manifest_path(&self) -> PathBuf {
+            self.source_dir().join("install.json")
+        }
+
+        fn credential_path(&self) -> PathBuf {
+            self.source_dir().join("credential.json")
+        }
+
+        fn hook_path(&self) -> PathBuf {
+            self.repository.plan().hook_path
+        }
+
+        fn manifest(&self) -> InstallManifest {
+            read_install_manifest(&self.manifest_path()).expect("read retained install manifest")
+        }
+
+        fn set_phase(&self, phase: InstallPhase) -> InstallManifest {
+            let mut manifest = self.manifest();
+            manifest.phase = phase;
+            private_replace_json(&self.manifest_path(), &manifest)
+                .expect("persist simulated durable phase boundary");
+            manifest
+        }
+
+        fn install(&self) -> HookInstallReadback {
+            apply_post_commit(
+                &self.repository.plan(),
+                &self.source_id,
+                &self.credential,
+                &self.repository.swarm_executable,
+            )
+            .expect("install actual hook fixture")
+        }
+
+        fn readback(&self) -> HookInstallReadback {
+            readback_post_commit(
+                &self.repository.repository_path,
+                &self.repository.git_executable,
+                &self.source_id,
+            )
+            .expect("read hook fixture state")
+        }
+
+        fn revoke(&self) -> HookInstallReadback {
+            revoke_post_commit(
+                &self.repository.repository_path,
+                &self.repository.git_executable,
+                &self.source_id,
+            )
+            .expect("revoke hook fixture")
+        }
+
+        fn restore_from_retained_backup(&self, manifest: &InstallManifest) {
+            match (
+                manifest.previous_hook_path.as_deref(),
+                manifest.previous_hook_sha256.as_deref(),
+            ) {
+                (Some(path), Some(_)) => {
+                    let backup = read_optional_regular_file(Path::new(path))
+                        .expect("read preserved hook backup")
+                        .expect("preserved hook backup exists");
+                    assert!(matches_saved_previous(&backup, manifest));
+                    atomic_replace_bytes(
+                        &PathBuf::from(&manifest.hook_path),
+                        &backup.bytes,
+                        manifest.previous_hook_mode,
+                    )
+                    .expect("apply exact hook restoration effect");
+                }
+                (None, None) => {
+                    let target = PathBuf::from(&manifest.hook_path);
+                    let current = read_optional_regular_file(&target)
+                        .expect("read wrapper before removal")
+                        .expect("installed wrapper exists");
+                    assert_eq!(current.sha256, manifest.wrapper_sha256);
+                    fs::remove_file(target).expect("apply exact hook removal effect");
+                }
+                _ => panic!("actual install manifest has complete backup identity"),
+            }
+        }
+
+        fn finish_cleanup_tail_before_directory(&self, manifest: &InstallManifest) {
+            self.restore_from_retained_backup(manifest);
+            if let Some(path) = manifest.previous_hook_path.as_deref() {
+                fs::remove_file(path).expect("apply backup deletion effect");
+            }
+            remove_source_credential(
+                &self.repository.repository_path,
+                &self.repository.git_executable,
+                &self.source_id,
+            )
+            .expect("apply source credential and setup descriptor cleanup effect");
+            fs::remove_file(self.manifest_path()).expect("apply manifest deletion effect");
+        }
+    }
+
+    fn find_git_executable() -> PathBuf {
+        let path_value = std::env::var_os("PATH").expect("test process PATH");
+        #[cfg(windows)]
+        let names = ["git.exe"];
+        #[cfg(not(windows))]
+        let names = ["git"];
+        std::env::split_paths(&path_value)
+            .find_map(|directory| {
+                names
+                    .iter()
+                    .map(|name| directory.join(*name))
+                    .find(|candidate| candidate.is_file())
+            })
+            .and_then(|path| fs::canonicalize(path).ok())
+            .expect("Git executable is available for hook integration tests")
+    }
+
+    fn run_fixture_git(git: &Path, repository: &Path, empty_hooks: &Path, args: &[&str]) {
+        let mut command = Command::new(git);
+        command
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", empty_hooks.display()))
+            .args(args)
+            .current_dir(repository)
+            .stdin(std::process::Stdio::null());
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(|key| {
+                key.starts_with("GIT_CONFIG_KEY_")
+                    || key.starts_with("GIT_CONFIG_VALUE_")
+                    || key.starts_with("GIT_TRACE")
+                    || key == "GIT_CURL_VERBOSE"
+            }) {
+                command.env_remove(key);
+            }
+        }
+        let output = command.output().expect("start fixture Git command");
+        assert!(
+            output.status.success(),
+            "fixture Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn test_credential(source_id: &str) -> Credential {
+        Credential {
+            client_id: format!("hook-source:{source_id}"),
+            token: format!("{}{}", model::new_id(), model::new_id()),
+        }
+    }
+
+    fn store_test_credential(
+        repository: &TestRepository,
+        source_id: &str,
+        credential: &Credential,
+    ) {
+        let git_dir = repository.git_dir();
+        let sources_dir = git_dir.join(SOURCE_DIRECTORY);
+        ensure_private_directory(&sources_dir).expect("create hook source root");
+        let source_path = source_dir(&git_dir, source_id);
+        ensure_private_directory(&source_path).expect("create hook source directory");
+        write_private_secret_new(
+            &source_path.join("credential.json"),
+            &serde_json::to_vec(credential).expect("serialize private hook credential"),
+        )
+        .expect("write private hook credential");
+    }
+
+    fn assert_restored(fixture: &HookFixture, manifest: &InstallManifest) {
+        match manifest.previous_hook_path.as_deref() {
+            Some(_) => {
+                let hook = read_optional_regular_file(&PathBuf::from(&manifest.hook_path))
+                    .expect("read restored hook")
+                    .expect("original hook was restored");
+                assert!(matches_saved_previous(&hook, manifest));
+            }
+            None => assert!(
+                read_optional_regular_file(&PathBuf::from(&manifest.hook_path))
+                    .expect("read removed wrapper")
+                    .is_none()
+            ),
+        }
+        assert!(!fixture.credential_path().exists());
+        assert!(!fixture.manifest_path().exists());
+        assert!(!fixture.source_dir().exists());
+    }
+
+    #[test]
+    fn install_resumes_from_manifest_before_wrapper_publication() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        assert_eq!(fixture.install().state, "installed");
+        let manifest = fixture.set_phase(InstallPhase::Installing);
+        fixture.restore_from_retained_backup(&manifest);
+
+        let interrupted = fixture.readback();
+        assert_eq!(interrupted.state, "installing");
+        assert!(!interrupted.wrapper_matches);
+        assert_eq!(
+            fs::read(fixture.hook_path()).unwrap().as_slice(),
+            ORIGINAL_HOOK
+        );
+
+        let resumed = fixture.install();
+        assert_eq!(resumed.state, "installed");
+        assert!(resumed.wrapper_matches);
+        assert_eq!(resumed.source_id, fixture.source_id);
+        assert_eq!(resumed.backup_matches, Some(true));
+        let installed = fixture.readback();
+        assert_eq!(installed.state, "installed");
+        assert_eq!(installed.wrapper_sha256, interrupted.wrapper_sha256);
+        let backup = read_optional_regular_file(Path::new(
+            fixture.manifest().previous_hook_path.as_deref().unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(matches_saved_previous(&backup, &fixture.manifest()));
+    }
+
+    #[test]
+    fn install_finalizes_after_wrapper_publication_without_rewriting_it() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        assert_eq!(fixture.install().state, "installed");
+        let wrapper_before = fs::read(fixture.hook_path()).unwrap();
+        let manifest = fixture.set_phase(InstallPhase::Installing);
+        let interrupted = fixture.readback();
+        assert_eq!(interrupted.state, "installing");
+        assert!(interrupted.wrapper_matches);
+        assert_eq!(manifest.wrapper_sha256, interrupted.wrapper_sha256.unwrap());
+
+        let resumed = fixture.install();
+        assert_eq!(resumed.state, "installed");
+        assert_eq!(fs::read(fixture.hook_path()).unwrap(), wrapper_before);
+        assert_eq!(fixture.readback().state, "installed");
+    }
+
+    #[test]
+    fn revoke_resumes_after_exact_restore_and_backup_removal() {
+        for remove_backup_before_retry in [false, true] {
+            let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+            assert_eq!(fixture.install().state, "installed");
+            let manifest = fixture.set_phase(InstallPhase::Revoking);
+            fixture.restore_from_retained_backup(&manifest);
+            if remove_backup_before_retry {
+                fs::remove_file(manifest.previous_hook_path.as_deref().unwrap())
+                    .expect("apply backup deletion boundary");
+            }
+
+            assert_eq!(fixture.readback().state, "revoking");
+            let resumed = fixture.revoke();
+            assert_eq!(resumed.state, "restored");
+            assert_restored(&fixture, &manifest);
+        }
+    }
+
+    #[test]
+    fn revoke_resumes_after_wrapper_removal_when_no_user_hook_existed() {
+        let fixture = HookFixture::new(None);
+        assert_eq!(fixture.install().state, "installed");
+        let manifest = fixture.set_phase(InstallPhase::Revoking);
+        fixture.restore_from_retained_backup(&manifest);
+        assert_eq!(fixture.readback().state, "revoking");
+
+        let resumed = fixture.revoke();
+        assert_eq!(resumed.state, "restored");
+        assert_restored(&fixture, &manifest);
+    }
+
+    #[test]
+    fn revoke_cleans_empty_source_directory_after_credential_and_manifest_tail() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        assert_eq!(fixture.install().state, "installed");
+        let manifest = fixture.set_phase(InstallPhase::Revoking);
+        fixture.finish_cleanup_tail_before_directory(&manifest);
+        assert!(fixture.source_dir().is_dir());
+        assert!(!fixture.credential_path().exists());
+        assert!(!fixture.manifest_path().exists());
+
+        let retry = fixture.revoke();
+        assert_eq!(retry.state, "absent");
+        assert!(!fixture.source_dir().exists());
+        assert_eq!(
+            fs::read(&fixture.hook_path()).unwrap().as_slice(),
+            ORIGINAL_HOOK
+        );
+    }
+
+    #[test]
+    fn revoke_preserves_user_modified_hook_and_original_backup() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        assert_eq!(fixture.install().state, "installed");
+        let manifest = fixture.set_phase(InstallPhase::Revoking);
+        fs::write(&manifest.hook_path, MODIFIED_HOOK).expect("simulate user hook edit");
+        let backup_path = manifest.previous_hook_path.as_deref().unwrap();
+        let backup_before = fs::read(backup_path).unwrap();
+
+        let result = fixture.revoke();
+        assert_eq!(result.state, "modified");
+        assert_eq!(
+            fs::read(&manifest.hook_path).unwrap().as_slice(),
+            MODIFIED_HOOK
+        );
+        assert_eq!(fs::read(backup_path).unwrap(), backup_before);
+        assert!(fixture.manifest_path().is_file());
+        assert_eq!(fixture.manifest().phase, InstallPhase::Revoking);
+    }
+
+    #[test]
+    fn revoke_preserves_mismatched_backup_and_installed_wrapper() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        assert_eq!(fixture.install().state, "installed");
+        let manifest = fixture.set_phase(InstallPhase::Revoking);
+        let wrapper_before = fs::read(&manifest.hook_path).unwrap();
+        let backup_path = manifest.previous_hook_path.as_deref().unwrap();
+        let mismatched_backup = b"user-modified preserved backup\n";
+        fs::write(backup_path, mismatched_backup).expect("simulate changed backup");
+
+        let result = fixture.revoke();
+        assert_eq!(result.state, "modified");
+        assert_eq!(fs::read(&manifest.hook_path).unwrap(), wrapper_before);
+        assert_eq!(fs::read(backup_path).unwrap().as_slice(), mismatched_backup);
+        assert!(fixture.manifest_path().is_file());
+        assert_eq!(fixture.manifest().phase, InstallPhase::Revoking);
+    }
+
+    #[test]
+    fn phase_less_legacy_manifest_remains_installed_and_revoke_compatible() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        assert_eq!(fixture.install().state, "installed");
+        let manifest_path = fixture.manifest_path();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&read_bounded(&manifest_path).unwrap()).unwrap();
+        assert_eq!(legacy["phase"], "installed");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("phase")
+            .expect("remove phase to represent a retained legacy manifest");
+        private_replace_json(&manifest_path, &legacy).unwrap();
+
+        let readback = fixture.readback();
+        assert_eq!(readback.state, "installed");
+        assert_eq!(readback.backup_matches, Some(true));
+        let manifest = fixture.manifest();
+        assert_eq!(manifest.phase, InstallPhase::Installed);
+        assert_eq!(fixture.revoke().state, "restored");
+        assert_restored(&fixture, &manifest);
+    }
+
+    #[test]
+    fn setup_rollback_cleans_an_interrupted_install_and_matching_identity() {
+        let repository = TestRepository::new(Some(ORIGINAL_HOOK));
+        let plan = repository.plan();
+        let prepared = prepare_source_credential(
+            &plan,
+            &format!("hook-test-project-{}", model::new_id()),
+            Some(&model::new_id()),
+        )
+        .expect("prepare exact setup identity and private credential");
+        let fixture = HookFixture::from_prepared(repository, &prepared);
+        assert_eq!(fixture.install().state, "installed");
+        let manifest = fixture.set_phase(InstallPhase::Installing);
+        fixture.restore_from_retained_backup(&manifest);
+
+        let rollback = fixture.revoke();
+        assert_eq!(rollback.state, "restored");
+        assert_restored(&fixture, &manifest);
+        discard_source_setup(&plan, &prepared).expect("finish matching setup rollback cleanup");
+        assert!(!prepared.pending_descriptor_path.exists());
+        assert!(!fixture.source_dir().join(SETUP_REQUEST_FILE).exists());
+        assert_eq!(fixture.readback().state, "absent");
+    }
 }

@@ -57,6 +57,18 @@ enum Command {
         #[arg(last = true, required = true)]
         args: Vec<String>,
     },
+    /// Internal independent owner for the explicit ModuleRun command.
+    #[command(hide = true)]
+    ModuleOwnerWorker {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        command: PathBuf,
+        #[arg(long)]
+        invocation: String,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Internal transient executor; never opens the controller database.
     #[command(hide = true)]
     CheckWorker {
@@ -837,6 +849,16 @@ fn execute(cli: Cli) -> Result<()> {
     {
         return swarm_kernel_host::runtime::owner::run(state_dir, command, args);
     }
+    if let Command::ModuleOwnerWorker {
+        state_dir,
+        command,
+        invocation,
+        args,
+    } = &cli.command
+    {
+        swarm_kernel_host::runtime::owner::run_worker(state_dir, command, args, invocation);
+        return Ok(());
+    }
     if let Command::CheckWorker { file } = &cli.command {
         return swarm_kernel_host::checks::worker::run(file);
     }
@@ -1035,7 +1057,8 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::OwnedOpencodeService { .. }
         | Command::ScriptWorker { .. }
         | Command::ZedBatchWorker { .. }
-        | Command::ModuleRun { .. } => {
+        | Command::ModuleRun { .. }
+        | Command::ModuleOwnerWorker { .. } => {
             unreachable!("executor returned above")
         }
         Command::Observer { .. } => unreachable!("observer read command returned above"),

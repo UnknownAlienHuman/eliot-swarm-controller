@@ -31,7 +31,8 @@ use swarm_bus::{
 };
 use swarm_contracts::DeclaredServiceScope;
 use swarm_process::{
-    departed_empty, process_image_identity, service_owner_is_live, write_private_new,
+    departed_empty, process_image_identity, service_owner_is_live, spawned_identity,
+    write_private_new,
 };
 use tokio::{
     process::{Child, Command},
@@ -43,6 +44,8 @@ use tokio::{
 const SCAN_FALLBACK: Duration = Duration::from_secs(2);
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_STARTS_PER_WINDOW: usize = 5;
+const OWNER_RECEIPT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const PRE_READY_STOP_GRACE: Duration = Duration::from_secs(2);
 const BASE_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(30);
 const ISOLATED_RETRY: Duration = Duration::from_secs(60);
@@ -100,8 +103,12 @@ struct Slot {
     config_path: PathBuf,
     child: Option<Child>,
     spawned_image: Option<serde_json::Value>,
+    spawned_process_identity: Option<serde_json::Value>,
+    launch_contract: Option<DispatcherLaunchContract>,
     spawn_verified: bool,
     child_exited: bool,
+    missing_owner_cleanup_started: Option<Instant>,
+    missing_owner_kill_attempted: bool,
     start_attempt: Instant,
     starts: VecDeque<Instant>,
     failures: VecDeque<Instant>,
@@ -122,8 +129,76 @@ struct PersistedHealth {
     retry_in_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatcherLaunchContract {
+    scope: DeclaredServiceScope,
+    store_root: PathBuf,
+    config_path: PathBuf,
+    owner_dir: PathBuf,
+    owner_manager_id: String,
+    project_id: String,
+    automation_id: String,
+    consumer_client_id: String,
+    scope_digest: String,
+    credential_token_sha256: String,
+    worker_config_sha256: String,
+    dispatcher_path: PathBuf,
+    dispatcher_sha256: String,
+}
+
+impl DispatcherLaunchContract {
+    fn from_launch(demand: &ManagedBusServiceDemand, pin: &DispatcherPin, slot: &Slot) -> Self {
+        Self {
+            scope: demand.scope.clone(),
+            store_root: slot.data_root.clone(),
+            config_path: slot.config_path.clone(),
+            owner_dir: slot.owner_dir.clone(),
+            owner_manager_id: demand.owner_manager_id.clone(),
+            project_id: demand.project_id.clone(),
+            automation_id: demand.automation_id.clone(),
+            consumer_client_id: demand.consumer_client_id.clone(),
+            scope_digest: demand.scope_digest.clone(),
+            credential_token_sha256: demand.credential_token_sha256.clone(),
+            worker_config_sha256: demand.worker_config_sha256.clone(),
+            dispatcher_path: pin.executable.clone(),
+            dispatcher_sha256: pin.sha256.to_ascii_lowercase(),
+        }
+    }
+
+    fn still_matches(
+        &self,
+        demand: Option<&ManagedBusServiceDemand>,
+        pin: &DispatcherPin,
+        slot: &Slot,
+    ) -> bool {
+        self.scope == slot.scope
+            && self.store_root == slot.data_root
+            && self.config_path == slot.config_path
+            && self.owner_dir == slot.owner_dir
+            && self.dispatcher_path == pin.executable
+            && self.dispatcher_sha256.eq_ignore_ascii_case(&pin.sha256)
+            && demand.is_none_or(|current| {
+                self.scope == current.scope
+                    && self.owner_manager_id == current.owner_manager_id
+                    && self.project_id == current.project_id
+                    && self.automation_id == current.automation_id
+                    && self.consumer_client_id == current.consumer_client_id
+                    && self.scope_digest == current.scope_digest
+                    && self.credential_token_sha256 == current.credential_token_sha256
+                    && self.worker_config_sha256 == current.worker_config_sha256
+            })
+    }
+}
+
 impl Slot {
     fn new(scope: DeclaredServiceScope, root: &Path, now: Instant) -> Result<Self> {
+        #[cfg(all(test, any(windows, target_os = "linux")))]
+        if tests::slot_construction_failure(&scope, root) {
+            return Err(Error::new(
+                "BUS_SERVICE_OWNER_DIRECTORY_INVALID",
+                "test-only scoped slot construction failure",
+            ));
+        }
         Ok(Self {
             data_root: root.to_path_buf(),
             config_path: managed_worker_config_path(root, &scope.service_id)?,
@@ -131,8 +206,12 @@ impl Slot {
             scope,
             child: None,
             spawned_image: None,
+            spawned_process_identity: None,
+            launch_contract: None,
             spawn_verified: false,
             child_exited: false,
+            missing_owner_cleanup_started: None,
+            missing_owner_kill_attempted: false,
             start_attempt: now,
             starts: VecDeque::new(),
             failures: VecDeque::new(),
@@ -199,6 +278,7 @@ pub(crate) async fn run(
     let mut tick = tokio::time::interval(SCAN_FALLBACK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut slots: BTreeMap<DeclaredServiceScope, Slot> = BTreeMap::new();
+    let mut constructor_health: BTreeMap<DeclaredServiceScope, PersistedHealth> = BTreeMap::new();
     let mut store_changes_open = true;
 
     loop {
@@ -247,15 +327,72 @@ pub(crate) async fn run(
             continue;
         }
 
-        for demand in demands.values() {
-            slots.entry(demand.scope.clone()).or_insert(Slot::new(
-                demand.scope.clone(),
-                &data_root,
-                Instant::now(),
-            )?);
-        }
-        let known: Vec<_> = slots.keys().cloned().collect();
         let mut store_failed = false;
+        for demand in demands.values() {
+            if slots.contains_key(&demand.scope) {
+                continue;
+            }
+            match Slot::new(demand.scope.clone(), &data_root, Instant::now()) {
+                Ok(slot) => {
+                    slots.insert(demand.scope.clone(), slot);
+                    constructor_health.remove(&demand.scope);
+                }
+                Err(error) => {
+                    let health = PersistedHealth {
+                        state: "unknown".to_owned(),
+                        consecutive_failures: 0,
+                        error: Some(safe_reconcile_error(&error.code).to_owned()),
+                        retry_in_ms: None,
+                    };
+                    let disposition_changed =
+                        constructor_health.get(&demand.scope) != Some(&health);
+                    if disposition_changed {
+                        match store
+                            .record_managed_bus_service_health(
+                                demand.scope.clone(),
+                                health.state.clone(),
+                                health.consecutive_failures,
+                                health.error.clone(),
+                                health.retry_in_ms,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                constructor_health.insert(demand.scope.clone(), health.clone());
+                            }
+                            Err(error) if is_store_unavailable(&error) => {
+                                #[cfg(all(test, any(windows, target_os = "linux")))]
+                                tests::notify_constructor_store_failure();
+                                // Do not continue other Store reconciliation on
+                                // an unknown database outcome. Existing child
+                                // handles remain owned in `slots`.
+                                store_failed = true;
+                                break;
+                            }
+                            Err(error) if error.code == "BUS_SERVICE_SCOPE_STALE" => {
+                                constructor_health.remove(&demand.scope);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        eprintln!(
+                            "managed bus scope isolated during slot construction: {}",
+                            health.error.as_deref().unwrap_or("BUS_SUPERVISOR_ERROR")
+                        );
+                    }
+                }
+            }
+        }
+        constructor_health
+            .retain(|scope, _| demands.contains_key(scope) && !slots.contains_key(scope));
+        if store_failed {
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = stopping.changed() => return drain_on_shutdown(&store, &pin, &mut slots).await,
+            }
+            continue;
+        }
+
+        let known: Vec<_> = slots.keys().cloned().collect();
         for scope in known {
             let demand = demands.get(&scope);
             let Some(slot) = slots.get_mut(&scope) else {
@@ -521,6 +658,160 @@ fn safe_reconcile_error(code: &str) -> &'static str {
         .find(|allowed| *allowed == code)
         .unwrap_or("BUS_SUPERVISOR_ERROR")
 }
+
+async fn reconcile_unreceipted_child(
+    store: &Store,
+    pin: &DispatcherPin,
+    demand: Option<&ManagedBusServiceDemand>,
+    slot: &mut Slot,
+) -> Result<()> {
+    let elapsed = Instant::now().saturating_duration_since(slot.start_attempt);
+    if !slot.spawn_verified {
+        slot.last_error = Some("BUS_DISPATCHER_IMAGE_UNKNOWN");
+        persist_status(
+            store,
+            slot,
+            "unknown",
+            Some("BUS_DISPATCHER_IMAGE_UNKNOWN"),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+    if elapsed < OWNER_RECEIPT_STARTUP_TIMEOUT {
+        persist_status(store, slot, "starting", None, None).await?;
+        return Ok(());
+    }
+
+    let launch_matches = slot
+        .launch_contract
+        .as_ref()
+        .is_some_and(|contract| contract.still_matches(demand, pin, slot));
+    if !launch_matches || !exact_spawned_dispatcher_is_live(slot, pin) {
+        slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+        persist_status(
+            store,
+            slot,
+            "unknown",
+            Some("BUS_SERVICE_OWNER_UNKNOWN"),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // The dispatcher writes owner.json before its first stop-request check and
+    // before poll_once, its first Store/network effect. Publish the stop marker
+    // and then reread owner.json: an already-ready dispatcher must leave its
+    // persistent receipt visible; one that publishes later will observe the
+    // marker before it can begin effects.
+    if let Err(error) = request_pre_ready_stop(slot) {
+        let code = safe_reconcile_error(&error.code);
+        slot.last_error = Some(code);
+        persist_status(store, slot, "unknown", Some(code), None).await?;
+        return Ok(());
+    }
+    match owner_receipt_exists(slot) {
+        Ok(true) => {
+            slot.missing_owner_cleanup_started = None;
+            slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_UNKNOWN");
+            persist_status(
+                store,
+                slot,
+                "unknown",
+                Some("BUS_SERVICE_STOP_REQUEST_UNKNOWN"),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(error) => {
+            let code = safe_reconcile_error(&error.code);
+            slot.last_error = Some(code);
+            persist_status(store, slot, "unknown", Some(code), None).await?;
+            return Ok(());
+        }
+    }
+
+    let cleanup_started = *slot
+        .missing_owner_cleanup_started
+        .get_or_insert_with(Instant::now);
+    if Instant::now().saturating_duration_since(cleanup_started) < PRE_READY_STOP_GRACE {
+        slot.last_error = Some("BUS_SERVICE_OWNER_RECEIPT_MISSING");
+        persist_status(
+            store,
+            slot,
+            "unknown",
+            Some("BUS_SERVICE_OWNER_RECEIPT_MISSING"),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if slot.missing_owner_kill_attempted {
+        let code = slot
+            .last_error
+            .unwrap_or("BUS_SERVICE_OWNER_RECEIPT_MISSING");
+        persist_status(store, slot, "unknown", Some(code), None).await?;
+        return Ok(());
+    }
+    if !slot
+        .launch_contract
+        .as_ref()
+        .is_some_and(|contract| contract.still_matches(demand, pin, slot))
+        || !exact_spawned_dispatcher_is_live(slot, pin)
+    {
+        slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+        persist_status(
+            store,
+            slot,
+            "unknown",
+            Some("BUS_SERVICE_OWNER_UNKNOWN"),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+    match owner_receipt_exists(slot) {
+        Ok(false) => {}
+        Ok(true) => {
+            slot.missing_owner_cleanup_started = None;
+            slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_UNKNOWN");
+            persist_status(
+                store,
+                slot,
+                "unknown",
+                Some("BUS_SERVICE_STOP_REQUEST_UNKNOWN"),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(error) => {
+            let code = safe_reconcile_error(&error.code);
+            slot.last_error = Some(code);
+            persist_status(store, slot, "unknown", Some(code), None).await?;
+            return Ok(());
+        }
+    }
+
+    // Only the exact verified Child handle is signaled. If termination cannot
+    // be initiated or later departure cannot be read back, keep the handle and
+    // scope fence and expose unknown; never infer family absence from age.
+    slot.missing_owner_kill_attempted = true;
+    let code = match slot.child.as_mut() {
+        Some(child) => match child.start_kill() {
+            Ok(()) => "BUS_SERVICE_OWNER_RECEIPT_MISSING",
+            Err(_) => "BUS_WORKER_WAIT_UNKNOWN",
+        },
+        None => "BUS_SERVICE_OWNER_UNKNOWN",
+    };
+    slot.last_error = Some(code);
+    persist_status(store, slot, "unknown", Some(code), None).await
+}
+
 async fn reconcile_slot(
     store: &Store,
     pin: &DispatcherPin,
@@ -541,6 +832,12 @@ async fn reconcile_slot(
                     } else {
                         slot.last_error = Some("BUS_DISPATCHER_IMAGE_UNKNOWN");
                     }
+                }
+                if slot.spawned_process_identity.is_none()
+                    && let Some(pid) = child.id()
+                    && let Ok(identity) = spawned_identity(pid)
+                {
+                    slot.spawned_process_identity = Some(identity);
                 }
             }
             Err(_) => {
@@ -771,8 +1068,12 @@ async fn reconcile_slot(
         remove_owner_receipt(slot)?;
         slot.child = None;
         slot.spawned_image = None;
+        slot.spawned_process_identity = None;
+        slot.launch_contract = None;
         slot.spawn_verified = false;
         slot.child_exited = false;
+        slot.missing_owner_cleanup_started = None;
+        slot.missing_owner_kill_attempted = false;
         clear_stop_request(slot)?;
         if slot.stopping || !slot.demanded {
             persist_status(store, slot, "dormant", None, None).await?;
@@ -796,10 +1097,16 @@ async fn reconcile_slot(
     }
 
     if slot.child.is_some() && slot.child_exited {
-        // The dispatcher publishes its owner receipt before it can call Store
-        // or create any descendants. A waited child with no receipt therefore
-        // has no hidden process family to adopt.
-        if !slot.spawn_verified {
+        // run_managed_worker publishes owner.json before its first stop check
+        // and before poll_once, its first Store/network effect. When the exact
+        // verified Child handle is reaped with no receipt, no worker effect or
+        // descendant could have started.
+        if !slot.spawn_verified
+            || slot
+                .launch_contract
+                .as_ref()
+                .is_none_or(|contract| contract.scope != slot.scope)
+        {
             slot.last_error = Some("BUS_DISPATCHER_IMAGE_UNKNOWN");
             persist_status(
                 store,
@@ -820,10 +1127,15 @@ async fn reconcile_slot(
                 )
                 .await?;
         }
+        clear_stop_request(slot)?;
         slot.child = None;
         slot.spawned_image = None;
+        slot.spawned_process_identity = None;
+        slot.launch_contract = None;
         slot.spawn_verified = false;
         slot.child_exited = false;
+        slot.missing_owner_cleanup_started = None;
+        slot.missing_owner_kill_attempted = false;
         if slot.demanded {
             let code = slot.last_error.take().unwrap_or("BUS_DISPATCHER_EXIT");
             let delay = slot
@@ -842,33 +1154,7 @@ async fn reconcile_slot(
     }
 
     if slot.child.is_some() {
-        // The exact child has started but has not published its service owner
-        // receipt. It may still be resolving startup; keep the scope single-flight.
-        let elapsed = Instant::now().saturating_duration_since(slot.start_attempt);
-        if !slot.spawn_verified {
-            slot.last_error = Some("BUS_DISPATCHER_IMAGE_UNKNOWN");
-            persist_status(
-                store,
-                slot,
-                "unknown",
-                Some("BUS_DISPATCHER_IMAGE_UNKNOWN"),
-                None,
-            )
-            .await?;
-            return Ok(());
-        }
-        let error = if elapsed > Duration::from_secs(10) {
-            Some("BUS_SERVICE_OWNER_RECEIPT_MISSING")
-        } else {
-            None
-        };
-        if let Some(code) = error {
-            slot.last_error = Some(code);
-            persist_status(store, slot, "unknown", Some(code), None).await?;
-        } else {
-            persist_status(store, slot, "starting", None, None).await?;
-        }
-        return Ok(());
+        return reconcile_unreceipted_child(store, pin, demand, slot).await;
     }
 
     let Some(demand) = demand else {
@@ -1034,6 +1320,7 @@ async fn start_worker(
         })?;
     let attempt_now = Instant::now();
     slot.note_start(attempt_now);
+    let launch_contract = DispatcherLaunchContract::from_launch(demand, pin, slot);
     let mut command = Command::new(executable);
     let generation = demand.scope.generation.to_string();
     command
@@ -1068,11 +1355,16 @@ async fn start_worker(
     let child = command
         .spawn()
         .map_err(|_| StartFailure::Code("BUS_DISPATCHER_START_FAILED"))?;
+    let spawned_process_identity = child.id().and_then(|pid| spawned_identity(pid).ok());
     let spawned_image = child.id().and_then(|pid| process_image_identity(pid).ok());
     slot.spawn_verified = spawned_image
         .as_ref()
         .is_some_and(|image| image_matches_pin(image, pin));
     slot.spawned_image = spawned_image;
+    slot.spawned_process_identity = spawned_process_identity;
+    slot.launch_contract = Some(launch_contract);
+    slot.missing_owner_cleanup_started = None;
+    slot.missing_owner_kill_attempted = false;
     slot.child_exited = false;
     slot.child = Some(child);
     if !slot.spawn_verified {
@@ -1155,6 +1447,39 @@ fn image_matches_pin(image: &serde_json::Value, pin: &DispatcherPin) -> bool {
         .is_some_and(|digest| digest.eq_ignore_ascii_case(&pin.sha256))
         && configured_image.is_some()
         && observed_image == configured_image
+}
+
+/// Confirm that the still-owned Child handle, birth identity, and pinned image
+/// all identify the exact dispatcher launched for this slot. Signaling remains
+/// through Child::start_kill, never through the observed PID.
+fn exact_spawned_dispatcher_is_live(slot: &Slot, pin: &DispatcherPin) -> bool {
+    let Some(child) = slot.child.as_ref() else {
+        return false;
+    };
+    let Some(pid) = child.id() else {
+        return false;
+    };
+    let Some(image) = slot.spawned_image.as_ref() else {
+        return false;
+    };
+    let Some(identity) = slot.spawned_process_identity.as_ref() else {
+        return false;
+    };
+    if identity["scope"] != "launcher_spawned_process"
+        || identity["purpose"] != "check"
+        || identity["pid"].as_u64() != Some(u64::from(pid))
+        || image["pid"].as_u64() != Some(u64::from(pid))
+        || !image_matches_pin(image, pin)
+    {
+        return false;
+    }
+    let Ok(current_image) = process_image_identity(pid) else {
+        return false;
+    };
+    let Ok(current_identity) = spawned_identity(pid) else {
+        return false;
+    };
+    same_process_image(image, &current_image) && &current_identity == identity
 }
 
 fn read_owner_receipt(
@@ -1328,23 +1653,36 @@ fn same_owner_image(owner: &serde_json::Value, image: &serde_json::Value) -> boo
 
 fn same_process_birth(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     match (
-        left["creation_filetime"].as_u64(),
-        right["creation_filetime"].as_u64(),
+        left.get("creation_filetime"),
+        right.get("creation_filetime"),
     ) {
-        (Some(left), Some(right)) => left == right,
-        _ => {
-            matches!(
-                (
-                    left["boot_id"].as_str(),
-                    left["start_ticks"].as_str(),
-                    right["boot_id"].as_str(),
-                    right["start_ticks"].as_str(),
-                ),
-                (Some(left_boot), Some(left_start), Some(right_boot), Some(right_start))
-                    if left_boot == right_boot && left_start == right_start
-            )
-        }
+        (Some(left), Some(right)) => matches!(
+            (process_birth_filetime(left), process_birth_filetime(right)),
+            (Some(left), Some(right)) if left == right
+        ),
+        (None, None) => matches!(
+            (
+                left["boot_id"].as_str(),
+                left["start_ticks"].as_str(),
+                right["boot_id"].as_str(),
+                right["start_ticks"].as_str(),
+            ),
+            (Some(left_boot), Some(left_start), Some(right_boot), Some(right_start))
+                if left_boot == right_boot && left_start == right_start
+        ),
+        _ => false,
     }
+}
+
+/// Normalize existing Windows encodings without accepting lossy, signed,
+/// zero, or noncanonical process birth values.
+fn process_birth_filetime(value: &serde_json::Value) -> Option<u64> {
+    if let Some(birth) = value.as_u64() {
+        return (birth > 0).then_some(birth);
+    }
+    let text = value.as_str()?;
+    let birth = text.parse::<u64>().ok()?;
+    (birth > 0 && birth.to_string() == text).then_some(birth)
 }
 
 fn owner_receipt_exists(slot: &Slot) -> Result<bool> {
@@ -1384,24 +1722,33 @@ fn remove_owner_receipt(slot: &Slot) -> Result<()> {
 
 fn request_stop(slot: &mut Slot) -> Result<()> {
     if !slot.stopping {
-        ensure_private_dir(&slot.data_root, &slot.owner_dir)?;
-        let path = slot.owner_dir.join("stop.request");
-        match write_private_new(&path, &[]) {
-            Ok(()) => {}
-            Err(error) if error.code == "FILE_EXISTS" => {
-                let metadata = fs::symlink_metadata(&path)?;
-                if !metadata.is_file() || is_link_or_reparse(&metadata) || metadata.len() != 0 {
-                    return Err(Error::new(
-                        "BUS_SERVICE_STOP_REQUEST_INVALID",
-                        "stop marker is invalid",
-                    ));
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
+        ensure_stop_request(slot)?;
         slot.stopping = true;
     }
     Ok(())
+}
+
+fn request_pre_ready_stop(slot: &Slot) -> Result<()> {
+    ensure_stop_request(slot)
+}
+
+fn ensure_stop_request(slot: &Slot) -> Result<()> {
+    ensure_private_dir(&slot.data_root, &slot.owner_dir)?;
+    let path = slot.owner_dir.join("stop.request");
+    match write_private_new(&path, &[]) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "FILE_EXISTS" => {
+            if stop_request_exists(slot)? {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    "BUS_SERVICE_STOP_REQUEST_INVALID",
+                    "stop marker is invalid",
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn clear_stop_request(slot: &Slot) -> Result<()> {
@@ -1506,7 +1853,7 @@ fn validate_private_dir_beneath(root: &Path, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_private_directory(_path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.is_dir() || is_link_or_reparse(metadata) {
         return Err(Error::new(
             "BUS_SERVICE_OWNER_DIRECTORY_INVALID",
@@ -1524,7 +1871,7 @@ fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<()
         }
     }
     #[cfg(windows)]
-    swarm_process::private_permissions(path, true)?;
+    swarm_process::private_permissions(_path, true)?;
     Ok(())
 }
 
@@ -1624,4 +1971,586 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Config,
+        platform::{DataRoot, bootstrap_credential, process_group::process_birth_identity},
+        store::StoreOwner,
+    };
+    use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+    use serde_json::{Value, json};
+    use sha2::Digest;
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+        process::Stdio,
+        sync::{Arc, Mutex, OnceLock},
+        thread,
+        time::Duration as StdDuration,
+    };
+    use tokio::{
+        process::Command,
+        sync::{oneshot, watch},
+        time::{self, Duration, Instant},
+    };
+
+    const DAMAGE_SCOPE: &str = "bus-script-damaged";
+    const HEALTHY_SCOPE: &str = "bus-script-healthy";
+    const MISSING_RECEIPT_SCOPE: &str = "bus-script-no-receipt";
+    const CHILD_RELEASE_ENV: &str = "ELIOT_SWARM_BUS_SUPERVISOR_CHILD_RELEASE";
+    const CHILD_TEST: &str = "host_bus_supervisor::tests::child_waits_for_release";
+
+    type FailedSlotConstruction = (DeclaredServiceScope, PathBuf);
+
+    static FAILED_SLOT_CONSTRUCTIONS: OnceLock<Mutex<BTreeSet<FailedSlotConstruction>>> =
+        OnceLock::new();
+    static CONSTRUCTOR_STORE_FAILURE: OnceLock<Mutex<Option<oneshot::Sender<()>>>> =
+        OnceLock::new();
+
+    pub(super) fn slot_construction_failure(scope: &DeclaredServiceScope, root: &Path) -> bool {
+        FAILED_SLOT_CONSTRUCTIONS.get().is_some_and(|scopes| {
+            scopes
+                .lock()
+                .is_ok_and(|scopes| scopes.contains(&(scope.clone(), root.to_path_buf())))
+        })
+    }
+
+    pub(super) fn notify_constructor_store_failure() {
+        if let Some(signal) = CONSTRUCTOR_STORE_FAILURE.get()
+            && let Ok(mut signal) = signal.lock()
+            && let Some(sender) = signal.take()
+        {
+            let _ = sender.send(());
+        }
+    }
+
+    struct SlotConstructionFailureGuard(FailedSlotConstruction);
+
+    impl Drop for SlotConstructionFailureGuard {
+        fn drop(&mut self) {
+            if let Some(scopes) = FAILED_SLOT_CONSTRUCTIONS.get()
+                && let Ok(mut scopes) = scopes.lock()
+            {
+                scopes.remove(&self.0);
+            }
+        }
+    }
+
+    fn fail_slot_construction_for(
+        scope: DeclaredServiceScope,
+        root: &Path,
+    ) -> SlotConstructionFailureGuard {
+        let key = (scope, root.to_path_buf());
+        FAILED_SLOT_CONSTRUCTIONS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .expect("lock test-only slot-construction injection")
+            .insert(key.clone());
+        SlotConstructionFailureGuard(key)
+    }
+
+    fn arm_constructor_store_failure_signal() -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        let mut signal = CONSTRUCTOR_STORE_FAILURE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("lock test-only Store-failure signal");
+        assert!(
+            signal.replace(sender).is_none(),
+            "only one Store failure is armed"
+        );
+        receiver
+    }
+
+    #[test]
+    fn process_birth_comparison_normalizes_exact_windows_filetimes_only() {
+        assert!(same_process_birth(
+            &json!({"creation_filetime": 123}),
+            &json!({"creation_filetime": "123"})
+        ));
+        assert!(same_process_birth(
+            &json!({"creation_filetime": "123"}),
+            &json!({"creation_filetime": "123"})
+        ));
+        for invalid in [
+            json!("124"),
+            json!("00123"),
+            json!("+123"),
+            json!("-123"),
+            json!("123 "),
+            json!("18446744073709551616"),
+            json!(0),
+            json!(-123),
+            json!(123.5),
+            json!(true),
+            json!(null),
+        ] {
+            assert!(!same_process_birth(
+                &json!({"creation_filetime": 123}),
+                &json!({"creation_filetime": invalid})
+            ));
+        }
+        assert!(!same_process_birth(
+            &json!({"creation_filetime": "corrupt", "boot_id": "boot", "start_ticks": "7"}),
+            &json!({"creation_filetime": "corrupt", "boot_id": "boot", "start_ticks": "7"})
+        ));
+        assert!(!same_process_birth(
+            &json!({"creation_filetime": 0}),
+            &json!({"creation_filetime": 0})
+        ));
+        assert!(!same_process_birth(
+            &json!({"creation_filetime": 123}),
+            &json!({})
+        ));
+        assert!(!same_process_birth(&json!({}), &json!({})));
+        assert!(same_process_birth(
+            &json!({"boot_id": "boot", "start_ticks": "7"}),
+            &json!({"boot_id": "boot", "start_ticks": "7"})
+        ));
+    }
+
+    #[test]
+    fn child_waits_for_release() {
+        let Ok(release) = std::env::var(CHILD_RELEASE_ENV) else {
+            return;
+        };
+        let release = PathBuf::from(release);
+        fs::write(release.with_extension("ready"), b"ready")
+            .expect("publish fixture child readiness");
+        while !release.exists() {
+            thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_failure_is_persisted_without_blocking_healthy_scope() {
+        let root = test_root("bus-scope-isolation");
+        let owner =
+            store_with_registrations(&root, &[(DAMAGE_SCOPE, false), (HEALTHY_SCOPE, false)]).await;
+        let damaged_scope = test_scope(DAMAGE_SCOPE);
+        let _constructor_failure = fail_slot_construction_for(damaged_scope, &root);
+        let pin = inert_pin();
+        let (stop, stopping) = watch::channel(false);
+        let task = tokio::spawn(run(owner.store.clone(), root.clone(), pin, stopping));
+
+        wait_for_health(
+            &root,
+            DAMAGE_SCOPE,
+            "unknown",
+            Some("BUS_SERVICE_OWNER_DIRECTORY_INVALID"),
+        )
+        .await;
+        wait_for_health(&root, HEALTHY_SCOPE, "dormant", None).await;
+        let _ = stop.send(true);
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stop scoped bus supervisor")
+            .expect("join scoped bus supervisor")
+            .expect("scope-local constructor error is not a host error");
+
+        let demands = owner
+            .store
+            .managed_bus_service_snapshot()
+            .await
+            .expect("read both retained managed scopes");
+        assert_eq!(demands.len(), 2, "damaged scope did not hide its neighbor");
+        assert!(
+            demands
+                .iter()
+                .any(|demand| demand.scope.service_id == HEALTHY_SCOPE)
+        );
+        owner.close().await.expect("close temporary Store owner");
+        fs::remove_dir_all(root).expect("remove exact test Store directory");
+    }
+
+    #[tokio::test]
+    async fn constructor_health_sqlite_failure_holds_later_scope_reconciliation() {
+        let root = test_root("bus-scope-store-failure");
+        let owner =
+            store_with_registrations(&root, &[(DAMAGE_SCOPE, false), (HEALTHY_SCOPE, false)]).await;
+        let healthy_before = read_registration(&root, HEALTHY_SCOPE)
+            .expect("read healthy registration before reconciliation")
+            .expect("healthy registration exists before reconciliation");
+        install_registration_update_rejection(&root, DAMAGE_SCOPE);
+        let _constructor_failure = fail_slot_construction_for(test_scope(DAMAGE_SCOPE), &root);
+        let store_failure = arm_constructor_store_failure_signal();
+        let (stop, stopping) = watch::channel(false);
+        let task = tokio::spawn(run(
+            owner.store.clone(),
+            root.clone(),
+            inert_pin(),
+            stopping,
+        ));
+
+        time::timeout(Duration::from_secs(5), store_failure)
+            .await
+            .expect("constructor health write reached the Store failure branch")
+            .expect("Store failure signal was delivered");
+        assert!(
+            !task.is_finished(),
+            "unknown SQLite outcome remains held and observable"
+        );
+        assert_eq!(
+            read_registration(&root, HEALTHY_SCOPE)
+                .expect("read healthy registration after held reconciliation"),
+            Some(healthy_before),
+            "later scope was not reconciled after unknown Store outcome"
+        );
+        let _ = stop.send(true);
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stop Store-held bus supervisor")
+            .expect("join Store-held bus supervisor")
+            .expect("Store outage remains a held supervisor state");
+        owner.close().await.expect("close temporary Store owner");
+        fs::remove_dir_all(root).expect("remove exact test Store directory");
+    }
+
+    #[tokio::test]
+    async fn missing_owner_receipt_keeps_scope_fenced_until_exact_child_departure() {
+        let root = test_root("bus-missing-owner-receipt");
+        let owner = store_with_registrations(&root, &[(MISSING_RECEIPT_SCOPE, true)]).await;
+        let demand = test_demand(test_scope(MISSING_RECEIPT_SCOPE));
+        let pin = test_dispatcher_pin();
+        let release = root.join("release-child");
+        let mut release_guard = ReleaseFileGuard::new(release.clone());
+        let mut slot = Slot::new(demand.scope.clone(), &root, Instant::now())
+            .expect("construct exact managed service slot");
+        slot.demanded = true;
+        slot.start_attempt =
+            Instant::now() - OWNER_RECEIPT_STARTUP_TIMEOUT - Duration::from_secs(1);
+        slot.missing_owner_cleanup_started =
+            Some(Instant::now() - PRE_READY_STOP_GRACE - Duration::from_millis(1));
+
+        let child = spawn_fixture_child(&release);
+        let ready = release.with_extension("ready");
+        time::timeout(Duration::from_secs(5), async {
+            while !ready.is_file() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture dispatcher entered its release wait before identity checks");
+        let pid = child.id().expect("fixture dispatcher has a PID");
+        let birth = process_birth_identity(pid)
+            .expect("read fixture dispatcher birth identity")
+            .expect("fixture dispatcher remains alive");
+        let image = process_image_identity(pid).expect("read fixture dispatcher image identity");
+        let process_identity = spawned_identity(pid).expect("read fixture dispatcher custody");
+        slot.child = Some(child);
+        assert!(
+            image_matches_pin(&image, &pin),
+            "child image matches exact test pin"
+        );
+        slot.spawned_image = Some(image);
+        slot.spawned_process_identity = Some(process_identity);
+        slot.spawn_verified = true;
+        slot.launch_contract = Some(DispatcherLaunchContract::from_launch(&demand, &pin, &slot));
+        assert!(exact_spawned_dispatcher_is_live(&slot, &pin));
+        assert!(!owner_receipt_exists(&slot).expect("read missing owner receipt"));
+
+        reconcile_unreceipted_child(&owner.store, &pin, Some(&demand), &mut slot)
+            .await
+            .expect("bounded missing-receipt cleanup requests exact Child stop");
+        assert!(slot.missing_owner_kill_attempted);
+        assert!(
+            slot.child.is_some(),
+            "exact Child remains owned until wait proves exit"
+        );
+        assert!(
+            slot.launch_contract.is_some(),
+            "launch contract remains fenced"
+        );
+        assert!(
+            slot.starts.is_empty(),
+            "missing receipt did not reserve a replacement"
+        );
+        let before_departure = owner
+            .store
+            .managed_bus_service_snapshot()
+            .await
+            .expect("read retained owner state");
+        assert_eq!(
+            before_departure[0].owner_state,
+            ManagedBusOwnerState::LaunchUncertain,
+            "no owner receipt means no durable departure proof"
+        );
+        assert_eq!(
+            read_registration(&root, MISSING_RECEIPT_SCOPE)
+                .expect("read service registration")
+                .expect("service registration remains retained")
+                ["managed_bus_service_health"]
+                ["start_attempts_ms"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "no replacement start was persisted before child departure"
+        );
+        let retained_health = read_registration(&root, MISSING_RECEIPT_SCOPE)
+            .expect("read missing-receipt health disposition")
+            .expect("missing-receipt service registration remains retained")
+            ["managed_bus_service_health"]
+            .clone();
+        assert_eq!(retained_health["state"].as_str(), Some("unknown"));
+        assert_eq!(
+            retained_health["error_code"].as_str(),
+            Some("BUS_SERVICE_OWNER_RECEIPT_MISSING")
+        );
+
+        time::timeout(Duration::from_secs(8), async {
+            loop {
+                reconcile_slot(&owner.store, &pin, Some(&demand), &mut slot)
+                    .await
+                    .expect("reconcile exact child after stop request");
+                if slot.child.is_none() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("exact direct child departed within the bounded cleanup window");
+        release_guard.release();
+        let current_birth = process_birth_identity(pid)
+            .expect("verify exact child departure")
+            .unwrap_or(Value::Null);
+        assert_ne!(
+            current_birth, birth,
+            "departed PID did not retain the same birth identity"
+        );
+        assert!(
+            slot.starts.is_empty(),
+            "reconciliation records departure without replacement"
+        );
+        let after_departure = owner
+            .store
+            .managed_bus_service_snapshot()
+            .await
+            .expect("read exact departed owner state");
+        assert_eq!(
+            after_departure[0].owner_state,
+            ManagedBusOwnerState::Departed
+        );
+        owner.close().await.expect("close temporary Store owner");
+        fs::remove_dir_all(root).expect("remove exact test Store directory");
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("eliot-{label}-{}", crate::model::new_id()));
+        fs::create_dir_all(&path).expect("create exact test Store directory");
+        fs::canonicalize(path).expect("canonicalize exact test Store directory")
+    }
+
+    fn test_scope(service_id: &str) -> DeclaredServiceScope {
+        DeclaredServiceScope::new(
+            swarm_contracts::DeclaredServicePurpose::BusConsumer,
+            service_id,
+            1,
+        )
+        .expect("construct valid test service scope")
+    }
+
+    fn registration(service_id: &str, launch_uncertain: bool) -> Value {
+        let mut value = json!({
+            "role":"module",
+            "token_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "disabled":true,
+            "bus_consumer":{
+                "schema_version":1,
+                "owner_manager_id":"fixture-manager",
+                "project_id":"fixture-project",
+                "automation_id":"fixture-automation",
+                "consumer_client_id":service_id,
+                "scope_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "method_scope":["bus.events.page","bus.consumer.admit"],
+                "created_at_ms":1,
+                "managed_service":true,
+                "service_generation":1,
+                "worker_config_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+        });
+        if launch_uncertain {
+            value["managed_bus_service_health"] = json!({
+                "schema_version":1,
+                "state":"starting",
+                "consecutive_failures":0,
+                "error_code":null,
+                "retry_after_ms":null,
+                "updated_at_ms":1,
+                "start_attempts_ms":[1],
+                "owner_state":"launch_uncertain",
+                "owner_receipt_sha256":null
+            });
+        }
+        value
+    }
+
+    async fn store_with_registrations(root: &Path, registrations: &[(&str, bool)]) -> StoreOwner {
+        fs::create_dir_all(root).expect("create test Store root");
+        let root = fs::canonicalize(root).expect("canonicalize test Store root");
+        let initial = open_store_owner(&root).await;
+        initial
+            .close()
+            .await
+            .expect("close Store before fixture seeding");
+        let db = Connection::open(root.join("swarm.db")).expect("open quiescent fixture database");
+        for (service_id, launch_uncertain) in registrations {
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    format!("client:{service_id}"),
+                    serde_json::to_string(&registration(service_id, *launch_uncertain))
+                        .expect("serialize fixture Module registration")
+                ],
+            )
+            .expect("seed exact disabled managed service registration");
+        }
+        drop(db);
+        open_store_owner(&root).await
+    }
+
+    async fn open_store_owner(root: &Path) -> StoreOwner {
+        let data_root = DataRoot::acquire(root).expect("acquire test Store root");
+        let config = test_config(&data_root.path);
+        let credential =
+            bootstrap_credential(&data_root.path).expect("load test Store operator credential");
+        StoreOwner::start(data_root, config, credential)
+            .await
+            .expect("start test Store owner")
+    }
+
+    fn test_config(root: &Path) -> Arc<Config> {
+        let mut config = Config::default();
+        config.storage.data_dir = root.to_path_buf();
+        Arc::new(config)
+    }
+
+    fn read_registration(root: &Path, service_id: &str) -> Result<Option<Value>> {
+        let db = Connection::open_with_flags(
+            root.join("swarm.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let encoded = db
+            .query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [format!("client:{service_id}")],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        encoded
+            .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn wait_for_health(root: &Path, service_id: &str, state: &str, error_code: Option<&str>) {
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(registration) =
+                    read_registration(root, service_id).expect("read retained service registration")
+                {
+                    let health = &registration["managed_bus_service_health"];
+                    if health["state"].as_str() == Some(state)
+                        && health["error_code"].as_str() == error_code
+                    {
+                        return;
+                    }
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "scope health did not reach {state}/{error_code:?}: {error}; retained={:?}",
+                read_registration(root, service_id)
+            )
+        });
+    }
+
+    fn install_registration_update_rejection(root: &Path, service_id: &str) {
+        let db = Connection::open(root.join("swarm.db")).expect("open quiescent Store database");
+        let sql = format!(
+            "CREATE TRIGGER reject_test_scope_health BEFORE UPDATE OF value_json ON meta \
+             WHEN OLD.key='client:{service_id}' BEGIN \
+             SELECT RAISE(ABORT,'fixture SQLite failure'); END;"
+        );
+        db.execute_batch(&sql)
+            .expect("install scoped Store failure trigger");
+    }
+
+    fn test_demand(scope: DeclaredServiceScope) -> ManagedBusServiceDemand {
+        ManagedBusServiceDemand {
+            consumer_client_id: scope.service_id.clone(),
+            scope,
+            owner_manager_id: "fixture-manager".to_owned(),
+            project_id: "fixture-project".to_owned(),
+            automation_id: "fixture-automation".to_owned(),
+            scope_digest: "b".repeat(64),
+            credential_token_sha256: "a".repeat(64),
+            worker_config_sha256: "c".repeat(64),
+            owner_state: ManagedBusOwnerState::LaunchUncertain,
+            owner_receipt_sha256: None,
+            state: DemandState::Ready,
+        }
+    }
+
+    fn inert_pin() -> DispatcherPin {
+        DispatcherPin {
+            executable: std::env::current_exe().expect("resolve test executable"),
+            sha256: "0".repeat(64),
+        }
+    }
+
+    fn test_dispatcher_pin() -> DispatcherPin {
+        let executable = std::env::current_exe()
+            .expect("resolve test dispatcher image")
+            .canonicalize()
+            .expect("canonicalize test dispatcher image");
+        let bytes = fs::read(&executable).expect("read test dispatcher bytes");
+        DispatcherPin {
+            executable,
+            sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+        }
+    }
+
+    fn spawn_fixture_child(release: &Path) -> Child {
+        let mut command = Command::new(std::env::current_exe().expect("resolve test executable"));
+        command
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_RELEASE_ENV, release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        command.spawn().expect("start real no-effect child process")
+    }
+
+    struct ReleaseFileGuard {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    impl ReleaseFileGuard {
+        fn new(path: PathBuf) -> Self {
+            Self { path, armed: true }
+        }
+
+        fn release(&mut self) {
+            fs::write(&self.path, b"release").expect("release fixture child");
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ReleaseFileGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::write(&self.path, b"release");
+            }
+        }
+    }
 }

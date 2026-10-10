@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +26,46 @@ async function load(name) {
   return JSON.parse(await readFile(path.join(here, 'fixtures', name), 'utf8'));
 }
 const AT_MS = 1780000000123;
+const museDescriptor = JSON.parse(await readFile(path.join(here, 'module-descriptor.template.json'), 'utf8'));
+const compareText = (left,right) => left<right?-1:left>right?1:0;
+function fixtureSchemaClaims(schemas) {
+  return schemas.map(schema => ({schema_id:schema.schema_id,version:schema.version,
+    ...(typeof schema.sha256==='string'?{sha256:schema.sha256}:{})})).sort((left,right)=>
+      compareText(left.schema_id,right.schema_id)||compareText(left.version,right.version)
+        ||compareText(left.sha256??'',right.sha256??''));
+}
+const museModuleContractClaim = {
+  schema_version:1,
+  module_id:museDescriptor.module_id,
+  artifact:{artifact_id:museDescriptor.artifact.artifact_id,version:museDescriptor.artifact.version,
+    ...(typeof museDescriptor.artifact.build_id==='string'?{build_id:museDescriptor.artifact.build_id}:{})},
+  protocol:{major:1,minor:0},
+  capabilities:[...museDescriptor.capabilities].sort(compareText),
+  config_schema:museDescriptor.config_schema??null,
+  ...(museDescriptor.pre_input_open==null?{}:{pre_input_open:museDescriptor.pre_input_open}),
+  command_schemas:fixtureSchemaClaims(museDescriptor.command_schemas),
+  event_schemas:fixtureSchemaClaims(museDescriptor.event_schemas),
+};
+const museModuleContractNegotiation = {
+  status:'negotiated',
+  source:'store_registered_descriptor',
+  descriptor_revision:1,
+  module_id:museModuleContractClaim.module_id,
+  artifact:museModuleContractClaim.artifact,
+  protocol:museModuleContractClaim.protocol,
+  capabilities:museModuleContractClaim.capabilities,
+  config_schema:museModuleContractClaim.config_schema,
+  pre_input_open:museModuleContractClaim.pre_input_open??null,
+  command_schemas:museModuleContractClaim.command_schemas,
+  event_schemas:museModuleContractClaim.event_schemas,
+  effects_authorized_by_descriptor:false,
+};
+function canonicalFixtureJson(value) {
+  if(Array.isArray(value))return `[${value.map(canonicalFixtureJson).join(',')}]`;
+  if(value!==null&&typeof value==='object')return `{${Object.keys(value).sort(compareText)
+    .map(key=>`${JSON.stringify(key)}:${canonicalFixtureJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
 
 // 1. Durability profile: three distinct recorded states; an unrecognized
 // handshake value never collapses into durable (SS2.13.1).
@@ -162,7 +202,6 @@ const AT_MS = 1780000000123;
   await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token}));
   const nativeScope=`muse:${process.platform}:${process.platform==='win32'?canonicalHome.toLowerCase():canonicalHome}`;
   const saved=structuredClone(checkpointFixture.state);
-  saved.module_artifact_id='muse-sdk-1.3.0-bridge.8';
   saved.native_scope=nativeScope;
   saved.route_defaults.workspaceRoot=home;
   saved.route_defaults.modelId=childFixture.root_session.modelId;
@@ -171,6 +210,15 @@ const AT_MS = 1780000000123;
   saved.children=[[childFixture.checkpoint_child.sessionId,childFixture.checkpoint_child],
     [childFixture.unverified_child.sessionId,childFixture.unverified_child]];
   await writeFile(path.join(stateDir,'checkpoint.json'),JSON.stringify({version:1,...saved}));
+  function storeCommand(operationId,createdAtMs,method,input) {
+    // These fake module.next rows model the public RuntimeCommand identity:
+    // digest the original, un-enriched request and retain the authenticated
+    // binding plus the exact descriptor artifact selected for this route.
+    const inputSha256=createHash('sha256').update(canonicalFixtureJson(input),'utf8').digest('hex');
+    return {operation_id:operationId,created_at_ms:createdAtMs,method,binding_id:'fixture-binding',generation:1,
+      native_root_id:saved.root_id,route:{runtime:'muse',module_artifact_id:museDescriptor.artifact.artifact_id},
+      input_sha256:inputSha256,input};
+  }
 
   const nativeFixturePath=path.join(dir,'native-fixtures.json');
   const auditPath=path.join(dir,'native-audit.json');
@@ -267,10 +315,7 @@ process.stdin.on('end',()=>process.exit(0));
     stale:'40000000-0000-4000-8000-000000000003',
     nonsettling:'40000000-0000-4000-8000-000000000004',
   };
-  const commands=[{
-    operation_id:commandIds.recover,created_at_ms:AT_MS,method:'agent.recover',native_root_id:saved.root_id,
-    input:{expected_boot_id:token},
-  }];
+  const commands=[storeCommand(commandIds.recover,AT_MS,'agent.recover',{expected_boot_id:token})];
   const outcomes=new Map(),observations=[],rpcMethods=[],deliveredCommands=[];
   let refreshQueued=false,staleQueued=false,nonsettlingQueued=false,resolveFinished,rejectFinished;
   const finished=new Promise((resolve,reject)=>{resolveFinished=resolve;rejectFinished=reject;});
@@ -284,15 +329,17 @@ process.stdin.on('end',()=>process.exit(0));
     }
     const recoveryReady=recoveryOutcome?.outcome==='applied'&&state?.recovery?.status==='resumed';
     if(recoveryReady&&child?.last_refresh_attempt?.status==='failed'&&!refreshQueued){
-      refreshQueued=true;commands.push({operation_id:commandIds.refresh,created_at_ms:AT_MS+1,method:'agent.refresh',native_root_id:saved.root_id,input:{session_id:childFixture.checkpoint_child.sessionId}});
+      refreshQueued=true;commands.push(storeCommand(commandIds.refresh,AT_MS+1,'agent.refresh',
+        {session_id:childFixture.checkpoint_child.sessionId}));
     }
     if(outcomes.has(commandIds.refresh)&&child?.snapshot_freshness==='fresh'&&!staleQueued){
-      staleQueued=true;commands.push({operation_id:commandIds.stale,created_at_ms:AT_MS+2,method:'agent.send',native_root_id:saved.root_id,input:staleFixture.input});
+      staleQueued=true;commands.push(storeCommand(commandIds.stale,AT_MS+2,'agent.send',staleFixture.input));
     }
     if(outcomes.has(commandIds.stale)&&child?.snapshot_freshness==='stale'
         &&child?.snapshot_freshness_reason===childFixture.expected.after_event_snapshot_freshness_reason
         &&!outcomes.has(commandIds.nonsettling)&&!nonsettlingQueued){
-      nonsettlingQueued=true;commands.push({operation_id:commandIds.nonsettling,created_at_ms:AT_MS+3,method:'agent.send',native_root_id:saved.root_id,input:staleFixture.nonsettling.input});
+      nonsettlingQueued=true;commands.push(storeCommand(commandIds.nonsettling,AT_MS+3,'agent.send',
+        staleFixture.nonsettling.input));
     }
     if(outcomes.has(commandIds.nonsettling))resolveFinished();
   }
@@ -300,7 +347,12 @@ process.stdin.on('end',()=>process.exit(0));
     rpcMethods.push(packet.method);
     let result={};
     if(packet.method==='client.hello')result={client_id:'muse-fixture-client'};
-    else if(packet.method==='module.hello')result={binding_id:'fixture-binding',generation:1,recovery_required:true};
+    else if(packet.method==='module.hello'){
+      assert.deepEqual(packet.params.module_contract,museModuleContractClaim);
+      result={binding_id:'fixture-binding',generation:1,recovery_required:true,
+        native_root_id:saved.root_id,native_scope_key:saved.native_scope,
+        module_contract_negotiation:museModuleContractNegotiation};
+    }
     else if(packet.method==='module.next'){
       if(commands.length){result={command:commands.shift()};deliveredCommands.push(result.command.method);}
       else await delay(10);
@@ -336,7 +388,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.8',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.9',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',nativeFixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};

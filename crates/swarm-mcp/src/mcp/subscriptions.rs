@@ -158,6 +158,10 @@ const MAILBOX_KINDS: [&str; 4] = [
     "check.completed",
 ];
 
+#[cfg(test)]
+#[path = "subscription_contract_tests.rs"]
+mod subscription_contract_tests;
+
 /// One subscription category: an exact filter over the committed
 /// observation stream, never a source of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

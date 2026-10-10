@@ -364,10 +364,10 @@ async fn read_child_logs(
         for (id, entry) in &retained {
             if let Some(saved) = entry.get("execution_scan").filter(|value| !value.is_null()) {
                 let parent = entry["parentSessionId"].as_str().unwrap_or_default();
-                if let Ok(scan) = SessionScan::restore(id, parent, Some(saved))
-                    && !scan.is_terminal()
-                {
-                    enqueue(id);
+                match SessionScan::restore(id, parent, Some(saved)) {
+                    Ok(scan) if !scan.is_terminal() => enqueue(id),
+                    Err(_) => enqueue(id),
+                    Ok(_) => {}
                 }
             }
         }
@@ -800,3 +800,107 @@ impl Service {
 #[cfg(test)]
 #[path = "snapshot_budget_tests.rs"]
 mod snapshot_budget_tests;
+
+#[cfg(test)]
+mod overflow_scan_snapshot_tests {
+    use crate::runtime::opencode_v2::{
+        root_id,
+        tests::{Fixture, child_events},
+    };
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn resumed_overflow_scan_advances_native_log_without_terminal_or_family_proof() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let open = fixture.open(&service).await;
+        let root = root_id(&open.binding_id, open.generation);
+        let child = "ses_snapshot_overflow_child";
+        let run_ids: Vec<String> = (0..17)
+            .map(|index| format!("snapshot_overflow_run_{index}"))
+            .collect();
+        let runs: Vec<(&str, Option<&str>)> =
+            run_ids.iter().map(|run| (run.as_str(), None)).collect();
+        let events = child_events(child, &root, &runs);
+        {
+            let mut world = fixture.world.lock().unwrap();
+            world.sessions.insert(
+                child.into(),
+                json!({
+                    "id":child,
+                    "parentID":root,
+                    "projectID":"prj_fixture",
+                    "time":{"created":1,"updated":2}
+                }),
+            );
+            world.log_watermarks.insert(child.into(), 18);
+            world.logs.insert(child.into(), events.clone());
+        }
+
+        let bound = BTreeSet::from([child.to_owned()]);
+        let first = service
+            .snapshot(&root, &Value::Null, &bound)
+            .await
+            .expect("the bounded native log is readable");
+        let first_child = first.state["observed_children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["sessionId"] == child)
+            .unwrap();
+        assert_eq!(first_child["execution_disposition"], "unknown");
+        assert_eq!(first_child["execution_scan"]["overflowed"], true);
+        assert_eq!(
+            first_child["execution_scan"]["periods"]
+                .as_array()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(first_child.get("last_turn").is_none_or(Value::is_null));
+        assert_eq!(first.state["turns"], json!([]));
+        assert_eq!(first.state["family_completeness"], "partial");
+        assert_eq!(
+            first.state["family_coverage"]["members_with_terminal_evidence"],
+            0
+        );
+
+        let mut later_events = events;
+        later_events.push(json!({
+            "id":"evt_snapshot_overflow_late_terminal",
+            "type":"session.execution.succeeded",
+            "version":1,
+            "created":1.0,
+            "durable":{"aggregateID":child,"seq":19,"version":1},
+            "data":{"sessionID":child}
+        }));
+        {
+            let mut world = fixture.world.lock().unwrap();
+            world.log_watermarks.insert(child.into(), 19);
+            world.logs.insert(child.into(), later_events);
+        }
+
+        let resumed = service
+            .snapshot(&root, &first.state, &bound)
+            .await
+            .expect("the retained overflow checkpoint resumes the native read");
+        let resumed_child = resumed.state["observed_children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["sessionId"] == child)
+            .unwrap();
+        assert_eq!(resumed_child["execution_disposition"], "unknown");
+        assert_eq!(resumed_child["execution_scan"]["overflowed"], true);
+        assert_eq!(resumed_child["execution_scan"]["anchor"]["seq"], 19);
+        assert_eq!(resumed_child["execution_scan"]["after"], 18);
+        assert!(resumed_child.get("last_turn").is_none_or(Value::is_null));
+        assert_eq!(resumed.state["turns"], json!([]));
+        assert_eq!(resumed.state["family_completeness"], "partial");
+        assert_eq!(
+            resumed.state["family_coverage"]["members_with_terminal_evidence"],
+            0
+        );
+    }
+}

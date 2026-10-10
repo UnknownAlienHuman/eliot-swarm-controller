@@ -708,7 +708,9 @@ fn build_plan(
     Ok(planned)
 }
 
-fn observation_cut(db: &Connection) -> Result<i64> {
+pub(super) fn observation_cut(db: &Connection) -> Result<i64> {
+    // Activation cuts and consumer cursors share the global observation position.
+    // Consumers still filter their exact source facts within each bounded interval.
     Ok(db.query_row(
         "SELECT COALESCE(MAX(observation_id),0) FROM observations",
         [],

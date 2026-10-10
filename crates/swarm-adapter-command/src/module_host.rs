@@ -145,12 +145,6 @@ fn optional_env(name: &str) -> Result<Option<String>> {
 }
 
 fn command_capabilities_match(claim: &ModuleContractClaim, profile: Profile) -> bool {
-    const V2: [&str; 4] = [
-        "agent.open",
-        "agent.reconcile",
-        "agent.refresh",
-        "task.dispatch",
-    ];
     const V3: [&str; 5] = [
         "agent.open",
         "agent.reconcile",
@@ -214,26 +208,31 @@ fn schemas_match(claim: &ModuleContractClaim, profile: Profile) -> bool {
 }
 
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
-    matches!(profile_for_claim(claim), Some(Profile::BatchV4 | Profile::AcpV1))
-        || exact_schema_set(
-            &claim.command_schemas,
-            &["swarm.runtime_command", "swarm.task_dispatch_context"],
-        ) && exact_schema_set(
-            &claim.event_schemas,
-            &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
-        )
-        || normalized_result_schemas_match(claim)
+    matches!(
+        profile_for_claim(claim),
+        Some(Profile::BatchV4 | Profile::AcpV1)
+    ) || exact_schema_set(
+        &claim.command_schemas,
+        &["swarm.runtime_command", "swarm.task_dispatch_context"],
+    ) && exact_schema_set(
+        &claim.event_schemas,
+        &["swarm.runtime_outcome", "swarm.task_dispatch_admission"],
+    ) || normalized_result_schemas_match(claim)
 }
 
 pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
     normalized_result_schemas_match(claim)
-        || matches!(profile_for_claim(claim), Some(Profile::BatchV4 | Profile::AcpV1))
-            && acp_v1_schemas_match(claim)
+        || matches!(
+            profile_for_claim(claim),
+            Some(Profile::BatchV4 | Profile::AcpV1)
+        ) && acp_v1_schemas_match(claim)
 }
 
 pub fn task_prompt_v1_enabled(claim: &ModuleContractClaim) -> bool {
-    matches!(profile_for_claim(claim), Some(Profile::BatchV4 | Profile::AcpV1))
-        && acp_v1_schemas_match(claim)
+    matches!(
+        profile_for_claim(claim),
+        Some(Profile::BatchV4 | Profile::AcpV1)
+    ) && acp_v1_schemas_match(claim)
 }
 
 fn profile_for_claim(claim: &ModuleContractClaim) -> Option<Profile> {

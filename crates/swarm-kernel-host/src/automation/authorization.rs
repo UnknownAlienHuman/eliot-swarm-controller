@@ -11,7 +11,8 @@ use crate::{
     github::protocol::ManagedLabelRequest,
     model::{self, Principal, Role},
     review::{
-        PRIMARY_REVIEW_SLOT, ReviewCoverage, ReviewSlotIdentity, ReviewSubmitRequest, ReviewVerdict,
+        PRIMARY_REVIEW_SLOT, ReviewCoverage, ReviewFindingsPackage, ReviewSlotIdentity,
+        ReviewSubmitRequest, ReviewVerdict,
     },
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -3985,11 +3986,7 @@ fn validate_publication_link(db: &Connection, link: &OnBehalfOperationLink) -> R
     let request = crate::forge::PublishRefRequest::parse(&request_value).map_err(|_| corrupt())?;
     let effective: Value = serde_json::from_str(&publication_operation.effective_request_json)
         .map_err(|_| corrupt())?;
-    model::fields(
-        &effective,
-        &["publication_intent", "automation_on_behalf", "receipt"],
-    )
-    .map_err(|_| corrupt())?;
+    crate::store::validate_publication_effective_request(&effective).map_err(|_| corrupt())?;
     let saved_linkage = effective
         .get("automation_on_behalf")
         .filter(|value| value.is_object())
@@ -4076,6 +4073,65 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
         return Err(corrupt());
     }
 
+    let sponsor_id = match link.cause.get("review_assignment_sponsor_id") {
+        Some(value) => value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(corrupt)?,
+        None => link.effective_manager_id.as_str(),
+    };
+    let slot: ReviewSlotIdentity =
+        serde_json::from_value(identity.clone()).map_err(|_| corrupt())?;
+    let retained_attempt: Option<RetainedAcceptanceAttempt> = db
+        .query_row(
+            "SELECT a.owner_id,a.task_id,a.task_revision,a.submission_ref,a.candidate_ref,t.project_id \
+             FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id WHERE a.attempt_id=?1",
+            [&slot.attempt_id],
+            |row| {
+                Ok(RetainedAcceptanceAttempt {
+                    owner_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    task_revision: row.get(2)?,
+                    submission_ref: row.get(3)?,
+                    candidate_ref: row.get(4)?,
+                    project_id: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let retained_attempt = retained_attempt.ok_or_else(corrupt)?;
+    if retained_attempt.task_id != slot.task_id
+        || retained_attempt.task_revision != slot.task_revision
+        || retained_attempt.submission_ref.as_deref() != Some(slot.submission_ref.as_str())
+        || retained_attempt.candidate_ref.as_deref() != Some(slot.candidate_ref.as_str())
+        || retained_attempt.project_id != link.project_id
+    {
+        return Err(corrupt());
+    }
+    if sponsor_id != retained_attempt.owner_id
+        || link.effective_manager_id != retained_attempt.owner_id
+    {
+        // Historical feedback survives later transfers. Validate its sealed
+        // owner chain independently of today's GM and current action gates.
+        let owners = validated_transfer_owner_lineage(
+            db,
+            &retained_attempt.owner_id,
+            &link.project_id,
+            &link.automation_id,
+        )?;
+        let sponsor_position = owners
+            .iter()
+            .position(|owner| owner == sponsor_id)
+            .ok_or_else(corrupt)?;
+        let manager_position = owners
+            .iter()
+            .position(|owner| owner == &link.effective_manager_id)
+            .ok_or_else(corrupt)?;
+        if sponsor_position > manager_position {
+            return Err(corrupt());
+        }
+    }
+
     let assignment_key = format!("assignment:{assignment_id}");
     let assignment_row: Option<(String, String)> = db
         .query_row(
@@ -4093,7 +4149,7 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
     if assignment["review_assignment_id"] != assignment_id
         || assignment["operation_id"] != assignment_operation_id
         || assignment["identity"] != *identity
-        || assignment["sponsor_client_id"] != link.effective_manager_id
+        || assignment["sponsor_client_id"] != sponsor_id
     {
         return Err(corrupt());
     }
@@ -4113,7 +4169,7 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
         || state != "settled"
         || assignment_result["review_assignment_id"] != assignment_id
         || assignment_result["identity"] != *identity
-        || assignment_result["sponsor_client_id"] != link.effective_manager_id
+        || assignment_result["sponsor_client_id"] != sponsor_id
         || assignment["reviewer_client_id"]
             .as_str()
             .is_none_or(str::is_empty)
@@ -4160,7 +4216,7 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
         || result != record["result"]
         || result["review_assignment_id"] != assignment_id
         || result["reviewer_client_id"] != assignment["reviewer_client_id"]
-        || result["sponsor_client_id"] != link.effective_manager_id
+        || result["sponsor_client_id"] != sponsor_id
         || result["task_id"] != identity["task_id"]
         || result["attempt_id"] != identity["attempt_id"]
         || result["task_revision"] != identity["task_revision"]
@@ -4172,36 +4228,83 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
         return Err(corrupt());
     }
 
-    let feedback_operation: Option<(String, String, String, String)> = db
+    let feedback_operation: Option<(String, String, String, String, String)> = db
         .query_row(
-            "SELECT caller_id,method,original_request_json,state FROM operations WHERE operation_id=?1",
+            "SELECT caller_id,method,client_request_id,original_request_json,state \
+             FROM operations WHERE operation_id=?1",
             [&link.operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((caller_id, method, original_json, state)) = feedback_operation else {
+    let Some((caller_id, method, client_request_id, original_json, state)) = feedback_operation
+    else {
         return Err(corrupt());
     };
     let request: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
-    let finding_id = request["finding_id"].as_str().ok_or_else(corrupt)?;
-    let finding = result["findings"]
-        .as_array()
-        .and_then(|findings| {
-            findings
-                .iter()
-                .find(|finding| finding["finding_id"] == finding_id)
-        })
+    let request_client_request_id = request["client_request_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
         .ok_or_else(corrupt)?;
+    if client_request_id != request_client_request_id {
+        return Err(corrupt());
+    }
+    if let Some(package_value) = request.get("package") {
+        model::fields(&request, &["client_request_id", "package"]).map_err(|_| corrupt())?;
+        let package: ReviewFindingsPackage =
+            serde_json::from_value(package_value.clone()).map_err(|_| corrupt())?;
+        package.validate().map_err(|_| corrupt())?;
+        let package_identity: ReviewSlotIdentity =
+            serde_json::from_value(identity.clone()).map_err(|_| corrupt())?;
+        let expected_request_id = model::digest(
+            model::canonical(&json!([
+                link.effective_manager_id.as_str(),
+                package.identity.submission_ref.as_str(),
+                package.findings_digest.as_str()
+            ]))
+            .map_err(|_| corrupt())?
+            .as_bytes(),
+        );
+        let package_findings = serde_json::to_value(&package.findings).map_err(|_| corrupt())?;
+        if package.identity != package_identity
+            || package.review_assignment_id != assignment_id
+            || package.review_result_operation_id != result_operation_id
+            || package_findings != result["findings"]
+            || request_client_request_id != expected_request_id.as_str()
+        {
+            return Err(corrupt());
+        }
+    } else {
+        let finding_id = request["finding_id"].as_str().ok_or_else(corrupt)?;
+        let finding = result["findings"]
+            .as_array()
+            .and_then(|findings| {
+                findings
+                    .iter()
+                    .find(|finding| finding["finding_id"] == finding_id)
+            })
+            .ok_or_else(corrupt)?;
+        if request["attempt_id"] != identity["attempt_id"]
+            || request["expected_revision"] != identity["task_revision"]
+            || request["submission_ref"] != identity["submission_ref"]
+            || request["candidate_ref"] != identity["candidate_ref"]
+            || request["reason"] != finding["reason"]
+            || request["requirement_ids"] != finding["requirement_ids"]
+            || request["evidence"] != finding["evidence_refs"]
+        {
+            return Err(corrupt());
+        }
+    }
     if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
         || method != "task.request_changes"
         || state != "settled"
-        || request["attempt_id"] != identity["attempt_id"]
-        || request["expected_revision"] != identity["task_revision"]
-        || request["submission_ref"] != identity["submission_ref"]
-        || request["candidate_ref"] != identity["candidate_ref"]
-        || request["reason"] != finding["reason"]
-        || request["requirement_ids"] != finding["requirement_ids"]
-        || request["evidence"] != finding["evidence_refs"]
     {
         return Err(corrupt());
     }

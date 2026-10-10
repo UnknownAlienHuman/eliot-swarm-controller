@@ -345,6 +345,15 @@ fn fixture() -> ExactPullRequestFixture {
     }
 }
 
+fn fixture_git_executable() -> PathBuf {
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
+        .expect("Git executable is available for the configured Forge mapping")
+}
+
 fn seed_accepted_candidate(db: &rusqlite::Connection, caller: &str) -> Result<()> {
     let now = 1_i64;
     let candidate_digest = "c".repeat(64);
@@ -371,8 +380,12 @@ fn seed_accepted_candidate(db: &rusqlite::Connection, caller: &str) -> Result<()
         ],
     )?;
     let spec = json!({"owner_policy_id":"policy-1"});
-    let snapshot =
-        json!({"spec":spec.clone(),"owner_policy":{"status":"legacy_unknown"},"brief":{}});
+    let snapshot = json!({
+        "spec":spec.clone(),
+        "revision":1,
+        "owner_policy":{"status":"legacy_unknown"},
+        "brief":{}
+    });
     db.execute(
         "INSERT INTO tasks(task_id,project_id,origin_key,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('task-1','project-1',NULL,1,'open',?1,?2,?2)",
         params![model::canonical(&spec)?, now],
@@ -439,6 +452,7 @@ fn seed_accepted_candidate_revision_two(db: &rusqlite::Connection, caller: &str)
     let task = tasks::get_task(db, "task-1")?;
     let snapshot = json!({
         "spec":task["spec"],
+        "revision":2,
         "owner_policy":{"status":"legacy_unknown"},
         "brief":{}
     });
@@ -575,7 +589,7 @@ async fn successor_gm_reconciles_predecessor_unknown_pr_effect_readback_only() {
     let mut config = Config::default();
     config.storage.data_dir = directory.clone();
     config.forge.enabled = true;
-    config.forge.git_executable = std::env::current_exe().unwrap();
+    config.forge.git_executable = fixture_git_executable();
     config.forge.projects.insert(
         "project-1".into(),
         ForgeProject {
@@ -628,20 +642,13 @@ async fn successor_gm_reconciles_predecessor_unknown_pr_effect_readback_only() {
         "expected_old_ref":null,
         "expected_create":true
     });
-    let publication_config = owner.store.config.clone();
-    let publication_principal = predecessor.clone();
     let publication_receipt = owner
         .store
-        .run(move |db| {
-            let current = current_principal(db, publication_principal)?;
-            mutate(
-                db,
-                &current,
-                "forge.publish_ref",
-                &publication_request,
-                publication_config.as_ref(),
-            )
-        })
+        .call(
+            predecessor.clone(),
+            "forge.publish_ref".into(),
+            publication_request,
+        )
         .await
         .unwrap();
 
@@ -896,20 +903,13 @@ async fn successor_gm_reconciles_predecessor_unknown_pr_effect_readback_only() {
         "expected_old_ref":null,
         "expected_create":true
     });
-    let new_publication_config = owner.store.config.clone();
-    let new_publication_principal = successor.clone();
     let new_publication_receipt = owner
         .store
-        .run(move |db| {
-            let current = current_principal(db, new_publication_principal)?;
-            mutate(
-                db,
-                &current,
-                "forge.publish_ref",
-                &new_publication_request,
-                new_publication_config.as_ref(),
-            )
-        })
+        .call(
+            successor.clone(),
+            "forge.publish_ref".into(),
+            new_publication_request,
+        )
         .await
         .unwrap();
     let new_publication_operation_id = model::text(&new_publication_receipt, "operation_id")

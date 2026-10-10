@@ -705,7 +705,8 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
                 || !completion.controller_effects.is_empty()))
         || completion.controller_effects.len() > manifest::MAX_CONTROLLER_EFFECTS
         || completion.controller_effects.iter().any(|effect| {
-            !work.bundle.controller_effects.contains(&effect.effect) || effect.validate().is_err()
+            !work.invocation.controller_effects.contains(&effect.effect)
+                || effect.validate().is_err()
         })
         || completion.result.byte_length > (MAX_RESULT_BYTES + 16 * 1024) as u64
         || completion.stdout.byte_length > MAX_RESULT_BYTES as u64
@@ -1319,7 +1320,16 @@ fn validate_work(work: &Work) -> Result<()> {
         || work.invocation.protocol_version != 1
         || work.invocation.operation_id != work.operation_id
         || work.invocation.run_id != work.run_id
-        || work.invocation.controller_effects != work.bundle.controller_effects
+        || work.invocation.controller_effects.len() > manifest::MAX_CONTROLLER_EFFECTS
+        || work
+            .invocation
+            .controller_effects
+            .iter()
+            .enumerate()
+            .any(|(index, effect)| {
+                !work.bundle.controller_effects.contains(effect)
+                    || work.invocation.controller_effects[..index].contains(effect)
+            })
         || environment_sha256(&work.environment)? != work.environment_sha256
     {
         return Err(Error::new(

@@ -41,8 +41,9 @@ Operations unknown. Current-GM or local-Operator `operation.get` exposes
 generation, including the verified old/new boot IDs and an adapter-supported
 `agent.reconcile` template. A successor GM receives the same action without
 rewriting historical actors. The cause and native effect stay unknown;
-`retry_authorized` and `native_replay` are false. Command `.3`/`.4` reconciliation
-targets only `agent.open` or `task.dispatch`; Codex-controller `.3` and
+`retry_authorized` and `native_replay` are false. Command `.5` reconciliation
+targets only `agent.open` or `task.dispatch`; historical Command `.3`/`.4`
+routes advertise no executable recovery command. Codex-controller `.3` and
 Antigravity `.2` also accept `agent.send`. Missing prior-boot evidence can leave
 the original Operation unknown, especially Antigravity's process-local journal.
 No native input is replayed by this projection.

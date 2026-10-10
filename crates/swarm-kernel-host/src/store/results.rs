@@ -19,9 +19,7 @@ pub(super) fn input_status_target_supported(
 ) -> Result<bool> {
     match target["method"].as_str() {
         Some("task.dispatch" | "agent.send") => Ok(true),
-        Some("native.opencode.loop_step")
-            if binding["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME =>
-        {
+        Some("native.opencode.loop_step") => {
             Ok(super::module_handshake::selected_native_command_supported(
                 db,
                 model::text(binding, "module_artifact_id")?,

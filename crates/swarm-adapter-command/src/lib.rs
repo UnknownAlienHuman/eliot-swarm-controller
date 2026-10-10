@@ -5,8 +5,8 @@
 
 #![recursion_limit = "256"]
 
-mod adapter;
 mod acp_prompt;
+mod adapter;
 mod journal;
 mod module_host;
 mod native;

@@ -1,10 +1,9 @@
 //! Exact Store-produced TaskPrompt admission for the separately selected ACP artifact.
 
-use serde_json::Value;
 use swarm_contracts::{
     error::{Error, Result},
     runtime::{RuntimeCommand, TaskDispatchContext},
-    task_prompt::{TaskPromptEnvelopeV1, TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION},
+    task_prompt::{TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION, TaskPromptEnvelopeV1},
 };
 
 use crate::journal::digest;
@@ -135,8 +134,4 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-pub(crate) fn has_exact_envelope(input: &Value) -> bool {
-    input["task_prompt"].is_object()
 }

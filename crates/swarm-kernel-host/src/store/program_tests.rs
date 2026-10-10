@@ -846,8 +846,33 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         .unwrap();
     assert_eq!(automatic["method"], "forge.publish_ref");
     assert_eq!(automatic["state"], "queued");
+    assert!(
+        automatic.get("caller_id").is_none(),
+        "the scoped Operation receipt does not expose its retained issuer"
+    );
+    let (retained_caller_id, retained_effective_request) = owner
+        .store
+        .run({
+            let operation_id = automatic_operation_id.clone();
+            move |db| {
+                let (caller_id, effective_request_json): (String, String) = db.query_row(
+                    "SELECT caller_id,effective_request_json FROM operations \
+                     WHERE operation_id=?1 AND method='forge.publish_ref'",
+                    [operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let effective_request: Value = serde_json::from_str(&effective_request_json)?;
+                Ok((caller_id, effective_request))
+            }
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        automatic["caller_id"],
+        retained_caller_id,
+        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    );
+    assert_eq!(
+        retained_effective_request["automation_on_behalf"]["technical_requester_id"],
         crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
     );
 
@@ -864,6 +889,14 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         .await
         .unwrap();
     assert_eq!(explanation["publication"]["status"], "ready");
+    assert_eq!(explanation["publication"]["catch_up_until"], Value::Null);
+    assert!(
+        explanation["publication"]["cursor"].as_i64().unwrap()
+            >= explanation["publication"]["activation_cut"]
+                .as_i64()
+                .unwrap(),
+        "catch-up covers the global activation cut, including non-acceptance facts"
+    );
     let publication_history = explanation["linked_operation_history"]["items"]
         .as_array()
         .unwrap()
@@ -882,6 +915,73 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         publication_history["cause"]["candidate_ref"],
         subject.candidate_ref
     );
+    assert_eq!(
+        retained_effective_request["automation_on_behalf"]["cause"]["kind"],
+        publication_history["cause"]["kind"]
+    );
+    assert_eq!(
+        retained_effective_request["automation_on_behalf"]["cause"]["operation_id"],
+        acceptance_operation_id
+    );
+    assert_eq!(
+        retained_effective_request["automation_on_behalf"]["cause"]["candidate_ref"],
+        subject.candidate_ref
+    );
+
+    // The real Forge producer retains its executable pin. Valid pins remain
+    // readable; malformed pins must close the derived history without granting
+    // authority or erasing the retained Operation.
+    let mut damaged_effective = retained_effective_request.clone();
+    damaged_effective["execution_pin"]["git_executable_sha256"] = json!("invalid-digest");
+    owner
+        .store
+        .run({
+            let operation_id = automatic_operation_id.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, model::canonical(&damaged_effective)?],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let damaged_history = owner
+        .store
+        .call(
+            gm.clone(),
+            "automation.config.explain".into(),
+            json!({"project_id":"fixture","automation_id":"accepted-candidate-publication"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        damaged_history["linked_operation_history"]["closed"]["error_code"],
+        "AUTOMATION_LINK_CORRUPT"
+    );
+    assert_eq!(
+        damaged_history["linked_operation_history"]["items"],
+        json!([])
+    );
+    owner
+        .store
+        .run({
+            let operation_id = automatic_operation_id.clone();
+            let effective = retained_effective_request.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, model::canonical(&effective)?],
+                )?;
+                assert!(
+                    crate::automation::authorization::operation_link(db, &operation_id)?.is_some()
+                );
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
 
     let repeated_pass = owner.store.reconcile_automations_once().await.unwrap();
     assert_eq!(repeated_pass["publication"]["processed"], 0);
@@ -951,22 +1051,33 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         .await
         .unwrap();
     assert_eq!(successor_operation["state"], "settled");
-    assert_eq!(successor_operation["result"]["outcome"], "stale_gm_epoch");
-    assert_eq!(successor_operation["result"]["publication"], "not_started");
-    assert_eq!(
-        successor_operation["caller_id"],
-        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
-    );
+    assert_eq!(successor_operation["result_status"], "not_projected");
+    assert!(successor_operation.get("result").is_none());
+    assert!(successor_operation.get("caller_id").is_none());
     let retained_link_id = automatic_operation_id.clone();
-    let retained_link = owner
+    let (retained_link, retained_settled_operation) = owner
         .store
         .run(move |db| {
-            crate::automation::authorization::operation_link(db, &retained_link_id)?
-                .ok_or_else(|| Error::new("NOT_FOUND", "retained publication attribution"))
+            let link = crate::automation::authorization::operation_link(db, &retained_link_id)?
+                .ok_or_else(|| Error::new("NOT_FOUND", "retained publication attribution"))?;
+            Ok((link, operations::get_operation(db, &retained_link_id)?))
         })
         .await
         .unwrap();
     assert_eq!(retained_link.effective_manager_id, "review-gm");
+    assert_eq!(retained_settled_operation["state"], "settled");
+    assert_eq!(
+        retained_settled_operation["result"]["outcome"],
+        "stale_gm_epoch"
+    );
+    assert_eq!(
+        retained_settled_operation["result"]["publication"],
+        "not_started"
+    );
+    assert_eq!(
+        retained_link.technical_requester_id,
+        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    );
     let successor_history = owner
         .store
         .call(
@@ -1020,8 +1131,8 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         .await
         .unwrap();
     assert_eq!(retained_operation["state"], "settled");
-    assert_eq!(retained_operation["result"]["outcome"], "stale_gm_epoch");
-    assert_eq!(retained_operation["result"]["publication"], "not_started");
+    assert_eq!(retained_operation["result_status"], "not_projected");
+    assert!(retained_operation.get("result").is_none());
     let active_effects: i64 = owner
         .store
         .run(|db| {
@@ -1248,7 +1359,7 @@ async fn sponsored_review_result_drives_only_exact_v2_owner_disposition_and_priv
             .unwrap();
         assert_eq!(
             listed["next_after"].as_i64(),
-            Some(listed["items"].as_array().unwrap().len() as i64)
+            listed["examined_through"].as_i64()
         );
         assert!(listed["items"].as_array().unwrap().iter().all(|item| {
             !private_operation_ids
@@ -1265,7 +1376,15 @@ async fn sponsored_review_result_drives_only_exact_v2_owner_disposition_and_priv
             .await
             .unwrap();
         assert!(delta["items"].as_array().unwrap().is_empty());
-        assert_eq!(delta["next_cursor"], 0);
+        assert!(
+            delta["next_cursor"]
+                .as_i64()
+                .is_some_and(|cursor| cursor > 0)
+        );
+        assert_eq!(
+            delta["next_cursor"],
+            delta["projection"]["range"]["examined_through"]
+        );
         assert_eq!(delta["projection"]["has_newer"], false);
     }
     let visible_private_operations = owner
@@ -1407,6 +1526,23 @@ async fn add_submission_source_fact_with_key(
         .unwrap();
 }
 
+fn repair_fixture_route() -> Value {
+    json!({
+        "alias":"repair-continuation-fixture",
+        "runtime":"muse",
+        "module_artifact_id":"muse-sdk-1.3.0-bridge.5",
+        "enabled":true,
+        "native_options":{"workspaceRoot":"C:\\fixture","modelId":"fixture-model"}
+    })
+}
+
+fn repair_fixture_config() -> Config {
+    Config {
+        routes: vec![serde_json::from_value(repair_fixture_route()).unwrap()],
+        ..Config::default()
+    }
+}
+
 async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> String {
     let binding_id = format!("repair-binding-{}", subject.attempt_id);
     let module_client_id = format!("repair-module-{}", subject.attempt_id);
@@ -1426,13 +1562,7 @@ async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> 
                     "binding_generation":1
                 }),
             )?;
-            let route = json!({
-                "alias":"repair-continuation-fixture",
-                "runtime":"muse",
-                "module_artifact_id":"muse-sdk-1.3.0-bridge.5",
-                "enabled":true,
-                "native_options":{"workspaceRoot":"C:\\fixture","modelId":"fixture-model"}
-            });
+            let route = repair_fixture_route();
             let state = json!({
                 "connection":"connected",
                 "module_client_id":module_client_id,
@@ -1486,7 +1616,7 @@ async fn consume_repair_result_for_entry(
             .ok_or_else(|| Error::new("NOT_FOUND", "transferred RepairDispatch entry"))?;
             let value = super::automation_repair::consume_review_result_for_entry(
                 &tx,
-                &Config::default(),
+                &repair_fixture_config(),
                 &entry,
                 &assignment_id,
                 &result_operation_id,
@@ -1610,6 +1740,8 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
     configure_subject_acceptance_policy(&owner.store, &accepted).await;
     add_submission_source_fact(&owner.store, "successor-correction", &correction).await;
     add_submission_source_fact(&owner.store, "successor-acceptance", &accepted).await;
+    let correction_binding_id = attach_ready_repair_binding(&owner.store, &correction).await;
+    assert!(!correction_binding_id.is_empty());
 
     owner
         .store
@@ -1734,15 +1866,30 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
 
     owner
         .store
-        .call(
-            correction_reviewer,
-            "review.submit".into(),
-            review_result_request(
+        .call(correction_reviewer, "review.submit".into(), {
+            let mut request = review_result_request(
                 &correction,
                 &correction_assignment_id,
                 "successor-correction-result",
-            ),
-        )
+            );
+            request["findings"] = json!([
+                {
+                    "finding_id":"missing-r1-evidence",
+                    "requirement_ids":["R1"],
+                    "reason":"The candidate omits the requested evidence.",
+                    "evidence_refs":["evidence://review/r1"],
+                    "requested_change":"Add the retained evidence for R1."
+                },
+                {
+                    "finding_id":"missing-r1-verification",
+                    "requirement_ids":["R1"],
+                    "reason":"The candidate omits a verification record for R1.",
+                    "evidence_refs":["evidence://review/r1"],
+                    "requested_change":"Add the verification record for R1."
+                }
+            ]);
+            request
+        })
         .await
         .unwrap();
     owner
@@ -1874,6 +2021,72 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
     assert_eq!(operations.3["submitted_by"], "review-owner-v2");
     assert_eq!(operations.2["state"], "needs_correction");
 
+    let (package_request, package, lineage) = owner
+        .store
+        .run({
+            let task_id = correction.task_id.clone();
+            move |db| {
+                let (feedback_operation_id, original_request_json): (String, String) =
+                    db.query_row(
+                        "SELECT operation_id,original_request_json FROM operations \
+                         WHERE method='task.request_changes' AND task_id=?1 AND state='settled'",
+                        [&task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                let package_request: Value = serde_json::from_str(&original_request_json)?;
+                let package: crate::review::ReviewFindingsPackage =
+                    serde_json::from_value(package_request["package"].clone())?;
+                assert!(
+                    crate::automation::authorization::operation_link(db, &feedback_operation_id)?
+                        .is_some(),
+                    "the package feedback must retain a valid on-behalf operation link"
+                );
+                let disposition_key = format!("disposition:{}", package.review_assignment_id);
+                let disposition_operation_id: String = db.query_row(
+                    "SELECT operation_id FROM observations WHERE source_stream_id='controller:review' \
+                     AND source_event_key=?1 AND kind='review.disposition'",
+                    [&disposition_key],
+                    |row| row.get(0),
+                )?;
+                let feedback_observation_id: i64 = db.query_row(
+                    "SELECT observation_id FROM observations WHERE source_stream_id='controller:review' \
+                     AND operation_id=?1 AND kind='task.feedback' \
+                     ORDER BY observation_id DESC LIMIT 1",
+                    [&feedback_operation_id],
+                    |row| row.get(0),
+                )?;
+                let lineage = crate::automation::repair::validate_committed_review_and_feedback(
+                    db,
+                    &package.identity,
+                    &package.review_assignment_id,
+                    &package.review_result_operation_id,
+                    &disposition_operation_id,
+                    &feedback_operation_id,
+                    feedback_observation_id,
+                    &package,
+                )?;
+                Ok((package_request, package, lineage))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        package_request.as_object().map(|object| object.len()),
+        Some(2)
+    );
+    assert_eq!(
+        package.finding_ids(),
+        vec![
+            "missing-r1-evidence".to_owned(),
+            "missing-r1-verification".to_owned()
+        ]
+    );
+    assert_eq!(package.identity.task_id, correction.task_id);
+    assert_eq!(package.review_assignment_id, correction_assignment_id);
+    assert_eq!(lineage.source_attempt_owner_id, "review-owner-v2");
+    assert_eq!(lineage.review_assignment_sponsor_id, successor.client_id);
+    assert_eq!(lineage.decision_manager_id, final_manager.client_id);
+
     let acceptance_effective: Value = serde_json::from_str(&operations.1.1).unwrap();
     let acceptance_result: Value = serde_json::from_str(&operations.1.2).unwrap();
     assert_eq!(
@@ -1907,7 +2120,8 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
 
 #[tokio::test]
 async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_current_slot() {
-    let (owner, directory, bootstrap) = start_store("gm-successor-repair").await;
+    let (owner, directory, bootstrap) =
+        start_store_with_config("gm-successor-repair", repair_fixture_config()).await;
     let operator = owner.store.authenticate(bootstrap).await.unwrap();
     seed_clients(&owner.store).await;
 
@@ -2364,6 +2578,7 @@ async fn assigned_reviewer_can_record_and_read_only_the_historical_result_after_
         )
         .await
         .unwrap();
+    assert_eq!(review["assignment"]["review_assignment_id"], assignment_id);
     assert_eq!(review["result"]["operation_id"], result["operation_id"]);
     assert_eq!(review["result"]["applicability"], "historical_candidate");
     assert_eq!(review["current_candidate"], false);
@@ -2377,7 +2592,7 @@ async fn assigned_reviewer_can_record_and_read_only_the_historical_result_after_
         .await
         .unwrap();
     assert_eq!(operation["method"], "review.submit");
-    assert_eq!(operation["result"]["review_assignment_id"], assignment_id);
+    assert_eq!(operation["result_status"], "not_projected");
 
     let context_error = owner
         .store

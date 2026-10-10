@@ -729,5 +729,8 @@ async fn successor_gm_reconciles_unknown_label_by_exact_readback_only() {
         .unwrap();
     assert_eq!(original_readback["method"], "github.effect.managed_label");
     assert_eq!(original_readback["state"], "settled");
-    assert_eq!(original_readback["caller_id"], "label-former-gm");
+    assert_eq!(
+        original_readback["diagnostic"]["caller_id"],
+        "label-former-gm"
+    );
 }

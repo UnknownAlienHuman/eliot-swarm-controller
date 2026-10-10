@@ -197,15 +197,15 @@ pub fn build_normalized(command: &RuntimeCommand) -> Result<Value> {
             "normalized result command identity is invalid",
         )
     })?;
-    let origin: NormalizedResultOriginContext =
-        serde_json::from_value(command.input["normalized_result_origin"].clone()).map_err(
-            |_| {
-                Error::new(
-                    "RESULT_PROVENANCE_INVALID",
-                    "normalized result origin is malformed",
-                )
-            },
-        )?;
+    let origin: NormalizedResultOriginContext = serde_json::from_value(
+        command.input["normalized_result_origin"].clone(),
+    )
+    .map_err(|_| {
+        Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "normalized result origin is malformed",
+        )
+    })?;
     origin.validate().map_err(|_| {
         Error::new(
             "RESULT_PROVENANCE_INVALID",

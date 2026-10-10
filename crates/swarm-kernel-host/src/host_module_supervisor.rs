@@ -1564,3 +1564,408 @@ fn validate_host_config(config: &ModuleSupervisorHostConfig) -> Result<()> {
 fn module_error(error: swarm_supervisor::Error) -> Error {
     Error::new(error.code, error.message)
 }
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Config,
+        ipc,
+        platform::{DataRoot, bootstrap_credential},
+        store::StoreOwner,
+    };
+    use rusqlite::Connection;
+    use serde_json::{Value, json};
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        path::{Path, PathBuf},
+        process::{Command as StdCommand, Stdio},
+        sync::Arc,
+        thread,
+        time::Duration as StdDuration,
+    };
+    use tokio::{
+        process::Command,
+        sync::watch,
+        task::JoinHandle,
+        time::{self, Duration},
+    };
+
+    const ROLE_ENV: &str = "ELIOT_SWARM_UNKNOWN362_ROLE";
+    const ROOT_ENV: &str = "ELIOT_SWARM_UNKNOWN362_ROOT";
+    const RELEASE_ENV: &str = "ELIOT_SWARM_UNKNOWN362_RELEASE";
+    const LAUNCHES_ENV: &str = "ELIOT_SWARM_UNKNOWN362_LAUNCHES";
+    const CHILD_RELEASE_ENV: &str = "ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE";
+    const MAIN_TEST: &str = "host_module_supervisor::tests::unknown362_identity_failure_and_health_write_failure_survive_restart";
+    const CHILD_TEST: &str = "host_module_supervisor::tests::child_waits_for_release";
+
+    #[tokio::test]
+    async fn unknown362_identity_failure_and_health_write_failure_survive_restart() {
+        match std::env::var(ROLE_ENV).as_deref() {
+            Ok("host-a") => run_host_a().await,
+            Ok("host-b") => run_host_b().await,
+            _ => run_outer_harness().await,
+        }
+    }
+
+    #[test]
+    fn child_waits_for_release() {
+        let Ok(release) = std::env::var(CHILD_RELEASE_ENV) else {
+            return;
+        };
+        let release = PathBuf::from(release);
+        while !release.exists() {
+            thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+
+    struct TestIpcRuntime {
+        owner: StoreOwner,
+        control: SupervisorControlClient,
+        stop: watch::Sender<bool>,
+        accept: JoinHandle<()>,
+    }
+
+    impl TestIpcRuntime {
+        async fn start(root: &Path) -> Self {
+            let data_root = DataRoot::acquire(root).expect("acquire temporary Store root");
+            let config = test_config(&data_root.path);
+            let credential = bootstrap_credential(&data_root.path)
+                .expect("load temporary Store operator credential");
+            let owner = StoreOwner::start(data_root, config.clone(), credential)
+                .await
+                .expect("start temporary Store owner");
+            let (stop, mut stopping) = watch::channel(false);
+            let mut listener = ipc::Listener::bind(root).expect("bind real Store IPC");
+            let store = owner.store.clone();
+            let ipc_config = Arc::new(config.ipc.clone());
+            let accept = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        changed = stopping.changed() => {
+                            if changed.is_err() || *stopping.borrow() {
+                                break;
+                            }
+                        }
+                        accepted = listener.accept() => match accepted {
+                            Ok(stream) => {
+                                let store = store.clone();
+                                let ipc_config = ipc_config.clone();
+                                let stopping = stopping.clone();
+                                tokio::spawn(async move {
+                                    let _ = ipc::serve(stream, store, ipc_config, stopping).await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+            let control = SupervisorControlClient::new(
+                root.to_path_buf(),
+                owner.module_supervisor_credential(),
+                config.ipc.clone(),
+            )
+            .expect("create authenticated supervisor IPC client");
+            Self {
+                owner,
+                control,
+                stop,
+                accept,
+            }
+        }
+
+        async fn close(self) {
+            let _ = self.stop.send(true);
+            let mut accept = self.accept;
+            if time::timeout(Duration::from_secs(3), &mut accept)
+                .await
+                .is_err()
+            {
+                accept.abort();
+            }
+            self.owner
+                .close()
+                .await
+                .expect("close temporary Store owner");
+        }
+    }
+
+    fn test_config(root: &Path) -> Arc<Config> {
+        let mut config = Config::default();
+        config.storage.data_dir = root.to_path_buf();
+        Arc::new(config)
+    }
+
+    async fn initialize_store(root: &Path) {
+        fs::create_dir_all(root).expect("create temporary Store directory");
+        let root = fs::canonicalize(root).expect("canonicalize temporary Store directory");
+        let data_root = DataRoot::acquire(&root).expect("acquire temporary Store root");
+        let credential = bootstrap_credential(&data_root.path)
+            .expect("create temporary Store operator credential");
+        StoreOwner::start(data_root, test_config(&root), credential)
+            .await
+            .expect("initialize temporary Store")
+            .close()
+            .await
+            .expect("close temporary Store initializer");
+    }
+
+    fn install_identity_health_rejection(root: &Path) {
+        let db = Connection::open(root.join("swarm.db")).expect("open temporary Store database");
+        db.execute_batch(
+            r#"CREATE TRIGGER reject_unknown362_health
+               BEFORE UPDATE OF value_json ON meta
+               WHEN OLD.key = 'host:optional-workers:v1'
+                AND instr(NEW.value_json,
+                    '"last_error_code":"MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH"') > 0
+               BEGIN
+                   SELECT RAISE(ABORT, 'fixture rejected child identity health');
+               END;"#,
+        )
+        .expect("install exact SQLite health-write rejection");
+    }
+
+    async fn run_outer_harness() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-unknown362-{}", crate::model::new_id()));
+        fs::create_dir_all(&root).expect("create exact test directory");
+        let root = fs::canonicalize(root).expect("canonicalize exact test directory");
+        let release = root.join("release-child");
+        let launches = root.join("launches.jsonl");
+        let mut release_guard = ReleaseFileGuard::new(release.clone());
+        initialize_store(&root).await;
+        install_identity_health_rejection(&root);
+
+        let mut host_a = spawn_host_process("host-a", &root, &release, &launches);
+        let host_a_status = host_a.wait().expect("wait for first host generation");
+        assert!(host_a_status.success(), "first host generation failed");
+        let first_launch = read_launches(&launches)
+            .into_iter()
+            .next()
+            .expect("first generation recorded its exact child");
+        let (pid, birth) = launch_identity(&first_launch);
+        assert_same_live_process(pid, &birth, "after first host teardown");
+
+        let mut host_b = spawn_host_process("host-b", &root, &release, &launches);
+        let host_b_status = host_b.wait().expect("wait for restarted host generation");
+        let launch_records = read_launches(&launches);
+        assert_same_live_process(pid, &birth, "after restart reconciliation");
+
+        release_guard.release();
+        for record in &launch_records {
+            let (child_pid, child_birth) = launch_identity(record);
+            wait_for_process_departure(child_pid, &child_birth).await;
+        }
+
+        assert!(host_b_status.success(), "restarted host generation failed");
+        assert_eq!(
+            launch_records.len(),
+            1,
+            "retained pending launch must block a duplicate child"
+        );
+        fs::remove_dir_all(&root).expect("remove exact temporary Store directory");
+    }
+
+    fn spawn_host_process(
+        role: &str,
+        root: &Path,
+        release: &Path,
+        launches: &Path,
+    ) -> std::process::Child {
+        StdCommand::new(std::env::current_exe().expect("resolve current test executable"))
+            .args(["--exact", MAIN_TEST, "--nocapture"])
+            .env(ROLE_ENV, role)
+            .env(ROOT_ENV, root)
+            .env(RELEASE_ENV, release)
+            .env(LAUNCHES_ENV, launches)
+            .spawn()
+            .expect("start isolated host-generation test process")
+    }
+
+    async fn run_host_a() {
+        let root = env_path(ROOT_ENV);
+        let release = env_path(RELEASE_ENV);
+        let launches = env_path(LAUNCHES_ENV);
+        let runtime = TestIpcRuntime::start(&root).await;
+        record_module_actor_status(
+            &runtime.control,
+            "isolated",
+            0,
+            Some(SUPERVISOR_SPAWN_PENDING),
+            Some(MODULE_ACTOR_ISOLATED_RETRY),
+        )
+        .await
+        .expect("persist launch-pending fence before child start");
+
+        let child = spawn_fixture_child(&release, true);
+        let pid = child.id().expect("test child has a PID");
+        append_launch_record(&launches, pid).await;
+        let capture_error = capture_supervisor_child_identity(&child, &root)
+            .expect_err("real process capture must reject the wrong expected image");
+        assert_eq!(capture_error.code, "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH");
+        reap_failed_supervisor_child(
+            child,
+            None,
+            None,
+            &runtime.control,
+            "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+        )
+        .await
+        .expect("transfer the exact unidentified Child to its reaper");
+
+        let rejected = record_module_actor_status(
+            &runtime.control,
+            "isolated",
+            1,
+            Some(&capture_error.code),
+            Some(MODULE_ACTOR_ISOLATED_RETRY),
+        )
+        .await
+        .expect_err("SQLite trigger must reject the child-failure health update");
+        assert_eq!(rejected.code, "STORE_ERROR");
+        let retained = runtime
+            .control
+            .read_health()
+            .await
+            .expect("read retained health through authenticated IPC");
+        assert_eq!(
+            retained.error_code.as_deref(),
+            Some(SUPERVISOR_SPAWN_PENDING)
+        );
+        assert!(
+            retained.child.is_none(),
+            "no unverified child receipt was written"
+        );
+        runtime.close().await;
+    }
+
+    async fn run_host_b() {
+        let root = env_path(ROOT_ENV);
+        let release = env_path(RELEASE_ENV);
+        let launches = env_path(LAUNCHES_ENV);
+        let runtime = TestIpcRuntime::start(&root).await;
+        match reconcile_prior_child(&runtime.control).await {
+            Err(error) if error.code == SUPERVISOR_SPAWN_PENDING => {}
+            Ok(PriorChildState::Clear { .. }) => {
+                let child = spawn_fixture_child(&release, false);
+                append_launch_record(&launches, child.id().expect("replacement child has PID"))
+                    .await;
+                drop(child);
+            }
+            Ok(PriorChildState::Alive(_)) => {
+                panic!("no child receipt exists to adopt during this restart")
+            }
+            Err(error) => panic!("restart returned an unexpected gate error: {}", error.code),
+        }
+        runtime.close().await;
+    }
+
+    fn env_path(name: &str) -> PathBuf {
+        PathBuf::from(std::env::var_os(name).expect("required subprocess fixture path"))
+    }
+
+    fn spawn_fixture_child(release: &Path, pipe_stdin: bool) -> Child {
+        let mut command = Command::new(std::env::current_exe().expect("resolve test executable"));
+        command
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_RELEASE_ENV, release)
+            .stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        command.spawn().expect("start real fixture child process")
+    }
+
+    async fn append_launch_record(path: &Path, pid: u32) {
+        let birth = wait_for_birth(pid).await;
+        let record = json!({"pid":pid,"birth":birth});
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open child launch ledger");
+        writeln!(file, "{record}").expect("append child launch identity");
+    }
+
+    async fn wait_for_birth(pid: u32) -> Value {
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(identity) =
+                    process_birth_identity(pid).expect("read test child birth identity")
+                {
+                    return identity;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("test child birth identity became readable")
+    }
+
+    fn read_launches(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .expect("read child launch ledger")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse child launch identity"))
+            .collect()
+    }
+
+    fn launch_identity(record: &Value) -> (u32, Value) {
+        (
+            record["pid"].as_u64().expect("launch PID is numeric") as u32,
+            record["birth"].clone(),
+        )
+    }
+
+    fn assert_same_live_process(pid: u32, expected_birth: &Value, phase: &str) {
+        let actual = process_birth_identity(pid)
+            .expect("read process identity during restart test")
+            .unwrap_or_else(|| panic!("original child departed {phase}"));
+        assert_eq!(&actual, expected_birth, "PID was reused {phase}");
+    }
+
+    async fn wait_for_process_departure(pid: u32, expected_birth: &Value) {
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = process_birth_identity(pid)
+                    .expect("verify exact child departure after release");
+                if current.as_ref() != Some(expected_birth) {
+                    return;
+                }
+                time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("released fixture child departed");
+    }
+
+    struct ReleaseFileGuard {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    impl ReleaseFileGuard {
+        fn new(path: PathBuf) -> Self {
+            Self { path, armed: true }
+        }
+
+        fn release(&mut self) {
+            fs::write(&self.path, b"release").expect("release exact fixture child");
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ReleaseFileGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::write(&self.path, b"release");
+            }
+        }
+    }
+}

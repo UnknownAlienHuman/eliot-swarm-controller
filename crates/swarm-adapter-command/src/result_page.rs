@@ -203,7 +203,7 @@ pub fn build_output(
         "kind":"command_output",
         "result_operation_id":command.operation_id,
         "result_input_sha256":result_input_sha256,
-        "result_module_receipt":result_receipt,
+        "result_module_receipt":receipt(command, claim, &command.operation_id, result_input_sha256)?,
         "input_operation_id":target_id,
         "target_input_sha256":target_input_sha256,
         "target_module_receipt":target["module_receipt"],
@@ -312,7 +312,6 @@ pub fn build_normalized_output(
             "output differs from the Store-sealed payload identity",
         ));
     }
-    let result_receipt = receipt(command, claim, &command.operation_id, result_input_sha256)?;
     let bytes = store.read_native_output(
         target_id,
         target_input_sha256,
@@ -344,7 +343,9 @@ pub fn build_acp_output(
         || command.input["selector"]["native_output"] != "acp.assistant_messages.txt"
         || !crate::module_host::normalized_result_enabled(claim)
     {
-        return Err(invalid("ACP normalized output result contract is unavailable"));
+        return Err(invalid(
+            "ACP normalized output result contract is unavailable",
+        ));
     }
     let origin: NormalizedResultOriginContext =
         serde_json::from_value(command.input["normalized_result_origin"].clone())
@@ -357,7 +358,9 @@ pub fn build_acp_output(
         || origin.target_operation_id != command.input["selector"]["input_operation_id"]
         || command.target_input_sha256.as_deref() != Some(origin.target_input_sha256.as_str())
     {
-        return Err(invalid("ACP result origin differs from its exact Store request"));
+        return Err(invalid(
+            "ACP result origin differs from its exact Store request",
+        ));
     }
     let expected = &command.input["normalized_result_payload_identity"];
     let payload_sha256 = text(expected, "sha256")?;
@@ -369,7 +372,9 @@ pub fn build_acp_output(
         || payload_sha256 != sha256_hex(bytes)
         || payload_bytes != bytes.len() as u64
     {
-        return Err(invalid("ACP capture differs from the Store-sealed output identity"));
+        return Err(invalid(
+            "ACP capture differs from the Store-sealed output identity",
+        ));
     }
     let result_input_sha256 = command
         .input_sha256

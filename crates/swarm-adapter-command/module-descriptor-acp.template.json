@@ -46,6 +46,8 @@
     "agent.open",
     "agent.reconcile",
     "agent.refresh",
+    "agent.reply",
+    "agent.result",
     "agent.send/next_turn",
     "native.command.cancel_turn",
     "native.command.close_session",

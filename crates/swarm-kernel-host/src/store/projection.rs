@@ -308,11 +308,11 @@ mod tests {
     #[test]
     fn oversized_item_becomes_gap_reference_and_cursor_stays_honest() {
         let db = fixture_db();
-        insert_observation(&db, 1, "runtime.state", &json!({"note": "small"}));
+        insert_observation(&db, 1, "runtime.result", &json!({"note": "small"}));
         let big_text = "x".repeat(MAX_SINGLE_ITEM_BYTES);
         let big_payload = json!({"details": {"artifact_ref": "art-9"}, "blob": big_text});
         insert_observation(&db, 2, "runtime.result", &big_payload);
-        insert_observation(&db, 3, "runtime.state", &json!({"note": "after"}));
+        insert_observation(&db, 3, "runtime.result", &json!({"note": "after"}));
 
         let page = delta(&db, 0, 50);
         let items = page["items"].as_array().unwrap();
@@ -358,7 +358,10 @@ mod tests {
         // one page's serialized budget.
         let filler = "y".repeat(MAX_SINGLE_ITEM_BYTES - 4_096);
         for id in 1..=6 {
-            insert_observation(&db, id, "runtime.state", &json!({"blob": filler}));
+            // runtime.state has a narrower public allowlist; unscoped
+            // runtime.result entries exercise the generic redacted payload
+            // projection whose bytes are subject to the page budget.
+            insert_observation(&db, id, "runtime.result", &json!({"blob": filler}));
         }
         let first = delta(&db, 0, 50);
         let first_items = first["items"].as_array().unwrap();
@@ -419,7 +422,7 @@ mod tests {
         assert_eq!(items[0]["kind"], "message.send");
         assert_eq!(page["projection"]["source_kind"], "mailbox");
         assert_eq!(page["projection"]["coverage_complete"], true);
-        assert_eq!(page["projection"]["limits"]["max_source_rows"], 50);
+        assert_eq!(page["projection"]["limits"]["max_source_rows"], 201);
     }
 
     fn family_fixture(children: Value, completeness: &str) -> (Connection, Value) {

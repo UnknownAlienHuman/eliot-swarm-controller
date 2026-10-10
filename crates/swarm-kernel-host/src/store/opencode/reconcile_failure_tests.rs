@@ -18,6 +18,7 @@ async fn start(f: &Fixture) -> (StoreOwner, Principal) {
     let mut config = Config::default();
     config.storage.data_dir = directory;
     config.routes.push(Route {
+        admission_policy: Default::default(),
         workspace_option: None,
         owned_service: None,
         alias: "fixture".into(),
@@ -48,6 +49,14 @@ async fn read_operation(store: &Store, principal: &Principal, id: &str) -> Value
             "operation.get".into(),
             json!({"operation_id":id}),
         )
+        .await
+        .unwrap()
+}
+
+async fn retained_operation(store: &Store, id: &str) -> Value {
+    let id = id.to_owned();
+    store
+        .run(move |db| crate::store::operations::get_operation(db, &id))
         .await
         .unwrap()
 }
@@ -273,12 +282,14 @@ async fn reconcile_target_load_failure_stays_unknown_without_readback() {
     .await;
     assert_eq!(reconcile["state"], "outcome_unknown");
     assert_eq!(reconcile["result"]["outcome"], "unknown");
+    assert!(reconcile["result"].get("details").is_none());
+    let retained = retained_operation(&store, reconcile["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        reconcile["result"]["details"]["stage"],
+        retained["result"]["details"]["stage"],
         "reconcile_target_load"
     );
-    assert_eq!(reconcile["result"]["details"]["code"], "NOT_FOUND");
-    assert!(reconcile["result"]["details"]["completion_condition"].is_null());
+    assert_eq!(retained["result"]["details"]["code"], "NOT_FOUND");
+    assert!(retained["result"]["details"]["completion_condition"].is_null());
 
     let target_after =
         read_operation(&store, &principal, target["operation_id"].as_str().unwrap()).await;

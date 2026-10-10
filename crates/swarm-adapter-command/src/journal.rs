@@ -96,15 +96,14 @@ pub struct RunStore {
 }
 
 impl RunStore {
-    pub fn new(module_state: &Path) -> Result<Self> {
-        Self::new_for_profile(module_state, crate::Profile::BatchV3)
-    }
-
     pub fn new_for_profile(module_state: &Path, profile: crate::Profile) -> Result<Self> {
         let state = fs::canonicalize(module_state)?;
         // Each descriptor version owns an immutable journal namespace. In
         // particular, BatchV4 must never reinterpret legacy BatchV3 receipts.
-        let root = state.join(format!("command-adapter-runs-v{}", profile.artifact_version()));
+        let root = state.join(format!(
+            "command-adapter-runs-v{}",
+            profile.artifact_version()
+        ));
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(Error::new(

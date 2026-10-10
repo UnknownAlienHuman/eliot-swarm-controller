@@ -1,7 +1,7 @@
-use crate::module_host::{self, ModuleHostIdentity};
-use crate::{ARTIFACT_ID, CONTRACT_REVISION, EXECUTION_SHAPE, RUNTIME};
 use crate::Profile;
-use crate::acp_prompt::PreparedAcpDispatch;
+use crate::acp_prompt::{self, PreparedAcpDispatch};
+use crate::module_host::{self, ModuleHostIdentity};
+use crate::{ARTIFACT_ID, EXECUTION_SHAPE, RUNTIME};
 use crate::{
     journal::{DispatchIdentity, RunStore, digest},
     native, result_page,
@@ -402,8 +402,7 @@ fn acp_dispatch_admission(
     if !matches!(owner.host.profile, Profile::AcpV1 | Profile::BatchV4)
         || !module_host::task_prompt_v1_enabled(&owner.host.claim)
         || dispatch.identity.operation_id != command.operation_id
-        || dispatch.identity.input_sha256
-            != command.input_sha256.as_deref().unwrap_or_default()
+        || dispatch.identity.input_sha256 != command.input_sha256.as_deref().unwrap_or_default()
         || dispatch.identity.prompt_sha256 != dispatch.envelope.prompt_sha256
         || dispatch.identity.prompt_bytes != dispatch.envelope.prompt_bytes
     {
@@ -575,8 +574,7 @@ async fn process_command(
                 (dispatch.envelope.prompt.clone(), identity, Some(admission))
             } else {
                 let (prompt, identity) = native::prompt_for(command)?;
-                let admission =
-                    normalized_dispatch_admission(owner, command, &identity, &prompt)?;
+                let admission = normalized_dispatch_admission(owner, command, &identity, &prompt)?;
                 (prompt, identity, admission)
             };
             let workspace = native::route_workspace(command)?;
@@ -1057,7 +1055,7 @@ async fn connect_module(config: &Config, credential: &Credential, owner: &Owner)
     connect_module_with_native_state(config, credential, owner, None, None).await
 }
 
-pub(super) async fn connect_module_with_native_state(
+async fn connect_module_with_native_state(
     config: &Config,
     credential: &Credential,
     owner: &Owner,
@@ -1256,7 +1254,9 @@ fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
                 .is_none()
     } else {
         (result_kind == Some("command_status")
-            && command.input["target_operation_status"].as_object().is_none())
+            && command.input["target_operation_status"]
+                .as_object()
+                .is_none())
             || (result_kind == Some("command_output")
                 && command.input["target_command_output"].as_object().is_none())
     };
@@ -1315,10 +1315,7 @@ fn load_config(path: &Path, profile: Profile) -> Result<Config> {
     }
     let config: Config = serde_json::from_slice(&bytes)
         .map_err(|_| Error::new("CONFIG_INVALID", "adapter config JSON is invalid"))?;
-    let batch_config_valid = config
-        .mod_path
-        .as_deref()
-        .is_some_and(Path::is_absolute)
+    let batch_config_valid = config.mod_path.as_deref().is_some_and(Path::is_absolute)
         && config
             .run_timeout_ms
             .is_some_and(|timeout| (100..=86_400_000).contains(&timeout))
@@ -1329,14 +1326,23 @@ fn load_config(path: &Path, profile: Profile) -> Result<Config> {
                 && !arg.chars().any(char::is_control)
                 && !reserved_argument(arg)
         });
-    let acp_config_valid = config.mod_path.is_none()
-        && config.run_timeout_ms.is_none()
-        && config.command_args.len() == 1
-        && config.command_args[0] == "acp";
+    let acp_args_valid = match config.command_args.as_slice() {
+        [mode] => mode == "acp",
+        [entrypoint, mode] => {
+            mode == "acp"
+                && Path::new(entrypoint).is_absolute()
+                && entrypoint.len() <= MAX_FIXED_ARG_BYTES
+                && !entrypoint.chars().any(char::is_control)
+                && !reserved_argument(entrypoint)
+        }
+        _ => false,
+    };
+    let acp_config_valid =
+        config.mod_path.is_none() && config.run_timeout_ms.is_none() && acp_args_valid;
     if config.module_artifact_id != profile.artifact_id()
         || !config.command.is_absolute()
         || match profile {
-            Profile::BatchV3 => !batch_config_valid,
+            Profile::BatchV3 | Profile::BatchV4 => !batch_config_valid,
             Profile::AcpV1 => !acp_config_valid,
         }
     {

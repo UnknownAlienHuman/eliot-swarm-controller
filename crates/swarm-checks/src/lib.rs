@@ -901,7 +901,6 @@ enum PipeRead {
 #[cfg(target_os = "linux")]
 impl<T: Read + std::os::fd::AsRawFd> PollableRead for T {
     fn make_nonblocking(&self) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
         const F_GETFL: i32 = 3;
         const F_SETFL: i32 = 4;
         const O_NONBLOCK: i32 = 0x800;

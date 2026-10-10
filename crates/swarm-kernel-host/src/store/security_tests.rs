@@ -340,6 +340,11 @@ async fn stale_forge_epoch_cancellation_requires_operator_and_retains_the_diagno
         let now = model::now_ms()?;
         // The same client holds GM again, but this publication belongs to an
         // earlier epoch. Client identity alone must not restore its authority.
+        set_meta(
+            db,
+            "client:gm-returned",
+            &json!({"role":"manager","disabled":false}),
+        )?;
         set_meta(db, "gm", &json!({"client_id":"gm-returned","epoch":3}))?;
         for (id, state, result) in [
             ("forge-stale-queued", "queued", Value::Null),

@@ -52,6 +52,20 @@ mod tests {
             .optional()?)
     }
 
+    async fn public_operation_read(
+        store: &Store,
+        principal: &Principal,
+        operation_id: &str,
+    ) -> Result<Value> {
+        store
+            .call(
+                principal.clone(),
+                "operation.get".to_owned(),
+                json!({"operation_id":operation_id}),
+            )
+            .await
+    }
+
     async fn seed_workspace_launch(store: &Store) -> Result<()> {
         store
             .run(move |db| {
@@ -117,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_workspace_failure_keeps_first_and_latest_manager_readback() {
+    async fn repeated_workspace_failure_keeps_first_and_latest_public_readback() {
         let directory = std::env::temp_dir().join(format!("swarm-c34-failure-{}", model::new_id()));
         std::fs::create_dir_all(&directory).expect("create temporary Store directory");
         let (owner, _credential, _operator) = start_store(&directory).await;
@@ -139,10 +153,7 @@ mod tests {
         let current = manager("fixture-current-manager");
         let former = manager("fixture-former-manager");
         let unrelated = manager("fixture-unrelated-manager");
-        let current_for_read = current.clone();
-        let former_for_read = former.clone();
-        let unrelated_for_read = unrelated.clone();
-        let readback = owner
+        let retained_and_lease = owner
             .store
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -151,44 +162,62 @@ mod tests {
                     "gm",
                     &json!({"client_id":"fixture-current-manager","epoch":2}),
                 )?;
+                for client_id in [
+                    "fixture-current-manager",
+                    "fixture-former-manager",
+                    "fixture-unrelated-manager",
+                ] {
+                    super::super::set_meta(
+                        &tx,
+                        &format!("client:{client_id}"),
+                        &json!({"role":"manager","disabled":false}),
+                    )?;
+                }
                 tx.commit()?;
 
                 let retained_raw = read_meta_raw(db, FAILURE_KEY)?.ok_or_else(|| {
                     crate::error::Error::new("STORE_ERROR", "failure metadata missing")
                 })?;
                 let retained: Value = serde_json::from_str(&retained_raw)?;
-                let current = super::super::operations::get_operation_for_current_manager(
-                    db,
-                    &current_for_read,
-                    OPERATION_ID,
-                )?;
-                let former = super::super::operations::get_operation_for_current_manager(
-                    db,
-                    &former_for_read,
-                    OPERATION_ID,
-                )?;
-                let unrelated = super::super::operations::get_operation_for_current_manager(
-                    db,
-                    &unrelated_for_read,
-                    OPERATION_ID,
-                )?;
-                let ordinary = super::super::operations::get_operation(db, OPERATION_ID)?;
                 let lease_state: String = db.query_row(
                     "SELECT state FROM workspace_leases WHERE operation_id=?1",
                     [OPERATION_ID],
                     |row| row.get(0),
                 )?;
-                Ok(json!({
-                    "retained":retained,
-                    "current":current,
-                    "former":former,
-                    "unrelated":unrelated,
-                    "ordinary":ordinary,
-                    "lease_state":lease_state,
-                }))
+                Ok(json!({"retained":retained,"lease_state":lease_state}))
             })
             .await
-            .expect("read retained manager diagnostics");
+            .expect("read retained failure metadata and lease state");
+
+        let current_receipt = public_operation_read(&owner.store, &current, OPERATION_ID)
+            .await
+            .expect("current GM receives the bounded Task-scoped launch receipt");
+        assert_eq!(current_receipt["operation_id"], OPERATION_ID);
+        assert_eq!(current_receipt["method"], "swarm.launch");
+        assert_eq!(current_receipt["state"], "outcome_unknown");
+        assert_eq!(current_receipt["task_id"], "c34-fixture-task");
+        assert!(current_receipt["attempt_id"].is_null());
+        assert_eq!(
+            current_receipt["result"],
+            json!({"operation_id":OPERATION_ID,"state":"outcome_unknown","failure":{"code":"workspace_effect_unknown"}})
+        );
+        assert!(current_receipt.get("workspace_failure_readback").is_none());
+        assert!(current_receipt.get("diagnostic").is_none());
+
+        for manager in [&former, &unrelated] {
+            let error = public_operation_read(&owner.store, manager, OPERATION_ID)
+                .await
+                .expect_err("former and unrelated Managers remain outside Task scope");
+            assert_eq!(error.code, "NOT_FOUND");
+        }
+        let operation = public_operation_read(&owner.store, &_operator, OPERATION_ID)
+            .await
+            .expect("read the retained launch through the public local-Operator path");
+        let readback = json!({
+            "retained":retained_and_lease["retained"],
+            "lease_state":retained_and_lease["lease_state"],
+            "operation":operation,
+        });
 
         assert_eq!(
             readback["retained"]["first_failure"]["code"],
@@ -204,21 +233,23 @@ mod tests {
             "workspace_effect_unknown"
         );
         assert_eq!(readback["lease_state"], "outcome_unknown");
-        for view in ["current", "former", "unrelated", "ordinary"] {
-            assert_eq!(readback[view]["state"], "outcome_unknown");
-            assert_eq!(readback[view]["result"]["native_effect"], "unknown");
-        }
+        assert_eq!(readback["operation"]["state"], "outcome_unknown");
         assert_eq!(
-            readback["current"]["workspace_failure_readback"]["first_retained_failure"]["code"],
+            readback["operation"]["result"],
+            json!({"operation_id":OPERATION_ID,"state":"outcome_unknown","failure":{"code":"workspace_effect_unknown"}})
+        );
+        assert!(
+            readback["operation"]["workspace_failure_readback"].is_object(),
+            "local Operator retains the bounded workspace diagnostic"
+        );
+        assert_eq!(
+            readback["operation"]["workspace_failure_readback"]["first_retained_failure"]["code"],
             "WORKSPACE_GIT_UNKNOWN"
         );
         assert_eq!(
-            readback["current"]["workspace_failure_readback"]["latest_failure"]["code"],
+            readback["operation"]["workspace_failure_readback"]["latest_failure"]["code"],
             "WORKSPACE_PATH"
         );
-        for view in ["former", "unrelated", "ordinary"] {
-            assert!(readback[view].get("workspace_failure_readback").is_none());
-        }
 
         owner.close().await.expect("close Store owner");
         std::fs::remove_dir_all(&directory).expect("remove the exact fixture Store directory");
@@ -351,8 +382,7 @@ mod tests {
             .expect("retain the later observation without replaying admission closure");
 
         let current = manager("fixture-current-manager");
-        let current_for_read = current.clone();
-        let readback = owner
+        let retained_lease_state = owner
             .store
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -361,17 +391,12 @@ mod tests {
                     "gm",
                     &json!({"client_id":"fixture-current-manager","epoch":2}),
                 )?;
+                super::super::set_meta(
+                    &tx,
+                    "client:fixture-current-manager",
+                    &json!({"role":"manager","disabled":false}),
+                )?;
                 tx.commit()?;
-                let closed = super::super::operations::get_operation_for_current_manager(
-                    db,
-                    &current_for_read,
-                    CLOSED_OPERATION_ID,
-                )?;
-                let legacy = super::super::operations::get_operation_for_current_manager(
-                    db,
-                    &current_for_read,
-                    LEGACY_OPERATION_ID,
-                )?;
                 let closed_lease = db.query_row(
                     "SELECT state,clean_state_json FROM workspace_leases WHERE operation_id=?1",
                     [CLOSED_OPERATION_ID],
@@ -383,21 +408,49 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 Ok(json!({
-                    "closed": closed,
-                    "legacy": legacy,
                     "closed_lease_state": closed_lease.0,
                     "closed_clean_state": serde_json::from_str::<Value>(&closed_lease.1)?,
                     "legacy_lease_state": legacy_lease,
                 }))
             })
             .await
-            .expect("read exact Manager diagnostics");
+            .expect("read exact lease recovery state");
+
+        let current_receipt = public_operation_read(&owner.store, &current, CLOSED_OPERATION_ID)
+            .await
+            .expect("current GM receives the bounded Task receipt without diagnostics");
+        assert_eq!(current_receipt["operation_id"], CLOSED_OPERATION_ID);
+        assert_eq!(current_receipt["method"], "swarm.launch");
+        assert_eq!(current_receipt["state"], "settled");
+        assert_eq!(
+            current_receipt["task_id"],
+            format!("{CLOSED_OPERATION_ID}-task")
+        );
+        assert!(current_receipt["attempt_id"].is_null());
+        assert_eq!(
+            current_receipt["result"],
+            json!({"operation_id":CLOSED_OPERATION_ID,"state":"settled","failure":{"code":"workspace_admission_rejected"}})
+        );
+        assert!(current_receipt.get("workspace_failure_readback").is_none());
+        assert!(current_receipt.get("diagnostic").is_none());
+        let closed = public_operation_read(&owner.store, &_operator, CLOSED_OPERATION_ID)
+            .await
+            .expect("read closed launch through the public local-Operator path");
+        let legacy = public_operation_read(&owner.store, &_operator, LEGACY_OPERATION_ID)
+            .await
+            .expect("read legacy launch through the public local-Operator path");
+        let readback = json!({
+            "closed":closed,
+            "legacy":legacy,
+            "closed_lease_state":retained_lease_state["closed_lease_state"],
+            "closed_clean_state":retained_lease_state["closed_clean_state"],
+            "legacy_lease_state":retained_lease_state["legacy_lease_state"],
+        });
 
         assert_eq!(readback["closed"]["state"], "settled");
-        assert_eq!(readback["closed"]["result"]["launch_state"], "blocked");
         assert_eq!(
-            readback["closed"]["result"]["native_effect"],
-            "not_attempted"
+            readback["closed"]["result"],
+            json!({"operation_id":CLOSED_OPERATION_ID,"state":"settled","failure":{"code":"workspace_admission_rejected"}})
         );
         assert_eq!(readback["closed_lease_state"], "stale");
         assert_eq!(
@@ -425,7 +478,10 @@ mod tests {
             "WORKSPACE_GIT_PATH_TOO_LONG"
         );
         assert_eq!(readback["legacy"]["state"], "outcome_unknown");
-        assert_eq!(readback["legacy"]["result"]["native_effect"], "unknown");
+        assert_eq!(
+            readback["legacy"]["result"],
+            json!({"operation_id":LEGACY_OPERATION_ID,"state":"outcome_unknown","failure":{"code":"workspace_effect_unknown"}})
+        );
         assert_eq!(readback["legacy_lease_state"], "outcome_unknown");
         assert_eq!(
             readback["legacy"]["workspace_failure_readback"]["status"],

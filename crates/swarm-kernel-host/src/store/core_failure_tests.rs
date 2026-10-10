@@ -15,7 +15,7 @@ const PRIVATE_SERVICE_PROOF_MARKER: &str = "DO_NOT_EXPOSE_OWNED_SERVICE_PROOF_MA
 
 struct Fixture {
     db: Connection,
-    admission_result: Value,
+    public_launch_receipt: Value,
     admission_result_json: String,
     observation_id: i64,
 }
@@ -84,7 +84,7 @@ fn fixture() -> Fixture {
     .unwrap();
     db.execute(
         "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,producers_json,created_at_ms,updated_at_ms) \
-         VALUES(?1,?2,1,'{}',?3,'controller',?4,1,'running','[]',1,1)",
+         VALUES(?1,?2,1,'{\"revision\":1}',?3,'controller',?4,1,'running','[]',1,1)",
         params![ATTEMPT_ID, TASK_ID, ORIGINAL_GM, BINDING_ID],
     )
     .unwrap();
@@ -199,7 +199,10 @@ fn fixture() -> Fixture {
 
     Fixture {
         db,
-        admission_result,
+        public_launch_receipt: json!({
+            "operation_id":LAUNCH_OPERATION_ID,
+            "state":"queued",
+        }),
         admission_result_json,
         observation_id,
     }
@@ -276,7 +279,7 @@ fn assert_failure_visible_through_store_reads(fixture: &Fixture, caller: Princip
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(operation["result"], fixture.admission_result);
+    assert_eq!(operation["result"], fixture.public_launch_receipt);
     assert!(operation.get("runtime_dispatch_action_required").is_none());
     let operation_action = &operation["manager_action_required"];
     assert_failure_action(operation_action, fixture.observation_id);
@@ -361,7 +364,7 @@ fn successor_gm_keeps_failure_readback_while_former_gm_loses_action_authority() 
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(former_operation["result"], fixture.admission_result);
+    assert_eq!(former_operation["result"], fixture.public_launch_receipt);
     assert!(former_operation.get("manager_action_required").is_none());
     let former_exceptions = store_read(
         &fixture.db,
@@ -577,7 +580,7 @@ fn queued_open_selection_failure_is_deduplicated_and_survives_handover_and_depar
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(operation["result"], fixture.admission_result);
+    assert_eq!(operation["result"], fixture.public_launch_receipt);
     let operation_action = &operation["runtime_dispatch_action_required"];
     assert_dispatch_failure_action(operation_action, observation_id);
     let exceptions = store_read(
@@ -608,7 +611,7 @@ fn queued_open_selection_failure_is_deduplicated_and_survives_handover_and_depar
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(successor_operation["result"], fixture.admission_result);
+    assert_eq!(successor_operation["result"], fixture.public_launch_receipt);
     let successor_action = &successor_operation["runtime_dispatch_action_required"];
     assert_dispatch_failure_action(successor_action, observation_id);
     assert_eq!(successor_action, operation_action);
@@ -618,7 +621,7 @@ fn queued_open_selection_failure_is_deduplicated_and_survives_handover_and_depar
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(former_operation["result"], fixture.admission_result);
+    assert_eq!(former_operation["result"], fixture.public_launch_receipt);
     assert!(
         former_operation
             .get("runtime_dispatch_action_required")
@@ -657,7 +660,7 @@ fn queued_open_selection_failure_is_deduplicated_and_survives_handover_and_depar
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(departed_operation["result"], fixture.admission_result);
+    assert_eq!(departed_operation["result"], fixture.public_launch_receipt);
     assert_eq!(departed_operation["state"], "rejected");
     let departed_action = &departed_operation["runtime_dispatch_action_required"];
     assert_dispatch_failure_action(departed_action, observation_id);
@@ -786,7 +789,7 @@ fn corrupt_optional_startup_diagnostic_returns_a_safe_gap_without_breaking_reads
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(operation["result"], fixture.admission_result);
+    assert_eq!(operation["result"], fixture.public_launch_receipt);
     let gap = &operation["manager_action_required"];
     assert_eq!(gap["status"], "readback_required");
     assert_eq!(gap["kind"], "owned_service_start_diagnostic_gap");
@@ -862,7 +865,10 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(original_before_readback["result"], fixture.admission_result);
+    assert_eq!(
+        original_before_readback["result"],
+        fixture.public_launch_receipt
+    );
     assert_eq!(
         original_before_readback["native_mcp_readback"]["state"],
         "retry_wait"
@@ -897,7 +903,10 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(original_after_readback["result"], fixture.admission_result);
+    assert_eq!(
+        original_after_readback["result"],
+        fixture.public_launch_receipt
+    );
     assert_eq!(
         original_after_readback["native_mcp_readback"]["state"],
         "observed_partial"
@@ -914,7 +923,7 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(successor_operation["result"], fixture.admission_result);
+    assert_eq!(successor_operation["result"], fixture.public_launch_receipt);
     assert_eq!(
         successor_operation["native_mcp_readback"],
         original_after_readback["native_mcp_readback"]
@@ -925,8 +934,13 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(former_operation["result"], fixture.admission_result);
-    assert!(former_operation.get("native_mcp_readback").is_none());
+    assert_eq!(former_operation["result"], fixture.public_launch_receipt);
+    // Handover revokes action authority, while the exact retained Attempt
+    // owner keeps the ordinary receipt grant and bounded technical facts.
+    assert_eq!(
+        former_operation["native_mcp_readback"],
+        original_after_readback["native_mcp_readback"]
+    );
     assert!(former_operation.get("manager_action_required").is_none());
     assert!(
         former_operation
@@ -971,7 +985,7 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(corrupted["result"], fixture.admission_result);
+    assert_eq!(corrupted["result"], fixture.public_launch_receipt);
     assert_eq!(
         corrupted["native_mcp_readback"]["state"],
         "observed_partial"
@@ -1067,7 +1081,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         "model_consumed":"unknown",
         "dispatch_permitted":false,
     });
-    assert_eq!(original_operation["result"], fixture.admission_result);
+    assert_eq!(original_operation["result"], fixture.public_launch_receipt);
     assert_eq!(original_operation["native_mcp_tools_readback"], expected);
     let original_json = serde_json::to_string(&original_operation).unwrap();
     for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
@@ -1081,7 +1095,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(successor_operation["result"], fixture.admission_result);
+    assert_eq!(successor_operation["result"], fixture.public_launch_receipt);
     assert_eq!(successor_operation["native_mcp_tools_readback"], expected);
     let former_operation = store_read(
         &fixture.db,
@@ -1089,8 +1103,18 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(former_operation["result"], fixture.admission_result);
-    assert!(former_operation.get("native_mcp_tools_readback").is_none());
+    assert_eq!(former_operation["result"], fixture.public_launch_receipt);
+    assert_eq!(former_operation["native_mcp_tools_readback"], expected);
+    assert!(former_operation.get("manager_action_required").is_none());
+    assert!(
+        former_operation
+            .get("runtime_dispatch_action_required")
+            .is_none()
+    );
+    let former_json = serde_json::to_string(&former_operation).unwrap();
+    for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
+        assert!(!former_json.contains(marker));
+    }
     let successor_json = serde_json::to_string(&successor_operation).unwrap();
     for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
         assert!(!successor_json.contains(marker));
@@ -1117,7 +1141,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
             json!({"operation_id":LAUNCH_OPERATION_ID}),
         );
         let failure = &rpc_operation["native_mcp_tools_readback"]["latest_failure"];
-        assert_eq!(rpc_operation["result"], fixture.admission_result);
+        assert_eq!(rpc_operation["result"], fixture.public_launch_receipt);
         assert_eq!(failure["code"], code);
         assert_eq!(failure["stage"], "challenge");
         assert_eq!(failure["rejection_class"], class);
@@ -1143,7 +1167,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
             "operation.get",
             json!({"operation_id":LAUNCH_OPERATION_ID}),
         );
-        assert_eq!(corrupt["result"], fixture.admission_result);
+        assert_eq!(corrupt["result"], fixture.public_launch_receipt);
         assert_eq!(
             corrupt["native_mcp_tools_readback"]["latest_failure"]["code"],
             "NATIVE_MCP_TOOLS_DIAGNOSTIC_CORRUPT"
@@ -1175,7 +1199,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(malformed_record["result"], fixture.admission_result);
+    assert_eq!(malformed_record["result"], fixture.public_launch_receipt);
     assert_eq!(
         malformed_record["native_mcp_tools_readback"],
         json!({
@@ -1219,7 +1243,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(malformed_schedule["result"], fixture.admission_result);
+    assert_eq!(malformed_schedule["result"], fixture.public_launch_receipt);
     assert_eq!(
         malformed_schedule["native_mcp_tools_readback"]["latest_failure"]["code"],
         "NATIVE_MCP_TOOLS_DIAGNOSTIC_CORRUPT"
@@ -1262,7 +1286,7 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(schedule_only["result"], fixture.admission_result);
+    assert_eq!(schedule_only["result"], fixture.public_launch_receipt);
     assert_eq!(
         schedule_only["native_mcp_tools_readback"],
         json!({
@@ -1368,7 +1392,7 @@ fn successor_manager_gets_readback_action_for_unknown_start_after_host_interrupt
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(live_pending["result"], fixture.admission_result);
+    assert_eq!(live_pending["result"], fixture.public_launch_receipt);
     assert!(live_pending.get("manager_action_required").is_none());
     let pending_exceptions = store_read(
         &fixture.db,
@@ -1395,7 +1419,7 @@ fn successor_manager_gets_readback_action_for_unknown_start_after_host_interrupt
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(original_launch["result"], fixture.admission_result);
+    assert_eq!(original_launch["result"], fixture.public_launch_receipt);
     let action = &original_launch["manager_action_required"];
     assert_eq!(action["status"], "required");
     assert_eq!(action["kind"], "owned_service_start_readback_required");
@@ -1452,7 +1476,7 @@ fn successor_manager_gets_readback_action_for_unknown_start_after_host_interrupt
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(successor_launch["result"], fixture.admission_result);
+    assert_eq!(successor_launch["result"], fixture.public_launch_receipt);
     assert_eq!(successor_launch["manager_action_required"], action.clone());
     let successor_open = store_read(
         &fixture.db,
@@ -1483,7 +1507,7 @@ fn successor_manager_gets_readback_action_for_unknown_start_after_host_interrupt
         "operation.get",
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
-    assert_eq!(former_launch["result"], fixture.admission_result);
+    assert_eq!(former_launch["result"], fixture.public_launch_receipt);
     assert!(former_launch.get("manager_action_required").is_none());
     let former_exceptions = store_read(
         &fixture.db,

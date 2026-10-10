@@ -36,6 +36,7 @@ fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     db.execute_batch(SCHEMA).unwrap();
+    db.execute_batch(PROVIDER_CONDITION_SCHEMA).unwrap();
 
     for client_id in ["old-gm", "successor-gm", "replacement-gm", "unrelated"] {
         set_meta(
@@ -109,7 +110,17 @@ fn reply_request(request_id: &str) -> Value {
 #[test]
 fn successor_gm_continues_exact_attempt_without_restarting_dispatch() {
     let mut db = fixture();
-    let config = Config::default();
+    let mut config = Config::default();
+    config.routes.push(
+        serde_json::from_value(json!({
+            "alias":"gm-fixture",
+            "runtime":"muse",
+            "module_artifact_id":"muse-sdk-1.3.0-bridge.5",
+            "enabled":true,
+            "native_options":{"workspaceRoot":r"C:\fixture","modelId":"fixture-model"}
+        }))
+        .unwrap(),
+    );
     let old_gm = principal("old-gm", Role::Manager, "old-link");
     let successor = principal("successor-gm", Role::Manager, "successor-link");
     let replacement = principal("replacement-gm", Role::Manager, "replacement-link");

@@ -996,7 +996,7 @@ fn consumer_owner_has_current_attempt(
 ) -> Result<bool> {
     let scope: Option<ConsumerTaskAttemptScopeRow> = db
         .query_row(
-            "SELECT t.project_id,t.state,t.revision,t.current_attempt_id,a.owner_id,a.task_revision,a.released_at_ms \
+            "SELECT t.project_id,t.state,t.revision,a.attempt_id,a.owner_id,a.task_revision,a.released_at_ms \
              FROM tasks AS t JOIN attempts AS a ON a.task_id=t.task_id \
              WHERE t.task_id=?1 AND a.attempt_id=?2",
             params![task_id, attempt_id],
@@ -3395,28 +3395,28 @@ fn concilium_event_is_script_feedback_from_same_automation(
     );
     let metadata: Option<ScriptInvocationMetadata> = db
         .query_row(
-            "WITH operation_request AS (\
-                 SELECT json_valid(effective_request_json) AS is_valid,\
-                        CASE WHEN json_valid(effective_request_json)\
-                             THEN effective_request_json ELSE '{}' END AS request_json \
-                 FROM operations WHERE operation_id=?1\
-             ) \
-             SELECT is_valid,\
-                    COALESCE(json_type(request_json,'$.script_invocation')='object',0),\
-                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
-                         THEN json_extract(request_json,'$.script_invocation.schema_version') END,\
-                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
-                              AND length(CAST(json_extract(request_json,'$.script_invocation.operation_id') AS BLOB))<=256\
-                         THEN json_extract(request_json,'$.script_invocation.operation_id') END,\
-                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
-                              AND length(CAST(json_extract(request_json,'$.script_invocation.action') AS BLOB))<=32\
-                         THEN json_extract(request_json,'$.script_invocation.action') END,\
-                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
-                              AND length(CAST(json_extract(request_json,'$.script_invocation.grant') AS BLOB))<=32\
-                         THEN json_extract(request_json,'$.script_invocation.grant') END,\
-                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
-                              AND length(CAST(json_extract(request_json,'$.script_invocation.cause.script_run_operation_id') AS BLOB))<=256\
-                         THEN json_extract(request_json,'$.script_invocation.cause.script_run_operation_id') END \
+            "WITH operation_request AS (
+                 SELECT json_valid(effective_request_json) AS is_valid,
+                        CASE WHEN json_valid(effective_request_json)
+                             THEN effective_request_json ELSE '{}' END AS request_json
+                 FROM operations WHERE operation_id=?1
+             )
+             SELECT is_valid,
+                    COALESCE(json_type(request_json,'$.script_invocation')='object',0),
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'
+                         THEN json_extract(request_json,'$.script_invocation.schema_version') END,
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.operation_id') AS BLOB))<=256
+                         THEN json_extract(request_json,'$.script_invocation.operation_id') END,
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.action') AS BLOB))<=32
+                         THEN json_extract(request_json,'$.script_invocation.action') END,
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.grant') AS BLOB))<=32
+                         THEN json_extract(request_json,'$.script_invocation.grant') END,
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.cause.script_run_operation_id') AS BLOB))<=256
+                         THEN json_extract(request_json,'$.script_invocation.cause.script_run_operation_id') END
              FROM operation_request",
             [operation_id],
             |row| {

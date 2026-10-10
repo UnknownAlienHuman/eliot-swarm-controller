@@ -386,7 +386,6 @@ pub(crate) struct GitOutput {
 #[cfg(not(windows))]
 struct Captured {
     bytes: Vec<u8>,
-    total: u64,
     truncated: bool,
 }
 
@@ -408,7 +407,6 @@ fn drain_bounded<R: Read>(mut reader: R, cap: usize) -> std::io::Result<Captured
     Ok(Captured {
         truncated: total > retained.len() as u64,
         bytes: retained,
-        total,
     })
 }
 
@@ -837,7 +835,6 @@ mod tests {
         {
             let output = drain_bounded(&b"abcdef"[..], 3).unwrap();
             assert_eq!(output.bytes, b"abc");
-            assert_eq!(output.total, 6);
             assert!(output.truncated);
         }
     }

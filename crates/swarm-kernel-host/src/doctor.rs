@@ -729,24 +729,24 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
     // --- capacity accounting and attention (R23 / R12) -------------------
     // The same read-only projections report.capacity / report.attention
     // serve, embedded here so one diagnostic read shows both. A scope
-    // with an open quota incident is an attention finding; the incident
-    // record itself lives in the capacity section.
+    // with a retained historical quota incident is an attention finding;
+    // that record does not establish current native admission permission.
     let capacity = crate::store::capacity::capacity_report(db, 200, 0)?;
     let attention = crate::store::capacity::attention_report(db, 200, 0)?;
     if let Some(items) = capacity["items"].as_array() {
         for item in items {
-            if item["quota_incident"].is_object() {
+            if item["historical_quota_incident"].is_object() {
                 findings.push(finding(
                     "CAPACITY_QUOTA_INCIDENT",
                     "attention",
                     format!(
-                        "scope {} has an open quota incident ({})",
+                        "scope {} retains a historical quota incident ({})",
                         item["scope"]["scope_key"].as_str().unwrap_or_default(),
-                        item["quota_incident"]["error_code"]
+                        item["historical_quota_incident"]["error_code"]
                             .as_str()
                             .unwrap_or("quota"),
                     ),
-                    "Wait for the reset evidence recorded on the incident or route new work to another scope; the incident never edits owner-selected configuration.",
+                    "Inspect the retained incident and current native usage evidence; the historical record does not gate new work or edit owner-selected configuration.",
                 ));
             }
         }

@@ -515,17 +515,25 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
         ));
     }
     let lock_path = directory.join("worker.lock");
-    let lock_metadata = fs::symlink_metadata(&lock_path)?;
-    if is_link_or_reparse(&lock_metadata) || !lock_metadata.is_file() {
-        return Err(Error::invalid("CheckRun worker lock is not a regular file"));
-    }
-    let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-    }
+    let lock = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if !is_link_or_reparse(&metadata) && metadata.is_file() => {
+            match OpenOptions::new().read(true).write(true).open(&lock_path) {
+                Ok(lock) => match lock.try_lock() {
+                    Ok(()) => Some(lock),
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::fs::TryLockError::Error(_)) => None,
+                },
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
     let family_departed = matches!(departed_empty(&identity["process"], &work.token), Ok(true));
+    if lock.is_none() && !family_departed {
+        // An absent or unusable lock cannot establish that the executor stopped
+        // writing. Wait for positive departure of this exact accepted process.
+        return Ok(None);
+    }
 
     if execution_path.try_exists()? {
         let receipt: ExecutionReceipt =
@@ -653,7 +661,11 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
         )
         .map(Some);
     }
-    Ok(None)
+    // With no execution/failure receipt, recover only after the exact accepted
+    // worker family was observed empty. Drop an acquired lock before the helper
+    // takes its own lock and independently rechecks the same owner and family.
+    drop(lock);
+    worker::recover(work, files)
 }
 
 fn build_completion(
@@ -1411,4 +1423,212 @@ fn sha256_file(path: &Path) -> Result<String> {
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::{
+        artifacts::ArtifactRecord,
+        checks::{model::Parser, worker::write_once},
+        model,
+    };
+    use std::{
+        collections::BTreeMap,
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const OWNER_CHILD_MODE: &str = "SWARM_CHECK_OWNER_FIXTURE";
+    const OWNER_CHILD_PATH: &str = "SWARM_CHECK_OWNER_FIXTURE_PATH";
+    const OWNER_CHILD_TOKEN: &str = "SWARM_CHECK_OWNER_FIXTURE_TOKEN";
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    fn fixture() -> (PathBuf, Work) {
+        let root = std::env::temp_dir().join(format!("swarm-check-finalize-{}", model::new_id()));
+        fs::create_dir_all(root.join("checks")).unwrap();
+        let work = Work {
+            check_id: model::new_id(),
+            operation_id: model::new_id(),
+            token: model::new_id(),
+            data_dir: root.clone(),
+            candidate: ArtifactRecord {
+                kind: "source_snapshot".into(),
+                artifact_id: "candidate-test".into(),
+                relative_path: "artifacts/candidate-test".into(),
+                byte_length: 0,
+                content_digest: "digest".into(),
+                metadata: json!({}),
+            },
+            profile: crate::checks::model::CheckProfile {
+                profile_id: "profile-test".into(),
+                profile_revision: "1".into(),
+                executable: "test-command-must-not-run".into(),
+                args: Vec::new(),
+                parser: Parser::ExitCode,
+                resource: "target".into(),
+                environment: Default::default(),
+                inherit_env: Vec::new(),
+                expected_targets: Vec::new(),
+                reproducible: false,
+                fingerprint_env: Vec::new(),
+                versioned_inputs: BTreeMap::new(),
+            },
+            executor: None,
+            resolved_inputs: None,
+            scope_plan: None,
+            input_fingerprint: None,
+            preflight_error: None,
+            cancel_request: None,
+            expected_worker: None,
+            launch: None,
+        };
+        fs::create_dir_all(check_directory(&work, true).unwrap()).unwrap();
+        (root, work)
+    }
+
+    fn spawn_owner(token: &str, identity_path: &Path) -> ChildGuard {
+        ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("accepted_check_owner_process_child")
+                .arg("--nocapture")
+                .env(OWNER_CHILD_MODE, "hold")
+                .env(OWNER_CHILD_PATH, identity_path)
+                .env(OWNER_CHILD_TOKEN, token)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn wait_for_identity(child: &mut ChildGuard, path: &Path) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(bytes) = fs::read(path)
+                && let Ok(identity) = serde_json::from_slice(&bytes)
+            {
+                return identity;
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("process-group fixture exited before publishing identity: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+                panic!("process-group fixture did not publish identity");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn worker_identity(token: &str, process: Value) -> Value {
+        json!({
+            "token":token,
+            "process":process,
+            "ready_at_ms":1,
+            "control_version":2
+        })
+    }
+
+    fn publish_worker(work: &Work, identity: &Value) {
+        write_once(
+            &check_directory(work, false).unwrap().join("worker.json"),
+            identity,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_and_unusable_lock_hold_live_owner_then_exact_departure_recovers_incomplete() {
+        let (root, mut work) = fixture();
+        let identity_path = root.join("owner-process.json");
+        let mut child = spawn_owner(&work.token, &identity_path);
+        let process = wait_for_identity(&mut child, &identity_path);
+        let identity = worker_identity(&work.token, process);
+        work.expected_worker = Some(identity.clone());
+        publish_worker(&work, &identity);
+        let files = ArtifactFiles::new(&work.data_dir).unwrap();
+        let directory = check_directory(&work, false).unwrap();
+
+        // A missing lock and a non-file lock are both inconclusive while this
+        // exact accepted process family is still alive.
+        assert!(finalize_execution(&work, &files).unwrap().is_none());
+        fs::create_dir(directory.join("worker.lock")).unwrap();
+        assert!(finalize_execution(&work, &files).unwrap().is_none());
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let completion = finalize_execution(&work, &files)
+            .unwrap()
+            .expect("departed accepted owner should be durably recovered");
+        assert_eq!(completion.state, "incomplete");
+        assert_eq!(completion.exit_code, None);
+        assert!(completion.resource_released);
+        assert!(directory.join("completion.json").is_file());
+        let retained = worker::completion(&work, &files)
+            .unwrap()
+            .expect("completion readback must validate the durable record");
+        assert_eq!(retained.state, "incomplete");
+        let result: Value =
+            serde_json::from_slice(&files.document_bytes(&retained.result).unwrap()).unwrap();
+        assert_eq!(result["recovery"]["command_replayed"], false);
+        assert!(!directory.join("stdout").exists());
+        assert!(!directory.join("stderr").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wrong_accepted_worker_identity_cannot_settle_a_live_receipt() {
+        let (root, mut work) = fixture();
+        let first_path = root.join("first-process.json");
+        let second_path = root.join("second-process.json");
+        let mut first = spawn_owner(&work.token, &first_path);
+        let first_process = wait_for_identity(&mut first, &first_path);
+        let mut second = spawn_owner(&work.token, &second_path);
+        let second_process = wait_for_identity(&mut second, &second_path);
+
+        let receipt = worker_identity(&work.token, first_process);
+        // This is a real owner receipt for a different live process. It is not
+        // a numeric-PID guess or reconstructed departure authority.
+        work.expected_worker = Some(worker_identity(&work.token, second_process));
+        publish_worker(&work, &receipt);
+        let files = ArtifactFiles::new(&work.data_dir).unwrap();
+        let directory = check_directory(&work, false).unwrap();
+
+        let error = finalize_execution(&work, &files).unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        assert!(!directory.join("completion.json").exists());
+
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        second.0.kill().unwrap();
+        second.0.wait().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepted_check_owner_process_child() {
+        if std::env::var(OWNER_CHILD_MODE).ok().as_deref() != Some("hold") {
+            return;
+        }
+        let token = std::env::var(OWNER_CHILD_TOKEN).unwrap();
+        let path = std::env::var_os(OWNER_CHILD_PATH).unwrap();
+        let group = swarm_process::Group::enter(&token).unwrap();
+        fs::write(path, serde_json::to_vec(&group.identity).unwrap()).unwrap();
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
 }

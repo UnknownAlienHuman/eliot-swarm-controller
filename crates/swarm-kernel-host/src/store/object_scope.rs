@@ -789,6 +789,73 @@ pub(crate) fn resolve_launch_diagnostic_read(
     explicit_launch_diagnostic_relation(db, principal, &operation, identity.as_ref())
 }
 
+/// Permit only the bounded task.dispatch execution card. This does not change
+/// the OperationReadGrant or any launch/read/list grant.
+pub(crate) fn resolve_task_dispatch_diagnostic_read(
+    db: &Connection,
+    principal: &Principal,
+    operation_id: &str,
+) -> Result<bool> {
+    if !registered_manager(db, principal)? {
+        return Ok(false);
+    }
+    let Some(operation) = load_operation(db, operation_id)? else {
+        return Ok(false);
+    };
+    if operation.method != "task.dispatch" {
+        return Ok(false);
+    }
+    let Some(identity) = operation_task_identity(db, &operation)? else {
+        return Ok(false);
+    };
+    let Some(attempt_id) = identity.attempt_id.as_deref() else {
+        return Ok(false);
+    };
+    // Require the exact frozen Attempt generation. A task.dispatch receipt
+    // without the full pair may still have a base Receipt, never this card.
+    if identity.binding_id.is_none()
+        || identity
+            .binding_generation
+            .is_none_or(|generation| generation <= 0)
+        || operation.binding_id.as_deref() != identity.binding_id.as_deref()
+        || operation.binding_generation != identity.binding_generation
+    {
+        return Err(identity_damaged(
+            "task.dispatch diagnostic has no exact Attempt binding generation",
+        ));
+    }
+    let owner: Option<String> = db
+        .query_row(
+            "SELECT owner_id FROM attempts WHERE attempt_id=?1 AND task_id=?2 AND task_revision=?3",
+            params![
+                attempt_id,
+                identity.task_id,
+                identity.task_revision.ok_or_else(|| {
+                    identity_damaged("task.dispatch Attempt has no frozen revision")
+                })?
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let owner = owner.ok_or_else(|| {
+        identity_damaged("task.dispatch diagnostic Attempt owner is not retained")
+    })?;
+    if owner == principal.client_id {
+        return Ok(true);
+    }
+    if !current_gm_for_read(db)?.is_some_and(|current| current.client_id == principal.client_id) {
+        return Ok(false);
+    }
+    Ok(
+        resolve_task_read(db, principal, &identity, TaskReadLevel::Evidence)?.is_some_and(
+            |grant| {
+                grant.basis == TaskReadBasis::CurrentGmProjectScope
+                    && grant.level >= TaskReadLevel::Evidence
+            },
+        ),
+    )
+}
+
 /// Resolve one Operation read. `Ok(None)` means no positive relation exists.
 ///
 /// The exact caller receives a bounded Receipt, never a global Diagnostic and never

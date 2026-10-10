@@ -300,17 +300,21 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
         "SELECT pos.observation_id,pos.source_event_key FROM observations AS pos JOIN {table} AS target ON target.{key}=pos.source_event_key WHERE pos.source_stream_id=?1 AND pos.observation_id>?2 {condition} ORDER BY pos.observation_id LIMIT ?4"
     );
     let mut statement = db.prepare(&sql)?;
+    // The source scan remains bounded independently of the requested visible
+    // page size. Unauthorized rows advance coverage without consuming a slot.
+    let scan_limit = projection::MAX_PROJECTED_ITEMS as i64;
     let rows = statement
-        .query_map(params![kind.source(), after, state, limit + 1], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![kind.source(), after, state, scan_limit + 1],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut examined = after;
     let mut before = Vec::new();
     let mut projected = Vec::new();
     let mut filtered = Vec::new();
     let mut damaged = Vec::new();
-    for (position, id) in rows.iter().take(limit as usize) {
+    for (position, id) in rows.iter().take(scan_limit as usize) {
         let value = match kind {
             ObjectKind::Task => task(db, p, id),
             ObjectKind::Operation => operation(db, p, id),
@@ -335,6 +339,9 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
             }
             Err(error) => return Err(error),
         };
+        if projected.len() == limit as usize {
+            break;
+        }
         before.push(examined);
         value["cursor"] = json!(position);
         projected.push(value);
@@ -351,7 +358,7 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
     } else {
         examined
     };
-    let has_newer = limited.stopped_early || rows.len() > limit as usize;
+    let has_newer = limited.stopped_early || rows.iter().any(|(position, _)| *position > next);
     Ok(
         json!({"items":limited.items,"next_after":next,"pagination":"committed_observation_position",
         "examined_through":next,"filtered_count":filtered.iter().filter(|position| **position<=next).count(),
@@ -454,9 +461,10 @@ pub(super) fn timeline(
         super::require_local_operator(db, &p.client_id)?;
     }
     let sql = format!(
-        "SELECT o.observation_id,o.kind,o.payload_json,o.recorded_at_ms,o.operation_id FROM observations AS o {TIMELINE_CANDIDATE_SQL} ORDER BY o.observation_id LIMIT ?5"
+        "SELECT o.observation_id,o.kind,o.recorded_at_ms,o.operation_id FROM observations AS o {TIMELINE_CANDIDATE_SQL} ORDER BY o.observation_id LIMIT ?5"
     );
     let mut statement = db.prepare(&sql)?;
+    let scan_limit = projection::MAX_PROJECTED_ITEMS as i64;
     let rows = statement
         .query_map(
             params![
@@ -464,16 +472,15 @@ pub(super) fn timeline(
                 mailbox_only,
                 p.client_id,
                 operator,
-                limit + 1,
+                scan_limit + 1,
                 through
             ],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )?
@@ -483,7 +490,7 @@ pub(super) fn timeline(
     let mut filtered = Vec::new();
     let mut damaged = Vec::new();
     let mut entries = Vec::new();
-    for (cursor, kind, raw, time, operation_id) in rows.iter().take(limit as usize) {
+    for (cursor, kind, time, operation_id) in rows.iter().take(scan_limit as usize) {
         let projected: Result<Option<Value>> = (|| {
             let grant = if let Some(id) = operation_id {
                 let Some(grant) = object_scope::resolve_operation_read(db, p, id)? else {
@@ -493,7 +500,14 @@ pub(super) fn timeline(
             } else {
                 None
             };
-            let retained: Value = serde_json::from_str(raw).map_err(|_| {
+            // The candidate scan retains metadata only. Load a payload only
+            // after the exact receipt grant allows its projection.
+            let raw: String = db.query_row(
+                "SELECT payload_json FROM observations WHERE observation_id=?1",
+                [cursor],
+                |row| row.get(0),
+            )?;
+            let retained: Value = serde_json::from_str(&raw).map_err(|_| {
                 Error::new(
                     "OBSERVATION_DAMAGED",
                     "retained observation payload is invalid",
@@ -534,6 +548,11 @@ pub(super) fn timeline(
             }
             Err(error) => return Err(error),
         };
+        // Hidden observations advance coverage even after the visible page
+        // fills; stop before consuming the next authorized observation.
+        if entries.len() == limit as usize {
+            break;
+        }
         before.push(examined);
         entries.push(entry);
         examined = *cursor;
@@ -554,9 +573,9 @@ pub(super) fn timeline(
         json!({"after":after,"next_cursor":next,"examined_through":next,
             "filtered_count":filtered.iter().filter(|cursor| **cursor<=next).count()}),
         &limited,
-        limit,
+        scan_limit + 1,
         after > 0,
-        limited.stopped_early || rows.len() > limit as usize,
+        limited.stopped_early || rows.iter().any(|(cursor, ..)| *cursor > next),
         limited.gap_count == 0 && delivered_damage == 0,
         Vec::new(),
     )?;
@@ -583,6 +602,13 @@ fn project_scoped_observation(
     grant: object_scope::OperationReadGrant,
 ) -> Result<Value> {
     let fields: &[&str] = match kind {
+        "operation.rejected" | "operation.outcome_unknown" | "operation.cancelled" => &[
+            "schema_version",
+            "phase",
+            "status",
+            "occurrence_id",
+            "error_code",
+        ],
         "coordination.contract_ratified" | "coordination.contract_rejected" => &[
             "thread_id",
             "proposal_id",

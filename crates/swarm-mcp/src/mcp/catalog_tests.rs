@@ -3,25 +3,26 @@ use super::{
     list_tools_page, search_catalog,
 };
 use crate::config::McpToolProfile;
+use swarm_contracts::mcp_catalog::{ToolAudience, metadata_for};
 
 #[test]
 fn published_pr_description_effect_is_manual_and_manager_scoped() {
     let method = "github.pull_request.update_description";
-    let entry = super::metadata_for(method).expect("PR write effect is discoverable");
+    let entry = metadata_for(method).expect("PR write effect is discoverable");
     assert_eq!(entry.method, method);
     assert_eq!(entry.load_tier, super::LoadTier::ManualOnly);
-    assert!(entry.audiences.contains(&super::ToolAudience::Manager));
-    assert!(entry.audiences.contains(&super::ToolAudience::GmOperator));
+    assert!(entry.audiences.contains(&ToolAudience::Manager));
+    assert!(entry.audiences.contains(&ToolAudience::GmOperator));
 }
 
 #[test]
 fn pr_description_readback_reconcile_is_manual_and_current_manager_scoped() {
     let method = "github.pull_request.reconcile_description";
-    let entry = super::metadata_for(method).expect("PR readback reconciliation is discoverable");
+    let entry = metadata_for(method).expect("PR readback reconciliation is discoverable");
     assert_eq!(entry.method, method);
     assert_eq!(entry.load_tier, super::LoadTier::ManualOnly);
-    assert!(entry.audiences.contains(&super::ToolAudience::Manager));
-    assert!(entry.audiences.contains(&super::ToolAudience::GmOperator));
+    assert!(entry.audiences.contains(&ToolAudience::Manager));
+    assert!(entry.audiences.contains(&ToolAudience::GmOperator));
 }
 
 #[test]
@@ -52,12 +53,11 @@ fn drifted_metadata_uses_exact_executable_input_fields() {
     ];
 
     for (method, expected_fields, expected_context) in cases {
-        let metadata = super::metadata_for(method).expect("method metadata exists");
+        let metadata = metadata_for(method).expect("method metadata exists");
         let (_, spec) = super::find_spec(method).expect("method ToolSpec exists");
         assert_eq!(metadata.required_input_fields, *expected_fields, "{method}");
         assert_eq!(metadata.required_context, *expected_context, "{method}");
         assert_eq!(metadata.required_input_fields, spec.required, "{method}");
-        assert!(super::metadata_input_contract_matches(metadata, spec));
     }
     super::validate_registry_metadata().expect("typed metadata matches executable schemas");
 }

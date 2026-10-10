@@ -6078,14 +6078,67 @@ mod script_event_trigger_tests {
             }),
         )
         .unwrap();
+        let artifact = json!({
+            "artifact_id":"accepted-event-artifact",
+            "version":"1.0.0",
+        });
+        let descriptor = json!({
+            "schema_version":1,
+            "module_id":MODULE_ID,
+            "artifact":artifact,
+            "launch":{
+                "executable":std::env::current_exe().unwrap().display().to_string(),
+                "argv":[],
+                "environment":[],
+                "credential_ref":"host.module-binding-credential",
+                "working_directory":null,
+                "inherited_environment_allowlist":[],
+                "executable_sha256":null
+            },
+            "protocol":{"minimum":{"major":1,"minor":0},"maximum":{"major":1,"minor":0}},
+            "lifecycle":"owned_service",
+            "activation":"on_demand",
+            "enabled":true,
+            "event_schemas":[swarm_contracts::module_contract::runtime_outcome_schema()],
+        });
+        let module_selector = json!({
+            "schema_version":1,
+            "module_id":MODULE_ID,
+            "artifact":descriptor["artifact"],
+            "registered_revision":1,
+            "selected_revision":1,
+        });
+        super::super::set_meta(
+            &db,
+            "module_catalog:trusted_descriptors:v1",
+            &json!({
+                "schema_version":1,
+                "revision":1,
+                "descriptors":[{"registered_revision":1,"descriptor":descriptor}],
+                "selections":{},
+            }),
+        )
+        .unwrap();
         let binding_state = json!({
             "module_client_id":MODULE_ID,
-            "module_link_id":MODULE_LINK_ID
+            "module_link_id":MODULE_LINK_ID,
+            "module_contract_selector":module_selector,
         });
         db.execute(
             "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) \
-             VALUES(?1,1,'accepted-event-lane','accepted-event-instance','accepted-event-artifact','ready',NULL,NULL,'{}',?2,1)",
-            params![BINDING_ID, model::canonical(&binding_state).unwrap()],
+             VALUES(?1,1,'accepted-event-lane','accepted-event-instance','accepted-event-artifact','ready',NULL,NULL,?3,?2,1)",
+            params![
+                BINDING_ID,
+                model::canonical(&binding_state).unwrap(),
+                model::canonical(&json!({"runtime":"module"})).unwrap(),
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,binding_id,binding_generation,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) \
+             VALUES('accepted-event-agent-open',?1,'accepted-event-open','agent.open','{}','{}',?2,1,'settled',?3,1,1,1,1)",
+            params![MANAGER_ID, BINDING_ID,
+                model::canonical(&json!({"operation_id":"accepted-event-agent-open","state":"settled"})).unwrap()],
         )
         .unwrap();
         db.execute(
@@ -6105,6 +6158,32 @@ mod script_event_trigger_tests {
             client_id: MODULE_ID.to_owned(),
             role: Role::Module,
         };
+        let original_request_raw: String = db
+            .query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [ACCEPTED_OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_request: serde_json::Value =
+            serde_json::from_str(&original_request_raw).unwrap();
+        let module_receipt = json!({
+            "schema_version":1,
+            "module_id":MODULE_ID,
+            "artifact":{
+                "artifact_id":"accepted-event-artifact",
+                "version":"1.0.0",
+            },
+            "protocol":{"major":1,"minor":0},
+            "binding_id":BINDING_ID,
+            "binding_generation":1,
+            "operation_id":ACCEPTED_OPERATION_ID,
+            "input_sha256":model::digest(
+                model::canonical(&original_request)
+                    .unwrap()
+                    .as_bytes()
+            ),
+        });
         for (index, receipt_detail) in ["first receipt", "second receipt"].iter().enumerate() {
             super::super::runtime::outcome(
                 &mut db,
@@ -6120,7 +6199,8 @@ mod script_event_trigger_tests {
                         "private_native_detail":PRIVATE_DETAIL,
                         "oversized_private_detail":if index == 0 { PRIVATE_DETAIL } else { oversized_private_detail.as_str() },
                         "private_link_id":MODULE_LINK_ID,
-                        "receipt_note":receipt_detail
+                        "receipt_note":receipt_detail,
+                        "module_receipt":module_receipt.clone()
                     }
                 }),
             )
@@ -6498,6 +6578,26 @@ mod script_event_trigger_tests {
                 "error_code":"OPERATION_CANCELLED"
             })
         );
+
+        let report = super::super::read(
+            &db,
+            &manager,
+            "report.delta",
+            &json!({"after":0,"limit":200}),
+            &Config::default(),
+        )
+        .unwrap();
+        let public_fact = report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["operation_id"] == TARGET_OPERATION_ID)
+            .expect("the authorized public timeline retains the cancellation fact");
+        assert_eq!(public_fact["kind"], "operation.cancelled");
+        assert_eq!(public_fact["payload"], payload);
+        let public_json = serde_json::to_string(public_fact).unwrap();
+        assert!(!public_json.contains(PRIVATE_CANCEL_REASON));
+        assert!(!public_json.contains(PRIVATE_TARGET_REQUEST));
 
         let app_config = Config::default();
         let first_state = {

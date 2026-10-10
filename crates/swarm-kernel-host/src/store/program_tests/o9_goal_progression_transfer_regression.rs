@@ -15,9 +15,35 @@ const GOAL_ID: &str = "o9-terminal-goal";
 const SOURCE_OPERATION_ID: &str = "o9-completed-native-goal-turn";
 const EVENT_STREAM_REPLAY_SUFFIX: &str = ":post-transfer-replay";
 
+fn fixture_route(directory: &std::path::Path) -> Value {
+    json!({
+        "alias":"o9-opencode-fixture",
+        "runtime":crate::runtime::opencode_v2::RUNTIME,
+        "module_artifact_id":"eliot-opencode-v2.http.1",
+        "enabled":true,
+        "native_options":{
+            "service_id":"o9-service",
+            "connection_file":directory.join("opencode.json").display().to_string(),
+            "expected_version":"1",
+            "directory":directory.display().to_string(),
+            "model":{"id":"o9-fixture-model","providerID":"o9-fixture-provider","variant":"default"}
+        }
+    })
+}
+
 #[tokio::test]
 async fn completed_goal_event_admits_once_and_remains_readable_across_transfer() {
-    let (owner, _directory, bootstrap) = super::start_store("o9-goal-transfer").await;
+    let fixture_directory = std::env::temp_dir().join(format!(
+        "eliot-o9-opencode-fixture-{}",
+        crate::model::new_id()
+    ));
+    let route = fixture_route(&fixture_directory);
+    let mut config = Config::default();
+    config
+        .routes
+        .push(serde_json::from_value(route.clone()).unwrap());
+    let (owner, _directory, bootstrap) =
+        super::start_store_with_config("o9-goal-transfer", config).await;
     super::seed_clients(&owner.store).await;
     let operator = owner.store.authenticate(bootstrap).await.unwrap();
     let former = super::principal("review-gm", Role::Manager);
@@ -39,19 +65,6 @@ async fn completed_goal_event_admits_once_and_remains_readable_across_transfer()
 
     let attempt_id = subject.attempt_id.clone();
     let binding_id_for_db = binding_id.clone();
-    let route = json!({
-        "alias":"o9-opencode-fixture",
-        "runtime":crate::runtime::opencode_v2::RUNTIME,
-        "module_artifact_id":"eliot-opencode-v2.http.1",
-        "enabled":true,
-        "native_options":{
-            "service_id":"o9-service",
-            "connection_file":"C:\\fixture\\opencode.json",
-            "expected_version":"1",
-            "directory":"C:\\fixture",
-            "model":{"id":"o9-fixture-model","providerID":"o9-fixture-provider","variant":"default"}
-        }
-    });
     let state = json!({
         "connection":"connected",
         "bridge_boot_id":"o9-fixture-boot",
@@ -319,9 +332,11 @@ async fn completed_goal_event_admits_once_and_remains_readable_across_transfer()
     assert_eq!(admitted_readback["state"], "queued");
     assert_eq!(admitted_readback["result"]["operation_id"], continuation_id);
     assert_eq!(admitted_readback["result"]["state"], "queued");
-    assert_eq!(
-        admitted_readback["result"]["native_admission"],
-        "not_observed"
+    assert!(
+        admitted_readback["result"]
+            .get("native_admission")
+            .is_none(),
+        "native admission stays outside the public operation receipt"
     );
 
     let (slot_count, slot, retained_link) = owner
@@ -465,9 +480,9 @@ async fn completed_goal_event_admits_once_and_remains_readable_across_transfer()
         .await
         .unwrap();
     assert_eq!(successor_operation_readback["method"], "agent.goal");
-    assert_eq!(
-        successor_operation_readback["caller_id"],
-        technical_requester
+    assert!(
+        successor_operation_readback.get("caller_id").is_none(),
+        "the scoped Operation receipt does not expose its retained issuer"
     );
 
     let successor_pass = owner.store.reconcile_automations_once().await.unwrap();

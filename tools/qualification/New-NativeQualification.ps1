@@ -31,6 +31,7 @@ param(
     [Parameter(Mandatory)][string] $ModuleOwnerHelperPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedModuleOwnerHelperSha256,
     [ValidateSet('OpenCode', 'Command', 'Codex', 'Antigravity', 'Claude')][string] $Adapter = 'OpenCode',
+    [Guid] $RunId,
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
     [string] $OpenCodeCommandTestModelRef = 'kilo/stepfun-step-5-preview-free',
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
@@ -448,9 +449,15 @@ function Assert-PublicCliHostSibling {
 }
 
 function New-PrivateRunDirectory {
-    param([Parameter(Mandatory)][string] $Parent)
-    $runId = [Guid]::NewGuid().ToString('D')
-    $path = Join-Path $Parent $runId
+    param([Parameter(Mandatory)][string] $Parent, [Guid] $RunId)
+    if ($PSBoundParameters.ContainsKey('RunId')) {
+        if ($RunId -eq [Guid]::Empty) { Stop-Qualification 'RUN_ID_EMPTY' }
+        $runIdText = $RunId.ToString('D')
+    }
+    else { $runIdText = [Guid]::NewGuid().ToString('D') }
+    $path = Join-Path $Parent $runIdText
+    $reservationPath = Join-Path $Parent ('.native-qualification-' + $runIdText + '.reserve')
+    if (Test-Path -LiteralPath $path) { Stop-Qualification 'RUN_DIRECTORY_ALREADY_EXISTS' }
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $security = [System.Security.AccessControl.DirectorySecurity]::new()
     $security.SetAccessRuleProtection($true, $false)
@@ -463,15 +470,36 @@ function New-PrivateRunDirectory {
         [System.Security.AccessControl.AccessControlType]::Allow
     )
     [void]$security.AddAccessRule($rule)
-    [void][System.IO.Directory]::CreateDirectory($path, $security)
-    [void](Assert-NoReparseTraversal $path)
-    $script:RunDirectory = $path
-    $script:RequestDirectory = Join-Path $path 'requests'
-    $script:StateDirectory = Join-Path $path 'state'
-    [void][System.IO.Directory]::CreateDirectory($script:RequestDirectory)
-    [void][System.IO.Directory]::CreateDirectory($script:StateDirectory)
-    $script:Report.run_id = $runId
-    Save-Report
+    $reservation = $null
+    try {
+        try {
+            $reservation = [System.IO.File]::Open(
+                $reservationPath,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+        }
+        catch [System.IO.IOException] { Stop-Qualification 'RUN_ID_NOT_FRESH' }
+        if (Test-Path -LiteralPath $path) { Stop-Qualification 'RUN_DIRECTORY_ALREADY_EXISTS' }
+        [void][System.IO.Directory]::CreateDirectory($path, $security)
+        [void](Assert-NoReparseTraversal $path)
+        $script:RunDirectory = $path
+        $script:RequestDirectory = Join-Path $path 'requests'
+        $script:StateDirectory = Join-Path $path 'state'
+        [void][System.IO.Directory]::CreateDirectory($script:RequestDirectory)
+        [void][System.IO.Directory]::CreateDirectory($script:StateDirectory)
+        $script:Report.run_id = $runIdText
+        Save-Report
+    }
+    finally {
+        if ($null -ne $reservation) {
+            $reservation.Dispose()
+            if (Test-Path -LiteralPath $reservationPath) {
+                try { [System.IO.File]::Delete($reservationPath) } catch { }
+            }
+        }
+    }
 }
 
 function Save-Report {
@@ -1155,22 +1183,15 @@ function Get-Operations {
     return [pscustomobject]@{ success = $false; code = 'OPERATION_PAGE_LIMIT'; items = @() }
 }
 
-function Get-ReceiptIdentity {
+function Test-PublicAppliedOperationReadback {
     param([Parameter(Mandatory)] $Operation, [Parameter(Mandatory)][string] $OperationId,
-        [Parameter(Mandatory)][string] $BindingId, [Parameter(Mandatory)][long] $Generation,
-        [Parameter(Mandatory)] $Contract, [AllowNull()][string] $ExpectedBuildId)
-    $outcome = $Operation.result
-    $receipt = $outcome.details.module_receipt
-    if ($null -eq $receipt -or $outcome.operation_id -ne $OperationId -or
-        $receipt.schema_version -ne 1 -or $receipt.module_id -ne $Contract.module_id -or
-        $receipt.artifact.artifact_id -ne $Contract.artifact_id -or $receipt.artifact.version -ne $Contract.version -or
-        $receipt.artifact.build_id -ne $ExpectedBuildId -or
-        $receipt.protocol.major -ne 1 -or $receipt.protocol.minor -ne 0 -or
-        $receipt.binding_id -ne $BindingId -or $receipt.binding_generation -ne $Generation -or
-        $receipt.operation_id -ne $OperationId -or [string]$receipt.input_sha256 -notmatch '\A[a-f0-9]{64}\z') {
-        return $false
-    }
-    return $true
+        [Parameter(Mandatory)][string] $Method, [Parameter(Mandatory)][string] $BindingId,
+        [Parameter(Mandatory)][long] $Generation)
+    $result = Get-OptionalField $Operation 'result'
+    return ($Operation.operation_id -ceq $OperationId -and $Operation.method -ceq $Method -and
+        $Operation.binding_id -ceq $BindingId -and [long]$Operation.binding_generation -eq $Generation -and
+        $null -ne $result -and (Get-OptionalField $result 'operation_id') -ceq $OperationId -and
+        (Get-OptionalField $result 'outcome') -ceq 'applied')
 }
 
 function Get-ExactAgentState {
@@ -1261,7 +1282,10 @@ try {
     Assert-PublicCliHostSibling -PublicCliBuild $publicCliBuild -HostLauncherBuild $hostLauncherBuild -HostBuild $hostBuild -HostSupervisorBuild $hostSupervisorBuild
     $script:ConfigPath = Assert-ExistingFile $HostConfigPath
     $outputRoot = Assert-ExistingDirectory $OutputRoot
-    New-PrivateRunDirectory -Parent $outputRoot
+    if ($PSBoundParameters.ContainsKey('RunId')) {
+        New-PrivateRunDirectory -Parent $outputRoot -RunId $RunId
+    }
+    else { New-PrivateRunDirectory -Parent $outputRoot }
     $taskPath = Assert-ExistingFile $TaskSpecPath
     $settingsPath = Assert-ExistingFile $LaunchSettingsPath
     $turnPath = Assert-ExistingFile $OneTurnTextPath
@@ -1596,8 +1620,8 @@ try {
             $parentOp.method -ne 'swarm.launch' -or $parentOp.task_id -ne $taskId -or $parentOp.attempt_id -ne $attemptId) {
             Start-Sleep -Milliseconds 750; continue
         }
-        if (-not (Get-ReceiptIdentity -Operation $openOp -OperationId ([string]$openOp.operation_id) -BindingId $bindingId -Generation $generation -Contract $contract -ExpectedBuildId $module.descriptor.artifact.build_id)) {
-            $launchReadbackFailure = 'OPEN_MODULE_RECEIPT_MISMATCH'
+        if (-not (Test-PublicAppliedOperationReadback -Operation $openOp -OperationId ([string]$openOps[0].operation_id) -Method 'agent.open' -BindingId $bindingId -Generation $generation)) {
+            $launchReadbackFailure = 'OPEN_PUBLIC_OPERATION_READBACK_MISMATCH'
             Start-Sleep -Milliseconds 750; continue
         }
         $agentState = Get-ExactAgentState -BindingId $bindingId -Generation $generation -TimeoutMilliseconds 30000
@@ -1626,10 +1650,19 @@ try {
     $openOperationId = [string]$readyProof.open.operation_id
     $bindingId = [string]$readyProof.binding_id
     $generation = [long]$readyProof.generation
-    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; typed_receipt = 'store_readback_identity_matches' }
+    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
     Add-Stage -Name 'module_open_and_hello' -Status 'passed' -Facts $script:Report.safe_facts.launch
 
     $script:CurrentStage = 'single_task_dispatch'
+    if ($Adapter -eq 'OpenCode') {
+        $script:Report.limits.unsupported = @($script:Report.limits.unsupported) + 'opencode_exact_assistant_parent_contract_unavailable'
+        $script:Report.safe_facts.native_result_readback = [ordered]@{
+            status = 'unavailable'
+            code = 'OPENCODE_PUBLIC_PARENT_CONTRACT_UNAVAILABLE'
+            agent_result_attempted = $false
+            reason = 'no exact assistant message selector is exposed by the pinned public contract'
+        }
+    }
     if (-not (Confirm-CodexStillAttached)) { Stop-Qualification 'CODEX_APP_SERVER_CHANGED_BEFORE_DISPATCH' }
     $dispatchParams = [ordered]@{ attempt_id = $attemptId; launch_operation_id = $parentOperationId; text = $oneTurnText; client_request_id = New-RequestId }
     $script:DispatchSubmitted = $true
@@ -1646,11 +1679,17 @@ try {
             if ($operationCall.completed -and $operationCall.exit_code -eq 0 -and $null -ne $operationCall.value) {
                 $candidate = $operationCall.value
                 if ($candidate.operation_id -ne $dispatchOperationId -or $candidate.method -ne 'task.dispatch' -or
-                    $candidate.task_id -ne $taskId -or $candidate.attempt_id -ne $attemptId) {
+                    $candidate.task_id -ne $taskId -or $candidate.attempt_id -ne $attemptId -or
+                    $candidate.binding_id -ne $bindingId -or [long]$candidate.binding_generation -ne $generation) {
                     $dispatchReadbackCode = 'DISPATCH_OPERATION_IDENTITY_MISMATCH'
                 }
                 else {
                     $dispatchOperation = $candidate
+                    $publicResult = Get-OptionalField $candidate 'result'
+                    $publicResultOperationId = Get-OptionalField $publicResult 'operation_id'
+                    if ($null -ne $publicResultOperationId -and $publicResultOperationId -ne $dispatchOperationId) {
+                        $dispatchReadbackCode = 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH'
+                    }
                     if ($candidate.state -in $terminalDispatchStates) { break }
                     if ($candidate.state -notin @('queued', 'sending', 'native_accepted')) { $dispatchReadbackCode = 'DISPATCH_OPERATION_STATE_UNKNOWN' }
                 }
@@ -1683,39 +1722,14 @@ try {
         $operationState = if ($rawOperationState -in $knownDispatchStates) { $rawOperationState } else { 'unknown' }
         $stateCode = if ($operationState -eq 'unknown') { 'DISPATCH_OPERATION_STATE_UNKNOWN' } else { $null }
         $operationResult = $dispatchOperation.result
-        $operationDetails = Get-OptionalField $operationResult 'details'
         $rawOutcomeValue = Get-OptionalField $operationResult 'outcome'
         $rawOutcome = if ($null -ne $rawOutcomeValue) { [string]$rawOutcomeValue } else { $null }
         $outcome = if ($rawOutcome -in @('accepted', 'applied', 'rejected', 'unknown')) { $rawOutcome } else { $null }
-        $diagnostic = $null
-        if ($null -ne $operationResult) {
-            $operationError = Get-OptionalField $operationResult 'error'
-            $errorData = Get-OptionalField $operationError 'data'
-            foreach ($candidateCode in @(
-                [string](Get-OptionalField $operationDetails 'diagnostic_code'),
-                [string](Get-OptionalField $errorData 'code'),
-                [string](Get-OptionalField $operationError 'code')
-            )) {
-                if ($candidateCode -match '\A[A-Z0-9_]{1,64}\z') { $diagnostic = $candidateCode; break }
-            }
-        }
-        if ($diagnostic -notmatch '\A[A-Z0-9_]{1,64}\z') { $diagnostic = $null }
-        $receiptVerified = $false
-        $receiptCode = $null
-        $moduleReceipt = Get-OptionalField $operationDetails 'module_receipt'
-        if ($null -ne $moduleReceipt) {
-            if (Get-ReceiptIdentity -Operation $dispatchOperation -OperationId $dispatchOperationId -BindingId $bindingId -Generation $generation -Contract $contract -ExpectedBuildId $module.descriptor.artifact.build_id) {
-                $receiptVerified = $true
-            }
-            else { $receiptCode = 'DISPATCH_MODULE_RECEIPT_MISMATCH' }
-        }
-        elseif ($outcome -eq 'applied') { $receiptCode = 'DISPATCH_MODULE_RECEIPT_MISSING' }
-        $isReceiptFailure = $null -ne $receiptCode
-        $isReadbackInconsistent = $isReceiptFailure -or $null -ne $stateCode
+        $isReadbackInconsistent = $null -ne $stateCode -or $dispatchReadbackCode -eq 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH'
         $script:Report.status = if ($isReadbackInconsistent) { 'dispatch_readback_inconsistent' } elseif ($operationState -in $terminalDispatchStates) { 'dispatch_readback_complete' } else { 'dispatch_pending' }
         $script:Report.qualification = 'not_qualified'
-        $safeDiagnostic = if ($receiptCode) { $receiptCode } elseif ($stateCode) { $stateCode } else { $diagnostic }
-        $dispatchFacts = [ordered]@{ task_id = $taskId; attempt_id = $attemptId; operation_id = [string]$dispatchOperation.operation_id; operation_state = $operationState; outcome = $outcome; diagnostic_code = $safeDiagnostic; module_receipt_verified = $receiptVerified; replayed = $false; codex_process_still_matches = $codexStillAttached }
+        $safeDiagnostic = if ($stateCode) { $stateCode } elseif ($dispatchReadbackCode -eq 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH') { $dispatchReadbackCode } else { $null }
+        $dispatchFacts = [ordered]@{ task_id = $taskId; attempt_id = $attemptId; operation_id = [string]$dispatchOperation.operation_id; operation_state = $operationState; outcome = $outcome; diagnostic_code = $safeDiagnostic; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get'; replayed = $false; codex_process_still_matches = $codexStillAttached }
         $stageStatus = if ($isReadbackInconsistent -or $operationState -eq 'outcome_unknown') { 'unknown' } elseif ($operationState -in @('settled', 'rejected', 'cancelled')) { 'observed' } else { 'pending' }
         Add-Stage -Name 'single_task_dispatch' -Status $stageStatus -Code $safeDiagnostic -Facts $dispatchFacts
         $script:Report.safe_facts.dispatch = $dispatchFacts

@@ -3252,9 +3252,11 @@ pub(crate) fn admit_work_dispatch(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    if preview["route"]["admission"]["decision"] == "hold" {
+    let admission: provider_conditions::RouteAdmissionProjection =
+        serde_json::from_value(preview["route"]["admission"].clone())?;
+    if let provider_conditions::RouteAdmissionDecision::Hold { code, .. } = admission.decision {
         return Ok(WorkDispatchOutcome::Pending {
-            reason: model::text(&preview["route"]["admission"], "code")?.to_owned(),
+            reason: code,
             wake_when: vec!["launch_readiness_changed".to_owned()],
         });
     }
@@ -5131,8 +5133,7 @@ fn launch_preview_inner(
             })
             .map(|(id, generation)| super::operations::get_binding(db, id, generation))
             .transpose()?;
-        let current = route_admission(db, selected, binding.as_ref(), exclude_operation_id)?;
-        let mut admission = serde_json::to_value(&current)?;
+        let mut admission = route_admission(db, selected, binding.as_ref(), exclude_operation_id)?;
         if let Some(operation_id) = exclude_operation_id {
             let retained: Option<String> = db.query_row(
                 "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
@@ -5146,24 +5147,20 @@ fn launch_preview_inner(
                     // Keep immutable preview evidence in the plan digest.
                     // Current admission is checked separately before workspace
                     // reservation and before every new native effect.
-                    let _: provider_conditions::RouteAdmissionProjection =
-                        serde_json::from_value(original.clone())?;
-                    admission = original.clone();
+                    admission = serde_json::from_value(original.clone())?;
                 }
             }
         }
-        match admission["decision"].as_str() {
-            Some("admit") => {}
-            Some("hold") => hard_blocks.push("route_admission_held"),
-            Some("unavailable") => hard_blocks.push("route_admission_unavailable"),
-            _ => {
-                return Err(Error::new(
-                    "STORE_CORRUPT",
-                    "route admission decision is invalid",
-                ));
+        match &admission.decision {
+            provider_conditions::RouteAdmissionDecision::Admit => {}
+            provider_conditions::RouteAdmissionDecision::Hold { .. } => {
+                hard_blocks.push("route_admission_held")
+            }
+            provider_conditions::RouteAdmissionDecision::Unavailable { .. } => {
+                hard_blocks.push("route_admission_unavailable")
             }
         }
-        route["admission"] = admission;
+        route["admission"] = serde_json::to_value(admission)?;
     }
     let mcp_profile = launch_mcp_profile_projection(db, config, actor, &request, &mut hard_blocks)?;
     let baseline = workspace_baseline_projection(db, &row, spec.as_ref())?;

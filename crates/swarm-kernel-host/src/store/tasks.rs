@@ -94,7 +94,7 @@ fn attach_operation_scope(
     })?)?;
     if !matches!(
         operation["method"].as_str(),
-        Some("task.create" | "task.claim" | "task.release")
+        Some("task.create" | "task.claim" | "attempt.release")
     ) || operation["state"] != "queued"
     {
         return Err(Error::new(

@@ -216,7 +216,14 @@ async fn interrupted_host_retains_task_and_operation_for_successor_manager() {
             json!({"operation_id": operation_id}),
         )
         .await;
-    assert_eq!(before["result"], admission);
+    // operation.get exposes the closed durable receipt projection. `created`
+    // is an admission-time fact and is intentionally not part of that
+    // projection; bind the persisted receipt to its exact stable identity.
+    let retained_receipt = &before["result"];
+    assert_eq!(retained_receipt["operation_id"], operation_id);
+    assert_eq!(retained_receipt["task_id"], task_id);
+    assert_eq!(retained_receipt["revision"], 1);
+    assert!(retained_receipt.get("created").is_none());
     let task_before = fixture
         .call(&manager_a, "task.get", json!({"task_id": task_id}))
         .await;
@@ -265,6 +272,8 @@ async fn interrupted_host_retains_task_and_operation_for_successor_manager() {
             .await,
         task_before
     );
+    // Retrying the identical caller/request ID returns the original immutable
+    // mutation receipt, unlike operation.get's deliberately narrower projection.
     assert_eq!(
         fixture
             .call(&fixture.operator, "task.create", request)

@@ -25,10 +25,10 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader as AsyncBufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
     process::{Child, ChildStdin, Command as AsyncCommand},
     time::timeout,
 };
@@ -45,6 +45,44 @@ const MAX_BUN_STDERR_DIAGNOSTIC_BYTES: usize = 48 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const STOP_REQUEST_PREFIX: &str = "stop_deadline_unix_ms=";
+const MAX_STOP_REQUEST_BYTES: usize = 64;
+
+/// One cross-process deadline. The timestamp is created before launch
+/// preparation and carried unchanged in the private helper plan; foreground
+/// and helper waits therefore consume the same budget.
+#[derive(Clone, Copy)]
+struct SharedDeadline {
+    unix_millis: u64,
+}
+
+impl SharedDeadline {
+    fn after(duration: Duration) -> Result<Self> {
+        let delta = u64::try_from(duration.as_millis())
+            .map_err(|_| readback_error("owned service deadline is out of range"))?;
+        let unix_millis = unix_millis_now()?
+            .checked_add(delta)
+            .ok_or_else(|| readback_error("owned service deadline is out of range"))?;
+        Ok(Self { unix_millis })
+    }
+
+    fn remaining(self) -> Result<Duration> {
+        let now = unix_millis_now()?;
+        Ok(Duration::from_millis(self.unix_millis.saturating_sub(now)))
+    }
+
+    fn expired(self) -> Result<bool> {
+        Ok(self.remaining()?.is_zero())
+    }
+}
+
+fn unix_millis_now() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| readback_error("system clock cannot establish an owned-service deadline"))?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| readback_error("owned service clock is out of range"))
+}
 
 pub(crate) use super::mcp_plugin::{OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceSeed};
 
@@ -454,7 +492,7 @@ pub(crate) enum OwnedServiceStartFailure {
         stage: OwnedServiceStartStage,
         // Keep EOF from stopping a newly ready helper until Store has recorded
         // the bounded failure diagnostic against this exact start reservation.
-        helper_stdin: Option<ChildStdin>,
+        helper_stdin: Option<Box<ChildStdin>>,
     },
 }
 
@@ -692,7 +730,7 @@ pub(crate) struct OwnedServiceHandle {
     options: Options,
     service: Service,
     readback: OwnedServiceReadback,
-    helper: Option<Child>,
+    helper: Option<HelperChild>,
     helper_stdin: Option<ChildStdin>,
 }
 
@@ -714,13 +752,59 @@ impl OwnedServiceHandle {
                 "no retained foreground owner is available to stop this service",
             ));
         };
-        self.helper_stdin.take(); // EOF is the only graceful stop signal; never kill the service process.
-        let status = timeout(STOP_TIMEOUT, helper.wait()).await.map_err(|_| {
-            Error::new(
+        let deadline = match SharedDeadline::after(STOP_TIMEOUT) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                self.helper_stdin.take();
+                drop(helper);
+                return Err(error);
+            }
+        };
+        let Some(mut stdin) = self.helper_stdin.take() else {
+            drop(helper);
+            return Err(Error::new(
                 "OWNED_SERVICE_STOP_UNKNOWN",
-                "owned service graceful stop is not yet confirmed",
-            )
-        })??;
+                "owned service graceful stop request could not be delivered",
+            ));
+        };
+        let request = format!("{STOP_REQUEST_PREFIX}{}\n", deadline.unix_millis);
+        let write_budget = match deadline.remaining() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                drop(stdin);
+                drop(helper);
+                return Err(error);
+            }
+        };
+        if !matches!(
+            timeout(write_budget, stdin.write_all(request.as_bytes())).await,
+            Ok(Ok(()))
+        ) {
+            drop(stdin);
+            drop(helper);
+            return Err(Error::new(
+                "OWNED_SERVICE_STOP_UNKNOWN",
+                "owned service graceful stop request could not be delivered",
+            ));
+        }
+        drop(stdin); // EOF remains the only signal sent to the native server.
+        let remaining = match deadline.remaining() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                drop(helper);
+                return Err(error);
+            }
+        };
+        let status = match timeout(remaining, helper.child_mut().wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) | Err(_) => {
+                drop(helper);
+                return Err(Error::new(
+                    "OWNED_SERVICE_STOP_UNKNOWN",
+                    "owned service graceful stop is not yet confirmed",
+                ));
+            }
+        };
         if !status.success() {
             return Err(Error::new(
                 "OWNED_SERVICE_STOP_UNKNOWN",
@@ -734,10 +818,6 @@ impl OwnedServiceHandle {
 
 /// Start one foreground helper only after Store has durably authorized the
 /// effect. The helper enters the non-killing process Job before spawning Bun.
-#[expect(
-    clippy::result_large_err,
-    reason = "The failure retains the exact helper stdin until Store records its diagnostic; changing this ownership handoff could stop a ready helper too early."
-)]
 pub(crate) async fn start_foreground(
     prepared: PreparedOwnedService,
     mut permit: OwnedServiceStartPermit,
@@ -762,10 +842,16 @@ pub(crate) async fn start_foreground(
         ));
     }
     permit.consumed = true;
+    let startup_deadline = match SharedDeadline::after(START_TIMEOUT) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            return Err(start_failure(error, OwnedServiceStartStage::PreSpawn, None));
+        }
+    };
     if prepared.route.verify_files().is_err() {
         return Err(pre_spawn_failure(&prepared.route, &permit, false));
     }
-    let plan_path = match materialize_launch(&prepared) {
+    let plan_path = match materialize_launch(&prepared, startup_deadline) {
         Ok(plan_path) => plan_path,
         Err(failure) => {
             return Err(pre_spawn_failure(
@@ -781,6 +867,13 @@ pub(crate) async fn start_foreground(
             return Err(pre_spawn_failure(&prepared.route, &permit, true));
         }
     };
+    match startup_deadline.expired() {
+        Ok(false) => {}
+        Ok(true) => return Err(pre_spawn_failure(&prepared.route, &permit, true)),
+        Err(error) => {
+            return Err(start_failure(error, OwnedServiceStartStage::PreSpawn, None));
+        }
+    }
     let child = AsyncCommand::new(executable)
         .arg("owned-opencode-service")
         .arg("--file")
@@ -797,7 +890,13 @@ pub(crate) async fn start_foreground(
             // have started even when the parent could not observe its handle.
             start_failure(error.into(), OwnedServiceStartStage::HelperSpawn, None)
         })?;
-    complete_foreground_start(prepared, child, permit.provider_auth.take()).await
+    complete_foreground_start(
+        prepared,
+        child,
+        permit.provider_auth.take(),
+        startup_deadline,
+    )
+    .await
 }
 
 fn start_failure(
@@ -808,61 +907,169 @@ fn start_failure(
     OwnedServiceStartFailure::Unknown {
         error,
         stage,
-        helper_stdin,
+        helper_stdin: helper_stdin.map(Box::new),
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "The failure retains the exact helper stdin until Store records its diagnostic; changing this ownership handoff could stop a ready helper too early."
-)]
+fn start_failure_with_child(
+    error: Error,
+    stage: OwnedServiceStartStage,
+    helper_stdin: Option<ChildStdin>,
+    child: HelperChild,
+) -> OwnedServiceStartFailure {
+    drop(child);
+    start_failure(error, stage, helper_stdin)
+}
+
+/// Cancellation may drop a startup/stop future or an idle active handle. Keep
+/// its exact Child in custody in every case, using the existing exit observer.
+struct HelperChild {
+    child: Option<Child>,
+}
+
+impl HelperChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("helper custody keeps its child until Drop")
+    }
+}
+
+impl Drop for HelperChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            retain_helper_child(child);
+        }
+    }
+}
+
+/// Keep the exact helper process handle after a foreground startup timeout or
+/// uncertain receipt. Its durable helper receipt remains the only departure
+/// evidence; observing this Child exit never proves the service family left.
+fn retain_helper_child(mut child: Child) {
+    let mut stdout = child.stdout.take();
+    #[cfg(test)]
+    let child_id = child.id();
+    #[cfg(test)]
+    let observer_witness = child_id.and_then(deadline_contract_tests::take_child_exit_witness);
+    let observer = tokio::spawn(async move {
+        let mut discarded = [0; 4096];
+        loop {
+            if let Ok(Some(_status)) = child.try_wait() {
+                #[cfg(test)]
+                return (child_id, _status);
+                #[cfg(not(test))]
+                return;
+            }
+            if let Some(pipe) = stdout.as_mut() {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                    read = pipe.read(&mut discarded) => {
+                        if !matches!(read, Ok(count) if count > 0) {
+                            stdout = None;
+                        }
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    });
+    #[cfg(test)]
+    if let Some(witness) = observer_witness {
+        let _ = witness.send(observer);
+    } else {
+        drop(observer);
+    }
+    #[cfg(not(test))]
+    drop(observer);
+}
+
 async fn complete_foreground_start(
     prepared: PreparedOwnedService,
-    mut child: Child,
+    child: Child,
     provider_auth_permit: Option<provider_auth::ProviderAuthPermit>,
+    startup_deadline: SharedDeadline,
 ) -> std::result::Result<OwnedServiceHandle, OwnedServiceStartFailure> {
-    let Some(stdin) = child.stdin.take() else {
-        return Err(start_failure(
+    let mut child = HelperChild::new(child);
+    let Some(stdin) = child.child_mut().stdin.take() else {
+        return Err(start_failure_with_child(
             readback_error("owned service helper input is unavailable"),
             OwnedServiceStartStage::HelperInput,
             None,
+            child,
         ));
     };
-    let Some(stdout) = child.stdout.take() else {
-        return Err(start_failure(
+    if child.child_mut().stdout.is_none() {
+        return Err(start_failure_with_child(
             readback_error("owned service helper output is unavailable"),
             OwnedServiceStartStage::HelperInput,
             Some(stdin),
+            child,
         ));
-    };
-    let bounded_stdout = stdout.take((MAX_HANDSHAKE_BYTES + 1) as u64);
-    let mut reader = AsyncBufReader::new(bounded_stdout);
+    }
     let mut line = Vec::with_capacity(MAX_HANDSHAKE_BYTES);
-    let read_result = timeout(START_TIMEOUT, reader.read_until(b'\n', &mut line)).await;
+    let remaining = match startup_deadline.remaining() {
+        Ok(remaining) if !remaining.is_zero() => remaining,
+        Ok(_) => {
+            return Err(start_failure_with_child(
+                readback_error("owned service startup deadline expired before its ready receipt"),
+                OwnedServiceStartStage::ReadyReceipt,
+                Some(stdin),
+                child,
+            ));
+        }
+        Err(error) => {
+            return Err(start_failure_with_child(
+                error,
+                OwnedServiceStartStage::ReadyReceipt,
+                Some(stdin),
+                child,
+            ));
+        }
+    };
+    let read_result = {
+        // Borrow the pipe: cancellation drops only this bounded reader, while
+        // HelperChild retains the handle for its exact exit observer to drain.
+        let stdout = child
+            .child_mut()
+            .stdout
+            .as_mut()
+            .expect("helper stdout was checked before the bounded read");
+        let mut reader = AsyncBufReader::new(stdout.take((MAX_HANDSHAKE_BYTES + 1) as u64));
+        timeout(remaining, reader.read_until(b'\n', &mut line)).await
+    };
     let count = match read_result {
         Ok(Ok(count)) if count > 0 && count <= MAX_HANDSHAKE_BYTES => count,
         _ => {
-            return Err(start_failure(
+            return Err(start_failure_with_child(
                 readback_error("owned service helper did not publish a bounded ready receipt"),
                 OwnedServiceStartStage::ReadyReceipt,
                 Some(stdin),
+                child,
             ));
         }
     };
     if line[count - 1] != b'\n' {
-        return Err(start_failure(
+        return Err(start_failure_with_child(
             readback_error("owned service helper receipt is unterminated"),
             OwnedServiceStartStage::ReadyReceipt,
             Some(stdin),
+            child,
         ));
     }
     let value: Value = match serde_json::from_slice(&line[..count - 1]) {
         Ok(value) => value,
         Err(_) => {
-            return Err(start_failure(
+            return Err(start_failure_with_child(
                 readback_error("owned service helper receipt is invalid"),
                 OwnedServiceStartStage::ReadyReceipt,
                 Some(stdin),
+                child,
             ));
         }
     };
@@ -874,10 +1081,11 @@ async fn complete_foreground_start(
     ) {
         Ok(readback) => readback,
         Err(error) => {
-            return Err(start_failure(
+            return Err(start_failure_with_child(
                 error,
                 OwnedServiceStartStage::FromRoute,
                 Some(stdin),
+                child,
             ));
         }
     };
@@ -886,34 +1094,67 @@ async fn complete_foreground_start(
         || value["plugin_module_sha256"].as_str() != Some(prepared.plugin.module_sha256())
         || value["plugin_entrypoint_sha256"].as_str() != Some(prepared.plugin.entrypoint_sha256())
     {
-        return Err(start_failure(
+        return Err(start_failure_with_child(
             readback_error("ready receipt differs from the exact prepared plugin config"),
             OwnedServiceStartStage::FromRoute,
             Some(stdin),
+            child,
         ));
     }
-    let service = match Service::connect_owned(
-        &options,
-        readback.pid(),
-        readback.birth_token(),
-        readback.binary_sha256(),
-    )
-    .await
-    {
-        Ok(service) => service,
+    let remaining = match startup_deadline.remaining() {
+        Ok(remaining) if !remaining.is_zero() => remaining,
+        Ok(_) => {
+            return Err(start_failure_with_child(
+                readback_error("owned service startup deadline expired before owner connection"),
+                OwnedServiceStartStage::ConnectOwned,
+                Some(stdin),
+                child,
+            ));
+        }
         Err(error) => {
-            return Err(start_failure(
+            return Err(start_failure_with_child(
                 error,
                 OwnedServiceStartStage::ConnectOwned,
                 Some(stdin),
+                child,
+            ));
+        }
+    };
+    let service = match timeout(
+        remaining,
+        Service::connect_owned(
+            &options,
+            readback.pid(),
+            readback.birth_token(),
+            readback.binary_sha256(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(service)) => service,
+        Ok(Err(error)) => {
+            return Err(start_failure_with_child(
+                error,
+                OwnedServiceStartStage::ConnectOwned,
+                Some(stdin),
+                child,
+            ));
+        }
+        Err(_) => {
+            return Err(start_failure_with_child(
+                readback_error("owned service startup deadline expired during owner connection"),
+                OwnedServiceStartStage::ConnectOwned,
+                Some(stdin),
+                child,
             ));
         }
     };
     if let Err(error) = prepared.route.verify_files() {
-        return Err(start_failure(
+        return Err(start_failure_with_child(
             error,
             OwnedServiceStartStage::RouteVerify,
             Some(stdin),
+            child,
         ));
     }
     match (prepared.provider_credential, provider_auth_permit) {
@@ -921,43 +1162,99 @@ async fn complete_foreground_start(
             let provider_scope = match provider_auth_scope(&prepared.route, &readback.proof) {
                 Ok(scope) => scope,
                 Err(error) => {
-                    return Err(start_failure(
+                    return Err(start_failure_with_child(
                         error,
                         OwnedServiceStartStage::ProviderScope,
                         Some(stdin),
+                        child,
                     ));
                 }
             };
-            let provider_proof =
-                match provider_auth::bootstrap_once(&service, credential, permit, provider_scope)
-                    .await
-                {
-                    Ok(proof) => proof,
-                    Err(error) => {
-                        return Err(start_failure(
-                            error,
-                            OwnedServiceStartStage::Bootstrap,
-                            Some(stdin),
-                        ));
-                    }
-                };
+            let remaining = match startup_deadline.remaining() {
+                Ok(remaining) if !remaining.is_zero() => remaining,
+                Ok(_) => {
+                    return Err(start_failure_with_child(
+                        readback_error(
+                            "owned service startup deadline expired before provider bootstrap",
+                        ),
+                        OwnedServiceStartStage::Bootstrap,
+                        Some(stdin),
+                        child,
+                    ));
+                }
+                Err(error) => {
+                    return Err(start_failure_with_child(
+                        error,
+                        OwnedServiceStartStage::Bootstrap,
+                        Some(stdin),
+                        child,
+                    ));
+                }
+            };
+            let provider_proof = match timeout(
+                remaining,
+                provider_auth::bootstrap_once(&service, credential, permit, provider_scope),
+            )
+            .await
+            {
+                Ok(Ok(proof)) => proof,
+                Ok(Err(error)) => {
+                    return Err(start_failure_with_child(
+                        error,
+                        OwnedServiceStartStage::Bootstrap,
+                        Some(stdin),
+                        child,
+                    ));
+                }
+                Err(_) => {
+                    return Err(start_failure_with_child(
+                        readback_error(
+                            "owned service startup deadline expired during provider bootstrap",
+                        ),
+                        OwnedServiceStartStage::Bootstrap,
+                        Some(stdin),
+                        child,
+                    ));
+                }
+            };
             readback = match readback.with_provider_auth(&prepared.route, provider_proof) {
                 Ok(readback) => readback,
                 Err(error) => {
-                    return Err(start_failure(
+                    return Err(start_failure_with_child(
                         error,
                         OwnedServiceStartStage::ProviderProof,
                         Some(stdin),
+                        child,
                     ));
                 }
             };
         }
         (None, None) => {}
         _ => {
-            return Err(start_failure(
+            return Err(start_failure_with_child(
                 scope_error("provider credential and one-shot permission do not match"),
                 OwnedServiceStartStage::ProviderScope,
                 Some(stdin),
+                child,
+            ));
+        }
+    }
+    match startup_deadline.expired() {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(start_failure_with_child(
+                readback_error("owned service startup deadline expired before completion"),
+                OwnedServiceStartStage::ProviderProof,
+                Some(stdin),
+                child,
+            ));
+        }
+        Err(error) => {
+            return Err(start_failure_with_child(
+                error,
+                OwnedServiceStartStage::ProviderProof,
+                Some(stdin),
+                child,
             ));
         }
     }
@@ -1178,6 +1475,8 @@ pub(crate) async fn readback_retained(
 #[serde(deny_unknown_fields)]
 struct HelperPlan {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_deadline_unix_ms: Option<u64>,
     owner_nonce: String,
     service_id: String,
     version: String,
@@ -1207,6 +1506,7 @@ struct MaterializeFailure {
 
 fn materialize_launch(
     prepared: &PreparedOwnedService,
+    startup_deadline: SharedDeadline,
 ) -> std::result::Result<PathBuf, MaterializeFailure> {
     let route = &prepared.route;
     (|| -> Result<()> {
@@ -1249,6 +1549,7 @@ fn materialize_launch(
         write_private_new(&route.password_file, password.as_bytes())?;
         let plan = HelperPlan {
             schema_version: 1,
+            startup_deadline_unix_ms: Some(startup_deadline.unix_millis),
             owner_nonce: route.owner_nonce.clone(),
             service_id: route.service_id.clone(),
             version: VERSION.into(),
@@ -1285,10 +1586,29 @@ fn materialize_launch(
 pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     let plan = read_plan(plan_path)?;
     validate_plan(&plan, plan_path)?;
+    let startup_deadline = SharedDeadline {
+        unix_millis: plan
+            .startup_deadline_unix_ms
+            .ok_or_else(|| readback_error("owned helper launch plan has no startup deadline"))?,
+    };
+    let startup_remaining = startup_deadline.remaining()?;
+    if startup_remaining > START_TIMEOUT || startup_remaining.is_zero() {
+        return Err(Error::new(
+            "OWNED_SERVICE_START_UNKNOWN",
+            "owned helper startup deadline expired before process launch",
+        ));
+    }
     let consumed = plan.state_root.join(".owned-launch-consumed");
     write_private_new(&consumed, plan.owner_nonce.as_bytes())?;
     let _group = Group::enter_module(&plan.owner_nonce)?;
     let helper_observation = write_helper_observation(&plan)?;
+    let mut command = bun_command(&plan);
+    if startup_deadline.expired()? {
+        return Err(Error::new(
+            "OWNED_SERVICE_START_UNKNOWN",
+            "owned helper startup deadline expired before process launch",
+        ));
+    }
     write_helper_start_receipt(
         &plan,
         &helper_observation,
@@ -1297,7 +1617,6 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
         None,
         None,
     )?;
-    let mut command = bun_command(&plan);
     let mut bun = match command.spawn() {
         Ok(bun) => bun,
         Err(error) => {
@@ -1400,13 +1719,29 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
             "spawned owner process observation could not be retained",
         ));
     }
-    let ready = wait_for_ready(
+    let ready = match wait_for_ready(
         &plan,
         &mut bun,
         &helper_observation,
         spawned_pid,
         &stderr_capture,
-    )?;
+        startup_deadline,
+    ) {
+        Ok(ready) => ready,
+        Err(error) if error.code == "OWNED_SERVICE_START_UNKNOWN" => {
+            drop(bun.stdin.take());
+            let status = wait_for_bun_exit(&mut bun, startup_deadline);
+            let stopped_plan = verify_stopped_plan(&plan);
+            wait_for_family_empty(&_group, startup_deadline);
+            if status.success()
+                && let Ok(()) = stopped_plan
+            {
+                write_helper_family_stop(&plan, &helper_observation)?;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if ready.pid != observation.pid {
         return Err(readback_error(
             "ready owner PID differs from the spawned process",
@@ -1421,50 +1756,79 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     output.write_all(b"\n")?;
     output.flush()?;
 
-    // Parent EOF is the only stop request. No signal/kill fallback is used.
-    let stdin = std::io::stdin();
-    let mut discard = [0_u8; 1024];
-    loop {
-        match stdin.lock().read(&mut discard) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
+    // The parent sends its exact wait deadline, then EOF. Only EOF reaches the
+    // native server; no signal/kill fallback is used.
+    let stop_deadline = read_stop_deadline()?;
     drop(bun.stdin.take());
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    loop {
-        if let Some(status) = bun.try_wait()? {
-            if !status.success() {
-                return Err(Error::new(
-                    "OWNED_SERVICE_STOP_UNKNOWN",
-                    "pinned OpenCode owner exited without a confirmed stop",
-                ));
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "OWNED_SERVICE_STOP_UNKNOWN",
-                "pinned OpenCode owner stop receipt is not confirmed",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let status = wait_for_bun_exit(&mut bun, stop_deadline);
+    let stopped_plan = verify_stopped_plan(&plan);
+    wait_for_family_empty(&_group, stop_deadline);
+    if !status.success() {
+        return Err(Error::new(
+            "OWNED_SERVICE_STOP_UNKNOWN",
+            "pinned OpenCode owner exited without a confirmed stop",
+        ));
     }
-    verify_stopped_plan(&plan)?;
-    let family_deadline = Instant::now() + STOP_TIMEOUT;
-    while !_group.children_empty()? {
-        if Instant::now() >= family_deadline {
-            return Err(Error::new(
-                "OWNED_SERVICE_STOP_UNKNOWN",
-                "owned helper did not confirm its process family has exited",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    stopped_plan?;
     write_helper_family_stop(&plan, &helper_observation)?;
     Ok(())
+}
+
+fn read_stop_deadline() -> Result<SharedDeadline> {
+    let stdin = std::io::stdin();
+    let mut request = Vec::with_capacity(MAX_STOP_REQUEST_BYTES);
+    stdin
+        .lock()
+        .take((MAX_STOP_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut request)?;
+    if request.is_empty() {
+        // EOF after a failed request carries no usable foreground budget.
+        // Treat it as already expired and keep waiting without inventing one.
+        return Ok(SharedDeadline { unix_millis: 0 });
+    }
+    if request.len() > MAX_STOP_REQUEST_BYTES || request.last() != Some(&b'\n') {
+        return Ok(SharedDeadline { unix_millis: 0 });
+    }
+    let Ok(request) = std::str::from_utf8(&request[..request.len() - 1]) else {
+        return Ok(SharedDeadline { unix_millis: 0 });
+    };
+    let Some(timestamp) = request
+        .strip_prefix(STOP_REQUEST_PREFIX)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Ok(SharedDeadline { unix_millis: 0 });
+    };
+    Ok(SharedDeadline {
+        unix_millis: timestamp,
+    })
+}
+
+fn wait_for_bun_exit(
+    bun: &mut std::process::Child,
+    deadline: SharedDeadline,
+) -> std::process::ExitStatus {
+    loop {
+        if let Ok(Some(status)) = bun.try_wait() {
+            return status;
+        }
+        std::thread::sleep(stop_poll_interval(deadline));
+    }
+}
+
+fn wait_for_family_empty(group: &Group, deadline: SharedDeadline) {
+    loop {
+        if matches!(group.children_empty(), Ok(true)) {
+            return;
+        }
+        std::thread::sleep(stop_poll_interval(deadline));
+    }
+}
+
+fn stop_poll_interval(deadline: SharedDeadline) -> Duration {
+    match deadline.expired() {
+        Ok(false) => Duration::from_millis(100),
+        Ok(true) | Err(_) => Duration::from_millis(500),
+    }
 }
 
 fn bun_command(plan: &HelperPlan) -> Command {
@@ -1499,11 +1863,19 @@ fn wait_for_ready(
     helper_observation: &HelperObservation,
     spawned_pid: u32,
     stderr_capture: &Arc<Mutex<BunStderrCapture>>,
+    startup_deadline: SharedDeadline,
 ) -> Result<ReadyRecord> {
     let owner_path = plan.state_root.join("owner.json");
     let connection_path = &plan.connection_file;
-    let deadline = Instant::now() + START_TIMEOUT;
     loop {
+        if startup_deadline.expired()? {
+            return Err(readiness_timeout_error(
+                plan,
+                helper_observation,
+                spawned_pid,
+                stderr_capture,
+            ));
+        }
         match bun.try_wait() {
             Ok(Some(status)) => {
                 let _ = write_bun_stderr_diagnostic(
@@ -1559,6 +1931,14 @@ fn wait_for_ready(
             && connection.username == "opencode"
             && !connection.password.is_empty()
         {
+            if startup_deadline.expired()? {
+                return Err(readiness_timeout_error(
+                    plan,
+                    helper_observation,
+                    spawned_pid,
+                    stderr_capture,
+                ));
+            }
             let endpoint = validate_endpoint(&connection.endpoint, plan.port)?;
             return Ok(ReadyRecord {
                 pid: owner.pid,
@@ -1566,24 +1946,37 @@ fn wait_for_ready(
                 connection_digest,
             });
         }
-        if Instant::now() >= deadline {
-            let _ =
-                write_bun_stderr_diagnostic(plan, helper_observation, spawned_pid, stderr_capture);
-            let _ = write_helper_start_receipt(
+        if startup_deadline.expired()? {
+            return Err(readiness_timeout_error(
                 plan,
                 helper_observation,
-                HelperStartPhase::ReadinessTimedOut,
-                Some(spawned_pid),
-                None,
-                None,
-            );
-            return Err(Error::new(
-                "OWNED_SERVICE_START_UNKNOWN",
-                "pinned service did not publish matching owner and connection receipts",
+                spawned_pid,
+                stderr_capture,
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn readiness_timeout_error(
+    plan: &HelperPlan,
+    helper_observation: &HelperObservation,
+    spawned_pid: u32,
+    stderr_capture: &Arc<Mutex<BunStderrCapture>>,
+) -> Error {
+    let _ = write_bun_stderr_diagnostic(plan, helper_observation, spawned_pid, stderr_capture);
+    let _ = write_helper_start_receipt(
+        plan,
+        helper_observation,
+        HelperStartPhase::ReadinessTimedOut,
+        Some(spawned_pid),
+        None,
+        None,
+    );
+    Error::new(
+        "OWNED_SERVICE_START_UNKNOWN",
+        "pinned service did not publish matching owner and connection receipts before the shared deadline",
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -2740,6 +3133,7 @@ fn read_owned_files(route: &OwnedServiceRoute) -> Result<Option<OwnedServiceRead
     }
     let plan = HelperPlan {
         schema_version: 1,
+        startup_deadline_unix_ms: None,
         owner_nonce: route.owner_nonce.clone(),
         service_id: route.service_id.clone(),
         version: VERSION.into(),
@@ -3325,4 +3719,579 @@ fn source_error(message: &str) -> Error {
 }
 fn readback_error(message: &str) -> Error {
     Error::new("OWNED_SERVICE_READBACK", message)
+}
+
+#[cfg(test)]
+mod deadline_contract_tests {
+    use super::*;
+    use crate::{
+        model::{Principal, Role},
+        runtime::opencode_v2::tests::Fixture,
+        store::launcher::LaunchActor,
+    };
+    use std::{
+        collections::HashMap,
+        fs,
+        io::Read,
+        path::{Path, PathBuf},
+        process::Stdio,
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CHILD_FIXTURE_DIR: &str = "ELIOT_OPENCODE_CHILD_FIXTURE_DIR";
+    const CHILD_FIXTURE_MODE: &str = "ELIOT_OPENCODE_CHILD_FIXTURE_MODE";
+
+    pub(super) type ChildExitObserver =
+        tokio::task::JoinHandle<(Option<u32>, std::process::ExitStatus)>;
+
+    pub(super) type ChildExitWitness = tokio::sync::oneshot::Sender<ChildExitObserver>;
+
+    fn child_exit_witnesses() -> &'static Mutex<HashMap<u32, ChildExitWitness>> {
+        static WITNESSES: OnceLock<Mutex<HashMap<u32, ChildExitWitness>>> = OnceLock::new();
+        WITNESSES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn watch_child_exit(child_id: u32) -> tokio::sync::oneshot::Receiver<ChildExitObserver> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let previous = child_exit_witnesses()
+            .lock()
+            .unwrap()
+            .insert(child_id, sender);
+        assert!(previous.is_none(), "child exit witness already registered");
+        receiver
+    }
+
+    pub(super) fn take_child_exit_witness(child_id: u32) -> Option<ChildExitWitness> {
+        child_exit_witnesses().lock().unwrap().remove(&child_id)
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("eliot-owned-service-{label}-{}", model::new_id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ChildFixtureGuard(PathBuf);
+
+    impl ChildFixtureGuard {
+        fn new(directory: &TestDirectory) -> Self {
+            Self(directory.path().to_owned())
+        }
+
+        async fn release_and_wait(&self) {
+            fs::write(self.0.join("release"), b"release").unwrap();
+            wait_for_file(&self.0.join("done"), Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    impl Drop for ChildFixtureGuard {
+        fn drop(&mut self) {
+            let _ = fs::write(self.0.join("release"), b"release");
+            for _ in 0..250 {
+                if self.0.join("done").exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    async fn wait_for_file(path: &Path, budget: Duration) {
+        tokio::time::timeout(budget, async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child fixture should publish its marker");
+    }
+
+    async fn expect_observed_child_exit(mut observer: ChildExitObserver, child_id: u32) {
+        let (observed_child_id, status) = timeout(Duration::from_secs(5), &mut observer)
+            .await
+            .expect("the retained child observer should finish after helper exit")
+            .expect("the retained child observer should report its exit");
+        assert_eq!(
+            observed_child_id,
+            Some(child_id),
+            "observer retained the exact Child"
+        );
+        assert!(
+            status.success(),
+            "the exact helper fixture exited successfully"
+        );
+    }
+
+    async fn take_child_exit_observer(
+        observer: tokio::sync::oneshot::Receiver<ChildExitObserver>,
+    ) -> ChildExitObserver {
+        timeout(Duration::from_secs(5), observer)
+            .await
+            .expect("HelperChild Drop should transfer the observer JoinHandle")
+            .expect("the retained observer witness should remain connected")
+    }
+
+    async fn drain_fixture_harness_output(child: &mut Child) {
+        let mut stdout = child
+            .stdout
+            .take()
+            .expect("startup fixture stdout should be piped");
+        let mut banner = Vec::new();
+        let mut byte = [0; 1];
+        let read_banner = async {
+            loop {
+                let count = stdout.read(&mut byte).await?;
+                assert_eq!(count, 1, "libtest should remain active in the fixture");
+                banner.push(byte[0]);
+                assert!(banner.len() <= 512, "libtest banner should stay bounded");
+                if banner.ends_with(b"owned_service_child_fixture ... ") {
+                    break;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        timeout(Duration::from_secs(5), read_banner)
+            .await
+            .expect("libtest should emit its initial fixture banner within one bounded read")
+            .expect("libtest banner should be readable");
+        let banner = String::from_utf8(banner).unwrap();
+        let test_line = banner
+            .strip_prefix("running 1 test\n")
+            .or_else(|| banner.strip_prefix("\nrunning 1 test\n"))
+            .expect("only the initial one-test libtest banner is drained");
+        assert!(test_line.starts_with("test "));
+        child.stdout = Some(stdout);
+    }
+
+    async fn spawn_child_fixture(
+        directory: &TestDirectory,
+        capture_stdout: bool,
+        mode: &str,
+    ) -> Child {
+        let mut command = AsyncCommand::new(std::env::current_exe().unwrap());
+        command
+            .arg("owned_service_child_fixture")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_FIXTURE_DIR, directory.path())
+            .env(CHILD_FIXTURE_MODE, mode)
+            .stdin(Stdio::piped())
+            .stdout(if capture_stdout {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        let child = command.spawn().unwrap();
+        wait_for_file(&directory.path().join("ready"), Duration::from_secs(10)).await;
+        child
+    }
+
+    fn prepared_service(directory: &Path) -> PreparedOwnedService {
+        let workspace = directory.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let bun_executable = std::env::current_exe().unwrap();
+        let server_program = super::super::resource_paths::required_file("serve.mjs").unwrap();
+        let route = OwnedServiceRoute::from_config(&OwnedOpenCodeServiceConfig {
+            origin: "fresh_owned_service".into(),
+            service_id: "deadline-test-service".into(),
+            model: ModelRef {
+                id: "deadline-test-model".into(),
+                provider_id: "deadline-test-provider".into(),
+                variant: "explicit-test-variant".into(),
+            },
+            model_catalog: "offline".into(),
+            credential_ref: None,
+            bun_sha256: hash_file(&bun_executable, 512 * 1024 * 1024).unwrap(),
+            bun_executable,
+            server_program_sha256: hash_file(&server_program, 512 * 1024).unwrap(),
+            server_program,
+            state_root: directory.join("service-state"),
+            port: 43_721,
+        })
+        .unwrap()
+        .for_launch(&model::new_id(), &workspace)
+        .unwrap();
+        let intent = OwnedServiceIntent::from_store_admission(OwnedServiceSeed {
+            launch_operation_id: "op_deadline_launch".into(),
+            open_operation_id: "op_deadline_open".into(),
+            open_operation_state: "queued".into(),
+            actor: LaunchActor::Direct(Principal {
+                link_id: "link_deadline_test".into(),
+                client_id: "manager_deadline_test".into(),
+                role: Role::Manager,
+            }),
+            task_id: "task_deadline_test".into(),
+            task_revision: 1,
+            attempt_id: "attempt_deadline_test".into(),
+            lease_id: "lease_deadline_test".into(),
+            lease_state: "held".into(),
+            lease_generation: 1,
+            binding_id: "binding_deadline_test".into(),
+            binding_state: "opening".into(),
+            binding_generation: 1,
+            binding_digest: model::digest(b"deadline-test-binding"),
+            service_id: route.service_id.clone(),
+            service_version: VERSION.into(),
+            route_digest: route.route_digest().unwrap(),
+            owner_nonce: route.owner_nonce.clone(),
+            origin: OwnedServiceOrigin::FreshOwnedService,
+        })
+        .unwrap();
+        prepare_owned_service(&route, &intent).unwrap()
+    }
+
+    fn inert_route_for_stop_error() -> OwnedServiceRoute {
+        OwnedServiceRoute {
+            origin: OwnedServiceOrigin::FreshOwnedService,
+            base_service_id: "stop-test-service".into(),
+            service_id: "stop-test-service".into(),
+            model: ModelRef {
+                id: "stop-test-model".into(),
+                provider_id: "stop-test-provider".into(),
+                variant: "explicit-test-variant".into(),
+            },
+            model_catalog: "offline".into(),
+            credential_ref: None,
+            bun_executable: PathBuf::new(),
+            bun_sha256: String::new(),
+            server_program: PathBuf::new(),
+            server_program_sha256: String::new(),
+            base_state_root: PathBuf::new(),
+            state_root: PathBuf::new(),
+            port: 0,
+            owner_nonce: String::new(),
+            workspace_directory: PathBuf::new(),
+            password_file: PathBuf::new(),
+            connection_file: PathBuf::new(),
+            config_file: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn owned_service_child_fixture() {
+        let Some(directory) = std::env::var_os(CHILD_FIXTURE_DIR).map(PathBuf::from) else {
+            return;
+        };
+        fs::write(directory.join("ready"), b"ready").unwrap();
+        let mode = std::env::var(CHILD_FIXTURE_MODE).unwrap_or_default();
+        if mode == "read_stop" || mode == "read_stop_hold" {
+            let mut request = Vec::new();
+            std::io::stdin().lock().read_to_end(&mut request).unwrap();
+            fs::write(directory.join("request"), request).unwrap();
+        }
+        if mode == "read_stop" {
+            fs::write(directory.join("done"), b"done").unwrap();
+            return;
+        }
+        let fixture_deadline = Instant::now() + Duration::from_secs(45);
+        while !directory.join("release").exists() && Instant::now() < fixture_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(directory.join("done"), b"done").unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialized_start_deadline_is_shared_with_helper_before_spawn() {
+        let directory = TestDirectory::new("start-deadline");
+        let prepared = prepared_service(directory.path());
+        let deadline = SharedDeadline::after(Duration::from_millis(100)).unwrap();
+
+        let plan_path = match materialize_launch(&prepared, deadline) {
+            Ok(path) => path,
+            Err(_) => panic!("the actual helper plan should materialize"),
+        };
+        let plan = read_plan(&plan_path).unwrap();
+        assert_eq!(plan.startup_deadline_unix_ms, Some(deadline.unix_millis));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let error = run_owned_service_helper(&plan_path).unwrap_err();
+        assert_eq!(error.code, "OWNED_SERVICE_START_UNKNOWN");
+        assert!(
+            !prepared
+                .route
+                .state_root
+                .join(".owned-launch-consumed")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_start_budget_rejects_ready_readback_and_keeps_child_observable() {
+        let directory = TestDirectory::new("start-readback");
+        let deadline = SharedDeadline::after(Duration::from_millis(20)).unwrap();
+        let prepared = prepared_service(directory.path());
+        let child = spawn_child_fixture(&directory, true, "hold").await;
+        let guard = ChildFixtureGuard::new(&directory);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(deadline.expired().unwrap());
+
+        let failure = complete_foreground_start(prepared, child, None, deadline)
+            .await
+            .err();
+        let Some(OwnedServiceStartFailure::Unknown {
+            error,
+            stage,
+            helper_stdin,
+        }) = failure
+        else {
+            panic!("expired ready readback must remain an unknown start");
+        };
+        assert_eq!(stage.as_str(), "ready_receipt");
+        assert_eq!(error.code, "OWNED_SERVICE_READBACK");
+        assert!(helper_stdin.is_some());
+        assert!(!directory.path().join("done").exists());
+        drop(helper_stdin);
+        guard.release_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_startup_transfers_exact_child_to_exit_observer() {
+        let directory = TestDirectory::new("start-cancel");
+        let prepared = prepared_service(directory.path());
+        let mut child = spawn_child_fixture(&directory, true, "hold").await;
+        drain_fixture_harness_output(&mut child).await;
+        let child_id = child
+            .id()
+            .expect("fixture child should have a live process id");
+        let observer = watch_child_exit(child_id);
+        let guard = ChildFixtureGuard::new(&directory);
+
+        let startup = complete_foreground_start(
+            prepared,
+            child,
+            None,
+            SharedDeadline::after(Duration::from_secs(5)).unwrap(),
+        );
+        assert!(
+            timeout(Duration::from_millis(100), startup).await.is_err(),
+            "startup should be waiting for the helper ready receipt"
+        );
+        let mut exit_observer = take_child_exit_observer(observer).await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut exit_observer)
+                .await
+                .is_err(),
+            "the observer task must remain pending while the exact helper is live"
+        );
+
+        guard.release_and_wait().await;
+        expect_observed_child_exit(exit_observer, child_id).await;
+    }
+
+    #[tokio::test]
+    async fn stop_request_is_delivered_before_waiting_for_the_same_helper() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let directory = TestDirectory::new("stop-request");
+        let mut helper = spawn_child_fixture(&directory, false, "read_stop").await;
+        let helper_stdin = helper.stdin.take().unwrap();
+        let guard = ChildFixtureGuard::new(&directory);
+        let route = inert_route_for_stop_error();
+        let handle = OwnedServiceHandle {
+            options: route.options(),
+            route,
+            service,
+            readback: OwnedServiceReadback { proof: Value::Null },
+            helper: Some(HelperChild::new(helper)),
+            helper_stdin: Some(helper_stdin),
+        };
+
+        let outcome = timeout(Duration::from_secs(5), handle.close_gracefully())
+            .await
+            .expect("the helper should receive EOF and exit within the test bound");
+        if let Err(error) = outcome {
+            assert_ne!(error.code, "OWNED_SERVICE_STOP_UNKNOWN");
+        }
+        let request = fs::read_to_string(directory.path().join("request")).unwrap();
+        let deadline = request
+            .strip_prefix(STOP_REQUEST_PREFIX)
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.parse::<u64>().ok());
+        assert!(
+            deadline.is_some(),
+            "the real stop request carries its shared deadline"
+        );
+        assert!(directory.path().join("done").exists());
+        guard.release_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn blocked_stop_request_write_expires_within_shared_budget_and_retains_child() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let directory = TestDirectory::new("stop-write");
+        let mut helper = spawn_child_fixture(&directory, false, "hold").await;
+        let mut helper_stdin = helper.stdin.take().unwrap();
+        let guard = ChildFixtureGuard::new(&directory);
+
+        // The child deliberately does not read stdin. Fill its actual pipe so
+        // close_gracefully must apply the stop deadline to request delivery.
+        let chunk = vec![b'x'; 8 * 1024];
+        let mut bytes_written = 0;
+        while bytes_written < 8 * 1024 * 1024 {
+            match timeout(Duration::from_millis(250), helper_stdin.write(&chunk)).await {
+                Ok(Ok(count)) if count > 0 => bytes_written += count,
+                Err(_) => break,
+                Ok(Ok(_)) => panic!("child stdin closed while filling the pipe"),
+                Ok(Err(error)) => panic!("could not fill the child stdin pipe: {error}"),
+            }
+        }
+        assert!(
+            bytes_written < 8 * 1024 * 1024,
+            "child unexpectedly drained stdin"
+        );
+
+        let route = inert_route_for_stop_error();
+        let handle = OwnedServiceHandle {
+            options: route.options(),
+            route,
+            service,
+            readback: OwnedServiceReadback { proof: Value::Null },
+            helper: Some(HelperChild::new(helper)),
+            helper_stdin: Some(helper_stdin),
+        };
+        let started = Instant::now();
+        let result = timeout(
+            STOP_TIMEOUT + Duration::from_secs(5),
+            handle.close_gracefully(),
+        )
+        .await
+        .expect("stop request writing must be bounded by the shared deadline");
+        let elapsed = started.elapsed();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a saturated helper pipe cannot deliver the stop request"),
+        };
+        assert_eq!(error.code, "OWNED_SERVICE_STOP_UNKNOWN");
+        assert!(elapsed >= STOP_TIMEOUT - Duration::from_secs(2));
+        assert!(!directory.path().join("done").exists());
+
+        guard.release_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_blocked_stop_write_transfers_exact_child_to_exit_observer() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let directory = TestDirectory::new("stop-write-cancel");
+        let mut helper = spawn_child_fixture(&directory, false, "hold").await;
+        let child_id = helper
+            .id()
+            .expect("fixture child should have a live process id");
+        let mut helper_stdin = helper.stdin.take().unwrap();
+        let guard = ChildFixtureGuard::new(&directory);
+
+        let chunk = vec![b'x'; 8 * 1024];
+        let mut bytes_written = 0;
+        while bytes_written < 8 * 1024 * 1024 {
+            match timeout(Duration::from_millis(250), helper_stdin.write(&chunk)).await {
+                Ok(Ok(count)) if count > 0 => bytes_written += count,
+                Err(_) => break,
+                Ok(Ok(_)) => panic!("child stdin closed while filling the pipe"),
+                Ok(Err(error)) => panic!("could not fill the child stdin pipe: {error}"),
+            }
+        }
+        assert!(
+            bytes_written < 8 * 1024 * 1024,
+            "child unexpectedly drained stdin"
+        );
+        let probe = [b'x'];
+        assert!(
+            timeout(Duration::from_millis(50), helper_stdin.write(&probe))
+                .await
+                .is_err(),
+            "one more byte should block on the saturated helper pipe"
+        );
+
+        let observer = watch_child_exit(child_id);
+        let route = inert_route_for_stop_error();
+        let handle = OwnedServiceHandle {
+            options: route.options(),
+            route,
+            service,
+            readback: OwnedServiceReadback { proof: Value::Null },
+            helper: Some(HelperChild::new(helper)),
+            helper_stdin: Some(helper_stdin),
+        };
+        assert!(
+            timeout(Duration::from_millis(100), handle.close_gracefully())
+                .await
+                .is_err(),
+            "the stop request write should remain pending until cancellation"
+        );
+        let mut exit_observer = take_child_exit_observer(observer).await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut exit_observer)
+                .await
+                .is_err(),
+            "the observer task must remain pending while the exact helper is live"
+        );
+
+        guard.release_and_wait().await;
+        expect_observed_child_exit(exit_observer, child_id).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_stop_wait_transfers_exact_child_to_exit_observer() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let directory = TestDirectory::new("stop-wait-cancel");
+        let mut helper = spawn_child_fixture(&directory, false, "read_stop_hold").await;
+        let child_id = helper
+            .id()
+            .expect("fixture child should have a live process id");
+        let helper_stdin = helper.stdin.take().unwrap();
+        let observer = watch_child_exit(child_id);
+        let guard = ChildFixtureGuard::new(&directory);
+        let route = inert_route_for_stop_error();
+        let handle = OwnedServiceHandle {
+            options: route.options(),
+            route,
+            service,
+            readback: OwnedServiceReadback { proof: Value::Null },
+            helper: Some(HelperChild::new(helper)),
+            helper_stdin: Some(helper_stdin),
+        };
+        let mut close = Box::pin(handle.close_gracefully());
+        let request_path = directory.path().join("request");
+
+        tokio::select! {
+            _ = wait_for_file(&request_path, Duration::from_secs(5)) => {}
+            result = close.as_mut() => match result {
+                Ok(_) => panic!("the held helper cannot confirm stop before release"),
+                Err(_) => panic!("stop should wait for the held helper after request delivery"),
+            }
+        }
+        drop(close);
+        let mut exit_observer = take_child_exit_observer(observer).await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut exit_observer)
+                .await
+                .is_err(),
+            "the observer task must remain pending while the exact helper is live"
+        );
+
+        guard.release_and_wait().await;
+        expect_observed_child_exit(exit_observer, child_id).await;
+    }
 }

@@ -9,6 +9,24 @@ pub(super) fn public_facade(
     ipc: swarm_mcp::config::Ipc,
     tool_profile: McpToolProfile,
 ) -> swarm_mcp::ProfiledFacade {
+    let expected_client_id = credential.client_id.clone();
+    public_facade_with_expected_client_id(
+        data_dir,
+        credential,
+        ipc,
+        tool_profile,
+        expected_client_id,
+    )
+    .expect("the test frontend profile is valid")
+}
+
+pub(super) fn public_facade_with_expected_client_id(
+    data_dir: PathBuf,
+    credential: crate::model::Credential,
+    ipc: swarm_mcp::config::Ipc,
+    tool_profile: McpToolProfile,
+    expected_client_id: String,
+) -> std::result::Result<swarm_mcp::ProfiledFacade, String> {
     let profile_name = "mcp-integration";
     let frontend = swarm_mcp::Config {
         storage: Storage { data_dir },
@@ -19,7 +37,7 @@ pub(super) fn public_facade(
                 profile_name.to_owned(),
                 McpProfileConfig {
                     tool_profile,
-                    expected_client_id: credential.client_id.clone(),
+                    expected_client_id,
                     surface: None,
                     deferred_groups: Vec::new(),
                     manual_tools: Vec::new(),
@@ -28,7 +46,7 @@ pub(super) fn public_facade(
         },
     };
     swarm_mcp::profiled_facade(&frontend, credential, Some(profile_name))
-        .expect("the test frontend profile is valid")
+        .map_err(|error| error.code)
 }
 
 mod profiles;

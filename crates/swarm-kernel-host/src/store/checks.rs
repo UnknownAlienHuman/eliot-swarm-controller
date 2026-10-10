@@ -2583,6 +2583,7 @@ mod tests {
         })
         .await
         .expect("worker did not publish its process identity");
+        let expected_identity = identity.clone();
         let expected_check = work.check_id.clone();
         let ready_work = work.clone();
         let persisted = fixture
@@ -2620,7 +2621,25 @@ mod tests {
         assert_eq!(result["state"], "passed");
         assert_eq!(result["exit_code"], 0);
         assert!(!result["resource_released_at_ms"].is_null());
-        assert!(result["process"].is_object());
+        assert!(
+            result.get("process").is_none(),
+            "public check.get must not expose the raw process identity"
+        );
+        let retained_identity = fixture
+            .owner
+            .store
+            .run({
+                let root = fixture.directory.clone();
+                let id = check_id.to_owned();
+                move |db| Ok(super::work(db, &id, root)?.expected_worker)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            retained_identity,
+            Some(expected_identity),
+            "the internal Store read retains the exact accepted worker identity"
+        );
     }
 
     async fn output_paths(fixture: &Fixture, operation_id: &str) -> Vec<PathBuf> {

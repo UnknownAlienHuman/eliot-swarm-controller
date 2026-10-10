@@ -47,6 +47,7 @@ async fn start_stack() -> Stack {
         module_artifact_id: "eliot-opencode-v2.http.1".into(),
         enabled: true,
         native_options: json!({}),
+        admission_policy: None,
     });
     let config = Arc::new(cfg);
     let owner = StoreOwner::start(root, config.clone(), credential.clone())
@@ -320,9 +321,25 @@ async fn retried_mutation_with_caller_id_resolves_to_the_same_task() {
     let second = client.call_tool("agent_open", arguments).await.unwrap();
     assert_eq!(first["resultType"], json!("task"));
     assert_eq!(second["resultType"], json!("task"));
-    // The Phase A identity rule, one level up: same caller request ID →
-    // same Operation → same taskId; the retry created no second copy.
-    assert_eq!(first["taskId"], second["taskId"]);
+    let operation_id = first["taskId"].as_str().unwrap();
+    let stored = stack
+        .store_call("operation.get", json!({"operation_id": operation_id}))
+        .await
+        .unwrap();
+    assert_eq!(stored["operation_id"], json!(operation_id));
+    assert_eq!(stored["method"], json!("agent.open"));
+
+    // The Phase A identity rule binds both retried responses to the durable
+    // Operation, not merely to each other or to a fabricated stable handle.
+    assert_eq!(second["taskId"], stored["operation_id"]);
+    assert_eq!(stack.operation_count("agent.open").await, 1);
+
+    let polled = client
+        .request("tasks/get", json!({"taskId": stored["operation_id"]}))
+        .await
+        .unwrap();
+    assert_eq!(polled["taskId"], stored["operation_id"]);
+    assert_eq!(polled["status"], json!("working"));
     assert_eq!(stack.operation_count("agent.open").await, 1);
     client.close().await;
     stack.close().await;
@@ -357,11 +374,21 @@ async fn tasks_get_projects_settled_failed_and_unknown_operations() {
     let stack = start_stack().await;
     let mut client = McpClient::connect(&stack, true).await;
 
-    // Settled synchronously: host.mode lands as a completed task whose
-    // result is the Operation's recorded result.
+    // host.mode settles synchronously, but its result is intentionally outside
+    // operation.get's closed receipt vocabulary. Tasks/get follows that safe
+    // public readback instead of exposing the private mode-change result.
     let mode = stack
         .write("host.mode", json!({"new_work": "disabled"}))
         .await;
+    let operation = stack
+        .store_call(
+            "operation.get",
+            json!({"operation_id": mode["operation_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(operation["result_status"], json!("not_projected"));
+    assert!(operation.get("result").is_none());
     let polled = client
         .request(
             "tasks/get",
@@ -370,13 +397,10 @@ async fn tasks_get_projects_settled_failed_and_unknown_operations() {
         .await
         .unwrap();
     assert_eq!(polled["status"], json!("completed"));
+    assert_eq!(polled["taskId"], mode["operation_id"]);
     assert_eq!(
-        polled["result"]["structuredContent"]["new_work"],
-        json!("disabled")
-    );
-    assert_eq!(
-        polled["result"]["structuredContent"]["operation_id"],
-        mode["operation_id"]
+        polled["result"]["structuredContent"],
+        json!({"result": null})
     );
 
     // Admission-rejected: the rejected operation.cancel row (its target

@@ -2989,11 +2989,19 @@ fn launch_route_match(
                 | "awaiting_participant_credential"
         )
     );
+    let retained_admission = &manifest["runtime"]["route"]["admission"];
+    let admitting_plan = retained_admission == &authority["route"]["admission"]
+        && serde_json::from_value::<super::provider_conditions::RouteAdmissionProjection>(
+            retained_admission.clone(),
+        )
+        .is_ok_and(|admission| {
+            admission.decision == super::provider_conditions::RouteAdmissionDecision::Admit
+        });
     if !active_launch_state
         || (operation_state == "queued" && result["state"] != "queued")
         || (operation_state == "outcome_unknown" && result["state"] != "outcome_unknown")
         || !matches!(operation_state, "queued" | "outcome_unknown")
-        || manifest["runtime"]["route"]["admission"]["decision"] != "admit"
+        || !admitting_plan
     {
         return Ok(LaunchRouteMatch::Unknown);
     }

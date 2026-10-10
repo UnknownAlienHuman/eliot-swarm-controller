@@ -265,7 +265,7 @@ pub(crate) fn forge_preparation_demand(
     // A damaged immutable entry cannot demand executable hashing. Reconciliation
     // records its exact key and payload digest in the publication transaction.
     let (entries, _, _) = enabled_entry_page(db, entry_budget)?;
-    let high_water = acceptance_high_water(db)?;
+    let high_water = super::automation::observation_cut(db)?;
     entries.iter().try_fold(false, |demand, entry| {
         if demand {
             return Ok(true);
@@ -357,7 +357,7 @@ fn reconcile_entry(
     }
 
     let key = state_key(entry)?;
-    let high_water = acceptance_high_water(tx)?;
+    let high_water = super::automation::observation_cut(tx)?;
     let mut state = match load_state(tx, entry)? {
         Some(state) => state,
         None => {
@@ -1432,14 +1432,6 @@ fn empty_state(
 
 fn entry_publication_active(entry: &AutomationEntry) -> bool {
     entry.publication_ready()
-}
-
-fn acceptance_high_water(db: &Connection) -> Result<i64> {
-    Ok(db.query_row(
-        "SELECT COALESCE(MAX(observation_id),0) FROM observations WHERE source_stream_id=?1 AND kind='task.acceptance'",
-        [ACCEPTANCE_STREAM],
-        |row| row.get(0),
-    )?)
 }
 
 fn save_state(db: &Connection, key: &str, state: &PublicationState) -> Result<()> {

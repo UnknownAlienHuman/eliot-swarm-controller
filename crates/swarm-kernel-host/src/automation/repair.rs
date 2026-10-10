@@ -1420,11 +1420,49 @@ pub(crate) fn validate_committed_review_and_feedback(
             "client_request_id":request_client_request_id,
             "package":package_value
         });
+    let matches_package_feedback = feedback_client_request_id
+        == expected_feedback_client_request_id
+        && preserves_review_scope
+        && feedback_result["finding"].is_null()
+        && feedback_result["findings_package"] == package_value
+        && feedback_result["findings_digest"] == findings_package.findings_digest
+        && feedback_result["text"]
+            == format!(
+                "Applied exact ordered reviewer findings package {}.",
+                findings_package.findings_digest
+            )
+        && feedback_result["review_provenance"]["findings_package"] == package_value;
+    // The public direct producer also accepts one exact ChangeRequest. Its
+    // manager-authored feedback is distinct from the immutable reviewer finding;
+    // retain both, and still derive the repair input from the full review package.
+    // A malformed package request cannot fall back to this closed typed shape.
+    let matches_single_finding_feedback = if feedback_request_value.get("package").is_none()
+        && findings_package.findings.len() == 1
+    {
+        let input = crate::submission::ChangeRequest::parse(&feedback_request_value)
+            .map_err(|_| damaged())?;
+        let finding = &findings_package.findings[0];
+        feedback_caller == decision_manager_id
+            && input.attempt_id == identity.attempt_id
+            && input.expected_revision == identity.task_revision
+            && input.submission_ref == identity.submission_ref
+            && input.candidate_ref == identity.candidate_ref
+            && input.finding_id == finding.finding_id
+            && input.requirement_ids == finding.requirement_ids
+            && input.evidence == finding.evidence_refs
+            && feedback_result["finding"] == input.finding()
+            && feedback_result["text"] == input.reason
+            && feedback_result["findings_package"].is_null()
+            && feedback_result["findings_digest"].is_null()
+            && feedback_result["review_provenance"]["finding"] == json!(finding)
+            && feedback_result["review_provenance"]["findings_package"].is_null()
+    } else {
+        false
+    };
     if feedback_method != "task.request_changes"
         || feedback_state != "settled"
-        || feedback_client_request_id != expected_feedback_client_request_id
         || request_client_request_id != feedback_client_request_id
-        || !preserves_review_scope
+        || !(matches_package_feedback || matches_single_finding_feedback)
         || feedback_task.as_deref() != Some(identity.task_id.as_str())
         || feedback_attempt.as_deref() != Some(identity.attempt_id.as_str())
         || feedback_result["operation_id"] != feedback_operation_id
@@ -1434,18 +1472,9 @@ pub(crate) fn validate_committed_review_and_feedback(
         || feedback_result["sender"] != decision_manager_id
         || feedback_result["recipient"] != source_attempt_owner_id
         || feedback_result["task_id"] != identity.task_id
-        || !feedback_result["finding"].is_null()
-        || feedback_result["findings_package"] != package_value
-        || feedback_result["findings_digest"] != findings_package.findings_digest
-        || feedback_result["text"]
-            != format!(
-                "Applied exact ordered reviewer findings package {}.",
-                findings_package.findings_digest
-            )
         || feedback_result["review_provenance"]["review_assignment_id"] != assignment_id
         || feedback_result["review_provenance"]["review_operation_id"] != result_operation_id
         || feedback_result["review_provenance"]["identity"] != json!(identity)
-        || feedback_result["review_provenance"]["findings_package"] != package_value
         || feedback_result["native_input_sent"] != false
         || feedback_result["repair_started"] != false
     {

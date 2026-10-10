@@ -1,4 +1,4 @@
-use super::subscriptions::*;
+use super::*;
 use serde_json::{Value, json};
 fn item(kind: &str, operation_id: Option<&str>, payload: Value) -> Value {
     json!({
@@ -141,13 +141,22 @@ fn notification_shapes_carry_frame_identity_and_resync() {
         from_cursor: 4,
         through_cursor: 10,
         head_reached: true,
+        cut_cursor: 10,
+        failure: None,
     };
-    let lagged = lagged_notification("sub-1", &gap);
+    let lagged = lagged_notification_with_reads(
+        "sub-1",
+        &gap,
+        &["report.delta", "message.read", "operation.get"],
+    );
     assert_eq!(lagged.method, LAGGED_NOTIFICATION);
     let params = lagged.params.expect("params");
     assert_eq!(params["dropped_items"], json!(6));
     assert_eq!(params["from_cursor"], json!(4));
     assert_eq!(params["through_cursor"], json!(10));
+    assert_eq!(params["cut_cursor"], json!(10));
+    assert_eq!(params["reached_cut"], json!(true));
+    assert_eq!(params["failure"], Value::Null);
     assert_eq!(params["resync"]["after"], json!(4));
     assert_eq!(
         params["resync"]["reads"],

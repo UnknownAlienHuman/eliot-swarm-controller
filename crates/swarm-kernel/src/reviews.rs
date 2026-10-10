@@ -235,9 +235,9 @@ fn exact_object<'a>(
 ) -> Result<&'a serde_json::Map<String, Value>, ReviewValidationError> {
     let object = value.as_object().ok_or(ReviewValidationError::Shape)?;
     if required.iter().any(|key| !object.contains_key(*key))
-        || object.keys().any(|key| {
-            !required.contains(&key.as_str()) && !optional.contains(&key.as_str())
-        })
+        || object
+            .keys()
+            .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
     {
         return Err(ReviewValidationError::Shape);
     }
@@ -272,9 +272,9 @@ fn nonempty_text_array(
 }
 
 fn valid_sha256(value: &Value) -> bool {
-    value.as_str().is_some_and(|text| {
-        text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+    value
+        .as_str()
+        .is_some_and(|text| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn validate_findings_shape(value: &Value) -> Result<(), ReviewValidationError> {
@@ -298,10 +298,8 @@ fn validate_findings_shape(value: &Value) -> Result<(), ReviewValidationError> {
         {
             return Err(ReviewValidationError::Findings);
         }
-        required_text(finding, "reason")
-            .map_err(|_| ReviewValidationError::Findings)?;
-        required_text(finding, "requested_change")
-            .map_err(|_| ReviewValidationError::Findings)?;
+        required_text(finding, "reason").map_err(|_| ReviewValidationError::Findings)?;
+        required_text(finding, "requested_change").map_err(|_| ReviewValidationError::Findings)?;
         nonempty_text_array(&finding["evidence_refs"], ReviewValidationError::Evidence)?;
     }
     Ok(())
@@ -340,7 +338,10 @@ fn validate_slot_identity(value: &Value) -> Result<(), ReviewValidationError> {
     ] {
         required_text(value, field)?;
     }
-    if value["task_revision"].as_i64().is_none_or(|revision| revision < 1) {
+    if value["task_revision"]
+        .as_i64()
+        .is_none_or(|revision| revision < 1)
+    {
         return Err(ReviewValidationError::Identity);
     }
     Ok(())
@@ -361,11 +362,11 @@ fn validate_review_semantics(
         }
         _ => {}
     }
-    if requirement_reviews.is_some_and(|reviews| {
-        !reviews.as_array().is_some_and(|items| items.is_empty())
-    }) && (verdict != ReviewVerdict::Pass
-        || coverage != ReviewCoverage::Complete
-        || finding_count != 0)
+    if requirement_reviews
+        .is_some_and(|reviews| !reviews.as_array().is_some_and(|items| items.is_empty()))
+        && (verdict != ReviewVerdict::Pass
+            || coverage != ReviewCoverage::Complete
+            || finding_count != 0)
     {
         return Err(ReviewValidationError::RequirementReviews);
     }
@@ -428,10 +429,7 @@ pub fn validate_finding_requirements(
     requirement_ids: &BTreeSet<String>,
 ) -> Result<(), ReviewValidationError> {
     validate_findings_shape(findings)?;
-    for finding in findings
-        .as_array()
-        .ok_or(ReviewValidationError::Findings)?
-    {
+    for finding in findings.as_array().ok_or(ReviewValidationError::Findings)? {
         let ids = finding["requirement_ids"]
             .as_array()
             .ok_or(ReviewValidationError::Findings)?;
@@ -495,7 +493,9 @@ pub fn validate_result(value: &Value) -> Result<ReviewResult, ReviewValidationEr
     ] {
         required_text(value, field)?;
     }
-    if value["task_revision"].as_i64().is_none_or(|revision| revision < 1)
+    if value["task_revision"]
+        .as_i64()
+        .is_none_or(|revision| revision < 1)
         || !valid_sha256(&value["candidate_sha256"])
     {
         return Err(ReviewValidationError::Identity);
@@ -555,8 +555,7 @@ pub fn validate_result_record(value: &Value) -> Result<ReviewResult, ReviewValid
         || value["input"]["coverage"] != value["result"]["coverage"]
         || value["input"]["findings"] != value["result"]["findings"]
         || value["input"]["evidence_refs"] != value["result"]["evidence_refs"]
-        || value["input"].get("requirement_reviews")
-            != value["result"].get("requirement_reviews")
+        || value["input"].get("requirement_reviews") != value["result"].get("requirement_reviews")
         || [
             "task_id",
             "attempt_id",
@@ -585,9 +584,7 @@ pub fn validate_result_event(
         return Err(ReviewValidationError::EventIdentity);
     }
     let result = validate_result_record(value)?;
-    if value["review_assignment_id"] != assignment_id
-        || value["operation_id"] != operation_id
-    {
+    if value["review_assignment_id"] != assignment_id || value["operation_id"] != operation_id {
         return Err(ReviewValidationError::EventIdentity);
     }
     Ok(result)
@@ -618,9 +615,7 @@ pub fn actionable_finding<'a>(
 /// Validate the one manager disposition currently emitted by Store feedback.
 /// This is a fact contract only; authorization and exact identity matching
 /// remain in Store SQL/transaction code.
-pub fn validate_disposition(
-    value: &Value,
-) -> Result<ReviewDisposition, ReviewValidationError> {
+pub fn validate_disposition(value: &Value) -> Result<ReviewDisposition, ReviewValidationError> {
     exact_object(value, DISPOSITION_FIELDS, &[])?;
     if value["schema_version"] != 1 || value["kind"] != "review.disposition" {
         return Err(ReviewValidationError::Schema);
@@ -637,8 +632,7 @@ pub fn validate_disposition(
     if value["disposition"] != ReviewDisposition::ReturnForCorrection.as_str() {
         return Err(ReviewValidationError::Disposition);
     }
-    required_text(value, "reason")
-        .map_err(|_| ReviewValidationError::Disposition)?;
+    required_text(value, "reason").map_err(|_| ReviewValidationError::Disposition)?;
     nonempty_text_array(&value["evidence_refs"], ReviewValidationError::Evidence)?;
     nonempty_text_array(&value["finding_ids"], ReviewValidationError::Findings)?;
     validate_slot_identity(&value["identity"])?;

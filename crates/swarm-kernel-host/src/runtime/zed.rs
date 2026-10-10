@@ -929,13 +929,41 @@ fn run_batch_inner(
     })
 }
 
+fn batch_worker_executable() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    {
+        let path = std::env::var_os("ELIOT_ZED_TEST_HOST_EXECUTABLE")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "ELIOT_ZED_TEST_HOST_EXECUTABLE is required for Zed worker tests",
+                )
+            })?;
+        if !path.is_absolute()
+            || !path.is_file()
+            || path.file_stem() != Some(std::ffi::OsStr::new("swarm-kernel-host"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ELIOT_ZED_TEST_HOST_EXECUTABLE must name the absolute swarm-kernel-host binary",
+            ));
+        }
+        Ok(path)
+    }
+    #[cfg(not(test))]
+    {
+        std::env::current_exe()
+    }
+}
+
 fn execute_batch_worker(
     plan_path: &Path,
     owner_path: &Path,
     plan: &BatchWorkerPlan,
     owner: &mut BatchProcessOwnerRecord,
 ) -> Result<()> {
-    let executable = std::env::current_exe().map_err(|error| {
+    let executable = batch_worker_executable().map_err(|error| {
         owner.launch_state = "not_started".to_owned();
         owner.launch_error = Some(format!("worker executable lookup failed: {error}"));
         owner.cleanup = "not_needed".to_owned();

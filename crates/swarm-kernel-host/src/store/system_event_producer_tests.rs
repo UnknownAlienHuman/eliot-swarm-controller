@@ -8,13 +8,17 @@ const TERMINAL_EVENT_PROJECT_ID: &str = "host-terminal-event-project";
 const TERMINAL_EVENT_AUTOMATION_ID: &str = "host-terminal-event-script-trigger";
 const TERMINAL_EVENT_SCRIPT_ID: &str = "host_terminal_event_script";
 
-async fn started_store() -> (StoreOwner, Principal, std::path::PathBuf) {
+async fn started_store(with_script_executor: bool) -> (StoreOwner, Principal, std::path::PathBuf) {
     let directory = std::env::temp_dir().join(format!("eliot-system-events-{}", model::new_id()));
     std::fs::create_dir_all(&directory).expect("create temporary Store directory");
     let root = DataRoot::acquire(&directory).expect("acquire temporary Store root");
     let credential = bootstrap_credential(&root.path).expect("create Operator credential");
     let mut config = Config::default();
     config.storage.data_dir = directory.clone();
+    if with_script_executor {
+        config.scripts.executor =
+            Some(crate::store::o6_taskless_path_fixture::store_only_script_executor_pin());
+    }
     let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
         .await
         .expect("start Store");
@@ -152,7 +156,7 @@ async fn explain_terminal_event_trigger(store: &Store, manager: &Principal) -> V
 
 #[tokio::test]
 async fn rejected_admission_retains_one_safe_failure_event_on_request_replay() {
-    let (owner, operator, directory) = started_store().await;
+    let (owner, operator, directory) = started_store(false).await;
     let request = json!({
         "client_request_id":"rejected-event-fixture",
         "recipient":"missing-recipient",
@@ -195,7 +199,7 @@ async fn rejected_admission_retains_one_safe_failure_event_on_request_replay() {
 
 #[tokio::test]
 async fn message_and_reply_aliases_keep_only_safe_headers_and_share_their_cause() {
-    let (owner, operator, directory) = started_store().await;
+    let (owner, operator, directory) = started_store(false).await;
     let alice = register_manager(&owner.store, &operator, "alice").await;
     let bob = register_manager(&owner.store, &operator, "bob").await;
     let original = write(
@@ -556,7 +560,7 @@ async fn terminal_host_exit_is_a_safe_any_event_and_failure_views_share_one_scri
     // This exercises the ordinary Store producer, committed observations,
     // the current Manager's ScriptRun cursor, and its retained operation link.
     // The separate script supervisor is not started, so no interpreter runs.
-    let (owner, operator, directory) = started_store().await;
+    let (owner, operator, directory) = started_store(true).await;
     let manager = register_manager(&owner.store, &operator, TERMINAL_EVENT_MANAGER_ID).await;
     write(
         &owner.store,

@@ -115,8 +115,14 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         )?;
                         if action.retire_bridge {
                             interactions.retire_bridge(&boot_id, &journal)?;
-                            harness.take();
-                            native_prepared = false;
+                            // Retire this adapter process instead of serving a
+                            // dead bridge or reopening it in-process. The
+                            // parent owner retains the process-family identity
+                            // and gates replacement on exact departure proof.
+                            return Err(Error::new(
+                                "SDK_HARNESS_RETIRED",
+                                "retired bridge requires parent-owned process-family readback before replacement",
+                            ));
                         }
                         if action.reconnect {
                             link = open_link(LinkInvocation {
@@ -1437,42 +1443,67 @@ async fn handle_result(invocation: ResultInvocation<'_>) -> Result<bool> {
             journal.save_outcome(&command.operation_id, &outcome)?;
             Ok(false)
         }
-        Ok(_) => save_result_unknown(UnknownResultInvocation {
-            config,
-            journal,
-            command,
-            receipt: &result_receipt,
-            boot_id,
-            native_root_id: selected_session_id,
-            target_operation_id,
-            target_input_id,
-            target_receipt,
-            code: "MODULE_RESULT_ACK_SCHEMA",
-            reconnect: false,
-        }),
-        Err(_) => save_result_unknown(UnknownResultInvocation {
-            config,
-            journal,
-            command,
-            receipt: &result_receipt,
-            boot_id,
-            native_root_id: selected_session_id,
-            target_operation_id,
-            target_input_id,
-            target_receipt,
-            code: "MODULE_RESULT_UNKNOWN",
-            reconnect: true,
-        }),
+        Ok(_) => save_result_unknown_with_intent(
+            UnknownResultInvocation {
+                config,
+                journal,
+                command,
+                receipt: &result_receipt,
+                boot_id,
+                native_root_id: selected_session_id,
+                target_operation_id,
+                target_input_id,
+                target_receipt,
+                code: "MODULE_RESULT_ACK_SCHEMA",
+                reconnect: false,
+            },
+            &intent,
+        ),
+        Err(_) => save_result_unknown_with_intent(
+            UnknownResultInvocation {
+                config,
+                journal,
+                command,
+                receipt: &result_receipt,
+                boot_id,
+                native_root_id: selected_session_id,
+                target_operation_id,
+                target_input_id,
+                target_receipt,
+                code: "MODULE_RESULT_UNKNOWN",
+                reconnect: true,
+            },
+            &intent,
+        ),
     }
 }
 
 fn save_result_unknown(invocation: UnknownResultInvocation<'_>) -> Result<bool> {
+    let intent = intent_for(
+        invocation.command,
+        invocation.receipt,
+        Some(json!({
+            "result_target_operation_id":invocation.target_operation_id,
+            "native_root_id":invocation.native_root_id,
+            "native_scope_key":invocation.config.native_options.scope_key(),
+            "native_input_id":invocation.target_input_id
+        })),
+        invocation.boot_id,
+        &invocation.config.native_options.scope_key(),
+    )?;
+    save_result_unknown_with_intent(invocation, &intent)
+}
+
+fn save_result_unknown_with_intent(
+    invocation: UnknownResultInvocation<'_>,
+    intent: &Value,
+) -> Result<bool> {
     let UnknownResultInvocation {
         config,
         journal,
         command,
         receipt,
-        boot_id,
+        boot_id: _,
         native_root_id,
         target_operation_id,
         target_input_id,
@@ -1480,19 +1511,59 @@ fn save_result_unknown(invocation: UnknownResultInvocation<'_>) -> Result<bool> 
         code,
         reconnect,
     } = invocation;
-    let intent = intent_for(
-        command,
-        receipt,
-        Some(json!({
-            "result_target_operation_id":target_operation_id,
-            "native_root_id":native_root_id,
-            "native_scope_key":config.native_options.scope_key(),
-            "native_input_id":target_input_id
-        })),
-        boot_id,
-        &config.native_options.scope_key(),
-    )?;
-    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
+    if let Some(saved) = journal.get(&command.operation_id)? {
+        if saved.outcome.is_some() {
+            // A terminal result is immutable. Keep it and reconnect so the
+            // caller can read the retained outcome instead of replacing it.
+            return Ok(true);
+        }
+        let saved_intent = saved.intent.as_ref().ok_or_else(|| {
+            Error::new(
+                "ADAPTER_INTENT_MISSING",
+                "saved result operation has no retained intent",
+            )
+        })?;
+        let exact = saved.receipt.as_ref() == Some(receipt)
+            && saved.method.as_deref() == Some(command.method.as_str())
+            && saved_intent == intent;
+        if exact {
+            journal.retain_exact_intent_for_recovery(
+                &command.operation_id,
+                receipt,
+                &command.method,
+                saved_intent,
+            )?;
+        }
+        let diagnostic = if exact {
+            code
+        } else {
+            "CLAUDE_RESULT_INTENT_CONFLICT"
+        };
+        let mut outcome =
+            unknown_outcome_from_saved(&command.operation_id, &saved, diagnostic, config)?;
+        let retained_native = &saved_intent["native"];
+        let retained_target_operation_id = if exact {
+            json!(target_operation_id)
+        } else {
+            retained_native["result_target_operation_id"].clone()
+        };
+        let retained_target_input_id = if exact {
+            json!(target_input_id)
+        } else {
+            retained_native["native_input_id"].clone()
+        };
+        annotate_result_unknown(
+            &mut outcome,
+            retained_target_operation_id,
+            retained_target_input_id,
+            exact.then_some(target_receipt),
+            !exact,
+        )?;
+        journal.save_outcome(&command.operation_id, &outcome)?;
+        return Ok(reconnect || !exact);
+    }
+
+    journal.write_intent(&command.operation_id, receipt, &command.method, intent)?;
     let mut outcome = unknown_outcome(
         command,
         receipt,
@@ -1500,16 +1571,39 @@ fn save_result_unknown(invocation: UnknownResultInvocation<'_>) -> Result<bool> 
         Some(native_root_id),
         &config.native_options.scope_key(),
     )?;
+    annotate_result_unknown(
+        &mut outcome,
+        json!(target_operation_id),
+        json!(target_input_id),
+        Some(target_receipt),
+        false,
+    )?;
+    journal.save_outcome(&command.operation_id, &outcome)?;
+    Ok(reconnect)
+}
+
+fn annotate_result_unknown(
+    outcome: &mut RuntimeOutcome,
+    target_operation_id: Value,
+    target_input_id: Value,
+    target_receipt: Option<&swarm_contracts::runtime::ModuleReceiptIdentity>,
+    intent_conflict: bool,
+) -> Result<()> {
+    outcome.native_input_id = target_input_id.as_str().map(str::to_owned);
     outcome.details["completion_condition"] = json!("assistant_result_unavailable");
-    outcome.details["target_operation_id"] = json!(target_operation_id);
-    outcome.details["target_input_id"] = json!(target_input_id);
-    outcome.details["target_module_receipt"] = serde_json::to_value(target_receipt)?;
+    outcome.details["target_operation_id"] = target_operation_id;
+    outcome.details["target_input_id"] = target_input_id;
+    if let Some(target_receipt) = target_receipt {
+        outcome.details["target_module_receipt"] = serde_json::to_value(target_receipt)?;
+    }
     outcome.details["native_response_identity"] = json!("sdk_result_frame");
     outcome.details["execution_complete"] = json!(false);
     outcome.details["task_completion"] = json!("unknown");
     outcome.details["native_replay"] = json!(false);
-    journal.save_outcome(&command.operation_id, &outcome)?;
-    Ok(reconnect)
+    if intent_conflict {
+        outcome.details["intent_recovery"] = json!("conflict_fenced");
+    }
+    Ok(())
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>> {

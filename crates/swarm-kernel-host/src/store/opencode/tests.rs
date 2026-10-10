@@ -14,6 +14,7 @@ async fn start(f: &Fixture) -> (StoreOwner, Principal) {
     let mut cfg = Config::default();
     cfg.storage.data_dir = directory;
     cfg.routes.push(Route {
+        admission_policy: Default::default(),
         workspace_option: None,
         owned_service: None,
         alias: "fixture".into(),
@@ -28,6 +29,129 @@ async fn start(f: &Fixture) -> (StoreOwner, Principal) {
     let p = owner.store.authenticate(credential).await.unwrap();
     (owner, p)
 }
+
+fn registered_opencode_descriptor() -> Value {
+    let mut descriptor: Value = serde_json::from_str(include_str!(
+        "../../../../swarm-adapter-opencode/registration/descriptor.template.json"
+    ))
+    .unwrap();
+    descriptor["enabled"] = json!(true);
+    descriptor["launch"]["executable"] = json!(
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+    descriptor
+}
+
+async fn start_module_route(
+    f: &Fixture,
+    descriptor: Value,
+    select_descriptor: bool,
+) -> (StoreOwner, Principal, Value) {
+    let directory = f.dir.join("module-controller");
+    let root = DataRoot::acquire(&directory).unwrap();
+    let credential = bootstrap_credential(&root.path).unwrap();
+    let artifact_id = descriptor["artifact"]["artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let standalone_opencode = artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID;
+    let mut cfg = Config::default();
+    cfg.storage.data_dir = directory;
+    cfg.routes.push(Route {
+        admission_policy: Default::default(),
+        workspace_option: standalone_opencode.then(|| "directory".to_owned()),
+        owned_service: None,
+        alias: "module-fixture".into(),
+        runtime: "module".into(),
+        module_artifact_id: artifact_id.clone(),
+        enabled: true,
+        native_options: if standalone_opencode {
+            json!(f.options)
+        } else {
+            json!({})
+        },
+    });
+    let owner = StoreOwner::start(root, Arc::new(cfg), credential.clone())
+        .await
+        .unwrap();
+    let p = owner.store.authenticate(credential).await.unwrap();
+    let supervisor = owner
+        .store
+        .authenticate(owner.module_supervisor_credential())
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            supervisor,
+            "module.descriptor.register".into(),
+            json!({"descriptor":descriptor}),
+        )
+        .await
+        .unwrap();
+    let selector = if select_descriptor {
+        select_module_route(&owner, &p, "module-fixture", &artifact_id).await
+    } else {
+        Value::Null
+    };
+    let binding = module_binding("module-fixture", &artifact_id, selector);
+    (owner, p, binding)
+}
+
+async fn select_module_route(
+    owner: &StoreOwner,
+    p: &Principal,
+    route_alias: &str,
+    artifact_id: &str,
+) -> Value {
+    let catalog = read(&owner.store, p, "module.catalog.get", json!({})).await;
+    let selected = write(
+        &owner.store,
+        p,
+        "module.route.select",
+        json!({
+            "route_alias":route_alias,
+            "module_id":"eliot.opencode.v2",
+            "artifact_id":artifact_id,
+            "version":"0.5.0",
+            "expected_catalog_revision":catalog["catalog_revision"],
+        }),
+    )
+    .await
+    .unwrap();
+    selected["selection"].clone()
+}
+
+fn module_binding(route_alias: &str, artifact_id: &str, selector: Value) -> Value {
+    let mut observation = json!({});
+    if !selector.is_null() {
+        observation["module_contract_selector"] = selector;
+    }
+    json!({
+        "binding_id":"module-consumer-fixture",
+        "generation":1,
+        "module_artifact_id":artifact_id,
+        "route":{"alias":route_alias,"runtime":"module","module_artifact_id":artifact_id},
+        "observation":observation,
+    })
+}
+
+async fn loop_step_status_supported(owner: &StoreOwner, binding: Value) -> Result<bool> {
+    owner
+        .store
+        .run(move |db| {
+            crate::store::results::input_status_target_supported(
+                db,
+                &binding,
+                &json!({"method":"native.opencode.loop_step"}),
+            )
+        })
+        .await
+}
+
 async fn write(store: &Store, p: &Principal, method: &str, mut input: Value) -> Result<Value> {
     input["client_request_id"] = json!(model::new_id());
     store.call(p.clone(), method.into(), input).await
@@ -57,6 +181,80 @@ async fn wait_operation(store: &Store, p: &Principal, operation: &Value, state: 
     })
     .await
     .unwrap()
+}
+
+async fn retained_operation(store: &Store, operation_id: &str) -> Value {
+    let operation_id = operation_id.to_owned();
+    store
+        .run(move |db| crate::store::operations::get_operation(db, &operation_id))
+        .await
+        .unwrap()
+}
+
+async fn retained_attempt(store: &Store, attempt_id: &str) -> Value {
+    let attempt_id = attempt_id.to_owned();
+    store
+        .run(move |db| crate::store::tasks::get_attempt(db, &attempt_id))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn loop_step_input_status_accepts_only_the_exact_selected_opencode_module_contract() {
+    let exact = registered_opencode_descriptor();
+    let artifact_id = crate::config::OPENCODE_RUST_ARTIFACT_ID;
+    assert_eq!(exact["artifact"]["artifact_id"], artifact_id);
+    assert_eq!(exact["artifact"]["version"], "0.5.0");
+
+    let f = Fixture::new().await;
+    let (owner, _p, binding) = start_module_route(&f, exact.clone(), true).await;
+    assert_eq!(binding["route"]["runtime"], "module");
+    assert!(loop_step_status_supported(&owner, binding).await.unwrap());
+    owner.close().await.unwrap();
+
+    let f = Fixture::new().await;
+    let mut no_capability = exact.clone();
+    no_capability["capabilities"] = json!(
+        no_capability["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|capability| capability.as_str() != Some("native.opencode.loop_step"))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(no_capability["artifact"], exact["artifact"]);
+    let (owner, _p, binding) = start_module_route(&f, no_capability, true).await;
+    assert!(!loop_step_status_supported(&owner, binding).await.unwrap());
+    owner.close().await.unwrap();
+
+    let f = Fixture::new().await;
+    let mut no_schema = exact.clone();
+    no_schema["command_schemas"] = json!(
+        no_schema["command_schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|schema| schema["schema_id"] != "swarm.opencode_loop_step_command")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(no_schema["artifact"], exact["artifact"]);
+    let (owner, _p, binding) = start_module_route(&f, no_schema, true).await;
+    assert!(!loop_step_status_supported(&owner, binding).await.unwrap());
+    owner.close().await.unwrap();
+
+    let f = Fixture::new().await;
+    let mut wrong_artifact = exact.clone();
+    wrong_artifact["artifact"]["artifact_id"] = json!("eliot-opencode-v2.rust-http-other.1");
+    let (owner, _p, binding) = start_module_route(&f, wrong_artifact, true).await;
+    assert!(!loop_step_status_supported(&owner, binding).await.unwrap());
+    owner.close().await.unwrap();
+
+    let f = Fixture::new().await;
+    let (owner, _p, binding) = start_module_route(&f, exact, false).await;
+    assert!(!loop_step_status_supported(&owner, binding).await.unwrap());
+    owner.close().await.unwrap();
 }
 #[tokio::test]
 async fn shared_reader_receipts_survive_host_restart_without_replaying_native_work() {
@@ -123,15 +321,31 @@ async fn shared_reader_receipts_survive_host_restart_without_replaying_native_wo
     let (stop, receiver) = watch::channel(false);
     let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
     let operation = wait_operation(&owner.store, &p, &dispatch, "settled").await;
-    assert!(operation["native_refs"]["turn_id"].is_null());
-    assert!(operation["native_refs"]["input_id"].is_string());
-    let current = read(
+    assert_eq!(operation["result"]["outcome"], "applied");
+    assert!(operation.get("native_refs").is_none());
+    assert!(
+        operation["diagnostic"]["native_refs"]
+            .get("input_id")
+            .is_none()
+    );
+    assert!(
+        operation["diagnostic"]["native_refs"]
+            .get("native_input_id")
+            .is_none()
+    );
+    let retained =
+        retained_operation(&owner.store, dispatch["operation_id"].as_str().unwrap()).await;
+    assert!(retained["native_refs"]["turn_id"].is_null());
+    assert!(retained["native_refs"]["input_id"].is_string());
+    let projected_attempt = read(
         &owner.store,
         &p,
         "attempt.get",
         json!({"attempt_id":attempt["attempt_id"]}),
     )
     .await;
+    assert!(projected_attempt.get("producers").is_none());
+    let current = retained_attempt(&owner.store, attempt["attempt_id"].as_str().unwrap()).await;
     assert_eq!(current["producers"].as_array().unwrap().len(), 1);
     assert_eq!(current["producers"][0]["admission_kind"], "native_inbox");
     assert!(current["producers"][0].get("native_run_id").is_none());
@@ -246,8 +460,10 @@ async fn rejected_open_preflight_retains_diagnostic_without_partial_native_ident
 
     assert_eq!(operation["state"], "rejected");
     assert_eq!(operation["result"]["outcome"], "rejected");
+    assert!(operation["result"].get("details").is_none());
+    let retained = retained_operation(&owner.store, open["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        operation["result"]["details"]["code"],
+        retained["result"]["details"]["code"],
         "NATIVE_MODEL_UNAVAILABLE"
     );
     let binding = read(
@@ -314,12 +530,14 @@ async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
     let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
     let operation = wait_operation(&owner.store, &p, &goal, "settled").await;
     assert_eq!(operation["result"]["outcome"], "applied");
+    assert!(operation["result"].get("details").is_none());
+    let retained = retained_operation(&owner.store, goal["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        operation["result"]["details"]["completion_condition"],
+        retained["result"]["details"]["completion_condition"],
         "native_goal_recorded"
     );
     assert_eq!(
-        operation["result"]["details"]["goal"]["activation_input_id"],
+        retained["result"]["details"]["goal"]["activation_input_id"],
         Value::Null
     );
     {
@@ -398,8 +616,11 @@ async fn configure_prerequisite_gates_goal_start() {
     .unwrap();
     let configure = wait_operation(&owner.store, &p, &configure, "settled").await;
     assert_eq!(configure["result"]["outcome"], "applied");
+    assert!(configure["result"].get("details").is_none());
+    let retained_configure =
+        retained_operation(&owner.store, configure["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        configure["result"]["details"]["completion_condition"],
+        retained_configure["result"]["details"]["completion_condition"],
         "native_configuration_applied"
     );
     let goal = write(
@@ -413,17 +634,24 @@ async fn configure_prerequisite_gates_goal_start() {
     assert_eq!(goal["prerequisite_state"], "satisfied");
     let goal = wait_operation(&owner.store, &p, &goal, "settled").await;
     assert_eq!(goal["result"]["outcome"], "applied");
+    assert!(goal["result"].get("details").is_none());
+    assert!(goal.get("operation_contract").is_none());
+    let retained_goal =
+        retained_operation(&owner.store, goal["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        goal["result"]["details"]["completion_condition"],
+        retained_goal["result"]["details"]["completion_condition"],
         "native_goal_recorded"
     );
     assert_eq!(
-        goal["operation_contract"]["completion_condition"],
+        retained_goal["operation_contract"]["completion_condition"],
         "native_goal_recorded"
     );
-    assert_eq!(goal["operation_contract"]["native_goal_api"], false);
     assert_eq!(
-        goal["operation_contract"]["continuation_owner"],
+        retained_goal["operation_contract"]["native_goal_api"],
+        false
+    );
+    assert_eq!(
+        retained_goal["operation_contract"]["continuation_owner"],
         "controller_record"
     );
     assert_eq!(
@@ -695,8 +923,11 @@ async fn goal_pause_cancels_queued_goal_set_on_same_binding() {
     .await;
     assert_eq!(cancelled["state"], "cancelled");
     assert_eq!(cancelled["result"]["reason"], "superseded_by_goal_stop");
+    assert!(cancelled["result"].get("stop_operation_id").is_none());
+    let retained_cancelled =
+        retained_operation(&owner.store, set["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        cancelled["result"]["stop_operation_id"],
+        retained_cancelled["result"]["stop_operation_id"],
         pause["operation_id"]
     );
     stop.send(true).unwrap();
@@ -826,14 +1057,16 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         );
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let projected_attempt = read(
+        &owner.store,
+        &p,
+        "attempt.get",
+        json!({"attempt_id":attempt["attempt_id"]}),
+    )
+    .await;
+    assert!(projected_attempt.get("producers").is_none());
     loop {
-        let current = read(
-            &owner.store,
-            &p,
-            "attempt.get",
-            json!({"attempt_id":attempt["attempt_id"]}),
-        )
-        .await;
+        let current = retained_attempt(&owner.store, attempt["attempt_id"].as_str().unwrap()).await;
         let producers = current["producers"].as_array().unwrap();
         if producers.iter().all(|x| {
             matches!(
@@ -909,28 +1142,381 @@ async fn background_operation_settles_from_the_native_notice() {
     .unwrap();
     let background = wait_operation(&owner.store, &p, &background, "settled").await;
     assert_eq!(background["result"]["outcome"], "applied");
+    assert!(background["result"].get("details").is_none());
+    assert!(background.get("operation_contract").is_none());
+    let retained_background =
+        retained_operation(&owner.store, background["operation_id"].as_str().unwrap()).await;
     assert_eq!(
-        background["result"]["details"]["completion_condition"],
+        retained_background["result"]["details"]["completion_condition"],
         "native_foreground_tools_backgrounded"
     );
     assert_eq!(
-        background["result"]["details"]["backgrounded"],
+        retained_background["result"]["details"]["backgrounded"],
         json!([{"type":"task","label":"fixture child"}])
     );
     assert_eq!(
-        background["operation_contract"]["completion_condition"],
+        retained_background["operation_contract"]["completion_condition"],
         "native_foreground_tools_backgrounded"
     );
     assert_eq!(
-        background["operation_contract"]["contract_revision"],
+        retained_background["operation_contract"]["contract_revision"],
         "opencode-background-v1"
     );
     assert_eq!(
-        background["operation_contract"]["replay_policy"],
+        retained_background["operation_contract"]["replay_policy"],
         "readback_only_no_mutation_replay"
     );
     assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
     assert_eq!(f.posts(&format!("/api/session/{root}/prompt")), 0);
+    stop.send(true).unwrap();
+    worker.await.unwrap().unwrap();
+    owner.close().await.unwrap();
+}
+
+async fn register_execution_diagnostic_manager(
+    store: &Store,
+    operator: &Principal,
+    client_id: &str,
+) -> Principal {
+    let token = format!("execution-diagnostic-token-{}", model::new_id());
+    write(
+        store,
+        operator,
+        "client.register",
+        json!({
+            "client_id":client_id,
+            "role":"manager",
+            "token_hash":model::digest(token.as_bytes())
+        }),
+    )
+    .await
+    .unwrap();
+    store
+        .authenticate(crate::model::Credential {
+            client_id: client_id.to_owned(),
+            token,
+        })
+        .await
+        .unwrap()
+}
+
+fn assert_execution_diagnostic_gap(operation: &Value, card: &str) {
+    assert!(
+        operation["diagnostic_gaps"].as_array().is_some_and(|gaps| {
+            gaps.iter()
+                .any(|gap| gap["card"] == card && gap["reason_code"] == "OBJECT_SCOPE_DAMAGED")
+        }),
+        "missing {card} damage gap: {operation}"
+    );
+}
+
+#[tokio::test]
+async fn task_dispatch_execution_diagnostic_is_scoped_and_rejects_damaged_identity() {
+    let f = Fixture::new().await;
+    let (owner, operator) = start(&f).await;
+    let store = owner.store.clone();
+    let owner_id = format!("execution-attempt-owner-{}", model::new_id());
+    let gm_id = format!("execution-current-gm-{}", model::new_id());
+    let unrelated_id = format!("execution-unrelated-manager-{}", model::new_id());
+    let attempt_owner = register_execution_diagnostic_manager(&store, &operator, &owner_id).await;
+    let current_gm = register_execution_diagnostic_manager(&store, &operator, &gm_id).await;
+    let unrelated = register_execution_diagnostic_manager(&store, &operator, &unrelated_id).await;
+    write(
+        &store,
+        &operator,
+        "gm.handover",
+        json!({"client_id":current_gm.client_id.clone()}),
+    )
+    .await
+    .unwrap();
+
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(store.clone().supervise_opencode(receiver));
+    let open = write(
+        &store,
+        &operator,
+        "agent.open",
+        json!({"lane_id":"execution-diagnostic","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&store, &operator, &open, "settled").await;
+    let task = write(
+        &store,
+        &operator,
+        "task.create",
+        json!({
+            "project_id":"fixture",
+            "spec":serde_json::from_str::<Value>(include_str!("../../../config/task.example.json")).unwrap()
+        }),
+    )
+    .await
+    .unwrap();
+    let attempt = write(
+        &store,
+        &attempt_owner,
+        "task.claim",
+        json!({
+            "task_id":task["task_id"],
+            "expected_revision":1,
+            "start_owner":"controller",
+            "binding_id":open["binding_id"],
+            "binding_generation":1
+        }),
+    )
+    .await
+    .unwrap();
+    let dispatch = write(
+        &store,
+        &current_gm,
+        "task.dispatch",
+        json!({"attempt_id":attempt["attempt_id"],"text":"fixture-only diagnostic evidence"}),
+    )
+    .await
+    .unwrap();
+    let operation_id = dispatch["operation_id"].as_str().unwrap().to_owned();
+    let binding_id = open["binding_id"].as_str().unwrap().to_owned();
+    let root = oc::root_id(&binding_id, 1);
+    let prompt = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let request = {
+                f.world
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .find(|request| {
+                        request.method == "POST"
+                            && request.path == format!("/api/session/{root}/prompt")
+                    })
+                    .cloned()
+            };
+            if let Some(request) = request {
+                break request;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_operation(&store, &current_gm, &dispatch, "settled").await;
+
+    // The mock native log carries the exact prompt written by the real Store
+    // dispatch. Its terminal failure becomes the retained Attempt producer's
+    // Observation/EventRef through the ordinary OpenCode reader.
+    let input_id = prompt.body["id"].as_str().unwrap().to_owned();
+    let text = prompt.body["text"].as_str().unwrap().to_owned();
+    let metadata = prompt.body["metadata"].clone();
+    let delivery = prompt.body["delivery"].clone();
+    let event = |id: &str, kind: &str, seq: u64, data: Value| {
+        json!({
+            "id":id,
+            "type":kind,
+            "version":1,
+            "created":seq as f64,
+            "durable":{"aggregateID":root,"seq":seq,"version":1},
+            "data":data
+        })
+    };
+    let lifecycle = [
+        event(
+            "evt_diagnostic_input_enqueued",
+            "session.inbox.enqueued",
+            2,
+            json!({
+                "sessionID":root,
+                "inboxID":input_id,
+                "item":{
+                    "id":input_id,
+                    "sessionID":root,
+                    "type":"user",
+                    "delivery":delivery,
+                    "payload":{"text":text,"metadata":metadata}
+                }
+            }),
+        ),
+        event(
+            "evt_diagnostic_execution_started",
+            "session.execution.started",
+            3,
+            json!({"sessionID":root}),
+        ),
+        event(
+            "evt_diagnostic_input_delivered",
+            "session.inbox.delivered",
+            4,
+            json!({"sessionID":root,"inboxID":input_id}),
+        ),
+        event(
+            "evt_diagnostic_execution_failed",
+            "session.execution.failed",
+            5,
+            json!({
+                "sessionID":root,
+                "error":{"code":"NATIVE_ROOT_FAILED","message":"private native error text"}
+            }),
+        ),
+    ];
+    {
+        let mut world = f.world.lock().unwrap();
+        let mut log = world.logs.get(&root).cloned().unwrap();
+        assert_eq!(log[0]["type"], "session.created");
+        log.extend(lifecycle);
+        world.logs.insert(root.clone(), log);
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let retained = retained_attempt(&store, attempt["attempt_id"].as_str().unwrap()).await;
+            if retained["producers"].as_array().is_some_and(|producers| {
+                producers.first().is_some_and(|producer| {
+                    producer["terminal_evidence"].is_object()
+                        && producer["terminal_evidence"]["stage"] == "execution_failed"
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let owner_read = read(
+        &store,
+        &attempt_owner,
+        "operation.get",
+        json!({"operation_id":operation_id}),
+    )
+    .await;
+    let manager_read = read(
+        &store,
+        &current_gm,
+        "operation.get",
+        json!({"operation_id":operation_id}),
+    )
+    .await;
+    let expected_card = json!({"stage":"execution_failed","error_code":"NATIVE_ROOT_FAILED"});
+    assert_eq!(owner_read["execution_diagnostic"], expected_card);
+    assert_eq!(manager_read["execution_diagnostic"], expected_card);
+    assert!(manager_read["execution_diagnostic"]["message"].is_null());
+    let denied = store
+        .call(
+            unrelated,
+            "operation.get".into(),
+            json!({"operation_id":operation_id}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "NOT_FOUND");
+
+    let saved_native_refs = {
+        let id = operation_id.clone();
+        store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT native_refs_json FROM operations WHERE operation_id=?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap()
+    };
+    for damaged_native_refs in ["[]", "17", "\"scalar\""] {
+        let id = operation_id.clone();
+        let damaged_native_refs = damaged_native_refs.to_owned();
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE operations SET native_refs_json=?2 WHERE operation_id=?1",
+                    rusqlite::params![id, damaged_native_refs],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let projected = read(
+            &store,
+            &current_gm,
+            "operation.get",
+            json!({"operation_id":operation_id}),
+        )
+        .await;
+        assert_eq!(projected["method"], "task.dispatch");
+        assert_eq!(projected["state"], "settled");
+        assert_eq!(projected["task_id"], task["task_id"]);
+        assert_eq!(projected["attempt_id"], attempt["attempt_id"]);
+        assert_eq!(projected["result"]["operation_id"], operation_id);
+        assert!(projected.get("execution_diagnostic").is_none());
+        assert_execution_diagnostic_gap(&projected, "execution_diagnostic");
+        assert_execution_diagnostic_gap(&projected, "module_recovery_action_required");
+        assert_execution_diagnostic_gap(&projected, "module_outcome_readback_required");
+    }
+    let id = operation_id.clone();
+    store
+        .run(move |db| {
+            db.execute(
+                "UPDATE operations SET native_refs_json=?2 WHERE operation_id=?1",
+                rusqlite::params![id, saved_native_refs],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let saved_producers = {
+        let id = attempt["attempt_id"].as_str().unwrap().to_owned();
+        store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT producers_json FROM attempts WHERE attempt_id=?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap()
+    };
+    let mut damaged_producers: Value = serde_json::from_str(&saved_producers).unwrap();
+    assert_eq!(damaged_producers[0]["assignment_id"], operation_id);
+    damaged_producers[0]["native_run_id"] = json!(17);
+    let id = attempt["attempt_id"].as_str().unwrap().to_owned();
+    let producer_json = model::canonical(&damaged_producers).unwrap();
+    store
+        .run(move |db| {
+            db.execute(
+                "UPDATE attempts SET producers_json=?2 WHERE attempt_id=?1",
+                rusqlite::params![id, producer_json],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let projected = read(
+        &store,
+        &current_gm,
+        "operation.get",
+        json!({"operation_id":operation_id}),
+    )
+    .await;
+    assert_eq!(projected["method"], "task.dispatch");
+    assert_eq!(projected["result"]["operation_id"], operation_id);
+    assert!(projected.get("execution_diagnostic").is_none());
+    assert_execution_diagnostic_gap(&projected, "execution_diagnostic");
+    let id = attempt["attempt_id"].as_str().unwrap().to_owned();
+    store
+        .run(move |db| {
+            db.execute(
+                "UPDATE attempts SET producers_json=?2 WHERE attempt_id=?1",
+                rusqlite::params![id, saved_producers],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
     stop.send(true).unwrap();
     worker.await.unwrap().unwrap();
     owner.close().await.unwrap();

@@ -14,21 +14,25 @@ import {
   classifyLine,
   MODULE_ARTIFACT_ID,
   PREVIOUS_MODULE_ARTIFACT_ID,
+  TASK_PROMPT_CONTRACT_REVISION,
   commandReceiptFacts,
   describe,
   openRun,
   snapshotRun,
   DEFAULT_MOD_PATH,
   batchRunId,
-  buildTaskPrompt,
   controlRecordRef,
   outcomeFromRun,
   resultRecordRef,
   sha256Hex,
+  validateTaskPromptDispatch,
 } from "./glue.mjs";
+import { FIXTURE_MODULE_CONTRACT, makeTaskDispatchCommand } from "./fixtures/task-dispatch.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FAKE = join(HERE, "fixtures", "fake-cmd.mjs");
+const FIXTURE_WORKER_BOOT_ID = "owner-token-fixture";
+const FIXTURE_REQUESTED_MODEL = "fixture-model";
 const config = {
   command: process.execPath,
   commandArgs: [FAKE],
@@ -42,7 +46,7 @@ const ownerDir = join(scratch, "module-owner");
 mkdirSync(ownerDir, { recursive: true });
 writeFileSync(join(ownerDir, "owner.json"), JSON.stringify({
   version: 1,
-  token: "owner-token-fixture",
+  token: FIXTURE_WORKER_BOOT_ID,
   process: { purpose: "module" },
 }));
 process.env.ELIOT_SWARM_MODULE_STATE = ownerDir;
@@ -81,18 +85,53 @@ try {
     assert.equal(classifyLine('{"answer": 42}').kind, "gap");
   });
 
-  await test("core-canonical prompt order and Unicode byte digest are stable", () => {
-    const snapshot = { objective: "Review café 🐇", nested: { b: 2, a: "雪" } };
-    const canonical = '{"nested":{"a":"雪","b":2},"objective":"Review café 🐇"}';
-    const text = "Keep these words exactly: naïve 🐇";
-    const prompt = buildTaskPrompt(snapshot, text, canonical);
-    assert.equal(prompt, `${text}\n\nELIOT immutable task snapshot:\n${canonical}`);
-    const facts = commandReceiptFacts("operation-🐇", prompt);
-    assert.equal(facts.prompt_bytes, Buffer.byteLength(prompt, "utf8"));
-    assert.equal(facts.prompt_sha256, sha256Hex(prompt));
-    assert.throws(() => buildTaskPrompt(snapshot, text, '{"objective":"altered"}'), /CANONICAL_TASK_SNAPSHOT_MISMATCH/);
-    const changedPrompt = buildTaskPrompt(snapshot, "changed words 🐇", canonical);
-    assert.notEqual(commandReceiptFacts("operation-🐇", changedPrompt).prompt_sha256, facts.prompt_sha256);
+  await test("Store TaskPrompt v1 binds exact prompt and source UTF-8 bytes", () => {
+    const command = fixtureTaskDispatchCommand(
+      "operation-🐇",
+      "Keep these source words exactly: naïve 🐇",
+      "Store-selected prompt bytes: café 🐇\nReview the fixture output.",
+    );
+    const validated = validateTaskPromptDispatch(
+      command,
+      FIXTURE_WORKER_BOOT_ID,
+      FIXTURE_MODULE_CONTRACT,
+    );
+    const prompt = command.input.task_prompt.prompt;
+    assert.equal(validated.prompt, prompt);
+    assert.equal(command.input.task_prompt.prompt_bytes, Buffer.byteLength(prompt, "utf8"));
+    assert.equal(command.input.task_prompt.prompt_sha256, sha256Hex(prompt));
+    assert.deepEqual(command.input.command_core_binding, commandReceiptFacts(command.operation_id, prompt));
+    assert.equal(validated.dispatchAdmission.native_payload_sha256, sha256Hex(prompt));
+    assert.equal(validated.dispatchAdmission.native_payload_bytes, Buffer.byteLength(prompt, "utf8"));
+
+    const snapshotFallback = { ...command, input: { ...command.input, task_snapshot: { objective: "fallback" } } };
+    assert.throws(() => validateTaskPromptDispatch(snapshotFallback, FIXTURE_WORKER_BOOT_ID, FIXTURE_MODULE_CONTRACT),
+      /TASK_PROMPT_SNAPSHOT_FALLBACK_FORBIDDEN/);
+    const tamperedPrompt = {
+      ...command,
+      input: {
+        ...command.input,
+        task_prompt: {
+          ...command.input.task_prompt,
+          prompt: "altered prompt",
+          prompt_bytes: Buffer.byteLength("altered prompt", "utf8"),
+        },
+      },
+    };
+    assert.throws(() => validateTaskPromptDispatch(tamperedPrompt, FIXTURE_WORKER_BOOT_ID, FIXTURE_MODULE_CONTRACT),
+      /TASK_PROMPT_DIGEST_MISMATCH/);
+    const extendedPrompt = {
+      ...command,
+      input: {
+        ...command.input,
+        task_prompt: { ...command.input.task_prompt, task_snapshot: { objective: "legacy prompt fallback" } },
+      },
+    };
+    assert.throws(() => validateTaskPromptDispatch(extendedPrompt, FIXTURE_WORKER_BOOT_ID, FIXTURE_MODULE_CONTRACT),
+      /TASK_PROMPT_INVALID/);
+    const tamperedSource = { ...command, input: { ...command.input, text: "altered source" } };
+    assert.throws(() => validateTaskPromptDispatch(tamperedSource, FIXTURE_WORKER_BOOT_ID, FIXTURE_MODULE_CONTRACT),
+      /TASK_DISPATCH_CONTEXT_INVALID/);
   });
 
   await test("describe reports the fixture CLI and the pinned mod honestly", async () => {
@@ -252,14 +291,19 @@ try {
   await test("a mismatched core binding is rejected before admission or native spawn", async () => {
     const dir = join(scratch, "bad-core-binding");
     const prompt = "unaltered prompt 🐇";
+    const operationId = "bad-core-binding-op";
+    const command = fixtureTaskDispatchCommand(operationId, prompt, prompt);
     const invocationFile = join(scratch, "bad-core-binding-invocations.ndjson");
     process.env.FAKE_CMD_INVOCATION_FILE = invocationFile;
     await assert.rejects(() => openRun(config, {
-      operationId: "bad-core-binding-op",
-      requestedModel: "fixture-model",
+      operationId,
+      requestedModel: FIXTURE_REQUESTED_MODEL,
       prompt,
+      command,
+      bootId: FIXTURE_WORKER_BOOT_ID,
+      moduleContract: FIXTURE_MODULE_CONTRACT,
       coreBinding: {
-        ...commandReceiptFacts("bad-core-binding-op", prompt),
+        ...commandReceiptFacts(operationId, prompt),
         prompt_sha256: sha256Hex("altered prompt 🐇"),
       },
       controlDir: dir,
@@ -269,7 +313,7 @@ try {
     delete process.env.FAKE_CMD_INVOCATION_FILE;
   });
 
-  await test("legacy .2 files stay readable and unchanged but cannot authorize .4 replay", async () => {
+  await test("legacy .2 files stay readable and unchanged but cannot authorize .5 replay", async () => {
     const dir = join(scratch, "legacy-v2");
     const operationId = "legacy-v2-op";
     mkdirSync(dir, { recursive: true });
@@ -435,28 +479,16 @@ try {
     const dir = join(scratch, "admitted-only");
     const prompt = "do not replay";
     const operationId = "admitted-only-op";
+    const command = fixtureTaskDispatchCommand(operationId, prompt, prompt);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "admission.json"), JSON.stringify({
-      schema: 2,
-      module_artifact_id: MODULE_ARTIFACT_ID,
-      operation_id: operationId,
-      execution_shape: "sessionless_batch",
-      batch_run_id: batchRunId(operationId),
-      requested_model: "fixture-model",
-      prompt_sha256: sha256Hex(prompt),
-      prompt_bytes: Buffer.byteLength(prompt, "utf8"),
-      core_binding: commandReceiptFacts(operationId, prompt),
-      control_record_ref: controlRecordRef(operationId),
-      result_ref: resultRecordRef(operationId),
-      artifact_refs: [
-        { kind: "command_control_record", ref: controlRecordRef(operationId) },
-        { kind: "command_result_record", ref: resultRecordRef(operationId) },
-      ],
-      admitted_at: "fixture",
-    }));
+    writeFileSync(join(dir, "admission.json"), JSON.stringify(fixtureAdmission(command), null, 2) + "\n");
+    const snapshot = snapshotRun(dir);
+    assert.equal(snapshot.evidence.valid, false);
+    assert.equal(snapshot.evidence.diagnostic_code, "saved_terminal_evidence_missing");
     const record = await openFixtureRun(operationId, prompt, dir);
     assert.equal(record.disposition, "unknown");
     assert.equal(record.disposition_basis, "admission_without_terminal_record");
+    assert.equal(record.evidence_validation.diagnostic_code, "saved_terminal_evidence_missing");
     assert.equal(record.replayed_from_saved_evidence, true);
     assert.equal(record.anomalies[0], "native_result_missing_after_admission");
     assert.equal(snapshotRun(dir).run, null);
@@ -488,11 +520,64 @@ function writeInbox(dir, commands) {
 }
 
 function openFixtureRun(operationId, prompt, controlDir) {
+  const command = fixtureTaskDispatchCommand(operationId, prompt, prompt);
   return openRun(config, {
     operationId,
-    requestedModel: "fixture-model",
+    requestedModel: FIXTURE_REQUESTED_MODEL,
     prompt,
-    coreBinding: commandReceiptFacts(operationId, prompt),
+    command,
+    bootId: FIXTURE_WORKER_BOOT_ID,
+    moduleContract: FIXTURE_MODULE_CONTRACT,
+    coreBinding: command.input.command_core_binding,
     controlDir,
   });
+}
+
+function fixtureTaskDispatchCommand(operationId, sourceText, prompt) {
+  const command = makeTaskDispatchCommand({
+    operationId,
+    sourceText,
+    prompt,
+    workerBootId: FIXTURE_WORKER_BOOT_ID,
+  });
+  return {
+    ...command,
+    route: {
+      runtime: "command",
+      module_artifact_id: MODULE_ARTIFACT_ID,
+      native_options: { modelId: FIXTURE_REQUESTED_MODEL, workspaceRoot: process.cwd() },
+    },
+  };
+}
+
+function fixtureAdmission(command) {
+  const dispatch = validateTaskPromptDispatch(
+    command,
+    FIXTURE_WORKER_BOOT_ID,
+    FIXTURE_MODULE_CONTRACT,
+  );
+  const coreBinding = dispatch.coreBinding;
+  return {
+    schema: 3,
+    module_artifact_id: MODULE_ARTIFACT_ID,
+    operation_id: dispatch.operationId,
+    execution_shape: "sessionless_batch",
+    batch_run_id: coreBinding.batch_run_id,
+    requested_model: FIXTURE_REQUESTED_MODEL,
+    prompt_sha256: coreBinding.prompt_sha256,
+    prompt_bytes: coreBinding.prompt_bytes,
+    core_binding: coreBinding,
+    task_prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    task_prompt: dispatch.taskPrompt,
+    task_dispatch_context: dispatch.taskDispatchContext,
+    dispatch_admission: dispatch.dispatchAdmission,
+    control_record_ref: controlRecordRef(dispatch.operationId),
+    result_ref: resultRecordRef(dispatch.operationId),
+    artifact_refs: [
+      { kind: "command_control_record", ref: controlRecordRef(dispatch.operationId) },
+      { kind: "command_result_record", ref: resultRecordRef(dispatch.operationId) },
+    ],
+    admitted_at: "fixture",
+  };
 }

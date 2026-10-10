@@ -655,7 +655,8 @@ fn command_output(
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            helper.creation_flags(0x08000000);
+            // This pipe-only probe never needs a Windows console.
+            helper.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
         }
         let mut child = helper.spawn()?;
         temp_guard.preserve();
@@ -1153,7 +1154,9 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+        // A pipe-only input resolver must not allocate console infrastructure
+        // that can outlive its direct process and enter the owned Job.
+        command.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -1814,7 +1817,10 @@ mod tests {
     }
 
     fn isolated_cargo_test_root(label: &str) -> PathBuf {
+        #[cfg(windows)]
         let mut bases = vec![std::env::temp_dir()];
+        #[cfg(not(windows))]
+        let bases = vec![std::env::temp_dir()];
         #[cfg(windows)]
         if let Some(system_root) = std::env::var_os("SystemRoot") {
             bases.insert(0, PathBuf::from(system_root).join("Temp"));

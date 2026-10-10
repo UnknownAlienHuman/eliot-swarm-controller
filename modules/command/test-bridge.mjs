@@ -12,12 +12,18 @@ import { fileURLToPath } from "node:url";
 import {
   DEFAULT_MOD_PATH,
   MODULE_ARTIFACT_ID,
-  buildTaskPrompt,
+  TASK_PROMPT_CONTRACT_REVISION,
   commandReceiptFacts,
   controlRecordRef,
   resultRecordRef,
   sha256Hex,
+  validateTaskPromptDispatch,
 } from "./glue.mjs";
+import {
+  FIXTURE_MODULE_CONTRACT,
+  makeRuntimeCommand,
+  makeTaskDispatchCommand,
+} from "./fixtures/task-dispatch.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FAKE = join(HERE, "fixtures", "fake-cmd.mjs");
@@ -29,133 +35,123 @@ const nativeOptions = {
   modelId: "stealth/space-bunny-alpha",
   workspaceRoot: process.cwd(),
 };
-const taskSnapshot = { task_id: "fixture-task", objective: "return fixture output" };
-const taskSnapshotCanonical = '{"objective":"return fixture output","task_id":"fixture-task"}';
+const workerBootId = "fixture-command-worker-boot";
+const ownerDir = join(scratch, "module-owner");
+mkdirSync(ownerDir, { recursive: true });
+writeFileSync(join(ownerDir, "owner.json"), JSON.stringify({
+  version: 1,
+  token: workerBootId,
+  process: { purpose: "module" },
+}));
 const dispatchText = "return a marker";
-const dispatchPrompt = buildTaskPrompt(taskSnapshot, dispatchText, taskSnapshotCanonical);
+const dispatchCommand = makeTaskDispatchCommand({
+  operationId: "mock-task-dispatch",
+  workerBootId,
+  sourceText: dispatchText,
+  prompt: "Store-selected TaskPrompt: return a marker.",
+});
+const dispatchPrompt = dispatchCommand.input.task_prompt.prompt;
 const foreignOperationId = "mock-foreign-admission";
 const foreignText = "do not replace the foreign admission";
-const foreignPrompt = buildTaskPrompt(taskSnapshot, foreignText, taskSnapshotCanonical);
-const foreignBinding = commandReceiptFacts(foreignOperationId, foreignPrompt);
+const foreignCommand = makeTaskDispatchCommand({
+  operationId: foreignOperationId,
+  workerBootId,
+  sourceText: foreignText,
+  prompt: "Store-selected TaskPrompt: preserve the foreign admission.",
+});
+const foreignPrompt = foreignCommand.input.task_prompt.prompt;
+const foreignBinding = foreignCommand.input.command_core_binding;
 const tamperedOperationId = "mock-tampered-saved-run";
 const tamperedText = "read the saved result without replay";
-const tamperedPrompt = buildTaskPrompt(taskSnapshot, tamperedText, taskSnapshotCanonical);
-const tamperedBinding = commandReceiptFacts(tamperedOperationId, tamperedPrompt);
+const tamperedCommand = makeTaskDispatchCommand({
+  operationId: tamperedOperationId,
+  workerBootId,
+  sourceText: tamperedText,
+  prompt: "Store-selected TaskPrompt: read saved evidence without replay.",
+});
+const tamperedPrompt = tamperedCommand.input.task_prompt.prompt;
+const tamperedBinding = tamperedCommand.input.command_core_binding;
+const tamperedDispatchFacts = validateTaskPromptDispatch(
+  tamperedCommand,
+  workerBootId,
+  FIXTURE_MODULE_CONTRACT,
+);
 const reconcileOperationId = "mock-reconcile-corrupt-admission";
 const reconcileTargetOperationId = "mock-corrupt-reconcile-target";
 const reconcileTargetText = "read corrupt target evidence without replay";
-const reconcileTargetPrompt = buildTaskPrompt(taskSnapshot, reconcileTargetText, taskSnapshotCanonical);
-const reconcileTargetBinding = commandReceiptFacts(reconcileTargetOperationId, reconcileTargetPrompt);
+const reconcileTargetCommand = makeTaskDispatchCommand({
+  operationId: reconcileTargetOperationId,
+  workerBootId,
+  sourceText: reconcileTargetText,
+  prompt: "Store-selected TaskPrompt: read target evidence without replay.",
+});
+const reconcileTargetBinding = reconcileTargetCommand.input.command_core_binding;
 const openReconcileOperationId = "mock-reconcile-lost-open-ack";
 const openTargetOperationId = "mock-lost-open-ack-target";
+const openTargetCommand = makeRuntimeCommand({
+  operationId: openTargetOperationId,
+  method: "agent.open",
+});
 const commands = [
   {
-    operation_id: "mock-agent-open",
-    method: "agent.open",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...makeRuntimeCommand({ operationId: "mock-agent-open", method: "agent.open" }),
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {},
   },
   {
-    operation_id: "mock-task-dispatch",
-    method: "task.dispatch",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...dispatchCommand,
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {
-      task_snapshot: taskSnapshot,
-      task_snapshot_canonical: taskSnapshotCanonical,
-      command_core_binding: commandReceiptFacts("mock-task-dispatch", dispatchPrompt),
-      text: dispatchText,
-    },
   },
   {
-    operation_id: foreignOperationId,
-    method: "task.dispatch",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...foreignCommand,
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {
-      task_snapshot: taskSnapshot,
-      task_snapshot_canonical: taskSnapshotCanonical,
-      command_core_binding: foreignBinding,
-      text: foreignText,
-    },
   },
   {
-    operation_id: tamperedOperationId,
-    method: "task.dispatch",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...tamperedCommand,
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {
-      task_snapshot: taskSnapshot,
-      task_snapshot_canonical: taskSnapshotCanonical,
-      command_core_binding: tamperedBinding,
-      text: tamperedText,
-    },
   },
   {
-    operation_id: "mock-agent-refresh",
-    method: "agent.refresh",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...makeRuntimeCommand({ operationId: "mock-agent-refresh", method: "agent.refresh" }),
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {},
   },
   {
-    operation_id: "mock-agent-reconcile",
-    method: "agent.reconcile",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...makeRuntimeCommand({
+      operationId: "mock-agent-reconcile",
+      method: "agent.reconcile",
+      input: {
+        operation_id: "mock-task-dispatch",
+        target_command_method: "task.dispatch",
+        target_command_requested_model: nativeOptions.modelId,
+        target_command_core_binding: commandReceiptFacts("mock-task-dispatch", dispatchPrompt),
+      },
+    }),
+    target_input_sha256: dispatchCommand.input_sha256,
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {
-      operation_id: "mock-task-dispatch",
-      target_command_method: "task.dispatch",
-      target_command_requested_model: nativeOptions.modelId,
-      target_command_core_binding: commandReceiptFacts("mock-task-dispatch", dispatchPrompt),
-    },
   },
   {
-    operation_id: reconcileOperationId,
-    method: "agent.reconcile",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...makeRuntimeCommand({
+      operationId: reconcileOperationId,
+      method: "agent.reconcile",
+      input: {
+        operation_id: reconcileTargetOperationId,
+        target_command_method: "task.dispatch",
+        target_command_requested_model: nativeOptions.modelId,
+        target_command_core_binding: reconcileTargetBinding,
+      },
+    }),
+    target_input_sha256: reconcileTargetCommand.input_sha256,
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {
-      operation_id: reconcileTargetOperationId,
-      target_command_method: "task.dispatch",
-      target_command_requested_model: nativeOptions.modelId,
-      target_command_core_binding: reconcileTargetBinding,
-    },
   },
   {
-    operation_id: openReconcileOperationId,
-    method: "agent.reconcile",
-    created_at_ms: Date.now(),
-    binding_id: "mock-binding",
-    generation: 1,
-    native_root_id: null,
+    ...makeRuntimeCommand({
+      operationId: openReconcileOperationId,
+      method: "agent.reconcile",
+      input: {
+        operation_id: openTargetOperationId,
+        target_command_method: "agent.open",
+      },
+    }),
+    target_input_sha256: openTargetCommand.input_sha256,
     route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
-    input: {
-      operation_id: openTargetOperationId,
-      target_command_method: "agent.open",
-    },
   },
 ];
 
@@ -216,10 +212,25 @@ const server = net.createServer(socket => {
       if (packet.method === "client.hello") {
         respond({ client_id: "fixture-module-client" });
       } else if (packet.method === "module.hello") {
+        assert.deepEqual(packet.params.module_contract, FIXTURE_MODULE_CONTRACT);
         respond({
           binding_id: "mock-binding",
           generation: 1,
           route: { runtime: "command", module_artifact_id: MODULE_ARTIFACT_ID, native_options: nativeOptions },
+          module_contract_negotiation: {
+            status: "negotiated",
+            source: "store_registered_descriptor",
+            descriptor_revision: 1,
+            effects_authorized_by_descriptor: false,
+            module_id: FIXTURE_MODULE_CONTRACT.module_id,
+            artifact: FIXTURE_MODULE_CONTRACT.artifact,
+            protocol: FIXTURE_MODULE_CONTRACT.protocol,
+            capabilities: FIXTURE_MODULE_CONTRACT.capabilities,
+            config_schema: FIXTURE_MODULE_CONTRACT.config_schema,
+            pre_input_open: null,
+            command_schemas: FIXTURE_MODULE_CONTRACT.command_schemas,
+            event_schemas: FIXTURE_MODULE_CONTRACT.event_schemas,
+          },
         });
       } else if (packet.method === "module.next") {
         const command = commands[commandIndex++] ?? null;
@@ -338,7 +349,7 @@ try {
   const tamperedDirectory = join(scratch, "runs", `op-${sha256Hex(tamperedOperationId).slice(0, 32)}`);
   mkdirSync(tamperedDirectory, { recursive: true });
   writeFileSync(join(tamperedDirectory, "admission.json"), JSON.stringify({
-    schema: 2,
+    schema: 3,
     module_artifact_id: MODULE_ARTIFACT_ID,
     operation_id: tamperedOperationId,
     execution_shape: "sessionless_batch",
@@ -347,6 +358,11 @@ try {
     prompt_sha256: tamperedBinding.prompt_sha256,
     prompt_bytes: tamperedBinding.prompt_bytes,
     core_binding: tamperedBinding,
+    task_prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    task_prompt: tamperedDispatchFacts.taskPrompt,
+    task_dispatch_context: tamperedDispatchFacts.taskDispatchContext,
+    dispatch_admission: tamperedDispatchFacts.dispatchAdmission,
     control_record_ref: controlRecordRef(tamperedOperationId),
     result_ref: resultRecordRef(tamperedOperationId),
     artifact_refs: [
@@ -356,7 +372,7 @@ try {
     admitted_at: new Date().toISOString(),
   }, null, 2) + "\n");
   writeFileSync(join(tamperedDirectory, "run.json"), JSON.stringify({
-    schema: 2,
+    schema: 3,
     runtime: "command",
     entrypoint: "native_mod",
     transport: "headless_ndjson",
@@ -375,6 +391,11 @@ try {
     ],
     prompt_sha256: tamperedBinding.prompt_sha256,
     prompt_bytes: tamperedBinding.prompt_bytes,
+    task_prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    prompt_contract_revision: TASK_PROMPT_CONTRACT_REVISION,
+    task_prompt: tamperedDispatchFacts.taskPrompt,
+    task_dispatch_context: tamperedDispatchFacts.taskDispatchContext,
+    dispatch_admission: tamperedDispatchFacts.dispatchAdmission,
     result: { subtype: "success", final_text: "untrusted terminal result" },
     exit: { code: 0, signal: null, spawn_error: null, meaning: "EXIT_SUCCESS" },
     spawn_error_observed: false,
@@ -416,7 +437,13 @@ try {
   });
   process.stdout.write("fixture: local host listening\n");
   child = spawn(process.execPath, [join(HERE, "bridge.mjs"), "--config", configFile], {
-    env: { ...process.env, FAKE_CMD_SCENARIO: "success" },
+    env: {
+      ...process.env,
+      FAKE_CMD_SCENARIO: "success",
+      ELIOT_SWARM_MODULE_STATE: ownerDir,
+      ELIOT_SWARM_MODULE_OWNER: join(ownerDir, "owner.json"),
+      ELIOT_SWARM_MODULE_CONTRACT: JSON.stringify(FIXTURE_MODULE_CONTRACT),
+    },
     stdio: ["ignore", "ignore", "pipe"],
   });
   childClosed = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })));

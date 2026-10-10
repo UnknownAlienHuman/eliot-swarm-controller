@@ -797,11 +797,6 @@ pub struct ProfiledFacade {
 }
 
 impl ProfiledFacade {
-    #[cfg(test)]
-    fn new(inner: McpFacade, profile: McpToolProfile) -> Self {
-        Self::with_surface(inner, profile, catalog::Surface::role_default(profile))
-    }
-
     fn with_surface(inner: McpFacade, profile: McpToolProfile, surface: catalog::Surface) -> Self {
         Self {
             inner,
@@ -1456,9 +1451,6 @@ mod subscriptions;
 #[cfg(test)]
 #[path = "frontend_contract_tests.rs"]
 mod frontend_contract_tests;
-#[cfg(test)]
-#[path = "subscription_contract_tests.rs"]
-mod subscription_contract_tests;
 #[cfg(test)]
 #[path = "task_projection_tests.rs"]
 mod task_projection_tests;

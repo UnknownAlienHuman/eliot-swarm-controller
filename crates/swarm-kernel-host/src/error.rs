@@ -81,16 +81,76 @@ impl From<std::io::Error> for Error {
 }
 impl From<rusqlite::Error> for Error {
     fn from(value: rusqlite::Error) -> Self {
-        Self::new("STORE_ERROR", value.to_string())
+        let code = match &value {
+            rusqlite::Error::SqliteFailure(error, _)
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                "STORE_BUSY"
+            }
+            _ => "STORE_ERROR",
+        };
+        Self::new(code, value.to_string())
     }
 }
 impl From<swarm_store::Error> for Error {
     fn from(value: swarm_store::Error) -> Self {
-        Self::new(value.code(), value.message())
+        match value {
+            swarm_store::Error::Sqlite(error) => error.into(),
+            other => Self::new(other.code(), other.message()),
+        }
     }
 }
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self::invalid(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use rusqlite::{Connection, ErrorCode};
+
+    #[test]
+    fn real_sqlite_contention_is_retryable_but_constraint_errors_are_hard() {
+        let directory =
+            std::env::temp_dir().join(format!("swarm-store-contention-{}", crate::model::new_id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("store.sqlite");
+        let first = Connection::open(&path).unwrap();
+        let second = Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        first.execute_batch("CREATE TABLE data(value TEXT UNIQUE); INSERT INTO data VALUES('busy'); BEGIN IMMEDIATE;").unwrap();
+        let busy = second
+            .execute("INSERT INTO data VALUES('other')", [])
+            .unwrap_err();
+        assert!(
+            matches!(&busy, rusqlite::Error::SqliteFailure(error, _) if error.code == ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(
+            Error::from(swarm_store::Error::Sqlite(busy)).code,
+            "STORE_BUSY"
+        );
+        first.execute_batch("ROLLBACK").unwrap();
+        let constraint = second
+            .execute("INSERT INTO data VALUES('busy')", [])
+            .unwrap_err();
+        assert_eq!(Error::from(constraint).code, "STORE_ERROR");
+        let mut statement = first.prepare("SELECT value FROM data").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        let locked = first.execute("DROP TABLE data", []).unwrap_err();
+        assert!(
+            matches!(&locked, rusqlite::Error::SqliteFailure(error, _) if error.code == ErrorCode::DatabaseLocked)
+        );
+        assert_eq!(Error::from(locked).code, "STORE_BUSY");
+        drop(rows);
+        drop(statement);
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -937,6 +937,10 @@ fn saved_execution_pin(db: &Connection, id: &str) -> Result<Option<ForgeExecutio
         |row| row.get(0),
     )?;
     let value: Value = serde_json::from_str(&raw)?;
+    decode_execution_pin(&value)
+}
+
+fn decode_execution_pin(value: &Value) -> Result<Option<ForgeExecutionPin>> {
     let Some(pin) = value.get("execution_pin").filter(|value| !value.is_null()) else {
         return Ok(None);
     };
@@ -948,6 +952,25 @@ fn saved_execution_pin(db: &Connection, id: &str) -> Result<Option<ForgeExecutio
     })?;
     pin.validate()?;
     Ok(Some(pin))
+}
+
+pub(crate) fn validate_publication_effective_request(value: &Value) -> Result<()> {
+    model::fields(
+        value,
+        &[
+            "publication_intent",
+            "execution_pin",
+            "automation_on_behalf",
+            "receipt",
+        ],
+    )
+    .map_err(|_| {
+        Error::new(
+            "FORGE_INTENT_INVALID",
+            "saved publication fields are invalid",
+        )
+    })?;
+    decode_execution_pin(value).map(|_| ())
 }
 
 fn request(db: &Connection, id: &str) -> Result<PublishRefRequest> {
@@ -3240,6 +3263,14 @@ mod tests {
     fn re_promoted_gm_does_not_make_an_old_queued_epoch_current_again() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
+        for client_id in ["manager-a", "manager-b"] {
+            super::super::set_meta(
+                &db,
+                &format!("client:{client_id}"),
+                &json!({"role":"manager","disabled":false}),
+            )
+            .unwrap();
+        }
         assert_eq!(gm::current_epoch(&db).unwrap(), 0);
         super::super::set_meta(&db, "gm", &json!({"client_id":"manager-a","epoch":4})).unwrap();
         let admitted_epoch = gm::current_epoch(&db).unwrap();

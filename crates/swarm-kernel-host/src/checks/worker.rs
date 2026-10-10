@@ -20,13 +20,31 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use swarm_checks::{
     CaptureDisposition, CapturedStream, CheckControl, CheckExecution, CheckIdentity, DirectExit,
     FamilyDeparture, MAX_CAPTURE_BYTES_PER_STREAM, OwnedCheckProcess, ResolvedCheckPlan,
     StartDecision, Termination,
 };
+
+const START_GATE_TIMEOUT: Duration = Duration::from_secs(120);
+const START_GATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const TEST_START_GATE_TIMEOUT_ENV: &str = "SWARM_CHECK_TEST_START_GATE_TIMEOUT_MS";
+
+#[cfg(test)]
+fn test_start_gate_timeout() -> Duration {
+    match std::env::var(TEST_START_GATE_TIMEOUT_ENV) {
+        Ok(milliseconds) => Duration::from_millis(
+            milliseconds
+                .parse()
+                .expect("test start-gate timeout must be an unsigned millisecond count"),
+        ),
+        Err(std::env::VarError::NotPresent) => START_GATE_TIMEOUT,
+        Err(error) => panic!("could not read test start-gate timeout: {error}"),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -573,6 +591,8 @@ impl Cancellation {
 struct HostCheckControl<'a> {
     work: &'a Work,
     dir: &'a Path,
+    #[cfg(test)]
+    start_gate_timeout: Duration,
     cancellation: Cancellation,
     identity: Option<Value>,
     cancellation_observed: bool,
@@ -590,6 +610,8 @@ impl<'a> HostCheckControl<'a> {
         Self {
             work,
             dir,
+            #[cfg(test)]
+            start_gate_timeout: test_start_gate_timeout(),
             cancellation: Cancellation::default(),
             identity: None,
             cancellation_observed: false,
@@ -669,6 +691,11 @@ impl CheckControl for HostCheckControl<'_> {
         write_once(&self.dir.join("worker.json"), &identity).map_err(into_swarm_checks_error)?;
         self.identity = Some(identity);
 
+        #[cfg(test)]
+        let start_gate_timeout = self.start_gate_timeout;
+        #[cfg(not(test))]
+        let start_gate_timeout = START_GATE_TIMEOUT;
+        let deadline = Instant::now() + start_gate_timeout;
         loop {
             if self
                 .cancellation
@@ -677,6 +704,9 @@ impl CheckControl for HostCheckControl<'_> {
             {
                 self.cancellation.skipped_start = true;
                 return Ok(StartDecision::CancelBeforeStart);
+            }
+            if Instant::now() >= deadline {
+                return Ok(StartDecision::StartGateTimedOut);
             }
             let go = self.dir.join("go.json");
             if go.try_exists()? {
@@ -689,7 +719,9 @@ impl CheckControl for HostCheckControl<'_> {
                 self.started_at_ms = Some(model::now_ms().map_err(into_swarm_checks_error)?);
                 return Ok(StartDecision::Start);
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(
+                START_GATE_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 
@@ -1278,27 +1310,24 @@ pub(super) fn failure_with_process(
     write_once(&dir.join("completion.json"), &json!(c))?;
     Ok(c)
 }
-/// Read-only recovery after the worker lock is released. Never replays the command
-/// or signals a numeric PID from an old snapshot. Unknown/live groups retain ownership.
+/// Read-only recovery. A usable lock is held when present, but a missing or unusable
+/// lock is not release proof; exact worker identity and family departure are still
+/// required. Never replays the command or signals a numeric PID from an old snapshot.
 pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>> {
     let dir = directory(&work.data_dir, &work.check_id)?;
-    // A missing lock file is not proof of departure either; group disposition
-    // below is. When the file exists, hold it so no new worker can start.
-    let _lock = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join("worker.lock"))
-    {
-        Ok(lock) => {
-            match lock.try_lock() {
-                Ok(()) => {}
-                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    let lock_path = dir.join("worker.lock");
+    let _lock = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if !is_link_or_reparse(&metadata) && metadata.is_file() => {
+            match OpenOptions::new().read(true).write(true).open(&lock_path) {
+                Ok(lock) => match lock.try_lock() {
+                    Ok(()) => Some(lock),
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::fs::TryLockError::Error(_)) => None,
+                },
+                Err(_) => None,
             }
-            Some(lock)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
+        _ => None,
     };
     if let Some(c) = completion(work, files)? {
         return Ok(Some(c));
@@ -2467,6 +2496,7 @@ mod coverage_validation_tests {
 mod tests {
     use super::*;
     use crate::checks::model::Parser;
+    use std::process::Stdio;
 
     fn fixture(launch: Option<Value>) -> (PathBuf, Work) {
         let root = std::env::temp_dir().join(format!("swarm-check-{}", model::new_id()));
@@ -2574,6 +2604,74 @@ mod tests {
         .unwrap();
         let files = ArtifactFiles::new(&w.data_dir).unwrap();
         assert!(recover_pre_identity(&w, &files).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn timed_out_start_gate_releases_without_building_or_spawning_a_command() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("host_check_start_gate_no_go_execution_child")
+            .arg("--nocapture")
+            .env("SWARM_CHECK_TEST_CHILD_MODE", "start-gate-no-go")
+            .env(TEST_START_GATE_TIMEOUT_ENV, "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated no-go child exceeded the bounded test deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "isolated no-go child failed: {status}");
+    }
+
+    #[test]
+    fn host_check_start_gate_no_go_execution_child() {
+        if std::env::var("SWARM_CHECK_TEST_CHILD_MODE").ok().as_deref() != Some("start-gate-no-go")
+        {
+            return;
+        }
+
+        let (root, work) = fixture(None);
+        let dir = directory(&work.data_dir, &work.check_id).unwrap();
+        let work_path = dir.join("work.json");
+        let work_value = serde_json::to_value(&work).unwrap();
+        fs::write(&work_path, model::canonical(&work_value).unwrap()).unwrap();
+        run(&work_path).unwrap();
+
+        let files = ArtifactFiles::new(&work.data_dir).unwrap();
+        let completion = completion(&work, &files)
+            .unwrap()
+            .expect("no-go execution must durably settle after exact no-effect release");
+        assert_eq!(completion.state, "error");
+        assert_eq!(completion.exit_code, None);
+        assert!(completion.resource_released);
+        let facts = completion.process_facts.as_ref().unwrap();
+        assert_eq!(facts["termination"], "start_gate_timed_out");
+        assert_eq!(facts["direct_exit"]["state"], "not_started");
+        assert_eq!(facts["family_departure"]["state"], "confirmed");
+        assert!(facts["resource_released"].as_bool().unwrap());
+        assert_eq!(facts["termination_requests"], 0);
+        let recorded_owner = read_value(&dir.join("worker.json")).unwrap();
+        assert_eq!(recorded_owner["token"], work.token);
+        assert_eq!(
+            recorded_owner["process"],
+            facts["family_departure"]["process"]
+        );
+        assert!(dir.join("terminal.json").is_file());
+        assert!(dir.join("completion.json").is_file());
+        assert!(!dir.join("failure.json").exists());
+        assert!(!dir.join("stdout").exists());
+        assert!(!dir.join("stderr").exists());
         let _ = fs::remove_dir_all(root);
     }
 }

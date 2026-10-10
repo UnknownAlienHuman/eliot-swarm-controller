@@ -7,8 +7,8 @@
 
 use super::{
     BatchWorkerPlan, CLEANUP_GRACE_SECONDS, HOST_GRACE_SECONDS, MAX_OUTPUT_BYTES, POLL_INTERVAL,
-    WORKER_MAX_TERMINATION_ATTEMPTS, WORKER_START_GATE_SECONDS,
-    WORKER_TERMINATION_RETRY, read_json_bounded, replace_json_durable, write_json_new,
+    WORKER_MAX_TERMINATION_ATTEMPTS, WORKER_START_GATE_SECONDS, WORKER_TERMINATION_RETRY,
+    read_json_bounded, replace_json_durable, write_json_new,
 };
 use crate::{
     error::{Error, Result},

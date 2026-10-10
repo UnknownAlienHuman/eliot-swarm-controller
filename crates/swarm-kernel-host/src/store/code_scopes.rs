@@ -641,6 +641,11 @@ fn accept(
             continue;
         }
         let overlap = overlap(&accepted_scope, &accepted_scope_from_record(other));
+        if overlap.class == "unknown" || !overlap.unsupported_paths.is_empty() {
+            // A known conflict does not resolve unsupported path pairs in the
+            // same comparison. Reject before applying any requested override.
+            unknown_overlap = true;
+        }
         match overlap.class {
             "conflict" => {
                 required_overrides.insert(other_id.to_owned());
@@ -648,7 +653,7 @@ fn accept(
             "coordination_required" => {
                 coordination_required.insert(other_id.to_owned());
             }
-            "unknown" => unknown_overlap = true,
+            "unknown" => {}
             _ => {}
         }
     }
@@ -1552,4 +1557,178 @@ fn role_name(role: &Role) -> &'static str {
 
 fn damaged(message: &str) -> Error {
     Error::new("STORE_INVARIANT", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_rejects_mixed_known_and_unsupported_overlap_before_override_mutation() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);
+             CREATE TABLE tasks(
+                 task_id TEXT PRIMARY KEY,project_id TEXT,revision INTEGER,state TEXT,
+                 origin_key TEXT,spec_json TEXT,accepted_attempt_id TEXT,
+                 accepted_operation_id TEXT,accepted_revision INTEGER,
+                 accepted_phase TEXT,accepted_candidate_ref TEXT
+             );
+             CREATE TABLE attempts(
+                 attempt_id TEXT PRIMARY KEY,task_id TEXT,task_revision INTEGER,
+                 owner_id TEXT,start_owner TEXT,start_operation_id TEXT,
+                 binding_id TEXT,binding_generation INTEGER,state TEXT,
+                 released_at_ms INTEGER,task_snapshot_json TEXT,producers_json TEXT,
+                 submission_ref TEXT,candidate_ref TEXT
+             );",
+        )
+        .unwrap();
+
+        let task_id = "task-scope-test";
+        let attempt_id = "attempt-scope-test";
+        let manager_id = "manager-scope-test";
+        let participant_id = "participant-scope-test";
+        let task_revision = 1;
+        db.execute(
+            "INSERT INTO tasks(task_id,project_id,revision,state,origin_key,spec_json) \
+             VALUES(?1,'project-test',1,'open','origin-test','{}')",
+            [task_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,owner_id,start_owner, \
+             state,released_at_ms,task_snapshot_json,producers_json) \
+             VALUES(?1,?2,1,?3,'manager','running',NULL,'{}','[]')",
+            params![attempt_id, task_id, manager_id],
+        )
+        .unwrap();
+
+        let manager_registration = json!({"role":"manager","disabled":false});
+        set_meta(&db, &format!("client:{manager_id}"), &manager_registration).unwrap();
+        let participation_basis = json!({
+            "kind":"attempt_owner",
+            "assignment_id":null,
+            "review_scope":null
+        });
+        let participant_registration = json!({
+            "role":"participant",
+            "disabled":false,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "participation_basis":participation_basis,
+            "binding_id":null,
+            "binding_generation":null,
+            "created_by":manager_id
+        });
+        set_meta(
+            &db,
+            &format!("client:{participant_id}"),
+            &participant_registration,
+        )
+        .unwrap();
+        let registration_fingerprint = coordination::concilium_registration_fingerprint(
+            participant_id,
+            &participant_registration,
+        )
+        .unwrap();
+        let actor = json!({
+            "client_id":participant_id,
+            "role":"participant",
+            "generation":null
+        });
+
+        let old_id = format!("cscope-{}", model::new_id());
+        let candidate_id = format!("cscope-{}", model::new_id());
+        let mut old = json!({
+            "schema":SCHEMA,
+            "scope_intent_id":old_id,
+            "state":"active",
+            "state_revision":1,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "assignment_id":null,
+            "actor":actor,
+            "participation_basis":participation_basis,
+            "registration_fingerprint":registration_fingerprint,
+            "proposal":{"mode":"exclusive_edit","paths":["src/main.rs"],"symbols":[],"interfaces":[]},
+            "accepted":{"mode":"exclusive_edit","paths":["src/main.rs"],"symbols":[],"interfaces":[]},
+            "expires_at_ms":null,
+            "override_scope_intent_ids":[],
+            "coordination_required_with":[],
+            "overridden_by_scope_id":null,
+            "created_at_ms":1,
+            "updated_at_ms":1,
+            "list_sequence":1,
+            "source_operation_id":"seed-old"
+        });
+        old["digest"] = json!(record_digest(&old).unwrap());
+        let mut candidate = json!({
+            "schema":SCHEMA,
+            "scope_intent_id":candidate_id,
+            "state":"proposed",
+            "state_revision":1,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "assignment_id":null,
+            "actor":actor,
+            "participation_basis":participation_basis,
+            "registration_fingerprint":registration_fingerprint,
+            "proposal":{"mode":"exclusive_edit","paths":["src/main.rs"],"symbols":[],"interfaces":[]},
+            "accepted":null,
+            "expires_at_ms":null,
+            "override_scope_intent_ids":[],
+            "coordination_required_with":[],
+            "overridden_by_scope_id":null,
+            "created_at_ms":2,
+            "updated_at_ms":2,
+            "list_sequence":2,
+            "source_operation_id":"seed-candidate"
+        });
+        candidate["digest"] = json!(record_digest(&candidate).unwrap());
+        let candidate_digest = candidate["digest"].as_str().unwrap().to_owned();
+
+        let tx = db.transaction().unwrap();
+        set_meta(&tx, &record_key(&old_id).unwrap(), &old).unwrap();
+        set_meta(&tx, &record_key(&candidate_id).unwrap(), &candidate).unwrap();
+        add_active_index(&tx, &old).unwrap();
+        let request = json!({
+            "client_request_id":"accept-mixed-glob-test",
+            "scope_intent_id":candidate_id,
+            "expected_state_revision":1,
+            "proposal_digest":candidate_digest,
+            "mode":"exclusive_edit",
+            "paths":["src/main.rs","src/[ab].rs"],
+            "reason":"exercise conservative overlap admission",
+            "acknowledge_broad_scope":false,
+            "override_scope_intent_ids":[old_id]
+        });
+        let principal = Principal {
+            link_id: "test-link".into(),
+            client_id: manager_id.into(),
+            role: Role::Manager,
+        };
+
+        let error = apply(
+            &tx,
+            &principal,
+            "code.scope.accept",
+            &request,
+            "accept-operation-test",
+            3,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "SCOPE_OVERLAP_UNKNOWN");
+
+        let retained_old = load_record(&tx, &old_id).unwrap();
+        assert_eq!(retained_old["state"], "active");
+        assert_eq!(retained_old["state_revision"], 1);
+        assert!(retained_old["overridden_by_scope_id"].is_null());
+        assert_eq!(retained_old["digest"], old["digest"]);
+        let retained_candidate = load_record(&tx, &candidate_id).unwrap();
+        assert_eq!(retained_candidate["state"], "proposed");
+        assert_eq!(retained_candidate["state_revision"], 1);
+    }
 }

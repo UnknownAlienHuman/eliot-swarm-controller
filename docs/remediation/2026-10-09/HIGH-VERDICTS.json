@@ -38,7 +38,9 @@
       "evidence": "crates/swarm-kernel-host/src/store/coordination.rs::inbox builds a bounded scan window at 3310-3326 (scan_limit = limit times RELEVANCE_SCAN_FACTOR plus 32, capped at keys::MAX_INBOX_SCAN; rows fetched as scan_limit plus 1) and computes the cursor at 3408-3413: next_after = if more or (scan_more and not messages.is_empty()) then last_operation else None. When the entire fetched window is filtered out (missing operation_id, method or state mismatch, scope mismatch, or body mismatch, each incrementing stale) while scan_more is true, the response has empty items and null next_after, yet coverage is partial (3422) and gaps names inbox_scan_bound (3423). The index producer keys::mailbox_key (crates/swarm-kernel-host/src/coordination/mod.rs) sorts on created_at_ms then operation_id, so the window cannot advance on its own, and a retry with the null cursor re-reads the identical rows. Public caller coordination.inbox passes the client after_operation_id straight through (3236-3309) and rejects a stale or corrupt after key as invalid rather than repairing it (3301-3305).",
       "owner": "R08/#34 mailbox cursor writer - crates/swarm-kernel-host/src/store/coordination.rs (store/coordination lane, single manager)",
       "remaining_gap": "Emit a last-examined retained key in next_after whenever partial, mirroring the already-correct list_participant_page pattern at 2200-2294 (last_scanned and cursor_before_extra at 2227-2256, next_after at 2290), then re-authorize the next read instead of returning null. Decide explicitly whether that cursor is a mailbox meta key or an operation id; the two are currently conflated at 3273-3306.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "main@85189dd crates/swarm-kernel-host/src/store/coordination.rs::send writes the v2 mailbox index from the retained Operation read position; ::inbox advances last_examined_operation over stale filters, leaves a valid over-budget item for the next page, and returns next_after; ::inbox_cursor_key resolves the operation cursor to the authenticated v2 or legacy index.",
+      "remaining_execution_gap": "Runtime stale-window cursor progression remains unqualified; this is source-only evidence."
     },
     {
       "id": "HIGH-0111",
@@ -62,7 +64,9 @@
       "evidence": "crates/swarm-kernel-host/src/store/code_scopes.rs::overlap (913-963) sets matched from path, symbol and interface pairs, then classifies at 941-955 as if matched then mode-based classes, else if unknown_path then unknown, else none. So an unsupported-glob pair (path_overlap returning None, setting unknown_path at 926) is discarded whenever any other pair matched. accept() converts unknown into a hard SCOPE_OVERLAP_UNKNOWN only at 546-551, which is unreachable for records where a known pair also matched. The reader conflicts_for() (882-911) projects classification with no uncertainty field, so code.scope.conflicts and code.scope.inspect report a definite class for a partly-unsupported comparison. Partial mitigation already traced: the mode precedence at 944-950 means an exclusive_edit pair can never be classified coordination_required, so the old row's specific wording about an exclusive-edit conflict being silently downgraded is not reachable as written.",
       "owner": "code-scope overlap and accept writer - crates/swarm-kernel-host/src/store/code_scopes.rs (store/coordination lane, single manager)",
       "remaining_gap": "Surface the uncertainty dimension explicitly: either fail accept() when any compared pair in the chosen override set is unsupported, or add an uncertainty marker to the accept receipt and to conflicts_for() findings. The exact pattern set for which path_overlap returns None was not traced in this pass and must be enumerated before the fix is written.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "main@85189dd crates/swarm-kernel-host/src/store/code_scopes.rs::path_overlap classifies unsupported glob syntax (`*`, `?`, `[`, `{`) as unknown unless an earlier exact/broad/proven `/**` rule resolves it; ::overlap retains every unresolved pair in unsupported_paths alongside known matches; ::accept rejects class=unknown or any nonempty unsupported_paths before validating/applying override mutations. Thus the mixed exclusive_edit example cannot be accepted and is not downgraded to coordination_required.",
+      "remaining_execution_gap": "Runtime qualification remains pending; no runtime qualification was performed."
     },
     {
       "id": "HIGH-0116",
@@ -86,7 +90,9 @@
       "evidence": "store/submissions.rs:1496 request_changes_core, actual execution order on 953efa1. Steps BEFORE the early return: :1504 context.require_current_action (automation actor only); :1506 tasks::get_attempt(tx,&input.attempt_id) - tasks.rs:29-35 selects by attempt_id with NO filter on released_at_ms, state or task_revision, so a released Attempt is still returned; :1508-1524 authority - a Direct Manager needs only p.role==Manager and a['owner_id']==p.client_id (:1509-1510), else :1510 gm::require_attempt_control, and becomes scoped_manager at :1516-1519 when !legacy_authority && role==Manager && owner_id==client_id && allows_scoped_manager_feedback(a['task_snapshot']), Operator/current-GM becoming legacy_authority at :1512-1515; :1539 document(tx,&input.submission_ref) - submissions.rs:1298-1329 validates only the frozen submission artifact, its task.submit Operation and the doc/candidate digest, so doc['task_revision'] is the FROZEN revision and the :1540-1546 anchor check passes for a stale-revision replay repeating the original body; :1548 spec is parsed from a['task_snapshot']['spec'], i.e. the old revision, so requirement_ids still validate at :1549-1554; :1559-1600 automation_task re-checks current Task state, release, submission_ref and candidate_ref - automation actor only; :1608-1617 key=digest(decision_actor_id,submission_ref,finding_id); :1620 prior lookup; :1621-1624 FINDING_ID_CONFLICT only if the payload differs; :1643-1644 prior['coalesced']=json!(true); return Ok(prior). Only AFTER that return: :1646 t=get_task, :1650-1657 applies recomputed, :1658-1663 scoped_manager && !applies -> STALE_REVIEW_SUBJECT, :1723-1724 UPDATE attempts SET state='needs_correction', :1737 UPDATE operations SET task_id,attempt_id, :1740 review observation insert.",
       "owner": "Manager, PR #49/#51 operation-object relation (same owner as the R27 consumer seam)",
       "remaining_gap": "Two narrow defects, no leak. (a) Stale authoritative payload: replay after attempt.release or task.revise returns applied:true,status:needs_correction from the original pass, for a Direct scoped owner, with no live applicability re-evaluation. Fix: hoist the :1646-1657 current-state read plus a scoped-manager STALE_REVIEW_SUBJECT check above the :1620 prior lookup, or derive the status freshly on the replay branch. (b) Missing object scope: the coalesced Operation keeps NULL task_id/attempt_id so R23 relation-derived reads cannot attribute it, unlike task.create/claim/release which attach scope via tasks.rs:76 attach_operation_scope. Fix: stamp scope on the replay path, or document that coalesced semantic no-ops intentionally keep NULL scope and are read via caller_id plus the retained review observation. Not an authorization leak: OPERATION_VISIBILITY_SQL (mod.rs:3165) admits the Operation via the non-denylisted disjunct and caller_id=:client, and the provenance is keyed by actor+submission+finding digest at :1608-1617 so it cannot drift.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "At main@85189dd, crates/swarm-kernel-host/src/store/submissions.rs::request_changes_core evaluates current Task/Attempt applicability and scoped-owner stale rejection before coalescing, stamps task_id/attempt_id on the new Operation before lookup, and refreshes replay operation_id/status/applied while applying needs_correction only when current. The consumer path crates/swarm-kernel-host/src/store/object_reads.rs::operation -> object_scope::resolve_operation_read reads that retained Task/Attempt relation for scoped Operation access. HIGH-0122 baseline verdict remains unchanged.",
+      "remaining_execution_gap": "Source candidate only: Connected production strict Clippy passed; replay/release/revision runtime qualification remains pending. No runtime qualification is claimed."
     },
     {
       "id": "HIGH-0141",
@@ -110,7 +116,11 @@
       "evidence": "automation_dispatch_bus.rs:3373-3379 discards ConciliumEventSourceProof; automation_dispatch.rs:1777-1797 marks the retained source valid and skips the Operation-scope branch. Fresh dispatch at automation_dispatch_bus.rs:2669-2702 consumes the proof tuple directly, so the alleged new-execution consequence is not established by that producer path.",
       "owner": "Ohm / native GPT 6 Luna max — automation dispatch",
       "remaining_gap": "Prove whether a divergent retained cause reaches a currently admitted ScriptRun effect without a later exact Task/Attempt gate; the retained-link validator alone does not prove that runtime consequence.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "Dirty candidate based on main@85189dd: store/scripts.rs::admit_script_trigger validates the exact retained system_event cause and preserves the Operation/Task/revision/Attempt tuple; applied_submission alone loads its submission candidate. Independent source review review-concilium-admission.json found no defect. Scoped production host Clippy passed. Real Store/event reconciliation/admission regression includes saved link readback, semantic retry and four scope mutations.",
+      "remaining_execution_gap": "Bounded Store/event-reconciler admission regression passed; fixture seeds historical Concilium source and does not qualify proposal writer or interpreter execution. Historical UNKNOWN remains unchanged.",
+      "execution_status": "bounded_admission_case_verified_windows_linux",
+      "execution_evidence": "store::scripts::script_trigger_admission_isolation_tests::retained_concilium_cause_admits_one_script_run_and_rejects_scope_mutations PASS in windows-remaining-host-tests.log:54 and linux-remaining-host-tests.log:60. Retained exact cause admits once, semantic retry is reused, changed Operation/Task/revision/Attempt rejected before ScriptRun admission."
     },
     {
       "id": "HIGH-0153",
@@ -122,7 +132,9 @@
       "evidence": "launcher.rs:5158-5163 hashes the full preview before fallback. The oversized and terminal fallbacks at launcher.rs:5166-5198 and :5201-5237 omit route and mcp; admission copies those fields into the durable manifest at :3275-3286, while launcher_owned_service.rs:2926-2933 requires runtime.route.alias.",
       "owner": "Ohm / native GPT 6 Luna max — launcher preview",
       "remaining_gap": "Admission must consume a full exact authoritative plan, not bounded/fallback preview. Render preview from retained plan; route/MCP/digest fields must remain bound to that same full plan.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "At main 85189dd, store/launcher.rs::PlannedLaunch::effect_facts retains the full LaunchPlanAuthority. launch_for_actor reparses the request, recomputes launch_preview_inner under the actor, and requires the same plan_digest; validate_launch_manifest_precommit binds request, route, MCP, task, candidate scope, and Attempt back to that authority. Admission therefore uses the full recomputed plan rather than a bounded preview rendering.",
+      "remaining_execution_gap": "Native launch/readback qualification on the candidate runtime remains unverified; no runtime result is inferred from source or Clippy."
     },
     {
       "id": "HIGH-0177",
@@ -134,7 +146,9 @@
       "evidence": "Rust-module routes are accepted by launcher_owned_service.rs:2953-2958 and owned_opencode_artifact at :1504-1508, but departure_source at :2454-2464 requires only the V2 artifact. departure_batch at :2425-2438 turns that mismatch into a candidate without a route, and lifecycle reconciliation invokes this path from store/mod.rs:1066-1074.",
       "owner": "Ohm / native GPT 6 Luna max — owned-service lifecycle",
       "remaining_gap": "Rust-module owned-service starts cannot produce departure proof through this reconciler, so their departure and resource release remain unrecorded.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "store/launcher_owned_service.rs::departure_source now reuses owned_opencode_artifact and requires binding.module_artifact_id to equal the retained route artifact. It admits only the exact OpenCode v2/runtime pair or module/OPENCODE_RUST_ARTIFACT_ID pair; the existing launch, Task/Attempt, lease, route-digest, and intent-digest checks remain in the proof chain.",
+      "remaining_execution_gap": "Native departure observation and retained service_departed readback have not been runtime-qualified; no runtime result is inferred from formatting or source review."
     },
     {
       "id": "HIGH-0178",
@@ -146,7 +160,9 @@
       "evidence": "launcher_owned_service.rs:2430-2438 suppresses departure_source errors; :633-683 suppresses proof/route/canonicalization failures, then :685-689 touches the candidate and returns a successful count. The close helper at :280-283 discards the reconciler result. Database errors still propagate from the once method.",
       "owner": "Ohm / native GPT 6 Luna max — owned-service lifecycle",
       "remaining_gap": "Candidate-level route/provenance/proof failures need an observable bounded disposition; this is narrower than the allegation that every database error is swallowed.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "store/launcher_owned_service.rs::departure_batch and build_departure_proof now preserve semantic/proof/observation failures as bounded codes. persist_departure_issue uses an immediate transaction and exact row CAS to advance only the still-uncertain candidate and insert an idempotent controller observation bound by candidate, route, intent, and source-proof digests. It leaves the candidate state/evidence fenced; STORE_* and transaction errors propagate.",
+      "remaining_execution_gap": "Runtime qualification of durable issue readback, retry fairness, and later proof-backed departure remains unverified; no Cargo or tests were run."
     },
     {
       "id": "HIGH-0186",
@@ -170,7 +186,9 @@
       "evidence": "Producer finish() at store/checks.rs:1743 rejects c.resource_released==false with Error::conflict(\"check completion mismatched\"); guard at :1750-1755, UPDATE at :1764. No settle/incomplete path exists: greps for settle_incomplete and mark_unknown in store/checks.rs return no hits; the only incompleteness handling is a coverage projection at :2636-2660 plus a preflight branch in the state guard at :1697-1702. Results reaching finish come from build_completion (standalone_host.rs:563) and worker::failure_with_process (:551,:563), so a resource_released==false result aborts the transaction and leaves check_runs in running/reconciling with resource_claimed_at_ms set and resource_released_at_ms NULL.",
       "owner": "R35 owner (checks completion): store/checks.rs finish() plus worker.rs finalize_execution",
       "remaining_gap": "Add a durable settlement path for unreleased-resource completions: record incomplete, retain the Job/group, bounded retry. Do not hard-conflict into a permanently wedged resource slot.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "Current Store path: crates/swarm-kernel-host/src/store/checks.rs::finish validates exact check_id/operation_id/token and artifacts, then retains an unreleased Completion under spec.cleanup_pending, keeps CheckRun reconciling and Operation outcome_unknown, and does not set resource_released_at_ms. describe exposes cleanup_pending, resource_released, process_facts and release_evidence; ready refuses another go while cleanup is retained, and next keeps the claimed resource blocked until positive release. reconcile_checks_once and supervise_checks read the same execution via standalone_host::finalize_execution or worker::completion; a later released Completion moves the pending record to cleanup_history. The original hard rejection is closed on this Store path without rerunning the command.",
+      "remaining_execution_gap": "No runtime qualification claimed. Verify Windows/Linux late exact-family departure upgrades the retained Completion once, preserves captured artifacts, and never reruns the command."
     },
     {
       "id": "HIGH-0234",
@@ -194,7 +212,9 @@
       "evidence": "Producer wait_for_start at checks/worker.rs:548-585 is a literal unbounded loop: writes worker.json once, then loops { cancellation_requested?; go.json exists?; sleep(100ms) } with no deadline and no host-liveness check. The standalone executor has the identical shape at swarm-checks/src/bin/swarm-checks.rs:145-201 (sleep(CONTROL_POLL)=100ms, no deadline, no liveness). Both hold worker.lock (try_lock at standalone_host.rs:501) and the resource_key slot for their whole life. Contrast swarm-script-worker/lib.rs:797-831 wait_for_go, which does bound itself with START_GATE_TIMEOUT=120s.",
       "owner": "R35 owner (checks worker): checks/worker.rs wait_for_start plus swarm-checks/src/bin/swarm-checks.rs wait_for_start",
       "remaining_gap": "Bound the start gate and preserve an explicit incomplete/unknown receipt. Release resource only after positive no-spawn or exact family-departure proof, never timeout or age alone.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/checks/worker.rs::HostCheckControl::wait_for_start validates and persists the exact worker identity, then uses a 120-second monotonic deadline with bounded polling and returns StartGateTimedOut when Go never arrives. swarm_checks::execute_with_plan turns that decision into not_started evidence; worker::run requires DirectExit::NotStarted, FamilyDeparture::Confirmed, and resource_released before persisting the terminal/completion facts, without building or spawning the check command.",
+      "remaining_execution_gap": "Runtime qualification remains pending; verify timeout settlement and restart/reconcile after a crash without command replay."
     },
     {
       "id": "HIGH-0274",
@@ -206,7 +226,9 @@
       "evidence": "Producer finalize_execution at checks/standalone_host.rs:466-535. At :495-499 it does fs::symlink_metadata(&lock_path)? and returns the raw io error before any worker.json/execution/failure handling. Compare the guarded lock probe in the same function at :501-506 (try_lock WouldBlock returns Ok(None)). A worker that dies between publishing worker.json and creating/locking worker.lock leaves the metadata error, so the run never reaches build_completion or worker::failure_with_process: no Completion, no terminal record, resource_released_at_ms stays NULL.",
       "owner": "R35 owner (ch\necks host): checks/standalone_host.rs finalize_execution",
       "remaining_gap": "Treat a missing or unusable worker.lock as a settled failure with the exact owner identity re-checked, not a hard error; keep the process-emptiness proof as the family gate.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/checks/standalone_host.rs::finalize_execution tolerates a missing/unusable worker.lock only when the exact worker family is observed departed; otherwise it returns no Completion and retains the resource. Execution/failure receipts remain bound to the accepted worker identity/process. With no terminal receipt it calls worker.rs::recover after dropping any acquired lock; recover treats an unusable lock as unavailable but still verifies worker.json against expected_worker/token and requires departed_empty before writing an incomplete durable Completion without replay.",
+      "remaining_execution_gap": "Runtime qualification remains pending; exercise missing and unusable lock cases with live and departed exact worker families, including restart reconciliation and no replay."
     },
     {
       "id": "HIGH-0296",
@@ -218,7 +240,9 @@
       "evidence": "scheduler.rs:189-200 propagates reconciliation errors with ?. rusqlite errors map to STORE_ERROR in error.rs:82-85; legacy_optional_workers.rs:521-523 treats STORE_* as fatal, and host.rs:221-235 terminates the host supervisor on that worker error instead of retrying the scheduler.",
       "owner": "Ohm / native GPT 6 Luna max — scheduler lifecycle",
       "remaining_gap": "A transient Store error still terminates the scheduler/host path; isolate and retry the scheduler failure without converting Store uncertainty to success.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "error.rs classifies typed SQLite DatabaseBusy/DatabaseLocked as STORE_BUSY, including swarm_store::Error::Sqlite. scheduler::run paces failed passes with capped exponential retry, retains retry_wait status when Store is writable, and re-enters retained-evidence readback; only a successful pass and recovery-status write clears contention. Other Store, corruption, and transaction failures remain hard.",
+      "remaining_execution_gap": "Fresh connected production Clippy and runtime SQLite contention/recovery qualification remain pending; no tests or native model calls have run."
     },
     {
       "id": "HIGH-0308",
@@ -230,7 +254,9 @@
       "evidence": "Two current producers. (1) scripts/runner.rs allow() at :499-517 checks deny.json before writing go.json but never re-checks it; deny() at :522-529 uses write_once, which conflicts on differing bytes but cannot detect an already-written go.json. (2) The consumer gate swarm-script-worker/lib.rs wait_for_go at :797-831 tests receipt_exists(gate) BEFORE receipt_exists(denial). A deny written after allow's deny-check but before go.json is therefore read go-first and execution proceeds; verify_go at :718-729 validates only run_id/operation_id/token and never a denial. The in-root path has the same ordering at scripts/runner.rs:956-1018 (gate at :956 before denied at :984).",
       "owner": "R38/R67 owner (scripts start gate): scripts/runner.rs allow/deny plus swarm-script-worker/src/lib.rs wait_for_go",
       "remaining_gap": "Replace competing go/deny files with one immutable decision CAS bound to exact run/Operation/token and consumed consistently. A second deny existence check is not an atomic decision.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "The public Store ScriptRun path acknowledges the exact worker before calling scripts::runner::allow. allow, deny and deny_unstarted publish one schema- and run/operation/token-bound ScriptStartDecision through swarm-script-worker::publish_start_decision, which uses first-writer-wins publication and reads back the retained winner. The actual worker run_worker waits in wait_for_start_decision before accepting the execution plan; old go/deny receipts are decode-only, and conflicting or mixed current/legacy receipts fail closed as ambiguous. Thus Allow cannot overwrite a retained Deny, and Deny cannot override a retained Allow.",
+      "remaining_execution_gap": "No runtime qualification claimed. Exercise concurrent Allow/Deny, legacy single-receipt readback, and restart readback on the native platforms before qualification."
     },
     {
       "id": "HIGH-0309",
@@ -242,7 +268,9 @@
       "evidence": "Producer execute() at scripts/runner.rs:1156-1161: after the poll loop ends (timeout or exit), status = Some(child.wait()?) at :1157 is a blocking reap with no grace bound, and the following while !group.children_empty()? { cancel_children_and_record(...); sleep(25ms) } at :1158-1161 has no iteration or time bound. Identical shape in swarm-script-worker execute (blocking child.wait() at :984, unbounded drain at :986-989) and finish_worker_error at :1040-1043. The 5-minute bound applies only to the try_wait poll loop at :952/:1151 (deadline = timeout_ms.min(MAX_SCRIPT_DURATION_MS), swarm-scripts/src/lib.rs:28 = 300000). A surviving grandchild keeps children_empty()==false forever and cancel_children_and_record only writes a diagnostic.",
       "owner": "R35 owner (scripts execution): scripts/runner.rs execute plus swarm-script-worker/src/lib.rs execute/finish_worker_error",
       "remaining_gap": "Add a bounded drain deadline after the execution deadline, then retain the Group and record a CleanupPending/Incomplete terminal receipt instead of blocking forever.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "Current swarm-script-worker::execute uses Child::try_wait polling and a bounded termination grace; it no longer performs the alleged blocking child.wait or an unbounded family-drain loop. request_script_termination starts the grace clock before attempting cancellation, including failed requests. If exact family departure or complete capture is unproved, publish_cleanup_pending retains process identity, process facts, and partial stdout/stderr capture with resource_released=false. The Store observe/recover_cleanup_pending path verifies those artifacts and upgrades only after departed_empty for the retained process/token; existing cleanup-pending markers and Store state prevent relaunch.",
+      "remaining_execution_gap": "No runtime qualification claimed. Verify a surviving grandchild and partial capture remain observable through worker/Store restart, then upgrade only after exact family departure with no second execution."
     },
     {
       "id": "HIGH-0320",
@@ -290,7 +318,9 @@
       "evidence": "The only mutation of a retained assignment in crates/swarm-kernel-host/src/store/reviews.rs is the replacement branch of reserve_assign (382-474). It demands result_observation(tx, existing_id) first (405-410, REVIEW_REPLACEMENT_UNDISPOSED) and then a retained review.disposition observation whose review_assignment_id, identity, review_result_operation_id and disposition ReturnForCorrection all match exactly (411-442, REVIEW_REPLACEMENT_DISPOSITION_MISMATCH). When replaces_review_assignment_id does not name the current slot pointer the code coalesces an identical target (390-398) or fails with REVIEW_SLOT_CONFLICT (400-403) or REVIEW_REPLACEMENT_NOT_FOUND (477-482). No other path rewrites, releases or supersedes an assignment, and replacement additionally requires a distinct reviewer (450-455). operations::cancel (crates/swarm-kernel-host/src/store/operations.rs:3294-3379) refuses anything already sent with NOT_QUEUED at 3379-3384, and review.assign appears both in the on-behalf cancel set (3306) and the continuation set (3446-3451).",
       "owner": "R09/#35 review replacement writer - crates/swarm-kernel-host/src/store/reviews.rs (store lane, single manager)",
       "remaining_gap": "Whether review.assign settles synchronously in the central dispatcher, making the NOT_QUEUED branch the firing one, was not traced in this pass, so the cancel half of the claim is CONFIRMED with that single point open. The needed change is an addressable manager supersede or revoke with expected-slot CAS, reason and evidence refs for an assignment that has no result, kept separate from the reviewer-result path, without resetting the Attempt to submitted.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "main@85189dd crates/swarm-kernel-host/src/review.rs::ReviewAssignRequest::parse requires prior assignment ID, nonempty reason, and evidence refs; store/reviews.rs::replacement_class admits Unanswered when no result exists, ::reserve_assign requires the exact current slot and a distinct reviewer, and ::create_assignment retains supersedes/replacement_context with compare_and_set_slot_pointer CAS.",
+      "remaining_execution_gap": "Manager-authorized unanswered reassignment and late superseded-review submission remain unqualified at runtime."
     },
     {
       "id": "HIGH-0326",
@@ -302,7 +332,9 @@
       "evidence": "review_disposition.rs:324-358 calls event_identity(event)? before consume_isolated; pending retries do the same at :457-477. The top-level reconcile loop at :169-180 also propagates each entry error, so a malformed event aborts that pass before the savepoint boundary.",
       "owner": "Fermat — review disposition",
       "remaining_gap": "Move event identity validation into per-event isolation or persist a bounded quarantine/cursor disposition so one damaged event cannot block the pass.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "main@85189dd crates/swarm-kernel-host/src/store/review_disposition.rs::reconcile routes fresh events through ::consume_isolated; event_identity runs inside its subject savepoint and damaged-event errors classify to quarantine. Pending retries similarly run through ::consume_pending_isolated with identity validation inside the savepoint.",
+      "remaining_execution_gap": "A mixed healthy-and-damaged event pass remains unqualified at runtime; this is source-only evidence."
     },
     {
       "id": "HIGH-0343",
@@ -314,7 +346,9 @@
       "evidence": "owned_service.rs:710-723 consumes the handle and maps a 30s parent timeout to OWNED_SERVICE_STOP_UNKNOWN; helper shutdown allows 30s for Bun plus a separate 30s family-departure proof at :1435-1467. Store caller reconciles only on Ok (store/opencode.rs:283-295; launcher_owned_service.rs:280-284).",
       "owner": "#28 OpenCode recovery/IPC",
       "remaining_gap": "Parent must cover the helper complete stop-and-proof budget while preserving exact owner state on timeout; live timing remains unqualified.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/runtime/opencode_v2/owned_service.rs::OwnedServiceHandle::close_gracefully applies one absolute stop deadline to request delivery and helper.wait(); run_owned_service_helper receives that timestamp and continues supervising after expiry; retain_helper_child keeps the exact helper Child for late wait. write_helper_family_stop remains after verify_stopped_plan and children_empty, so helper exit alone is never departure.",
+      "remaining_execution_gap": "No connected runtime fault-injection verified a child exiting after the shared 30s foreground deadline or the later durable receipt being consumed by host.rs::supervise_launcher / store::reconcile_workspace_lifecycle_once. Runtime qualification remains pending."
     },
     {
       "id": "HIGH-0344",
@@ -326,7 +360,9 @@
       "evidence": "owned_service.rs:841-849 starts the parent 120s read timeout immediately after helper spawn; helper wait_for_ready starts its own 120s deadline later at :1503-1506, after helper startup work. Store crosses the durable unknown boundary before start_foreground (launcher_owned_service.rs:498-502), so a slow ready receipt is not safely retried.",
       "owner": "#28 OpenCode recovery/IPC",
       "remaining_gap": "Align the parent/helper startup deadline and retain exact helper ownership across timeout; no slow-start runtime qualification.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/runtime/opencode_v2/owned_service.rs::start_foreground creates SharedDeadline before route verification/materialization and stores its exact timestamp in HelperPlan::startup_deadline_unix_ms; run_owned_service_helper checks that timestamp before Bun spawn and wait_for_ready uses it. complete_foreground_start applies the remaining budget to receipt, connect, and provider bootstrap, retaining Child via start_failure_with_child on unknown outcomes.",
+      "remaining_execution_gap": "No connected runtime delay injection verified that helper setup and readiness share the parent’s absolute 120s boundary, or that an expired late-ready helper reaches clean stop/family proof. Runtime qualification remains pending."
     },
     {
       "id": "HIGH-0347",
@@ -350,7 +386,9 @@
       "evidence": "Producer execution.rs SessionScan::consume (crates/swarm-kernel-host/src/runtime/opencode_v2/execution.rs:826-960): on session.execution.started it pushes a SessionPeriod, then runs the eviction loop at 866-876: `while self.periods.len() > MAX_SESSION_PERIODS { let Some(oldest_terminal) = self.periods.iter().position(|p| p.terminal.is_some()) else { break }; self.periods.remove(oldest_terminal); }` with MAX_SESSION_PERIODS=16 (line 402). The `else { break }` is the exact edge: when no retained period has a terminal, the loop breaks WITHOUT removing anything, so periods.len() keeps growing beyond 16 and every one of those periods stays unresolved. Separately, a started event arriving while periods.last() has no terminal marks uncertainty NATIVE_EXECUTION_RESTART_GAP (846-855) rather than terminating the earlier period, which is how that unresolved set accumulates in practice. Restore consumer SessionScan::restore (749-780) rejects scan.periods.len() > MAX_SESSION_PERIODS with NATIVE_LOG_CHECKPOINT_SCOPE, and the persisted value is written by the same struct (tests.rs:1717-1747 round-trips a saved scan through serde and restores it). Outer consumers: snapshot.rs read_child_logs (337-398) restores the saved scan and enqueues only non-terminal periods; tests.rs session_scan_records_periods_and_refuses_gap_terminals asserts the restore rejection path. The registry sentence is therefore exact: the writer persists a checkpoint its own restore rejects, and once the count exceeds 16 the child's evidence is frozen because every later restore fails before any new event can be consumed.",
       "owner": "#41 owner (crates/swarm-kernel-host/src/runtime/opencode_v2/execution.rs); Luna to quality-check the eviction boundary",
       "remaining_gap": "Writer and restorer must agree on one bounded checkpoint contract. Preserve unresolved evidence; overflow/gap can never imply terminal/departure or permit new effects. Do not silently evict unresolved periods or create an in-memory authority.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/runtime/opencode_v2/execution.rs::SessionScan::consume caps periods at 16, prunes terminal entries first, and marks all-unresolved overflow permanently uncertain while advancing the native-log anchor without adding or settling periods. restore clamps legacy oversized checkpoints to the same unknown state; snapshot.rs::read_child_logs schedules unknown scans and surfaces invalid checkpoints. Raw native logs remain unchanged and no overflow projects terminal turns.",
+      "remaining_execution_gap": "No connected native-log run verified restart/resume after 17 unresolved starts and later terminal events while the checkpoint stays bounded and projections remain unknown. Runtime qualification remains pending."
     },
     {
       "id": "HIGH-0356",
@@ -386,7 +424,9 @@
       "evidence": "host_bus_supervisor.rs:250-255 propagates Slot::new failure out of run before per-scope reconciliation. The outer actor records retry_wait and reruns the whole coordinator (same file:377-423); a persistent failing demand therefore prevents every scope from being processed, though the actor backs off instead of dying permanently.",
       "owner": "#71 optional worker supervision",
       "remaining_gap": "Isolate a single scope-construction failure and preserve reconciliation for unaffected scopes; current guard retries globally.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/host_bus_supervisor.rs::run now handles Slot::new per demand. A constructor error persists the existing managed-bus health record as unknown with the safe error code, caches that disposition, and proceeds to reconcile other slots. A stale removed scope is skipped; STORE_CLOSED/STORE_ERROR/STORE_PANIC during health persistence gates the whole pass while retaining existing Child handles, so unknown SQLite is not swallowed.",
+      "remaining_execution_gap": "Runtime qualification remains: induce one scope's path-construction failure beside a healthy scope and verify durable unknown plus continued healthy reconciliation; inject a Store/SQLite health-write failure and verify the pass gates without dropping child custody. Not run here."
     },
     {
       "id": "HIGH-0360",
@@ -398,7 +438,9 @@
       "evidence": "host_bus_supervisor.rs:844-871 retains a live child lacking its owner receipt; after 10s it records BUS_SERVICE_OWNER_RECEIPT_MISSING/unknown, then returns without stopping or replacing that child. The 10s detection threshold exists, but no recovery transition follows.",
       "owner": "#71 optional worker supervision",
       "remaining_gap": "Define safe bounded recovery after missing receipt, requiring exact family-departure proof before replacement.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/host_bus_supervisor.rs::reconcile_unreceipted_child requires the pinned image, retained birth identity, exact Child handle, and matching stored launch contract. After the 10-second startup bound it creates stop.request, rereads owner.json, allows a 2-second stop grace, then calls start_kill only through that verified Child handle. crates/swarm-bus/src/bin/dispatcher.rs::run_managed_worker writes owner.json before checking stop.request and before poll_once, its first Store/network effect; a raced receipt therefore routes back through exact owner-family verification instead of direct-child cleanup. If identity, contract, receipt readback, kill, or exit proof is uncertain, the Child and scope fence remain and durable health stays unknown; no age-based replacement occurs.",
+      "remaining_execution_gap": "Runtime qualification remains: exercise delayed receipt publication across the stop-marker reread, exact no-receipt child exit, receipt-present family departure, identity/readback failures, and a child that does not exit after start_kill; verify no duplicate starts and durable unknown while held. Not run here."
     },
     {
       "id": "HIGH-0362",
@@ -410,7 +452,10 @@
       "evidence": "host_module_supervisor.rs:1321 and :1361 await child.wait() without a deadline. The unidentified-child path transfers the exact handle to a one-shot reaper (:1264-1277); identity errors are non-retryable (:853-865), and host observes module-supervisor failure (host.rs:221-240). Source does not establish whether the child survives host teardown into a later launch.",
       "owner": "#27 module supervisor",
       "remaining_gap": "Missing proof: one bounded runtime scenario with child-identity capture failure, failed health persistence, host restart, and observation of whether the unidentified child remains live or is duplicated.",
-      "implementation_status": "pending"
+      "implementation_status": "pending",
+      "execution_status": "bounded_case_verified_windows_linux",
+      "execution_evidence": "host_module_supervisor::tests::unknown362_identity_failure_and_health_write_failure_survive_restart PASS in rust-host-final-full-tests.log:383,392,397 and linux-full-rust-tests.log:456,462,466. Real child survives host teardown, SQLite rejects identity-health write, fresh host reconciliation keeps spawn-pending fence; launch count remains one.",
+      "qualification_limits": "Deterministic real identity capture followed by image-validation failure. OS identity-read failure and complete installed supervisor loop are not exercised; historical source UNKNOWN is retained."
     },
     {
       "id": "HIGH-0365",
@@ -422,7 +467,9 @@
       "evidence": "runtime/zed.rs:951 propagates std Child::try_wait error before the timeout-only terminate path (:954-958); spawn has no kill-on-drop setting (:503-541). Store catches the batch error and records Unknown (:3767-3792), without retaining the child or proving family departure. This is the Zed one-shot batch path, not interactive Command ACP.",
       "owner": "#72 Zed one-shot batch",
       "remaining_gap": "Retain exact child/family ownership on wait error and prove departure before any retry; no runtime try_wait-error capture.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "The current native producer is crates/swarm-kernel-host/src/runtime/zed_worker.rs::observe_native. Child::try_wait errors become direct_exit=observation_unknown; family membership is checked independently through the exact Group, with bounded cancellation and cleanup_pending when departure is not proved. An empty Group can be disarmed while preserving unknown direct exit. The outer zed::run_batch_inner retains the run intent/process-owner evidence and refuses reuse of the existing run directory; Store::batch_original maps a post-launch error to Outcome Unknown and records it instead of retrying the native command.",
+      "remaining_execution_gap": "No runtime qualification claimed. Inject a native try_wait failure while the child is live and verify exact-family custody, bounded unknown settlement, same-run recovery after restart, and no relaunch on Windows/Linux."
     },
     {
       "id": "HIGH-0370",
@@ -434,7 +481,9 @@
       "evidence": "runtime/owner.rs:111 acquires module.lock; :174 waits for the bridge, then :177-181 loops until the owned process group is empty before dropping the lock. The CLI calls this path (main.rs:782-790). Direct child exit is not treated as family departure, but both waits are unbounded.",
       "owner": "#27 module supervisor",
       "remaining_gap": "Bound the wait while retaining lock/ownership uncertainty until exact family departure is proved.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "runtime/owner.rs::run now starts the same pinned host executable through hidden ModuleOwnerWorker in main.rs with a fresh invocation UUID and a bounded private disposition pipe. run_owned creates logs only after marker/prior-owner guards, redirects bridge stdout/stderr to invocation-named private regular files, and retains Group plus module.lock until exact children_empty. After the post-bridge 30-second grace or a wait/family observation error, it sends owner-bound Pending/Unknown while retaining custody; the foreground verifies invocation, PID, and OS birth identity, detaches the exact helper without signals, and returns. Terminal helper exit has a separate two-second bound. Prior owner replacement still requires verify_departed; output and status failure grant no replay or departure authority.",
+      "remaining_execution_gap": "Public Windows/Linux CLI qualification remains: surviving grandchild after bridge exit, owner lock retained after foreground return, late exact family departure, second launch refusal, failed response/birth identity, and private file output with no inherited disposition pipe. No runtime/model tests have run."
     },
     {
       "id": "HIGH-0372",
@@ -446,7 +495,9 @@
       "evidence": "legacy_optional_workers.rs:260 begins the Store receipt. The child.id()==None branch kills/waits but returns without abandon/finish (:288-299); identity failure does the same (:301-321). The outer optional-worker loop records failure and retries, leaving the durable scheduler receipt held.",
       "owner": "#71 optional worker supervision",
       "remaining_gap": "After confirmed safe departure, settle the exact launch receipt on both identity-failure branches; preserve Unknown if departure is not proven.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs::run_automation_scheduler_worker captures spawned_identity -> service_owner_group_identity, gates activation on wait_for_scheduler_ready, and uses Store finish/abandon APIs. crates/swarm-kernel-host/src/store/automation_scheduler.rs::finish_owner and abandon_exited_owner require service_owner_family_empty; retain_unidentified_scheduler_owner only kills/waits the direct child, returns Unknown, and leaves the launch receipt retained when exact identity is absent.",
+      "remaining_execution_gap": "Runtime qualification of absent-PID/identity failure and exact family-departure cases remains pending; no runtime qualification is claimed."
     },
     {
       "id": "HIGH-0373",
@@ -458,7 +509,9 @@
       "evidence": "legacy_optional_workers.rs:484-508 and :556-630 await worker tasks without a deadline. Host shutdown calls the worker supervisor and then awaits supervisor JoinSet completion without a timeout (host.rs:188-195,279-306).",
       "owner": "#71 optional worker supervision",
       "remaining_gap": "Add bounded shutdown handling that retains unfinished worker ownership and reports Unknown rather than hanging indefinitely.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs::stop_all uses a shared 10-second join deadline and transfers unresolved JoinHandles to retain_unfinished_worker_custody before any shutdown-status await. Initial status writes share a 250 ms budget; timeout returns LEGACY_WORKER_SHUTDOWN_UNKNOWN because an already queued Store job may still finish. Completion writes are gated until initial writes settle, and stop_worker/reap_finished use the same bounded status path. Cleanup preserves concrete Store/kernel errors over non-core unknown outcomes. No worker or native descendant is aborted; reaper join custody lasts only while the Tokio runtime is alive, while independent durable native owner receipts remain outside that volatile custody.",
+      "remaining_execution_gap": "Runtime qualification of bounded status timeout/late commit ordering, join custody completion and errors, and runtime shutdown remains pending. Root-owned typed SQLite_BUSY retry integration is outside this source slice and is not qualified here."
     },
     {
       "id": "HIGH-0379",
@@ -470,7 +523,9 @@
       "evidence": "task.create links validate as effects at authorization.rs:1723-1777, but any_on_behalf_operation_link classifies only message.send as ScriptEffect at :4632-4638; the taskless-effect guard at :4317-4326 is therefore bypassed. tasks.rs:242-245 attaches the created Task ID to the child Operation, and the Review fallback at authorization.rs:4457-4472 can grant a successor GM project-scoped visibility.",
       "owner": "Ohm / native GPT 6 Luna max — automation authorization",
       "remaining_gap": "Classify task.create as ScriptEffect in the visibility path so the existing taskless-effect guard applies to successor Managers.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "At main 85189dd, automation/authorization.rs::any_on_behalf_operation_link classifies task.create script_controller_effect links as ScriptEffect. on_behalf_visible_to preserves exact owner history through script_effect_historical_task_scope, while taskless task_create effects are explicitly denied successor-manager scope. validate_script_task_create_effect_operation_link binds the child receipt to the exact taskless ScriptRun and retained project.",
+      "remaining_execution_gap": "Runtime qualification of owner historical access and successor-manager denial remains unverified; this is a source-backed implementation candidate, not a runtime authorization claim."
     },
     {
       "id": "HIGH-0380",
@@ -494,7 +549,9 @@
       "evidence": "Producer apply_post_commit at hooks/git.rs:562-581. Crash-point trace: (a) :563 write_new(install.json, mode 0600) writes the manifest while no wrapper exists; (b) :572 ensure_hook_directory; (c) :574 write_new(wrapper_tmp, mode 0755); (d) :575 atomic_replace(wrapper_tmp, hook_path). A crash or IO error between (a) and (d) leaves the manifest present with no wrapper. readback_post_commit then computes wrapper_matches=false and state modified (state selection at :683-680), so a retry hits the gate in apply at :484-493: existing.state != absent yields HOOK_INSTALL_STATE_CONFLICT and apply never reaches the install logic again. InstallManifest (fields at :538-561) carries no phase field, so the install is neither resumable nor self-describing.",
       "owner": "R38 owner (hooks): hooks/git.rs apply_post_commit plus readback_post_commit state machine",
       "remaining_gap": "Add a manifest phase (installing/installed/revoking) and a resume path that recognizes a manifest-only crash state and completes the wrapper replace, instead of permanently reporting modified.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "In crates/swarm-kernel-host/src/hooks/git.rs, InstallManifest.phase durably distinguishes installing from installed while defaulting older manifests to installed. apply_post_commit records installing before wrapper publication; readback_post_commit exposes that incomplete state; resume_install_post_commit resumes only when source/path identity, wrapper digest, and the exact prior-hook backup digest/mode agree, and finalize_installation marks installed only after exact wrapper readback. Setup rollback can enter the matching revocation recovery path.",
+      "remaining_execution_gap": "No failure-injection or runtime qualification was performed. Verify restart after manifest persistence, wrapper-temp write, wrapper replacement, and final phase replacement; confirm user-modified hooks and mismatched backups remain untouched."
     },
     {
       "id": "HIGH-0410",
@@ -506,7 +563,9 @@
       "evidence": "Producer revoke_post_commit at hooks/git.rs:730-806. Crash-point trace: :788 atomic_replace_bytes(target, backup bytes) restores the previous hook; :789 removes the backup; :791 removes the hook when no backup existed; :794 removes the credential file; :795 removes install.json; :796 removes the source dir. A failur\ne between :788 and :795 (for example a credential-deletion failure at :794) returns Err with the hook already restored but the manifest, backup and credential retained. The early return at :770-772 (current wrapper digest != manifest wrapper_sha256) returns state modified and never enters removal at all. readback exposes only installed/inactive/modified/absent/restored (strings at :745, :798, :683) with no revoking phase, so a half-revoked install is unrecoverable.",
       "owner": "R38 owner (hooks): hooks/git.rs revoke_post_commit plus readback_post_commit",
       "remaining_gap": "Add a revoking phase plus an idempotent completion path that finishes credential/manifest/backup/source-dir removal and verifies each step, rather than orphaning artifacts on any error.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "In crates/swarm-kernel-host/src/hooks/git.rs, revoke_post_commit persists the revoking phase before hook restoration/removal. readback_post_commit recognizes only exact intermediate states; finish_revocation resumes restoration from the retained digest-and-mode-matched backup, or continues cleanup when the exact original hook already occupies the target. Foreign hooks and mismatched backups are preserved, and the revoking manifest remains until the hook, backup, credential/setup descriptors, and recognized source files reach the checked cleanup boundary; legacy manifests default to installed.",
+      "remaining_execution_gap": "No failure-injection or runtime qualification was performed. Verify restart after restoration, backup removal, credential/descriptor cleanup, manifest removal, and directory removal; confirm cleanup never overwrites a user-modified hook or discards the only exact original-hook copy."
     },
     {
       "id": "HIGH-0418",
@@ -578,7 +637,9 @@
       "evidence": "Producer crates/swarm-adapter-claude/src/lib.rs run_owned (35-159): `let mut harness: Option<NativeHarness> = None; let mut native_prepared = false; let mut session_root: Option<String> = None;` are loop-local and never reset to None anywhere. handle_frame (1507-1650) sets harness_alive=false and native_prepared=false in harness_ended (1607-1615), Exited (1631-1638) and ReadFailure (1644-1650), plus recover_uncertain_with_code and clear_pending, but never clears harness or session_root. Guards in handle_command: agent.open rejects SESSION_ALREADY_OPEN while harness.is_some() (322-330); task.dispatch/agent.send reject NATIVE_SESSION_NOT_OPEN when harness is None and SDK_HARNESS_NOT_ALIVE when !harness_alive (405-426). Caller run_owned's select loop re-opens the link on a returned reconnect flag (109-115, 144-152) but never respawns the harness.",
       "owner": "#42 owner (crates/swarm-adapter-claude/src/lib.rs)",
       "remaining_gap": "Retire dead bridge generation and mark current live projection unavailable; retain durable Applied history and unresolved intents. A bridge direct exit does not prove family departure. Replacement admission requires exact family departure and a separately authorized generation; no blind same-process root reopen.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-adapter-claude/src/lib.rs::run_owned now persists bridge retirement and exits on retire_bridge from harness_ended/Exited/ReadFailure instead of serving the dead bridge. Existing crates/swarm-supervisor/src/supervisor.rs::run_lifecycle requires owned-service demand for replacement and records readback-required state; its owner loop waits for departed_empty on the exact owner process/token before restart. can_replace_descriptor also requires exit_proven with retained owner, worker, and boot identity. No in-process reopen is added.",
+      "remaining_execution_gap": "No Windows/Linux runtime scenario has verified that a retired adapter exits, a surviving descendant keeps the parent owner retained, and replacement waits for departed_empty on the exact owner/token; source behavior remains unqualified."
     },
     {
       "id": "HIGH-0440",
@@ -590,7 +651,9 @@
       "evidence": "Producer handle_refresh (crates/swarm-adapter-claude/src/lib.rs:1265-1356) rebuilds latest_state on every sdk_frame from NativeControl::snapshot (native_state.rs:71-91), a purely in-memory struct of frames received on the CURRENT bridge boot: bridge_boot_id, root_id, and state.input_executions. Nothing in that snapshot is durable proof of an effect; it is a synthetic current-liveness projection. handle_reconcile (1996-2092) selects its evidence exclusively from that same in-memory latest_state: it requires scope_ok and expected_boot == latest_state[\"bridge_boot_id\"] at 2049-2052 and matches executions by native_input_id/user_message_uuid/correlation unique/native_session_id/result_frame_uuid at 2053-2066, then writes RuntimeOutcome Applied with completion_condition adapter_readback_recorded and native_readback current_sdk_observation_only (2073-2091). handle_command's only harness_alive gate covers task.dispatch and agent.send (405-426); agent.refresh and agent.reconcile are not gated (dispatch table 225-240). By contrast the durable path is genuinely lawful after bridge death: the journal keeps the persisted intent and outcome per operation (crates/swarm-adapter-claude/src/journal.rs), so an original task.dispatch whose exact durable input proof was already recorded stays settled Applied and must NOT be rewritten to Unknown merely because the bridge process is gone. The gap is not the historical record; it is that refresh and reconcile treat an in-memory synthetic snapshot from a dead generation as current liveness.",
       "owner": "#42 owner (crates/swarm-adapter-claude/src/lib.rs)",
       "remaining_gap": "Split the two claims exactly. (a) Do not erase applied historical proof: recover_uncertain_with_code (journal.rs:401-439) is correct today because it only rewrites operations that have NO saved outcome; a settled Applied with its persisted exact-input evidence must stay Applied across bridge death, and any fix here must preserve that. (b) Real gaps: handle_refresh serves the dead generation's synthetic snapshot as current instead of marking it stale/unavailable, and handle_reconcile can emit Applied from current_sdk_observation_only with no fresh liveness evidence and no process-family proof. Both need to fail closed when harness_alive is false, and reconcile must settle an original effect only from durable persisted input proof, not from a live-but-dead snapshot.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-adapter-claude/src/lib.rs::handle_refresh serves cached observation only when harness_alive, boot, root, and scope match; otherwise it records a null/unavailable observation. handle_reconcile reads executions only under harness_alive and exact boot/root/scope checks, while retaining the target's durable outcome.",
+      "remaining_execution_gap": "No connected Claude runtime fault-injection run verified refresh/reconcile after bridge death or a stale cached generation; source behavior is not runtime-qualified."
     },
     {
       "id": "HIGH-0441",
@@ -602,7 +665,9 @@
       "evidence": "Producer handle_result (crates/swarm-adapter-claude/src/lib.rs:680-1142): after link.result at 1077-1079, the Ok(_) arm at 1113 and the Err(_) arm at 1121 both call save_result_unknown (1143-1182), whose first statement is journal.write_intent(&command.operation_id, receipt, &command.method, &intent) at 1169. write_intent (crates/swarm-adapter-claude/src/journal.rs:227-251) appends a JournalRecord{kind:\"intent\"} unconditionally with no existence check. The journal reader get/read_path enforces the duplicate-intent guard when two intent records for one operation are read. Error path: save_result_unknown -> handle_result -> handle_command -> run_owned -> main.rs fail() -> process::exit(2). The reconnect=true arm is 1121-1134.",
       "owner": "#42 owner (crates/swarm-adapter-claude/src/lib.rs)",
       "remaining_gap": "Confirmed and open: write_intent is not idempotent and the duplicate-intent conflict is a process exit instead of a saved Unknown outcome. write_intent must accept an identical existing intent and route a differing one to Unknown. Priority to the reconnect=true arm (1121-1134); Luna to quality-check that arm specifically.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-adapter-claude/src/lib.rs::handle_result passes the exact pre-link.result marker to save_result_unknown_with_intent. For a matching retained receipt/method/intent, crates/swarm-adapter-claude/src/journal.rs::OperationJournal::retain_exact_intent_for_recovery verifies the same durable marker and saves Unknown without appending another intent. A differing marker is not overwritten; when no terminal outcome exists, Unknown is built from unknown_outcome_from_saved and reconnect is requested. Ordinary write_intent still rejects existing markers, and native_replay remains false.",
+      "remaining_execution_gap": "No runtime case injected a recorded result with lost ACK, malformed ACK, or conflicting marker to verify durable Unknown, immutable-outcome behavior, and reconnect; source behavior remains unqualified."
     },
     {
       "id": "HIGH-0446",
@@ -614,7 +679,9 @@
       "evidence": "Producer crates/swarm-adapter-codex/src/lib.rs active_turns (2069-2093): requests thread/turns/list with limit:20 and returns page_limited = match response.get(\"nextCursor\") { None | Some(Value::Null) => false, Some(Value::String(cursor)) => !cursor.is_empty(), Some(_) => Err(Protocol) }. Caller send_operation steer branch (3605-3616): `if limited || active.len() != 1 || Some(active[0].0.as_str()) != expected_turn.as_deref() { return rejected(command, \"EXPECTED_TURN_NOT_ACTIVE\", &journal.state) }`. Any thread with more than 20 turns has a non-empty nextCursor, so limited is always true and every steer is rejected, and the diagnostic does not mention pagination. Outer guards already present: thread/read config preflight (3581-3597) rejects THREAD_CONFIGURATION_MISMATCH, and expected_turn is required earlier (3550-3560).",
       "owner": "#29 owner (crates/swarm-adapter-codex/src/lib.rs)",
       "remaining_gap": "Confirmed and open: drop the page_limited precondition because native expectedTurnId is the real atomic guard; keep the thread/read preflight and the non-steer THREAD_NOT_IDLE rule; preserve reconcile_send's exact-input readback (accepted_after_exact_input, 2778-2810), which is correct and must not be removed with the preflight.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-adapter-codex/src/lib.rs::send_operation no longer gates steer on a 20-turn active-turns page; it requires and persists expected_turn_id, and native_send_payload sends expectedTurnId to turn/steer. reconcile_send preserves exact input digest/length and requires the matched turn ID to equal expected_turn_id.",
+      "remaining_execution_gap": "No connected native run with more than 20 turns verified that turn/steer enforces expectedTurnId atomically and that exact-input reconciliation remains sound under paginated history."
     },
     {
       "id": "HIGH-0447",
@@ -626,7 +693,9 @@
       "evidence": "Producer crates/swarm-adapter-codex/src/lib.rs open_operation (3243-3456): after thread/start it writes journal.state.native_root_id = Some(thread_id) and effective provider/model at 3404-3408, record.native_root_id at 3409-3411, then journal.save() at 3413. Only after that does it compute config_exact (3412) and, on mismatch, return an Unknown outcome with diagnostic THREAD_CONFIGURATION_MISMATCH (3424-3441). Consumer send_operation requires journal.state.native_root_id == command root (3515-3521), so a mismatched root is now the sole active root and later sends and reconciles fail on the same mismatch. Note the checkpoint save itself is guarded: save failure returns CHECKPOINT_WRITE_FAILED as Unknown (3413-3423).",
       "owner": "#29 owner (crates/swarm-adapter-codex/src/lib.rs)",
       "remaining_gap": "Confirmed and open: adoption precedes proof. The R03 fix is a Pending/Candidate/Active classifier with one adopt_verified_root writer that requires exact open Operation, app-server scope, provider/model/canonical cwd and absence of a different active root; no such helper exists on current main (checked by name scan).",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-adapter-codex/src/lib.rs::open_operation persists Pending before thread/start and Candidate after the returned ID; only adopt_verified_root transitions Candidate to Active after fresh thread/readback matches the exact agent.open Operation, app-server scope, provider/model, canonical cwd, and root. A different Active root is rejected; sends require the Active root.",
+      "remaining_execution_gap": "No connected Codex run exercised a substituted thread/start result, failed/mismatched readback, and restart recovery; the source classifier is not runtime-qualified."
     },
     {
       "id": "HIGH-0454",
@@ -697,8 +766,9 @@
       "verdict": "CONFIRMED",
       "evidence": "Producer mcp_plugin.rs prepare_plugin_config (47-122, crates/swarm-adapter-opencode/src/mcp_plugin.rs): module_source (169-200) reads workspace/modules/opencode/native-mcp-proof.mjs at call time, digests those bytes, and the digest is written into the config as moduleSha256 (55-62). validate_options (145-160) checks only expected_version == PINNED_VERSION (\"2.0.7\", line 17) and a bounded service_id. The only byte-pinned file is PLUGIN_ENTRY_BYTES (line 20) compared against index.mjs in plugin_entry_path (200-225). verify_plugin_config_value (80-143) re-derives module_sha256 from the same mutable file, and verify_plugin_config_file (130-141) re-reads the same source, so both accept any current content.",
       "owner": "#73 owner (crates/swarm-adapter-opencode/src/mcp_plugin.rs)",
+      "implementation_evidence": "Candidate 85189dd embeds the actual native plugin source bytes in the verified adapter, derives the expected SHA-256 from those bytes, and resolves the source root from canonical verified server_program.parent(). Exact source bytes are checked before config serialization/write and on readback; the entry wrapper remains byte-checked. No new digest or SDK version constant was introduced. Connected strict production Clippy passes; replacement/install execution negatives remain pending.",
       "remaining_gap": "Confirmed and open, and the remedy direction is constrained by the rules: no new static SDK/version/digest pin may be introduced, so PINNED_VERSION and a hard-coded module digest are both wrong answers. The immutable expected digest must be derived from a supervisor-supplied verified installed artifact or source receipt (the same pattern the Claude harness already uses in crates/swarm-adapter-claude/src/sdk_harness.rs:110-181, where materialize bundles include_bytes from the executable and ensure_embedded_file refuses any file that differs from those bytes), or from data bundled with a verified installed adapter. Concretely: the owner/launcher options must carry the verified module digest, the adapter must compare module_source's computed digest against that expected value, and a mismatch must fail closed before the plugin config is written. Until the supervisor supplies that receipt, the correct state is fail-closed for a fresh owned service, not a new constant.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification"
     },
     {
       "id": "HIGH-0474",
@@ -722,7 +792,9 @@
       "evidence": "crates/swarm-mcp/src/mcp/subscriptions.rs::resync_reads (283-301) appends CONCILIUM_RESYNC_READS for any of Reports, Operations or Concilium, with an explicit comment at 285-288 explaining that Reports and Operations also carry Concilium cursors, but appends COORDINATION_RESYNC_READS only when the narrow Coordination category is present (297-299). Because Category::Reports matches every stream item (200-202) and Category::Operations matches any item carrying an operation_id (203), both categories do deliver the ID-only coordination projection produced by is_coordination_fact and notification_item (220-269: cursor, kind, operation_id, thread_id, plus proposal_id and proposal_revision_id for the two contract kinds), while the acknowledgement names only report.delta, message.read and operation.get as resync reads (RESYNC_READS at 142, surfaced in the ack at 494-496).",
       "owner": "swarm-mcp subscriptions writer - crates/swarm-mcp/src/mcp/subscriptions.rs (swarm-mcp lane, single manager)",
       "remaining_gap": "Append the typed Thread and contract reads for Reports and Operations exactly as the Concilium branch does, or stop delivering coordination-shaped items under those two categories. Check first that a manager facade credential can actually call coordination.thread.get and coordination.contract.get; the module doc at 42-46 claims manager profiles need them, but profile registration was not traced in this pass.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "main@85189dd crates/swarm-mcp/src/mcp/subscriptions.rs::notification_item emits ID-only coordination facts to Reports/Operations, and ::resync_reads adds the four Coordination reads for those categories. mcp/mod.rs::subscribe intersects them with profile and Store authorization; mcp_catalog.rs::exposes_method and store/mod.rs::mcp_authorization expose the exact reads to Manager.",
+      "remaining_execution_gap": "Manager facade acknowledgement and exact coordination resync remain unqualified at runtime; this is source-only evidence."
     },
     {
       "id": "HIGH-0500",
@@ -734,7 +806,9 @@
       "evidence": "Root and independent Luna verified wait_for_prior_owner_to_depart positively checks old family; clear_prior_helper_result deletes worker/launch-result but preserves owner.json. New monitor_owner_helper begins owner_record=None and immediately compares any retained owner.json with newly spawned helper_identity, returning MODULE_OWNER_IDENTITY_MISMATCH for the departed previous owner before new helper publishes its own receipt (supervisor.rs:1931-1956,2538-2577). Old verified receipt and new owner generation must remain distinct.",
       "owner": "Ampere / native GPT 6 Luna max, #27 module supervisor",
       "remaining_gap": "Recognize exactly verified departed prior owner while awaiting current receipt; do not delete or signal unverified owners. Validate any cached current worker when exact new owner is admitted.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-supervisor/src/supervisor.rs::wait_for_prior_owner_to_depart returns VerifiedDepartedOwner only after departed_empty succeeds for the exact retained owner/token. run_lifecycle passes that proof to monitor_owner_helper; read_current_owner_receipt_optional ignores a stale owner.json only when its complete receipt and token match that verified prior owner, while unrelated mismatches remain hard errors. This makes clear_prior_helper_result's retention of owner.json safe across helper generations.",
+      "remaining_execution_gap": "Runtime qualification remains: restart with an exactly departed prior owner receipt and a new helper receipt, and confirm an unrelated mismatching receipt still fails closed. Not run here."
     },
     {
       "id": "HIGH-0501",
@@ -746,7 +820,9 @@
       "evidence": "can_replace_descriptor allows only WaitingForDemand, Completed, and Isolated, so demand returns MODULE_UPDATE_DEFERRED for every ProcessExited state. run_lifecycle writes ProcessExited for unresolved/failed starts and for helper exits that do not satisfy the success/no-restart completion condition; in the latter case exit_proven is assigned from attempt.family_departure_proven. monitor_owner_helper sets that proof only after departed_empty succeeds for the exact owner process/token; certified pre-spawn evidence is a separate no-family case. No transition promotes ProcessExited to Completed, so even a positively departed ProcessExited service remains non-replaceable.",
       "owner": "R01 owner (supervisor): supervisor.rs can_replace_descriptor plus run_lifecycle terminal transitions",
       "remaining_gap": "Make descriptor replacement conditional on retained proof bound to the same boot and owner identity: exact family departure (departed_empty for the recorded owner/token), or a separate validated no-spawn receipt. Keep unknown-operation/readback gates. Do not infer family departure from helper PID exit, exit_code, or elapsed age, and do not allow every ProcessExited state.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "crates/swarm-supervisor/src/supervisor.rs::can_replace_descriptor now permits ProcessExited only with exit_proven=true, retained owner and worker identities, a valid boot ID, and a finished runner; run_lifecycle sets that proof only from monitor_owner_helper's exact departed_empty result. WaitingForKernel is reached only while demand is active, which already blocks replacement; after demand release, run_lifecycle handles !has_demand first, returns status to WaitingForDemand, and exits. Thus the formerly terminal ProcessExited/WaitingForKernel paths no longer strand a settled, demand-free service.",
+      "remaining_execution_gap": "Runtime qualification remains: exercise exact-departure replacement and demand release while admission is closed, while confirming active demand and unproved exits remain deferred. Not run here."
     },
     {
       "id": "HIGH-0534",
@@ -770,7 +846,9 @@
       "evidence": "OpenCodex verifyFields returns observed when fields are not_checked or not all verified (:895-901); executors mark applied whenever state is not mismatch (for example :1163-1197, :1357-1378, and listed sites :1003/:1278/:1335/:1432). runRequest dispatches directly and finish only redacts (:822-823,1629-1638); no outer positive-verification guard is present.",
       "owner": "#73 OpenCodex config verify",
       "remaining_gap": "Require verification.state=verified before Applied; otherwise return Unknown/partial and preserve evidence. Validate after code and Clippy, not during this audit.",
-      "implementation_status": "pending"
+      "implementation_status": "source_candidate_pending_qualification",
+      "implementation_evidence": "modules/opencodex/bridge.mjs::verifyFields preserves not_checked as observed; outcomeFromReadback reports applied only for verification.state=verified and otherwise reports unknown. All configure executor paths call this gate before finish redacts the record; runRequest only dispatches to those executors.",
+      "remaining_execution_gap": "No connected OpenCodex service run verified that missing/failed GET readbacks across configure handlers remain Unknown after a mutation response; source behavior is not runtime-qualified."
     }
   ]
 }
