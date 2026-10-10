@@ -4,7 +4,7 @@
 **Status:** actionable research and implementation plan; NOT a claim of release readiness.
 **Source of evidence:** full Master Audit v26, accepted owner decisions, existing R01–R51 handoffs, and GitHub PR/Issue status checked on 2026-10-09.
 
-**Current execution, 2026-10-10:** [C7 standalone handoff](C7-MCP-REPAIR-EVIDENCE.json) and [public ACK/restart harness](CORE-ACK-HARNESS-REPAIR-EVIDENCE.json) source repairs are verified at their recorded scope. Affected production Clippy passes on Windows/Linux; affected library cohorts retain 399/412 unique passing tests. Fresh M installed core and exact Step 5 free / Gemini 3.8 native execution remain pending. Historical receipts, the two audit evidence gaps and upstream result/dependency limits are not promoted by source review.
+**Current execution, 2026-10-10:** [C7 standalone handoff](C7-MCP-REPAIR-EVIDENCE.json) and [public ACK/restart harness](CORE-ACK-HARNESS-REPAIR-EVIDENCE.json) source repairs are verified at their recorded scope. Affected production Clippy passes on Windows/Linux; affected library cohorts retain 399/412 unique passing tests. [M installed execution](EXECUTION-RESULTS-M.json) completed on eight exact `694794f` packages; both native runs remain unqualified with zero dispatch. [The corrected public core contour](EXECUTION-RESULTS-M-CORE-CORRECTION.json) observed all three manager/hook cases against those exact binaries; optional-worker fault injection remains unavailable. C8 first-dispatch proof and Antigravity MCP scope require source investigation. Historical receipts and upstream result/dependency limits are not promoted by source review.
 
 ## Supplied source input: HIGH appendix
 

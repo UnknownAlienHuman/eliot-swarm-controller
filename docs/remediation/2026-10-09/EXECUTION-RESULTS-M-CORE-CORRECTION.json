@@ -1,0 +1,137 @@
+{
+  "schema": "eliot.v27_core_correction_results.v1",
+  "observed_at_utc": "2026-10-10T11:39:23.8035974Z",
+  "binary_candidate": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+  "harness_sha256": "d436981589baa3538db93d90e016a242a49ae1b81ab3c28c1ec6a15881242f4f",
+  "task_spec_sha256": "991eb23c3aa16ec5186c6f70e9ad28796f0e4051d19682a9c358644fe0b9a6bd",
+  "receipt_sha256": "6dc76c9699b5d0263c6bef670ab0e14b40b4623cd97e67f9fbec7b8f63e888c4",
+  "historical_execution": "EXECUTION-RESULTS-M.json remains unchanged",
+  "source_change": "Singleton final hook array preserved; complete explicit serialized TaskSpec fixture supplies source_refs and Scope defaults; no Rust changes",
+  "status": "completed",
+  "qualification": "not_qualified",
+  "scenarios": [
+    {
+      "name": "manager-dropped-ack-restart",
+      "run_id": "manager-dropped-ack-restart-a5da6e9434b9436cb54747806842d9aa",
+      "status": "observed",
+      "code": null,
+      "facts": {
+        "host_pid": 69804,
+        "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "host_epoch_before": 1,
+        "public_task_count_before": 0,
+        "public_task_list_pages_before": 1,
+        "task_create_operation_count_before": 0,
+        "operation_list_pages_before": 1,
+        "public_task_baseline": "empty",
+        "task_create_operation_baseline": "empty",
+        "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+        "application_effect_possible": true,
+        "manager_ack": "intentionally_not_read",
+        "logical_request_id": "core-failure:11bda7bf7e524a8bb18b4f067acefc6f",
+        "admitted_operation_before_restart": "77a82f09-3d5e-4f1b-ab63-9a9cac42a886",
+        "admitted_task_before_restart": "da39d9f3-a460-4e20-95fc-cbf9e28efe39",
+        "task_create_operation_list_pages_after_send": 1,
+        "public_task_identity_before_restart": "verified",
+        "host_restart_pid": 85720,
+        "host_restart_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "host_epoch_after": 2,
+        "public_task_identity_after_restart": "verified",
+        "operation_id_after_restart": "77a82f09-3d5e-4f1b-ab63-9a9cac42a886",
+        "task_id_after_restart": "da39d9f3-a460-4e20-95fc-cbf9e28efe39",
+        "operation_id": "77a82f09-3d5e-4f1b-ab63-9a9cac42a886",
+        "task_id": "da39d9f3-a460-4e20-95fc-cbf9e28efe39",
+        "manager_readback_after_restart": true,
+        "operation_state_after_restart": "settled",
+        "public_receipt_stable_across_restart": true,
+        "public_task_stable_across_restart": true,
+        "replayed": false,
+        "effect": "one local Task create; caller acknowledgement was unknown until exact post-restart Manager readback"
+      }
+    },
+    {
+      "name": "manager-durable-request-conflict",
+      "run_id": "manager-durable-request-conflict-74d5348596ef47f0a23214919fa48429",
+      "status": "observed",
+      "code": null,
+      "facts": {
+        "host_pid": 89808,
+        "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "host_restart_pid": 89752,
+        "host_restart_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "host_epoch_after": 2,
+        "manager_error_code": "REQUEST_ID_CONFLICT",
+        "original_operation_id": "dc01d59f-de6b-490d-b6aa-0a4d4308fa9b",
+        "original_task_id": "2198f19f-5724-4f50-b67e-ba04db375da0",
+        "original_operation_state": "settled",
+        "conflicting_task_created": false,
+        "complete_public_task_identity_set_verified": true,
+        "current_manager_handover": true,
+        "gm_epoch": 1
+      }
+    },
+    {
+      "name": "hook-callback-restart-dedup",
+      "run_id": "hook-callback-restart-dedup-98c247c4839f4912aba244c36702634d",
+      "status": "observed",
+      "code": null,
+      "facts": {
+        "host_pid": 86528,
+        "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "hook_source_event_count_before": 0,
+        "hook_source_baseline_pages": 1,
+        "hook_source_baseline": "empty_for_setup_issued_source",
+        "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+        "application_effect_possible": true,
+        "callback_ack": "intentionally_not_read",
+        "source_id": "255a8cb1-6a45-41a1-93df-d6cdb731e33e",
+        "commit_oid": "0a6294dc8bae1de6ef5d0b359501deb2c7cce432",
+        "observation_id_before_restart": 2,
+        "verified_event_before_restart": "verified",
+        "host_restart_pid": 66392,
+        "host_restart_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "host_epoch_after": 2,
+        "observation_id_after_restart": 2,
+        "observation_id": 2,
+        "duplicate_callback": true,
+        "durable_after_host_restart": true,
+        "callback_identity": "{source_id, commit_oid}",
+        "replayed_native_effect": false,
+        "fixture_hook_revoked_and_restored": true
+      }
+    },
+    {
+      "name": "optional-worker-observation",
+      "run_id": "optional-worker-observation-bd1e0e690b6448438af8789990e4b647",
+      "status": "blocked",
+      "code": "NO_PUBLIC_OPTIONAL_WORKER_FAULT_TRIGGER",
+      "facts": {
+        "host_pid": 84972,
+        "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+        "manager_visible_workers": {
+          "module-supervisor": {
+            "state": "dormant",
+            "consecutive_failures": 0,
+            "last_error_code": null
+          }
+        },
+        "healthy_or_dormant_status_observed": true,
+        "failure_was_injected_by_harness": false
+      }
+    }
+  ],
+  "limits": {
+    "native_calls": 0,
+    "model_calls": 0,
+    "mutation_replay": false,
+    "uncertain_native_effect_replay": false,
+    "current_codex_or_opencode_process_control": "none",
+    "process_control": "only this harness own-host stdin EOF; no forced termination",
+    "raw_contents_in_receipt": false,
+    "task_spec_retained_in_private_store": true,
+    "no_public_optional_worker_fault_trigger": true,
+    "source_effect_unknown_state": "only claimed when exact Manager/HookSource readback proves the corresponding durable record"
+  },
+  "scope": "Three exact public core cases observed against actual installed M binaries; no native/model calls. Optional worker public fault trigger absent; overall core harness remains not_qualified. Native M was not repeated.",
+  "local_verifier_sha256": "062e2dfe0927cee69728616989cfaa64a9cc6b1f93c7657be01d18b9e8bf3372"
+}

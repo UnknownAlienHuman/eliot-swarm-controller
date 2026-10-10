@@ -1393,7 +1393,8 @@ function Invoke-HookRestartDedupScenario {
             $result.status = 'unknown'; $result.code = $(if ($duplicate.code) { $duplicate.code } else { 'HOOK_DUPLICATE_ACK_MISMATCH' }); return $result
         }
         $finalRead = Read-PublicHookSourceEvents -Scenario $scenario -CredentialPath $scenario.hook_credential_path -SourceId $sourceId
-        $finalEvents = if ($finalRead.success) { @($finalRead.events) } else { @() }
+        $finalEvents = @()
+        if ($finalRead.success) { $finalEvents = @($finalRead.events) }
         if (-not $finalRead.success -or $finalEvents.Count -ne 1 -or
             -not (Test-HookObservation -Event $finalEvents[0] -SourceId $sourceId -CommitOid $eventParams.commit_oid -ObservationId $firstId)) {
             $result.status = 'unknown'; $result.code = 'HOOK_DEDUP_READBACK_MISMATCH'; return $result

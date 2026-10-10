@@ -16,7 +16,14 @@
     "core_tokens": 17437,
     "native_errors": 0
   },
-  "runtime_execution": "not_run; one fresh M contour required",
+  "runtime_execution": "Fresh corrected core completed against exact M installed binaries; historical M unknown receipts unchanged",
   "historical_core": "C gaps stay UNKNOWN until new evidence",
-  "qualification": "SOURCE_REPAIRED; runtime pending"
+  "qualification": "Three bounded public core scenarios observed; full/native qualification not established",
+  "post_M_correction": {
+    "harness_sha256": "d436981589baa3538db93d90e016a242a49ae1b81ab3c28c1ec6a15881242f4f",
+    "reason": "M finalRead if-expression unwrapped a singleton array to Count3 dictionary; preserve explicit array",
+    "fixture_reason": "Explicit serialized TaskSpec source_refs and Scope defaults; original M input retained privately",
+    "verifier_sha256": "062e2dfe0927cee69728616989cfaa64a9cc6b1f93c7657be01d18b9e8bf3372",
+    "public_execution": "EXECUTION-RESULTS-M-CORE-CORRECTION.json: three public cases observed; optional-worker trigger blocked; no native/model calls"
+  }
 }

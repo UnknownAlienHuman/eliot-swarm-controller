@@ -1,0 +1,234 @@
+{
+  "schema": "eliot.v27_execution_results.v1",
+  "observed_at_utc": "2026-10-10T11:32:33.3649046Z",
+  "candidate_commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+  "binding_receipt_sha256": "d155b46d7e5b26fc3faa65fdcf0265d972357206ad8ad2d1f94b8885b9aae91e",
+  "execution_scope": "fresh core and native (Both); previous C load evidence was not replayed or promoted",
+  "build_packages": [
+    {
+      "package": "host_runtime",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "aa01fc1c22f4d475cc061dc2cc78a704b3ce9c34bc303854b46b522eeb0cbdbb"
+    },
+    {
+      "package": "host_supervisor",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "7c4e528810a4efa5037ff235212daa97a6554be5a7877da6ce16d6ee9cccab65"
+    },
+    {
+      "package": "host_launcher",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "67750dc68877b234e769011b009e1f125fdde50297c4b2beece272c4dc1f45f0"
+    },
+    {
+      "package": "public_cli",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "f24cee7d655bbc851789d2f9ce307f32138a8b927c46e05feb1fe8a212ed784a"
+    },
+    {
+      "package": "process_owner_helper",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "2d4f8435a4d45b2a1b01cc65febbc5d8ff333fa748a7ca17b61b470616fd767d"
+    },
+    {
+      "package": "opencode_module",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "c84a2a549a85a2be2b7c1e91aa3f05c22b179daa6ba7a0957355c0747c52b1d1"
+    },
+    {
+      "package": "antigravity_module",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "13c00cf17e696415b8a5ee48c479772a9fd7c2493849ba5c7a7a42519b9a55d0"
+    },
+    {
+      "package": "swarm_mcp",
+      "commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "6ffa318cb3e8fe94b08fb44a25e5176812099015f8f9460f393f71852e280ebd"
+    }
+  ],
+  "core": {
+    "status": "completed",
+    "qualification": "not_qualified",
+    "receipt_sha256": "5b4fe1d28525fbb5199690699079af5c2e8a297bc17e68c80adb741a0bca0aed",
+    "scenarios": [
+      {
+        "name": "manager-dropped-ack-restart",
+        "status": "unknown",
+        "code": "TASK_CREATE_PRE_RESTART_RECEIPT_OR_TASK_MISMATCH",
+        "facts": {
+          "host_pid": 90376,
+          "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+          "host_epoch_before": 1,
+          "public_task_count_before": 0,
+          "public_task_list_pages_before": 1,
+          "task_create_operation_count_before": 0,
+          "operation_list_pages_before": 1,
+          "public_task_baseline": "empty",
+          "task_create_operation_baseline": "empty",
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "manager_ack": "intentionally_not_read",
+          "logical_request_id": "core-failure:9fbc8ff6a4c3412da7de590519c63ff5",
+          "public_task_identity_before_restart": "unknown",
+          "public_task_identity_before_restart_code": "TASK_CREATE_PRE_RESTART_RECEIPT_OR_TASK_MISMATCH"
+        }
+      },
+      {
+        "name": "manager-durable-request-conflict",
+        "status": "observed",
+        "code": null,
+        "facts": {
+          "host_pid": 8924,
+          "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+          "host_restart_pid": 73092,
+          "host_restart_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+          "host_epoch_after": 2,
+          "manager_error_code": "REQUEST_ID_CONFLICT",
+          "original_operation_id": "f3e00a9f-f76f-4109-9c7b-a59bad78ba0f",
+          "original_task_id": "a404b98c-441d-4a36-92ed-8627624feaee",
+          "original_operation_state": "settled",
+          "conflicting_task_created": false,
+          "complete_public_task_identity_set_verified": true,
+          "current_manager_handover": true,
+          "gm_epoch": 1
+        }
+      },
+      {
+        "name": "hook-callback-restart-dedup",
+        "status": "unknown",
+        "code": "HOOK_DEDUP_READBACK_MISMATCH",
+        "facts": {
+          "host_pid": 53436,
+          "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+          "hook_source_event_count_before": 0,
+          "hook_source_baseline_pages": 1,
+          "hook_source_baseline": "empty_for_setup_issued_source",
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "callback_ack": "intentionally_not_read",
+          "source_id": "2f0b9b96-d39d-43fd-a71f-fb35cf1e0a5d",
+          "commit_oid": "0a6294dc8bae1de6ef5d0b359501deb2c7cce432",
+          "observation_id_before_restart": 2,
+          "verified_event_before_restart": "verified",
+          "host_restart_pid": 76424,
+          "host_restart_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+          "host_epoch_after": 2,
+          "observation_id_after_restart": 2,
+          "fixture_hook_revoked_and_restored": true
+        }
+      },
+      {
+        "name": "optional-worker-observation",
+        "status": "blocked",
+        "code": "NO_PUBLIC_OPTIONAL_WORKER_FAULT_TRIGGER",
+        "facts": {
+          "host_pid": 88436,
+          "host_image_sha256": "9668c0d1af1854ccee0127f54f01842144f1cd4a1f5ca6d6e47c16bb6eca371b",
+          "manager_visible_workers": {
+            "module-supervisor": {
+              "state": "dormant",
+              "consecutive_failures": 0,
+              "last_error_code": null
+            }
+          },
+          "healthy_or_dormant_status_observed": true,
+          "failure_was_injected_by_harness": false
+        }
+      }
+    ],
+    "limits": {
+      "native_calls": 0,
+      "model_calls": 0,
+      "mutation_replay": false,
+      "uncertain_native_effect_replay": false,
+      "current_codex_or_opencode_process_control": "none",
+      "process_control": "only this harness own-host stdin EOF; no forced termination",
+      "raw_contents_in_receipt": false,
+      "task_spec_retained_in_private_store": true,
+      "no_public_optional_worker_fault_trigger": true,
+      "source_effect_unknown_state": "only claimed when exact Manager/HookSource readback proves the corresponding durable record"
+    }
+  },
+  "native": {
+    "opencode": {
+      "exit_code": 0,
+      "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010m\\runs\\dc7d729b-24c8-45c3-b824-786056d1bd56\\qualification-receipt.json",
+      "receipt_sha256": "2d470f242563922bf2a058e87d16cf4b14e57f5e8db407f54ae6f47bc9870830",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "route": {
+        "alias": "native-prereq-opencode",
+        "runtime": "module",
+        "artifact_id": "eliot-opencode-v2.rust-http.1",
+        "model_id": "step-5-preview-free",
+        "provider_id": "opencode",
+        "variant": "high",
+        "requested_model_ref": "opencode/step-5-preview-free"
+      },
+      "native_selected_agent_model_readback": "UNKNOWN; current public qualification receipt does not surface the adapter snapshot fields"
+    },
+    "antigravity": {
+      "exit_code": 0,
+      "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010m\\runs\\f284fe59-208b-45dd-97c0-b16feba9f117\\qualification-receipt.json",
+      "receipt_sha256": "f2c49375cb30e9c2cc92ee40c306fca9b29fb9aaf1b34af139c7158537256381",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "route": {
+        "alias": "native-prereq-antigravity",
+        "runtime": "antigravity",
+        "artifact_id": "eliot-antigravity.rust-headless.1",
+        "model_id": "gemini-3.8-flash-high",
+        "provider_id": null,
+        "variant": null,
+        "requested_model_ref": null
+      },
+      "native_selected_agent_model_readback": "UNKNOWN; current public qualification receipt does not surface the adapter snapshot fields"
+    }
+  },
+  "host_load": {
+    "status": "historical C retained, not repeated for M",
+    "receipt_sha256": "634ede27c539425fb4efe35f486a45952ca73563bec9552320959ec8ea362499"
+  },
+  "private_diagnostic": {
+    "projection_sha256": "ffd205ef24ad042d7e4bdab904ee8d172e4acc297181b9586fd41783e2625f17",
+    "qualification_authority": "none; private diagnostic only",
+    "observations": [
+      "OpenCode exact open applied and C7 assigned_session observe applied native_replay=false; one retained child",
+      "C8 install connected, challenge observed, applied arm/read; native discovery11 tools observed, session_context/provider_request/model_consumed unknown; dispatch false",
+      "Antigravity launch snapshot NATIVE_MCP_SCOPE_MISMATCH; dispatch0"
+    ]
+  },
+  "harness_correction": {
+    "historical_M_results": "unchanged",
+    "manager_fixture": "Missing serialized source_refs/forbidden_paths/prerequisite_policy defaults; exact private closed-M diagnosis; corrected fixture pending fresh public execution",
+    "hook_final_array": "PowerShell if-expression unwraps singleton event to dictionary with Count3; corrected array Count1, exact/wrong IDs verified",
+    "proof_sha256": "062e2dfe0927cee69728616989cfaa64a9cc6b1f93c7657be01d18b9e8bf3372",
+    "fixture_diagnostic_sha256": "5b1aaf082c0d891d9f6079c070aa1e08c5306712d3f0de5fd9864e024469e831"
+  },
+  "qualification": "NOT_QUALIFIED",
+  "remaining": [
+    "C8 first-dispatch readiness contract and Antigravity assigned-session MCP surface require independent source diagnosis",
+    "Fresh core execution after specific fixture/array corrections required",
+    "Optional worker fault trigger unavailable in public harness",
+    "Exact OpenCode assistant parent and Antigravity result body unavailable",
+    "13 dependency alerts remain open"
+  ]
+}

@@ -13,11 +13,15 @@ Windows and Linux. The affected library cohorts retain 399/412 unique passing
 tests, with one ignored case on each platform; independent native GPT-6 Luna Max
 source review found no confirmed C7 defect.
 
-Fresh installed core and native qualification on the latest clean candidate
-remains pending. The exact requested models are OpenCode Step 5 free with high
-reasoning and Antigravity Gemini 3.8. Historical L dispatch counts remain zero;
-source checks do not establish native consumption or a causal result. The
-unsupported result contracts and 13 upstream dependency alerts remain open.
+Fresh M installed core and native execution completed on eight exact `694794f`
+packages. Both native runs remain unqualified with zero dispatch. OpenCode C7
+applied its assigned-session observation; C8 retained unknown session/provider
+evidence and held dispatch. Antigravity retained an MCP scope mismatch. The
+requested coordinates remain Step 5 free with high reasoning and Gemini 3.8;
+model execution is not established. The corrected public core contour observed
+all three manager/hook cases against the exact M binaries, with no native/model
+calls; optional-worker fault injection remains unavailable. The unsupported
+result contracts and 13 upstream dependency alerts remain open.
 Current evidence and limits are recorded in the
 [V27 audit ledger](remediation/2026-10-09/CURRENT-AUDIT.md). Product status remains
 `PARTIAL_PROGRESS`; the dated closeout below is historical.

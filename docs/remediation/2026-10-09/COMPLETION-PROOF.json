@@ -19,8 +19,8 @@
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
-        "evidence": "EXECUTION-RESULTS-L.json; exact eight clean-candidate packages and genuine L installed native execution",
-        "residual_uncertainty": "Standalone C7 and first-hop environment source repairs delivered; installed M execution pending. Fresh core must prove admission and same-ID recovery; historical C remains unchanged.",
+        "evidence": "EXECUTION-RESULTS-M.json; exact eight clean694794f packages, genuine installed native Both and fresh core receipt; EXECUTION-RESULTS-M-CORE-CORRECTION.json",
+        "residual_uncertainty": "Three exact public core cases now observed against installed694794f; original M receipts unchanged. Optional-worker fault trigger unavailable. Native dispatch0; C8 session/provider evidence and Antigravity MCP scope require diagnosis.",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
       {
@@ -86,6 +86,8 @@
       "docs/remediation/2026-10-09/EXECUTION-RESULTS-J.json",
       "docs/remediation/2026-10-09/EXECUTION-RESULTS-K.json",
       "docs/remediation/2026-10-09/EXECUTION-RESULTS-L.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-M-CORE-CORRECTION.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-M.json",
       "docs/remediation/2026-10-09/HOST-SUPERVISOR-ENVIRONMENT-REPAIR-EVIDENCE.json",
       "docs/remediation/2026-10-09/IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
       "docs/remediation/2026-10-09/MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json",
@@ -176,13 +178,18 @@
       "Windows/Linux strict affected3 C7 production Clippy; refreshed host gates after fixture-only fix",
       "Affected3 library cohorts: Windows399/Linux412 unique passed, one ignored each; only original19/17 failures rerun",
       "Native GPT-6 Luna Max independent C7 source review PASS; 18 hashes before/after; persisted model/provider/effort verified",
-      "Core public admission/same-ID restart harness and NativeMcpCommand2 schema marker parse PASS; owned3 format and diff check PASS"
+      "Core public admission/same-ID restart harness and NativeMcpCommand2 schema marker parse PASS; owned3 format and diff check PASS",
+      "Eight exact clean694794f provenance builds and genuine M install with immutable locked resource closure",
+      "One fresh M core contour and one native invocation per adapter, distinct IDs; both native blocked, zero dispatch",
+      "PowerShell singleton-array bug reproduced and corrected; exact/wrong fixture and hook identity checks PASS; 15 Rust sources unchanged",
+      "Closed-M private fixture diagnosis establishes missing serialized defaults; corrected complete fixture matches producer, no public qualification promoted",
+      "One justified corrected core contour on existing exact M binaries: dropped ACK same public Operation/Task receipt before/after restart observed; request-ID conflict observed; singleton hook restart/dedup observed; no native/model calls; native M not repeated"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "Fresh installed M core and native qualification pending on latest clean candidate. L historical failures/zero dispatch remain unchanged. Exact causal native result and 13 dependency advisories remain open.",
+    "remaining_uncertainty": "Native M unqualified: C8 first-dispatch evidence unknown and Antigravity MCP scope mismatch; zero dispatch/model execution not established. Corrected public core3 observed, optional-worker trigger unavailable. Exact causal native result,13 advisories and historical HIGH ledger limits retained.",
     "final_status": "PARTIAL_PROGRESS"
   }
 }
