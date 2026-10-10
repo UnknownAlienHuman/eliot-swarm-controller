@@ -19,7 +19,7 @@ async fn start(f: &Fixture) -> (StoreOwner, Principal) {
         owned_service: None,
         alias: "fixture".into(),
         runtime: oc::RUNTIME.into(),
-        module_artifact_id: oc::ARTIFACT_ID.into(),
+        module_artifact_id: oc::TASK_PROMPT_ARTIFACT_ID.into(),
         enabled: true,
         native_options: json!(f.options),
     });
@@ -160,13 +160,14 @@ async fn read(store: &Store, p: &Principal, method: &str, input: Value) -> Value
     store.call(p.clone(), method.into(), input).await.unwrap()
 }
 async fn wait_operation(store: &Store, p: &Principal, operation: &Value, state: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let operation_id = operation["operation_id"].as_str().unwrap_or("<missing>");
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let observed = read(
                 store,
                 p,
                 "operation.get",
-                json!({"operation_id":operation["operation_id"]}),
+                json!({"operation_id":operation_id}),
             )
             .await;
             if observed["state"] == state {
@@ -179,10 +180,17 @@ async fn wait_operation(store: &Store, p: &Principal, operation: &Value, state: 
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap()
+    .await;
+    match result {
+        Ok(observed) => observed,
+        Err(_) => {
+            let retained = retained_operation(store, operation_id).await;
+            panic!(
+                "operation did not reach {state} before timeout; retained operation: {retained}"
+            );
+        }
+    }
 }
-
 async fn retained_operation(store: &Store, operation_id: &str) -> Value {
     let operation_id = operation_id.to_owned();
     store
@@ -347,7 +355,10 @@ async fn shared_reader_receipts_survive_host_restart_without_replaying_native_wo
     assert!(projected_attempt.get("producers").is_none());
     let current = retained_attempt(&owner.store, attempt["attempt_id"].as_str().unwrap()).await;
     assert_eq!(current["producers"].as_array().unwrap().len(), 1);
-    assert_eq!(current["producers"][0]["admission_kind"], "native_inbox");
+    assert_eq!(
+        current["producers"][0]["admission_kind"],
+        "normalized_task_dispatch"
+    );
     assert!(current["producers"][0].get("native_run_id").is_none());
     assert!(current["released_at_ms"].is_null());
     let blocked=write(&owner.store,&p,"attempt.release",json!({"attempt_id":attempt["attempt_id"],"outcome":"cancelled","assignment_closed":true,"reason":"test must not erase an unresolved native producer"})).await.unwrap_err();
@@ -1364,7 +1375,7 @@ async fn task_dispatch_execution_diagnostic_is_scoped_and_rejects_damaged_identi
         log.extend(lifecycle);
         world.logs.insert(root.clone(), log);
     }
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let terminal_evidence_wait = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let retained = retained_attempt(&store, attempt["attempt_id"].as_str().unwrap()).await;
             if retained["producers"].as_array().is_some_and(|producers| {
@@ -1378,8 +1389,15 @@ async fn task_dispatch_execution_diagnostic_is_scoped_and_rejects_damaged_identi
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if terminal_evidence_wait.is_err() {
+        let retained_operation_state = retained_operation(&store, &operation_id).await;
+        let retained_attempt_state =
+            retained_attempt(&store, attempt["attempt_id"].as_str().unwrap()).await;
+        panic!(
+            "durable execution log did not produce terminal Attempt evidence; operation={retained_operation_state}; attempt={retained_attempt_state}"
+        );
+    }
 
     let owner_read = read(
         &store,

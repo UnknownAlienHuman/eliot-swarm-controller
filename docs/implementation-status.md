@@ -2,9 +2,9 @@
 
 ## Current state
 
-### Published process custody assembly — 2026-10-10
+### Host recovery and process custody qualification — 2026-10-10
 
-The current source assembly is published on `main` at
+The process-custody source assembly was published on `main` at
 `4e470821beae15f091547ea7fba4c1d329e219ba`. It adds shared bounded capture,
 durable artifact publication, scheduler source isolation, exact module actor
 fencing and host-owned shutdown custody. Actual process owners survive failed
@@ -19,13 +19,41 @@ with zero errors and zero warnings. Owned-package formatting passed. The
 passed on the published SHA. Host test-target compilation passed with 21
 retained test-only warnings; compilation does not establish test execution.
 
-Full owned-package qualification is now running on Windows and Ubuntu from a
-clean managed checkout of that exact SHA. All 29 recorded assembly source hashes
-match the checkout. Fresh host and worker binaries precede the test execution.
-Fresh installed native/model qualification remains pending, including Step 5
-free with high reasoning and Antigravity Gemini 3.8. The historical M receipts,
-R48 installed fault/recovery gap and dependency alerts retain their recorded
-limits. Project status remains `PARTIAL_PROGRESS`.
+The full owned-package baseline completed on Windows and Ubuntu. Other owned
+packages completed their target/doc-test runs; the repaired Windows probe
+passed. Ten fixture files matching the passing repair snapshot were delivered
+in `fcf624a`, whose CI passed. The remaining Command receipt, reviewer schema
+and Windows launch-ledger fixtures now pass on both applicable platforms.
+
+OpenCode's execution reader and restart reconciliation previously reconstructed
+only the old Task snapshot, losing the retained TaskPrompt and dispatch context.
+Both now use the existing batch reconstruction through one shared helper. The
+original request digest, exact binding-generation guards and legacy decoder
+remain. Fresh strict host production Clippy passed with zero warnings on both
+platforms; Luna Max found no P1/P2 on the exact two production source hashes.
+
+The completed host evidence covers every current library test name: Windows
+453 PASS / 1 ignored, Linux 466 PASS / 1 ignored, with no unresolved failures.
+It combines the full baseline, affected repair cohorts and the final remaining
+case; it is not a new full run on the delivery commit. Windows' fresh affected
+selection passed all 26 cases. Linux passed 24 of 25, then only the remaining
+restart case was rerun after its stale producer-kind assertion was corrected.
+Both platforms used the same base commit and 17-path raw SHA256 manifest.
+Test-target compilation retains 21 existing test-only warnings. The
+[qualification record](remediation/2026-10-10/HOST-QUALIFICATION-EVIDENCE.json)
+binds source hashes, scope, result logs and the union ledger.
+
+The ScriptRun custody repair in `92e6d26` recovers exact identity from the
+retained unreaped child and keeps custody through failed receipt publication.
+Strict host production Clippy passed with zero warnings on both platforms, all
+18 runner/Store ScriptRun cases passed on each, and independent Luna Max source
+review found no further finding. CI passed on that exact commit. These checks
+do not establish installed native/model qualification.
+
+Fresh installed qualification N remains pending from a separate clean candidate
+checkout, including Step 5 free with high reasoning and Antigravity Gemini 3.8.
+The historical M receipts, R48 installed fault/recovery gap and dependency alerts
+retain their recorded limits. Project status remains `PARTIAL_PROGRESS`.
 
 ### V27 audit and installed qualification — 2026-10-10
 

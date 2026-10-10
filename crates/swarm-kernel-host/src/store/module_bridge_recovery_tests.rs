@@ -827,6 +827,12 @@ fn verified_bridge_boot_change_projects_readback_to_current_and_successor_manage
 fn command_diagnostic_store() -> (PathBuf, Principal) {
     let (path, module, _) = durable_prompt_store();
     let db = Connection::open(&path).unwrap();
+    // This retained diagnostic fixture is repaired with the exact trusted
+    // descriptor of its own current Command artifact so that descriptor
+    // admission accepts the binding. Descriptor capabilities never grant
+    // native-effect authority; the fixture only projects Store-side
+    // Assignment and receipt facts and never starts a Command process.
+    let (selector, selected_revision) = register_command_diagnostic_descriptor(&db);
     let route = json!({
         "alias":"command-diagnostic-retained",
         "runtime":crate::runtime::batch::COMMAND_RUNTIME,
@@ -834,15 +840,26 @@ fn command_diagnostic_store() -> (PathBuf, Principal) {
         "enabled":true,
         "native_options":{"modelId":"diagnostic-fixture-model"}
     });
+    let raw_binding_state: String = db
+        .query_row(
+            "SELECT state_json FROM bindings WHERE binding_id=?1 AND generation=1",
+            [PROMPT_RECOVERY_BINDING],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut binding_state: Value = serde_json::from_str(&raw_binding_state).unwrap();
+    binding_state["module_contract_selector"] = selector;
     db.execute(
-        "UPDATE bindings SET module_artifact_id=?2,route_json=?3 WHERE binding_id=?1 AND generation=1",
+        "UPDATE bindings SET module_artifact_id=?2,route_json=?3,state_json=?4 WHERE binding_id=?1 AND generation=1",
         params![
             PROMPT_RECOVERY_BINDING,
             crate::runtime::batch::COMMAND_ARTIFACT_ID,
             model::canonical(&route).unwrap(),
+            model::canonical(&binding_state).unwrap(),
         ],
     )
     .unwrap();
+    assert_eq!(selected_revision, 1);
     let raw: String = db
         .query_row(
             "SELECT effective_request_json FROM operations WHERE operation_id=?1",
@@ -867,11 +884,106 @@ fn command_diagnostic_store() -> (PathBuf, Principal) {
     (path, module)
 }
 
-fn command_terminal_receipt(command: &Value) -> Value {
+/// Register a current Command bridge descriptor with its exact task.dispatch
+/// capability, task_dispatch_context_schema command schema and
+/// task_dispatch_admission_schema event schema, then return the bounded
+/// selector a binding retains for that exact trusted descriptor. Registration
+/// is metadata only: no executable is inspected, no process is started and
+/// no native effect is authorized.
+fn register_command_diagnostic_descriptor(db: &Connection) -> (Value, u64) {
+    let artifact_id = crate::runtime::batch::COMMAND_ARTIFACT_ID.to_owned();
+    let descriptor = json!({
+        "schema_version":1,
+        "module_id":"command-diagnostic-module",
+        "artifact":{"artifact_id":artifact_id,"version":"5"},
+        "launch":{
+            "executable":if cfg!(windows) {
+                r"C:\modules\command-bridge"
+            } else {
+                "/modules/command-bridge"
+            },
+            "argv":[],
+            "environment":[],
+            "inherited_environment_allowlist":[],
+        },
+        "command_schemas":[
+            {"schema_id":"swarm.runtime_command","version":"1"},
+            {"schema_id":"swarm.task_dispatch_context","version":"1"},
+        ],
+        "event_schemas":[
+            {"schema_id":"swarm.task_dispatch_admission","version":"1"},
+        ],
+        "protocol":{"minimum":{"major":1,"minor":0},"maximum":{"major":1,"minor":0}},
+        "capabilities":["task.dispatch"],
+        "lifecycle":"owned_service",
+        "activation":"on_demand",
+        "enabled":true,
+    });
+    let descriptor: swarm_contracts::module_catalog::ModuleDescriptor =
+        serde_json::from_value(descriptor).unwrap();
+    let tx = db.unchecked_transaction().unwrap();
+    let registered = super::module_handshake::register_trusted_descriptor(&tx, descriptor).unwrap();
+    tx.commit().unwrap();
+    let selector = json!({
+        "schema_version":1,
+        "module_id":registered["module_id"],
+        "artifact":registered["artifact"],
+        "registered_revision":registered["registered_revision"],
+        "selected_revision":registered["registered_revision"],
+    });
+    (
+        selector,
+        registered["registered_revision"].as_u64().unwrap(),
+    )
+}
+
+fn command_terminal_receipt(db: &Connection, command: &Value) -> Value {
     let command = &command["command"];
     let operation_id = command["operation_id"].as_str().unwrap();
     let instruction = crate::runtime::batch::instruction(&command["input"]).unwrap();
     let facts = crate::runtime::batch::command_receipt_facts(operation_id, &instruction);
+    let binding = operations::get_binding(
+        db,
+        command["binding_id"].as_str().unwrap(),
+        command["generation"].as_i64().unwrap(),
+    )
+    .unwrap();
+    let identity = super::module_handshake::retained_contract_identity(
+        db,
+        binding["module_artifact_id"].as_str().unwrap(),
+        binding["observation"].get("module_contract_selector"),
+    )
+    .unwrap()
+    .unwrap();
+    let context: swarm_contracts::runtime::TaskDispatchContext =
+        serde_json::from_value(command["input"]["task_dispatch_context"].clone()).unwrap();
+    let module_receipt = swarm_contracts::runtime::ModuleReceiptIdentity {
+        schema_version: 1,
+        module_id: identity.module_id,
+        artifact: identity.artifact,
+        protocol: identity.protocol,
+        binding_id: context.binding_id.clone(),
+        binding_generation: context.binding_generation,
+        operation_id: operation_id.to_owned(),
+        input_sha256: command["input_sha256"].as_str().unwrap().to_owned(),
+    };
+    let admission = swarm_contracts::runtime::TaskDispatchAdmissionReceipt {
+        schema_version: 1,
+        module_receipt: module_receipt.clone(),
+        operation_id: context.operation_id,
+        binding_id: context.binding_id,
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id,
+        attempt_id: context.attempt_id,
+        task_id: context.task_id,
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256,
+        source_text_sha256: context.source_text_sha256,
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: facts.prompt_sha256.clone(),
+        native_payload_bytes: u64::try_from(facts.prompt_bytes).unwrap(),
+        native_input_id: None,
+    };
     json!({
         "operation_id":operation_id,
         "outcome":"applied",
@@ -880,6 +992,8 @@ fn command_terminal_receipt(command: &Value) -> Value {
         "turn_id":null,
         "native_input_id":null,
         "details":{
+            "module_receipt":module_receipt,
+            "dispatch_admission":admission,
             "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
             "completion_condition":"native_result_observed",
             "batch_run_id":facts.batch_run_id,
@@ -907,7 +1021,7 @@ fn record_command_terminal(db: &mut Connection, module: &Principal) -> (String, 
         dispatch["command"]["operation_id"],
         PROMPT_RECOVERY_OPERATION
     );
-    let receipt = command_terminal_receipt(&dispatch);
+    let receipt = command_terminal_receipt(db, &dispatch);
     let recorded = runtime::outcome(db, module, &receipt).unwrap();
     assert_eq!(recorded["recorded"], true);
     (PROMPT_RECOVERY_OPERATION.to_owned(), receipt)

@@ -2056,7 +2056,9 @@ mod tests {
             .append(true)
             .open(path)
             .expect("open child launch ledger");
-        writeln!(file, "{record}").expect("append child launch identity");
+        let line = format!("{record}\n");
+        file.write_all(line.as_bytes())
+            .expect("append complete child launch identity");
     }
 
     async fn wait_for_birth(pid: u32) -> Value {
@@ -2075,8 +2077,15 @@ mod tests {
     }
 
     fn read_launches(path: &Path) -> Vec<Value> {
-        fs::read_to_string(path)
-            .expect("read child launch ledger")
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => panic!("read child launch ledger: {error}"),
+        };
+        // A bounded poll can race the writer; only a newline commits a record.
+        // Malformed complete records still fail instead of disappearing.
+        let committed_end = raw.rfind('\n').map_or(0, |index| index + 1);
+        raw[..committed_end]
             .lines()
             .map(|line| serde_json::from_str(line).expect("parse child launch identity"))
             .collect()

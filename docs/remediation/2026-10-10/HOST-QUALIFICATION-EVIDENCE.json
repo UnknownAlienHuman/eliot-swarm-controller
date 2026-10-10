@@ -1,0 +1,155 @@
+{
+  "schema": "eliot.host_retained_prompt_qualification.v1",
+  "date": "2026-10-10",
+  "toolchain": "Rust 1.98.1",
+  "full_baseline_commit": "4e470821beae15f091547ea7fba4c1d329e219ba",
+  "frozen_repair_base": "4e9e64a7cd3c3a087a689b5c3e2581714e5ba47f",
+  "fixture_delivery_commit": "fcf624ad4f82c4e62fcf3b80f6f3a5c19181e446",
+  "production_source_sha256": {
+    "crates/swarm-kernel-host/src/scripts/runner.rs": "f6d987845f70ddafaf1de0fec9f804b008c4c1d571261e130d13a4dc3551c385",
+    "crates/swarm-kernel-host/src/store/runtime.rs": "0239f261929415e595db6c8d355ece841749c7565261dd613ca7e8aef27e307f",
+    "crates/swarm-kernel-host/src/store/opencode.rs": "b597a525ab3201dc1f74a22139673d8a88d0f8d09abb6a11193bb2a9d92947cf"
+  },
+  "frozen_source_sha256": {
+    "crates/swarm-kernel-host/src/checks/standalone_host.rs": "8c08b83525aa2219b7d9098fb450f88b6de46ff621f4d154969b37cd1e58e9a3",
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": "9f223e1c2c5de25ac166938fac0c4ddc58c51b4026a8247af58b82375bad368d",
+    "crates/swarm-kernel-host/src/scripts/runner.rs": "f6d987845f70ddafaf1de0fec9f804b008c4c1d571261e130d13a4dc3551c385",
+    "crates/swarm-kernel-host/src/store/automation_cron_candidate_fixture.rs": "6de75faec4bb783bd1dfe23ce9c109041bbe57ddce071d44d4a26931cfcaf4dd",
+    "crates/swarm-kernel-host/src/store/checks.rs": "257fbe3bd52d2f64f3c35d0cb71c677fc07716c95b61c1b3e9220eeddeb39351",
+    "crates/swarm-kernel-host/src/store/forge.rs": "c4e09438d68cd1b53f0b921db3d37453b0fcb61f4e815580a4fd7a23253c2922",
+    "crates/swarm-kernel-host/src/store/gm_continuation_tests.rs": "08ef432aecfa11968a0dae2b1eebbc22ae7be96af8425adbf35724c196c61808",
+    "crates/swarm-kernel-host/src/store/module_bridge_recovery_tests.rs": "641f423646f0219bdb6cca187a30bb27c0b7e621a0bf0ef9f0feeaae470ce718",
+    "crates/swarm-kernel-host/src/store/module_supervisor_observation.rs": "b863ab9b7a2cbae549b06e1b8ee898354770890548ed4712fd323b494db92878",
+    "crates/swarm-kernel-host/src/store/object_scope_review_tests.rs": "a5fb7cf2ff8afacc924634f4b55b1c850c7684bc2e90be99607bcb3203d5b2ee",
+    "crates/swarm-kernel-host/src/store/opencode/reconcile_failure_tests.rs": "fddc429f270c8563c711863da60e38207cc0588b3d67fbb12909a8e47066a21f",
+    "crates/swarm-kernel-host/src/store/opencode/tests.rs": "892d28c2f7e980607af15b232d9114b7fb5c3993adf79e3f2d5892039e51a869",
+    "crates/swarm-kernel-host/src/store/opencode/worker_failure_tests.rs": "2750f404c0a6d2178b087de97713430f41a6b231005798280dec6f917258581d",
+    "crates/swarm-kernel-host/src/store/program_tests.rs": "4026c0ecf49cb74b69fca26bb8ba4843704fbac7df18b28b887b26ca7461a5d0",
+    "crates/swarm-kernel-host/src/store/work_dispatch_regression.rs": "547a178337cbd07d80c252e5657e5e6ab4f84d4f9df0fa37fdffd0e921bf40e5",
+    "crates/swarm-kernel-host/src/store/runtime.rs": "0239f261929415e595db6c8d355ece841749c7565261dd613ca7e8aef27e307f",
+    "crates/swarm-kernel-host/src/store/opencode.rs": "b597a525ab3201dc1f74a22139673d8a88d0f8d09abb6a11193bb2a9d92947cf"
+  },
+  "repair": "Shared restore_task_dispatch_input rehydrates validated retained TaskPrompt and dispatch context for OpenCode execution readers and reconciliation, reusing the existing batch path. Original request digests, exact binding/generation guards and the legacy snapshot decoder remain.",
+  "platforms": {
+    "windows": {
+      "current_library_cases": 454,
+      "unique_passed": 453,
+      "ignored": 1,
+      "unresolved_failed": 0,
+      "clippy": {
+        "scope": "swarm-kernel-host --lib --bins --no-deps -D warnings",
+        "exit_code": 0,
+        "errors": 0,
+        "warnings": 0,
+        "receipt_sha256": "268ca9b40e55e7cc76d1d9f35ef8e988edd610d4ca8a4451b2dab60bdcb0d281",
+        "log_sha256": "d54769fbf8476e5136f7d8d6ad6e40d7f7217032091585185568227945085b80",
+        "source_manifest_sha256": "9dc2ce5ae840339d80c64f1c94b50bcab7e2ee6534c813f777a2e89573e64052",
+        "unchanged_production_hashes_match_final_manifest": true
+      },
+      "test_build": "PASS; 21 retained test-only dead-code warnings",
+      "fresh_affected_count": 26,
+      "result_logs": {
+        "full-owned-windows-remainder-20261010.log": {
+          "sha256": "5733d8ce0e9ce0caac1597728b807765bc173be92a53720a23bf6728dd6d5dcf",
+          "observed_result_lines": 451
+        },
+        "host-full-repair-windows-20261010-tests.log": {
+          "sha256": "3b786f486ebcad5ea41d00cd24eda4814eb137d5ba3976c88573eba07b201ae8",
+          "observed_result_lines": 55
+        },
+        "host-remainder-windows-20261010-tests.log": {
+          "sha256": "790651127aa59266fb4076384d68d43a69c12dba557b198e3d80aa93ec1b0215",
+          "observed_result_lines": 28
+        }
+      }
+    },
+    "linux": {
+      "current_library_cases": 467,
+      "unique_passed": 466,
+      "ignored": 1,
+      "unresolved_failed": 0,
+      "clippy": {
+        "scope": "swarm-kernel-host --lib --bins --no-deps -D warnings",
+        "exit_code": 0,
+        "errors": 0,
+        "warnings": 0,
+        "receipt_sha256": "074bd9ae4fb1759bbd5224dbe00043b614ae25dcd1dcda012cc3a6877604ef04",
+        "log_sha256": "f75095e464fdcbcfc063c94a3a851424f5b194a62359df4c57dbd4fa9047276d",
+        "source_manifest_sha256": "9dc2ce5ae840339d80c64f1c94b50bcab7e2ee6534c813f777a2e89573e64052",
+        "unchanged_production_hashes_match_final_manifest": true
+      },
+      "test_build": "PASS; 21 retained test-only dead-code warnings",
+      "fresh_affected_count": 25,
+      "result_logs": {
+        "full-owned-linux-20261010.log": {
+          "sha256": "a897fd212d63c03e33172e5a8f7d3fa815ff3bd3f826cd96a73a5256dedf4c4b",
+          "observed_result_lines": 464
+        },
+        "host-full-repair-linux-20261010-tests.log": {
+          "sha256": "727d16461a5d80286c90dc820f282fe6e68d09453892562e0c8478de570c00d4",
+          "observed_result_lines": 51
+        },
+        "host-remainder-linux-20261010-tests.log": {
+          "sha256": "7ab4dc19b7e729db96e917ed468f0bec4e4f088afc8013462e679ecb8ecec2d1",
+          "observed_result_lines": 25
+        },
+        "host-remainder-linux-20261010-retained-restart-tests.log": {
+          "sha256": "5627f0315165a09f70cc8623e13b35a54089149e87b214f4f0903b823187e3ad",
+          "observed_result_lines": 1
+        }
+      }
+    }
+  },
+  "union_ledger": {
+    "local_file": ".local/manager-audit/host-test-union-20261010.json",
+    "sha256": "64558028469c6bcb11fa17a6bb8d4b333c529b4fa60d2ff1979bd64f169e7428",
+    "qualification": "Full host baseline plus only affected repairs and remaining failures; not a new full run on the delivery commit"
+  },
+  "script_custody": {
+    "commit": "92e6d269a12f83ba0aa1ac26076a6bb360704bc9",
+    "source_sha256": "f6d987845f70ddafaf1de0fec9f804b008c4c1d571261e130d13a4dc3551c385",
+    "related_cases_passed_each_platform": 18,
+    "independent_review": "GPT-6 Luna Max: no further finding on exact runner source"
+  },
+  "native_calls": 0,
+  "model_calls": 0,
+  "fresh_installed_qualification": "pending N; historical M receipts are not promoted",
+  "remaining_acceptance": [
+    "R48 installed legacy optional-worker fault/recovery",
+    "Exact causal native result",
+    "Antigravity assigned-session MCP proof",
+    "13 upstream dependency alerts"
+  ],
+  "project_status": "PARTIAL_PROGRESS",
+  "recorded_at_utc": "2026-10-10T22:20:39.2739262Z",
+  "overlay_readback": {
+    "sha256": "977eb59148098fe8d14777cdb82d1690f10d954ddc0cdba26eff1bcc9b6aba11",
+    "expected_changed_paths": [
+      "crates/swarm-kernel-host/src/checks/standalone_host.rs",
+      "crates/swarm-kernel-host/src/host_module_supervisor.rs",
+      "crates/swarm-kernel-host/src/scripts/runner.rs",
+      "crates/swarm-kernel-host/src/store/automation_cron_candidate_fixture.rs",
+      "crates/swarm-kernel-host/src/store/checks.rs",
+      "crates/swarm-kernel-host/src/store/forge.rs",
+      "crates/swarm-kernel-host/src/store/gm_continuation_tests.rs",
+      "crates/swarm-kernel-host/src/store/module_bridge_recovery_tests.rs",
+      "crates/swarm-kernel-host/src/store/module_supervisor_observation.rs",
+      "crates/swarm-kernel-host/src/store/object_scope_review_tests.rs",
+      "crates/swarm-kernel-host/src/store/opencode.rs",
+      "crates/swarm-kernel-host/src/store/opencode/reconcile_failure_tests.rs",
+      "crates/swarm-kernel-host/src/store/opencode/tests.rs",
+      "crates/swarm-kernel-host/src/store/opencode/worker_failure_tests.rs",
+      "crates/swarm-kernel-host/src/store/program_tests.rs",
+      "crates/swarm-kernel-host/src/store/runtime.rs",
+      "crates/swarm-kernel-host/src/store/work_dispatch_regression.rs"
+    ],
+    "actual_changed_paths_match_each_platform": true,
+    "all_hashes_checked_before_and_after_each_test_execution": true,
+    "scope_guard_resolution": "One Windows failure name appeared twice in nested child/parent output. Deduplicate exact selectors; seven unique names required, guard retained."
+  },
+  "independent_review": {
+    "model": "gpt-6-luna",
+    "reasoning": "max",
+    "result": "No concrete P1/P2 on exact runtime.rs and opencode.rs hashes; original request digest and scope guards retained; unresolved native work goes through readback without replay"
+  }
+}

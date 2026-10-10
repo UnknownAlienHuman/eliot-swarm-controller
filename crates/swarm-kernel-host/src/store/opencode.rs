@@ -230,8 +230,7 @@ fn original(db: &Connection, p: &Principal, id: &str) -> Result<RuntimeCommand> 
     let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&o, "method")?.to_owned();
     if method == "task.dispatch" {
-        let a = tasks::get_attempt(db, model::text(&input, "attempt_id")?)?;
-        input["task_snapshot"] = a["task_snapshot"].clone();
+        runtime::restore_task_dispatch_input(db, &o, &mut input)?;
     }
     let target_input_sha256 = if method == "agent.reconcile" {
         let target_id = model::text(&input, "operation_id")?;

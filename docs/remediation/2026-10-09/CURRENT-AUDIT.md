@@ -1,5 +1,18 @@
 # Current-source audit and implementation ledger
 
+The [completed host qualification record](../2026-10-10/HOST-QUALIFICATION-EVIDENCE.json)
+closes the remaining named host-library failures. Every current name has retained
+execution evidence: Windows 453 PASS / 1 ignored, Linux 466 PASS / 1 ignored.
+The union combines the full baseline and only affected repairs; it is not a new
+full run on the delivery SHA. OpenCode retained-command recovery now restores
+the validated frozen TaskPrompt and dispatch context through the existing batch
+helper. Fresh strict host production Clippy passed on both platforms with zero
+warnings, and independent Luna Max review found no P1/P2 on the exact production
+hashes. Both verification checkouts match the same 17-path overlay and base SHA.
+No native/model calls ran in this cohort; installed N qualification, causal
+native-result evidence, Antigravity assigned-session MCP proof and the 13 upstream
+dependency alerts remain separate acceptance work.
+
 The [retained-worker readiness repair](RETAINED-WORKER-READINESS-REPAIR-EVIDENCE.json) resolves a source collision between normal helper polling and helper-exit drain polling. Both now use the same exact OS worker-liveness observation: an unconfirmed live worker stays `Starting`, an exact previously hello-confirmed boot and pid/birth/image stays `ProcessRunning`, and dead or missing evidence stays `OwnerGroupRetained`. Live observations in both paths contribute to the existing healthy restart-budget interval. Hello admission, receipts, owner tokens, membership and whole-family departure proofs remain unchanged. This source repair does not establish that the exact M worker was live; M's runtime cause remains `UNKNOWN`.
 
 The retained readiness source passes strict supervisor/host production Clippy on Windows and Linux. The affected supervisor library passes 21 Windows and 22 Linux tests, with two ignored fixtures on each platform; eight new pre-input packet cases pass on each platform. Twenty-six pure qualification-helper cases check bounded public failure projection, collection shape and exact scope without native effects. The lifecycle tests exercise the liveness/hello seam, not installed process-family qualification. Fresh installed qualification is still required.

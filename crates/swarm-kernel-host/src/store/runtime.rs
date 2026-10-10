@@ -510,6 +510,35 @@ fn attach_batch(db: &mut Connection, binding: &Value, boot: &str) -> Result<Prin
     Ok(principal)
 }
 
+/// Restore the frozen dispatch fields for native readback and reconciliation.
+pub(super) fn restore_task_dispatch_input(
+    db: &Connection,
+    operation: &Value,
+    input: &mut Value,
+) -> Result<()> {
+    let attempt = tasks::get_attempt(db, model::text(input, "attempt_id")?)?;
+    if operation["operation_contract"]["task_prompt"]["contract_revision"]
+        == swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION
+    {
+        let effective: String = db.query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [model::text(operation, "operation_id")?],
+            |row| row.get(0),
+        )?;
+        let effective: Value = serde_json::from_str(&effective)?;
+        input["task_prompt"] = serde_json::to_value(task_prompt::load(
+            &effective,
+            &attempt,
+            model::text(input, "text")?,
+        )?)?;
+        input["task_dispatch_context"] =
+            serde_json::to_value(retained_task_dispatch_context(&effective)?)?;
+    } else {
+        input["task_snapshot"] = attempt["task_snapshot"].clone();
+    }
+    Ok(())
+}
+
 fn batch_original(
     db: &Connection,
     principal: &Principal,
@@ -532,29 +561,7 @@ fn batch_original(
     let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&operation, "method")?.to_owned();
     if method == "task.dispatch" {
-        let attempt = tasks::get_attempt(db, model::text(&input, "attempt_id")?)?;
-        if operation["operation_contract"]["task_prompt"]["contract_revision"]
-            == swarm_contracts::task_prompt::TASK_PROMPT_CONTRACT_REVISION
-        {
-            let effective: String = db.query_row(
-                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-                [operation_id],
-                |row| row.get(0),
-            )?;
-            input["task_prompt"] = serde_json::to_value(task_prompt::load(
-                &serde_json::from_str::<Value>(&effective)?,
-                &attempt,
-                model::text(&input, "text")?,
-            )?)?;
-            input["task_dispatch_context"] =
-                serde_json::to_value(retained_task_dispatch_context(&serde_json::from_str::<
-                    Value,
-                >(
-                    &effective
-                )?)?)?;
-        } else {
-            input["task_snapshot"] = attempt["task_snapshot"].clone();
-        }
+        restore_task_dispatch_input(db, &operation, &mut input)?;
     }
     Ok(RuntimeCommand {
         operation_id: operation_id.to_owned(),

@@ -1,4 +1,4 @@
-use super::super::{SCHEMA, set_meta};
+use super::super::{SCHEMA, SCRIPT_SCHEMA, WORKSPACE_SCHEMA, set_meta};
 use super::{OperationReadBasis, OperationReadLevel, resolve_operation_read};
 use crate::{
     model::{self, Principal, Role},
@@ -75,6 +75,14 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
     let db = Connection::open_in_memory().unwrap();
     db.pragma_update(None, "foreign_keys", true).unwrap();
     db.execute_batch(SCHEMA).unwrap();
+
+    // resolve_operation_read always reaches any_on_behalf_operation_link, whose
+    // review and script-run link readers join the canonical script_runs table.
+    // The Store installer registers that table through migration 004 as the
+    // schema_extension:scripts extension, so the fixture restores the same
+    // canonical schema the installer applies instead of suppressing the error.
+    db.execute_batch(SCRIPT_SCHEMA).unwrap();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
 
     let identity = ReviewSlotIdentity {
         task_id: TASK_ID.to_owned(),
