@@ -2346,7 +2346,7 @@ fn worker_ref_readback(value: &Value) -> Option<RefReadback> {
 
 fn map_forge_worker_result(
     job: &NativeWorkerJob,
-    work: &ForgeWork,
+    intent: &PublicationIntent,
     result: &Value,
 ) -> ForgeOutcome {
     let readback = worker_ref_readback(&result["remote_ref"]);
@@ -2362,7 +2362,7 @@ fn map_forge_worker_result(
     let stderr_bytes = result["stderr_bytes"].as_u64();
     if result["authorized"] != true
         || result["job_id"] != job.job_id
-        || result["operation_id"] != work.intent.operation_id
+        || result["operation_id"] != intent.operation_id
         || result["plan_sha256"] != job.plan_sha256
     {
         return worker_unknown(
@@ -2388,7 +2388,7 @@ fn map_forge_worker_result(
         Some("applied")
             if readback
                 .as_ref()
-                .is_some_and(|value| value.matches_intent(&work.intent)) =>
+                .is_some_and(|value| value.matches_intent(intent)) =>
         {
             ForgeOutcome::Applied {
                 readback: readback.expect("validated exact candidate readback"),
@@ -2404,11 +2404,38 @@ fn map_forge_worker_result(
                 && push_exit_code.is_some_and(|code| code != 0)
                 && readback
                     .as_ref()
-                    .is_some_and(|value| value.matches_expected(&work.intent)) =>
+                    .is_some_and(|value| value.matches_expected(intent)) =>
         {
             ForgeOutcome::Failed(Error::new(
                 "FORGE_PUSH_REJECTED",
                 "native Git rejected publication and exact remote ref remains unchanged",
+            ))
+        }
+        Some("failed")
+            if reason == "expected_ref_conflict"
+                && !timed_out
+                && push_exit_code.is_some_and(|code| code != 0)
+                && readback
+                    .as_ref()
+                    .is_some_and(|value| !value.matches_expected(intent)) =>
+        {
+            ForgeOutcome::Failed(Error::new(
+                "FORGE_EXPECTED_REF_CONFLICT",
+                "native Git rejected the exact publication lease after the remote ref changed",
+            ))
+        }
+        Some("failed")
+            if reason == "candidate_not_fast_forward_from_expected_ref"
+                && !timed_out
+                && push_exit_code.is_none()
+                && intent.expected_old_ref.is_some()
+                && readback
+                    .as_ref()
+                    .is_some_and(|value| value.matches_expected(intent)) =>
+        {
+            ForgeOutcome::Failed(Error::new(
+                "FORGE_NON_FAST_FORWARD",
+                "candidate does not descend from the exact expected remote predecessor",
             ))
         }
         _ => worker_unknown(
@@ -3257,6 +3284,67 @@ mod tests {
             force: false,
             policy_revision: "owner-policy-v1".into(),
         }
+    }
+
+    #[test]
+    fn exact_worker_ref_failures_do_not_override_lost_response_or_family_custody() {
+        let intent = intent();
+        let job = NativeWorkerJob {
+            kind: "forge_publish",
+            phase_name: "push_once",
+            job_id: "job-fixture".into(),
+            operation_id: intent.operation_id.clone(),
+            owner_token: "owner-fixture".into(),
+            plan_sha256: "e".repeat(64),
+            directory: PathBuf::new(),
+            plan_path: PathBuf::new(),
+            owner_path: PathBuf::new(),
+            authorization_path: PathBuf::new(),
+            result_path: PathBuf::new(),
+            executable: PathBuf::new(),
+            executable_sha256: "f".repeat(64),
+            timeout_seconds: 1,
+        };
+        let mut result = json!({
+            "authorized":true,"job_id":job.job_id,"operation_id":intent.operation_id,
+            "plan_sha256":job.plan_sha256,"outcome":"failed","reason":"expected_ref_conflict",
+            "timed_out":false,"push_exit_code":1,"process_tree_unconfirmed":false,
+            "remote_ref":{"present":true,"commit":intent.commit},
+        });
+        assert!(matches!(map_forge_worker_result(&job, &intent, &result),
+            ForgeOutcome::Failed(error) if error.code == "FORGE_EXPECTED_REF_CONFLICT"));
+        result["process_tree_unconfirmed"] = json!(true);
+        assert!(matches!(
+            map_forge_worker_result(&job, &intent, &result),
+            ForgeOutcome::Unknown {
+                process_tree_unconfirmed: true,
+                ..
+            }
+        ));
+
+        result["process_tree_unconfirmed"] = json!(false);
+        result["outcome"] = json!("applied");
+        result["reason"] = json!("exact_candidate_ref_observed");
+        result["push_exit_code"] = json!(128);
+        assert!(matches!(
+            map_forge_worker_result(&job, &intent, &result),
+            ForgeOutcome::Applied {
+                push_exit_code: Some(128),
+                ..
+            }
+        ));
+
+        result["outcome"] = json!("failed");
+        result["reason"] = json!("candidate_not_fast_forward_from_expected_ref");
+        result["push_exit_code"] = Value::Null;
+        result["remote_ref"]["commit"] = json!(intent.expected_old_ref);
+        assert!(matches!(map_forge_worker_result(&job, &intent, &result),
+            ForgeOutcome::Failed(error) if error.code == "FORGE_NON_FAST_FORWARD"));
+        result["plan_sha256"] = json!("a".repeat(64));
+        assert!(matches!(
+            map_forge_worker_result(&job, &intent, &result),
+            ForgeOutcome::Unknown { .. }
+        ));
     }
 
     #[test]
@@ -4416,7 +4504,7 @@ impl super::Store {
             };
         }
         match result {
-            Ok(result) => map_forge_worker_result(&job, work, &result),
+            Ok(result) => map_forge_worker_result(&job, &work.intent, &result),
             Err(error) => ForgeOutcome::Unknown {
                 reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
                     "git_process_tree_unconfirmed"

@@ -167,6 +167,69 @@ impl RemoteRef {
     }
 }
 
+fn predecessor_ancestry_args(expected_old_ref: &str, candidate_commit: &str) -> Vec<String> {
+    vec![
+        "merge-base".to_owned(),
+        "--is-ancestor".to_owned(),
+        expected_old_ref.to_owned(),
+        candidate_commit.to_owned(),
+    ]
+}
+
+fn ancestry_status(successful: bool, exit_code: Option<i32>) -> Option<bool> {
+    match (successful, exit_code) {
+        (true, Some(0)) => Some(true),
+        (false, Some(1)) => Some(false),
+        _ => None,
+    }
+}
+
+fn publication_push_args(
+    target_ref: &str,
+    expected_old_ref: Option<&str>,
+    candidate_commit: &str,
+    endpoint: &str,
+) -> Vec<String> {
+    // Git parses the ref and expectation from this option value; Command passes it without a shell.
+    let lease = format!(
+        "--force-with-lease={target_ref}:{}",
+        expected_old_ref.unwrap_or_default()
+    );
+    let refspec = format!("{candidate_commit}:{target_ref}");
+    vec![
+        "push".to_owned(),
+        "--porcelain".to_owned(),
+        "--no-verify".to_owned(),
+        "--no-follow-tags".to_owned(),
+        "--recurse-submodules=no".to_owned(),
+        "--receive-pack=git-receive-pack".to_owned(),
+        lease,
+        endpoint.to_owned(),
+        refspec,
+    ]
+}
+
+fn exact_push_rejection(stdout: Option<&Capture>, target_ref: &str) -> bool {
+    let Some(capture) = stdout.filter(|capture| !capture.truncated) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&capture.prefix) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let mut fields = line.split('\t');
+        fields.next() == Some("!")
+            && fields
+                .next()
+                .and_then(|refs| refs.split_once(':'))
+                .is_some_and(|(_, destination)| destination == target_ref)
+            && fields.next().is_some_and(|summary| {
+                summary.starts_with("[rejected] ") || summary.starts_with("[remote rejected] ")
+            })
+            && fields.next().is_none()
+    })
+}
+
 #[derive(Debug)]
 struct Capture {
     prefix: Vec<u8>,
@@ -850,21 +913,81 @@ fn execute(plan: &WorkPlan, owner: &Group) -> RunResult {
         );
     }
 
-    let refspec = format!("{}:{}", plan.intent.commit, plan.intent.target_ref);
-    let push = match run_git(
-        plan,
-        owner,
-        &[
-            "push".to_owned(),
-            "--porcelain".to_owned(),
-            "--no-verify".to_owned(),
-            "--no-follow-tags".to_owned(),
-            "--recurse-submodules=no".to_owned(),
-            "--receive-pack=git-receive-pack".to_owned(),
-            endpoint.clone(),
-            refspec,
-        ],
-    ) {
+    if let Some(expected_old_ref) = plan.intent.expected_old_ref.as_deref() {
+        let ancestry = match run_git(
+            plan,
+            owner,
+            &predecessor_ancestry_args(expected_old_ref, &plan.intent.commit),
+        ) {
+            Ok(result) => result,
+            Err(_) => {
+                return unknown(
+                    plan.phase,
+                    "expected_predecessor_ancestry_unavailable",
+                    Some(before.clone()),
+                    None,
+                    false,
+                    owner,
+                    &evidence,
+                );
+            }
+        };
+        evidence.push(ancestry.evidence());
+        if ancestry.timed_out || !ancestry.process_tree_empty {
+            return unknown(
+                plan.phase,
+                "expected_predecessor_ancestry_unconfirmed",
+                Some(before.clone()),
+                ancestry.stderr.as_ref(),
+                ancestry.timed_out,
+                owner,
+                &evidence,
+            );
+        }
+        match ancestry_status(ancestry.successful, ancestry.exit_code) {
+            Some(true) => {}
+            Some(false) => {
+                let process_tree_empty = group_empty(owner)
+                    && evidence.iter().all(|item| {
+                        item.get("process_tree_empty").and_then(Value::as_bool) == Some(true)
+                    });
+                return RunResult {
+                    phase: plan.phase,
+                    outcome: "failed",
+                    reason: "candidate_not_fast_forward_from_expected_ref",
+                    remote_ref: Some(before),
+                    push_exit_code: None,
+                    timed_out: false,
+                    stderr_sha256: ancestry
+                        .stderr
+                        .as_ref()
+                        .map(|capture| capture.sha256.clone()),
+                    stderr_bytes: ancestry.stderr.as_ref().map(|capture| capture.byte_count),
+                    process_tree_empty,
+                    process_tree_unconfirmed: !process_tree_empty,
+                };
+            }
+            _ => {
+                return unknown(
+                    plan.phase,
+                    "expected_predecessor_ancestry_unavailable",
+                    Some(before.clone()),
+                    ancestry.stderr.as_ref(),
+                    false,
+                    owner,
+                    &evidence,
+                );
+            }
+        }
+    }
+
+    let push_args = publication_push_args(
+        &plan.intent.target_ref,
+        plan.intent.expected_old_ref.as_deref(),
+        &plan.intent.commit,
+        &endpoint,
+    );
+    let push = match run_git(plan, owner, &push_args) {
         Ok(result) => result,
         Err(_) => {
             let after = match remote_ref_at(plan, owner, &endpoint, &mut evidence) {
@@ -921,6 +1044,29 @@ fn execute(plan: &WorkPlan, owner: &Group) -> RunResult {
             };
         }
     };
+    if !push.timed_out
+        && push.exit_code.is_some_and(|code| code != 0)
+        && (after.is_expected(&plan.intent)
+            || exact_push_rejection(push.stdout.as_ref(), &plan.intent.target_ref))
+    {
+        let expected_ref_remains = after.is_expected(&plan.intent);
+        return RunResult {
+            phase: plan.phase,
+            outcome: "failed",
+            reason: if expected_ref_remains {
+                "git_rejected_and_expected_ref_remains"
+            } else {
+                "expected_ref_conflict"
+            },
+            remote_ref: Some(after),
+            push_exit_code: push.exit_code,
+            timed_out: false,
+            stderr_sha256: push.stderr.as_ref().map(|capture| capture.sha256.clone()),
+            stderr_bytes: push.stderr.as_ref().map(|capture| capture.byte_count),
+            process_tree_empty: group_empty(owner),
+            process_tree_unconfirmed: false,
+        };
+    }
     if after.is_candidate(&plan.intent) {
         return applied(
             plan.phase,
@@ -931,23 +1077,6 @@ fn execute(plan: &WorkPlan, owner: &Group) -> RunResult {
             &evidence,
         )
         .with_stderr(push.stderr.as_ref());
-    }
-    if !push.timed_out
-        && push.exit_code.is_some_and(|code| code != 0)
-        && after.is_expected(&plan.intent)
-    {
-        return RunResult {
-            phase: plan.phase,
-            outcome: "failed",
-            reason: "git_rejected_and_expected_ref_remains",
-            remote_ref: Some(after),
-            push_exit_code: push.exit_code,
-            timed_out: false,
-            stderr_sha256: push.stderr.as_ref().map(|capture| capture.sha256.clone()),
-            stderr_bytes: push.stderr.as_ref().map(|capture| capture.byte_count),
-            process_tree_empty: group_empty(owner),
-            process_tree_unconfirmed: false,
-        };
     }
     RunResult {
         phase: plan.phase,
@@ -1635,3 +1764,6 @@ fn is_truthy(value: &str) -> bool {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+#[cfg(test)]
+mod expected_old_ref_fixtures;
