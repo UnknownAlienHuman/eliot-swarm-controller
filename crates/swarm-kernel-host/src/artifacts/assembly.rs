@@ -283,7 +283,8 @@ impl ArtifactFiles {
                     "capture_read_error":if command_output {capture["read_error"].clone()} else {Value::Null},
                     "task_accepted":false}),
             };
-            match fs::hard_link(&temp, self.path(&record)?) {
+            let destination = self.path(&record)?;
+            match fs::hard_link(&temp, &destination) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Recovery after publication but before DB registration: compare
@@ -307,10 +308,17 @@ impl ArtifactFiles {
                 }
                 Err(e) => return Err(e.into()),
             }
+            swarm_process::sync_parent_directory(&destination)?;
             Ok(record)
         })();
-        let _ = fs::remove_file(&temp);
-        result
+        let cleanup: Result<bool> =
+            swarm_process::remove_private_durable(&temp).map_err(Into::into);
+        match (result, cleanup) {
+            (Ok(record), Ok(_)) => Ok(record),
+            (Err(error), Ok(_)) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(error.with_secondary_error(cleanup_error)),
+        }
     }
     pub(super) fn open_regular(&self, record: &ArtifactRecord) -> Result<File> {
         self.open_regular_existing(record)?

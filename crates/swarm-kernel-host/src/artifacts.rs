@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -163,11 +163,13 @@ impl ArtifactFiles {
             content_digest: format!("{:x}", hash.finalize()),
             metadata,
         };
-        match fs::hard_link(source, self.path(&record)?) {
+        let destination = self.path(&record)?;
+        match fs::hard_link(source, &destination) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => self.verify(&record)?,
             Err(e) => return Err(e.into()),
         }
+        swarm_process::sync_parent_directory(&destination)?;
         Ok(record)
     }
     pub fn record(operation_id: &str, bytes: &[u8], metadata: Value) -> ArtifactRecord {
@@ -216,30 +218,14 @@ impl ArtifactFiles {
             return Err(Error::invalid("artifact bytes differ from their identity"));
         }
         let destination = self.path(record)?;
-        let temp = self.root.join(format!(".{}.tmp", model::new_id()));
-        let result = (|| -> Result<()> {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+        match crate::platform::write_private_new(&destination, bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+                self.verify(record)?;
+                swarm_process::sync_parent_directory(&destination).map_err(Into::into)
             }
-            let mut file = options.open(&temp)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            drop(file);
-            match fs::hard_link(&temp, &destination) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.verify(record)?;
-                }
-                Err(e) => return Err(e.into()),
-            }
-            Ok(())
-        })();
-        let _ = fs::remove_file(&temp); // Only our uniquely named temporary file.
-        result
+            Err(error) => Err(error),
+        }
     }
     pub(super) fn verified_bytes(&self, record: &ArtifactRecord) -> Result<Vec<u8>> {
         let path = self.path(record)?;
