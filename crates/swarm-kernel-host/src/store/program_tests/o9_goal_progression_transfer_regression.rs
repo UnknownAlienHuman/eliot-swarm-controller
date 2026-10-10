@@ -16,6 +16,9 @@ const SOURCE_OPERATION_ID: &str = "o9-completed-native-goal-turn";
 const EVENT_STREAM_REPLAY_SUFFIX: &str = ":post-transfer-replay";
 
 fn fixture_route(directory: &std::path::Path) -> Value {
+    // This fixture seeds a pre-cutover `.1` binding directly and reconciles a
+    // Goal continuation through that retained binding; it does not admit a new
+    // binding, so keep the historical artifact identity for readback coverage.
     json!({
         "alias":"o9-opencode-fixture",
         "runtime":crate::runtime::opencode_v2::RUNTIME,

@@ -17,7 +17,7 @@ fn fixture_db() -> Connection {
 }
 
 fn opencode_route(service: &str) -> Value {
-    json!({"alias":"oc","runtime":"opencode_v2","module_artifact_id":"eliot-opencode-v2.http.1","enabled":true,
+    json!({"alias":"oc","runtime":"opencode_v2","module_artifact_id":"eliot-opencode-v2.http.2","enabled":true,
            "native_options":{"service_id":service,"connection_file":"/tmp/conn.json","expected_version":"1",
            "directory":"/tmp","model":{"id":"m1","providerID":"prov-a","variant":"v"}}})
 }
@@ -504,7 +504,7 @@ fn root_admission_route() -> crate::config::Route {
     serde_json::from_value(json!({
         "alias":"oc",
         "runtime":"opencode_v2",
-        "module_artifact_id":"eliot-opencode-v2.http.1",
+        "module_artifact_id":"eliot-opencode-v2.http.2",
         "enabled":true,
         "native_options":{
             "service_id":"svc-placeholder",
@@ -1569,7 +1569,7 @@ async fn store_admission_records_and_cancel_releases_the_reservation() {
         admission_policy: None,
         alias: "oc".into(),
         runtime: "opencode_v2".into(),
-        module_artifact_id: "eliot-opencode-v2.http.1".into(),
+        module_artifact_id: "eliot-opencode-v2.http.2".into(),
         enabled: true,
         native_options: json!({
             "service_id": "svc-hook",

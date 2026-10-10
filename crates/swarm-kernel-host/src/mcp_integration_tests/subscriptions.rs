@@ -41,7 +41,7 @@ async fn start_stack() -> Stack {
         owned_service: None,
         alias: "fixture".into(),
         runtime: "opencode_v2".into(),
-        module_artifact_id: "eliot-opencode-v2.http.1".into(),
+        module_artifact_id: "eliot-opencode-v2.http.2".into(),
         enabled: true,
         native_options: json!({}),
     });

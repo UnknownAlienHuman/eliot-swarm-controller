@@ -429,7 +429,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     let route = Route {
         alias: ROUTE_ALIAS.to_owned(),
         runtime: "opencode_v2".to_owned(),
-        module_artifact_id: "eliot-opencode-v2.http.1".to_owned(),
+        module_artifact_id: "eliot-opencode-v2.http.2".to_owned(),
         enabled: true,
         native_options: json!({
             "service_id":SERVICE_ID,
