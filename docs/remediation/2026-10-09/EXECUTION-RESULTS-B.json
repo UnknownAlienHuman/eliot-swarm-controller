@@ -1,0 +1,254 @@
+{
+  "schema": "eliot.v27_execution_results.v1",
+  "observed_at_utc": "2026-10-10T05:43:48.5543103Z",
+  "candidate_commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+  "binding_receipt_sha256": "3ebfb00624885890efc044e252904aab8a6a750546adabc083ba548508d2e4f1",
+  "build_packages": [
+    {
+      "package": "host_runtime",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "c9578e701c49251d19cf669db8873e892f0e10289b56ad52cc59c57a147e9040"
+    },
+    {
+      "package": "host_supervisor",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "f417f63f8dea6f2adde01800c00f974a30f81ce2c063f2ddc05f80c2d0508bc5"
+    },
+    {
+      "package": "host_launcher",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "fdeeb0c048824a63e59ea91f9ac91c8f2006b98da77e08289bb313c786b5529f"
+    },
+    {
+      "package": "public_cli",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "798a19aa86fbf40f51279986868e7e20d445d7eb3c9d608dcce4bfe134c76250"
+    },
+    {
+      "package": "process_owner_helper",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "9324e69b5799a6b58fc967c417993cae6891b490e53bd6eda7e8b8bd911f6a6e"
+    },
+    {
+      "package": "opencode_module",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "cd775ffa3d9880f626565add2654571019257c5e48dc97f86871852c5120efe8"
+    },
+    {
+      "package": "antigravity_module",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "575065527ff2448acae33e52c126eeed1a08cf92deb0d3325ccaf4c048699b4f"
+    },
+    {
+      "package": "swarm_mcp",
+      "commit": "ce471525071ec724dba9b796f98d0850aee932dd",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "f455e815da119c1cad27304eea0bf046e5dd7c50eccb0f1913c2fb6726cfe214"
+    }
+  ],
+  "host_resource_install": {
+    "install_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010b\\candidate-build\\host-stack",
+    "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010b\\candidate-build\\host-stack\\swarm-kernel-host.install-receipt.json",
+    "receipt_sha256": "592095da8508bd4d236cb67c648f5b692979be5f58f3265d39933d2adfaedd11",
+    "build_manifest_sha256": "c9578e701c49251d19cf669db8873e892f0e10289b56ad52cc59c57a147e9040",
+    "installer_readback_path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\candidate-install-readback.json",
+    "installer_readback_sha256": "d1eb9cd0dd62f14101a2b5f929d00532055c058aa155d0fcb259f737fb34ee12",
+    "resource_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010b\\candidate-build\\host-stack\\resources\\modules\\opencode",
+    "server_program": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010b\\candidate-build\\host-stack\\resources\\modules\\opencode\\serve.mjs",
+    "server_program_sha256": "d36394f227d272e91150ce3cf6e469b6c8bfae9997ad957306518bbeb49c956c",
+    "dependency_closure_manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010b\\candidate-build\\host-stack\\resources\\modules\\opencode\\dependency-closure.json",
+    "dependency_closure_sha256": "97600fed55ff73d59010df77be16c99d5488fe595aa95c3e9511183a26449519",
+    "dependency_tree_sha256": "396ef448a1494e29ae8a599ceee7827afeb88787487f88394cbf22e90e9fd486",
+    "dependency_file_count": 34060,
+    "unchanged_after_runner": true
+  },
+  "host_load": {
+    "status": "PASS",
+    "receipt_sha256": "78cc979ede324814f11daef7e13692fe69c2dc7a886b4d30308b711ea7e28dc7",
+    "scope": "host-only fixture load; no native runtimes, bridges or model calls",
+    "host_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+    "parameters": {
+      "clients": 200,
+      "senders": 32,
+      "duration_seconds": 20.0,
+      "tasks": 200,
+      "ipc_defaults": "max_connections=256, max_inflight_per_connection=8, max_frame_bytes=1048576 (config.rs defaults; no --config passed)"
+    },
+    "event_load": {
+      "seconds": 24.116,
+      "senders": 32,
+      "consumers": 168,
+      "message_send_ok": 3245,
+      "message_send_errors": 0,
+      "error_codes": {},
+      "events_per_second": 134.6,
+      "consumer_message_read_calls": 2006,
+      "consumer_items_read": 2564
+    },
+    "verification_drain": {
+      "events_after_baseline": 3245,
+      "message_send_events": 3245,
+      "matches_admissions": true,
+      "seconds": 0.275,
+      "events_per_second": 11804.6
+    },
+    "status_latency_under_load": {
+      "count": 350,
+      "min_ms": 0.468,
+      "p50_ms": 0.848,
+      "p95_ms": 1.207,
+      "p99_ms": 1.891,
+      "max_ms": 4.091,
+      "mean_ms": 0.89
+    },
+    "host_exit_code": 0,
+    "shutdown_disposition": "owned_fixture_host_stdin_eof"
+  },
+  "core_failure": {
+    "receipt_sha256": "3e27e6c81362eb0dd7fd143ad0a69bd13516f5bb246a8264f8532b96e6aafc92",
+    "execution_status": "completed",
+    "qualification": "not_qualified",
+    "scenarios": [
+      {
+        "name": "manager-dropped-ack-restart",
+        "run_id": "manager-dropped-ack-restart-6341f929a7db4247b9f7cda7140fdf57",
+        "status": "unknown",
+        "code": "PUBLIC_TASK_ORIGIN_UNAVAILABLE",
+        "facts": {
+          "host_pid": 79048,
+          "host_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "host_epoch_before": 1,
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "manager_ack": "intentionally_not_read",
+          "logical_request_id": "core-failure:f5a60ee5112846788eaea3e1002db152",
+          "public_task_identity_before_restart": "unknown",
+          "public_task_identity_before_restart_code": "PUBLIC_TASK_ORIGIN_UNAVAILABLE",
+          "host_restart_pid": 74964,
+          "host_restart_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "host_epoch_after": 2,
+          "public_task_identity_after_restart": "unknown",
+          "public_task_identity_after_restart_code": "PUBLIC_TASK_ORIGIN_UNAVAILABLE"
+        }
+      },
+      {
+        "name": "manager-durable-request-conflict",
+        "run_id": "manager-durable-request-conflict-d415a3369f294d08842823a285853077",
+        "status": "observed",
+        "code": null,
+        "facts": {
+          "host_pid": 25500,
+          "host_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "host_restart_pid": 76984,
+          "host_restart_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "host_epoch_after": 2,
+          "manager_error_code": "REQUEST_ID_CONFLICT",
+          "original_operation_id": "0ac49155-56cd-4548-af37-0604735f2e89",
+          "original_task_id": "2bb16c75-5c70-400a-aed8-b19851e0e1ca",
+          "original_operation_state": "settled",
+          "conflicting_task_created": false,
+          "complete_public_task_identity_set_verified": true,
+          "current_manager_handover": true,
+          "gm_epoch": 1
+        }
+      },
+      {
+        "name": "hook-callback-restart-dedup",
+        "run_id": "hook-callback-restart-dedup-c86c28275a534a18bfa61933062215c5",
+        "status": "unknown",
+        "code": "HOOK_EVENT_NOT_UNIQUE_AFTER_RESTART",
+        "facts": {
+          "host_pid": 29808,
+          "host_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "callback_ack": "intentionally_not_read",
+          "source_id": "e98e9e35-1404-4f29-b990-927bb5d8d6a5",
+          "commit_oid": "0238af4aae610d80c870cdc1eeca02ef23bad606",
+          "host_restart_pid": 53064,
+          "host_restart_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "host_epoch_after": 2,
+          "fixture_hook_revoked_and_restored": true
+        }
+      },
+      {
+        "name": "optional-worker-observation",
+        "run_id": "optional-worker-observation-bffedd9b5ad649c9bb69ea436d846283",
+        "status": "observed",
+        "code": null,
+        "facts": {
+          "host_pid": 63404,
+          "host_image_sha256": "7d7d7e3f104a9ee87c7cab9af8bf98beb3a84f96bea2d2e3dc4d476f57725de6",
+          "manager_visible_workers": {
+            "module-supervisor": {
+              "state": "isolated",
+              "consecutive_failures": 5,
+              "last_error_code": "SUPERVISOR_EXITED"
+            }
+          },
+          "failure_was_injected_by_harness": false,
+          "interpretation": "existing bounded health is Manager-visible; this harness has no public control that can induce a specific legacy worker failure"
+        }
+      }
+    ]
+  },
+  "native": [
+    {
+      "adapter": "OpenCode",
+      "run_id": "f697e07b-99a2-432e-a712-479d97d2a89a",
+      "receipt_sha256": "4517aa73879e035475131b974c421675889b8361b2be87c6cd95e4dc634d468d",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "isolated_host",
+          "status": "blocked",
+          "code": "HOST_SUPERVISOR_NOT_READY"
+        }
+      ]
+    },
+    {
+      "adapter": "Antigravity",
+      "run_id": "dd1942bd-12d5-44de-993b-10080de4ac4e",
+      "receipt_sha256": "1408e3e4f46be20681854f8f2b08b8961db810ba84fe27802e353b6e476daf8d",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "isolated_host",
+          "status": "blocked",
+          "code": "HOST_SUPERVISOR_NOT_READY"
+        }
+      ]
+    }
+  ],
+  "supervisor_health_readback_sha256": "737993f71ed10775639e721dd0dcfea581d2b2888a8a8c729f599fee7af75268",
+  "interpretation": "The supervisor now starts under exact process custody and bounded backoff. Its retained exit is MODULE_DESCRIPTOR_UNAVAILABLE; neither adapter dispatched or called a model. The Windows canonical-prefix repair is subsequent source and does not upgrade these historical outcomes."
+}

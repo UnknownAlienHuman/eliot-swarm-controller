@@ -149,7 +149,21 @@ fn checked_file_under_root(root: &Path, path: &Path, field: &str) -> Result<Path
             format!("{field} path must be absolute"),
         ));
     }
-    let relative = path.strip_prefix(root).map_err(|_| {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(Error::new(
+            "MODULE_INSTALL_PATH_INVALID",
+            format!("{field} path contains a non-normal component"),
+        ));
+    }
+    // Refuse links in the supplied spelling before canonicalization erases them.
+    reject_link_ancestors(path)?;
+    let canonical = fs::canonicalize(path)?;
+    let relative = canonical.strip_prefix(root).map_err(|_| {
         Error::new(
             "MODULE_INSTALL_PATH_INVALID",
             format!("{field} path escapes the configured install root"),
@@ -178,7 +192,6 @@ fn checked_file_under_root(root: &Path, path: &Path, field: &str) -> Result<Path
             ));
         }
     }
-    let canonical = fs::canonicalize(path)?;
     if !canonical.starts_with(root) || !fs::metadata(&current)?.is_file() {
         return Err(Error::new(
             "MODULE_INSTALL_PATH_INVALID",
@@ -617,5 +630,132 @@ pub(crate) fn validate_launch_value(value: &LaunchValue) -> Result<()> {
         LaunchValue::ModuleHostConfigPath { .. } => Err(Error::invalid(
             "module host config path schema is unsupported",
         )),
+    }
+}
+
+#[cfg(test)]
+mod installed_descriptor_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Fixture {
+        base: PathBuf,
+        root: PathBuf,
+        descriptor: PathBuf,
+        executable: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "swarm installed descriptor {}",
+                uuid::Uuid::new_v4()
+            ));
+            let root = base.join("install");
+            let artifact = root.join("artifact");
+            fs::create_dir_all(&artifact).unwrap();
+            let executable = artifact.join("adapter.exe");
+            fs::write(&executable, b"inert executable fixture").unwrap();
+            let digest = hash_file_sha256(&executable).unwrap();
+            let mut descriptor: serde_json::Value = serde_json::from_str(include_str!(
+                "../../swarm-adapter-opencode/registration/descriptor.template.json"
+            ))
+            .unwrap();
+            descriptor["launch"]["executable"] = json!(executable);
+            descriptor["launch"]["executable_sha256"] = json!(digest);
+            let descriptor_path = artifact.join("module-descriptor.json");
+            fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+            let receipt = json!({
+                "schema_version":1, "format":INSTALL_RECEIPT_FORMAT,
+                "module_id":descriptor["module_id"],
+                "artifact_id":descriptor["artifact"]["artifact_id"],
+                "version":descriptor["artifact"]["version"],
+                "build_id":descriptor["artifact"]["build_id"],
+                "source_file":executable, "installed_file":executable,
+                "source_sha256":digest, "staged_sha256":digest,
+                "installed_sha256":digest, "descriptor_file":descriptor_path,
+                "descriptor_sha256":hash_file_sha256(&descriptor_path).unwrap(),
+            });
+            fs::write(
+                artifact.join("install-receipt.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            Self {
+                base,
+                root,
+                descriptor: descriptor_path,
+                executable,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.base).unwrap();
+        }
+    }
+
+    #[test]
+    fn installed_descriptor_accepts_path_spellings_and_rejects_changed_bytes() {
+        let fixture = Fixture::new();
+        let ordinary = load_installed_descriptor(&fixture.descriptor, &fixture.root).unwrap();
+        let canonical = load_installed_descriptor(
+            &fs::canonicalize(&fixture.descriptor).unwrap(),
+            &fs::canonicalize(&fixture.root).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ordinary, canonical);
+        fs::write(&fixture.executable, b"changed executable bytes").unwrap();
+        assert_eq!(
+            load_installed_descriptor(&fixture.descriptor, &fixture.root)
+                .unwrap_err()
+                .code,
+            "MODULE_INSTALL_RECEIPT_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn installed_descriptor_rejects_escape_and_parent_traversal() {
+        let fixture = Fixture::new();
+        let outside = fixture.base.join("outside.json");
+        fs::copy(&fixture.descriptor, &outside).unwrap();
+        let traversal = fixture
+            .root
+            .join("artifact/../artifact/module-descriptor.json");
+        for path in [outside, traversal, fixture.root.clone()] {
+            assert_eq!(
+                load_installed_descriptor(&path, &fixture.root)
+                    .unwrap_err()
+                    .code,
+                "MODULE_INSTALL_PATH_INVALID"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_descriptor_rejects_symlink_before_canonicalization() {
+        let fixture = Fixture::new();
+        let link = fixture.root.join("linked-descriptor.json");
+        std::os::unix::fs::symlink(&fixture.descriptor, &link).unwrap();
+        assert_eq!(
+            load_installed_descriptor(&link, &fixture.root)
+                .unwrap_err()
+                .code,
+            "MODULE_INSTALL_PATH_INVALID"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires genuine installed descriptor/receipt inputs"]
+    fn genuine_installed_descriptor_readback() {
+        let inputs: Vec<(PathBuf, PathBuf)> =
+            serde_json::from_str(&std::env::var("ELIOT_INSTALLED_DESCRIPTOR_TEST_INPUTS").unwrap())
+                .unwrap();
+        assert!((1..=8).contains(&inputs.len()));
+        for (root, descriptor) in inputs {
+            load_installed_descriptor(&descriptor, &root).unwrap();
+        }
     }
 }

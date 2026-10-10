@@ -4,6 +4,8 @@ Status, 2026-10-10: installed execution and resulting bounded repairs in progres
 
 ## Connected source gate
 
+Latest follow-up: installed `ce47152` passed host load (3245 messages) and progressed past Manager credential creation, but both native adapters stopped at the descriptor loader with zero dispatches. The Windows canonical-prefix repair has strict production Clippy on both platforms and actual installed-descriptor readback on Windows, plus traversal, symlink and tamper regressions. It needs a fresh installed native execution. [B results](EXECUTION-RESULTS-B.json), [descriptor repair](DESCRIPTOR-REPAIR-EVIDENCE.json) and [open dependency alerts](DEPENDENCY-ALERTS.json) are separate evidence. Public Task origin and hook admission remain explicit core gaps.
+
 Run production-only Clippy for all owned workspace packages, without dependencies and with warnings denied. Format exact owned files; preserve the vendored Atlas snapshot. Record the committed candidate, commands, toolchain and source hashes. Native packages must use their current descriptor coordinates, not historical installed versions.
 
 ## Rust and public-path evidence

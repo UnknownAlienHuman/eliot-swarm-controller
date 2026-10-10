@@ -1,0 +1,283 @@
+{
+  "schema": "eliot.v27_dependency_alert_disposition.v1",
+  "observed_at_utc": "2026-10-10T05:31:24.1511716Z",
+  "agent_report_sha256": "8c4c1b1f57715af7c52ab660f1134bdbc168477f563e6be8df9e590c9ab47d44",
+  "alert_publication_readback": {
+    "alerts": [
+      {
+        "ecosystem": "npm",
+        "ghsa_id": "GHSA-6qxp-vccf-f47h",
+        "manifest": "modules/opencode/package-lock.json",
+        "number": 16,
+        "package": "@modelcontextprotocol/client",
+        "patched": "2.2.0",
+        "published_at": "2026-10-06T15:35:44Z",
+        "scope": "runtime",
+        "severity": "high",
+        "updated_at": "2026-10-06T15:35:44Z",
+        "vulnerable": ">= 2.0.0, < 2.2.0"
+      },
+      {
+        "ecosystem": "npm",
+        "ghsa_id": "GHSA-hp3w-g68c-fv3c",
+        "manifest": "modules/opencode/package-lock.json",
+        "number": 15,
+        "package": "sprintf-js",
+        "patched": null,
+        "published_at": "2026-09-24T15:31:31Z",
+        "scope": "runtime",
+        "severity": "medium",
+        "updated_at": "2026-10-05T23:47:35Z",
+        "vulnerable": "<= 1.1.3"
+      },
+      {
+        "ecosystem": "npm",
+        "ghsa_id": "GHSA-ch52-4w7c-c8xp",
+        "manifest": "modules/opencode/package-lock.json",
+        "number": 13,
+        "package": "http-cache-semantics",
+        "patched": null,
+        "published_at": "2026-09-18T18:31:44Z",
+        "scope": "runtime",
+        "severity": "high",
+        "updated_at": "2026-10-02T22:36:44Z",
+        "vulnerable": "<= 4.2.0"
+      },
+      {
+        "ecosystem": "npm",
+        "ghsa_id": "GHSA-vfj7-8cjw-p6xm",
+        "manifest": "modules/opencode/package-lock.json",
+        "number": 12,
+        "package": "braces",
+        "patched": null,
+        "published_at": "2026-09-18T18:31:41Z",
+        "scope": "runtime",
+        "severity": "high",
+        "updated_at": "2026-10-02T22:36:34Z",
+        "vulnerable": "<= 3.0.3"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-wjv6-jcfj-mf9r",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 9,
+        "package": "datamodel-code-generator",
+        "patched": "0.60.2",
+        "published_at": "2026-07-28T21:50:09Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:50:09Z",
+        "vulnerable": ">= 0.14.1, <= 0.60.1"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-8359-h9fx-j6v9",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 8,
+        "package": "datamodel-code-generator",
+        "patched": "0.62.0",
+        "published_at": "2026-07-28T21:49:34Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:49:37Z",
+        "vulnerable": "<= 0.61.0"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-386q-5hp3-95m9",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 7,
+        "package": "datamodel-code-generator",
+        "patched": "0.60.2",
+        "published_at": "2026-07-28T21:48:14Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:48:17Z",
+        "vulnerable": ">= 0.17.0, <= 0.60.1"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-vx7x-vcc2-c44g",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 6,
+        "package": "datamodel-code-generator",
+        "patched": "0.63.0",
+        "published_at": "2026-07-28T21:45:48Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:45:50Z",
+        "vulnerable": "<= 0.62.0"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-954p-556p-r752",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 5,
+        "package": "datamodel-code-generator",
+        "patched": "0.61.0",
+        "published_at": "2026-07-28T21:42:22Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:42:24Z",
+        "vulnerable": ">= 0.9.1, <= 0.60.2"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-5578-w22f-pfx9",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 4,
+        "package": "datamodel-code-generator",
+        "patched": "0.64.0",
+        "published_at": "2026-07-28T21:40:20Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:40:21Z",
+        "vulnerable": ">= 0.11.6, <= 0.63.0"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-j884-q54q-mmx3",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 3,
+        "package": "datamodel-code-generator",
+        "patched": "0.60.1",
+        "published_at": "2026-07-28T21:35:49Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:35:51Z",
+        "vulnerable": ">= 0.25.0, < 0.60.1"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-r5vv-ff45-prp2",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 2,
+        "package": "datamodel-code-generator",
+        "patched": "0.63.0",
+        "published_at": "2026-07-28T21:32:08Z",
+        "scope": "development",
+        "severity": "low",
+        "updated_at": "2026-07-28T21:32:09Z",
+        "vulnerable": "<= 0.62.0"
+      },
+      {
+        "ecosystem": "pip",
+        "ghsa_id": "GHSA-rfr2-mq9m-x2qx",
+        "manifest": "modules/codex/vendor_bridge/uv.lock",
+        "number": 1,
+        "package": "datamodel-code-generator",
+        "patched": "0.61.0",
+        "published_at": "2026-07-28T21:30:18Z",
+        "scope": "development",
+        "severity": "high",
+        "updated_at": "2026-07-28T21:30:19Z",
+        "vulnerable": ">= 0.9.1, <= 0.60.2"
+      }
+    ],
+    "observed_scope": "GitHub Dependabot open alerts",
+    "observed_at_utc": "2026-10-10T05:14:27.3975353Z"
+  },
+  "findings": [
+    {
+      "package": "@modelcontextprotocol/client",
+      "ecosystem": "npm",
+      "alert_numbers": [
+        16
+      ],
+      "severity": "high",
+      "locked_version": "2.0.0",
+      "patched_version_in_snapshot": "2.2.0",
+      "scope": "transitive production dependency in the optional OpenCode service-owner dependency closure",
+      "observed_dependency_edge": "@opencode/core@2.0.7 -> @modelcontextprotocol/client@2.0.0",
+      "disposition": "OPEN_BLOCKED_BY_EXACT_UPSTREAM_PIN",
+      "reason": "The upstream @opencode/core@2.0.7 package declares the client at the exact version 2.0.0. The user explicitly disallowed adding an override to bypass that pin. No @opencode/core version or dependency contract was changed.",
+      "limited_compatibility_evidence": "The 2.0.0 and 2.2.0 package entrypoint maps matched, and the imported client symbols observed in @opencode/core were present in both declaration export lists. This establishes symbol presence only; no behavior or runtime fixture was verified."
+    },
+    {
+      "package": "braces",
+      "ecosystem": "npm",
+      "alert_numbers": [
+        12
+      ],
+      "severity": "high",
+      "locked_version": "3.0.3",
+      "patched_version_in_snapshot": null,
+      "scope": "transitive production dependency in the optional OpenCode service-owner dependency closure",
+      "observed_dependency_path": "braces@3.0.3 <- micromatch@4.0.8 (^3.0.3) <- @parcel/watcher@2.5.1 <- @opencode/core@2.0.7",
+      "disposition": "OPEN_NO_PATCHED_UPSTREAM_VERSION",
+      "reason": "The npm registry version query returned 3.0.3, the same vulnerable version already locked. The saved advisory has no patched version."
+    },
+    {
+      "package": "http-cache-semantics",
+      "ecosystem": "npm",
+      "alert_numbers": [
+        13
+      ],
+      "severity": "high",
+      "locked_version": "4.2.0",
+      "patched_version_in_snapshot": null,
+      "scope": "transitive production dependency in the optional OpenCode service-owner dependency closure",
+      "observed_dependency_path": "http-cache-semantics@4.2.0 <- make-fetch-happen@15.0.6 <- @sigstore/sign@4.1.1 <- sigstore@4.1.1 <- pacote@21.5.1 <- @npmcli/arborist@9.4.0 <- @opencode/util@2.0.7",
+      "candidate_upstream_version_observed": "4.3.0",
+      "disposition": "OPEN_PATCH_STATUS_UNVERIFIED",
+      "reason": "Version 4.3.0 was present in registry metadata and fits the observed ^4.1.1 parent range, but the saved advisory has no patched version and this pass did not establish that 4.3.0 fixes this advisory. The lock was left unchanged and the alert is not claimed fixed."
+    },
+    {
+      "package": "sprintf-js",
+      "ecosystem": "npm",
+      "alert_numbers": [
+        15
+      ],
+      "severity": "medium",
+      "locked_version": "1.0.3",
+      "patched_version_in_snapshot": null,
+      "scope": "transitive production dependency in the optional OpenCode service-owner dependency closure",
+      "observed_dependency_path": "sprintf-js@1.0.3 <- argparse@1.0.10 (~1.0.2) <- js-yaml@3.15.2 <- gray-matter@4.0.3 <- @opencode/core@2.0.7",
+      "disposition": "OPEN_NO_PATCHED_UPSTREAM_VERSION",
+      "reason": "The npm registry version query returned 1.1.3, which remains within the saved advisory's vulnerable range <=1.1.3; the parent also constrains the dependency to ~1.0.2. No patched version was supplied."
+    },
+    {
+      "package": "datamodel-code-generator",
+      "ecosystem": "pip",
+      "alert_numbers": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "alert_count": 9,
+      "severities_in_snapshot": [
+        "high",
+        "low"
+      ],
+      "locked_version": "0.31.2",
+      "patched_versions_in_snapshot": [
+        "0.60.1",
+        "0.60.2",
+        "0.61.0",
+        "0.62.0",
+        "0.63.0",
+        "0.64.0"
+      ],
+      "scope": "direct development dependency included by both the test and dev dependency groups; not a runtime dependency",
+      "manifest_constraint": "datamodel-code-generator==0.31.2",
+      "disposition": "OPEN_BLOCKED_BY_IMMUTABLE_VENDOR_DONOR",
+      "reason": "modules/codex/UPDATE.md says the retained vendor_bridge source, generated models, and pins remain unchanged and prescribes a wholesale donor refresh with updated upstream identity and regenerated SHA256SUMS. The vendor verifier hashes both pyproject.toml and uv.lock, and SHA256SUMS is outside the authorized paths. Updating either allowed file alone would invalidate the vendor verification contract. No pin or lock was changed.",
+      "limited_compatibility_evidence": "PyPI metadata for 0.64.0 declared Python >=3.10, consistent with the project's interpreter floor. No uv resolution was attempted, so full dependency compatibility is unverified."
+    }
+  ],
+  "root_additional_readback": {
+    "candidate_core_version": "2.0.24",
+    "exact_mcp_client_pin": "2.0.0",
+    "registry_response_sha256": "5a3dd0e5a9e17fade8a075aeeae507ee837da40f0db4e46babd0bea638725159",
+    "meaning": "2.0.24 also pins 2.0.0; this observed upstream release does not fix the 2.2.0-required alert."
+  },
+  "dependency_updates_applied": [],
+  "status": "OPEN",
+  "qualification": "No advisory closure claimed; current main alerts require upstream-compatible remediation, or remain explicit blockers."
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "eliot.v27_descriptor_repair_evidence.v1",
+  "observed_at_utc": "2026-10-10T05:43:48.6711968Z",
+  "prior_installed_candidate": "ce471525071ec724dba9b796f98d0850aee932dd",
+  "prior_binding_receipt_sha256": "3ebfb00624885890efc044e252904aab8a6a750546adabc083ba548508d2e4f1",
+  "changed_source": {
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "08ad144b85c893f96c64ce08e0e1319fddc0c0845a08035b76775735ba12ab47"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    },
+    "crates/swarm-supervisor/src/descriptor.rs": {
+      "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+      "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+    }
+  },
+  "unchanged_baseline_source_count": 405,
+  "diagnosis": "Canonical Windows root had a verbatim prefix while ordinary installed paths were compared lexically before normalization.",
+  "invariants": [
+    "Reject raw parent/current components and links/reparse ancestors before canonicalization",
+    "Require canonical root containment and regular files",
+    "Retain descriptor/receipt identity, bounded JSON and all executable/descriptor hashes"
+  ],
+  "logs": {
+    "windows-installed-descriptor-clippy.log": "ff213e9a60d7f0b1a6fada2e94f6a4276676298830e5c7084b602b87470ff9a4",
+    "linux-installed-descriptor-clippy.log": "e9501fba8500811f1503c3581c2eb51dd46664c832dfb3f4e13a9196eaf4fa0a",
+    "windows-installed-descriptor-regressions.log": "0b77037305e223c88e0ad30024932773c38f9433ab726437d03f5153d2e6f2e1",
+    "linux-installed-descriptor-regressions.log": "2a2786acbd0f2e2f713f7db305e6d831a9a19532c3040af11a51ba8e04f23b24"
+  },
+  "windows_regressions": "3 PASS, including actual genuine B OpenCode and Antigravity installed descriptor/receipt/executable inputs",
+  "linux_regressions": "3 PASS, 1 ignored genuine Windows installation probe; escape, parent traversal, symlink and byte-tamper rejection exercised",
+  "production_clippy": "Windows/Linux strict --locked supervisor and host library+binaries PASS",
+  "qualification": "Installed repaired native process/catalogue/model components remain pending; old B outcomes preserved"
+}
