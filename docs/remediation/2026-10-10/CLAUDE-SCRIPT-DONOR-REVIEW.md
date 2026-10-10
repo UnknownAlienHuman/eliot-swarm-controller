@@ -24,7 +24,7 @@ This is implementation assistance, not a new governance programme. No mandatory 
 
 Example: `["issue:7/body", "issue:7/body"]` is rejected before a new specification can produce repeated legacy gaps. `["issue:7/body", "issue:8/body"]` keeps its order. Case-distinct or whitespace-distinct nonempty references are not silently merged. Selected text and its UTF-8 digest are unchanged.
 
-**Important limit:** this is the new-input portion of #46, not its complete migration. Historical duplicate refs still need a projection-only repair in `TaskSpec::brief`: make its existing membership set mutable and insert a ref when appending its first legacy gap. Keep richer source-index entries and first-occurrence order. Do not rewrite an existing Attempt snapshot or a retained TaskPrompt. A new claim that revalidates a malformed old Task may require an explicit Task revision, not an invisible data repair. #46 stays open.
+**Main integration followup, 2026-10-10:** `TaskSpec::brief` also records each first appended legacy reference in its existing membership set. Historical duplicate refs therefore produce one gap, in first-occurrence order; richer source-index entries retain their original priority. This projection changes no stored Task, Attempt snapshot or retained TaskPrompt. A new claim that revalidates a malformed old Task may require an explicit Task revision, not an invisible data repair. These two narrow corrections do not complete the remaining #46 consumer migration.
 
 **Do not copy literally:** the script's regex filtering by comment headings can hide an actual instruction. Current ELIOT should use explicitly selected source IDs/revisions/digests and visible gaps; an assistant must not decide that an owner's comment is merely noise. The script's modification-time refresh is a convenience, not authoritative source identity.
 
@@ -146,6 +146,6 @@ The archive also includes cleanup, session deletion, restarts, automatic form re
 
 This PR delivers one small production change in the existing TaskSpec validator plus this donor map. It does not claim that the other eleven mechanisms are newly implemented, nor that the whole #46 handoff is complete. Proposed follow-ups use existing owners and are not blockers for another agent's current task.
 
-The next small context improvement is the two-line historical `TaskSpec::brief` membership-set correction described in section 1. The next observational improvement should be selected from a concrete missing current tool/callback/span fact, not a new dashboard framework. The queue ideas belong to the existing queue/review consumers after their current implementations are checked.
+The two-line historical `TaskSpec::brief` membership-set correction described in section 1 is included in the main integration. The next observational improvement should be selected from a concrete missing current tool/callback/span fact, not a new dashboard framework. The queue ideas belong to the existing queue/review consumers after their current implementations are checked.
 
 Verification for this source slice is the existing scoped Rust workflow: formatting and compiler/Clippy. No archive scripts, local/native agent sessions, test suites, accounts, service recovery or load runs are executed. Actual CI state is reported on the PR, not predeclared here.

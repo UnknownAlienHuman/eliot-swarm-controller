@@ -436,12 +436,12 @@ impl TaskSpec {
                 entry.content_sha256 = Some(digest(text.as_bytes()));
             }
         }
-        let indexed_refs: BTreeSet<String> = source_index
+        let mut indexed_refs: BTreeSet<String> = source_index
             .iter()
             .map(|entry| entry.source_ref.clone())
             .collect();
         for source_ref in &self.source_refs {
-            if !indexed_refs.contains(source_ref) {
+            if indexed_refs.insert(source_ref.clone()) {
                 source_index.push(TaskSourceIndexEntry::legacy_gap(source_ref));
             }
         }
