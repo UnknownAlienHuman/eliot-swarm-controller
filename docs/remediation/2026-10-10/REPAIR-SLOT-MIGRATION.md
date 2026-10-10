@@ -24,3 +24,12 @@ Fixture execution is deferred until the source and Clippy assembly completes,
 as requested by the owner. Automatic transfer regression assembly and the full
 test/native/model gates remain pending. This is source delivery evidence;
 project status remains `PARTIAL_PROGRESS`.
+
+The direct caller recognizer also accepts the exact historical singleton bytes
+for readback. It resolves them against the current package contract and the
+sealed schema-1 receipt. A vacant historical request returns
+`REPAIR_REQUEST_RETIRED`, so changing the caller request ID cannot create a
+second correction. Current and historical text reuse the same retained
+Operation; changed immutable Operation text returns `REPAIR_SLOT_CORRUPT`.
+Public Store regressions cover these cases and retained transfer provenance.
+They have been added for the later test phase; execution remains deferred.

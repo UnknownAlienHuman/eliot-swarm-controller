@@ -1417,7 +1417,14 @@ pub(crate) fn recognize_direct_correction_request(
             "delivery":"next_turn",
             "text":crate::automation::repair::render_correction_text(&identity, &findings_package)
         });
-        if model::canonical(request)? != model::canonical(&expected)? {
+        let current_text = model::canonical(request)? == model::canonical(&expected)?;
+        if !package_request_matches(
+            request,
+            &expected,
+            &semantic_slot_id,
+            &findings_package,
+            true,
+        ) {
             continue;
         }
         let request_digest = repair_request_digest(request)?;
@@ -1437,6 +1444,12 @@ pub(crate) fn recognize_direct_correction_request(
             request: request.clone(),
             request_digest,
         };
+        if !current_text && resolve_direct_slot(db, &candidate)? == RepairSlotResolution::Vacant {
+            return Err(Error::new(
+                "REPAIR_REQUEST_RETIRED",
+                "historical singleton correction text can only read back a retained delivery",
+            ));
+        }
         if matched.is_some() {
             return Err(Error::new(
                 "REPAIR_SLOT_AMBIGUOUS",
@@ -1452,6 +1465,14 @@ pub(crate) fn resolve_direct_slot(
     db: &Connection,
     slot: &DirectRepairSlot,
 ) -> Result<RepairSlotResolution> {
+    // A retained singleton caller may still carry historical text. Lookup
+    // compares the current package contract and lets only the sealed v1
+    // receipt opt into its old immutable renderer.
+    let mut expected_request = slot.request.clone();
+    expected_request["text"] = json!(crate::automation::repair::render_correction_text(
+        &slot.identity,
+        &slot.findings_package,
+    ));
     resolve_slot_candidates(
         db,
         &slot.manager_id,
@@ -1460,8 +1481,8 @@ pub(crate) fn resolve_direct_slot(
         &slot.binding_id,
         slot.binding_generation,
         &slot.semantic_slot_id,
-        &slot.request,
-        &slot.request_digest,
+        &expected_request,
+        &repair_request_digest(&expected_request)?,
     )
 }
 

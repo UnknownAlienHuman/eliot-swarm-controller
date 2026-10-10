@@ -2323,10 +2323,161 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+async fn seed_historical_singleton_repair_slot(
+    store: &Store,
+    operation_id: &str,
+) -> (String, String) {
+    let operation_id = operation_id.to_owned();
+    store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            let link_key = format!("repair:v1:operation-link:{operation_id}");
+            let mut link = crate::automation::config::read_record(
+                &tx,
+                &link_key,
+                "historical singleton repair fixture link",
+            )?
+            .ok_or_else(|| Error::new("TEST_FIXTURE", "repair link is missing"))?;
+            let package: crate::review::ReviewFindingsPackage =
+                serde_json::from_value(link["findings_package"].clone())?;
+            if package.findings.len() != 1 {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "historical singleton fixture requires one retained finding",
+                ));
+            }
+            let finding = package.findings[0].clone();
+            let manager_id = model::text(&link, "effective_manager_id")?.to_owned();
+            let legacy_slot_id = crate::automation::repair::semantic_slot_id(
+                &manager_id,
+                &package.identity,
+                &finding.finding_id,
+            )?;
+            let current_slot_id = model::text(&link, "semantic_slot_id")?.to_owned();
+            if legacy_slot_id == current_slot_id {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "schema-1 and digest slot identities unexpectedly match",
+                ));
+            }
+            let historical_text = crate::automation::repair::historical_singleton_text(&package)
+                .ok_or_else(|| Error::new("TEST_FIXTURE", "legacy singleton text is missing"))?;
+            let request = crate::automation::repair::RepairDeliveryRequest {
+                client_request_id: legacy_slot_id.clone(),
+                binding_id: model::text(&link, "binding_id")?.to_owned(),
+                generation: model::positive(&link, "binding_generation")?,
+                text: historical_text.clone(),
+            };
+            let request_value = request.value();
+            let request_digest = request.parameters_digest()?;
+
+            let mut cause = link["cause"].clone();
+            let cause_object = cause.as_object_mut().ok_or_else(|| {
+                Error::new("TEST_FIXTURE", "repair cause is not a JSON object")
+            })?;
+            cause_object.remove("findings_digest");
+            cause_object.remove("finding_ids");
+            cause_object.insert("finding_id".to_owned(), json!(finding.finding_id));
+            cause_object.insert("semantic_slot_id".to_owned(), json!(legacy_slot_id));
+
+            link["schema_version"] = json!(1);
+            link["semantic_slot_id"] = json!(legacy_slot_id);
+            link["finding_id"] = json!(finding.finding_id);
+            link["finding"] = serde_json::to_value(&finding)?;
+            link["identity"] = serde_json::to_value(&package.identity)?;
+            link["request_digest"] = json!(request_digest);
+            link["cause"] = cause.clone();
+            link.as_object_mut()
+                .ok_or_else(|| Error::new("TEST_FIXTURE", "repair link is not an object"))?
+                .remove("findings_package");
+
+            let current_slot_key = format!("repair:v1:semantic-slot:{current_slot_id}");
+            let legacy_slot_key = format!("repair:v1:semantic-slot:{legacy_slot_id}");
+            let mut receipt = crate::automation::config::read_record(
+                &tx,
+                &current_slot_key,
+                "current repair slot before legacy conversion",
+            )?
+            .ok_or_else(|| Error::new("TEST_FIXTURE", "current repair slot is missing"))?;
+            if receipt["operation_id"] != operation_id
+                || receipt["source_attempt_owner_id"].as_str().is_none()
+                || receipt["review_assignment_sponsor_id"].as_str().is_none()
+                || receipt["decision_manager_id"].as_str().is_none()
+                || receipt["transfer_operation_ids"].as_array().is_none()
+                || receipt["captured_transfer_gm_epoch"].as_i64().is_none()
+            {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "transferred slot is missing retained provenance",
+                ));
+            }
+            receipt["schema_version"] = json!(1);
+            receipt["semantic_slot_id"] = json!(legacy_slot_id);
+            receipt["finding_id"] = json!(finding.finding_id);
+            receipt["parameters_digest"] = json!(request_digest);
+            receipt
+                .as_object_mut()
+                .ok_or_else(|| Error::new("TEST_FIXTURE", "repair receipt is not an object"))?
+                .remove("findings_digest");
+            tx.execute("DELETE FROM meta WHERE key=?1", [&current_slot_key])?;
+            crate::automation::config::write_record(&tx, &legacy_slot_key, &receipt)?;
+
+            let entry_key: String = tx.query_row(
+                "SELECT key FROM meta WHERE key LIKE 'repair:v1:operation_by_entry:%' \
+                 AND json_extract(value_json,'$.record.operation_id')=?1 LIMIT 1",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            crate::automation::config::write_record(&tx, &link_key, &link)?;
+            crate::automation::config::write_record(&tx, &entry_key, &link)?;
+
+            let effective_json: String = tx.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let mut effective: Value = serde_json::from_str(&effective_json)?;
+            effective["request"] = request_value.clone();
+            effective["automation_on_behalf"]["semantic_slot_id"] = json!(legacy_slot_id);
+            effective["automation_on_behalf"]["cause"] = cause;
+            if effective["receipt"]["value"]["semantic_slot_id"].is_string() {
+                effective["receipt"]["value"]["semantic_slot_id"] = json!(legacy_slot_id);
+            }
+            tx.execute(
+                "UPDATE operations SET client_request_id=?2,original_request_json=?3,effective_request_json=?4 \
+                 WHERE operation_id=?1",
+                params![
+                    operation_id,
+                    legacy_slot_id,
+                    model::canonical(&request_value)?,
+                    model::canonical(&effective)?,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((legacy_slot_id, historical_text))
+        })
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_current_slot() {
+    transferred_repair_dispatch_case(false).await;
+}
+
+#[tokio::test]
+async fn transferred_repair_dispatch_reuses_historical_singleton_slot_after_transfer() {
+    transferred_repair_dispatch_case(true).await;
+}
+
+async fn transferred_repair_dispatch_case(seed_historical_singleton: bool) {
+    let label = if seed_historical_singleton {
+        "gm-successor-repair-legacy"
+    } else {
+        "gm-successor-repair-current"
+    };
     let (owner, directory, bootstrap) =
-        start_store_with_config("gm-successor-repair", repair_fixture_config()).await;
+        start_store_with_config(label, repair_fixture_config()).await;
     let operator = owner.store.authenticate(bootstrap).await.unwrap();
     seed_clients(&owner.store).await;
 
@@ -2525,6 +2676,29 @@ async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_
     .await
     .unwrap();
     assert_eq!(first["status"], "pending");
+    let first_operation_id = owner
+        .store
+        .run({
+            let assignment_id = assignment_id.clone();
+            let result_operation_id = result_operation_id.clone();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT operation_id FROM operations WHERE method='agent.send' \
+                     AND json_extract(effective_request_json,'$.automation_on_behalf.cause.review_assignment_id')=?1 \
+                     AND json_extract(effective_request_json,'$.automation_on_behalf.cause.review_result_operation_id')=?2 \
+                     ORDER BY created_at_ms,operation_id LIMIT 1",
+                    params![assignment_id, result_operation_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    let historical_slot = if seed_historical_singleton {
+        Some(seed_historical_singleton_repair_slot(&owner.store, &first_operation_id).await)
+    } else {
+        None
+    };
     let second = consume_repair_result_for_entry(
         &owner.store,
         &current_manager.client_id,
@@ -2556,6 +2730,10 @@ async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_
         })
         .await
         .unwrap();
+    assert_eq!(
+        operation_id, first_operation_id,
+        "retry reads back the same Operation"
+    );
 
     let observed = owner
         .store
@@ -2633,6 +2811,21 @@ async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_
     assert_eq!(link["binding_id"], binding_id);
     assert_eq!(link["binding_generation"], 1);
     assert_eq!(link["cause"], cause.clone());
+    if let Some((historical_slot_id, historical_text)) = &historical_slot {
+        assert_eq!(operation_row.1, historical_slot_id.as_str());
+        assert_eq!(
+            original["client_request_id"].as_str(),
+            Some(historical_slot_id.as_str())
+        );
+        assert_eq!(original["text"].as_str(), Some(historical_text.as_str()));
+        assert_eq!(link["schema_version"], 1);
+        assert_eq!(link["finding_id"], "missing-r1-evidence");
+        assert_eq!(link["finding"]["finding_id"], "missing-r1-evidence");
+        assert!(link["findings_package"].is_null());
+        assert_eq!(cause["finding_id"], "missing-r1-evidence");
+        assert!(cause["findings_digest"].is_null());
+        assert!(cause["finding_ids"].is_null());
+    }
     assert_eq!(attempt["owner_id"], source_owner.client_id);
     assert_eq!(attempt["binding_id"], binding_id);
     assert_eq!(attempt["binding_generation"], 1);
@@ -2718,6 +2911,371 @@ async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_
         .await
         .unwrap();
     assert_eq!(retained_operation, ("queued".to_owned(), 1));
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+async fn seed_historical_direct_repair_slot(
+    store: &Store,
+    operation_id: &str,
+    manager_id: &str,
+    package: &crate::review::ReviewFindingsPackage,
+) -> (String, String) {
+    let operation_id = operation_id.to_owned();
+    let manager_id = manager_id.to_owned();
+    let package = package.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            if package.findings.len() != 1 {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "historical direct repair fixture requires one retained finding",
+                ));
+            }
+            let finding = package.findings[0].clone();
+            let current_slot_id = crate::automation::repair::semantic_slot_id(
+                &manager_id,
+                &package.identity,
+                package.semantic_subject_key(),
+            )?;
+            let historical_slot_id = crate::automation::repair::semantic_slot_id(
+                &manager_id,
+                &package.identity,
+                package.historical_semantic_subject_key(),
+            )?;
+            if current_slot_id == historical_slot_id {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "schema-1 and digest slot identities unexpectedly match",
+                ));
+            }
+            let historical_text = crate::automation::repair::historical_singleton_text(&package)
+                .ok_or_else(|| Error::new("TEST_FIXTURE", "legacy singleton text is missing"))?;
+
+            let current_slot_key = format!("repair:v1:semantic-slot:{current_slot_id}");
+            let historical_slot_key = format!("repair:v1:semantic-slot:{historical_slot_id}");
+            let mut receipt = crate::automation::config::read_record(
+                &tx,
+                &current_slot_key,
+                "current direct repair slot before legacy conversion",
+            )?
+            .ok_or_else(|| Error::new("TEST_FIXTURE", "current direct repair slot is missing"))?;
+            if receipt["operation_id"].as_str() != Some(operation_id.as_str())
+                || receipt["schema_version"] != 2
+                || receipt["findings_digest"].as_str()
+                    != Some(package.findings_digest.as_str())
+                || [
+                    "source_attempt_owner_id",
+                    "review_assignment_sponsor_id",
+                    "decision_manager_id",
+                    "transfer_operation_ids",
+                    "captured_transfer_gm_epoch",
+                ]
+                .iter()
+                .any(|field| !receipt[*field].is_null())
+            {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "direct v2 slot differs from its exact operation or has transfer provenance",
+                ));
+            }
+
+            let (caller_id, method, original_json): (String, String, String) = tx.query_row(
+                "SELECT caller_id,method,original_request_json FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if caller_id != manager_id || method != "agent.send" {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "direct slot does not point to the decision manager's agent.send",
+                ));
+            }
+            let original: Value = serde_json::from_str(&original_json)?;
+            let binding_id = model::text(&original, "binding_id")?.to_owned();
+            let generation = model::positive(&original, "generation")?;
+            let current_text =
+                crate::automation::repair::render_correction_text(&package.identity, &package);
+            if original["delivery"] != "next_turn"
+                || original["text"].as_str() != Some(current_text.as_str())
+            {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "direct operation was not admitted with the current correction rendering",
+                ));
+            }
+            let request = crate::automation::repair::RepairDeliveryRequest {
+                client_request_id: historical_slot_id.clone(),
+                binding_id,
+                generation,
+                text: historical_text.clone(),
+            };
+            let request_value = request.value();
+            let request_digest = request.parameters_digest()?;
+
+            receipt["schema_version"] = json!(1);
+            receipt["semantic_slot_id"] = json!(historical_slot_id);
+            receipt["finding_id"] = json!(finding.finding_id);
+            receipt["parameters_digest"] = json!(request_digest);
+            receipt
+                .as_object_mut()
+                .ok_or_else(|| Error::new("TEST_FIXTURE", "repair receipt is not an object"))?
+                .remove("findings_digest");
+            tx.execute("DELETE FROM meta WHERE key=?1", [&current_slot_key])?;
+            crate::automation::config::write_record(&tx, &historical_slot_key, &receipt)?;
+
+            let operation_request_changed = tx.execute(
+                "UPDATE operations SET client_request_id=?2,original_request_json=?3 \
+                 WHERE operation_id=?1 AND caller_id=?4 AND method='agent.send'",
+                params![
+                    operation_id,
+                    historical_slot_id,
+                    model::canonical(&request_value)?,
+                    manager_id,
+                ],
+            )?;
+            if operation_request_changed != 1 {
+                return Err(Error::new(
+                    "TEST_FIXTURE",
+                    "historical direct operation request was not retained",
+                ));
+            }
+            tx.commit()?;
+            Ok((historical_slot_id, historical_text))
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn direct_repair_reuses_historical_singleton_without_resending() {
+    let (owner, directory, bootstrap) =
+        start_store_with_config("direct-repair-legacy-singleton", repair_fixture_config()).await;
+    let operator = owner.store.authenticate(bootstrap).await.unwrap();
+    seed_clients(&owner.store).await;
+
+    let manager_id = "review-owner-v2";
+    let manager = principal(manager_id, Role::Manager);
+    owner
+        .store
+        .call(
+            operator,
+            "gm.handover".into(),
+            json!({"client_request_id":"designate-direct-repair-manager","client_id":manager_id}),
+        )
+        .await
+        .unwrap();
+
+    let subject = seed_subject(
+        &owner.store,
+        "direct-repair-legacy-singleton",
+        manager_id,
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    add_submission_source_fact(&owner.store, "direct-repair-legacy-singleton", &subject).await;
+    let binding_id = attach_ready_repair_binding(&owner.store, &subject).await;
+    let (reviewer, assignment_id) = assign_sponsored_reviewer(
+        &owner.store,
+        manager.clone(),
+        &subject,
+        "direct-repair-legacy-reviewer",
+        "direct-repair-legacy-reviewer-token",
+    )
+    .await;
+    let review_result = owner
+        .store
+        .call(
+            reviewer,
+            "review.submit".into(),
+            review_result_request(
+                &subject,
+                &assignment_id,
+                "direct-repair-legacy-review-result",
+            ),
+        )
+        .await
+        .unwrap();
+    let result_operation_id = review_result["operation_id"].as_str().unwrap().to_owned();
+    let feedback = owner
+        .store
+        .call(
+            manager.clone(),
+            "task.request_changes".into(),
+            request_changes_v2(
+                &subject,
+                &assignment_id,
+                &result_operation_id,
+                "direct-repair-legacy-feedback",
+                &["missing-r1-evidence"],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feedback["applied"], true);
+    assert_eq!(feedback["sender"], manager_id);
+    assert_eq!(feedback["recipient"], manager_id);
+    let package: crate::review::ReviewFindingsPackage =
+        serde_json::from_value(feedback["findings_package"].clone()).unwrap();
+    assert_eq!(package.findings.len(), 1);
+
+    let current_text =
+        crate::automation::repair::render_correction_text(&package.identity, &package);
+    let first_send = owner
+        .store
+        .call(
+            manager.clone(),
+            "agent.send".into(),
+            json!({
+                "client_request_id":"direct-repair-current-first-send",
+                "binding_id":binding_id,
+                "generation":1,
+                "delivery":"next_turn",
+                "text":current_text,
+            }),
+        )
+        .await
+        .unwrap();
+    let operation_id = first_send["operation_id"].as_str().unwrap().to_owned();
+    let (historical_slot_id, historical_text) =
+        seed_historical_direct_repair_slot(&owner.store, &operation_id, manager_id, &package).await;
+
+    let historical_retry = owner
+        .store
+        .call(
+            manager.clone(),
+            "agent.send".into(),
+            json!({
+                "client_request_id":"direct-repair-historical-fresh-request",
+                "binding_id":binding_id,
+                "generation":1,
+                "delivery":"next_turn",
+                "text":historical_text,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical_retry["semantic_reuse"], true);
+    assert_eq!(historical_retry["operation_id"], operation_id);
+
+    let current_retry = owner
+        .store
+        .call(
+            manager.clone(),
+            "agent.send".into(),
+            json!({
+                "client_request_id":"direct-repair-current-fresh-request",
+                "binding_id":binding_id,
+                "generation":1,
+                "delivery":"next_turn",
+                "text":current_text,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current_retry["semantic_reuse"], true);
+    assert_eq!(current_retry["operation_id"], operation_id);
+
+    let count_after_reuse: i64 = owner
+        .store
+        .run({
+            let attempt_id = subject.attempt_id.clone();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='agent.send' AND attempt_id=?1",
+                    [&attempt_id],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(count_after_reuse, 1);
+
+    owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            move |db| {
+                let original_json: String = db.query_row(
+                    "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                    [&operation_id],
+                    |row| row.get(0),
+                )?;
+                let mut original: Value = serde_json::from_str(&original_json)?;
+                original["text"] = json!("tampered immutable historical request text");
+                db.execute(
+                    "UPDATE operations SET original_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, model::canonical(&original)?],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let corrupted = owner
+        .store
+        .call(
+            manager.clone(),
+            "agent.send".into(),
+            json!({
+                "client_request_id":"direct-repair-corrupt-operation-readback",
+                "binding_id":binding_id,
+                "generation":1,
+                "delivery":"next_turn",
+                "text":current_text,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(corrupted.code, "REPAIR_SLOT_CORRUPT");
+
+    owner
+        .store
+        .run(move |db| {
+            db.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [format!("repair:v1:semantic-slot:{historical_slot_id}")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let retired = owner
+        .store
+        .call(
+            manager,
+            "agent.send".into(),
+            json!({
+                "client_request_id":"direct-repair-retired-historical-request",
+                "binding_id":binding_id,
+                "generation":1,
+                "delivery":"next_turn",
+                "text":historical_text,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(retired.code, "REPAIR_REQUEST_RETIRED");
+
+    let final_count: i64 = owner
+        .store
+        .run({
+            let attempt_id = subject.attempt_id;
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='agent.send' AND attempt_id=?1",
+                    [&attempt_id],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_count, 1);
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
