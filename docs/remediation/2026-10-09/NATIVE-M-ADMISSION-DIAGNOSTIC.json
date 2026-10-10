@@ -1,0 +1,273 @@
+{
+  "schema": "eliot.v27_private_admission_boundary.v1",
+  "evidence_role": "readonly_private_diagnostic_not_public_qualification",
+  "observed_at_utc": "2026-10-10T11:53:15.309Z",
+  "candidate_commit": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+  "native_calls": 0,
+  "mutation_calls": 0,
+  "runs": [
+    {
+      "run_id": "dc7d729b-24c8-45c3-b824-786056d1bd56",
+      "operations": [
+        {
+          "operation_id": "6d114395-6ae7-4974-9905-14b97be8804e",
+          "method": "swarm.launch",
+          "state": "queued",
+          "result_operation_id_matches": true,
+          "result_outcome": null,
+          "launch_state": "awaiting_native_mcp",
+          "binding_open": "ready_readback",
+          "task_dispatch": "not_started"
+        },
+        {
+          "operation_id": "0b365cd4-bf3e-4116-9e1a-a02f44ea963b",
+          "method": "agent.open",
+          "state": "settled",
+          "result_operation_id_matches": true,
+          "result_outcome": "applied",
+          "launch_state": null,
+          "binding_open": null,
+          "task_dispatch": null
+        }
+      ],
+      "bindings": [
+        {
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1,
+          "state_after_run": "reconciling",
+          "module_supervisor": {
+            "phase": "owner_retained",
+            "effect_certainty": "unknown",
+            "sequence": 4,
+            "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+            "generation": 1
+          },
+          "exact_bridge_boot_matches_supervisor": true,
+          "module_link_retained": true,
+          "caveat": "Final binding state includes qualification cleanup; lifecycle journal below preserves startup history."
+        }
+      ],
+      "lifecycle": [
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630798790,
+          "phase": "waiting_for_demand",
+          "effect_certainty": "unknown",
+          "sequence": 1,
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1
+        },
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630798802,
+          "phase": "starting",
+          "effect_certainty": "unknown",
+          "sequence": 2,
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1
+        },
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630800815,
+          "phase": "owner_retained",
+          "effect_certainty": "unknown",
+          "sequence": 3,
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1
+        },
+        {
+          "kind": "module.owner_retained",
+          "recorded_at_ms": 1791630800815,
+          "phase": "owner_retained",
+          "effect_certainty": "unknown",
+          "sequence": 3,
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1
+        },
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630810850,
+          "phase": "owner_retained",
+          "effect_certainty": "unknown",
+          "sequence": 4,
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1
+        },
+        {
+          "kind": "module.owner_retained",
+          "recorded_at_ms": 1791630810850,
+          "phase": "owner_retained",
+          "effect_certainty": "unknown",
+          "sequence": 4,
+          "binding_id": "ca9d854f-6647-4e0b-b025-f64d009eda11",
+          "generation": 1
+        },
+        {
+          "kind": "owned_service.departure_issue",
+          "recorded_at_ms": 1791630811475,
+          "disposition": "retained_uncertain",
+          "failure_code": "OWNED_SERVICE_DEPARTURE_NOT_PROVED"
+        }
+      ],
+      "inventories": [
+        {
+          "native_discovered": "observed",
+          "tool_count": 11,
+          "tools": [
+            {
+              "name": "artifact_read",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:5ec2c36f6cb98634850f04d4f9defe3b21c3080b7531cbbf8892d5cddbc773a3",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "coordination_consult",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:9d558af385635937bb48970a556622661be0725d8b7d3d2c879773189d3e5e18",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "coordination_inbox",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:b08929bce42459b9778d162969cd8cdf7b9c37a01fd1456f31a3d95c1d05ad8d",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "coordination_send",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:0d6033338662cca6473bd4bb38cc563deed3701ffb108f0a245b0a3997774ec3",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "coordination_sync_integration",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:6b1fcd36c4949c5c7d4e526986f2ad1a60bd8d70b09661354c77d539462f3269",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "coordination_watch_create",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:55ae7119a1a02eb52a004f754fda1f43a5b1ecf7535200dfe67f957b0213b303",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "operation_get",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:42fb0d1f2a01c1c99e8cacbafdf28da26b1c49c8c00d36ce2db39d39b386ce56",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "swarm_context_get",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:a332f0d39e6d7d1974e2bcdc2d1305f7514fee663ac9419c5b21542cd65198f7",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "swarm_overlap_check",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:9e8e26e5c4a97a4a4f0e51c88483926129fa53df7b4ee5171ba6738a114e2f79",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "swarm_tools_search",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:6ffcd7067648b1f5e2b2fb53dd1997082850514246ed18a743f6d28979b1b722",
+              "input_schema_is_object": true
+            },
+            {
+              "name": "task_submit",
+              "server_matches_install": true,
+              "input_schema_sha256": "sha256:d112b4c566f84ef0a4f7539e6d26383584d9fd675d14af0daa887c0409e7d1c1",
+              "input_schema_is_object": true
+            }
+          ]
+        }
+      ],
+      "supervisor_ready_observed": false,
+      "task_dispatch_operations": 0
+    },
+    {
+      "run_id": "f284fe59-208b-45dd-97c0-b16feba9f117",
+      "operations": [
+        {
+          "operation_id": "9a234f19-77c6-4417-aab0-eab51a8831ba",
+          "method": "swarm.launch",
+          "state": "queued",
+          "result_operation_id_matches": true,
+          "result_outcome": null,
+          "launch_state": "awaiting_native_mcp",
+          "binding_open": "ready_readback",
+          "task_dispatch": "not_started"
+        },
+        {
+          "operation_id": "51ad42b2-d927-47db-8bd5-9f701759b0ef",
+          "method": "agent.open",
+          "state": "settled",
+          "result_operation_id_matches": true,
+          "result_outcome": "applied",
+          "launch_state": null,
+          "binding_open": null,
+          "task_dispatch": null
+        }
+      ],
+      "bindings": [
+        {
+          "binding_id": "22b351c4-31a1-4d55-8f24-862444240d7c",
+          "generation": 1,
+          "state_after_run": "reconciling",
+          "module_supervisor": {
+            "phase": "owner_retained",
+            "effect_certainty": "unknown",
+            "sequence": 3,
+            "binding_id": "22b351c4-31a1-4d55-8f24-862444240d7c",
+            "generation": 1
+          },
+          "exact_bridge_boot_matches_supervisor": true,
+          "module_link_retained": true,
+          "caveat": "Final binding state includes qualification cleanup; lifecycle journal below preserves startup history."
+        }
+      ],
+      "lifecycle": [
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630989536,
+          "phase": "waiting_for_demand",
+          "effect_certainty": "unknown",
+          "sequence": 1,
+          "binding_id": "22b351c4-31a1-4d55-8f24-862444240d7c",
+          "generation": 1
+        },
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630989542,
+          "phase": "starting",
+          "effect_certainty": "unknown",
+          "sequence": 2,
+          "binding_id": "22b351c4-31a1-4d55-8f24-862444240d7c",
+          "generation": 1
+        },
+        {
+          "kind": "module.supervisor_observation",
+          "recorded_at_ms": 1791630991551,
+          "phase": "owner_retained",
+          "effect_certainty": "unknown",
+          "sequence": 3,
+          "binding_id": "22b351c4-31a1-4d55-8f24-862444240d7c",
+          "generation": 1
+        },
+        {
+          "kind": "module.owner_retained",
+          "recorded_at_ms": 1791630991551,
+          "phase": "owner_retained",
+          "effect_certainty": "unknown",
+          "sequence": 3,
+          "binding_id": "22b351c4-31a1-4d55-8f24-862444240d7c",
+          "generation": 1
+        }
+      ],
+      "inventories": [],
+      "supervisor_ready_observed": false,
+      "task_dispatch_operations": 0
+    }
+  ]
+}

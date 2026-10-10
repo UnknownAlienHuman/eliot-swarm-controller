@@ -20,7 +20,7 @@
         "item": "Repaired installed core/native components",
         "status": "not_verified",
         "evidence": "EXECUTION-RESULTS-M.json; exact eight clean694794f packages, genuine installed native Both and fresh core receipt; EXECUTION-RESULTS-M-CORE-CORRECTION.json",
-        "residual_uncertainty": "Three exact public core cases now observed against installed694794f; original M receipts unchanged. Optional-worker fault trigger unavailable. Native dispatch0; C8 session/provider evidence and Antigravity MCP scope require diagnosis.",
+        "residual_uncertainty": "Three exact public core cases now observed against installed694794f; original M receipts unchanged. Optional-worker fault trigger unavailable. Native dispatch0: M stopped before task.dispatch at missing public module-supervisor ready proof. Independent Luna review found no C8 post-input deadlock; unknown session/provider evidence is valid pre-input. Supervisor transition cause remains under investigation. Antigravity lacks the documented assigned-session server/tool-schema proof. NATIVE-M-ADMISSION-DIAGNOSTIC.json is private diagnostic evidence, not public qualification.",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
       {
