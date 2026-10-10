@@ -6,36 +6,31 @@
 //! after the Store has durably acknowledged that owner. The executor does not
 //! retry a command when that acknowledgement is missing or uncertain.
 
+mod capture;
 mod status;
 
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
+use capture::{CapturePair, CaptureReceipt, CaptureStream, PollableRead, create_output};
 use serde_json::Value;
 use swarm_contracts::{Error, Result};
-use swarm_process::Group;
+use swarm_process::{Group, MAX_CAPTURE_BYTES_PER_STREAM as PROCESS_CAPTURE_LIMIT};
 
 pub use status::read_check_status;
 
-/// Per-stream disk cap for retained check output. Excess bytes are drained
-/// from the pipe but not written, and the returned stream evidence is truncated.
-pub const MAX_CAPTURE_BYTES_PER_STREAM: u64 = 64 * 1024 * 1024;
+/// Maximum bytes retained per stdout/stderr file. Excess bytes are drained and
+/// counted as observed, while `truncated` reports that the disk cap was hit.
+pub const MAX_CAPTURE_BYTES_PER_STREAM: u64 = PROCESS_CAPTURE_LIMIT;
 const CHECK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LONG_DRAIN_DIAGNOSTIC_AFTER: Duration = Duration::from_secs(30);
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
-const CAPTURE_STOP_GRACE: Duration = Duration::from_millis(250);
 const TERMINATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_TERMINATION_ATTEMPTS: u8 = 3;
 
@@ -167,12 +162,39 @@ pub enum CaptureDisposition {
 #[derive(Debug, Clone)]
 pub struct CapturedStream {
     pub path: PathBuf,
+    /// Exact number of bytes accepted by the output file writer.
     pub bytes_written: u64,
+    /// Exact number of bytes read from the child pipe.
     pub bytes_observed: u64,
+    /// SHA-256 of exactly the `bytes_written` bytes accepted by the file.
+    pub sha256: String,
+    /// True when observed output exceeded the retained file prefix.
     pub truncated: bool,
     pub capture_complete: bool,
     pub capture_disposition: CaptureDisposition,
     pub capture_error: Option<String>,
+}
+
+impl From<CaptureReceipt> for CapturedStream {
+    fn from(receipt: CaptureReceipt) -> Self {
+        let capture_disposition = if !receipt.started {
+            CaptureDisposition::NotStarted
+        } else if receipt.capture_complete {
+            CaptureDisposition::Complete
+        } else {
+            CaptureDisposition::Incomplete
+        };
+        Self {
+            path: receipt.path,
+            bytes_written: receipt.bytes_written,
+            bytes_observed: receipt.bytes_observed,
+            sha256: receipt.sha256,
+            truncated: receipt.truncated,
+            capture_complete: receipt.capture_complete,
+            capture_disposition,
+            capture_error: receipt.capture_error,
+        }
+    }
 }
 
 /// Process-level evidence for the kernel's existing receipt validators. This
@@ -202,23 +224,6 @@ pub struct CheckExecution {
     pub termination_request_unconfirmed: bool,
 }
 
-#[derive(Debug, Default, Clone)]
-struct CaptureStats {
-    bytes: Vec<u8>,
-    bytes_observed: u64,
-    truncated: bool,
-    capture_complete: bool,
-    capture_error: Option<String>,
-}
-
-struct CaptureTask {
-    path: PathBuf,
-    file: File,
-    reader: JoinHandle<()>,
-    stop: Arc<AtomicBool>,
-    stats: Arc<Mutex<CaptureStats>>,
-}
-
 #[derive(Default)]
 struct TerminationState {
     started: Option<Instant>,
@@ -231,23 +236,31 @@ struct TerminationState {
 /// Executes exactly one kernel-resolved command, after the host adapter has
 /// acknowledged the process owner. Uses direct argv (never a shell), a fresh
 /// check-owned process group, bounded stdout/stderr files, and no retries.
-pub fn execute(
+pub fn execute<C: CheckControl>(
     plan: &ResolvedCheckPlan,
-    control: &mut impl CheckControl,
+    control: &mut C,
+    publish_execution: impl FnMut(&CheckExecution, &mut C) -> Result<()>,
 ) -> Result<CheckExecution> {
     let identity = plan.identity.clone();
     let output_directory = plan.output_directory.clone();
-    execute_with_plan(identity, output_directory, control, || Ok(plan.clone()))
+    execute_with_plan(
+        identity,
+        output_directory,
+        control,
+        || Ok(plan.clone()),
+        publish_execution,
+    )
 }
 
 /// Establish the existing CheckRun process owner and wait for Store's durable
 /// go-ahead before resolving execution inputs. `build_plan` runs only after
 /// that handshake and must return the same admitted identity.
-pub fn execute_with_plan(
+pub fn execute_with_plan<C: CheckControl>(
     identity: CheckIdentity,
     output_directory: PathBuf,
-    control: &mut impl CheckControl,
+    control: &mut C,
     build_plan: impl FnOnce() -> Result<ResolvedCheckPlan>,
+    mut publish_execution: impl FnMut(&CheckExecution, &mut C) -> Result<()>,
 ) -> Result<CheckExecution> {
     validate_identity(&identity)?;
 
@@ -266,23 +279,27 @@ pub fn execute_with_plan(
     match start {
         StartDecision::CancelBeforeStart => {
             group.disarm()?;
-            return Ok(not_started(
+            let execution = not_started(
                 &identity,
                 &output_directory,
                 owner,
                 Termination::CancelledBeforeStart,
                 false,
-            ));
+            );
+            publish_execution(&execution, control)?;
+            return Ok(execution);
         }
         StartDecision::StartGateTimedOut => {
             group.disarm()?;
-            return Ok(not_started(
+            let execution = not_started(
                 &identity,
                 &output_directory,
                 owner,
                 Termination::StartGateTimedOut,
                 false,
-            ));
+            );
+            publish_execution(&execution, control)?;
+            return Ok(execution);
         }
         StartDecision::Start => {}
     }
@@ -334,23 +351,27 @@ pub fn execute_with_plan(
         Ok(false) => {}
         Ok(true) => {
             group.disarm()?;
-            return Ok(not_started(
+            let execution = not_started(
                 &plan.identity,
                 &plan.output_directory,
                 owner,
                 Termination::CancelledBeforeStart,
                 false,
-            ));
+            );
+            publish_execution(&execution, control)?;
+            return Ok(execution);
         }
         Err(_) => {
             group.disarm()?;
-            return Ok(not_started(
+            let execution = not_started(
                 &plan.identity,
                 &plan.output_directory,
                 owner,
                 Termination::ControlReadUnknownBeforeStart,
                 true,
-            ));
+            );
+            publish_execution(&execution, control)?;
+            return Ok(execution);
         }
     }
 
@@ -383,26 +404,30 @@ pub fn execute_with_plan(
     };
     let child_pid = Some(child.id());
 
-    let stdout_reader = child.stdout.take().and_then(|pipe| {
-        capture_thread(
-            "swarm-check-stdout",
+    let stdout_capture = child.stdout.take().and_then(|pipe| {
+        CaptureStream::new(
             stdout_path.clone(),
-            pipe,
             stdout_file,
-            plan.output_limit_bytes_per_stream,
-        )
-        .ok()
-    });
-    let stderr_reader = child.stderr.take().and_then(|pipe| {
-        capture_thread(
-            "swarm-check-stderr",
-            stderr_path.clone(),
             pipe,
-            stderr_file,
             plan.output_limit_bytes_per_stream,
         )
         .ok()
     });
+    let stderr_capture = child.stderr.take().and_then(|pipe| {
+        CaptureStream::new(
+            stderr_path.clone(),
+            stderr_file,
+            pipe,
+            plan.output_limit_bytes_per_stream,
+        )
+        .ok()
+    });
+    let mut captures = CapturePair::new(
+        stdout_path.clone(),
+        stdout_capture,
+        stderr_path.clone(),
+        stderr_capture,
+    );
 
     let mut exit_code = None;
     let mut process_observation_unknown = false;
@@ -414,11 +439,15 @@ pub fn execute_with_plan(
     let mut control_diagnostic_published = false;
     let mut last_control_diagnostic_attempt = None;
     let mut termination = TerminationState::default();
-    if stdout_reader.is_none() || stderr_reader.is_none() {
+    if captures.has_setup_failure() {
         request_termination(&group, &mut termination);
     }
 
     loop {
+        captures.poll();
+        if captures.has_reader_failure() && termination.started.is_none() {
+            request_termination(&group, &mut termination);
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_code = status.code();
@@ -495,25 +524,18 @@ pub fn execute_with_plan(
         &mut termination,
         &mut cancel_observed,
         &mut control_read_unknown,
+        &mut captures,
     );
     let resource_released = if matches!(family_departure, FamilyDeparture::Confirmed) {
         group.disarm().is_ok()
     } else {
         false
     };
-    // On Windows this closes the exact Job owner (and may request kill-on-close);
-    // on every platform the serialized identity remains available for readback.
-    drop(group);
-    let (stdout, stderr) = finish_captures_bounded(
-        stdout_reader,
-        stderr_reader,
-        stdout_path,
-        stderr_path,
-        control,
-        &owner,
-        &mut control_read_unknown,
-    );
-
+    let (stdout, stderr) =
+        finish_captures_bounded(captures, control, &owner, &mut control_read_unknown);
+    // Keep the process owner alive until output files have been synced. On
+    // Windows, dropping a pending kill-on-close Job can terminate this worker;
+    // the caller still publishes the final execution receipt after return.
     let termination_reason = if process_observation_unknown {
         Termination::ProcessObservationUnknown
     } else if cancel_observed {
@@ -524,10 +546,10 @@ pub fn execute_with_plan(
         Termination::Exited
     };
 
-    Ok(CheckExecution {
+    let execution = CheckExecution {
         check_id: plan.identity.check_id.clone(),
         operation_id: plan.identity.operation_id.clone(),
-        process: owner.process,
+        process: owner.process.clone(),
         child_pid,
         termination: termination_reason,
         direct_exit: direct_exit.unwrap_or(DirectExit::ObservationUnknown),
@@ -539,19 +561,84 @@ pub fn execute_with_plan(
         resource_released,
         control_read_unknown,
         termination_request_unconfirmed: termination.request_unconfirmed,
-    })
+    };
+    let publication = publish_execution(&execution, control);
+    if publication.is_err()
+        || !publication_release_is_safe(&execution.family_departure, execution.resource_released)
+    {
+        // The caller's worker remains alive (and Store retains its Child) while
+        // this exact Group stays in custody. The callback is never retried.
+        retain_group_until_released(
+            &group,
+            control,
+            &owner,
+            &mut termination,
+            &mut cancel_observed,
+            &mut control_read_unknown,
+        );
+    }
+    publication?;
+    // The receipt was published before this disarmed owner is released.
+    drop(group);
+    Ok(execution)
 }
 
-fn wait_until_empty(
+fn publication_release_is_safe(
+    family_departure: &FamilyDeparture,
+    resource_released: bool,
+) -> bool {
+    matches!(family_departure, FamilyDeparture::Confirmed) && resource_released
+}
+
+fn retain_group_until_released(
     group: &Group,
     control: &mut impl CheckControl,
     owner: &OwnedCheckProcess,
     termination: &mut TerminationState,
     cancel_observed: &mut bool,
     control_read_unknown: &mut bool,
+) {
+    loop {
+        let family_departed = match group.children_empty() {
+            Ok(true) => {
+                if group.disarm().is_ok() {
+                    return;
+                }
+                true
+            }
+            Ok(false) | Err(_) => false,
+        };
+
+        if !family_departed {
+            if termination.started.is_none() {
+                request_termination(group, termination);
+            } else {
+                retry_termination(group, termination);
+            }
+        }
+        if !*control_read_unknown {
+            match control.cancellation_requested(owner) {
+                Ok(true) => *cancel_observed = true,
+                Ok(false) => {}
+                Err(_) => *control_read_unknown = true,
+            }
+        }
+        thread::sleep(CHECK_POLL_INTERVAL);
+    }
+}
+
+fn wait_until_empty<O: PollableRead, E: PollableRead>(
+    group: &Group,
+    control: &mut impl CheckControl,
+    owner: &OwnedCheckProcess,
+    termination: &mut TerminationState,
+    cancel_observed: &mut bool,
+    control_read_unknown: &mut bool,
+    captures: &mut CapturePair<O, E>,
 ) -> FamilyDeparture {
     let drain_started = termination.started.unwrap_or_else(Instant::now);
     loop {
+        captures.poll();
         let last_observation_unknown = match group.children_empty() {
             Ok(true) => return FamilyDeparture::Confirmed,
             Ok(false) => false,
@@ -666,207 +753,29 @@ fn reject_before_command<T>(group: &Group, error: Error) -> Result<T> {
     Err(error)
 }
 
-fn create_output(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|_| {
-            Error::new(
-                "CHECK_OUTPUT_CREATE_FAILED",
-                "could not create check output",
-            )
-        })
-}
-
-fn capture_thread<R: PollableRead + Send + 'static>(
-    name: &str,
-    path: PathBuf,
-    mut reader: R,
-    file: File,
-    limit: u64,
-) -> io::Result<CaptureTask> {
-    reader.make_nonblocking()?;
-    let capacity = usize::try_from(limit)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "capture limit overflow"))?;
-    let stats = Arc::new(Mutex::new(CaptureStats {
-        bytes: Vec::with_capacity(capacity.min(64 * 1024)),
-        ..CaptureStats::default()
-    }));
-    let thread_stats = Arc::clone(&stats);
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let reader = thread::Builder::new().name(name.into()).spawn(move || {
-        let mut buffer = [0u8; 16 * 1024];
-        loop {
-            if thread_stop.load(Ordering::Acquire) {
-                break;
-            }
-            match reader.read_available(&mut buffer) {
-                Ok(PipeRead::Pending) => thread::sleep(CHECK_POLL_INTERVAL),
-                Ok(PipeRead::Eof) => {
-                    capture_stats_lock(&thread_stats).capture_complete = true;
-                    return;
-                }
-                Ok(PipeRead::Data(read)) => {
-                    let mut current = capture_stats_lock(&thread_stats);
-                    current.bytes_observed = current.bytes_observed.saturating_add(read as u64);
-                    let remaining = capacity.saturating_sub(current.bytes.len());
-                    let keep = remaining.min(read);
-                    current.bytes.extend_from_slice(&buffer[..keep]);
-                    if keep < read {
-                        current.truncated = true;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    capture_error(&thread_stats, "capture_read_failed");
-                    return;
-                }
-            }
-        }
-        capture_error(&thread_stats, "capture_drain_timeout");
-    })?;
-    Ok(CaptureTask {
-        path,
-        file,
-        reader,
-        stop,
-        stats,
-    })
-}
-
-fn capture_stats_lock(stats: &Mutex<CaptureStats>) -> std::sync::MutexGuard<'_, CaptureStats> {
-    stats
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn capture_error(stats: &Mutex<CaptureStats>, code: &str) {
-    let mut current = capture_stats_lock(stats);
-    if current.capture_error.is_none() {
-        current.capture_error = Some(code.to_owned());
-    }
-}
-
-fn finish_capture_task(mut task: CaptureTask, drain_grace: Duration) -> CapturedStream {
-    let deadline = Instant::now() + drain_grace;
-    while !task.reader.is_finished() && Instant::now() < deadline {
-        thread::sleep(CHECK_POLL_INTERVAL);
-    }
-    let mut stopped = !task.reader.is_finished();
-    if stopped {
-        task.stop.store(true, Ordering::Release);
-        let stop_deadline = Instant::now() + CAPTURE_STOP_GRACE;
-        while !task.reader.is_finished() && Instant::now() < stop_deadline {
-            thread::sleep(CHECK_POLL_INTERVAL);
-        }
-        stopped = !task.reader.is_finished();
-    }
-    let join_panicked = if task.reader.is_finished() {
-        task.reader.join().is_err()
-    } else {
-        false
-    };
-    let mut stats = if stopped {
-        capture_stats_lock(&task.stats).clone()
-    } else {
-        let mut current = capture_stats_lock(&task.stats);
-        std::mem::take(&mut *current)
-    };
-    if join_panicked && stats.capture_error.is_none() {
-        stats.capture_error = Some("capture_reader_panicked".to_owned());
-    }
-    if stopped && stats.capture_error.is_none() {
-        stats.capture_error = Some("capture_reader_stop_pending".to_owned());
-    }
-    let mut bytes_written = 0u64;
-    while bytes_written < stats.bytes.len() as u64 {
-        let start = usize::try_from(bytes_written).unwrap_or(stats.bytes.len());
-        match task.file.write(&stats.bytes[start..]) {
-            Ok(0) => {
-                if stats.capture_error.is_none() {
-                    stats.capture_error = Some("capture_write_failed".to_owned());
-                }
-                break;
-            }
-            Ok(count) => bytes_written = bytes_written.saturating_add(count as u64),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => {
-                if stats.capture_error.is_none() {
-                    stats.capture_error = Some("capture_write_failed".to_owned());
-                }
-                break;
-            }
-        }
-    }
-    if task.file.sync_all().is_err() && stats.capture_error.is_none() {
-        stats.capture_error = Some("capture_sync_failed".to_owned());
-    }
-    let complete = stats.capture_complete
-        && stats.capture_error.is_none()
-        && !stopped
-        && bytes_written == stats.bytes.len() as u64;
-    CapturedStream {
-        path: task.path,
-        bytes_written,
-        bytes_observed: stats.bytes_observed,
-        truncated: stats.truncated,
-        capture_complete: complete,
-        capture_disposition: if complete {
-            CaptureDisposition::Complete
-        } else {
-            CaptureDisposition::Incomplete
-        },
-        capture_error: stats.capture_error,
-    }
-}
-
-fn capture_setup_failed(path: PathBuf) -> CapturedStream {
-    CapturedStream {
-        path,
-        bytes_written: 0,
-        bytes_observed: 0,
-        truncated: false,
-        capture_complete: false,
-        capture_disposition: CaptureDisposition::Incomplete,
-        capture_error: Some("capture_setup_failed".to_owned()),
-    }
-}
-
-fn finish_captures_bounded(
-    stdout: Option<CaptureTask>,
-    stderr: Option<CaptureTask>,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+fn finish_captures_bounded<O: PollableRead, E: PollableRead>(
+    mut captures: CapturePair<O, E>,
     control: &mut impl CheckControl,
     owner: &OwnedCheckProcess,
     control_read_unknown: &mut bool,
 ) -> (CapturedStream, CapturedStream) {
     let drain_started = Instant::now();
     let deadline = drain_started + CAPTURE_DRAIN_GRACE;
-    while Instant::now() < deadline
-        && (stdout
-            .as_ref()
-            .is_some_and(|task| !task.reader.is_finished())
-            || stderr
-                .as_ref()
-                .is_some_and(|task| !task.reader.is_finished()))
+    while Instant::now() < deadline && (!captures.stdout_finished() || !captures.stderr_finished())
     {
+        let progressed = captures.poll();
         if control
             .cancellation_requested_after_group_empty(owner)
             .is_err()
         {
             *control_read_unknown = true;
         }
-        thread::sleep(CHECK_POLL_INTERVAL);
+        if !progressed {
+            thread::sleep(CHECK_POLL_INTERVAL);
+        }
     }
-    let stdout_pending = stdout
-        .as_ref()
-        .is_some_and(|task| !task.reader.is_finished());
-    let stderr_pending = stderr
-        .as_ref()
-        .is_some_and(|task| !task.reader.is_finished());
+    let stdout_pending = !captures.stdout_finished();
+    let stderr_pending = !captures.stderr_finished();
     if stdout_pending || stderr_pending {
         let _ = control.output_capture_drain_pending(
             owner,
@@ -875,126 +784,8 @@ fn finish_captures_bounded(
             stderr_pending,
         );
     }
-    (
-        stdout.map_or_else(
-            || capture_setup_failed(stdout_path),
-            |task| finish_capture_task(task, Duration::ZERO),
-        ),
-        stderr.map_or_else(
-            || capture_setup_failed(stderr_path),
-            |task| finish_capture_task(task, Duration::ZERO),
-        ),
-    )
-}
-
-trait PollableRead: Read {
-    fn make_nonblocking(&self) -> io::Result<()>;
-    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead>;
-}
-
-enum PipeRead {
-    Data(usize),
-    Pending,
-    Eof,
-}
-
-#[cfg(target_os = "linux")]
-impl<T: Read + std::os::fd::AsRawFd> PollableRead for T {
-    fn make_nonblocking(&self) -> io::Result<()> {
-        const F_GETFL: i32 = 3;
-        const F_SETFL: i32 = 4;
-        const O_NONBLOCK: i32 = 0x800;
-        unsafe extern "C" {
-            fn fcntl(fd: i32, command: i32, ...) -> i32;
-        }
-        // SAFETY: fcntl reads and updates flags on this live pipe descriptor.
-        let flags = unsafe { fcntl(self.as_raw_fd(), F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_SETFL accepts the current flags plus O_NONBLOCK.
-        if unsafe { fcntl(self.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
-        match self.read(buffer) {
-            Ok(0) => Ok(PipeRead::Eof),
-            Ok(read) => Ok(PipeRead::Data(read)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl<T: Read + std::os::windows::io::AsRawHandle> PollableRead for T {
-    fn make_nonblocking(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
-        use std::ffi::c_void;
-        unsafe extern "system" {
-            fn PeekNamedPipe(
-                pipe: *mut c_void,
-                buffer: *mut c_void,
-                buffer_size: u32,
-                bytes_read: *mut u32,
-                total_available: *mut u32,
-                bytes_left: *mut u32,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
-        let mut available = 0u32;
-        // SAFETY: the handle is a live child pipe and output points to local storage.
-        let ok = unsafe {
-            PeekNamedPipe(
-                self.as_raw_handle().cast(),
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let code = unsafe { GetLastError() };
-            if code == 109 {
-                return Ok(PipeRead::Eof);
-            }
-            return Err(io::Error::from_raw_os_error(code as i32));
-        }
-        if available == 0 {
-            return Ok(PipeRead::Pending);
-        }
-        let bound = buffer.len().min(available as usize);
-        match self.read(&mut buffer[..bound]) {
-            Ok(0) => Ok(PipeRead::Eof),
-            Ok(read) => Ok(PipeRead::Data(read)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-impl<T: Read> PollableRead for T {
-    fn make_nonblocking(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "bounded pipe capture is unsupported on this platform",
-        ))
-    }
-
-    fn read_available(&mut self, _buffer: &mut [u8]) -> io::Result<PipeRead> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "bounded pipe capture is unsupported on this platform",
-        ))
-    }
+    let (stdout, stderr) = captures.finish();
+    (stdout.into(), stderr.into())
 }
 
 fn not_started(
@@ -1014,26 +805,41 @@ fn not_started(
         family_departure: FamilyDeparture::Confirmed,
         exit_code: None,
         termination_requests: 0,
-        stdout: CapturedStream {
-            path: output_directory.join("stdout"),
-            bytes_written: 0,
-            bytes_observed: 0,
-            truncated: false,
-            capture_complete: false,
-            capture_disposition: CaptureDisposition::NotStarted,
-            capture_error: Some("capture_not_started".to_owned()),
-        },
-        stderr: CapturedStream {
-            path: output_directory.join("stderr"),
-            bytes_written: 0,
-            bytes_observed: 0,
-            truncated: false,
-            capture_complete: false,
-            capture_disposition: CaptureDisposition::NotStarted,
-            capture_error: Some("capture_not_started".to_owned()),
-        },
+        stdout: CaptureReceipt::not_started(output_directory.join("stdout")).into(),
+        stderr: CaptureReceipt::not_started(output_directory.join("stderr")).into(),
         resource_released: true,
         control_read_unknown,
         termination_request_unconfirmed: false,
+    }
+}
+
+#[cfg(test)]
+mod publication_failure_fault_fixture {
+    use super::*;
+
+    #[test]
+    fn writer_error_requires_confirmed_departure_and_released_resource() {
+        let publication: Result<()> = Err(Error::new("FIXTURE_WRITE_FAILED", "injected"));
+        assert!(publication.is_err());
+        assert!(!publication_release_is_safe(
+            &FamilyDeparture::CleanupPending {
+                process: Value::Null,
+            },
+            false,
+        ));
+        assert!(!publication_release_is_safe(
+            &FamilyDeparture::ObservationUnknown {
+                process: Value::Null,
+            },
+            false,
+        ));
+        assert!(!publication_release_is_safe(
+            &FamilyDeparture::Confirmed,
+            false,
+        ));
+        assert!(publication_release_is_safe(
+            &FamilyDeparture::Confirmed,
+            true
+        ));
     }
 }

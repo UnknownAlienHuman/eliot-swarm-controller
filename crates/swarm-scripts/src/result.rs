@@ -8,6 +8,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Read;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessOutcome<'a> {
@@ -16,6 +17,19 @@ pub struct ProcessOutcome<'a> {
     pub timed_out: bool,
     pub output_overflow: bool,
     pub input_failed: bool,
+}
+
+/// Bounded reader input for projecting the terminal result from retained output.
+pub struct ReaderCompletionInput<'a, R> {
+    pub exit: ProcessExit,
+    pub timed_out: bool,
+    pub output_overflow: bool,
+    pub input_failed: bool,
+    pub stdout: R,
+    pub operation_id: &'a str,
+    pub run_id: &'a str,
+    pub result_schema: &'a ScriptValueSchema,
+    pub granted_effects: &'a [ScriptControllerEffect],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,14 +58,59 @@ pub fn project_completion(
     result_schema: &ScriptValueSchema,
     granted_effects: &[ScriptControllerEffect],
 ) -> Result<Option<CompletionProjection>> {
-    let ProcessExit::Observed { exit_code } = outcome.exit else {
+    project_completion_with_parser(
+        outcome.exit,
+        outcome.timed_out,
+        outcome.output_overflow,
+        outcome.input_failed,
+        || {
+            parse_result(
+                outcome.stdout,
+                operation_id,
+                run_id,
+                result_schema,
+                granted_effects,
+            )
+        },
+    )
+}
+
+/// Projects a ScriptRun result directly from its retained output file without
+/// materializing the raw stdout bytes in memory.
+pub fn project_completion_from_reader<R: Read>(
+    input: ReaderCompletionInput<'_, R>,
+) -> Result<Option<CompletionProjection>> {
+    let ReaderCompletionInput {
+        exit,
+        timed_out,
+        output_overflow,
+        input_failed,
+        stdout,
+        operation_id,
+        run_id,
+        result_schema,
+        granted_effects,
+    } = input;
+    project_completion_with_parser(exit, timed_out, output_overflow, input_failed, || {
+        parse_result_from_reader(stdout, operation_id, run_id, result_schema, granted_effects)
+    })
+}
+
+fn project_completion_with_parser(
+    exit: ProcessExit,
+    timed_out: bool,
+    output_overflow: bool,
+    input_failed: bool,
+    parse: impl FnOnce() -> Result<(Value, Vec<crate::protocol::ScriptEffectRequest>)>,
+) -> Result<Option<CompletionProjection>> {
+    let ProcessExit::Observed { exit_code } = exit else {
         return Ok(None);
     };
-    let mut error_code = if outcome.timed_out {
+    let mut error_code = if timed_out {
         Some("SCRIPT_TIMEOUT")
-    } else if outcome.output_overflow {
+    } else if output_overflow {
         Some("SCRIPT_OUTPUT_LIMIT")
-    } else if outcome.input_failed {
+    } else if input_failed {
         Some("SCRIPT_INPUT_FAILED")
     } else if exit_code != Some(0) {
         Some("SCRIPT_EXIT_NONZERO")
@@ -62,13 +121,7 @@ pub fn project_completion(
     let mut result_value = None;
     let mut controller_effects = Vec::new();
     if error_code.is_none() {
-        match parse_result(
-            outcome.stdout,
-            operation_id,
-            run_id,
-            result_schema,
-            granted_effects,
-        ) {
+        match parse() {
             Ok((result, effects)) => {
                 result_value = Some(result);
                 controller_effects = effects;
@@ -103,6 +156,34 @@ fn parse_result(
     }
     let result: ScriptResult =
         serde_json::from_slice(bytes).map_err(|_| ScriptError::new("SCRIPT_RESULT_INVALID"))?;
+    validate_result(result, operation_id, run_id, result_schema, granted_effects)
+}
+
+fn parse_result_from_reader<R: Read>(
+    reader: R,
+    operation_id: &str,
+    run_id: &str,
+    result_schema: &ScriptValueSchema,
+    granted_effects: &[ScriptControllerEffect],
+) -> Result<(Value, Vec<crate::protocol::ScriptEffectRequest>)> {
+    let maximum_with_probe = MAX_RESULT_BYTES as u64 + 1;
+    let mut bounded = reader.take(maximum_with_probe);
+    let result: ScriptResult = serde_json::from_reader(&mut bounded)
+        .map_err(|_| ScriptError::new("SCRIPT_RESULT_INVALID"))?;
+    let bytes_read = maximum_with_probe - bounded.limit();
+    if bytes_read > MAX_RESULT_BYTES as u64 {
+        return Err(ScriptError::new("SCRIPT_RESULT_INVALID"));
+    }
+    validate_result(result, operation_id, run_id, result_schema, granted_effects)
+}
+
+fn validate_result(
+    result: ScriptResult,
+    operation_id: &str,
+    run_id: &str,
+    result_schema: &ScriptValueSchema,
+    granted_effects: &[ScriptControllerEffect],
+) -> Result<(Value, Vec<crate::protocol::ScriptEffectRequest>)> {
     if result.protocol_version != 1
         || result.operation_id != operation_id
         || result.run_id != run_id

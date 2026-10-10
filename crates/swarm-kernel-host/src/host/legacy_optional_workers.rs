@@ -8,11 +8,16 @@ use crate::{
     error::{Error, Result},
     store::{LegacyWorkerDemand, Store},
 };
-use std::{collections::BTreeMap, process::Stdio, time::Duration};
-use tokio::process::Command;
+use std::{
+    collections::BTreeMap,
+    process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+use tokio::process::{Child, Command};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    sync::watch,
+    sync::{Mutex as AsyncMutex, watch},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
@@ -91,6 +96,7 @@ impl Worker {
 }
 
 struct Slot {
+    worker: Worker,
     task: Option<JoinHandle<Result<()>>>,
     stop: Option<watch::Sender<bool>>,
     stop_deadline: Option<Instant>,
@@ -98,11 +104,13 @@ struct Slot {
     failure_window_started: Instant,
     failures: u32,
     retry_at: Instant,
+    shutdown_custody: ShutdownCustody,
 }
 
 impl Slot {
-    fn new(now: Instant) -> Self {
+    fn new(worker: Worker, now: Instant, shutdown_custody: ShutdownCustody) -> Self {
         Self {
+            worker,
             task: None,
             stop: None,
             stop_deadline: None,
@@ -110,17 +118,39 @@ impl Slot {
             failure_window_started: now,
             failures: 0,
             retry_at: now,
+            shutdown_custody,
         }
     }
 }
 
-pub(super) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Result<()> {
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(join) = self.task.take() {
+            self.shutdown_custody.retain_worker(UnfinishedWorker {
+                worker: self.worker,
+                join,
+                consecutive_failures: self.failures,
+            });
+        }
+    }
+}
+
+pub(super) async fn run(
+    store: Store,
+    mut stopping: watch::Receiver<bool>,
+    shutdown_custody: ShutdownCustody,
+) -> Result<()> {
     let mut changed = store.subscribe_legacy_worker_demand_changes();
     let mut tick = tokio::time::interval(COORDINATOR_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut slots = Worker::ALL
         .into_iter()
-        .map(|worker| (worker, Slot::new(Instant::now())))
+        .map(|worker| {
+            (
+                worker,
+                Slot::new(worker, Instant::now(), shutdown_custody.clone()),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     let result = 'run: loop {
@@ -197,7 +227,13 @@ pub(super) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Re
     let persist_cleanup_status = !result.as_ref().is_err_and(|error| {
         is_store_or_kernel_failure(error) || error.code == "LEGACY_WORKER_SHUTDOWN_UNKNOWN"
     });
-    let cleanup = stop_all(&store, &mut slots, persist_cleanup_status).await;
+    let cleanup = stop_all(
+        &store,
+        &mut slots,
+        persist_cleanup_status,
+        &shutdown_custody,
+    )
+    .await;
     match (result, cleanup) {
         (Err(error), Err(cleanup_error)) => {
             if is_store_or_kernel_failure(&cleanup_error) && !is_store_or_kernel_failure(&error) {
@@ -228,10 +264,7 @@ async fn start_worker(store: &Store, worker: Worker, slot: &mut Slot) -> Result<
 
 async fn run_worker(worker: Worker, store: Store, stopping: watch::Receiver<bool>) -> Result<()> {
     match worker {
-        Worker::Checks => {
-            store.supervise_checks(stopping).await;
-            Ok(())
-        }
+        Worker::Checks => store.supervise_checks(stopping).await,
         Worker::Scripts => store.supervise_scripts(stopping).await,
         Worker::OpenCode => store.supervise_opencode(stopping).await,
         Worker::Zed => {
@@ -542,18 +575,27 @@ async fn stop_worker(store: &Store, worker: Worker, slot: &mut Slot) -> Result<(
         .expect("a requested worker stop has one bounded deadline");
     if !slot.shutdown_unconfirmed && Instant::now() >= deadline {
         slot.shutdown_unconfirmed = true;
+        let error_code = worker_shutdown_error_code(store, worker).await;
         record_bounded_shutdown_status(
             store,
             worker,
             "isolated",
             slot.failures,
-            Some(WORKER_SHUTDOWN_UNCONFIRMED.to_owned()),
+            Some(error_code.to_owned()),
             Some(ISOLATED_RETRY.as_millis() as u64),
             Instant::now() + WORKER_SHUTDOWN_STATUS_BUDGET,
         )
         .await?;
     }
     Ok(())
+}
+
+async fn worker_shutdown_error_code(store: &Store, worker: Worker) -> &'static str {
+    if worker == Worker::Checks && store.check_child_custody_count().await > 0 {
+        "CHECK_CUSTODY_CLEANUP_PENDING"
+    } else {
+        WORKER_SHUTDOWN_UNCONFIRMED
+    }
 }
 
 /// Persist worker-local errors before restarting. A Store error cannot be
@@ -607,6 +649,400 @@ struct UnfinishedWorker {
     consecutive_failures: u32,
 }
 
+struct PendingWorkerState {
+    join: Option<JoinHandle<Result<()>>>,
+    completion: Option<WorkerCompletion>,
+}
+
+#[derive(Clone)]
+enum WorkerCompletion {
+    Returned(Result<()>),
+    Panicked,
+}
+
+struct PendingWorker {
+    worker: Worker,
+    consecutive_failures: u32,
+    state: AsyncMutex<PendingWorkerState>,
+    status_recorded: std::sync::atomic::AtomicBool,
+}
+
+struct PendingSupervisorReaper {
+    task: AsyncMutex<Option<JoinHandle<Result<()>>>>,
+}
+
+impl PendingSupervisorReaper {
+    async fn join(&self) -> Result<()> {
+        let mut task = self.task.lock().await;
+        let Some(join) = task.as_mut() else {
+            return Ok(());
+        };
+        let result = join.await;
+        let _ = task.take();
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(Error::new(
+                "MODULE_SUPERVISOR_CHILD_REAPER_FAILED",
+                "module supervisor child custody task did not complete",
+            )),
+        }
+    }
+}
+
+impl PendingWorker {
+    fn new(worker: UnfinishedWorker) -> Self {
+        Self {
+            worker: worker.worker,
+            consecutive_failures: worker.consecutive_failures,
+            state: AsyncMutex::new(PendingWorkerState {
+                join: Some(worker.join),
+                completion: None,
+            }),
+            status_recorded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn completion(&self) -> WorkerCompletion {
+        let mut state = self.state.lock().await;
+        if state.completion.is_none() {
+            let joined = match state.join.as_mut() {
+                Some(join) => Some(join.await),
+                None => None,
+            };
+            let _ = state.join.take();
+            state.completion = Some(match joined {
+                Some(Ok(result)) => WorkerCompletion::Returned(result),
+                Some(Err(_)) | None => WorkerCompletion::Panicked,
+            });
+        }
+        state
+            .completion
+            .as_ref()
+            .expect("worker completion was retained after join")
+            .clone()
+    }
+}
+
+struct ShutdownCustodyState {
+    workers: Vec<Arc<PendingWorker>>,
+    supervisor_reapers: Vec<Arc<PendingSupervisorReaper>>,
+    direct_supervisor_children: Vec<Arc<AsyncMutex<Option<Child>>>>,
+    first_error: Option<Error>,
+    persist_completion_status: bool,
+    check_custody_recovery: Option<u32>,
+    check_status_recorded: bool,
+}
+
+/// Host-owned joins, supervisor Child custody, and Store ownership for work
+/// that outlives a coordinator's bounded stop grace. The host drains this guard
+/// before closing Store or returning control to the runtime owner.
+#[derive(Clone)]
+pub(crate) struct ShutdownCustody {
+    store: Store,
+    state: Arc<StdMutex<ShutdownCustodyState>>,
+}
+
+impl ShutdownCustody {
+    pub(crate) fn new(store: Store) -> Self {
+        Self {
+            store,
+            state: Arc::new(StdMutex::new(ShutdownCustodyState {
+                workers: Vec::new(),
+                supervisor_reapers: Vec::new(),
+                direct_supervisor_children: Vec::new(),
+                first_error: None,
+                persist_completion_status: true,
+                check_custody_recovery: None,
+                check_status_recorded: false,
+            })),
+        }
+    }
+
+    fn retain_worker(&self, worker: UnfinishedWorker) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .push(Arc::new(PendingWorker::new(worker)));
+    }
+
+    fn retain_workers(&self, workers: Vec<UnfinishedWorker>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.workers.extend(
+            workers
+                .into_iter()
+                .map(|worker| Arc::new(PendingWorker::new(worker))),
+        );
+    }
+
+    pub(crate) fn register_supervisor_reaper(&self, task: JoinHandle<Result<()>>) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .supervisor_reapers
+            .push(Arc::new(PendingSupervisorReaper {
+                task: AsyncMutex::new(Some(task)),
+            }));
+    }
+
+    pub(crate) fn retain_supervisor_child_without_runtime(&self, child: Child) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .direct_supervisor_children
+            .push(Arc::new(AsyncMutex::new(Some(child))));
+    }
+
+    fn allow_completion_status(&self, allowed: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_completion_status = allowed;
+    }
+
+    fn retain_check_recovery(&self, pending: bool, failures: u32) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.check_custody_recovery = pending.then_some(failures);
+    }
+
+    fn remember_error(&self, error: Error) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_log = state.first_error.as_ref().is_none_or(|first| {
+            first.code != error.code && !first.secondary_codes.contains(&error.code)
+        });
+        if should_log {
+            eprintln!("legacy worker shutdown custody: {error}");
+        }
+        if let Some(first) = state.first_error.take() {
+            state.first_error = Some(first.with_secondary_error(error));
+        } else {
+            state.first_error = Some(error);
+        }
+    }
+
+    fn disable_completion_status(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_completion_status = false;
+    }
+
+    async fn drain_check_children(&self) {
+        loop {
+            if self.store.check_child_custody_count().await == 0 {
+                return;
+            }
+            // A pre-signaled receiver asks the existing CheckRun supervisor to
+            // reconcile retained ownership without admitting a new run.
+            let (_stop, stopping) = watch::channel(true);
+            if let Err(error) = self.store.clone().supervise_checks(stopping).await {
+                self.remember_error(error);
+            }
+            if self.store.check_child_custody_count().await > 0 {
+                tokio::time::sleep(COORDINATOR_TICK).await;
+            }
+        }
+    }
+
+    async fn drain_script_children(&self) {
+        loop {
+            // In shutdown mode supervise_scripts only polls the retained
+            // ScriptRun direct child and exact family; it returns once empty.
+            let (_stop, stopping) = watch::channel(true);
+            if let Err(error) = self.store.clone().supervise_scripts(stopping).await {
+                self.remember_error(error);
+                tokio::time::sleep(COORDINATOR_TICK).await;
+            } else {
+                return;
+            }
+        }
+    }
+
+    async fn drain_supervisor_reapers(&self, reapers: Vec<Arc<PendingSupervisorReaper>>) {
+        for reaper in reapers {
+            if let Err(error) = reaper.join().await {
+                self.remember_error(error);
+            }
+        }
+    }
+
+    async fn drain_direct_supervisor_children(
+        &self,
+        children: Vec<Arc<AsyncMutex<Option<Child>>>>,
+    ) {
+        for retained in children {
+            let mut child = retained.lock().await;
+            let mut wait_error_reported = false;
+            while let Some(owned) = child.as_mut() {
+                match owned.wait().await {
+                    Ok(_) => {
+                        let _ = child.take();
+                    }
+                    Err(error) => {
+                        if !wait_error_reported {
+                            self.remember_error(error.into());
+                            wait_error_reported = true;
+                        }
+                        tokio::time::sleep(COORDINATOR_TICK).await;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn drain(&self) -> Result<()> {
+        let (workers, supervisor_reapers, direct_supervisor_children) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.workers.clone(),
+                state.supervisor_reapers.clone(),
+                state.direct_supervisor_children.clone(),
+            )
+        };
+        for worker in &workers {
+            if let WorkerCompletion::Returned(Err(error)) = worker.completion().await
+                && is_store_or_kernel_failure(&error)
+            {
+                self.disable_completion_status();
+                self.remember_error(error);
+            }
+        }
+
+        // Both maps are drained even when a worker task already returned or
+        // panicked. Store remains open, and these recovery-only loops own the
+        // final observation of each actual child/family.
+        tokio::join!(
+            self.drain_check_children(),
+            self.drain_script_children(),
+            self.drain_supervisor_reapers(supervisor_reapers),
+            self.drain_direct_supervisor_children(direct_supervisor_children),
+        );
+
+        let persist_status = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_completion_status;
+        if persist_status {
+            for worker in &workers {
+                let persist_status = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .persist_completion_status;
+                if !persist_status {
+                    worker
+                        .status_recorded
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    continue;
+                }
+                if worker
+                    .status_recorded
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    continue;
+                }
+                let update = match worker.completion().await {
+                    WorkerCompletion::Returned(Ok(())) => {
+                        Some(("dormant", worker.consecutive_failures, None, None))
+                    }
+                    WorkerCompletion::Returned(Err(error))
+                        if is_store_or_kernel_failure(&error) =>
+                    {
+                        None
+                    }
+                    WorkerCompletion::Returned(Err(error)) => Some((
+                        "isolated",
+                        worker.consecutive_failures.saturating_add(1).min(32),
+                        Some(safe_code(&error.code)),
+                        Some(ISOLATED_RETRY.as_millis() as u64),
+                    )),
+                    WorkerCompletion::Panicked => Some((
+                        "isolated",
+                        worker.consecutive_failures.saturating_add(1).min(32),
+                        Some("SUPERVISOR_PANIC".to_owned()),
+                        Some(ISOLATED_RETRY.as_millis() as u64),
+                    )),
+                };
+                if let Some((state, failures, error_code, retry_in_ms)) = update
+                    && let Err(error) = record_bounded_shutdown_status(
+                        &self.store,
+                        worker.worker,
+                        state,
+                        failures,
+                        error_code,
+                        retry_in_ms,
+                        Instant::now() + WORKER_SHUTDOWN_STATUS_BUDGET,
+                    )
+                    .await
+                {
+                    self.disable_completion_status();
+                    self.remember_error(error);
+                }
+                worker
+                    .status_recorded
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+
+            let (check_recovery, persist_check_status) = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    state.check_custody_recovery,
+                    state.persist_completion_status && !state.check_status_recorded,
+                )
+            };
+            if let Some(failures) = check_recovery
+                && persist_check_status
+            {
+                if let Err(error) = record_bounded_shutdown_status(
+                    &self.store,
+                    Worker::Checks,
+                    "dormant",
+                    failures,
+                    None,
+                    None,
+                    Instant::now() + WORKER_SHUTDOWN_STATUS_BUDGET,
+                )
+                .await
+                {
+                    self.disable_completion_status();
+                    self.remember_error(error);
+                }
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .check_status_recorded = true;
+            }
+        }
+
+        let error = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_error
+            .clone();
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 async fn record_bounded_shutdown_status(
     store: &Store,
     worker: Worker,
@@ -634,6 +1070,7 @@ async fn stop_all(
     store: &Store,
     slots: &mut BTreeMap<Worker, Slot>,
     persist_status: bool,
+    shutdown_custody: &ShutdownCustody,
 ) -> Result<()> {
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     let mut fatal = None;
@@ -670,6 +1107,7 @@ async fn stop_all(
             let _ = slot.stop.take();
             slot.stop_deadline = None;
             slot.shutdown_unconfirmed = true;
+            let error_code = worker_shutdown_error_code(store, worker).await;
             unfinished_workers.push(UnfinishedWorker {
                 worker,
                 join,
@@ -679,7 +1117,7 @@ async fn stop_all(
                 worker,
                 "isolated",
                 slot.failures,
-                Some(WORKER_SHUTDOWN_UNCONFIRMED.to_owned()),
+                Some(error_code.to_owned()),
                 Some(ISOLATED_RETRY.as_millis() as u64),
             ));
             continue;
@@ -725,12 +1163,27 @@ async fn stop_all(
             }
         }
     }
-    // Establish in-process join custody before any Store status await. The
-    // reaper waits for the gate so a late initial status write cannot overwrite
-    // a completion status written out of order.
+    // Establish host-owned join custody before any Store status await. Host
+    // finalization joins these tasks and recovers both child maps before Store
+    // close; no detached Tokio reaper owns the only live handle.
     let has_unfinished = !unfinished_workers.is_empty();
-    let completion_gate = retain_unfinished_worker_custody(store.clone(), unfinished_workers);
-
+    let check_failures = slots.get(&Worker::Checks).map_or(0, |slot| slot.failures);
+    let check_child_custody_pending = store.check_child_custody_count().await > 0;
+    shutdown_custody.retain_workers(unfinished_workers);
+    shutdown_custody.retain_check_recovery(check_child_custody_pending, check_failures);
+    if check_child_custody_pending
+        && !updates
+            .iter()
+            .any(|(worker, _, _, _, _)| *worker == Worker::Checks)
+    {
+        updates.push((
+            Worker::Checks,
+            "isolated",
+            check_failures,
+            Some("CHECK_CUSTODY_CLEANUP_PENDING".to_owned()),
+            Some(ISOLATED_RETRY.as_millis() as u64),
+        ));
+    }
     // A Store/journal fault is irreducible here. Do not issue cleanup status
     // writes that can obscure the first core failure with a secondary error.
     let mut status_error = None;
@@ -761,14 +1214,9 @@ async fn stop_all(
             }
         }
     }
-    if let Some(gate) = completion_gate {
-        let _ = gate.send(
-            persist_status
-                && !persistence_unavailable
-                && status_error.is_none()
-                && !status_timed_out,
-        );
-    }
+    shutdown_custody.allow_completion_status(
+        persist_status && !persistence_unavailable && status_error.is_none() && !status_timed_out,
+    );
     if let Some(error) = fatal {
         if let Some(status_error) = status_error {
             eprintln!("legacy worker shutdown status: {}", status_error.code);
@@ -787,6 +1235,12 @@ async fn stop_all(
             "worker shutdown status is unknown; an already queued Store write may still complete",
         ));
     }
+    if store.check_child_custody_count().await > 0 {
+        return Err(Error::new(
+            "CHECK_CUSTODY_CLEANUP_PENDING",
+            "an owned CheckRun child remains under Store custody until departure evidence is retained",
+        ));
+    }
     if has_unfinished {
         return Err(Error::new(
             "LEGACY_WORKER_SHUTDOWN_UNKNOWN",
@@ -794,73 +1248,6 @@ async fn stop_all(
         ));
     }
     Ok(())
-}
-
-/// Keep unfinished worker joins under an in-process reaper after the
-/// coordinator's common deadline. Join custody lasts only while the Tokio
-/// runtime remains alive; it is not durable across runtime shutdown. This
-/// never aborts a worker or native descendant, and independent durable native
-/// owner receipts remain untouched. Completion writes wait until the initial
-/// shutdown status writes are known to have finished.
-fn retain_unfinished_worker_custody(
-    store: Store,
-    unfinished: Vec<UnfinishedWorker>,
-) -> Option<tokio::sync::oneshot::Sender<bool>> {
-    if unfinished.is_empty() {
-        return None;
-    }
-    let (release_completion_status, completion_status_gate) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut persist_completion = completion_status_gate.await.unwrap_or(false);
-        for worker in unfinished {
-            let UnfinishedWorker {
-                worker: name,
-                join,
-                consecutive_failures,
-            } = worker;
-            let update = match join.await {
-                Ok(Ok(())) => Some(("dormant", consecutive_failures, None, None)),
-                Ok(Err(error)) if is_store_or_kernel_failure(&error) => {
-                    eprintln!("legacy worker custody {}: {}", name.name(), error.code);
-                    persist_completion = false;
-                    None
-                }
-                Ok(Err(error)) => Some((
-                    "isolated",
-                    consecutive_failures.saturating_add(1).min(32),
-                    Some(safe_code(&error.code)),
-                    Some(ISOLATED_RETRY.as_millis() as u64),
-                )),
-                Err(_) => Some((
-                    "isolated",
-                    consecutive_failures.saturating_add(1).min(32),
-                    Some("SUPERVISOR_PANIC".to_owned()),
-                    Some(ISOLATED_RETRY.as_millis() as u64),
-                )),
-            };
-            if persist_completion
-                && let Some((state, failures, error_code, retry_in_ms)) = update
-                && let Err(error) = record_bounded_shutdown_status(
-                    &store,
-                    name,
-                    state,
-                    failures,
-                    error_code,
-                    retry_in_ms,
-                    Instant::now() + WORKER_SHUTDOWN_STATUS_BUDGET,
-                )
-                .await
-            {
-                eprintln!(
-                    "legacy worker custody status {}: {}",
-                    name.name(),
-                    error.code
-                );
-                persist_completion = false;
-            }
-        }
-    });
-    Some(release_completion_status)
 }
 
 fn is_store_or_kernel_failure(error: &Error) -> bool {
@@ -1009,10 +1396,10 @@ mod tests {
         dropped_early: Arc<AtomicBool>,
     }
 
-    fn empty_slots() -> BTreeMap<Worker, Slot> {
+    fn empty_slots(custody: &ShutdownCustody) -> BTreeMap<Worker, Slot> {
         Worker::ALL
             .into_iter()
-            .map(|worker| (worker, Slot::new(Instant::now())))
+            .map(|worker| (worker, Slot::new(worker, Instant::now(), custody.clone())))
             .collect()
     }
 
@@ -1210,10 +1597,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_all_shares_deadline_and_reaper_keeps_worker_and_native_child_until_late_completion()
-     {
+    async fn host_owned_joinable_custody_keeps_check_and_script_workers_until_late_completion() {
         let fixture = Fixture::new().await;
-        let mut slots = empty_slots();
+        let host_custody = ShutdownCustody::new(fixture.owner.store.clone());
+        let coordinator_custody = host_custody.clone();
+        let mut slots = empty_slots(&coordinator_custody);
         for worker in [Worker::Checks, Worker::Scripts] {
             set_worker_status(&fixture, worker, "running", None, None).await;
         }
@@ -1224,7 +1612,7 @@ mod tests {
         let script = install_controlled_worker(&mut slots, Worker::Scripts);
 
         let started = Instant::now();
-        let error = stop_all(&fixture.owner.store, &mut slots, true)
+        let error = stop_all(&fixture.owner.store, &mut slots, true, &coordinator_custody)
             .await
             .expect_err("unfinished workers remain under shutdown custody");
         let elapsed = started.elapsed();
@@ -1256,6 +1644,19 @@ mod tests {
         assert!(!native.dropped_early.load(Ordering::SeqCst));
         assert!(!script.dropped_early.load(Ordering::SeqCst));
 
+        // The coordinator and its slots can go away; the host-owned guard
+        // still has the joinable Check and Script worker handles. Its drain
+        // remains pending until both actual worker-owned child lifetimes end.
+        drop(slots);
+        drop(coordinator_custody);
+        let drain_custody = host_custody.clone();
+        let drain = tokio::spawn(async move { drain_custody.drain().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain.is_finished(),
+            "host drain returned while children were held"
+        );
+
         let timed_out_status = fixture.status().await;
         let optional_workers = Fixture::optional_workers(&timed_out_status);
         for worker in [Worker::Checks, Worker::Scripts] {
@@ -1282,6 +1683,10 @@ mod tests {
             .completed
             .await
             .expect("script worker completed after release");
+        drain
+            .await
+            .expect("host custody drain task joined")
+            .expect("host custody drained CheckRun and ScriptRun workers");
         let late_status = fixture
             .wait_for_states(&[(Worker::Checks, "dormant"), (Worker::Scripts, "dormant")])
             .await;
@@ -1317,9 +1722,10 @@ mod tests {
             )
             .expect("hold the SQLite writer lock after installing audit trigger");
 
-        let mut slots = empty_slots();
+        let custody = ShutdownCustody::new(fixture.owner.store.clone());
+        let mut slots = empty_slots(&custody);
         let worker = install_controlled_worker(&mut slots, Worker::Checks);
-        let error = stop_all(&fixture.owner.store, &mut slots, true)
+        let error = stop_all(&fixture.owner.store, &mut slots, true, &custody)
             .await
             .expect_err("status persistence exceeds its budget behind the writer lock");
         assert_eq!(error.code, "LEGACY_WORKER_SHUTDOWN_UNKNOWN");
@@ -1346,6 +1752,10 @@ mod tests {
             .legacy_worker_demand_snapshot()
             .await
             .expect("drain the Store job queued behind the timed-out status caller");
+        custody
+            .drain()
+            .await
+            .expect("host custody joins completed worker without late status overwrite");
         let late_status = fixture
             .wait_for_states(&[(Worker::Checks, "isolated")])
             .await;
@@ -1384,9 +1794,9 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'injected worker status rejection'); END;",
             )
             .expect("install Store status rejection trigger");
-        let mut rejected_slots = empty_slots();
+        let mut rejected_slots = empty_slots(&custody);
         install_stop_responsive_worker(&mut rejected_slots, Worker::Checks);
-        let rejected = stop_all(&fixture.owner.store, &mut rejected_slots, true)
+        let rejected = stop_all(&fixture.owner.store, &mut rejected_slots, true, &custody)
             .await
             .expect_err("a rejected Store status write stays a hard failure");
         assert!(
@@ -1405,6 +1815,10 @@ mod tests {
         );
         let _ = blocker.execute_batch("COMMIT;");
         drop(blocker);
+        custody
+            .drain()
+            .await
+            .expect("host custody has no remaining child after rejected status");
         fixture.close().await;
     }
 

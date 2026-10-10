@@ -4,6 +4,7 @@
 //! or claim to sandbox same-user processes. Callers retain their own admission
 //! and recovery policy and persist the returned owner identity as-is.
 
+pub mod capture;
 pub mod child_error;
 pub mod dependency_closure;
 pub mod jsonl;
@@ -13,6 +14,10 @@ mod permissions;
 pub mod process_group;
 mod state_marker;
 
+pub use capture::{
+    CapturePair, CaptureReceipt, CaptureStream, MAX_CAPTURE_BYTES_PER_STREAM, PipeRead, PipeWrite,
+    PollableRead, PollableWrite, create_output,
+};
 pub use jsonl::{JsonlDamage, JsonlScanVerdict, scan_jsonl};
 pub use module_membership::module_child_belongs_to_owner;
 pub use permissions::{

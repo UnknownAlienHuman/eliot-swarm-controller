@@ -144,6 +144,8 @@ pub struct Store {
     artifacts: ArtifactFiles,
     artifact_io: Arc<Semaphore>,
     data_dir: std::path::PathBuf,
+    check_child_custody: checks::CheckChildCustody,
+    script_child_custody: crate::scripts::runner::ScriptChildCustody,
     automation_scheduler_owner_token: Option<Arc<String>>,
     launch_issuance: Arc<launcher_issuance::IssuanceRuntime>,
     telemetry: swarm_telemetry::Producer,
@@ -417,6 +419,8 @@ impl StoreOwner {
             changed: watch::channel(0).0,
             artifacts,
             data_dir: data_dir.clone(),
+            check_child_custody: checks::CheckChildCustody::default(),
+            script_child_custody: crate::scripts::runner::ScriptChildCustody::default(),
             automation_scheduler_owner_token: scheduler_owner_token.clone().map(Arc::new),
             launch_issuance: Arc::new(launcher_issuance::IssuanceRuntime::new()),
             artifact_io: Arc::new(Semaphore::new(4)),
@@ -2243,9 +2247,34 @@ impl Store {
                     .get("observation")
                     .cloned()
                     .ok_or_else(|| Error::invalid("observation is required"))?;
-                self.record_module_supervisor_observation(observation)
+                let rejection_scope = json!({
+                    "module_id":observation["module_id"],
+                    "binding_id":observation["scope"]["binding_id"],
+                    "generation":observation["scope"]["generation"],
+                    "actor_instance_id":observation["actor_instance_id"],
+                    "event_id":observation["event_id"],
+                    "boot_id":observation["boot_id"],
+                });
+                let disposition = self
+                    .record_module_supervisor_observation(observation)
                     .await?;
-                Ok(json!({"recorded":true}))
+                Ok(match disposition {
+                    module_supervisor_observation::ObservationDisposition::Committed => {
+                        json!({"disposition":"committed"})
+                    }
+                    module_supervisor_observation::ObservationDisposition::ExactDuplicate => {
+                        json!({"disposition":"exact_duplicate"})
+                    }
+                    module_supervisor_observation::ObservationDisposition::ScopedPermanentRejection {
+                        error_code,
+                    } => {
+                        let mut reply = rejection_scope;
+                        reply["disposition"] = json!("scoped_permanent_rejection");
+                        reply["error_code"] = json!(error_code);
+                        reply["retained"] = json!(true);
+                        reply
+                    }
+                })
             }
             "module.supervisor.health.record" => {
                 model::fields(

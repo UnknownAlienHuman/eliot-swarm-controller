@@ -25,7 +25,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
 };
 use swarm_checks::{CheckIdentity, MAX_CAPTURE_BYTES_PER_STREAM, ResolvedCheckPlan};
 
@@ -144,7 +143,10 @@ enum TerminationKind {
     ProcessObservationUnknown,
 }
 
-pub(crate) fn prepare_and_spawn(work: &Work, pin: &ExecutorPin) -> Result<Value> {
+pub(crate) fn prepare_and_spawn(
+    work: &Work,
+    pin: &ExecutorPin,
+) -> Result<(Result<Value>, std::process::Child)> {
     let executor = verify_executor(pin)?;
     let directory = check_directory(work, true)?;
     let data_dir = fs::canonicalize(&work.data_dir)?;
@@ -179,127 +181,55 @@ pub(crate) fn prepare_and_spawn(work: &Work, pin: &ExecutorPin) -> Result<Value>
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = command.spawn().map_err(|_| {
+    let child = command.spawn().map_err(|_| {
         Error::new(
             "CHECK_EXECUTOR_START_FAILED",
             "could not start the configured standalone checks executor",
         )
     })?;
     let pid = child.id();
-    let process = match spawned_identity(pid) {
-        Ok(process) => process,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Error::new(
+    // The caller keeps this child while checking and persisting the exact
+    // post-spawn identity. Failures after spawn remain paired with that child
+    // so the supervisor can retain or report cleanup-pending custody.
+    let launch = (|| -> Result<Value> {
+        let process = spawned_identity(pid).map_err(|error| {
+            Error::new(
                 "CHECK_LAUNCH_UNKNOWN",
                 format!("checks executor started without a recordable launch identity: {error}"),
-            ));
-        }
-    };
-    let image = match process_image_identity(pid) {
-        Ok(image) => image,
-        Err(_) => {
-            let killed = child.kill().is_ok();
-            let reaped = child.wait().is_ok();
-            return Err(if killed && reaped {
-                Error::new(
-                    "CHECK_EXECUTOR_MISMATCH",
-                    "checks executor image could not be verified before Store Go",
-                )
-            } else {
-                Error::new(
-                    "CHECK_LAUNCH_UNKNOWN",
-                    "checks executor image verification failed and its process may remain active",
-                )
-            });
-        }
-    };
-    let image_path = match canonical_path_text(&image["image_path"]) {
-        Ok(path) => path,
-        Err(_) => {
-            let killed = child.kill().is_ok();
-            let reaped = child.wait().is_ok();
-            return Err(if killed && reaped {
-                Error::new(
-                    "CHECK_EXECUTOR_MISMATCH",
-                    "the running checks executor image could not be verified",
-                )
-            } else {
-                Error::new(
-                    "CHECK_LAUNCH_UNKNOWN",
-                    "the checks executor image could not be verified and its process may remain active",
-                )
-            });
-        }
-    };
-    if image["image_sha256"].as_str() != Some(executor.sha256.as_str())
-        || image_path != path_text(&executor.executable)?
-    {
-        let killed = child.kill().is_ok();
-        let reaped = child.wait().is_ok();
-        return Err(if killed && reaped {
+            )
+        })?;
+        let image = process_image_identity(pid).map_err(|_| {
             Error::new(
                 "CHECK_EXECUTOR_MISMATCH",
-                "the running checks executor differs from the configured artifact pin",
+                "checks executor image could not be verified before Store Go",
             )
-        } else {
+        })?;
+        let image_path = canonical_path_text(&image["image_path"]).map_err(|_| {
             Error::new(
-                "CHECK_LAUNCH_UNKNOWN",
-                "the checks executor image differed and its process could not be confirmed stopped",
+                "CHECK_EXECUTOR_MISMATCH",
+                "the running checks executor image could not be verified",
             )
-        });
-    }
-    let launched_at = match now_ms() {
-        Ok(value) => value,
-        Err(error) => {
-            let killed = child.kill().is_ok();
-            let reaped = child.wait().is_ok();
-            return Err(if killed && reaped {
-                error
-            } else {
-                Error::new(
-                    "CHECK_LAUNCH_UNKNOWN",
-                    "the checks executor started but its launch receipt could not be timestamped or stopped",
-                )
-            });
-        }
-    };
-    let launch = json!({
-        "spawned_at_ms": launched_at,
-        "process": process,
-        "executor": {
-            "artifact_id": executor.artifact_id,
-            "version": executor.version,
-            "sha256": executor.sha256,
-            "image": image
-        }
-    });
-    let child_slot = Arc::new(Mutex::new(Some(child)));
-    let reaper_slot = Arc::clone(&child_slot);
-    if std::thread::Builder::new()
-        .name("checks-executor-reaper".into())
-        .spawn(move || {
-            if let Ok(mut child) = reaper_slot.lock()
-                && let Some(mut child) = child.take()
-            {
-                let _ = child.wait();
-            }
-        })
-        .is_err()
-    {
-        if let Ok(mut child) = child_slot.lock()
-            && let Some(mut child) = child.take()
+        })?;
+        if image["image_sha256"].as_str() != Some(executor.sha256.as_str())
+            || image_path != path_text(&executor.executable)?
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            return Err(Error::new(
+                "CHECK_EXECUTOR_MISMATCH",
+                "the running checks executor differs from the configured artifact pin",
+            ));
         }
-        return Err(Error::new(
-            "CHECK_LAUNCH_UNKNOWN",
-            "checks executor reaper was unavailable before Store Go",
-        ));
-    }
-    Ok(launch)
+        Ok(json!({
+            "spawned_at_ms": now_ms()?,
+            "process": process,
+            "executor": {
+                "artifact_id": executor.artifact_id,
+                "version": executor.version,
+                "sha256": executor.sha256,
+                "image": image
+            }
+        }))
+    })();
+    Ok((launch, child))
 }
 
 /// Called only after the existing Store ready transaction succeeded and the
@@ -570,6 +500,7 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
             if completion.process_facts.as_ref()
                 != Some(&execution_process_facts(&receipt.execution))
                 || completion.exit_code != receipt.execution.exit_code
+                || (completion.state == "passed" && !direct_exit_observed(&receipt.execution))
             {
                 return Err(Error::conflict(
                     "retained completion differs from the standalone execution receipt",
@@ -758,6 +689,12 @@ fn build_completion(
                 "the executor returned no command process for this admitted CheckRun",
             ));
         }
+        if !direct_exit_observed(&evidence) {
+            return Err(Error::new(
+                "CHECK_PROCESS_OBSERVATION_UNKNOWN",
+                "the command has no observed direct exit with a matching exit code",
+            ));
+        }
 
         let verified = source::verified_content(files, &work.data_dir, &work.candidate)?;
         let data_root = fs::canonicalize(&work.data_dir)?;
@@ -836,7 +773,9 @@ fn build_completion(
         coverage_gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
         coverage_gaps.dedup();
     }
-    let state = if !evidence.resource_released {
+    let state = if !evidence.resource_released
+        || (evidence.child_pid.is_some() && !direct_exit_observed(&evidence))
+    {
         "incomplete"
     } else if cancellation_applied {
         "cancelled"
@@ -939,6 +878,12 @@ fn build_completion(
     worker::write_once(&directory.join("terminal.json"), &json!(completion))?;
     worker::write_once(&directory.join("completion.json"), &json!(completion))?;
     Ok(completion)
+}
+
+fn direct_exit_observed(execution: &ExecutionEvidence) -> bool {
+    execution.child_pid.is_some()
+        && execution.direct_exit.state == "observed"
+        && execution.direct_exit.exit_code == execution.exit_code
 }
 
 fn execution_process_facts(execution: &ExecutionEvidence) -> Value {
@@ -1092,9 +1037,7 @@ fn validate_execution_receipt(
     };
     let valid_direct_exit = match execution.direct_exit.state.as_str() {
         "not_started" => execution.child_pid.is_none(),
-        "observed" => {
-            execution.child_pid.is_some() && execution.direct_exit.exit_code == execution.exit_code
-        }
+        "observed" => direct_exit_observed(execution),
         "observation_unknown" => execution.child_pid.is_some(),
         _ => false,
     };
@@ -1423,6 +1366,180 @@ fn sha256_file(path: &Path) -> Result<String> {
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(test)]
+mod execution_evidence_fixtures {
+    use super::*;
+    use crate::checks::{model::Parser, source::SourceManifest};
+    use std::collections::BTreeMap;
+
+    fn fixture(direct_state: &str, direct_code: Option<i32>) -> (PathBuf, Work, Value) {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-check-direct-exit-{}",
+            crate::model::new_id()
+        ));
+        fs::create_dir_all(root.join("checks")).unwrap();
+        let files = ArtifactFiles::new(&root).unwrap();
+        let manifest = SourceManifest {
+            version: 1,
+            commit: "a".repeat(40),
+            tree: "b".repeat(40),
+            files: Vec::new(),
+        };
+        let (candidate, bytes) = ArtifactFiles::document(
+            "source_snapshot",
+            &format!("source-{}", digest(b"direct-exit-fixture")),
+            &json!(manifest),
+            json!({"commit":manifest.commit,"tree":manifest.tree,"coverage":"complete","file_count":0}),
+        ).unwrap();
+        files.publish(&candidate, &bytes).unwrap();
+        fs::create_dir_all(root.join("sources").join(&candidate.artifact_id)).unwrap();
+        let mut work = Work {
+            check_id: crate::model::new_id(),
+            operation_id: crate::model::new_id(),
+            token: crate::model::new_id(),
+            data_dir: root.clone(),
+            candidate,
+            profile: crate::checks::model::CheckProfile {
+                profile_id: "direct-exit".into(),
+                profile_revision: "1".into(),
+                executable: std::env::current_exe().unwrap(),
+                args: Vec::new(),
+                parser: Parser::ExitCode,
+                resource: "direct-exit".into(),
+                environment: BTreeMap::new(),
+                inherit_env: Vec::new(),
+                expected_targets: Vec::new(),
+                reproducible: false,
+                fingerprint_env: Vec::new(),
+                versioned_inputs: BTreeMap::new(),
+            },
+            executor: None,
+            resolved_inputs: None,
+            scope_plan: None,
+            input_fingerprint: None,
+            preflight_error: None,
+            cancel_request: None,
+            expected_worker: None,
+            launch: None,
+        };
+        let verified = source::verified_content(&files, &root, &work.candidate).unwrap();
+        let (workspace, _) = inputs::execution_paths(&root, &work.profile, &verified).unwrap();
+        fs::create_dir_all(workspace).unwrap();
+        let directory = check_directory(&work, true).unwrap();
+        let identity =
+            json!({"token":work.token,"control_version":2,"process":{"fixture_owner":work.token}});
+        work.expected_worker = Some(identity.clone());
+        worker::write_once(&directory.join("worker.json"), &identity).unwrap();
+        fs::write(directory.join("worker.lock"), []).unwrap();
+        let stream = |name: &str| {
+            let path = directory.join(name);
+            fs::write(&path, []).unwrap();
+            json!({"path":path,"bytes_written":0,"bytes_observed":0,"truncated":false,
+                "capture_complete":true,"capture_disposition":"complete","capture_error":null})
+        };
+        let context = PlanContext {
+            candidate_ref: work.candidate.artifact_id.clone(),
+            candidate_content_sha256: verified.content_sha256,
+            input_fingerprint: None,
+            executable_path: path_text(&fs::canonicalize(&work.profile.executable).unwrap())
+                .unwrap(),
+            executable_sha256: sha256_file(&work.profile.executable).unwrap(),
+            profile_identity_sha256: inputs::profile_identity_sha256(&work.profile).unwrap(),
+            scope_plan_sha256: digest(canonical(&Value::Null).unwrap().as_bytes()),
+        };
+        let plan_sha256 = "c".repeat(64);
+        worker::write_once(
+            &directory.join(PLAN_READY_FILE),
+            &json!(PlanReceipt {
+                version: 1,
+                check_id: work.check_id.clone(),
+                operation_id: work.operation_id.clone(),
+                token: work.token.clone(),
+                process: identity["process"].clone(),
+                plan_sha256: plan_sha256.clone(),
+                context: context.clone(),
+                materialized_at_ms: 1,
+            }),
+        )
+        .unwrap();
+        let receipt = json!({
+            "version":1,"check_id":work.check_id,"operation_id":work.operation_id,
+            "token":work.token,"process":identity["process"],"plan_sha256":plan_sha256,
+            "context":context,"started_at_ms":1,"finished_at_ms":2,
+            "execution":{
+                "check_id":work.check_id,"operation_id":work.operation_id,"process":identity["process"],
+                "child_pid":42,"termination":"exited",
+                "direct_exit":{"state":direct_state,"exit_code":direct_code},
+                "family_departure":{"state":"confirmed"},"exit_code":0,"termination_requests":0,
+                "stdout":stream("stdout"),"stderr":stream("stderr"),"resource_released":true,
+                "control_read_unknown":false,"termination_request_unconfirmed":false
+            }
+        });
+        (root, work, receipt)
+    }
+
+    #[test]
+    fn unknown_direct_exit_with_zero_code_is_retained_incomplete() {
+        // Exercise validation, publication and receipt readback with otherwise
+        // successful source/capture evidence. No command process is launched.
+        for direct_code in [None, Some(0)] {
+            let (root, work, receipt) = fixture("observation_unknown", direct_code);
+            let directory = check_directory(&work, false).unwrap();
+            let identity = read_value(&directory.join("worker.json"), MAX_RECEIPT_BYTES).unwrap();
+            let parsed = serde_json::from_value(receipt.clone()).unwrap();
+            validate_execution_receipt(&work, &identity, &directory, &parsed).unwrap();
+            let files = ArtifactFiles::new(&root).unwrap();
+            worker::write_once(&directory.join(EXECUTION_FILE), &receipt).unwrap();
+            let completion = finalize_execution(&work, &files).unwrap().unwrap();
+            assert_eq!(completion.state, "incomplete");
+            assert_eq!(completion.exit_code, Some(0));
+            assert!(completion.resource_released);
+            assert_eq!(
+                completion.process_facts.as_ref().unwrap()["direct_exit"]["state"],
+                "observation_unknown"
+            );
+            assert_eq!(
+                worker::completion(&work, &files).unwrap().unwrap().state,
+                "incomplete"
+            );
+            assert_eq!(
+                finalize_execution(&work, &files).unwrap().unwrap().state,
+                "incomplete"
+            );
+            let report: Value =
+                serde_json::from_slice(&files.document_bytes(&completion.result).unwrap()).unwrap();
+            assert_eq!(report["error"]["code"], "CHECK_PROCESS_OBSERVATION_UNKNOWN");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn observed_direct_exit_requires_matching_code_and_can_pass() {
+        for direct_code in [Some(0), Some(1), None] {
+            let (root, work, receipt) = fixture("observed", direct_code);
+            let directory = check_directory(&work, false).unwrap();
+            let identity = read_value(&directory.join("worker.json"), MAX_RECEIPT_BYTES).unwrap();
+            let parsed = serde_json::from_value(receipt.clone()).unwrap();
+            let valid = validate_execution_receipt(&work, &identity, &directory, &parsed);
+            if direct_code == Some(0) {
+                valid.unwrap();
+                let files = ArtifactFiles::new(&root).unwrap();
+                worker::write_once(&directory.join(EXECUTION_FILE), &receipt).unwrap();
+                let completion = finalize_execution(&work, &files).unwrap().unwrap();
+                assert_eq!(completion.state, "passed");
+                assert_eq!(
+                    worker::completion(&work, &files).unwrap().unwrap().state,
+                    "passed"
+                );
+            } else {
+                assert_eq!(valid.unwrap_err().code, "INVALID_PARAMS");
+                assert!(!directory.join("completion.json").exists());
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

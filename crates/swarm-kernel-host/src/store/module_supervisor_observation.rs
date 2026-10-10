@@ -16,34 +16,117 @@ use serde_json::{Value, json};
 use swarm_telemetry::{Code, Component, Kind, Phase, Record, Severity};
 
 impl super::Store {
+    /// Persist the host-admitted actor fence before its child bootstrap is
+    /// encoded. The host calls this only after exact prior-child disposition.
+    pub(crate) async fn admit_module_supervisor_actor(
+        &self,
+        actor_instance_id: &str,
+    ) -> Result<()> {
+        if uuid::Uuid::parse_str(actor_instance_id).is_err() {
+            return Err(actor_authority_invalid());
+        }
+        let actor_instance_id = actor_instance_id.to_owned();
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let previous = super::meta(&tx, ACTIVE_ACTOR_META_KEY)?;
+            let activation_sequence = next_actor_activation_sequence(previous.as_ref())?;
+            let host_epoch = super::meta(&tx, "host_epoch")?;
+            if !valid_host_epoch(host_epoch.as_ref()) {
+                return Err(actor_authority_invalid());
+            }
+            super::set_meta(
+                &tx,
+                ACTIVE_ACTOR_META_KEY,
+                &json!({
+                    "schema_version":1,
+                    "actor_instance_id":actor_instance_id,
+                    "activation_sequence":activation_sequence,
+                    "host_epoch":host_epoch,
+                }),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(())
+    }
+
     /// Retain a bounded host-only status transition from the dedicated module
     /// supervisor. This has no RPC or bearer credential path and cannot
     /// settle or requeue an Operation.
     pub(crate) async fn record_module_supervisor_observation<T: Serialize>(
         &self,
         observation: T,
-    ) -> Result<()> {
+    ) -> Result<ObservationDisposition> {
         let observation = parse(observation)?;
-        let committed = self
+        let (disposition, diagnostic) = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let committed = record(&tx, &observation, model::now_ms()?)?;
-                tx.commit()?;
-                Ok(committed)
+                let now_ms = model::now_ms()?;
+                tx.execute_batch("SAVEPOINT module_supervisor_observation_write")?;
+                let result = record(&tx, &observation, now_ms);
+                match result {
+                    Ok(committed) => {
+                        release_observation_savepoint(&tx)?;
+                        tx.commit()?;
+                        Ok((
+                            if committed.inserted {
+                                ObservationDisposition::Committed
+                            } else {
+                                ObservationDisposition::ExactDuplicate
+                            },
+                            committed.diagnostic,
+                        ))
+                    }
+                    Err(error) if is_permanent_observation_error(&error.code) => {
+                        rollback_observation_savepoint(&tx)?;
+                        let actor_is_current = current_actor_id(&tx)?.as_deref()
+                            == Some(observation.actor_instance_id.as_str());
+                        retain_scoped_rejection(
+                            &tx,
+                            &observation,
+                            &error.code,
+                            now_ms,
+                            actor_is_current,
+                        )?;
+                        tx.commit()?;
+                        Ok((
+                            ObservationDisposition::ScopedPermanentRejection {
+                                error_code: error.code,
+                            },
+                            None,
+                        ))
+                    }
+                    Err(error) => {
+                        rollback_observation_savepoint(&tx)?;
+                        Err(error)
+                    }
+                }
             })
             .await?;
-        if committed.inserted {
+        if !matches!(&disposition, ObservationDisposition::ExactDuplicate) {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
-            if let Some(diagnostic) = committed.diagnostic {
-                // Diagnostics are explicitly lossy. Store commit failures
-                // still return above, and recorder loss cannot revise a
-                // durable observation or its operation authority.
-                let _ = self.telemetry.emit(diagnostic);
-            }
         }
-        Ok(())
+        // Diagnostics are emitted only from committed current-actor
+        // transitions. Exact duplicates and superseded history have no
+        // diagnostic candidate and cannot produce a second health event.
+        if let Some(diagnostic) = diagnostic {
+            // Diagnostics are explicitly lossy. Store commit failures still
+            // return above and cannot revise durable observation authority.
+            let _ = self.telemetry.emit(diagnostic);
+        }
+        Ok(disposition)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservationDisposition {
+    Committed,
+    ExactDuplicate,
+    ScopedPermanentRejection { error_code: String },
 }
 
 pub(super) struct ObservationCommit {
@@ -56,12 +139,193 @@ const MAX_UNKNOWN_OPERATION_COUNT: u64 = 1_000_000;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const STREAM_PREFIX: &str = "controller:module-supervisor";
 const EVENT_KIND: &str = "module.supervisor_observation";
+const REJECTION_EVENT_KIND: &str = "module.supervisor_observation_rejected";
+const ACTIVE_ACTOR_META_KEY: &str = "module_supervisor_current_actor";
 const READY_EVENT_KIND: &str = "module.ready";
 const START_FAILURE_EVENT_KIND: &str = "module.start_failed";
 const FAMILY_EXIT_EVENT_KIND: &str = "module.family_exited";
 const RECOVERY_BLOCKED_EVENT_KIND: &str = "module.recovery_blocked";
 const IDENTITY_UNKNOWN_EVENT_KIND: &str = "module.identity_unknown";
 const OWNER_RETAINED_EVENT_KIND: &str = "module.owner_retained";
+
+fn next_actor_activation_sequence(previous: Option<&Value>) -> Result<u64> {
+    let Some(previous) = previous else {
+        return Ok(1);
+    };
+    let (_, sequence) = retained_actor_authority(previous)?;
+    sequence.checked_add(1).ok_or_else(|| {
+        Error::new(
+            "MODULE_ACTOR_AUTHORITY_INVALID",
+            "retained supervisor actor activation sequence is exhausted",
+        )
+    })
+}
+
+fn retained_actor_authority(value: &Value) -> Result<(&str, u64)> {
+    let Some(fields) = value.as_object() else {
+        return Err(actor_authority_invalid());
+    };
+    let actor = fields
+        .get("actor_instance_id")
+        .and_then(Value::as_str)
+        .ok_or_else(actor_authority_invalid)?;
+    let sequence = fields
+        .get("activation_sequence")
+        .and_then(Value::as_u64)
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(actor_authority_invalid)?;
+    let valid = fields.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && uuid::Uuid::parse_str(actor).is_ok()
+        && fields
+            .get("host_epoch")
+            .is_some_and(|host_epoch| valid_host_epoch(Some(host_epoch)));
+    if !valid {
+        return Err(actor_authority_invalid());
+    }
+    Ok((actor, sequence))
+}
+
+fn valid_host_epoch(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(value) => value.as_i64().is_some_and(|epoch| epoch >= 0),
+    }
+}
+
+fn actor_authority_invalid() -> Error {
+    Error::new(
+        "MODULE_ACTOR_AUTHORITY_INVALID",
+        "retained supervisor actor authority is malformed",
+    )
+}
+
+fn release_observation_savepoint(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch("RELEASE SAVEPOINT module_supervisor_observation_write")?;
+    Ok(())
+}
+
+fn rollback_observation_savepoint(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch("ROLLBACK TO SAVEPOINT module_supervisor_observation_write")?;
+    release_observation_savepoint(tx)
+}
+
+fn current_actor_id(tx: &Transaction<'_>) -> Result<Option<String>> {
+    let Some(value) = super::meta(tx, ACTIVE_ACTOR_META_KEY)? else {
+        return Ok(None);
+    };
+    let (actor, _) = retained_actor_authority(&value)?;
+    Ok(Some(actor.to_owned()))
+}
+
+fn is_permanent_observation_error(code: &str) -> bool {
+    matches!(
+        code,
+        "MODULE_OBSERVATION_INVALID"
+            | "MODULE_OBSERVATION_CERTAINTY_INVALID"
+            | "MODULE_OBSERVATION_CONFLICT"
+            | "MODULE_OBSERVATION_STALE"
+            | "MODULE_OBSERVATION_IDENTITY_MISMATCH"
+            | "MODULE_OBSERVATION_OPERATION_SCOPE"
+            | "MODULE_OBSERVATION_OPERATION_TERMINAL"
+            | "MODULE_OBSERVATION_SCOPE_QUARANTINED"
+            | "MODULE_DESCRIPTOR_MISSING"
+            | "MODULE_ROUTE_CORRUPT"
+            | "MODULE_LIFECYCLE_TRIGGER_CONFLICT"
+            | "MODULE_NONTERMINAL_TRIGGER_CONFLICT"
+    )
+}
+
+fn retain_scoped_rejection(
+    tx: &Transaction<'_>,
+    observation: &ModuleSupervisorObservation,
+    error_code: &str,
+    now_ms: i64,
+    quarantine: bool,
+) -> Result<()> {
+    let generation = i64::try_from(observation.scope.generation)
+        .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
+    let binding = super::operations::get_binding(tx, &observation.scope.binding_id, generation)?;
+    let source_stream_id = format!(
+        "{STREAM_PREFIX}:{}:{generation}",
+        observation.scope.binding_id
+    );
+    let source_event_key = format!("rejected:{}", observation.event_id);
+    let rejection = json!({
+        "schema_version":1,
+        "disposition":"scoped_permanent_rejection",
+        "actor_instance_id":observation.actor_instance_id,
+        "event_id":observation.event_id,
+        "sequence":observation.sequence,
+        "module_id":observation.module_id,
+        "binding_id":observation.scope.binding_id,
+        "generation":generation,
+        "boot_id":observation.boot_id,
+        "error_code":error_code,
+    });
+    let rejection_json = model::canonical(&rejection)?;
+    if rejection_json.len() > 4096 {
+        return Err(invalid(
+            "scoped observation rejection exceeds its record bound",
+        ));
+    }
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM observations \
+             WHERE source_stream_id=?1 AND source_event_key=?2",
+            params![source_stream_id, source_event_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(previous) = previous {
+        if previous != rejection_json {
+            return Err(Error::new(
+                "MODULE_OBSERVATION_REJECTION_CONFLICT",
+                "permanent rejection identity was reused with different facts",
+            ));
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO observations(\
+                 source_stream_id,source_event_key,binding_id,binding_generation,\
+                 operation_id,kind,payload_json,recorded_at_ms\
+             ) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7)",
+            params![
+                source_stream_id,
+                source_event_key,
+                observation.scope.binding_id,
+                generation,
+                REJECTION_EVENT_KIND,
+                rejection_json,
+                now_ms,
+            ],
+        )?;
+    }
+    if quarantine && !binding["module_supervisor_quarantine"].is_object() {
+        let quarantine = json!({
+            "schema_version":1,
+            "actor_instance_id":observation.actor_instance_id,
+            "event_id":observation.event_id,
+            "sequence":observation.sequence,
+            "module_id":observation.module_id,
+            "binding_id":observation.scope.binding_id,
+            "generation":generation,
+            "boot_id":observation.boot_id,
+            "error_code":error_code,
+            "disposition":"scoped_permanent_rejection",
+        });
+        tx.execute(
+            "UPDATE bindings SET state_json=json_set(\
+                 state_json,'$.module_supervisor_quarantine',json(?3)\
+             ) WHERE binding_id=?1 AND generation=?2",
+            params![
+                observation.scope.binding_id,
+                generation,
+                model::canonical(&quarantine)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleTransition {
@@ -141,6 +405,10 @@ pub(super) struct ModuleSupervisorObservation {
     unknown_operation_ids: Vec<String>,
     unknown_operation_count: usize,
     unknown_operation_ids_truncated: bool,
+    /// Store-authored disposition on retained history. Producers omit this;
+    /// older flat v1/v2 facts therefore continue to decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -372,8 +640,6 @@ pub(super) fn record(
     let generation = i64::try_from(observation.scope.generation)
         .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
     let binding = super::operations::get_binding(tx, &observation.scope.binding_id, generation)?;
-    validate_binding_identity(&binding, observation)?;
-
     let source_stream_id = format!(
         "{STREAM_PREFIX}:{}:{generation}",
         observation.scope.binding_id
@@ -395,7 +661,13 @@ pub(super) fn record(
         )
         .optional()?;
     if let Some((old_payload, old_binding, old_generation, old_kind)) = existing {
-        if old_payload == payload_json
+        let old_facts = serde_json::from_str::<Value>(&old_payload).map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("actor_disposition");
+            }
+            value
+        });
+        if old_facts.as_ref().is_ok_and(|facts| facts == &payload)
             && old_binding.as_deref() == Some(observation.scope.binding_id.as_str())
             && old_generation == Some(generation)
             && old_kind == EVENT_KIND
@@ -411,6 +683,45 @@ pub(super) fn record(
         ));
     }
 
+    let Some(current_actor_id) = current_actor_id(tx)? else {
+        return Err(Error::new(
+            "MODULE_ACTOR_NOT_ADMITTED",
+            "Store has no retained host-admitted module supervisor actor",
+        ));
+    };
+    if current_actor_id != observation.actor_instance_id {
+        validate_binding_identity(&binding, observation)?;
+        let mut historical = payload;
+        historical["actor_disposition"] = json!("superseded_actor");
+        let historical_json = model::canonical(&historical)?;
+        tx.execute(
+            "INSERT INTO observations(\
+                 source_stream_id,source_event_key,binding_id,binding_generation,\
+                 operation_id,kind,payload_json,recorded_at_ms\
+             ) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7)",
+            params![
+                source_stream_id,
+                observation.event_id,
+                observation.scope.binding_id,
+                generation,
+                EVENT_KIND,
+                historical_json,
+                now_ms,
+            ],
+        )?;
+        return Ok(ObservationCommit {
+            inserted: true,
+            diagnostic: None,
+        });
+    }
+
+    if binding["module_supervisor_quarantine"].is_object() {
+        return Err(Error::new(
+            "MODULE_OBSERVATION_SCOPE_QUARANTINED",
+            "module supervisor scope requires explicit recovery after permanent rejection",
+        ));
+    }
+    validate_binding_identity(&binding, observation)?;
     let current = &binding["observation"]["module_supervisor"];
     if current["actor_instance_id"].as_str() == Some(observation.actor_instance_id.as_str())
         && current["sequence"]
@@ -791,7 +1102,6 @@ fn record_lifecycle_trigger(
         &observation.scope.binding_id,
         generation,
         boot_id,
-        &observation.event_id,
         event_kind,
     )?;
     let operation_id = operation_link.map(|link| link.operation_id.as_str());
@@ -829,6 +1139,21 @@ fn record_lifecycle_trigger(
             "lifecycle trigger already exists without its matching supervisor callback",
         ));
     }
+    let occurrence_already_retained: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations \
+         WHERE kind=?1 AND binding_id=?2 AND binding_generation=?3 \
+           AND json_extract(payload_json,'$.boot_id')=?4)",
+        params![
+            event_kind,
+            observation.scope.binding_id,
+            generation,
+            boot_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if occurrence_already_retained {
+        return Ok(());
+    }
     tx.execute(
         "INSERT INTO observations(\
              source_stream_id,source_event_key,binding_id,binding_generation,\
@@ -849,6 +1174,25 @@ fn record_lifecycle_trigger(
 }
 
 fn lifecycle_occurrence_id(
+    binding_id: &str,
+    generation: i64,
+    boot_id: &str,
+    event_kind: &str,
+) -> Result<String> {
+    Ok(model::digest(
+        model::canonical(&json!({
+            "binding_id":binding_id,
+            "generation":generation,
+            "boot_id":boot_id,
+            "event_kind":event_kind,
+        }))?
+        .as_bytes(),
+    ))
+}
+
+/// Accept pre-fence v1/v2 trigger facts during verification while all new
+/// writes use the actor-independent boot/phase occurrence identity above.
+fn legacy_lifecycle_occurrence_id(
     binding_id: &str,
     generation: i64,
     boot_id: &str,
@@ -998,14 +1342,21 @@ pub(super) fn verified_lifecycle_event(
         || fact.sequence == 0
         || valid_token(&fact.actor_instance_id).is_err()
         || valid_atom(&fact.module_id, false).is_err()
-        || fact.occurrence_id
+        || (fact.occurrence_id
             != lifecycle_occurrence_id(
                 &fact.binding_id,
                 fact.generation,
                 &fact.boot_id,
-                &fact.event_id,
                 &fact.event_kind,
             )?
+            && fact.occurrence_id
+                != legacy_lifecycle_occurrence_id(
+                    &fact.binding_id,
+                    fact.generation,
+                    &fact.boot_id,
+                    &fact.event_id,
+                    &fact.event_kind,
+                )?)
     {
         return Ok(None);
     }
@@ -2012,8 +2363,76 @@ mod journal_regression_tests {
     const ARTIFACT_ID: &str = "artifact-fixture";
     const ARTIFACT_VERSION: &str = "1.2.3";
     const BUILD_ID: &str = "build-fixture";
-    const ACTOR_INSTANCE_ID: &str = "actor-fixture";
+    const ACTOR_INSTANCE_ID: &str = "11400000-0000-4000-8000-000000000001";
+    const NEXT_ACTOR_INSTANCE_ID: &str = "11400000-0000-4000-8000-000000000002";
     const BOOT_ID: &str = "boot-fixture";
+
+    #[test]
+    fn corrupt_retained_actor_authority_cannot_reset_activation_sequence() {
+        let valid = json!({
+            "schema_version": 1,
+            "actor_instance_id": ACTOR_INSTANCE_ID,
+            "activation_sequence": 4,
+            "host_epoch": null,
+        });
+        assert_eq!(
+            next_actor_activation_sequence(None).expect("genesis sequence"),
+            1
+        );
+        assert_eq!(
+            next_actor_activation_sequence(Some(&valid)).expect("next retained sequence"),
+            5
+        );
+
+        let malformed = [
+            json!({
+                "schema_version": 2,
+                "actor_instance_id": ACTOR_INSTANCE_ID,
+                "activation_sequence": 4,
+                "host_epoch": null,
+            }),
+            json!({
+                "schema_version": 1,
+                "actor_instance_id": "not-a-uuid",
+                "activation_sequence": 4,
+                "host_epoch": null,
+            }),
+            json!({
+                "schema_version": 1,
+                "actor_instance_id": ACTOR_INSTANCE_ID,
+                "activation_sequence": 0,
+                "host_epoch": null,
+            }),
+            json!({
+                "schema_version": 1,
+                "actor_instance_id": ACTOR_INSTANCE_ID,
+                "activation_sequence": 4,
+            }),
+            json!({
+                "schema_version": 1,
+                "actor_instance_id": ACTOR_INSTANCE_ID,
+                "activation_sequence": 4,
+                "host_epoch": -1,
+            }),
+            json!({
+                "schema_version": 1,
+                "actor_instance_id": ACTOR_INSTANCE_ID,
+                "activation_sequence": 4,
+                "host_epoch": "0",
+            }),
+        ];
+        for authority in malformed {
+            assert!(next_actor_activation_sequence(Some(&authority)).is_err());
+        }
+
+        let exhausted = json!({
+            "schema_version": 1,
+            "actor_instance_id": ACTOR_INSTANCE_ID,
+            "activation_sequence": u64::MAX,
+            "host_epoch": 0,
+        });
+        assert!(next_actor_activation_sequence(Some(&exhausted)).is_err());
+    }
 
     fn fixture_db() -> Connection {
         let db = Connection::open_in_memory().expect("open in-memory Store database");
@@ -2048,6 +2467,20 @@ mod journal_regression_tests {
             ],
         )
         .expect("insert exact fixture binding");
+        db.execute(
+            "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+            params![
+                ACTIVE_ACTOR_META_KEY,
+                model::canonical(&json!({
+                    "schema_version":1,
+                    "actor_instance_id":ACTOR_INSTANCE_ID,
+                    "activation_sequence":1,
+                    "host_epoch":null,
+                }))
+                .expect("encode retained fixture actor"),
+            ],
+        )
+        .expect("admit fixture actor");
         db
     }
 
@@ -2177,6 +2610,73 @@ mod journal_regression_tests {
                 "MODULE_OBSERVATION_OPERATION_TERMINAL"
             );
         }
+    }
+
+    #[test]
+    fn superseded_actor_is_historical_only_and_cannot_replace_latest_ready() {
+        let mut db = fixture_db();
+        let ready = producer_observation(1, ProducerPhase::Ready, None);
+        record_in_transaction(&mut db, &ready, 100).expect("retain current actor Ready");
+        let ready_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM observations WHERE kind=?1",
+                [READY_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .expect("count initial Ready trigger");
+
+        let next_actor = model::canonical(&json!({
+            "schema_version":1,
+            "actor_instance_id":NEXT_ACTOR_INSTANCE_ID,
+            "activation_sequence":2,
+            "host_epoch":null,
+        }))
+        .expect("encode rotated fixture actor");
+        db.execute(
+            "UPDATE meta SET value_json=?2 WHERE key=?1",
+            params![ACTIVE_ACTOR_META_KEY, next_actor],
+        )
+        .expect("rotate retained actor authority");
+
+        let mut stale = producer_observation(2, ProducerPhase::ExitedProven, None);
+        stale.event_id = format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:2");
+        let historical = record_in_transaction(&mut db, &stale, 200)
+            .expect("retain superseded actor event as history");
+        assert!(historical.inserted);
+        assert!(historical.diagnostic.is_none());
+
+        let latest: (String, i64, String) = db
+            .query_row(
+                "SELECT json_extract(state_json,'$.observation.module_supervisor.actor_instance_id'),\
+                        json_extract(state_json,'$.observation.module_supervisor.sequence'),\
+                        json_extract(state_json,'$.observation.module_supervisor.phase')\
+                 FROM bindings WHERE binding_id=?1 AND generation=?2",
+                params![BINDING_ID, GENERATION as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read authoritative latest observation");
+        assert_eq!(
+            latest,
+            (ACTOR_INSTANCE_ID.to_owned(), 1, "ready".to_owned())
+        );
+
+        let retained_disposition: String = db
+            .query_row(
+                "SELECT json_extract(payload_json,'$.actor_disposition') \
+                 FROM observations WHERE source_event_key=?1",
+                [&stale.event_id],
+                |row| row.get(0),
+            )
+            .expect("read historical actor disposition");
+        assert_eq!(retained_disposition, "superseded_actor");
+        let ready_count_after: i64 = db
+            .query_row(
+                "SELECT count(*) FROM observations WHERE kind=?1",
+                [READY_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .expect("count Ready triggers after stale event");
+        assert_eq!(ready_count_after, ready_count);
     }
 
     #[test]

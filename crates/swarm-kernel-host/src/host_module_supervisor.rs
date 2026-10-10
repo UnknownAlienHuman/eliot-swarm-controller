@@ -5,6 +5,7 @@
 
 use crate::{
     error::{Error, Result},
+    host::ShutdownCustody,
     store::Store,
 };
 use futures_util::FutureExt;
@@ -38,6 +39,7 @@ use tokio::{
     task::JoinHandle,
     time,
 };
+use uuid::Uuid;
 
 const MODULE_ACTOR_RETRY_MAX: Duration = Duration::from_secs(30);
 const MODULE_ACTOR_ISOLATED_RETRY: Duration = Duration::from_secs(60);
@@ -167,6 +169,7 @@ impl ModuleSupervisorHostConfig {
                 launch_configs: BTreeMap::new(),
                 route_config_mapper,
             },
+            actor_instance_id: None,
         };
         bootstrap.validate().map_err(module_error)?;
         Ok(bootstrap)
@@ -222,6 +225,7 @@ pub(crate) fn spawn_independent_module_supervisor(
     ipc: swarm_client::IpcConfig,
     config: Arc<crate::config::Config>,
     stopping: watch::Receiver<bool>,
+    shutdown_custody: ShutdownCustody,
 ) -> OptionalModuleSupervisor {
     let control =
         SupervisorControlClient::new(root.clone(), supervisor_credential.clone(), ipc.clone());
@@ -287,7 +291,7 @@ pub(crate) fn spawn_independent_module_supervisor(
                         return Err(error);
                     }
                 };
-            run_supervisor_process_loop(store, control, bootstrap, stopping).await
+            run_supervisor_process_loop(store, control, bootstrap, stopping, shutdown_custody).await
         })
         .catch_unwind()
         .await;
@@ -327,8 +331,17 @@ pub(crate) fn spawn_isolated_module_supervisor(
     ipc: swarm_client::IpcConfig,
     config: Arc<crate::config::Config>,
     stopping: watch::Receiver<bool>,
+    shutdown_custody: ShutdownCustody,
 ) -> OptionalModuleSupervisor {
-    spawn_independent_module_supervisor(store, supervisor_credential, root, ipc, config, stopping)
+    spawn_independent_module_supervisor(
+        store,
+        supervisor_credential,
+        root,
+        ipc,
+        config,
+        stopping,
+        shutdown_custody,
+    )
 }
 
 const SUPERVISOR_PROCESS_BASE_RETRY: Duration = Duration::from_millis(250);
@@ -345,6 +358,7 @@ async fn run_supervisor_process_loop(
     control: SupervisorControlClient,
     bootstrap: SupervisorBootstrap,
     stopping: watch::Receiver<bool>,
+    shutdown_custody: ShutdownCustody,
 ) -> Result<()> {
     let mut stopping = stopping;
     let mut demand_changes = store.subscribe_module_demand_changes();
@@ -352,25 +366,6 @@ async fn run_supervisor_process_loop(
     let mut retry = SUPERVISOR_PROCESS_BASE_RETRY;
     // Configured descriptors need their catalogue owner before the first agent launch.
     let mut catalog_needed = !bootstrap.config.descriptor_files.is_empty();
-    let frame = match bootstrap.to_frame() {
-        Ok(frame) => frame,
-        Err(error) => {
-            let error = module_error(error);
-            let error = match record_module_actor_status(
-                &control,
-                "isolated",
-                1,
-                Some(&error.code),
-                Some(MODULE_ACTOR_ISOLATED_RETRY),
-            )
-            .await
-            {
-                Ok(()) => error,
-                Err(health_error) => return Err(error.with_secondary_error(health_error)),
-            };
-            return Err(error);
-        }
-    };
     loop {
         if *stopping.borrow() {
             return Ok(());
@@ -481,6 +476,61 @@ async fn run_supervisor_process_loop(
             }
         };
 
+        // The host alone chooses and durably admits the next actor UUID. This
+        // happens only after exact prior-child reconciliation and before the
+        // final child bootstrap frame is constructed.
+        let actor_instance_id = Uuid::new_v4().to_string();
+        if let Err(error) = store
+            .admit_module_supervisor_actor(&actor_instance_id)
+            .await
+        {
+            failures = failures.saturating_add(1).min(32);
+            if let Err(health_error) = record_module_actor_status(
+                &control,
+                "isolated",
+                failures,
+                Some(&error.code),
+                Some(MODULE_ACTOR_ISOLATED_RETRY),
+            )
+            .await
+            {
+                return Err(error.with_secondary_error(health_error));
+            }
+            if !wait_for_supervisor_retry(
+                MODULE_ACTOR_ISOLATED_RETRY,
+                &mut demand_changes,
+                &mut stopping,
+            )
+            .await
+            {
+                return Ok(());
+            }
+            continue;
+        }
+        let child_bootstrap = SupervisorBootstrap {
+            config: bootstrap.config.clone(),
+            actor_instance_id: Some(actor_instance_id),
+        };
+        let frame = match child_bootstrap.to_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                let error = module_error(error);
+                let error = match record_module_actor_status(
+                    &control,
+                    "isolated",
+                    failures.saturating_add(1).min(32),
+                    Some(&error.code),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
+                {
+                    Ok(()) => error,
+                    Err(health_error) => return Err(error.with_secondary_error(health_error)),
+                };
+                return Err(error);
+            }
+        };
+
         // Persist the launch intent, then read it back through the same
         // authenticated Store path before the first exec. A pending intent
         // with no departed receipt remains a restart fence after this host
@@ -504,7 +554,7 @@ async fn run_supervisor_process_loop(
 
         let started_at = time::Instant::now();
         let (child, bootstrap_pipe, child_identity) =
-            match spawn_supervisor_child(&control, &executable, &frame).await {
+            match spawn_supervisor_child(&control, &executable, &frame, &shutdown_custody).await {
                 Ok(child) => child,
                 Err(error) => {
                     failures = failures.saturating_add(1).min(32);
@@ -540,11 +590,16 @@ async fn run_supervisor_process_loop(
                     continue;
                 }
             };
-        let mut child =
-            SupervisorChildLease::new(child, bootstrap_pipe, child_identity, control.clone());
+        let mut child = SupervisorChildLease::new(
+            child,
+            bootstrap_pipe,
+            child_identity,
+            control.clone(),
+            shutdown_custody.clone(),
+        );
         // Own stderr before the running-health write. A failed or panicking
         // health path must not leave the child blocked on a full pipe while
-        // the lease transfers the exact handle to its detached reaper.
+        // the lease transfers the exact handle to its host-owned reaper.
         if let Some(stderr) = child.child_mut().stderr.take() {
             child.set_diagnostic(spawn_child_diagnostic(stderr));
         }
@@ -916,14 +971,15 @@ struct SupervisorChildIdentity {
 
 /// Owns every live child handle created by the coordinator. If an async path
 /// returns or unwinds before it explicitly reaps the child, Drop transfers the
-/// same handle to one bounded health-aware reaper instead of dropping a
-/// `kill_on_drop(false)` child into an untracked process.
+/// same handle to a health-aware reaper registered with host shutdown custody
+/// instead of dropping a `kill_on_drop(false)` child into an untracked process.
 struct SupervisorChildLease {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     diagnostic: Option<ChildDiagnosticTask>,
     identity: SupervisorChildIdentity,
     control: SupervisorControlClient,
+    shutdown_custody: ShutdownCustody,
     retain_code: &'static str,
     initial_health_result: Option<Result<()>>,
 }
@@ -934,6 +990,7 @@ impl SupervisorChildLease {
         stdin: ChildStdin,
         identity: SupervisorChildIdentity,
         control: SupervisorControlClient,
+        shutdown_custody: ShutdownCustody,
     ) -> Self {
         Self {
             child: Some(child),
@@ -941,6 +998,7 @@ impl SupervisorChildLease {
             diagnostic: None,
             identity,
             control,
+            shutdown_custody,
             retain_code: SUPERVISOR_CHILD_RETAINED,
             initial_health_result: None,
         }
@@ -988,8 +1046,9 @@ impl Drop for SupervisorChildLease {
         let control = self.control.clone();
         let retain_code = self.retain_code;
         let initial_health_result = self.initial_health_result.take();
+        let shutdown_custody = self.shutdown_custody.clone();
         if let Ok(handle) = Handle::try_current() {
-            drop(handle.spawn(reap_owned_supervisor_child(
+            let reaper = handle.spawn(reap_owned_supervisor_child(
                 child,
                 stdin,
                 diagnostic,
@@ -997,14 +1056,12 @@ impl Drop for SupervisorChildLease {
                 control,
                 retain_code,
                 initial_health_result,
-            )));
+            ));
+            shutdown_custody.register_supervisor_reaper(reaper);
         } else {
-            // The lease was created inside the Tokio coordinator. If the
-            // runtime is already gone, no detached async reaper can own the
-            // wait. Retain the OS child rather than issue a signal or falsely
-            // claim that it departed; the durable pending/uncertain receipt
-            // remains the Manager's only truthful recovery boundary.
-            std::mem::forget(child);
+            // Keep the exact child in the host-owned guard if no runtime is
+            // available to schedule its joinable wait task.
+            shutdown_custody.retain_supervisor_child_without_runtime(child);
             drop(stdin);
             if let Some(task) = diagnostic {
                 task.abort();
@@ -1266,23 +1323,32 @@ async fn join_child_diagnostic(task: Option<ChildDiagnosticTask>) -> Option<Chil
     }
 }
 
+fn retain_supervisor_reaper_error(primary: &mut Option<Error>, error: Error) {
+    *primary = Some(match primary.take() {
+        Some(previous) => previous.with_secondary_error(error),
+        None => error,
+    });
+}
+
 async fn reap_failed_supervisor_child(
     mut child: Child,
     stdin: Option<ChildStdin>,
     identity: Option<SupervisorChildIdentity>,
     control: &SupervisorControlClient,
     retain_code: &'static str,
+    shutdown_custody: &ShutdownCustody,
 ) -> Result<()> {
     let stdin = stdin.or_else(|| child.stdin.take());
     let diagnostic = child.stderr.take().map(spawn_child_diagnostic);
     let Some(identity) = identity else {
         // Without a verified birth/image receipt the coordinator cannot safely
         // claim this process as a replaceable owner. Keep the exact handle in
-        // a one-shot reaper and let the caller surface the identity failure.
+        // a host-owned joinable reaper and let the caller surface the identity failure.
         if let Ok(handle) = Handle::try_current() {
-            drop(handle.spawn(reap_unidentified_supervisor_child(child, stdin, diagnostic)));
+            let reaper = handle.spawn(reap_unidentified_supervisor_child(child, stdin, diagnostic));
+            shutdown_custody.register_supervisor_reaper(reaper);
         } else {
-            std::mem::forget(child);
+            shutdown_custody.retain_supervisor_child_without_runtime(child);
             drop(stdin);
             if let Some(task) = diagnostic {
                 task.abort();
@@ -1303,7 +1369,7 @@ async fn reap_failed_supervisor_child(
     .await;
     let reaper_health_result = health_result.clone();
     if let Ok(handle) = Handle::try_current() {
-        drop(handle.spawn(reap_owned_supervisor_child(
+        let reaper = handle.spawn(reap_owned_supervisor_child(
             child,
             stdin,
             diagnostic,
@@ -1311,12 +1377,10 @@ async fn reap_failed_supervisor_child(
             control.clone(),
             retain_code,
             Some(reaper_health_result),
-        )));
+        ));
+        shutdown_custody.register_supervisor_reaper(reaper);
     } else {
-        // With no runtime there is no bounded reaper task to await; retaining
-        // the exact child leaves durable Store uncertainty for Manager rather
-        // than inventing a departure receipt.
-        std::mem::forget(child);
+        shutdown_custody.retain_supervisor_child_without_runtime(child);
         drop(stdin);
         if let Some(task) = diagnostic {
             task.abort();
@@ -1329,19 +1393,40 @@ async fn reap_unidentified_supervisor_child(
     mut child: Child,
     stdin: Option<ChildStdin>,
     diagnostic: Option<ChildDiagnosticTask>,
-) {
+) -> Result<()> {
     let diagnostic = diagnostic.or_else(|| child.stderr.take().map(spawn_child_diagnostic));
     drop(stdin);
-    let _ = child.wait().await;
+    let mut wait_error = None;
+    let mut wait_error_reported = false;
+    loop {
+        match child.wait().await {
+            Ok(_) => break,
+            Err(error) => {
+                let error: Error = error.into();
+                if !wait_error_reported {
+                    eprintln!(
+                        "unidentified module supervisor child wait failed; retaining child: {error}"
+                    );
+                    retain_supervisor_reaper_error(&mut wait_error, error);
+                    wait_error_reported = true;
+                }
+                time::sleep(SUPERVISOR_PROCESS_BASE_RETRY).await;
+            }
+        }
+    }
     let _ = join_child_diagnostic(diagnostic).await;
+    match wait_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Reap the exact child handle transferred by `SupervisorChildLease::drop`.
-/// This is a one-shot wait, not a new health poller. When no health write was
-/// attempted, the reaper may make the still-live identity durable; an attempted
-/// but rejected write is carried in `initial_health_result` and never replaced
-/// by a synthetic receipt. The final receipt records the same child
-/// incarnation after the wait completes.
+/// This reaper keeps the exact Child until wait observation succeeds. When no
+/// health write was attempted, it may make the still-live identity durable; an
+/// attempted but rejected write is carried in `initial_health_result` and is
+/// never replaced by a synthetic receipt. The final receipt records this child
+/// incarnation only after confirmed departure.
 async fn reap_owned_supervisor_child(
     mut child: Child,
     stdin: Option<ChildStdin>,
@@ -1350,16 +1435,21 @@ async fn reap_owned_supervisor_child(
     control: SupervisorControlClient,
     retain_code: &'static str,
     initial_health_result: Option<Result<()>>,
-) {
+) -> Result<()> {
     // `None` means no initial health write was attempted. `Some(Ok(()))` is
     // already durable, while `Some(Err(_))` deliberately leaves the pending
     // launch intent/uncertainty untouched; writing a synthetic receipt here
     // would claim health that Store rejected.
     let diagnostic = diagnostic.or_else(|| child.stderr.take().map(spawn_child_diagnostic));
-    if initial_health_result.is_none() {
+    let (record_retained_health, mut reaper_error) = match initial_health_result {
+        None => (true, None),
+        Some(Ok(())) => (false, None),
+        Some(Err(error)) => (false, Some(error)),
+    };
+    if record_retained_health {
         let retained_health =
             supervisor_child_health(&identity, None, SupervisorChildStopState::Uncertain);
-        let _ = record_module_actor_health(
+        if let Err(error) = record_module_actor_health(
             &control,
             "isolated",
             1,
@@ -1367,20 +1457,39 @@ async fn reap_owned_supervisor_child(
             Some(MODULE_ACTOR_ISOLATED_RETRY),
             Some(&retained_health),
         )
-        .await;
+        .await
+        {
+            retain_supervisor_reaper_error(&mut reaper_error, error);
+        }
     }
     // EOF is the existing supervisor protocol's graceful release request. No
     // OS signal or broad kill is issued; the exact Child remains owned below.
     drop(stdin);
-    let exit = Some(child.wait().await);
-    let diagnostic = join_child_diagnostic(diagnostic).await;
-    let child_exit = child_exit_from_result(&exit, diagnostic.as_ref());
-    let stop = match &exit {
-        Some(Ok(_)) => SupervisorChildStopState::Confirmed,
-        Some(Err(_)) | None => SupervisorChildStopState::Uncertain,
+    let mut wait_error_reported = false;
+    let status = loop {
+        match child.wait().await {
+            Ok(status) => break status,
+            Err(error) => {
+                let error: Error = error.into();
+                if !wait_error_reported {
+                    eprintln!(
+                        "module supervisor child wait failed; retaining exact child: {error}"
+                    );
+                    retain_supervisor_reaper_error(&mut reaper_error, error);
+                    wait_error_reported = true;
+                }
+                time::sleep(SUPERVISOR_PROCESS_BASE_RETRY).await;
+            }
+        }
     };
-    let child_health = supervisor_child_health(&identity, Some(child_exit), stop);
-    let _ = record_module_actor_health(
+    let diagnostic = join_child_diagnostic(diagnostic).await;
+    let child_exit = child_exit_from_status(&status, diagnostic.as_ref());
+    let child_health = supervisor_child_health(
+        &identity,
+        Some(child_exit),
+        SupervisorChildStopState::Confirmed,
+    );
+    if let Err(error) = record_module_actor_health(
         &control,
         "isolated",
         1,
@@ -1388,7 +1497,14 @@ async fn reap_owned_supervisor_child(
         Some(MODULE_ACTOR_ISOLATED_RETRY),
         Some(&child_health),
     )
-    .await;
+    .await
+    {
+        retain_supervisor_reaper_error(&mut reaper_error, error);
+    }
+    match reaper_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn supervisor_child_health(
@@ -1446,6 +1562,7 @@ async fn spawn_supervisor_child(
     control: &SupervisorControlClient,
     executable: &Path,
     frame: &[u8],
+    shutdown_custody: &ShutdownCustody,
 ) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     let mut command = Command::new(executable);
     swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
@@ -1469,6 +1586,7 @@ async fn spawn_supervisor_child(
                 None,
                 control,
                 "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                shutdown_custody,
             )
             .await;
             return Err(error);
@@ -1485,6 +1603,7 @@ async fn spawn_supervisor_child(
             Some(identity),
             control,
             "MODULE_SUPERVISOR_BOOTSTRAP_PIPE_UNAVAILABLE",
+            shutdown_custody,
         )
         .await
         {
@@ -1504,6 +1623,7 @@ async fn spawn_supervisor_child(
             Some(identity),
             control,
             "MODULE_SUPERVISOR_BOOTSTRAP_WRITE_FAILED",
+            shutdown_custody,
         )
         .await
         {
@@ -1606,6 +1726,7 @@ mod tests {
     const ROOT_ENV: &str = "ELIOT_SWARM_UNKNOWN362_ROOT";
     const RELEASE_ENV: &str = "ELIOT_SWARM_UNKNOWN362_RELEASE";
     const LAUNCHES_ENV: &str = "ELIOT_SWARM_UNKNOWN362_LAUNCHES";
+    const DRAINING_ENV: &str = "ELIOT_SWARM_UNKNOWN362_DRAINING";
     const CHILD_RELEASE_ENV: &str = "ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE";
     const MAIN_TEST: &str = "host_module_supervisor::tests::unknown362_identity_failure_and_health_write_failure_survive_restart";
     const CHILD_TEST: &str = "host_module_supervisor::tests::child_waits_for_release";
@@ -1744,30 +1865,56 @@ mod tests {
         let root = fs::canonicalize(root).expect("canonicalize exact test directory");
         let release = root.join("release-child");
         let launches = root.join("launches.jsonl");
+        let draining = release.with_extension("draining");
         let mut release_guard = ReleaseFileGuard::new(release.clone());
         initialize_store(&root).await;
         install_identity_health_rejection(&root);
 
         let mut host_a = spawn_host_process("host-a", &root, &release, &launches);
+        let first_launch = time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(record) = read_launches(&launches).into_iter().next() {
+                    break record;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first generation recorded its exact child before timeout");
+        let (pid, birth) = launch_identity(&first_launch);
+        time::timeout(Duration::from_secs(10), async {
+            while !draining.exists() {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first host entered host-owned child custody drain");
+        assert_same_live_process(pid, &birth, "while first host shutdown is pending");
+        let early_host_exit = time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let Some(status) = host_a
+                    .try_wait()
+                    .expect("observe first host while its child is retained")
+                {
+                    break status;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            early_host_exit.is_err(),
+            "host returned while its exact supervisor child was still active"
+        );
+
+        release_guard.release();
         let host_a_status = host_a.wait().expect("wait for first host generation");
         assert!(host_a_status.success(), "first host generation failed");
-        let first_launch = read_launches(&launches)
-            .into_iter()
-            .next()
-            .expect("first generation recorded its exact child");
-        let (pid, birth) = launch_identity(&first_launch);
-        assert_same_live_process(pid, &birth, "after first host teardown");
+        wait_for_process_departure(pid, &birth).await;
 
         let mut host_b = spawn_host_process("host-b", &root, &release, &launches);
         let host_b_status = host_b.wait().expect("wait for restarted host generation");
         let launch_records = read_launches(&launches);
-        assert_same_live_process(pid, &birth, "after restart reconciliation");
-
-        release_guard.release();
-        for record in &launch_records {
-            let (child_pid, child_birth) = launch_identity(record);
-            wait_for_process_departure(child_pid, &child_birth).await;
-        }
 
         assert!(host_b_status.success(), "restarted host generation failed");
         assert_eq!(
@@ -1790,6 +1937,7 @@ mod tests {
             .env(ROOT_ENV, root)
             .env(RELEASE_ENV, release)
             .env(LAUNCHES_ENV, launches)
+            .env(DRAINING_ENV, release.with_extension("draining"))
             .spawn()
             .expect("start isolated host-generation test process")
     }
@@ -1798,7 +1946,9 @@ mod tests {
         let root = env_path(ROOT_ENV);
         let release = env_path(RELEASE_ENV);
         let launches = env_path(LAUNCHES_ENV);
+        let draining = env_path(DRAINING_ENV);
         let runtime = TestIpcRuntime::start(&root).await;
+        let shutdown_custody = ShutdownCustody::new(runtime.owner.store.clone());
         record_module_actor_status(
             &runtime.control,
             "isolated",
@@ -1821,6 +1971,7 @@ mod tests {
             None,
             &runtime.control,
             "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+            &shutdown_custody,
         )
         .await
         .expect("transfer the exact unidentified Child to its reaper");
@@ -1848,6 +1999,11 @@ mod tests {
             retained.child.is_none(),
             "no unverified child receipt was written"
         );
+        fs::write(&draining, b"waiting").expect("mark host-owned child custody drain");
+        shutdown_custody
+            .drain()
+            .await
+            .expect("host waits for the exact unidentified child before Store close");
         runtime.close().await;
     }
 

@@ -28,6 +28,17 @@ const SUPERVISOR_OBSERVATION_RECORD: &str = "module.supervisor.observation.recor
 const SUPERVISOR_HEALTH_RECORD: &str = "module.supervisor.health.record";
 const SUPERVISOR_HEALTH_READ: &str = "module.supervisor.health.read";
 
+/// The only four outcomes accepted at the Store observation boundary. A
+/// permanent rejection is usable only when the host confirms it retained the
+/// exact scope and event in the existing observation journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationDeliveryDisposition {
+    Committed,
+    ExactDuplicate,
+    RetryableInfrastructureFailure { error_code: String },
+    ScopedPermanentRejection { error_code: String },
+}
+
 /// Status-only Operation evidence returned by the host.  Inputs, outputs,
 /// caller identities, and native payloads never cross this boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,13 +496,64 @@ impl SupervisorControlClient {
     pub async fn record_observation(
         &self,
         observation: &ModuleSupervisorObservation,
-    ) -> Result<()> {
-        self.request_value(
-            SUPERVISOR_OBSERVATION_RECORD,
-            json!({"observation": observation}),
-        )
-        .await
-        .map(|_| ())
+    ) -> ObservationDeliveryDisposition {
+        let value = self
+            .request_value(
+                SUPERVISOR_OBSERVATION_RECORD,
+                json!({"observation": observation}),
+            )
+            .await;
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                return ObservationDeliveryDisposition::RetryableInfrastructureFailure {
+                    error_code: safe_observation_error_code(&error.code),
+                };
+            }
+        };
+        let Some(object) = value.as_object() else {
+            return ObservationDeliveryDisposition::RetryableInfrastructureFailure {
+                error_code: "MODULE_SUPERVISOR_RESPONSE_INVALID".to_owned(),
+            };
+        };
+        match object.get("disposition").and_then(Value::as_str) {
+            Some("committed") if object.len() == 1 => ObservationDeliveryDisposition::Committed,
+            Some("exact_duplicate") if object.len() == 1 => {
+                ObservationDeliveryDisposition::ExactDuplicate
+            }
+            Some("scoped_permanent_rejection")
+                if object.len() == 9
+                    && object.get("retained") == Some(&Value::Bool(true))
+                    && object.get("module_id").and_then(Value::as_str)
+                        == Some(observation.module_id.as_str())
+                    && object.get("binding_id").and_then(Value::as_str)
+                        == Some(observation.scope.binding_id.as_str())
+                    && object.get("generation").and_then(Value::as_u64)
+                        == Some(observation.scope.generation)
+                    && object.get("actor_instance_id").and_then(Value::as_str)
+                        == Some(observation.actor_instance_id.as_str())
+                    && object.get("event_id").and_then(Value::as_str)
+                        == Some(observation.event_id.as_str())
+                    && object.get("boot_id")
+                        == Some(
+                            &serde_json::to_value(&observation.boot_id).unwrap_or(Value::Null),
+                        )
+                    && object
+                        .get("error_code")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_safe_observation_error_code) =>
+            {
+                ObservationDeliveryDisposition::ScopedPermanentRejection {
+                    error_code: object["error_code"]
+                        .as_str()
+                        .unwrap_or("MODULE_OBSERVATION_REJECTED")
+                        .to_owned(),
+                }
+            }
+            _ => ObservationDeliveryDisposition::RetryableInfrastructureFailure {
+                error_code: "MODULE_SUPERVISOR_RESPONSE_INVALID".to_owned(),
+            },
+        }
     }
 
     pub async fn record_health(
@@ -570,5 +632,21 @@ impl SupervisorControlClient {
 
     async fn request_value(&self, method: &str, params: Value) -> Result<Value> {
         swarm_client::call(&self.root, &self.credential, method, params, &self.ipc).await
+    }
+}
+
+fn is_safe_observation_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn safe_observation_error_code(code: &str) -> String {
+    if is_safe_observation_error_code(code) {
+        code.to_owned()
+    } else {
+        "MODULE_SUPERVISOR_DELIVERY_UNKNOWN".to_owned()
     }
 }

@@ -1779,21 +1779,30 @@ impl Store {
     }
 
     pub async fn supervise_scripts(&self, mut stop: watch::Receiver<bool>) -> Result<()> {
+        let mut stopping = *stop.borrow();
         loop {
-            if *stop.borrow() {
-                return Ok(());
+            if stopping {
+                // Keep the Store-owned Child handles alive after the host's
+                // bounded shutdown grace. Each observation is a nonblocking
+                // try_wait; a failed observation remains under custody.
+                if !self.poll_script_children(true).await.unwrap_or(true) {
+                    return Ok(());
+                }
+                tokio::time::sleep(RECONCILE_INTERVAL).await;
+                continue;
             }
             self.reconcile_scripts_once().await?;
             tokio::select! {
                 _ = tokio::time::sleep(RECONCILE_INTERVAL) => {},
                 changed = stop.changed() => {
-                    if changed.is_err() || *stop.borrow() { return Ok(()); }
+                    if changed.is_err() || *stop.borrow() { stopping = true; }
                 }
             }
         }
     }
 
     pub(crate) async fn reconcile_scripts_once(&self) -> Result<()> {
+        self.poll_script_children(false).await?;
         let rows = self.run(|db| pending_runs(db)).await?;
         for pending in rows {
             let run_id = pending.run_id.clone();
@@ -1851,8 +1860,13 @@ impl Store {
                 continue;
             }
             let observe_work = work.clone();
+            let observe_digest = pending.work_digest.clone();
+            let child_custody = self.script_child_custody.clone();
             let observed = self
-                .file_io(move |files| observe(&observe_work, &files))
+                .file_io(move |files| {
+                    let child = child_custody.observe(&observe_work, &observe_digest)?;
+                    observe(&observe_work, &files, child)
+                })
                 .await;
             let observed = match observed {
                 Ok(observed) => observed,
@@ -1940,6 +1954,7 @@ impl Store {
                         return Err(error);
                     }
                 } else {
+                    self.release_script_child_custody(&pending).await?;
                     self.changed
                         .send_modify(|revision| *revision = revision.wrapping_add(1));
                 }
@@ -1958,8 +1973,11 @@ impl Store {
                         Ok(true) => {
                             let spawn_work = start_work.clone();
                             let digest = pending.work_digest.clone();
+                            let child_custody = self.script_child_custody.clone();
                             let launch = self
-                                .file_io(move |_| runner::prepare_and_spawn(&spawn_work, &digest))
+                                .file_io(move |_| {
+                                    runner::prepare_and_spawn(&child_custody, &spawn_work, &digest)
+                                })
                                 .await;
                             if let Err(error) = launch {
                                 self.record_run_error(&pending, error.clone()).await?;
@@ -2102,6 +2120,7 @@ impl Store {
         let code = code.to_owned();
         self.run(move |db| fail_before_start(db, &run_id, &code))
             .await?;
+        self.release_script_child_custody(pending).await?;
         self.changed
             .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
@@ -2117,6 +2136,7 @@ impl Store {
         let code = code.to_owned();
         self.run(move |db| settle_incomplete(db, &run_id, &code, execution_may_have_started))
             .await?;
+        self.release_script_child_custody(pending).await?;
         self.changed
             .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
@@ -2155,6 +2175,7 @@ impl Store {
         pending: &PendingRun,
         code: &str,
     ) -> Result<()> {
+        let child_departed = self.exact_script_child_exit_observed(pending).await;
         let data_dir = self.data_dir.clone();
         let run_id = pending.run_id.clone();
         let operation_id = pending.operation_id.clone();
@@ -2163,13 +2184,22 @@ impl Store {
                 runner::prestart_worker_family_departed(&data_dir, &run_id, &operation_id)
             })
             .await;
-        match departed {
-            Ok(true) if pending.operation_state == "sending" => {
+        match (departed, child_departed) {
+            (Ok(true), Ok(true)) if pending.operation_state == "sending" => {
                 self.fail_before_start(pending, code).await
             }
-            Ok(true) => self.settle_incomplete(pending, code, false).await,
-            Ok(false) => self.mark_unknown(pending, code).await,
-            Err(error) => {
+            (Ok(true), Ok(true)) => self.settle_incomplete(pending, code, false).await,
+            (Ok(true), Ok(false)) => {
+                let error = Error::new(
+                    "SCRIPT_CHILD_DEPARTURE_UNKNOWN",
+                    "process-family evidence conflicts with the still-running Store-owned Child",
+                );
+                self.record_run_error(pending, error).await?;
+                self.mark_unknown(pending, "SCRIPT_CHILD_DEPARTURE_UNKNOWN")
+                    .await
+            }
+            (Ok(false), Ok(_)) => self.mark_unknown(pending, code).await,
+            (Err(error), _) | (_, Err(error)) => {
                 self.record_run_error(pending, error.clone()).await?;
                 self.mark_unknown(pending, &error.code).await
             }
@@ -2202,6 +2232,14 @@ impl Store {
         let data_dir = self.data_dir.clone();
         let run_id = pending.run_id.clone();
         let operation_id = pending.operation_id.clone();
+        let child_departed = match self.exact_script_child_exit_observed(pending).await {
+            Ok(departed) => departed,
+            Err(error) => {
+                self.record_run_error(pending, error.clone()).await?;
+                self.mark_unknown(pending, &error.code).await?;
+                return Ok(());
+            }
+        };
         let departed = self
             .file_io(move |_| {
                 runner::worker_family_departed_from_identity(
@@ -2213,8 +2251,13 @@ impl Store {
             })
             .await;
         match departed {
-            Ok(true) => {
+            Ok(true) if child_departed => {
                 self.settle_incomplete(pending, code, true).await?;
+                Ok(())
+            }
+            Ok(true) => {
+                self.mark_unknown(pending, "SCRIPT_CHILD_DEPARTURE_UNKNOWN")
+                    .await?;
                 Ok(())
             }
             Ok(false) => {
@@ -2234,6 +2277,33 @@ impl Store {
         let operation_id = pending.operation_id.clone();
         self.run(move |db| record_incident(db, &run_id, &operation_id, error))
             .await
+    }
+
+    async fn poll_script_children(&self, require_family_departure: bool) -> Result<bool> {
+        let custody = self.script_child_custody.clone();
+        self.file_io(move |_| Ok(custody.poll_active_children(require_family_departure)))
+            .await
+    }
+
+    async fn release_script_child_custody(&self, pending: &PendingRun) -> Result<()> {
+        let custody = self.script_child_custody.clone();
+        let run_id = pending.run_id.clone();
+        let operation_id = pending.operation_id.clone();
+        self.file_io(move |_| custody.release_after_terminal(&run_id, &operation_id))
+            .await?;
+        Ok(())
+    }
+
+    async fn exact_script_child_exit_observed(&self, pending: &PendingRun) -> Result<bool> {
+        let custody = self.script_child_custody.clone();
+        let run_id = pending.run_id.clone();
+        let operation_id = pending.operation_id.clone();
+        self.file_io(move |_| {
+            Ok(custody
+                .exit_observed(&run_id, &operation_id)?
+                .unwrap_or(true))
+        })
+        .await
     }
 }
 
@@ -2773,11 +2843,31 @@ fn completion_matches_retained_worker(
     })
 }
 
-fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservation> {
+fn observe(
+    work: &runner::Work,
+    files: &ArtifactFiles,
+    child: Option<runner::ScriptChildObservation>,
+) -> Result<RunnerObservation> {
+    let child_departed = child.as_ref().is_none_or(|child| child.exit.is_some());
+    if let Some(exit) = child.as_ref().and_then(|child| child.exit)
+        && let Some(early_exit) = child
+            .as_ref()
+            .and_then(|child| child.launch.as_ref())
+            .and_then(|launch| launch.get("early_exit"))
+            .filter(|receipt| !receipt.is_null())
+        && early_exit["exit_code"] != json!(exit.code)
+    {
+        return Err(Error::new(
+            "SCRIPT_LAUNCH_DAMAGED",
+            "early-exit receipt differs from Store-observed Child status",
+        ));
+    }
     // A damaged optional diagnostic must not block a valid terminal receipt.
     let process_control_failure = runner::process_control_failure(work).ok().flatten();
     if let Some(completion) = runner::completion(work, files)? {
-        let launch_departed = runner::completion_family_departed(work, &completion)?;
+        validate_script_custody_process(child.as_ref(), &completion.process)?;
+        let launch_departed =
+            child_departed && runner::completion_family_departed(work, &completion)?;
         return Ok(RunnerObservation {
             completion: Some(completion),
             cleanup_pending: None,
@@ -2790,13 +2880,14 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
     }
     if let Some(pending) = runner::cleanup_pending(work, files)? {
         if let Some(completion) = runner::recover_cleanup_pending(work, files, &pending)? {
+            validate_script_custody_process(child.as_ref(), &completion.process)?;
             return Ok(RunnerObservation {
                 completion: Some(completion),
                 cleanup_pending: None,
                 process_control_failure,
                 ready: None,
                 launch: None,
-                launch_departed: true,
+                launch_departed: child_departed,
                 start_allowed: runner::has_start_gate(work)?,
             });
         }
@@ -2811,9 +2902,20 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
         });
     }
     let ready = runner::ready(work)?;
-    let launch = runner::launch_record(work)?;
+    let durable_launch = runner::launch_record(work)?;
+    let launch = match (durable_launch, child.and_then(|child| child.launch)) {
+        (Some(durable), Some(owned)) if durable != owned => {
+            return Err(Error::new(
+                "SCRIPT_LAUNCH_DAMAGED",
+                "durable launch receipt differs from Store-owned Child identity",
+            ));
+        }
+        (Some(durable), _) => Some(durable),
+        (None, owned) => owned,
+    };
     let launch_departed = match launch.as_ref() {
-        Some(launch) => runner::worker_departed(work, launch)?,
+        Some(launch) if child_departed => runner::worker_departed(work, launch)?,
+        Some(_) => false,
         None => false,
     };
     Ok(RunnerObservation {
@@ -2825,6 +2927,22 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
         launch_departed,
         start_allowed: runner::has_start_gate(work)?,
     })
+}
+
+fn validate_script_custody_process(
+    child: Option<&runner::ScriptChildObservation>,
+    process: &Value,
+) -> Result<()> {
+    if child
+        .and_then(|child| child.launch.as_ref())
+        .is_some_and(|launch| launch["process"] != *process)
+    {
+        return Err(Error::new(
+            "SCRIPT_LAUNCH_DAMAGED",
+            "completion process identity differs from Store-owned Child launch identity",
+        ));
+    }
+    Ok(())
 }
 
 fn record_cleanup_pending(

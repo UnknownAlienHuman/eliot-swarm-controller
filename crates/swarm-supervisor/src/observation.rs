@@ -148,7 +148,11 @@ impl ModuleSupervisorObservation {
                 "module observation identity or sequence is invalid",
             ));
         }
-        let boot_id = status.worker_boot_id.clone();
+        let boot_id = status
+            .hello_failure
+            .as_ref()
+            .map(|failure| failure.boot_id.clone())
+            .or_else(|| status.worker_boot_id.clone());
         let event_id = match boot_id.as_deref() {
             Some(boot_id) => format!("{boot_id}:{actor_instance_id}:{sequence}"),
             None => format!("{actor_instance_id}:{sequence}"),
@@ -170,13 +174,17 @@ impl ModuleSupervisorObservation {
         for operation_id in &unknown_operation_ids {
             validate_token(operation_id, "operation_id")?;
         }
-        let error_code = match status.lifecycle {
-            LifecycleState::OwnerGroupRetained { reason, .. } => Some(reason.code().to_owned()),
-            _ => status
-                .last_failure
-                .as_ref()
-                .map(|failure| failure.code.clone()),
-        };
+        let error_code = status
+            .hello_failure
+            .as_ref()
+            .map(|failure| failure.error_code.clone())
+            .or_else(|| match status.lifecycle {
+                LifecycleState::OwnerGroupRetained { reason, .. } => Some(reason.code().to_owned()),
+                _ => status
+                    .last_failure
+                    .as_ref()
+                    .map(|failure| failure.code.clone()),
+            });
         if let Some(code) = error_code.as_deref()
             && (code.len() > 128
                 || code.is_empty()

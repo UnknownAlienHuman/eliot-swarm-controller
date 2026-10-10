@@ -6,13 +6,14 @@
 //! Store handle, database connection, controller object, or host IPC listener
 //! never crosses into this crate.
 
+use crate::control::ObservationDeliveryDisposition;
 use crate::{
     AdmissionState, BindingLaunchConfig, BindingMapPublication, CapabilityId, DemandCause,
     DemandLease, DescriptorCatalog, KernelFault, LaunchValue, ModuleBindingCredential,
     ModuleDemandCursor, ModuleDemandRecord, ModuleDescriptor, ModuleOwnerExecutable,
     ModuleSupervisorObservation, OperationReadback, OperationSnapshot, ProtectedResolverContext,
     ResolverMapDirectory, ServiceScope, Sha256Digest, SupervisorControlClient, SupervisorRegistry,
-    SupervisorRegistryConfig, load_installed_descriptor, module_contract_claim,
+    SupervisorRegistryConfig, SupervisorStatus, load_installed_descriptor, module_contract_claim,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -214,11 +215,35 @@ impl StandaloneSupervisorConfig {
 #[serde(deny_unknown_fields)]
 pub struct SupervisorBootstrap {
     pub config: StandaloneSupervisorConfig,
+    /// Actor UUID admitted by the host after exact prior-child disposition.
+    /// `None` exists only on the host-side bootstrap template and can never
+    /// cross the child pipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_instance_id: Option<String>,
 }
 
 impl SupervisorBootstrap {
     pub fn validate(&self) -> Result<()> {
-        self.config.validate()
+        self.config.validate()?;
+        if self
+            .actor_instance_id
+            .as_deref()
+            .is_some_and(|actor| Uuid::parse_str(actor).is_err())
+        {
+            return Err(Error::invalid("supervisor actor admission ID is invalid"));
+        }
+        Ok(())
+    }
+
+    fn validate_for_child(&self) -> Result<()> {
+        self.validate()?;
+        if self.actor_instance_id.is_none() {
+            return Err(Error::new(
+                "MODULE_ACTOR_ADMISSION_REQUIRED",
+                "host did not admit an actor UUID before supervisor bootstrap",
+            ));
+        }
+        Ok(())
     }
 
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
@@ -232,7 +257,7 @@ impl SupervisorBootstrap {
             ));
         }
         let bootstrap: Self = serde_json::from_slice(&bytes)?;
-        bootstrap.validate()?;
+        bootstrap.validate_for_child()?;
         Ok(bootstrap)
     }
 
@@ -250,12 +275,12 @@ impl SupervisorBootstrap {
             ));
         }
         let bootstrap: Self = serde_json::from_reader(Cursor::new(line.as_slice()))?;
-        bootstrap.validate()?;
+        bootstrap.validate_for_child()?;
         Ok(bootstrap)
     }
 
     pub fn to_frame(&self) -> Result<Vec<u8>> {
-        self.validate()?;
+        self.validate_for_child()?;
         let mut bytes = serde_json::to_vec(self)?;
         bytes.push(b'\n');
         if bytes.len() > MAX_BOOTSTRAP_BYTES {
@@ -766,6 +791,12 @@ struct HealthSnapshot {
     retry_in_ms: Option<u64>,
 }
 
+struct PendingStatusObservation {
+    event: ModuleSupervisorObservation,
+    status: SupervisorStatus,
+    fingerprint: String,
+}
+
 /// Independent lifecycle process. It performs the same exact credential,
 /// resolver, operation-readback, and owner-helper ordering as the embedded
 /// host actor while keeping all durable authority behind `SupervisorControlClient`.
@@ -789,15 +820,41 @@ impl StandaloneSupervisor {
     }
 
     pub async fn start_from_bootstrap(bootstrap: SupervisorBootstrap) -> Result<Self> {
-        bootstrap.validate()?;
-        Self::start(bootstrap.config).await
+        bootstrap.validate_for_child()?;
+        let actor_instance_id = bootstrap.actor_instance_id.ok_or_else(|| {
+            Error::new(
+                "MODULE_ACTOR_ADMISSION_REQUIRED",
+                "host did not admit an actor UUID before supervisor bootstrap",
+            )
+        })?;
+        let config = bootstrap.config;
+        let provider = Arc::new(StaticLaunchConfigProvider {
+            entries: config.launch_configs.clone(),
+            mapper: config.route_config_mapper,
+            protected_files: config.protected_files.clone(),
+        });
+        Self::start_with_actor(config, actor_instance_id, provider).await
     }
 
     pub async fn start_with_provider(
         config: StandaloneSupervisorConfig,
         launch_config: Arc<dyn LaunchConfigProvider>,
     ) -> Result<Self> {
+        // This convenience entry point remains useful to embedded callers.
+        // Store's retained actor fence rejects its locally generated UUID
+        // unless the host has admitted that exact actor.
+        Self::start_with_actor(config, Uuid::new_v4().to_string(), launch_config).await
+    }
+
+    async fn start_with_actor(
+        config: StandaloneSupervisorConfig,
+        actor_instance_id: String,
+        launch_config: Arc<dyn LaunchConfigProvider>,
+    ) -> Result<Self> {
         config.validate()?;
+        if Uuid::parse_str(&actor_instance_id).is_err() {
+            return Err(Error::invalid("supervisor actor admission ID is invalid"));
+        }
         create_private_directory(&config.state_root)?;
         create_private_directory(&config.resolver_root)?;
         let mut descriptors = Vec::with_capacity(config.descriptor_files.len());
@@ -848,7 +905,7 @@ impl StandaloneSupervisor {
             resolver,
             config,
             launch_config,
-            actor_instance_id: Uuid::new_v4().to_string(),
+            actor_instance_id,
         })
     }
 
@@ -862,7 +919,8 @@ impl StandaloneSupervisor {
         let mut recovered = false;
         let mut held = HashMap::<DemandKey, DemandLease>::new();
         let mut last_status = HashMap::<(String, ServiceScope), String>::new();
-        let mut pending = VecDeque::<ModuleSupervisorObservation>::new();
+        let mut pending = VecDeque::<PendingStatusObservation>::new();
+        let mut delivery_quarantines = HashMap::<(String, ServiceScope), String>::new();
         let mut sequence = 0_u64;
         let mut last_health = None::<HealthSnapshot>;
         let mut consecutive_failures = 0_u32;
@@ -871,6 +929,7 @@ impl StandaloneSupervisor {
                 return Ok(());
             }
             let mut cycle_error = None::<String>;
+            let mut scoped_error = delivery_quarantines.values().next().cloned();
             let mut saw_demand = false;
             match self.control.admission().await {
                 Ok(AdmissionState::Open) => {
@@ -889,7 +948,7 @@ impl StandaloneSupervisor {
                         }
                     }
                     if recovered {
-                        match self.reconcile_demands(&mut held).await {
+                        match self.reconcile_demands(&mut held, &mut scoped_error).await {
                             Ok(found) => saw_demand = found,
                             Err(error) => {
                                 self.registry
@@ -914,14 +973,28 @@ impl StandaloneSupervisor {
                     eprintln!("module supervisor admission: {}", error.code);
                 }
             }
-            if let Err(error) = self
-                .collect_status_events(&mut last_status, &mut pending, &mut sequence)
+            if let Some(error_code) = scoped_error {
+                cycle_error.get_or_insert(error_code);
+            }
+            match self
+                .collect_status_events(
+                    &mut last_status,
+                    &mut pending,
+                    &mut sequence,
+                    &mut delivery_quarantines,
+                )
                 .await
             {
-                self.registry
-                    .close_durable_admission(KernelFault::StoreUnavailable);
-                cycle_error.get_or_insert_with(|| error.code.clone());
-                eprintln!("module supervisor observation: {}", error.code);
+                Err(error) => {
+                    self.registry
+                        .close_durable_admission(KernelFault::StoreUnavailable);
+                    cycle_error.get_or_insert_with(|| error.code.clone());
+                    eprintln!("module supervisor observation: {}", error.code);
+                }
+                Ok(Some(error_code)) => {
+                    cycle_error.get_or_insert(error_code);
+                }
+                Ok(None) => {}
             }
             if let Some(ref error_code) = cycle_error {
                 consecutive_failures = consecutive_failures.saturating_add(1).min(32);
@@ -1038,7 +1111,11 @@ impl StandaloneSupervisor {
             .map_err(module_error)
     }
 
-    async fn reconcile_demands(&self, held: &mut HashMap<DemandKey, DemandLease>) -> Result<bool> {
+    async fn reconcile_demands(
+        &self,
+        held: &mut HashMap<DemandKey, DemandLease>,
+        scoped_error: &mut Option<String>,
+    ) -> Result<bool> {
         let mut cursor = None::<ModuleDemandCursor>;
         let mut seen = HashSet::<DemandKey>::new();
         let mut saw_demand = false;
@@ -1107,7 +1184,19 @@ impl StandaloneSupervisor {
                             .confirm_module_hello(&key.module_id, &scope, boot_id)
                             .await
                     {
-                        eprintln!("module hello readback: {}", error.code);
+                        if is_control_failure(&error) {
+                            return Err(error);
+                        }
+                        self.registry
+                            .record_module_hello_failure(
+                                &key.module_id,
+                                &scope,
+                                boot_id,
+                                &error.code,
+                            )
+                            .await
+                            .map_err(module_error)?;
+                        scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
                     }
                     continue;
                 }
@@ -1159,7 +1248,19 @@ impl StandaloneSupervisor {
                             .confirm_module_hello(&demand.module_id, &scope, boot_id)
                             .await
                     {
-                        eprintln!("module new-scope hello readback: {}", error.code);
+                        if is_control_failure(&error) {
+                            return Err(error);
+                        }
+                        self.registry
+                            .record_module_hello_failure(
+                                &demand.module_id,
+                                &scope,
+                                boot_id,
+                                &error.code,
+                            )
+                            .await
+                            .map_err(module_error)?;
+                        scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
                     }
                 }
                 match self.start_demand(&demand, readback).await {
@@ -1222,7 +1323,14 @@ impl StandaloneSupervisor {
                     .confirm_module_hello(&key.module_id, &scope, boot_id)
                     .await
             {
-                eprintln!("module stale-scope hello readback: {}", error.code);
+                if is_control_failure(&error) {
+                    return Err(error);
+                }
+                self.registry
+                    .record_module_hello_failure(&key.module_id, &scope, boot_id, &error.code)
+                    .await
+                    .map_err(module_error)?;
+                scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
             }
             let pending = readback
                 .operations
@@ -1363,14 +1471,27 @@ impl StandaloneSupervisor {
     async fn collect_status_events(
         &self,
         last_status: &mut HashMap<(String, ServiceScope), String>,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        pending: &mut VecDeque<PendingStatusObservation>,
         sequence: &mut u64,
-    ) -> Result<()> {
+        quarantined: &mut HashMap<(String, ServiceScope), String>,
+    ) -> Result<Option<String>> {
+        let mut health_code = None;
+        let mut overflow = false;
         for status in self.registry.observation_statuses().await {
             let key = (status.module_id.clone(), status.scope.clone());
+            if quarantined.contains_key(&key) {
+                continue;
+            }
             let fingerprint = serde_json::to_string(&status)?;
             if last_status.get(&key) == Some(&fingerprint) {
                 self.registry.acknowledge_ready_observation(&status).await;
+                continue;
+            }
+            if pending.iter().any(|item| {
+                item.event.module_id == status.module_id
+                    && item.event.scope == status.scope
+                    && item.fingerprint == fingerprint
+            }) {
                 continue;
             }
             let next = sequence.checked_add(1).ok_or_else(|| {
@@ -1380,29 +1501,57 @@ impl StandaloneSupervisor {
                 )
             })?;
             if pending.len() >= MAX_STATUS_QUEUE {
-                eprintln!("module observation queue is full; retaining latest status");
-                continue;
+                overflow = true;
+                break;
             }
             let event =
                 ModuleSupervisorObservation::from_status(&status, &self.actor_instance_id, next)?;
             *sequence = next;
-            pending.push_back(event);
-            last_status.insert(key, fingerprint);
-            self.registry.acknowledge_ready_observation(&status).await;
+            pending.push_back(PendingStatusObservation {
+                event,
+                status,
+                fingerprint,
+            });
         }
-        while let Some(event) = pending.front() {
-            match self.control.record_observation(event).await {
-                Ok(()) => {
-                    pending.pop_front();
+        while let Some(item) = pending.front() {
+            match self.control.record_observation(&item.event).await {
+                ObservationDeliveryDisposition::Committed
+                | ObservationDeliveryDisposition::ExactDuplicate => {
+                    if let Some(item) = pending.pop_front() {
+                        let key = (item.status.module_id.clone(), item.status.scope.clone());
+                        last_status.insert(key, item.fingerprint);
+                        self.registry
+                            .acknowledge_ready_observation(&item.status)
+                            .await;
+                    }
                 }
-                Err(error) if is_control_failure(&error) => return Err(error),
-                Err(error) => {
-                    eprintln!("module observation retained: {}", error.code);
-                    break;
+                ObservationDeliveryDisposition::RetryableInfrastructureFailure { error_code } => {
+                    return Err(Error::new(
+                        error_code,
+                        "module observation delivery is uncertain; the exact event remains queued",
+                    ));
+                }
+                ObservationDeliveryDisposition::ScopedPermanentRejection { error_code } => {
+                    let Some(front) = pending.front() else {
+                        break;
+                    };
+                    let key = (front.status.module_id.clone(), front.status.scope.clone());
+                    self.registry
+                        .quarantine_scope(&key.0, &key.1, &error_code)
+                        .await
+                        .map_err(module_error)?;
+                    if let Some(item) = pending.pop_front() {
+                        last_status.insert(key.clone(), item.fingerprint);
+                        quarantined.insert(key, error_code.clone());
+                        health_code.get_or_insert(error_code);
+                    }
                 }
             }
         }
-        Ok(())
+        if overflow {
+            health_code.get_or_insert_with(|| "MODULE_OBSERVATION_QUEUE_FULL".to_owned());
+        }
+        Ok(health_code)
     }
 }
 

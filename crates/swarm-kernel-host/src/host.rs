@@ -13,6 +13,7 @@ use tokio::{
 };
 
 mod legacy_optional_workers;
+pub(crate) use legacy_optional_workers::ShutdownCustody;
 
 pub async fn run(config: Config) -> Result<()> {
     run_until(config, async {
@@ -159,6 +160,7 @@ async fn run_until(
         }
     };
     let (shutdown, stopping) = watch::channel(false);
+    let shutdown_custody = ShutdownCustody::new(owner.store.clone());
     // Keep the optional actor outside the host's required JoinSet: a module
     // failure cannot stop the Store, listener, or unrelated workers.
     let optional_module_supervisor = if config.module_supervisor.enabled {
@@ -170,6 +172,7 @@ async fn run_until(
                 (*ipc_config).clone(),
                 config.clone(),
                 stopping.clone(),
+                shutdown_custody.clone(),
             ),
         )
     } else {
@@ -187,11 +190,12 @@ async fn run_until(
     let mut supervisor_names: HashMap<Id, &'static str> = HashMap::new();
     let legacy_store = owner.store.clone();
     let legacy_stop = stopping.clone();
+    let legacy_custody = shutdown_custody.clone();
     spawn_supervisor(
         &mut supervisors,
         &mut supervisor_names,
         "legacy-workers",
-        async move { legacy_optional_workers::run(legacy_store, legacy_stop).await },
+        async move { legacy_optional_workers::run(legacy_store, legacy_stop, legacy_custody).await },
     );
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
@@ -304,6 +308,14 @@ async fn run_until(
             }
         }
     }
+    // This guard owns unfinished worker joins, module-supervisor Child reapers,
+    // and the Store clone for CheckRun/ScriptRun children. Shutdown stays
+    // pending until every retained child/family is reconciled before Store
+    // close and before the runtime owner can return.
+    if let Err(error) = shutdown_custody.drain().await {
+        eprintln!("host child custody shutdown: {error}");
+        retain_host_custody_error(&mut exit, error);
+    }
     if let Some(error_code) = kernel_snapshot_error_code(owner.store.kernel_snapshot()) {
         eprintln!("host kernel admission: {error_code}");
         retain_shutdown_error(
@@ -324,6 +336,25 @@ fn retain_shutdown_error(exit: &mut Result<()>, error: Error) {
         Ok(()) => Err(error),
         Err(primary) => Err(primary.with_secondary_error(error)),
     };
+}
+
+fn retain_host_custody_error(exit: &mut Result<()>, error: Error) {
+    if is_store_or_kernel_shutdown_failure(&error)
+        && let Err(primary) = exit
+        && !is_store_or_kernel_shutdown_failure(primary)
+    {
+        let previous = match std::mem::replace(exit, Ok(())) {
+            Err(previous) => previous,
+            Ok(()) => unreachable!("the prior host exit error was observed"),
+        };
+        *exit = Err(error.with_secondary_error(previous));
+        return;
+    }
+    retain_shutdown_error(exit, error);
+}
+
+fn is_store_or_kernel_shutdown_failure(error: &Error) -> bool {
+    error.code.starts_with("STORE_") || error.code.starts_with("KERNEL_")
 }
 
 fn kernel_snapshot_error_code(snapshot: swarm_kernel::KernelHostSnapshot) -> Option<&'static str> {

@@ -16,8 +16,8 @@ use std::{
     fs::{self, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use super::{
@@ -56,6 +56,385 @@ struct WorkerReceipt {
     run_id: String,
     work_digest: String,
     data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScriptChildExit {
+    pub(crate) code: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptChildObservation {
+    pub(crate) launch: Option<Value>,
+    pub(crate) exit: Option<ScriptChildExit>,
+}
+
+struct ScriptChildOwner {
+    data_dir: PathBuf,
+    work_digest: String,
+    operation_id: String,
+    token: String,
+    pid: u32,
+    child: Option<Child>,
+    launch: Option<Value>,
+    launch_persistence_pending: bool,
+    exit: Option<ScriptChildExit>,
+    release_when_exited: bool,
+}
+
+/// Store-owned direct-worker custody. The OS Child is polled without blocking;
+/// no helper thread can detach from the Store's lifetime or lose its handle.
+#[derive(Clone, Default)]
+pub(crate) struct ScriptChildCustody {
+    owners: Arc<Mutex<BTreeMap<String, ScriptChildOwner>>>,
+}
+
+impl ScriptChildCustody {
+    fn lock(&self) -> Result<MutexGuard<'_, BTreeMap<String, ScriptChildOwner>>> {
+        self.owners.lock().map_err(|_| {
+            Error::new(
+                "SCRIPT_CHILD_CUSTODY_UNKNOWN",
+                "script worker custody lock is unavailable; retained child ownership is unknown",
+            )
+        })
+    }
+
+    pub(crate) fn prepare_and_spawn(&self, work: &Work, work_digest: &str) -> Result<Value> {
+        validate_work(work)?;
+        let mut owners = self.lock()?;
+        if let Some(owner) = owners.get_mut(&work.run_id) {
+            validate_script_child_owner(owner, work, work_digest)?;
+            let Some(launch) = owner.launch.clone() else {
+                return Err(Error::new(
+                    "SCRIPT_LAUNCH_UNKNOWN",
+                    "this ScriptRun already has a Store-owned worker without a retained launch identity; it will not be respawned",
+                ));
+            };
+            let dir = directory(&work.data_dir, &work.run_id)?;
+            write_once(
+                &dir.join("launch.json"),
+                &model::canonical(&launch)?.into_bytes(),
+            )?;
+            owner.launch_persistence_pending = false;
+            return Ok(launch);
+        }
+
+        let dir = directory(&work.data_dir, &work.run_id)?;
+        ensure_private_directory(&work.data_dir, &dir)?;
+        let work_path = dir.join("work.json");
+        let bytes = fs::read(&work_path)?;
+        if model::digest(&bytes) != work_digest {
+            return Err(Error::new(
+                "SCRIPT_WORK_DAMAGED",
+                "script work receipt digest differs from Store",
+            ));
+        }
+        if dir.join("launch.json").try_exists()? {
+            let launch = read_json(&dir.join("launch.json"))?;
+            validate_script_launch_identity(work, &launch)?;
+            return Ok(launch);
+        }
+        if dir.join("worker.json").try_exists()? || dir.join("completion.json").try_exists()? {
+            return Err(Error::new(
+                "SCRIPT_WORKER_EXISTS",
+                "script run already has a worker identity",
+            ));
+        }
+        let current =
+            manifest::capture_interpreter(&work.interpreter.canonical_path, work.interpreter.kind)?;
+        if current.sha256 != work.interpreter.sha256
+            || current.canonical_path != work.interpreter.canonical_path
+        {
+            return Err(Error::new(
+                "SCRIPT_INTERPRETER_CHANGED",
+                "configured interpreter changed after admission",
+            ));
+        }
+        let pin = work.executor.as_ref().ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EXECUTOR_UNSELECTED",
+                "new ScriptRun requires a pinned standalone worker",
+            )
+        })?;
+        let executable = swarm_script_worker::verify_pinned_executor_file(pin)?;
+        let mut command = Command::new(executable);
+        command.arg("--file").arg(dir.join("receipt.json"));
+        command
+            .env_clear()
+            .envs(standalone_worker_environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let child = command.spawn()?;
+        let pid = child.id();
+        owners.insert(
+            work.run_id.clone(),
+            ScriptChildOwner {
+                data_dir: work.data_dir.clone(),
+                work_digest: work_digest.to_owned(),
+                operation_id: work.operation_id.clone(),
+                token: work.token.clone(),
+                pid,
+                child: Some(child),
+                launch: None,
+                launch_persistence_pending: false,
+                exit: None,
+                release_when_exited: false,
+            },
+        );
+        let owner = owners
+            .get_mut(&work.run_id)
+            .expect("spawned ScriptRun child is inserted into Store custody");
+
+        let (process, early_exit) = match spawned_identity(pid) {
+            Ok(identity) => (Some(identity), None),
+            Err(error) if error.code == "PROCESS_GONE" => {
+                let status = match owner.child.as_mut().and_then(|child| child.try_wait().ok()) {
+                    Some(Some(status)) => status,
+                    Some(None) | None => {
+                        return Err(Error::new(
+                            "SCRIPT_LAUNCH_UNKNOWN",
+                            "worker process identity could not be captured and its Store-owned exit was not confirmed",
+                        ));
+                    }
+                };
+                owner.exit = Some(script_child_exit(status));
+                drop(owner.child.take());
+                if receipt_exists(&dir.join("worker.json"))?
+                    || receipt_exists(&dir.join("start-decision.json"))?
+                    || receipt_exists(&dir.join("go.json"))?
+                    || receipt_exists(&dir.join("started.json"))?
+                    || receipt_exists(&dir.join("completion.json"))?
+                    || receipt_exists(&dir.join("terminal.json"))?
+                {
+                    return Err(Error::new(
+                        "SCRIPT_LAUNCH_UNKNOWN",
+                        "worker exited before launch identity capture but run receipts prevent an early-exit proof",
+                    ));
+                }
+                (
+                    None,
+                    Some(EarlyExitReceipt {
+                        schema_version: 1,
+                        state: EarlyExitState::ExitedBeforeWorkerIdentity,
+                        run_id: work.run_id.clone(),
+                        operation_id: work.operation_id.clone(),
+                        token: work.token.clone(),
+                        pid,
+                        exit_code: owner.exit.and_then(|exit| exit.code),
+                    }),
+                )
+            }
+            Err(error) => {
+                return Err(Error::new(
+                    "SCRIPT_LAUNCH_UNKNOWN",
+                    format!("worker started without a pinned launch identity: {error}"),
+                ));
+            }
+        };
+        let launch = json!({
+            "run_id":work.run_id,
+            "operation_id":work.operation_id,
+            "token":work.token,
+            "spawned_at_ms":model::now_ms()?,
+            "process":process,
+            "early_exit":early_exit
+        });
+        validate_script_launch_identity(work, &launch)?;
+        owner.launch = Some(launch.clone());
+        owner.launch_persistence_pending = true;
+        write_once(
+            &dir.join("launch.json"),
+            &model::canonical(&launch)?.into_bytes(),
+        )?;
+        owner.launch_persistence_pending = false;
+        Ok(launch)
+    }
+
+    pub(crate) fn observe(
+        &self,
+        work: &Work,
+        work_digest: &str,
+    ) -> Result<Option<ScriptChildObservation>> {
+        let mut owners = self.lock()?;
+        let Some(owner) = owners.get_mut(&work.run_id) else {
+            return Ok(None);
+        };
+        validate_script_child_owner(owner, work, work_digest)?;
+        match owner.child.as_mut().map(Child::try_wait) {
+            Some(Ok(Some(status))) => {
+                owner.exit = Some(script_child_exit(status));
+                drop(owner.child.take());
+            }
+            Some(Ok(None)) | None => {}
+            Some(Err(error)) => {
+                return Err(Error::new(
+                    "SCRIPT_CHILD_OBSERVATION_UNKNOWN",
+                    format!("Store-owned script Child status is unknown: {error}"),
+                ));
+            }
+        }
+        if let Some(launch) = owner.launch.as_ref() {
+            let dir = directory(&owner.data_dir, &work.run_id)?;
+            let launch_path = dir.join("launch.json");
+            if owner.launch_persistence_pending || !launch_path.try_exists()? {
+                write_once(&launch_path, &model::canonical(launch)?.into_bytes())?;
+                owner.launch_persistence_pending = false;
+            }
+        }
+        Ok(Some(ScriptChildObservation {
+            launch: owner.launch.clone(),
+            exit: owner.exit,
+        }))
+    }
+
+    pub(crate) fn exit_observed(&self, run_id: &str, operation_id: &str) -> Result<Option<bool>> {
+        let mut owners = self.lock()?;
+        let Some(owner) = owners.get_mut(run_id) else {
+            return Ok(None);
+        };
+        if owner.operation_id != operation_id {
+            return Err(Error::conflict(
+                "ScriptRun differs from its Store-owned Child operation identity",
+            ));
+        }
+        match owner.child.as_mut().map(Child::try_wait) {
+            Some(Ok(Some(status))) => {
+                owner.exit = Some(script_child_exit(status));
+                drop(owner.child.take());
+            }
+            Some(Ok(None)) | None => {}
+            Some(Err(error)) => {
+                return Err(Error::new(
+                    "SCRIPT_CHILD_OBSERVATION_UNKNOWN",
+                    format!("Store-owned script Child status is unknown: {error}"),
+                ));
+            }
+        }
+        Ok(Some(owner.exit.is_some()))
+    }
+
+    /// Poll every retained direct child without waiting. A failed poll retains
+    /// the Child so shutdown cannot mistake uncertainty for departure.
+    pub(crate) fn poll_active_children(&self, require_family_departure: bool) -> bool {
+        let Ok(mut owners) = self.owners.lock() else {
+            return true;
+        };
+        let mut release = Vec::new();
+        for (run_id, owner) in owners.iter_mut() {
+            if let Some(Ok(Some(status))) = owner.child.as_mut().map(Child::try_wait) {
+                owner.exit = Some(script_child_exit(status));
+                drop(owner.child.take());
+            }
+            if owner.release_when_exited && script_child_family_departed(owner) {
+                release.push(run_id.clone());
+            }
+        }
+        for run_id in release {
+            drop(owners.remove(&run_id));
+        }
+        if require_family_departure {
+            owners
+                .values()
+                .any(|owner| !script_child_family_departed(owner))
+        } else {
+            owners.values().any(|owner| owner.child.is_some())
+        }
+    }
+
+    /// Release an entry only after durable terminal settlement and direct-child
+    /// exit observation. If still active, retain it for the next bounded poll.
+    pub(crate) fn release_after_terminal(&self, run_id: &str, operation_id: &str) -> Result<bool> {
+        let mut owners = self.lock()?;
+        let Some(owner) = owners.get_mut(run_id) else {
+            return Ok(true);
+        };
+        if owner.operation_id != operation_id {
+            return Err(Error::conflict(
+                "terminal ScriptRun differs from its Store-owned child identity",
+            ));
+        }
+        if script_child_family_departed(owner) {
+            drop(owners.remove(run_id));
+            return Ok(true);
+        }
+        owner.release_when_exited = true;
+        Ok(false)
+    }
+}
+
+fn validate_script_child_owner(
+    owner: &ScriptChildOwner,
+    work: &Work,
+    work_digest: &str,
+) -> Result<()> {
+    if owner.data_dir != work.data_dir
+        || owner.work_digest != work_digest
+        || owner.operation_id != work.operation_id
+        || owner.token != work.token
+    {
+        return Err(Error::conflict(
+            "Store-owned script Child identifies another retained run",
+        ));
+    }
+    if let Some(launch) = owner.launch.as_ref() {
+        validate_script_launch_identity(work, launch)?;
+        let launch_pid = if launch["process"].is_null() {
+            launch["early_exit"]["pid"].as_u64()
+        } else {
+            launch["process"]["pid"].as_u64()
+        };
+        if launch_pid != Some(u64::from(owner.pid)) {
+            return Err(Error::new(
+                "SCRIPT_LAUNCH_DAMAGED",
+                "launch receipt process identity differs from the Store-owned Child PID",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_script_launch_identity(work: &Work, launch: &Value) -> Result<()> {
+    if launch["run_id"] != work.run_id
+        || launch["operation_id"] != work.operation_id
+        || launch["token"] != work.token
+    {
+        return Err(Error::new(
+            "SCRIPT_LAUNCH_DAMAGED",
+            "launch receipt differs from the retained ScriptRun identity",
+        ));
+    }
+    Ok(())
+}
+
+fn script_child_exit(status: ExitStatus) -> ScriptChildExit {
+    ScriptChildExit {
+        code: status.code(),
+    }
+}
+
+fn script_child_family_departed(owner: &ScriptChildOwner) -> bool {
+    if owner.child.is_some() || owner.exit.is_none() {
+        return false;
+    }
+    let Some(launch) = owner.launch.as_ref() else {
+        return false;
+    };
+    if launch["process"].is_null() {
+        return launch["early_exit"]["pid"] == json!(owner.pid);
+    }
+    let process = &launch["process"];
+    let departed = if process["scope"] == "launcher_spawned_process" {
+        spawned_departed(process, &owner.token)
+    } else {
+        departed_empty(process, &owner.token)
+    };
+    departed.unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,126 +656,12 @@ pub fn read_work_record(path: &Path) -> Result<(Work, String)> {
     Ok((work, digest))
 }
 
-pub fn prepare_and_spawn(work: &Work, work_digest: &str) -> Result<Value> {
-    validate_work(work)?;
-    let dir = directory(&work.data_dir, &work.run_id)?;
-    ensure_private_directory(&work.data_dir, &dir)?;
-    let work_path = dir.join("work.json");
-    let bytes = fs::read(&work_path)?;
-    if model::digest(&bytes) != work_digest {
-        return Err(Error::new(
-            "SCRIPT_WORK_DAMAGED",
-            "script work receipt digest differs from Store",
-        ));
-    }
-    if dir.join("launch.json").try_exists()? {
-        return read_json(&dir.join("launch.json"));
-    }
-    if dir.join("worker.json").try_exists()? || dir.join("completion.json").try_exists()? {
-        return Err(Error::new(
-            "SCRIPT_WORKER_EXISTS",
-            "script run already has a worker identity",
-        ));
-    }
-    let current =
-        manifest::capture_interpreter(&work.interpreter.canonical_path, work.interpreter.kind)?;
-    if current.sha256 != work.interpreter.sha256
-        || current.canonical_path != work.interpreter.canonical_path
-    {
-        return Err(Error::new(
-            "SCRIPT_INTERPRETER_CHANGED",
-            "configured interpreter changed after admission",
-        ));
-    }
-    let pin = work.executor.as_ref().ok_or_else(|| {
-        Error::new(
-            "SCRIPT_EXECUTOR_UNSELECTED",
-            "new ScriptRun requires a pinned standalone worker",
-        )
-    })?;
-    let executable = swarm_script_worker::verify_pinned_executor_file(pin)?;
-    let mut command = Command::new(executable);
-    command.arg("--file").arg(dir.join("receipt.json"));
-    command
-        .env_clear()
-        .envs(standalone_worker_environment())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let mut child = command.spawn()?;
-    let pid = child.id();
-    let (process, early_exit) = match spawned_identity(pid) {
-        Ok(identity) => (Some(identity), None),
-        Err(error) if error.code == "PROCESS_GONE" => {
-            let status = child.try_wait().map_err(|_| {
-                Error::new(
-                    "SCRIPT_LAUNCH_UNKNOWN",
-                    "worker process vanished before identity capture and its owned exit could not be confirmed",
-                )
-            })?.ok_or_else(|| {
-                Error::new(
-                    "SCRIPT_LAUNCH_UNKNOWN",
-                    "worker process identity could not be captured and its owned exit was not confirmed",
-                )
-            })?;
-            let dir = directory(&work.data_dir, &work.run_id)?;
-            if receipt_exists(&dir.join("worker.json"))?
-                || receipt_exists(&dir.join("start-decision.json"))?
-                || receipt_exists(&dir.join("go.json"))?
-                || receipt_exists(&dir.join("started.json"))?
-                || receipt_exists(&dir.join("completion.json"))?
-                || receipt_exists(&dir.join("terminal.json"))?
-            {
-                return Err(Error::new(
-                    "SCRIPT_LAUNCH_UNKNOWN",
-                    "worker exited before launch identity capture but run receipts prevent an early-exit proof",
-                ));
-            }
-            (
-                None,
-                Some(EarlyExitReceipt {
-                    schema_version: 1,
-                    state: EarlyExitState::ExitedBeforeWorkerIdentity,
-                    run_id: work.run_id.clone(),
-                    operation_id: work.operation_id.clone(),
-                    token: work.token.clone(),
-                    pid,
-                    exit_code: status.code(),
-                }),
-            )
-        }
-        Err(error) => {
-            return Err(Error::new(
-                "SCRIPT_LAUNCH_UNKNOWN",
-                format!("worker started without a pinned launch identity: {error}"),
-            ));
-        }
-    };
-    let exited_before_identity = early_exit.is_some();
-    let launch = json!({"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token,"spawned_at_ms":model::now_ms()? ,"process":process,"early_exit":early_exit});
-    write_once(
-        &dir.join("launch.json"),
-        &model::canonical(&launch)?.into_bytes(),
-    )?;
-    if !exited_before_identity {
-        thread::Builder::new()
-            .name("script-worker-reaper".into())
-            .spawn(move || {
-                let _ = child.wait();
-            })
-            .map_err(|error| {
-                Error::new(
-                    "SCRIPT_LAUNCH_UNKNOWN",
-                    format!("worker started but cannot be reaped: {error}"),
-                )
-            })?;
-    }
-    Ok(launch)
+pub(crate) fn prepare_and_spawn(
+    custody: &ScriptChildCustody,
+    work: &Work,
+    work_digest: &str,
+) -> Result<Value> {
+    custody.prepare_and_spawn(work, work_digest)
 }
 
 pub fn launch_record(work: &Work) -> Result<Option<Value>> {

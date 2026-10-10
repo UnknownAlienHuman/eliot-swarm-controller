@@ -15,6 +15,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -143,11 +144,33 @@ fn stream_facts(stream: &CapturedStream) -> Value {
     json!({
         "bytes_written": stream.bytes_written,
         "bytes_observed": stream.bytes_observed,
+        "sha256": stream.sha256,
+        "path": stream.path.to_string_lossy(),
         "truncated": stream.truncated,
         "capture_complete": stream.capture_complete,
         "capture_disposition": disposition,
         "capture_error": stream.capture_error
     })
+}
+
+fn execution_receipt(execution: &CheckExecution, started_at_ms: Option<i64>) -> Result<Value> {
+    Ok(json!({
+        "version": 1,
+        "check_id": execution.check_id,
+        "operation_id": execution.operation_id,
+        "process": execution.process,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": model::now_ms().map_err(into_swarm_checks_error)?,
+        "execution": {
+            "child_pid": execution.child_pid,
+            "exit_code": execution.exit_code,
+            "termination_requests": execution.termination_requests,
+            "resource_released": execution.resource_released,
+            "control_read_unknown": execution.control_read_unknown,
+            "termination_request_unconfirmed": execution.termination_request_unconfirmed,
+            "process_facts": process_facts(execution),
+        }
+    }))
 }
 
 fn termination_name(termination: Termination) -> &'static str {
@@ -221,7 +244,7 @@ fn profile_report_matches(work: &Work, reported: &Value) -> Result<bool> {
     Ok(model::canonical(&serde_json::to_value(previous)?)?
         == model::canonical(&serde_json::to_value(&work.profile)?)?)
 }
-pub fn prepare_and_spawn(work: &Work) -> Result<Value> {
+pub fn prepare_and_spawn(work: &Work) -> Result<(Result<Value>, std::process::Child)> {
     let dir = directory(&work.data_dir, &work.check_id)?;
     fs::create_dir_all(
         dir.parent()
@@ -254,38 +277,30 @@ pub fn prepare_and_spawn(work: &Work) -> Result<Value> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
-    let mut child = cmd.spawn()?;
+    let child = cmd.spawn()?;
     let pid = child.id();
-    // Record the launch before anything else can happen to the worker. A bare
-    // PID proves nothing; the platform record pins this process instance. If
-    // the process already exited, keep the partial record: departure of that
-    // PID/group may still be provable, absence never is.
-    let process = match spawned_identity(pid) {
-        Ok(v) => v,
-        Err(e) if e.code == "PROCESS_GONE" => {
-            json!({"pid":pid,"scope":"launcher_spawned_process","purpose":"check"})
-        }
-        Err(e) => {
-            return Err(Error::new(
-                "CHECK_LAUNCH_UNKNOWN",
-                format!("worker spawned without a recordable launch identity: {e}"),
-            ));
-        }
-    };
-    let launch = json!({"spawned_at_ms":model::now_ms()?,"process":process});
-    // Reap our worker on Unix without tying its life to an async task/host link.
-    std::thread::Builder::new()
-        .name("check-reaper".into())
-        .spawn(move || {
-            let _ = child.wait();
-        })
-        .map_err(|e| {
-            Error::new(
-                "CHECK_LAUNCH_UNKNOWN",
-                format!("worker started; reaper unavailable: {e}"),
-            )
-        })?;
-    Ok(launch) // Deliberately independent of a host/CLI disconnect.
+    // Keep the exact std::process::Child with the caller until the launch fact
+    // is durable. Every operation after spawn is an inner result so a capture
+    // failure cannot discard the only live owner of this process.
+    let launch = (|| -> Result<Value> {
+        // A bare PID proves nothing; the platform record pins this process
+        // instance. If it already exited, retain only the existing partial
+        // record, whose departure helper remains conservative.
+        let process = match spawned_identity(pid) {
+            Ok(value) => value,
+            Err(error) if error.code == "PROCESS_GONE" => {
+                json!({"pid":pid,"scope":"launcher_spawned_process","purpose":"check"})
+            }
+            Err(error) => {
+                return Err(Error::new(
+                    "CHECK_LAUNCH_UNKNOWN",
+                    format!("worker spawned without a recordable launch identity: {error}"),
+                ));
+            }
+        };
+        Ok(json!({"spawned_at_ms":model::now_ms()? ,"process":process}))
+    })();
+    Ok((launch, child))
 }
 pub fn ready(work: &Work) -> Result<Option<Value>> {
     let p = directory(&work.data_dir, &work.check_id)?.join("worker.json");
@@ -1415,9 +1430,6 @@ pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>>
 /// never a guessed pass and never a replayed command. Without a launch
 /// receipt, or with any doubt about departure, the check stays held.
 pub fn recover_pre_identity(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>> {
-    let Some(launch) = &work.launch else {
-        return Ok(None);
-    };
     let dir = directory(&work.data_dir, &work.check_id)?;
     if !dir.try_exists()? {
         return Ok(None);
@@ -1425,6 +1437,101 @@ pub fn recover_pre_identity(work: &Work, files: &ArtifactFiles) -> Result<Option
     if dir.join("worker.json").try_exists()? || dir.join("completion.json").try_exists()? {
         return Ok(None); // The identity/completion paths own this check.
     }
+    let launch_path = dir.join("launch.json");
+    let disk_launch = if launch_path.try_exists()? {
+        let receipt = read_value(&launch_path)?;
+        if receipt["version"] != 1
+            || receipt["check_id"] != work.check_id
+            || receipt["operation_id"] != work.operation_id
+            || receipt["token"] != work.token
+            || !receipt["launch"].is_object()
+        {
+            return Err(Error::new(
+                "CHECK_LAUNCH_RECEIPT_INVALID",
+                "private launch receipt does not match the active CheckRun",
+            ));
+        }
+        Some(receipt["launch"].clone())
+    } else {
+        None
+    };
+    let launch = match (&work.launch, disk_launch.as_ref()) {
+        (Some(retained), Some(disk)) if retained != disk => {
+            return Err(Error::new(
+                "CHECK_LAUNCH_RECEIPT_CONFLICT",
+                "Store and private launch receipts differ for the active CheckRun",
+            ));
+        }
+        (Some(retained), _) => retained.clone(),
+        (None, Some(disk)) => disk.clone(),
+        (None, None) => {
+            let unknown_path = dir.join("launch-unknown.json");
+            let unknown = if unknown_path.try_exists()? {
+                let receipt = read_value(&unknown_path)?;
+                if receipt["version"] != 1
+                    || receipt["check_id"] != work.check_id
+                    || receipt["operation_id"] != work.operation_id
+                    || receipt["token"] != work.token
+                    || receipt["error_code"].as_str().is_none_or(str::is_empty)
+                    || receipt["child_pid"].as_u64().is_none_or(|value| value == 0)
+                {
+                    return Err(Error::new(
+                        "CHECK_LAUNCH_UNKNOWN_RECEIPT_INVALID",
+                        "launch uncertainty receipt does not match the active CheckRun",
+                    ));
+                }
+                Some(receipt)
+            } else {
+                None
+            };
+            let departure_path = dir.join("launch-departed.json");
+            if departure_path.try_exists()? {
+                let departure = read_value(&departure_path)?;
+                if departure["version"] != 1
+                    || departure["check_id"] != work.check_id
+                    || departure["operation_id"] != work.operation_id
+                    || departure["token"] != work.token
+                    || departure["child_pid"].as_u64().is_none()
+                    || departure["exit_observed"] != true
+                    || departure["go_published"] != false
+                {
+                    return Err(Error::new(
+                        "CHECK_LAUNCH_DEPARTURE_INVALID",
+                        "direct-child departure receipt does not match the active CheckRun",
+                    ));
+                }
+                if let Some(unknown) = unknown.as_ref()
+                    && unknown["child_pid"].as_u64() != departure["child_pid"].as_u64()
+                {
+                    return Err(Error::new(
+                        "CHECK_LAUNCH_DEPARTURE_INVALID",
+                        "direct-child departure does not match the uncertain launch child",
+                    ));
+                }
+                if dir.join("go.json").try_exists()?
+                    || dir.join("execution-plan.json").try_exists()?
+                {
+                    return Ok(None);
+                }
+                let code = departure["error_code"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("CHECK_LAUNCH_UNKNOWN");
+                let error = json!({
+                    "code": code,
+                    "message": "the exact host-owned CheckRun child exited before Store Go; no command was started"
+                });
+                return Ok(Some(failure(work, files, error)?));
+            }
+            if unknown.is_some() {
+                return Err(Error::new(
+                    "CHECK_LAUNCH_IDENTITY_UNKNOWN",
+                    "spawned CheckRun has no exact launch identity or confirmed direct-child departure",
+                ));
+            }
+            return Ok(None);
+        }
+    };
     if !spawned_departed(&launch["process"], &work.token)? {
         return Ok(None);
     }
@@ -1860,7 +1967,8 @@ pub fn run(file: &Path) -> Result<()> {
     let mut outputs = Vec::new();
     let mut execution: Option<CheckExecution> = None;
     let mut source_verified = false;
-    let mut prepared: Option<(Vec<String>, PathBuf, source::SourceManifest, PathBuf)> = None;
+    let prepared = RefCell::new(None::<(Vec<String>, PathBuf, source::SourceManifest, PathBuf)>);
+    let execution_receipt_path = dir.join("execution.json");
     let mut plan_setup_failed = false;
     let outcome = (|| -> Result<Value> {
         let identity = CheckIdentity {
@@ -1968,7 +2076,8 @@ pub fn run(file: &Path) -> Result<()> {
                 })();
                 match setup {
                     Ok((plan, expected_targets, source_dir, manifest, program)) => {
-                        prepared = Some((expected_targets, source_dir, manifest, program));
+                        *prepared.borrow_mut() =
+                            Some((expected_targets, source_dir, manifest, program));
                         Ok(plan)
                     }
                     Err(error) => {
@@ -1977,8 +2086,28 @@ pub fn run(file: &Path) -> Result<()> {
                     }
                 }
             },
+            |executed, control: &mut HostCheckControl<'_>| {
+                control.record_execution(executed);
+                let receipt = execution_receipt(executed, control.started_at_ms)
+                    .map_err(into_swarm_checks_error)?;
+                write_once(&execution_receipt_path, &receipt).map_err(into_swarm_checks_error)?;
+                if let Some(pid) = executed.child_pid
+                    && let (Some(started_at_ms), Some(prepared)) =
+                        (control.started_at_ms, prepared.borrow().as_ref())
+                {
+                    let _ = write_once(
+                        &dir.join("started.json"),
+                        &json!({
+                            "pid": pid,
+                            "program": prepared.3,
+                            "started_at_ms": started_at_ms,
+                            "token": work.token
+                        }),
+                    );
+                }
+                Ok(())
+            },
         )?;
-        control.record_execution(&executed);
         code = executed.exit_code;
         execution = Some(executed.clone());
 
@@ -1993,28 +2122,6 @@ pub fn run(file: &Path) -> Result<()> {
                 "CHECK_OUTPUT_DIAGNOSTIC_WRITE_FAILED",
                 "the CheckRun output-capture diagnostic could not be persisted",
             ));
-        }
-
-        if let Some(pid) = executed.child_pid {
-            let started = control.started_at_ms.ok_or_else(|| {
-                Error::new(
-                    "CHECK_START_RECEIPT_MISSING",
-                    "the worker start acknowledgement has no timestamp",
-                )
-            })?;
-            let program = &prepared
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::new(
-                        "CHECK_EXECUTION_PLAN_MISSING",
-                        "the spawned check has no resolved plan context",
-                    )
-                })?
-                .3;
-            write_once(
-                &dir.join("started.json"),
-                &json!({"pid":pid,"program":program,"started_at_ms":started,"token":work.token}),
-            )?;
         }
 
         // A request noticed after process exit is retained without claiming it
@@ -2069,12 +2176,13 @@ pub fn run(file: &Path) -> Result<()> {
                 "the check cancellation receipt could not be read while the process was active",
             ));
         }
-        let (expected_targets, source_dir, manifest, _) = prepared.take().ok_or_else(|| {
-            Error::new(
-                "CHECK_EXECUTION_PLAN_MISSING",
-                "the check executor started without its resolved plan context",
-            )
-        })?;
+        let (expected_targets, source_dir, manifest, _) =
+            prepared.into_inner().ok_or_else(|| {
+                Error::new(
+                    "CHECK_EXECUTION_PLAN_MISSING",
+                    "the check executor started without its resolved plan context",
+                )
+            })?;
 
         let empty_scope_plan = Value::Null;
         let mut coverage = if work.profile.parser == Parser::CargoJson {

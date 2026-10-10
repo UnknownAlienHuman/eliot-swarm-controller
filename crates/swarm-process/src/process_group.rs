@@ -1448,3 +1448,21 @@ pub use os::{
     Group, departed_empty, process_birth_identity, process_image_identity, service_owner_is_live,
     spawned_departed, spawned_identity,
 };
+
+/// Result of one exact process-family observation. Unknown retains the OS
+/// error so callers can report uncertainty without treating it as departure.
+pub enum ProcessFamilyObservation {
+    ConfirmedEmpty,
+    Retained,
+    Unknown(Error),
+}
+
+/// Observe only the named owner family; this function never waits, signals,
+/// or converts an OS query failure into a departure claim.
+pub fn observe_process_family(identity: &Value, token: &str) -> ProcessFamilyObservation {
+    match departed_empty(identity, token) {
+        Ok(true) => ProcessFamilyObservation::ConfirmedEmpty,
+        Ok(false) => ProcessFamilyObservation::Retained,
+        Err(error) => ProcessFamilyObservation::Unknown(error),
+    }
+}

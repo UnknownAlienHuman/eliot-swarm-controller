@@ -16,7 +16,14 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Child,
+    time::Duration,
+};
 use tokio::sync::watch;
 
 pub(super) struct CheckPlanInputs {
@@ -1650,6 +1657,36 @@ fn next(db: &mut Connection, config: &Config, root: PathBuf) -> Result<Option<Wo
     tx.commit()?;
     Ok(Some(w))
 }
+// An outer prepare error proves that no child was spawned. Retain that fact
+// before publishing completion so an I/O failure only retries terminalization.
+fn retain_pre_spawn_failure(db: &mut Connection, w: &Work, error: Value) -> Result<Work> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let retained = work(&tx, &w.check_id, w.data_dir.clone())?;
+    if retained.operation_id != w.operation_id
+        || retained.token != w.token
+        || retained.launch.is_some()
+        || retained.expected_worker.is_some()
+        || retained
+            .preflight_error
+            .as_ref()
+            .is_some_and(|previous| previous != &error)
+    {
+        return Err(Error::conflict(
+            "pre-spawn failure differs from the retained CheckRun",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE check_runs SET state='reconciling',spec_json=json_set(spec_json,'$.preflight_error',json(?2)) WHERE check_id=?1 AND state IN ('running','reconciling') AND resource_released_at_ms IS NULL",
+        params![w.check_id, model::canonical(&error)?],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict("pre-spawn failure has no active CheckRun"));
+    }
+    let retry = work(&tx, &w.check_id, w.data_dir.clone())?;
+    tx.commit()?;
+    Ok(retry)
+}
+
 fn pending(db: &Connection, root: PathBuf) -> Result<Vec<Work>> {
     let mut s =
         db.prepare("SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))")?;
@@ -1821,6 +1858,286 @@ fn incident(db: &Connection, key: &str, error: Error) -> Result<()> {
     db.execute("INSERT INTO incidents(incident_id,dedup_key,state,occurrences,details_json,opened_at_ms,last_seen_at_ms) VALUES(?1,?2,'open',1,?3,?4,?4) ON CONFLICT(dedup_key) WHERE state='open' DO NOTHING",params![model::new_id(),key,model::canonical(&json!({"error":error}))?,now])?;
     Ok(())
 }
+
+#[derive(Clone, Copy)]
+struct CheckChildExit {
+    pid: u32,
+    success: bool,
+    code: Option<i32>,
+}
+
+struct CheckChildOwner {
+    work: Work,
+    child: Child,
+    launch: Option<Value>,
+    launch_error: Option<Error>,
+    launch_persistence_pending: bool,
+    exit: Option<CheckChildExit>,
+    terminal_retained: bool,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct CheckChildCustody {
+    owners: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, CheckChildOwner>>>,
+}
+
+impl CheckChildCustody {
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, BTreeMap<String, CheckChildOwner>> {
+        self.owners.lock().await
+    }
+}
+
+fn check_launch_receipt(work: &Work, launch: &Value) -> Value {
+    json!({
+        "version": 1,
+        "check_id": work.check_id,
+        "operation_id": work.operation_id,
+        "token": work.token,
+        "launch": launch
+    })
+}
+
+fn check_launch_unknown_receipt(work: &Work, child_pid: u32, error: &Error) -> Value {
+    json!({
+        "version": 1,
+        "check_id": work.check_id,
+        "operation_id": work.operation_id,
+        "token": work.token,
+        "child_pid": child_pid,
+        "error_code": error.code
+    })
+}
+
+fn check_child_departure_receipt(
+    work: &Work,
+    pid: u32,
+    exit_success: bool,
+    exit_code: Option<i32>,
+    launch_error: &Error,
+) -> Value {
+    json!({
+        "version": 1,
+        "check_id": work.check_id,
+        "operation_id": work.operation_id,
+        "token": work.token,
+        "child_pid": pid,
+        "exit_observed": true,
+        "exit_success": exit_success,
+        "exit_code": exit_code,
+        "go_published": false,
+        "error_code": launch_error.code
+    })
+}
+
+fn write_check_receipt(path: &Path, value: &Value) -> Result<()> {
+    let bytes = model::canonical(value)?.into_bytes();
+    match swarm_process::write_private_new(path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+            if read_check_receipt(path)?.as_ref() == Some(value) {
+                Ok(())
+            } else {
+                Err(Error::conflict("retained CheckRun launch receipt differs"))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_check_receipt(path: &Path) -> Result<Option<Value>> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(Error::invalid("CheckRun launch receipt is a reparse point"));
+        }
+    }
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::invalid(
+            "CheckRun launch receipt is not a regular file",
+        ));
+    }
+    const MAX_CHECK_LAUNCH_RECEIPT_BYTES: u64 = 1024 * 1024;
+    if metadata.len() > MAX_CHECK_LAUNCH_RECEIPT_BYTES {
+        return Err(Error::invalid(
+            "CheckRun launch receipt exceeds its size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_CHECK_LAUNCH_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CHECK_LAUNCH_RECEIPT_BYTES {
+        return Err(Error::invalid(
+            "CheckRun launch receipt exceeds its size limit",
+        ));
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn validate_check_receipt_owner(work: &Work, receipt: &Value) -> Result<()> {
+    if receipt["version"] != 1
+        || receipt["check_id"] != work.check_id
+        || receipt["operation_id"] != work.operation_id
+        || receipt["token"] != work.token
+    {
+        return Err(Error::conflict(
+            "CheckRun launch receipt belongs to a different check, operation, or token",
+        ));
+    }
+    Ok(())
+}
+
+fn retain_check_launch_fact(work: &Work, launch: &Value) -> Result<()> {
+    let directory = worker::directory(&work.data_dir, &work.check_id)?;
+    let receipt = check_launch_receipt(work, launch);
+    write_check_receipt(&directory.join("launch.json"), &receipt)
+}
+
+fn read_check_launch_fact(work: &Work) -> Result<Option<Value>> {
+    let directory = worker::directory(&work.data_dir, &work.check_id)?;
+    if let Some(receipt) = read_check_receipt(&directory.join("launch.json"))? {
+        validate_check_receipt_owner(work, &receipt)?;
+        let launch = receipt
+            .get("launch")
+            .filter(|launch| launch.is_object())
+            .cloned()
+            .ok_or_else(|| Error::new("CHECK_LAUNCH_RECEIPT_INVALID", "launch is missing"))?;
+        return Ok(Some(launch));
+    }
+    if let Some(departure) = read_check_receipt(&directory.join("launch-departed.json"))? {
+        validate_check_receipt_owner(work, &departure)?;
+        return Ok(None);
+    }
+    if let Some(unknown) = read_check_receipt(&directory.join("launch-unknown.json"))? {
+        validate_check_receipt_owner(work, &unknown)?;
+        return Err(Error::new(
+            "CHECK_LAUNCH_IDENTITY_UNKNOWN",
+            "spawned CheckRun child has no exact launch identity; its job remains held",
+        ));
+    }
+    Ok(None)
+}
+
+fn retain_check_launch_unknown(work: &Work, child_pid: u32, error: &Error) -> Result<()> {
+    let directory = worker::directory(&work.data_dir, &work.check_id)?;
+    write_check_receipt(
+        &directory.join("launch-unknown.json"),
+        &check_launch_unknown_receipt(work, child_pid, error),
+    )
+}
+
+fn retain_check_child_departure(
+    work: &Work,
+    pid: u32,
+    exit_success: bool,
+    exit_code: Option<i32>,
+    launch_error: &Error,
+) -> Result<()> {
+    let directory = worker::directory(&work.data_dir, &work.check_id)?;
+    write_check_receipt(
+        &directory.join("launch-departed.json"),
+        &check_child_departure_receipt(work, pid, exit_success, exit_code, launch_error),
+    )
+}
+
+fn retain_launch(db: &Connection, work: &Work, launch: Value) -> Result<()> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT operation_id,spec_json FROM check_runs WHERE check_id=?1 AND state IN ('running','reconciling')",
+            [&work.check_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((operation_id, raw_spec)) = row else {
+        return Err(Error::conflict(
+            "CheckRun launch receipt has no active owner",
+        ));
+    };
+    if operation_id != work.operation_id {
+        return Err(Error::conflict("CheckRun launch operation changed"));
+    }
+    let mut spec: Value = serde_json::from_str(&raw_spec)?;
+    if spec.get("token").and_then(Value::as_str) != Some(work.token.as_str()) {
+        return Err(Error::conflict("CheckRun launch token changed"));
+    }
+    if let Some(existing) = spec.get("launch").filter(|value| !value.is_null()) {
+        return if existing == &launch {
+            Ok(())
+        } else {
+            Err(Error::conflict("CheckRun launch receipt changed"))
+        };
+    }
+    spec["launch"] = launch.clone();
+    let changed = db.execute(
+        "UPDATE check_runs SET spec_json=?4 WHERE check_id=?1 AND operation_id=?2 AND state IN ('running','reconciling') AND json_extract(spec_json,'$.token')=?3",
+        params![work.check_id, work.operation_id, work.token, model::canonical(&spec)?],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict("CheckRun launch receipt was not retained"));
+    }
+    Ok(())
+}
+
+fn check_terminal_evidence_retained(db: &Connection, work: &Work) -> Result<bool> {
+    let row: Option<(String, String, Option<i64>, String)> = db
+        .query_row(
+            "SELECT operation_id,state,finished_at_ms,spec_json FROM check_runs WHERE check_id=?1",
+            [&work.check_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((operation_id, state, finished_at_ms, raw_spec)) = row else {
+        return Ok(false);
+    };
+    let spec: Value = serde_json::from_str(&raw_spec)?;
+    Ok(operation_id == work.operation_id
+        && spec.get("token").and_then(Value::as_str) == Some(work.token.as_str())
+        && finished_at_ms.is_some()
+        && !matches!(state.as_str(), "queued" | "running" | "reconciling")
+        && spec.get("cleanup_pending").is_none_or(Value::is_null))
+}
+
+fn check_supervisor_infrastructure(error: &Error) -> bool {
+    error.code.starts_with("STORE_") || error.code.starts_with("KERNEL_")
+}
+
+fn check_incident_persistence_error(primary: Error, persistence: Error) -> Error {
+    persistence.with_secondary_error(primary)
+}
+
+#[cfg(test)]
+async fn stop_unstarted_child_bounded(child: &mut Child, grace: Duration) -> Result<bool> {
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(true),
+        Ok(None) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let _ = child.kill();
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(None) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn launch_persistence_error(error: Error, file_error: Option<Error>) -> Error {
+    let mut combined = error.with_secondary_code("CHECK_LAUNCH_RECEIPT_NOT_RETAINED");
+    if let Some(file_error) = file_error {
+        combined = combined.with_secondary_error(file_error);
+    }
+    combined
+}
 impl Store {
     async fn record_check_process_diagnostic(&self, work: &Work) -> Result<()> {
         let scan = work.clone();
@@ -1848,6 +2165,9 @@ impl Store {
         let root = self.data_dir.clone();
         let items = self.run(move |db| pending(db, root)).await?;
         for work in items {
+            if self.terminalize_unstarted_check(&work).await? {
+                continue;
+            }
             self.record_check_process_diagnostic(&work).await?;
             let scan = work.clone();
             if let Some(completion) = self
@@ -1947,178 +2267,790 @@ impl Store {
         }
         Ok(receipt)
     }
-    pub async fn supervise_checks(self, mut stopping: watch::Receiver<bool>) {
+    async fn terminalize_unstarted_check(&self, work: &Work) -> Result<bool> {
+        let Some(error) = work.preflight_error.clone() else {
+            return Ok(false);
+        };
+        if work.launch.is_some()
+            || work.expected_worker.is_some()
+            || self.check_child_is_owned(&work.check_id).await
+        {
+            return Err(Error::conflict("unstarted CheckRun has a process owner"));
+        }
+        let failed = work.clone();
+        let completion = self
+            .file_io(move |files| match worker::completion(&failed, &files)? {
+                Some(completion) => Ok(completion),
+                None => worker::failure(&failed, &files, error),
+            })
+            .await?;
+        self.finish_supervised_check(work, completion).await?;
+        Ok(true)
+    }
+
+    async fn record_check_incident(&self, key: String, error: Error) -> Result<()> {
+        let primary = error.clone();
+        self.run(move |db| incident(db, &key, error))
+            .await
+            .map_err(|persistence| check_incident_persistence_error(primary, persistence))
+    }
+
+    async fn retain_check_child_owner(&self, owner: CheckChildOwner) -> Result<()> {
+        let check_id = owner.work.check_id.clone();
+        let mut owners = self.check_child_custody.lock().await;
+        if owners.contains_key(&check_id) {
+            return Err(Error::new(
+                "CHECK_CHILD_CUSTODY_DUPLICATE",
+                "a CheckRun already has a retained child owner",
+            ));
+        }
+        owners.insert(check_id, owner);
+        Ok(())
+    }
+
+    async fn check_child_count(&self) -> usize {
+        self.check_child_custody.lock().await.len()
+    }
+
+    async fn check_child_is_owned(&self, check_id: &str) -> bool {
+        self.check_child_custody.lock().await.contains_key(check_id)
+    }
+
+    pub(crate) async fn check_child_custody_count(&self) -> usize {
+        self.check_child_count().await
+    }
+
+    async fn check_child_has_launch_error(&self, check_id: &str) -> bool {
+        self.check_child_custody
+            .lock()
+            .await
+            .get(check_id)
+            .is_some_and(|owner| owner.launch_error.is_some())
+    }
+
+    async fn check_child_exit_confirmed(&self, check_id: &str) -> bool {
+        self.check_child_custody
+            .lock()
+            .await
+            .get(check_id)
+            .is_none_or(|owner| owner.exit.is_some())
+    }
+
+    async fn mark_check_launch_persistence_pending(
+        &self,
+        check_id: &str,
+        launch: &Value,
+        error: Error,
+    ) -> Result<()> {
+        let mut owners = self.check_child_custody.lock().await;
+        let owner = owners.get_mut(check_id).ok_or_else(|| {
+            Error::new(
+                "KERNEL_CHECK_CUSTODY_UNAVAILABLE",
+                "spawned CheckRun child lost its custody owner",
+            )
+        })?;
+        if owner.launch.as_ref() != Some(launch) {
+            return Err(Error::new(
+                "CHECK_LAUNCH_RECEIPT_CONFLICT",
+                "spawned CheckRun launch identity differs from its custody owner",
+            ));
+        }
+        owner.launch_persistence_pending = true;
+        owner.launch_error = Some(error);
+        Ok(())
+    }
+
+    async fn stop_check_child_before_go(&self, check_id: &str) -> Result<()> {
+        let mut owners = self.check_child_custody.lock().await;
+        let Some(owner) = owners.get_mut(check_id) else {
+            return Err(Error::new(
+                "KERNEL_CHECK_CUSTODY_UNAVAILABLE",
+                "spawned CheckRun child lost its custody owner",
+            ));
+        };
+        if owner.exit.is_some() {
+            return Ok(());
+        }
+        match owner.child.try_wait() {
+            Ok(Some(status)) => {
+                owner.exit = Some(CheckChildExit {
+                    pid: owner.child.id(),
+                    success: status.success(),
+                    code: status.code(),
+                });
+                Ok(())
+            }
+            Ok(None) => owner.child.kill().map_err(|error| {
+                Error::new(
+                    "CHECK_CHILD_STOP_FAILED",
+                    "the unacknowledged CheckRun child could not be stopped before Store Go",
+                )
+                .with_secondary_error(error.into())
+            }),
+            Err(error) => Err(Error::new(
+                "CHECK_CHILD_STATUS_UNKNOWN",
+                "the unacknowledged CheckRun child could not be observed before Store Go",
+            )
+            .with_secondary_error(error.into())),
+        }
+    }
+
+    async fn finish_supervised_check(&self, work: &Work, completion: Completion) -> Result<()> {
+        if !self.check_child_exit_confirmed(&work.check_id).await {
+            return Err(Error::new(
+                "CHECK_CHILD_EXIT_UNCONFIRMED",
+                "CheckRun completion is retained until its owned child exit is confirmed",
+            ));
+        }
+        let done = work.clone();
+        let evidence_work = work.clone();
+        let retained = self
+            .run(move |db| {
+                finish(db, &done, completion)?;
+                check_terminal_evidence_retained(db, &evidence_work)
+            })
+            .await?;
+        if !retained {
+            return Err(Error::new(
+                "CHECK_TERMINAL_EVIDENCE_UNRETAINED",
+                "CheckRun terminal evidence was not retained by the Store",
+            ));
+        }
+        if let Some(owner) = self
+            .check_child_custody
+            .lock()
+            .await
+            .get_mut(&work.check_id)
+        {
+            owner.terminal_retained = true;
+        }
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(())
+    }
+
+    async fn reap_check_children(&self) -> Result<()> {
+        let check_ids = self
+            .check_child_custody
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for check_id in &check_ids {
+            let observation = {
+                let mut owners = self.check_child_custody.lock().await;
+                let Some(owner) = owners.get_mut(check_id) else {
+                    continue;
+                };
+                if owner.exit.is_some() {
+                    continue;
+                }
+                match owner.child.try_wait() {
+                    Ok(Some(status)) => {
+                        owner.exit = Some(CheckChildExit {
+                            pid: owner.child.id(),
+                            success: status.success(),
+                            code: status.code(),
+                        });
+                        None
+                    }
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                }
+            };
+            if let Some(error) = observation {
+                let primary = Error::new(
+                    "CHECK_CHILD_STATUS_UNKNOWN",
+                    "the supervisor could not observe its owned CheckRun child",
+                )
+                .with_secondary_error(error.into());
+                self.record_check_incident(
+                    format!("check:{check_id}:{}", primary.code),
+                    primary.clone(),
+                )
+                .await?;
+                return Err(primary);
+            }
+        }
+
+        for check_id in check_ids {
+            let (work, launch, launch_error, launch_persistence_pending) = {
+                let owners = self.check_child_custody.lock().await;
+                let Some(owner) = owners.get(&check_id) else {
+                    continue;
+                };
+                (
+                    owner.work.clone(),
+                    owner.launch.clone(),
+                    owner.launch_error.clone(),
+                    owner.launch_persistence_pending,
+                )
+            };
+
+            if launch_persistence_pending {
+                let launch = launch.ok_or_else(|| {
+                    Error::new(
+                        "KERNEL_CHECK_CUSTODY_UNAVAILABLE",
+                        "pending CheckRun launch persistence has no exact launch identity",
+                    )
+                })?;
+                let launch_file_work = work.clone();
+                let launch_file = launch.clone();
+                if let Err(error) = self
+                    .file_io(move |_| retain_check_launch_fact(&launch_file_work, &launch_file))
+                    .await
+                {
+                    return Err(launch_persistence_error(error, None));
+                }
+                let update = work.clone();
+                let retained = launch.clone();
+                if let Err(error) = self
+                    .run(move |db| retain_launch(db, &update, retained))
+                    .await
+                {
+                    return Err(launch_persistence_error(error, None));
+                }
+                let uncertainty = Error::new(
+                    "CHECK_LAUNCH_PERSISTENCE_UNKNOWN",
+                    "the spawned CheckRun launch identity was reconciled from retained child custody",
+                )
+                .with_secondary_error(launch_error.unwrap_or_else(|| {
+                    Error::new(
+                        "CHECK_LAUNCH_RECEIPT_NOT_RETAINED",
+                        "the initial Store launch receipt write did not complete",
+                    )
+                }));
+                self.record_check_incident(
+                    format!("check-launch-persistence:{}", work.check_id),
+                    uncertainty,
+                )
+                .await?;
+                let mut owners = self.check_child_custody.lock().await;
+                if let Some(owner) = owners.get_mut(&check_id) {
+                    if owner.launch.as_ref() != Some(&launch) {
+                        return Err(Error::new(
+                            "CHECK_LAUNCH_RECEIPT_CONFLICT",
+                            "retained child launch identity changed during persistence recovery",
+                        ));
+                    }
+                    owner.launch_persistence_pending = false;
+                }
+            }
+
+            let (launch_error, exit, terminal_retained) = {
+                let owners = self.check_child_custody.lock().await;
+                let Some(owner) = owners.get(&check_id) else {
+                    continue;
+                };
+                (
+                    owner.launch_error.clone(),
+                    owner.exit,
+                    owner.terminal_retained,
+                )
+            };
+
+            if let (Some(launch_error), Some(exit)) = (launch_error, exit) {
+                let departure_work = work.clone();
+                let failure = json!(launch_error.clone());
+                let completion = self
+                    .file_io(move |files| {
+                        retain_check_child_departure(
+                            &departure_work,
+                            exit.pid,
+                            exit.success,
+                            exit.code,
+                            &launch_error,
+                        )?;
+                        worker::failure(&departure_work, &files, failure)
+                    })
+                    .await?;
+                self.finish_supervised_check(&work, completion).await?;
+            }
+
+            let terminal_retained = if exit.is_some() && !terminal_retained {
+                let evidence_work = work.clone();
+                let retained = self
+                    .run(move |db| check_terminal_evidence_retained(db, &evidence_work))
+                    .await?;
+                if retained
+                    && let Some(owner) = self.check_child_custody.lock().await.get_mut(&check_id)
+                {
+                    owner.terminal_retained = true;
+                }
+                retained
+            } else {
+                terminal_retained
+            };
+
+            if exit.is_some() && terminal_retained {
+                let mut owners = self.check_child_custody.lock().await;
+                if owners
+                    .get(&check_id)
+                    .is_some_and(|owner| owner.exit.is_some() && owner.terminal_retained)
+                {
+                    owners.remove(&check_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn supervise_checks(self, mut stopping: watch::Receiver<bool>) -> Result<()> {
         let mut changed = self.changed.subscribe();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_requested = *stopping.borrow() || stopping.has_changed().is_err();
         loop {
-            if *stopping.borrow() {
-                break;
+            self.reap_check_children().await?;
+            if shutdown_requested && self.check_child_count().await == 0 {
+                return Ok(());
             }
+
             let root = self.data_dir.clone();
-            if let Ok(items) = self.run(move |db| pending(db, root)).await {
-                for w in items {
-                    let result = async {
-                        self.record_check_process_diagnostic(&w).await?;
-                        if let Some(e) = w.preflight_error.clone() {
-                            let failed = w.clone();
-                            let c = self
-                                .file_io(move |files| worker::failure(&failed, &files, e))
-                                .await?;
-                            let done = w.clone();
-                            let result = self.run(move |db| finish(db, &done, c)).await;
-                            if result.is_ok() {
-                                self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
-                            }
-                            return result;
-                        }
-                        let scan = w.clone();
-                        let complete = self
-                            .file_io(move |files| {
-                                if standalone_host::owns_work(&scan)? {
-                                    standalone_host::finalize_execution(&scan, &files)
-                                } else {
-                                    worker::completion(&scan, &files)
-                                }
-                            })
-                            .await?;
-                        if let Some(c) = complete {
-                            self.record_check_process_diagnostic(&w).await?;
-                            let done = w.clone();
-                            let result = self.run(move |db| finish(db, &done, c)).await;
-                            if result.is_ok() {
-                                self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
-                            }
-                            return result;
-                        }
-                        // A launch whose worker died before publishing an
-                        // identity has no admitted worker to recover; only the
-                        // host's launch receipt can prove it departed.
-                        let scan = w.clone();
-                        if let Some(c) = self
-                            .file_io(move |files| worker::recover_pre_identity(&scan, &files))
-                            .await?
-                        {
-                            let done = w.clone();
-                            return self.run(move |db| finish(db, &done, c)).await;
-                        }
-                        let scan = w.clone();
-                        match self.file_io(move |_| worker::ready(&scan)).await {
-                            Ok(Some(identity)) => {
-                                let active = w.clone();
-                                let accepted_worker = identity.clone();
-                                if self.run(move |db| ready(db, &active, identity)).await? {
-                                    let allow = w.clone();
-                                    self.file_io(move |files| {
-                                        // Persisted cancellation is delivered before go-ahead when both are pending.
-                                        worker::deliver_cancel(&allow)?;
-                                        worker::allow(&allow)?;
-                                        if standalone_host::owns_work(&allow)?
-                                            && let Err(error) = standalone_host::materialize_plan(
-                                                &allow,
-                                                &files,
-                                                &accepted_worker,
-                                            ) {
-                                                standalone_host::publish_plan_failure(
-                                                    &allow,
-                                                    &accepted_worker,
-                                                )?;
-                                                return Err(error);
-                                        }
-                                        Ok(())
-                                    }).await?;
-                                }
-                            }
-                            Ok(None) => {},
-                            Err(e) if e.code == "CHECK_WORKER_LOST" => {
-                                let id = w.check_id.clone();
-                                self.run(move |db| { db.execute("UPDATE check_runs SET state='reconciling' WHERE check_id=?1 AND state='running'",[id])?; Ok(()) }).await?;
-                                let scan = w.clone();
-                                if let Some(c) = self.file_io(move |files| worker::recover(&scan, &files)).await? {
-                                    self.record_check_process_diagnostic(&w).await?;
-                                    let done = w.clone();
-                                    let result = self.run(move |db| finish(db, &done, c)).await;
-                                    if result.is_ok() {
-                                        self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
-                                    }
-                                    return result;
-                                }
-                                return Err(e);
-                            }
-                            Err(e) => return Err(e),
-                        }
-                        Ok(())
+            let items = self.run(move |db| pending(db, root)).await?;
+            for mut w in items {
+                if self.check_child_has_launch_error(&w.check_id).await {
+                    continue;
+                }
+                if let Some(owner_launch) = self
+                    .check_child_custody
+                    .lock()
+                    .await
+                    .get(&w.check_id)
+                    .and_then(|owner| owner.launch.clone())
+                {
+                    if w.launch
+                        .as_ref()
+                        .is_some_and(|launch| launch != &owner_launch)
+                    {
+                        return Err(Error::new(
+                            "CHECK_LAUNCH_RECEIPT_CONFLICT",
+                            "Store launch identity differs from the retained child owner",
+                        ));
                     }
-                    .await;
-                    if let Err(e) = result {
-                        if e.code == "CHECK_WORKER_LOST" {
-                            let id = w.check_id.clone();
-                            let _=self.run(move|db|{db.execute("UPDATE check_runs SET state='reconciling' WHERE check_id=?1 AND state='running'",[id])?;Ok(())}).await;
-                        }
-                        let key = format!("check:{}:{}", w.check_id, e.code);
-                        let _ = self.run(move |db| incident(db, &key, e)).await;
+                    if w.launch.is_none() {
+                        return Err(Error::new(
+                            "KERNEL_CHECK_CUSTODY_UNAVAILABLE",
+                            "retained child launch identity is not reflected in Store state",
+                        ));
                     }
                 }
-            }
-            let root = self.data_dir.clone();
-            let config = self.config.clone();
-            match self.run(move |db| next(db, &config, root)).await {
-                Ok(Some(w)) => {
-                    let launch = w.clone();
-                    // The executor selection is part of the immutable admitted
-                    // CheckRun spec. Existing rows without it retain the
-                    // legacy root-worker path during migration.
-                    let executor = launch.executor.clone();
-                    let error = if let Some(e) = w.preflight_error.clone() {
-                        Some(e)
-                    } else {
-                        match self
-                            .file_io(move |_| match executor {
-                                Some(pin) => standalone_host::prepare_and_spawn(&launch, &pin),
-                                None => worker::prepare_and_spawn(&launch),
-                            })
-                            .await
-                        {
-                            Ok(receipt) => {
-                                // Persist the launch receipt before relying on
-                                // it: a host restart must not erase the only
-                                // pre-identity evidence this launch will get.
-                                let id = w.check_id.clone();
-                                let _ = self
-                                    .run(move |db| {
-                                        db.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.launch',json(?2)) WHERE check_id=?1",params![id,model::canonical(&receipt)?])?;
-                                        Ok(())
-                                    })
-                                    .await;
-                                None
+                if w.launch.is_none() {
+                    let scan = w.clone();
+                    match self.file_io(move |_| read_check_launch_fact(&scan)).await {
+                        Ok(Some(launch)) => {
+                            let uncertainty = Error::new(
+                                "CHECK_LAUNCH_PERSISTENCE_UNKNOWN",
+                                "the exact private launch receipt exists but Store had not retained it",
+                            );
+                            self.record_check_incident(
+                                format!("check-launch-persistence:{}", w.check_id),
+                                uncertainty.clone(),
+                            )
+                            .await?;
+                            let update = w.clone();
+                            let retained = launch.clone();
+                            if let Err(error) = self
+                                .run(move |db| retain_launch(db, &update, retained))
+                                .await
+                            {
+                                return Err(error.with_secondary_error(uncertainty));
                             }
-                            Err(e) if e.code == "CHECK_LAUNCH_UNKNOWN" => {
-                                let key = format!("check-launch:{}", w.check_id);
-                                let _ = self.run(move |db| incident(db, &key, e)).await;
-                                None
-                            }
-                            Err(e) => Some(json!(e)),
-                        }
-                    };
-                    if let Some(error) = error {
-                        let failed = w.clone();
-                        if let Ok(c) = self
-                            .file_io(move |files| worker::failure(&failed, &files, error))
-                            .await
-                            && self.run(move |db| finish(db, &w, c)).await.is_ok()
-                        {
+                            w.launch = Some(launch);
                             self.changed
                                 .send_modify(|revision| *revision = revision.wrapping_add(1));
                         }
+                        Ok(None) => {}
+                        Err(error) => {
+                            if check_supervisor_infrastructure(&error) {
+                                return Err(error);
+                            }
+                            self.record_check_incident(
+                                format!("check:{}:{}", w.check_id, error.code),
+                                error,
+                            )
+                            .await?;
+                            continue;
+                        }
                     }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    let key = format!("check-admission:{}", e.code);
-                    let _ = self.run(move |db| incident(db, &key, e)).await;
+
+                let result = async {
+                    self.record_check_process_diagnostic(&w).await?;
+                    if self.terminalize_unstarted_check(&w).await? {
+                        return Ok(());
+                    }
+                    let scan = w.clone();
+                    let complete = self
+                        .file_io(move |files| {
+                            if standalone_host::owns_work(&scan)? {
+                                standalone_host::finalize_execution(&scan, &files)
+                            } else {
+                                worker::completion(&scan, &files)
+                            }
+                        })
+                        .await?;
+                    if let Some(completion) = complete {
+                        self.record_check_process_diagnostic(&w).await?;
+                        self.finish_supervised_check(&w, completion).await?;
+                        return Ok(());
+                    }
+                    let scan = w.clone();
+                    if let Some(completion) = self
+                        .file_io(move |files| worker::recover_pre_identity(&scan, &files))
+                        .await?
+                    {
+                        self.finish_supervised_check(&w, completion).await?;
+                        return Ok(());
+                    }
+                    let scan = w.clone();
+                    match self.file_io(move |_| worker::ready(&scan)).await {
+                        Ok(Some(identity)) => {
+                            let active = w.clone();
+                            let accepted_worker = identity.clone();
+                            if self.run(move |db| ready(db, &active, identity)).await? {
+                                let allow = w.clone();
+                                self.file_io(move |files| {
+                                    worker::deliver_cancel(&allow)?;
+                                    worker::allow(&allow)?;
+                                    if standalone_host::owns_work(&allow)?
+                                        && let Err(error) = standalone_host::materialize_plan(
+                                            &allow,
+                                            &files,
+                                            &accepted_worker,
+                                        )
+                                    {
+                                        standalone_host::publish_plan_failure(
+                                            &allow,
+                                            &accepted_worker,
+                                        )?;
+                                        return Err(error);
+                                    }
+                                    Ok(())
+                                })
+                                .await?;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if error.code == "CHECK_WORKER_LOST" => {
+                            let id = w.check_id.clone();
+                            let transition = self
+                                .run(move |db| {
+                                    let state: Option<String> = db
+                                        .query_row(
+                                            "SELECT state FROM check_runs WHERE check_id=?1",
+                                            [&id],
+                                            |row| row.get(0),
+                                        )
+                                        .optional()?;
+                                    match state.as_deref() {
+                                        Some("reconciling") => Ok(()),
+                                        Some("running") => {
+                                            let changed = db.execute(
+                                                "UPDATE check_runs SET state='reconciling' WHERE check_id=?1 AND state='running'",
+                                                [&id],
+                                            )?;
+                                            if changed == 1 {
+                                                Ok(())
+                                            } else {
+                                                Err(Error::conflict(
+                                                    "lost CheckRun transition was not retained",
+                                                ))
+                                            }
+                                        }
+                                        _ => Err(Error::conflict(
+                                            "lost CheckRun has no active durable state",
+                                        )),
+                                    }
+                                })
+                                .await;
+                            if let Err(storage_error) = transition {
+                                return Err(storage_error.with_secondary_error(error));
+                            }
+                            let scan = w.clone();
+                            if let Some(completion) = self
+                                .file_io(move |files| worker::recover(&scan, &files))
+                                .await?
+                            {
+                                self.record_check_process_diagnostic(&w).await?;
+                                self.finish_supervised_check(&w, completion).await?;
+                                return Ok(());
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    if check_supervisor_infrastructure(&error) {
+                        return Err(error);
+                    }
+                    self.record_check_incident(
+                        format!("check:{}:{}", w.check_id, error.code),
+                        error,
+                    )
+                    .await?;
                 }
             }
-            tokio::select! {_=stopping.changed()=>{},_=changed.changed()=>{},_=tick.tick()=>{}}
+
+            if !shutdown_requested
+                && self.check_child_count().await < self.config.checks.max_running
+            {
+                let root = self.data_dir.clone();
+                let config = self.config.clone();
+                match self.run(move |db| next(db, &config, root)).await {
+                    Ok(Some(w)) => {
+                        if self.check_child_is_owned(&w.check_id).await {
+                            return Err(Error::new(
+                                "CHECK_CHILD_CUSTODY_DUPLICATE",
+                                "CheckRun admission selected work that already has a retained child owner",
+                            ));
+                        }
+                        if let Some(error) = w.preflight_error.clone() {
+                            let failed = w.clone();
+                            let completion = self
+                                .file_io(move |files| worker::failure(&failed, &files, error))
+                                .await?;
+                            self.finish_supervised_check(&w, completion).await?;
+                        } else {
+                            let launch = w.clone();
+                            let executor = launch.executor.clone();
+                            let prepared = self
+                                .file_io(move |_| {
+                                    Ok(match executor {
+                                        Some(pin) => {
+                                            standalone_host::prepare_and_spawn(&launch, &pin)
+                                        }
+                                        None => worker::prepare_and_spawn(&launch),
+                                    })
+                                })
+                                .await?;
+                            match prepared {
+                                Err(error) if error.code == "CHECK_LAUNCH_UNKNOWN" => {
+                                    self.record_check_incident(
+                                        format!("check-launch:{}", w.check_id),
+                                        error.clone(),
+                                    )
+                                    .await?;
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    let retain = w.clone();
+                                    let failure = json!(error.clone());
+                                    let retained_error = failure.clone();
+                                    let terminalizing = self
+                                        .run(move |db| {
+                                            retain_pre_spawn_failure(db, &retain, retained_error)
+                                        })
+                                        .await
+                                        .map_err(|storage| {
+                                            storage.with_secondary_error(error.clone())
+                                        })?;
+                                    let failed = terminalizing.clone();
+                                    match self
+                                        .file_io(move |files| {
+                                            worker::failure(&failed, &files, failure)
+                                        })
+                                        .await
+                                    {
+                                        Ok(completion) => {
+                                            self.finish_supervised_check(
+                                                &terminalizing,
+                                                completion,
+                                            )
+                                            .await?;
+                                        }
+                                        Err(file_error) => {
+                                            let combined = error.with_secondary_error(file_error);
+                                            self.record_check_incident(
+                                                format!("check:{}:{}", w.check_id, combined.code),
+                                                combined.clone(),
+                                            )
+                                            .await?;
+                                            return Err(combined);
+                                        }
+                                    }
+                                }
+                                Ok((Err(error), child)) => {
+                                    let check_id = w.check_id.clone();
+                                    let child_pid = child.id();
+                                    self.retain_check_child_owner(CheckChildOwner {
+                                        work: w.clone(),
+                                        child,
+                                        launch: None,
+                                        launch_error: Some(error.clone()),
+                                        launch_persistence_pending: false,
+                                        exit: None,
+                                        terminal_retained: false,
+                                    })
+                                    .await?;
+                                    let marker_work = w.clone();
+                                    let marker_error = error.clone();
+                                    let marker_result = self
+                                        .file_io(move |_| {
+                                            retain_check_launch_unknown(
+                                                &marker_work,
+                                                child_pid,
+                                                &marker_error,
+                                            )
+                                        })
+                                        .await;
+                                    let mut diagnostic = match marker_result {
+                                        Ok(()) => error,
+                                        Err(marker_error) => {
+                                            error.with_secondary_error(marker_error)
+                                        }
+                                    };
+                                    let stop_error =
+                                        self.stop_check_child_before_go(&check_id).await.err();
+                                    if let Some(stop_error) = stop_error.clone() {
+                                        diagnostic = diagnostic.with_secondary_error(stop_error);
+                                    }
+                                    self.record_check_incident(
+                                        format!("check:{}:{}", check_id, diagnostic.code),
+                                        diagnostic,
+                                    )
+                                    .await?;
+                                    if let Some(stop_error) = stop_error {
+                                        return Err(stop_error);
+                                    }
+                                }
+                                Ok((Ok(launch), child)) => {
+                                    let check_id = w.check_id.clone();
+                                    self.retain_check_child_owner(CheckChildOwner {
+                                        work: w.clone(),
+                                        child,
+                                        launch: Some(launch.clone()),
+                                        launch_error: None,
+                                        launch_persistence_pending: true,
+                                        exit: None,
+                                        terminal_retained: false,
+                                    })
+                                    .await?;
+                                    let launch_work = w.clone();
+                                    let launch_fact = launch.clone();
+                                    let file_result = self
+                                        .file_io(move |_| {
+                                            retain_check_launch_fact(&launch_work, &launch_fact)
+                                        })
+                                        .await;
+                                    let file_error = file_result.err();
+                                    let update = w.clone();
+                                    let retained = launch.clone();
+                                    if let Err(error) = self
+                                        .run(move |db| retain_launch(db, &update, retained))
+                                        .await
+                                    {
+                                        let mut persistence_error =
+                                            launch_persistence_error(error, file_error.clone());
+                                        if let Err(owner_error) = self
+                                            .mark_check_launch_persistence_pending(
+                                                &check_id,
+                                                &launch,
+                                                persistence_error.clone(),
+                                            )
+                                            .await
+                                        {
+                                            persistence_error =
+                                                persistence_error.with_secondary_error(owner_error);
+                                        }
+                                        if let Err(stop_error) =
+                                            self.stop_check_child_before_go(&check_id).await
+                                        {
+                                            persistence_error =
+                                                persistence_error.with_secondary_error(stop_error);
+                                        }
+                                        return Err(persistence_error);
+                                    }
+                                    if let Some(file_error) = file_error {
+                                        let retry_work = w.clone();
+                                        let retry_launch = launch.clone();
+                                        if let Err(retry_error) = self
+                                            .file_io(move |_| {
+                                                retain_check_launch_fact(&retry_work, &retry_launch)
+                                            })
+                                            .await
+                                        {
+                                            let mut persistence_error = launch_persistence_error(
+                                                file_error,
+                                                Some(retry_error),
+                                            );
+                                            if let Err(owner_error) = self
+                                                .mark_check_launch_persistence_pending(
+                                                    &check_id,
+                                                    &launch,
+                                                    persistence_error.clone(),
+                                                )
+                                                .await
+                                            {
+                                                persistence_error = persistence_error
+                                                    .with_secondary_error(owner_error);
+                                            }
+                                            if let Err(stop_error) =
+                                                self.stop_check_child_before_go(&check_id).await
+                                            {
+                                                persistence_error = persistence_error
+                                                    .with_secondary_error(stop_error);
+                                            }
+                                            return Err(persistence_error);
+                                        }
+                                    }
+                                    let mut owners = self.check_child_custody.lock().await;
+                                    let owner = owners.get_mut(&check_id).ok_or_else(|| {
+                                        Error::new(
+                                            "KERNEL_CHECK_CUSTODY_UNAVAILABLE",
+                                            "spawned CheckRun child lost its custody owner",
+                                        )
+                                    })?;
+                                    if owner.launch.as_ref() != Some(&launch) {
+                                        return Err(Error::new(
+                                            "CHECK_LAUNCH_RECEIPT_CONFLICT",
+                                            "spawned CheckRun launch identity differs from its custody owner",
+                                        ));
+                                    }
+                                    owner.launch_persistence_pending = false;
+                                    drop(owners);
+                                    self.changed.send_modify(|revision| {
+                                        *revision = revision.wrapping_add(1)
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if check_supervisor_infrastructure(&error) {
+                            return Err(error);
+                        }
+                        self.record_check_incident(
+                            format!("check-admission:{}", error.code),
+                            error.clone(),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                }
+            }
+
+            tokio::select! {
+                result = stopping.changed(), if !shutdown_requested => {
+                    if result.is_err() || *stopping.borrow() {
+                        shutdown_requested = true;
+                    }
+                },
+                result = changed.changed() => {
+                    if result.is_err() {
+                        return Err(Error::new(
+                            "STORE_CLOSED",
+                            "CheckRun supervisor change stream ended",
+                        ));
+                    }
+                },
+                _ = tick.tick() => {}
+            }
         }
     }
 }
@@ -3142,5 +4074,590 @@ mod tests {
 
         fixture.owner.close().await.unwrap();
         std::fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    async fn queued_check(fixture: &Fixture, project_id: &str) -> (Value, Work) {
+        let (task_id, attempt_id) = create_attempt(fixture, project_id, None).await;
+        let candidate = source_snapshot(
+            fixture,
+            &task_id,
+            &attempt_id,
+            b"check child custody fault fixture",
+        )
+        .await;
+        let admitted = admit_check(fixture, &attempt_id, &candidate, "v1").await;
+        let check_id = admitted["check_id"].as_str().unwrap().to_owned();
+        let root = fixture.directory.clone();
+        let work = fixture
+            .owner
+            .store
+            .run(move |db| work(db, &check_id, root))
+            .await
+            .unwrap();
+        (admitted, work)
+    }
+
+    async fn child_custody_snapshot(
+        store: &Store,
+        check_id: &str,
+    ) -> (
+        u32,
+        usize,
+        Option<Value>,
+        bool,
+        Option<String>,
+        Option<(u32, bool, Option<i32>)>,
+    ) {
+        let owners = store.check_child_custody.lock().await;
+        let owner = owners
+            .get(check_id)
+            .expect("CheckRun child custody is retained");
+        (
+            owner.child.id(),
+            std::ptr::from_ref(&owner.child) as usize,
+            owner.launch.clone(),
+            owner.launch_persistence_pending,
+            owner.launch_error.as_ref().map(|error| error.code.clone()),
+            owner.exit.map(|exit| (exit.pid, exit.success, exit.code)),
+        )
+    }
+
+    #[tokio::test]
+    async fn pre_spawn_failure_publication_retry_terminalizes_without_launching() {
+        let fixture = fixture().await;
+        let (admitted, work) = queued_check(&fixture, "pre-spawn-publication-retry").await;
+        let store = fixture.owner.store.clone();
+        let pin = crate::checks::model::ExecutorPin {
+            executable: fixture.directory.join("mismatched-check-executor"),
+            sha256: "a".repeat(64),
+            artifact_id: "checks-fixture".into(),
+            version: "1".into(),
+        };
+        std::fs::write(&pin.executable, b"untrusted check executor fixture").unwrap();
+        let expected_error = standalone_host::prepare_and_spawn(&work, &pin).unwrap_err();
+        assert_eq!(expected_error.code, "CONFLICT");
+        let check_id = work.check_id.clone();
+        store.run(move |db| {
+            db.execute(
+                "UPDATE check_runs SET spec_json=json_set(spec_json,'$.executor',json(?2)) WHERE check_id=?1",
+                params![check_id, model::canonical(&json!(pin))?],
+            )?;
+            Ok(())
+        }).await.unwrap();
+        let directory = worker::directory(&fixture.directory, &work.check_id).unwrap();
+        // The mismatched pinned image fails before spawn. Failure report publication
+        // succeeds, but a directory at the completion path rejects its receipt.
+        std::fs::create_dir_all(directory.join("completion.json")).unwrap();
+        let (stop, stopping) = watch::channel(false);
+        let first_error = timeout(
+            Duration::from_secs(15),
+            store.clone().supervise_checks(stopping),
+        )
+        .await
+        .expect("failed publication must return from the supervisor")
+        .unwrap_err();
+        assert_eq!(first_error.code, expected_error.code);
+        assert!(!first_error.secondary_codes.is_empty());
+        assert_eq!(store.check_child_custody_count().await, 0);
+        for receipt in [
+            "launch.json",
+            "launch-unknown.json",
+            "launch-departed.json",
+            "worker.json",
+            "go.json",
+            "worker-bootstrap.json",
+        ] {
+            assert!(
+                !directory.join(receipt).exists(),
+                "pre-spawn failure must not create {receipt}"
+            );
+        }
+        assert!(!directory.join("completion.json").is_file());
+        let check_id = work.check_id.clone();
+        let root = fixture.directory.clone();
+        let retry = store
+            .run(move |db| {
+                let pending = pending(db, root)?;
+                let retained = pending
+                    .into_iter()
+                    .find(|work| work.check_id == check_id)
+                    .expect("failed publication remains pending for terminalization");
+                assert_eq!(
+                    describe(db, &json!({"check_id":check_id}))?["state"],
+                    "reconciling"
+                );
+                Ok(retained)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.preflight_error, Some(json!(expected_error)));
+        assert_eq!(retry.operation_id, work.operation_id);
+        let files = ArtifactFiles::new(&fixture.directory).unwrap();
+        assert!(
+            worker::recover_pre_identity(&retry, &files)
+                .unwrap()
+                .is_none()
+        );
+        let result_id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
+        let result_path = fixture
+            .directory
+            .join("artifacts")
+            .join(format!("{result_id}.bin"));
+        let published_report = std::fs::read(&result_path).unwrap();
+
+        std::fs::remove_dir(directory.join("completion.json")).unwrap();
+        store.reconcile_checks_once().await.unwrap();
+        // The pinned image remains invalid: reconciliation must consume
+        // the retained failure, not re-prepare work or wait for a worker receipt.
+        let completion = worker::completion(&retry, &files).unwrap().unwrap();
+        assert_eq!(completion.state, "error");
+        assert_eq!(completion.operation_id, work.operation_id);
+        assert_eq!(std::fs::read(&result_path).unwrap(), published_report);
+        let check_id = work.check_id.clone();
+        let description = store
+            .run(move |db| describe(db, &json!({"check_id":check_id})))
+            .await
+            .unwrap();
+        assert_eq!(description["state"], "error");
+        assert_eq!(description["resource_released"], true);
+        assert!(!description["resource_released_at_ms"].is_null());
+        assert_eq!(description["process"], Value::Null);
+        let completion_bytes = std::fs::read(directory.join("completion.json")).unwrap();
+        store.reconcile_checks_once().await.unwrap();
+        stop.send_replace(true);
+        store
+            .clone()
+            .supervise_checks(stop.subscribe())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("completion.json")).unwrap(),
+            completion_bytes
+        );
+        assert_eq!(store.check_child_custody_count().await, 0);
+        for receipt in [
+            "launch.json",
+            "launch-unknown.json",
+            "launch-departed.json",
+            "worker.json",
+            "go.json",
+            "worker-bootstrap.json",
+        ] {
+            assert!(!directory.join(receipt).exists());
+        }
+        assert_eq!(description["operation_id"], admitted["operation_id"]);
+        fixture.owner.close().await.unwrap();
+        std::fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    fn spawn_blocking_custody_child() -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::checks::launch_custody_fixtures::blocking_child_fixture",
+                "--nocapture",
+            ])
+            .env("SWARM_CHECK_CUSTODY_BLOCKING_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn store_launch_failure_and_supervisor_retry_keep_the_same_child_until_departure() {
+        let fixture = fixture().await;
+        let (admitted, work) = queued_check(&fixture, "custody-store-retry").await;
+        let check_id = admitted["check_id"].as_str().unwrap().to_owned();
+        let store = fixture.owner.store.clone();
+        store
+            .run(|db| {
+                db.execute_batch(
+                    "CREATE TRIGGER fixture_fail_check_launch BEFORE UPDATE OF spec_json ON check_runs WHEN json_type(NEW.spec_json, '$.launch') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected CheckRun launch persistence failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (stop, stopping) = watch::channel(false);
+        let first_error = timeout(
+            Duration::from_secs(15),
+            store.clone().supervise_checks(stopping),
+        )
+        .await
+        .expect("the injected Store failure must return from the supervisor")
+        .unwrap_err();
+        assert_eq!(first_error.code, "STORE_ERROR");
+        let first = child_custody_snapshot(&store, &check_id).await;
+        assert!(first.2.is_some());
+        assert!(first.3);
+        assert_eq!(first.4.as_deref(), Some("STORE_ERROR"));
+
+        let retry_error = timeout(
+            Duration::from_secs(15),
+            store.clone().supervise_checks(stop.subscribe()),
+        )
+        .await
+        .expect("the retry must report the same Store failure")
+        .unwrap_err();
+        assert_eq!(retry_error.code, "STORE_ERROR");
+        let retry = child_custody_snapshot(&store, &check_id).await;
+        assert_eq!(retry.0, first.0);
+        assert_eq!(retry.1, first.1, "retry must retain the same Child object");
+        assert_eq!(
+            retry.2, first.2,
+            "retry must retain the exact launch identity"
+        );
+        assert!(retry.3);
+
+        store
+            .run(|db| {
+                db.execute_batch("DROP TRIGGER fixture_fail_check_launch")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        stop.send_replace(true);
+        timeout(
+            Duration::from_secs(15),
+            store.clone().supervise_checks(stop.subscribe()),
+        )
+        .await
+        .expect("shutdown must finish after the exact child departure is retained")
+        .unwrap();
+
+        assert_eq!(store.check_child_custody_count().await, 0);
+        let directory = worker::directory(&work.data_dir, &work.check_id).unwrap();
+        let launch = read_check_receipt(&directory.join("launch.json"))
+            .unwrap()
+            .unwrap();
+        let departure = read_check_receipt(&directory.join("launch-departed.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(launch["check_id"], work.check_id);
+        assert_eq!(launch["operation_id"], work.operation_id);
+        assert_eq!(launch["token"], work.token);
+        assert_eq!(departure["child_pid"], first.0);
+        assert!(departure["exit_observed"].as_bool().unwrap());
+        assert!(!departure["go_published"].as_bool().unwrap());
+        assert!(
+            store
+                .run(move |db| check_terminal_evidence_retained(db, &work))
+                .await
+                .unwrap()
+        );
+
+        fixture.owner.close().await.unwrap();
+        std::fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn departure_receipt_write_failure_keeps_the_same_child_and_record_for_retry() {
+        let fixture = fixture().await;
+        let (admitted, _) = queued_check(&fixture, "custody-departure-retry").await;
+        let check_id = admitted["check_id"].as_str().unwrap().to_owned();
+        let store = fixture.owner.store.clone();
+        let config = fixture.config.clone();
+        let root = fixture.directory.clone();
+        let work = store
+            .run(move |db| {
+                next(db, &config, root)?
+                    .filter(|work| work.check_id == check_id)
+                    .ok_or_else(|| Error::new("TEST_STATE", "queued CheckRun was not next"))
+            })
+            .await
+            .unwrap();
+        let directory = worker::directory(&work.data_dir, &work.check_id).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let launch_error = Error::new("CHECK_LAUNCH_UNKNOWN", "launch identity was not recorded");
+        let child = spawn_blocking_custody_child();
+        let child_pid = child.id();
+        retain_check_launch_unknown(&work, child_pid, &launch_error).unwrap();
+        store
+            .retain_check_child_owner(CheckChildOwner {
+                work: work.clone(),
+                child,
+                launch: None,
+                launch_error: Some(launch_error.clone()),
+                launch_persistence_pending: false,
+                exit: None,
+                terminal_retained: false,
+            })
+            .await
+            .unwrap();
+
+        let exit = {
+            let mut owners = store.check_child_custody.lock().await;
+            let owner = owners.get_mut(&work.check_id).unwrap();
+            owner.child.kill().unwrap();
+            let status = owner.child.wait().unwrap();
+            let exit = CheckChildExit {
+                pid: child_pid,
+                success: status.success(),
+                code: status.code(),
+            };
+            owner.exit = Some(exit);
+            exit
+        };
+        let mut conflicting_work = work.clone();
+        conflicting_work.token = model::new_id();
+        retain_check_child_departure(
+            &conflicting_work,
+            child_pid,
+            exit.success,
+            exit.code,
+            &launch_error,
+        )
+        .unwrap();
+        let departure_path = directory.join("launch-departed.json");
+        let conflicting_record = std::fs::read(&departure_path).unwrap();
+
+        let (_stop, stopping) = watch::channel(true);
+        let first_error = store.clone().supervise_checks(stopping).await.unwrap_err();
+        assert_eq!(first_error.code, "CONFLICT");
+        let first = child_custody_snapshot(&store, &work.check_id).await;
+        assert_eq!(first.0, child_pid);
+        assert_eq!(first.4.as_deref(), Some("CHECK_LAUNCH_UNKNOWN"));
+        assert_eq!(first.5, Some((exit.pid, exit.success, exit.code)));
+        assert_eq!(std::fs::read(&departure_path).unwrap(), conflicting_record);
+
+        let retry_error = store
+            .clone()
+            .supervise_checks(watch::channel(true).1)
+            .await
+            .unwrap_err();
+        assert_eq!(retry_error.code, "CONFLICT");
+        let retry = child_custody_snapshot(&store, &work.check_id).await;
+        assert_eq!(retry.0, first.0);
+        assert_eq!(retry.1, first.1, "retry must retain the same Child object");
+        assert_eq!(retry.5, first.5);
+        assert_eq!(std::fs::read(&departure_path).unwrap(), conflicting_record);
+
+        std::fs::remove_file(&departure_path).unwrap();
+        let (_retry_stop, retry_stopping) = watch::channel(true);
+        store
+            .clone()
+            .supervise_checks(retry_stopping)
+            .await
+            .unwrap();
+        assert_eq!(store.check_child_custody_count().await, 0);
+        let retained_departure = read_check_receipt(&departure_path).unwrap().unwrap();
+        assert_eq!(
+            retained_departure,
+            check_child_departure_receipt(&work, child_pid, exit.success, exit.code, &launch_error,)
+        );
+        assert!(
+            store
+                .run(move |db| check_terminal_evidence_retained(db, &work))
+                .await
+                .unwrap()
+        );
+
+        fixture.owner.close().await.unwrap();
+        std::fs::remove_dir_all(fixture.directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod launch_custody_fixtures {
+    use super::*;
+    use crate::checks::model::{CheckProfile, Parser};
+    use std::{
+        collections::BTreeMap,
+        process::{Command, Stdio},
+        thread,
+    };
+
+    fn fixture() -> (PathBuf, Work) {
+        let root = std::env::temp_dir().join(format!("swarm-check-custody-{}", model::new_id()));
+        let work = Work {
+            check_id: model::new_id(),
+            operation_id: model::new_id(),
+            token: model::new_id(),
+            data_dir: root.clone(),
+            candidate: ArtifactRecord {
+                kind: "source_snapshot".into(),
+                artifact_id: "custody-candidate".into(),
+                relative_path: "artifacts/custody-candidate".into(),
+                byte_length: 0,
+                content_digest: "0".repeat(64),
+                metadata: json!({}),
+            },
+            profile: CheckProfile {
+                profile_id: "custody-fixture".into(),
+                profile_revision: "1".into(),
+                executable: "fixture-executor".into(),
+                args: Vec::new(),
+                parser: Parser::ExitCode,
+                resource: "custody-fixture".into(),
+                environment: BTreeMap::new(),
+                inherit_env: Vec::new(),
+                expected_targets: Vec::new(),
+                reproducible: false,
+                fingerprint_env: Vec::new(),
+                versioned_inputs: BTreeMap::new(),
+            },
+            executor: None,
+            resolved_inputs: None,
+            scope_plan: None,
+            input_fingerprint: None,
+            preflight_error: None,
+            cancel_request: None,
+            expected_worker: None,
+            launch: None,
+        };
+        fs::create_dir_all(worker::directory(&root, &work.check_id).unwrap()).unwrap();
+        (root, work)
+    }
+
+    fn retain_unknown_and_departure(work: &Work, child_pid: u32) {
+        let error = Error::new("CHECK_LAUNCH_UNKNOWN", "launch identity was not recorded");
+        retain_check_launch_unknown(work, child_pid, &error).unwrap();
+        retain_check_child_departure(work, child_pid, true, Some(0), &error).unwrap();
+    }
+
+    fn assert_control_file_holds_recovery(control_file: &str) {
+        let (root, work) = fixture();
+        retain_unknown_and_departure(&work, 42_011);
+        let dir = worker::directory(&root, &work.check_id).unwrap();
+        fs::write(dir.join(control_file), b"{}").unwrap();
+        let files = ArtifactFiles::new(&root).unwrap();
+        assert!(
+            worker::recover_pre_identity(&work, &files)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incident_write_failure_keeps_store_error_authoritative() {
+        let semantic = Error::new("CHECK_RECONCILIATION_FAILED", "check recovery failed")
+            .with_secondary_code("CHECK_RECEIPT_INVALID")
+            .with_secondary_code("CHECK_OUTPUT_INVALID");
+        let db = Connection::open_in_memory().unwrap();
+        let persistence = incident(&db, "check-fixture", semantic.clone()).unwrap_err();
+        let combined = check_incident_persistence_error(semantic, persistence);
+        assert_eq!(combined.code, "STORE_ERROR");
+        assert_eq!(combined.secondary_codes.len(), 2);
+        assert_eq!(combined.secondary_codes[0], "CHECK_RECONCILIATION_FAILED");
+        assert_eq!(combined.secondary_codes[1], "CHECK_RECEIPT_INVALID");
+    }
+
+    #[test]
+    fn private_launch_fact_survives_store_retention_failure() {
+        let (root, work) = fixture();
+        let launch = json!({
+            "spawned_at_ms": 1,
+            "process": {"pid": 123, "scope": "launcher_spawned_process", "purpose": "check"}
+        });
+        retain_check_launch_fact(&work, &launch).unwrap();
+
+        let db = Connection::open_in_memory().unwrap();
+        let error = retain_launch(&db, &work, launch.clone()).unwrap_err();
+        assert_eq!(error.code, "STORE_ERROR");
+        assert_eq!(read_check_launch_fact(&work).unwrap(), Some(launch));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_launch_fact_is_idempotent_and_bound_to_the_check() {
+        let (root, work) = fixture();
+        let launch = json!({
+            "spawned_at_ms": 1,
+            "process": {"pid": 123, "scope": "launcher_spawned_process", "purpose": "check"}
+        });
+        retain_check_launch_fact(&work, &launch).unwrap();
+        retain_check_launch_fact(&work, &launch).unwrap();
+        assert_eq!(read_check_launch_fact(&work).unwrap(), Some(launch.clone()));
+
+        let changed = json!({"spawned_at_ms": 2, "process": {"pid": 123}});
+        assert!(retain_check_launch_fact(&work, &changed).is_err());
+
+        let mut wrong_owner = work.clone();
+        wrong_owner.token = model::new_id();
+        assert_eq!(
+            read_check_launch_fact(&wrong_owner).unwrap_err().code,
+            "CONFLICT"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uncertain_launch_stays_held_until_its_exact_child_departure_is_retained() {
+        let (root, work) = fixture();
+        let error = Error::new("CHECK_LAUNCH_UNKNOWN", "launch identity was not recorded");
+        retain_check_launch_unknown(&work, 42_001, &error).unwrap();
+        assert_eq!(
+            read_check_launch_fact(&work).unwrap_err().code,
+            "CHECK_LAUNCH_IDENTITY_UNKNOWN"
+        );
+        let files = ArtifactFiles::new(&root).unwrap();
+        assert_eq!(
+            worker::recover_pre_identity(&work, &files)
+                .unwrap_err()
+                .code,
+            "CHECK_LAUNCH_IDENTITY_UNKNOWN"
+        );
+
+        retain_check_child_departure(&work, 42_002, true, Some(0), &error).unwrap();
+        assert_eq!(
+            worker::recover_pre_identity(&work, &files)
+                .unwrap_err()
+                .code,
+            "CHECK_LAUNCH_DEPARTURE_INVALID"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_pre_go_departure_recovers_as_command_not_started_error_and_never_after_go_or_plan() {
+        let (root, work) = fixture();
+        retain_unknown_and_departure(&work, 42_010);
+        let files = ArtifactFiles::new(&root).unwrap();
+        let completion = worker::recover_pre_identity(&work, &files)
+            .unwrap()
+            .expect("confirmed pre-Go child departure should resolve as incomplete");
+        assert_eq!(completion.state, "error");
+        assert_eq!(completion.exit_code, None);
+        assert!(completion.resource_released);
+        let _ = fs::remove_dir_all(root);
+
+        assert_control_file_holds_recovery("go.json");
+        assert_control_file_holds_recovery("execution-plan.json");
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_observes_exit_through_the_owned_child_handle() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "store::checks::launch_custody_fixtures::blocking_child_fixture",
+                "--nocapture",
+            ])
+            .env("SWARM_CHECK_CUSTODY_BLOCKING_CHILD", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(4),
+            stop_unstarted_child_bounded(&mut child, Duration::from_secs(2)),
+        )
+        .await
+        .expect("owned child cleanup must stay bounded")
+        .unwrap();
+        assert!(stopped);
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn blocking_child_fixture() {
+        if std::env::var_os("SWARM_CHECK_CUSTODY_BLOCKING_CHILD").is_some() {
+            thread::park();
+        }
     }
 }

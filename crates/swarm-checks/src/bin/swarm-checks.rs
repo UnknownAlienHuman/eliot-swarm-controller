@@ -314,6 +314,7 @@ fn execute(control_file: &Path) -> Result<()> {
 
     let plan_context: Arc<Mutex<Option<LoadedPlan>>> = Arc::new(Mutex::new(None));
     let captured_context = Arc::clone(&plan_context);
+    let receipt_context = Arc::clone(&plan_context);
     let identity = bootstrap.identity.clone();
     let expected_identity = identity.clone();
     let job_dir = bootstrap.job_dir.clone();
@@ -332,8 +333,40 @@ fn execute(control_file: &Path) -> Result<()> {
                 Some(loaded.clone());
             Ok(loaded.plan)
         },
+        |execution, control: &mut FileCheckControl| {
+            let loaded = receipt_context
+                .lock()
+                .map_err(|_| Error::new("CHECK_PLAN_LOCK_FAILED", "plan lock is unavailable"))?
+                .clone();
+            let plan_sha256 = loaded.as_ref().map(|value| value.plan_sha256.as_str());
+            let context = loaded.as_ref().map(|value| &value.context);
+            let receipt = execution_json(
+                &bootstrap,
+                execution,
+                plan_sha256,
+                context,
+                control.started_at_ms,
+                now_ms()?,
+            );
+            write_once(&job_dir.join(EXECUTION_FILE), &receipt)?;
+            if let Some(pid) = execution.child_pid
+                && let (Some(started_at_ms), Some(loaded)) =
+                    (control.started_at_ms, loaded.as_ref())
+            {
+                let _ = write_once(
+                    &job_dir.join("started.json"),
+                    &json!({
+                        "pid": pid,
+                        "program": loaded.plan.executable.to_string_lossy(),
+                        "started_at_ms": started_at_ms,
+                        "token": bootstrap.identity.token
+                    }),
+                );
+            }
+            Ok(())
+        },
     );
-    let execution = match execution_result {
+    match execution_result {
         Ok(_execution)
             if control.group_diagnostic_write_failed || control.output_diagnostic_write_failed =>
         {
@@ -347,7 +380,7 @@ fn execute(control_file: &Path) -> Result<()> {
                 "CheckRun diagnostics could not be persisted",
             ));
         }
-        Ok(execution) => execution,
+        Ok(_) => {}
         Err(error) => {
             // The root has already published an exact, host-authored plan
             // failure after Store Go. Reusing that receipt avoids creating a
@@ -364,37 +397,6 @@ fn execute(control_file: &Path) -> Result<()> {
             return Err(Error::new(code, "standalone checks executor failed"));
         }
     };
-
-    let loaded = plan_context
-        .lock()
-        .map_err(|_| Error::new("CHECK_PLAN_LOCK_FAILED", "plan lock is unavailable"))?
-        .clone();
-    let plan_sha256 = loaded.as_ref().map(|value| value.plan_sha256.as_str());
-    let plan_context = loaded.as_ref().map(|value| &value.context);
-
-    if let Some(pid) = execution.child_pid
-        && let (Some(started_at_ms), Some(loaded)) = (control.started_at_ms, loaded.as_ref())
-    {
-        write_once(
-            &job_dir.join("started.json"),
-            &json!({
-                "pid": pid,
-                "program": loaded.plan.executable.to_string_lossy(),
-                "started_at_ms": started_at_ms,
-                "token": bootstrap.identity.token
-            }),
-        )?;
-    }
-
-    let receipt = execution_json(
-        &bootstrap,
-        &execution,
-        plan_sha256,
-        plan_context,
-        control.started_at_ms,
-        now_ms()?,
-    );
-    write_once(&job_dir.join(EXECUTION_FILE), &receipt)?;
     drop(lock);
     Ok(())
 }
@@ -791,6 +793,7 @@ fn stream_json(stream: &swarm_checks::CapturedStream) -> Value {
         "path": stream.path.to_string_lossy(),
         "bytes_written": stream.bytes_written,
         "bytes_observed": stream.bytes_observed,
+        "sha256": stream.sha256,
         "truncated": stream.truncated,
         "capture_complete": stream.capture_complete,
         "capture_disposition": capture_disposition_name(stream.capture_disposition),

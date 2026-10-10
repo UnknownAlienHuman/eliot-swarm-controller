@@ -28,8 +28,9 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
 };
+use swarm_process::process_group::{ProcessFamilyObservation, observe_process_family};
 use swarm_process::{
-    departed_empty, module_child_belongs_to_owner, process_birth_identity, process_image_identity,
+    module_child_belongs_to_owner, process_birth_identity, process_image_identity,
 };
 use tokio::{
     process::{Child, Command},
@@ -45,6 +46,10 @@ const MODULE_PLAN_LIMIT: u64 = 65_536;
 const RESTART_HISTORY_LIMIT: u64 = 16_384;
 const OWNER_DRAIN_POLL: Duration = Duration::from_millis(500);
 const HELPER_START_POLL: Duration = Duration::from_millis(100);
+const HELPER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(45);
+const OWNER_FINAL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(20);
+const PRIOR_OWNER_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const OWNER_RECONCILE_RETRY: Duration = Duration::from_secs(1);
 const MAX_UNKNOWN_OPERATIONS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +154,7 @@ pub enum OwnerRetainedReason {
     WorkerIdentityUnknown,
     HelloUnconfirmed,
     OwnerFamilyNotEmpty,
+    OwnerFamilyObservationUnknown,
 }
 
 impl OwnerRetainedReason {
@@ -158,6 +164,7 @@ impl OwnerRetainedReason {
             Self::WorkerIdentityUnknown => "MODULE_WORKER_IDENTITY_UNKNOWN",
             Self::HelloUnconfirmed => "MODULE_HELLO_UNCONFIRMED",
             Self::OwnerFamilyNotEmpty => "MODULE_OWNER_FAMILY_NOT_EMPTY",
+            Self::OwnerFamilyObservationUnknown => "MODULE_OWNER_FAMILY_OBSERVATION_UNKNOWN",
         }
     }
 }
@@ -175,6 +182,12 @@ pub struct ProcessIdentity {
 pub struct FailureSummary {
     pub code: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleHelloFailure {
+    pub boot_id: String,
+    pub error_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +224,10 @@ pub struct SupervisorStatus {
     /// started or terminated by this supervisor.
     pub worker: Option<ProcessIdentity>,
     pub worker_boot_id: Option<String>,
+    /// Exact Store hello boot and closed reason when confirmation failed.
+    /// This diagnostic context must not overwrite the observed worker boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hello_failure: Option<ModuleHelloFailure>,
     /// Closed adapter error_code received only from this exact worker scope.
     /// Diagnostic data does not replace the generic lifecycle failure code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -732,8 +749,19 @@ impl SupervisorRegistry {
                 "module service scope is not active",
             ));
         }
+        drop(services);
         for service in matching {
             service.apply_readback(readback.clone())?;
+            let custody_pending = service.helper_child_custody.lock().await.is_some();
+            let owner_pending = matches!(
+                &service.status.borrow().lifecycle,
+                LifecycleState::OwnerGroupRetained { .. }
+                    | LifecycleState::OwnerIdentityUnknown
+                    | LifecycleState::ProcessIdentityUnknown { .. }
+            );
+            if custody_pending || owner_pending {
+                service.ensure_runner().await?;
+            }
         }
         Ok(())
     }
@@ -754,6 +782,42 @@ impl SupervisorRegistry {
             .map(|(_, service)| service.clone())
             .ok_or_else(|| Error::new("MODULE_NOT_ACTIVE", "module service scope is not active"))?;
         service.confirm_module_hello(boot_id)
+    }
+
+    /// Retain a bounded reason when Store's accepted hello cannot be matched
+    /// to the exact worker. The failed Store boot is kept separately from the
+    /// locally observed worker identity and the scope remains non-Ready.
+    pub async fn record_module_hello_failure(
+        &self,
+        module_id: &str,
+        scope: &ServiceScope,
+        boot_id: &str,
+        error_code: &str,
+    ) -> Result<()> {
+        let services = self.services.lock().await;
+        let service = services
+            .iter()
+            .find(|(key, _)| key.module_id == module_id && &key.scope == scope)
+            .map(|(_, service)| service.clone())
+            .ok_or_else(|| Error::new("MODULE_NOT_ACTIVE", "module service scope is not active"))?;
+        service.record_module_hello_failure(boot_id, error_code)
+    }
+
+    /// Stop only the exact permanently rejected scope while preserving the
+    /// first retained failure reason. Other module scopes continue normally.
+    pub async fn quarantine_scope(
+        &self,
+        module_id: &str,
+        scope: &ServiceScope,
+        error_code: &str,
+    ) -> Result<()> {
+        let services = self.services.lock().await;
+        let service = services
+            .iter()
+            .find(|(key, _)| key.module_id == module_id && &key.scope == scope)
+            .map(|(_, service)| service.clone())
+            .ok_or_else(|| Error::new("MODULE_NOT_ACTIVE", "module service scope is not active"))?;
+        service.quarantine(error_code)
     }
 
     pub async fn status(&self, module_id: &str, scope: &ServiceScope) -> Option<SupervisorStatus> {
@@ -888,8 +952,20 @@ struct Service {
     demand_epoch: watch::Sender<u64>,
     recovery_epoch: watch::Sender<u64>,
     readback_required: AtomicBool,
+    scope_quarantined: AtomicBool,
     unknown_operation_ids: Mutex<BTreeSet<String>>,
     runner: AsyncMutex<Option<JoinHandle<()>>>,
+    /// Exact helper Child retained when process, receipt, or family
+    /// observation is uncertain. This slot is bounded to one per scope.
+    helper_child_custody: AsyncMutex<Option<RetainedHelperChild>>,
+}
+
+struct RetainedHelperChild {
+    child: Child,
+    pid: Option<u32>,
+    identity: Option<ProcessIdentity>,
+    boot_id: Option<String>,
+    reason_code: String,
 }
 
 struct ConfirmedReady {
@@ -967,6 +1043,7 @@ impl Service {
             worker: None,
             owner: None,
             worker_boot_id: None,
+            hello_failure: None,
             worker_diagnostic_code: None,
             effect_certainty: ModuleEffectCertainty::Unknown,
             failure_stage: None,
@@ -1005,8 +1082,10 @@ impl Service {
             demand_epoch,
             recovery_epoch,
             readback_required: AtomicBool::new(prior_state),
+            scope_quarantined: AtomicBool::new(false),
             unknown_operation_ids: Mutex::new(BTreeSet::new()),
             runner: AsyncMutex::new(None),
+            helper_child_custody: AsyncMutex::new(None),
         }
     }
 
@@ -1048,12 +1127,21 @@ impl Service {
             return Ok(());
         }
         let current = self.status.borrow().lifecycle.clone();
+        let has_custody = self.helper_child_custody.lock().await.is_some();
+        let ownership_pending = matches!(
+            current,
+            LifecycleState::OwnerGroupRetained { .. }
+                | LifecycleState::OwnerIdentityUnknown
+                | LifecycleState::ProcessIdentityUnknown { .. }
+        );
         if matches!(
             &current,
             LifecycleState::Isolated { .. }
                 | LifecycleState::OwnerIdentityUnknown
                 | LifecycleState::ProcessIdentityUnknown { .. }
-        ) {
+        ) && !has_custody
+            && !ownership_pending
+        {
             return Err(Error::new(
                 "MODULE_ISOLATED",
                 "module is isolated pending a changed descriptor or exact recovery evidence",
@@ -1067,6 +1155,8 @@ impl Service {
                     | LifecycleState::Completed { .. }
                     | LifecycleState::ProcessExited { .. }
             )
+            && !has_custody
+            && !ownership_pending
         {
             let pid = self
                 .status
@@ -1093,23 +1183,176 @@ impl Service {
         Ok(())
     }
 
+    async fn retain_helper_child_custody(
+        &self,
+        child: Child,
+        identity: Option<ProcessIdentity>,
+        boot_id: Option<String>,
+        reason_code: &str,
+    ) {
+        let retained = RetainedHelperChild {
+            pid: child
+                .id()
+                .or_else(|| identity.as_ref().map(|identity| identity.pid)),
+            child,
+            identity,
+            boot_id,
+            reason_code: reason_code.to_owned(),
+        };
+        loop {
+            let mut custody = self.helper_child_custody.lock().await;
+            if custody.is_none() {
+                *custody = Some(retained);
+                break;
+            }
+            drop(custody);
+            // The per-scope runner normally makes this path unreachable. If a
+            // concurrent recovery reaches it, keep this actual Child alive in
+            // this future until the existing bounded custody slot is released.
+            time::sleep(OWNER_RECONCILE_RETRY).await;
+        }
+        self.readback_required.store(true, Ordering::Release);
+        self.update_status(|status| status.readback_required = true);
+    }
+
+    async fn restore_helper_child_custody(&self, retained: RetainedHelperChild) {
+        let mut retained = Some(retained);
+        loop {
+            let mut custody = self.helper_child_custody.lock().await;
+            if custody.is_none() {
+                *custody = retained.take();
+                return;
+            }
+            drop(custody);
+            time::sleep(OWNER_RECONCILE_RETRY).await;
+        }
+    }
+
+    async fn reconcile_retained_helper_child(&self) -> Result<()> {
+        let Some(mut retained) = self.helper_child_custody.lock().await.take() else {
+            return Ok(());
+        };
+
+        let departure = self.wait_for_prior_owner_to_depart().await;
+        let departed = match departure {
+            Ok(Some(departed)) => departed,
+            Ok(None) => {
+                self.record_failure(
+                    &retained.reason_code,
+                    "retained helper has no exact owner-family departure proof",
+                );
+                self.restore_helper_child_custody(retained).await;
+                return Err(Error::new(
+                    "MODULE_CHILD_CUSTODY_UNRESOLVED",
+                    "retained module helper has no exact owner-family departure proof",
+                ));
+            }
+            Err(error) => {
+                self.record_failure(
+                    &retained.reason_code,
+                    "retained helper owner-family reconciliation remains unresolved",
+                );
+                self.restore_helper_child_custody(retained).await;
+                return Err(error);
+            }
+        };
+
+        let departed_pid = departed.receipt["process"]["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok());
+        let direct_child_matches_departed_owner = departed_pid.is_some_and(|owner_pid| {
+            retained.pid.is_none_or(|pid| pid == owner_pid)
+                && retained
+                    .identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.pid == owner_pid)
+        });
+        if !direct_child_matches_departed_owner {
+            self.record_failure(
+                "MODULE_CHILD_CUSTODY_IDENTITY_MISMATCH",
+                "retained direct Child does not match the departed owner receipt",
+            );
+            self.restore_helper_child_custody(retained).await;
+            return Err(Error::new(
+                "MODULE_CHILD_CUSTODY_IDENTITY_MISMATCH",
+                "retained direct Child does not match the departed owner receipt",
+            ));
+        }
+
+        let exit = match retained.child.try_wait() {
+            Ok(Some(exit)) => exit,
+            Ok(None) => {
+                self.record_failure(
+                    "MODULE_CHILD_CUSTODY_UNRESOLVED",
+                    "owner-family departure was observed while the retained direct Child remains live",
+                );
+                self.restore_helper_child_custody(retained).await;
+                return Err(Error::new(
+                    "MODULE_CHILD_CUSTODY_UNRESOLVED",
+                    "retained direct module helper has not reported its exit",
+                ));
+            }
+            Err(_) => {
+                self.record_failure(
+                    "MODULE_CHILD_WAIT_UNKNOWN",
+                    "retained direct Child exit could not be observed after family reconciliation",
+                );
+                self.restore_helper_child_custody(retained).await;
+                return Err(Error::new(
+                    "MODULE_CHILD_WAIT_UNKNOWN",
+                    "retained direct module helper exit remains unknown",
+                ));
+            }
+        };
+
+        let owner = retained.identity.clone().or_else(|| {
+            serde_json::from_value::<ProcessIdentity>(departed.receipt["process"].clone()).ok()
+        });
+        self.update_status(|status| {
+            status.lifecycle = LifecycleState::ProcessExited {
+                exit_code: exit.code(),
+                exit_proven: true,
+            };
+            if let Some(owner) = owner {
+                status.owner = Some(owner);
+            }
+            if status.worker_boot_id.is_none() {
+                status.worker_boot_id = retained.boot_id.clone();
+            }
+        });
+        Ok(())
+    }
+
     // This cleanup may spawn another lifecycle task. A boxed Send boundary
     // avoids a recursive opaque-future type while preserving the runner mutex.
     fn after_runner_exit(self: &Arc<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let mut runner = self.runner.lock().await;
             *runner = None;
-            if !self.has_demand()
-                || matches!(
+            let custody_pending = self.helper_child_custody.lock().await.is_some();
+            let owner_pending = matches!(
+                &self.status.borrow().lifecycle,
+                LifecycleState::OwnerGroupRetained { .. }
+                    | LifecycleState::OwnerIdentityUnknown
+                    | LifecycleState::ProcessIdentityUnknown { .. }
+            );
+            if (!self.has_demand() && !custody_pending && !owner_pending)
+                || (matches!(
                     self.admission.borrow().clone(),
                     AdmissionState::Closed { .. }
-                )
-                || !matches!(
-                    &self.status.borrow().lifecycle,
-                    LifecycleState::WaitingForDemand | LifecycleState::WaitingForKernel
-                )
+                ) && !custody_pending)
+                || (!custody_pending
+                    && !owner_pending
+                    && !matches!(
+                        &self.status.borrow().lifecycle,
+                        LifecycleState::WaitingForDemand | LifecycleState::WaitingForKernel
+                    ))
             {
                 return;
+            }
+
+            if custody_pending || owner_pending {
+                time::sleep(OWNER_RECONCILE_RETRY).await;
             }
 
             // Demand can race the runner's final no-demand check. Recheck and
@@ -1213,6 +1456,12 @@ impl Service {
     }
 
     fn confirm_module_hello(&self, boot_id: &str) -> Result<()> {
+        if self.scope_quarantined.load(Ordering::Acquire) {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_SCOPE_QUARANTINED",
+                "module supervisor scope is permanently quarantined after rejection",
+            ));
+        }
         let status = self.status.borrow().clone();
         if status.worker_boot_id.as_deref() != Some(boot_id) {
             return Err(Error::new(
@@ -1293,6 +1542,14 @@ impl Service {
                 boot_id: boot_id.to_owned(),
             };
             current.readback_required = false;
+            if let Some(failure) = current.hello_failure.take()
+                && current
+                    .last_failure
+                    .as_ref()
+                    .is_some_and(|last| last.code == failure.error_code)
+            {
+                current.last_failure = None;
+            }
             if ready.as_ref().is_none_or(|previous| {
                 previous.status.worker_boot_id.as_deref() != Some(boot_id)
             }) {
@@ -1309,6 +1566,76 @@ impl Service {
         }
         self.readback_required.store(false, Ordering::Release);
         self.bump(&self.recovery_epoch);
+        Ok(())
+    }
+
+    fn record_module_hello_failure(&self, boot_id: &str, error_code: &str) -> Result<()> {
+        if boot_id.is_empty()
+            || boot_id.len() > 128
+            || boot_id.chars().any(char::is_control)
+            || error_code.is_empty()
+            || error_code.len() > 128
+            || !error_code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(Error::invalid(
+                "module hello diagnostic is outside its bound",
+            ));
+        }
+        let failure = ModuleHelloFailure {
+            boot_id: boot_id.to_owned(),
+            error_code: error_code.to_owned(),
+        };
+        self.update_status(|status| {
+            if matches!(
+                status.lifecycle,
+                LifecycleState::Starting { .. } | LifecycleState::ProcessRunning { .. }
+            ) {
+                status.lifecycle = LifecycleState::Starting {
+                    boot_id: boot_id.to_owned(),
+                };
+            }
+            status.hello_failure = Some(failure.clone());
+            status.last_failure = Some(FailureSummary {
+                code: error_code.to_owned(),
+                detail: "the exact Store module.hello boot could not be confirmed".to_owned(),
+            });
+            status.readback_required = true;
+        });
+        self.readback_required.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn quarantine(&self, error_code: &str) -> Result<()> {
+        if error_code.is_empty()
+            || error_code.len() > 128
+            || !error_code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(Error::invalid(
+                "module observation rejection code is invalid",
+            ));
+        }
+        self.scope_quarantined.store(true, Ordering::Release);
+        self.readback_required.store(true, Ordering::Release);
+        self.update_status(|status| {
+            let code = status
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.code.clone())
+                .unwrap_or_else(|| error_code.to_owned());
+            status.lifecycle = LifecycleState::Isolated {
+                reason: "module supervisor observation was permanently rejected".to_owned(),
+            };
+            status.readback_required = true;
+            status.last_failure = Some(FailureSummary {
+                code,
+                detail: "this exact binding generation is quarantined pending explicit recovery"
+                    .to_owned(),
+            });
+        });
         Ok(())
     }
 
@@ -1335,11 +1662,39 @@ impl Service {
                 return;
             }
         };
+        if let Err(error) = self.reconcile_retained_helper_child().await {
+            self.record_failure(
+                &error.code,
+                "retained helper custody is waiting for exact owner-family departure",
+            );
+            self.readback_required.store(true, Ordering::Release);
+            self.update_status(|status| {
+                status.readback_required = true;
+                if !matches!(
+                    status.lifecycle,
+                    LifecycleState::OwnerGroupRetained { .. }
+                        | LifecycleState::OwnerIdentityUnknown
+                        | LifecycleState::ProcessIdentityUnknown { .. }
+                ) {
+                    status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+                }
+            });
+            return;
+        }
         let mut demand_epoch = self.demand_epoch.subscribe();
         let mut admission = self.admission.subscribe();
         let mut recovery = self.recovery_epoch.subscribe();
 
         loop {
+            if self.scope_quarantined.load(Ordering::Acquire) {
+                self.update_status(|status| {
+                    status.lifecycle = LifecycleState::Isolated {
+                        reason: "module supervisor observation was permanently rejected".to_owned(),
+                    };
+                    status.readback_required = true;
+                });
+                return;
+            }
             if !self.has_demand() {
                 self.update_status(|status| {
                     if !matches!(
@@ -1457,7 +1812,9 @@ impl Service {
                         "prior module owner identity is missing or unresolved",
                     );
                     self.update_status(|status| {
-                        status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+                        if !matches!(status.lifecycle, LifecycleState::OwnerGroupRetained { .. }) {
+                            status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+                        }
                         status.readback_required = true;
                     });
                     self.readback_required.store(true, Ordering::Release);
@@ -1583,6 +1940,7 @@ impl Service {
                     continue;
                 }
             };
+            let receipt_deadline = Instant::now() + HELPER_RECEIPT_TIMEOUT;
             let Some(pid) = helper.id() else {
                 self.record_failure(
                     "MODULE_OWNER_IDENTITY",
@@ -1593,6 +1951,13 @@ impl Service {
                     status.lifecycle = LifecycleState::ProcessIdentityUnknown { pid: None };
                     status.readback_required = true;
                 });
+                self.retain_helper_child_custody(
+                    helper,
+                    None,
+                    Some(boot_id.clone()),
+                    "MODULE_OWNER_IDENTITY",
+                )
+                .await;
                 return;
             };
             let helper_identity = match capture_identity(pid) {
@@ -1608,6 +1973,13 @@ impl Service {
                             LifecycleState::ProcessIdentityUnknown { pid: Some(pid) };
                         status.readback_required = true;
                     });
+                    self.retain_helper_child_custody(
+                        helper,
+                        None,
+                        Some(boot_id.clone()),
+                        &error.code,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -1622,6 +1994,13 @@ impl Service {
                     status.owner = Some(helper_identity.clone());
                     status.readback_required = true;
                 });
+                self.retain_helper_child_custody(
+                    helper,
+                    Some(helper_identity),
+                    Some(boot_id.clone()),
+                    &error.code,
+                )
+                .await;
                 return;
             }
             if !self.image_matches_helper(&helper_identity) {
@@ -1635,6 +2014,13 @@ impl Service {
                     status.owner = Some(helper_identity.clone());
                     status.readback_required = true;
                 });
+                self.retain_helper_child_custody(
+                    helper,
+                    Some(helper_identity),
+                    Some(boot_id.clone()),
+                    "MODULE_OWNER_HELPER_MISMATCH",
+                )
+                .await;
                 return;
             }
 
@@ -1651,6 +2037,7 @@ impl Service {
                     &boot_id,
                     &helper_identity,
                     departed_prior_owner.as_ref(),
+                    receipt_deadline,
                 )
                 .await
             {
@@ -1662,10 +2049,33 @@ impl Service {
                     );
                     self.readback_required.store(true, Ordering::Release);
                     self.update_status(|status| {
-                        status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+                        status.lifecycle = match error.code.as_str() {
+                            "MODULE_OWNER_FAMILY_NOT_EMPTY"
+                            | "MODULE_FINAL_FAMILY_OBSERVATION_TIMEOUT" => {
+                                LifecycleState::OwnerGroupRetained {
+                                    owner_pid: helper_identity.pid,
+                                    reason: OwnerRetainedReason::OwnerFamilyNotEmpty,
+                                }
+                            }
+                            "MODULE_OWNER_FAMILY_OBSERVATION_UNKNOWN"
+                            | "MODULE_FINAL_FAMILY_OBSERVATION_UNKNOWN" => {
+                                LifecycleState::OwnerGroupRetained {
+                                    owner_pid: helper_identity.pid,
+                                    reason: OwnerRetainedReason::OwnerFamilyObservationUnknown,
+                                }
+                            }
+                            _ => LifecycleState::OwnerIdentityUnknown,
+                        };
                         status.owner = Some(helper_identity.clone());
                         status.readback_required = true;
                     });
+                    self.retain_helper_child_custody(
+                        helper,
+                        Some(helper_identity),
+                        Some(boot_id.clone()),
+                        &error.code,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -1679,14 +2089,22 @@ impl Service {
                 );
                 self.readback_required.store(true, Ordering::Release);
                 self.update_status(|status| {
-                    status.lifecycle = LifecycleState::Isolated {
-                        reason: "launch outcome is unknown; persisted evidence is retained and no replacement started".to_owned(),
-                    };
+                    status.lifecycle = LifecycleState::OwnerIdentityUnknown;
                     status.owner = Some(helper_identity.clone());
                     status.worker = attempt.worker.clone();
                     status.worker_boot_id = Some(boot_id.clone());
                     status.readback_required = true;
                 });
+                self.retain_helper_child_custody(
+                    helper,
+                    Some(helper_identity),
+                    Some(boot_id.clone()),
+                    attempt
+                        .failure_code
+                        .as_deref()
+                        .unwrap_or("MODULE_LAUNCH_RESULT_MISSING"),
+                )
+                .await;
                 return;
             }
             if let Err(error) = self.remove_plan(&boot_id) {
@@ -1742,7 +2160,8 @@ impl Service {
                 }
             }
 
-            let restart_needed = self.has_demand()
+            let restart_needed = !self.scope_quarantined.load(Ordering::Acquire)
+                && self.has_demand()
                 && matches!(
                     self.descriptor.lifecycle,
                     LifecycleOwnership::OwnedService | LifecycleOwnership::ExternalAttach
@@ -1751,7 +2170,11 @@ impl Service {
             self.readback_required
                 .store(needs_operation_readback, Ordering::Release);
             self.update_status(|status| {
-                status.lifecycle = if attempt.exit.success()
+                status.lifecycle = if self.scope_quarantined.load(Ordering::Acquire) {
+                    LifecycleState::Isolated {
+                        reason: "module supervisor observation was permanently rejected".to_owned(),
+                    }
+                } else if attempt.exit.success()
                     && !restart_needed
                     && attempt.family_departure_proven
                 {
@@ -2135,13 +2558,14 @@ impl Service {
             Some(worker) => process_identity_is_live(worker)?,
             None => false,
         };
+        let scope_quarantined = self.scope_quarantined.load(Ordering::Acquire);
         self.update_status(|status| {
             // Liveness advances only to Starting. Preserve Ready only when
             // Store already confirmed this exact boot and worker identity.
             let hello_confirmed = worker_live
                 && worker_identity
                     .is_some_and(|worker| worker_is_hello_confirmed(status, boot_id, worker));
-            if !worker_live {
+            if !scope_quarantined && !worker_live {
                 status.lifecycle = LifecycleState::OwnerGroupRetained {
                     owner_pid: helper_identity.pid,
                     reason: if worker_identity.is_some() {
@@ -2150,7 +2574,7 @@ impl Service {
                         OwnerRetainedReason::WorkerIdentityUnknown
                     },
                 };
-            } else if !hello_confirmed {
+            } else if !scope_quarantined && !hello_confirmed {
                 status.lifecycle = LifecycleState::Starting {
                     boot_id: boot_id.to_owned(),
                 };
@@ -2168,6 +2592,7 @@ impl Service {
         boot_id: &str,
         helper_identity: &ProcessIdentity,
         departed_prior_owner: Option<&VerifiedDepartedOwner>,
+        receipt_deadline: Instant,
     ) -> Result<OwnerHelperExit> {
         let owner_path = self.state_dir.join("owner.json");
         let worker_path = self.state_dir.join("worker.json");
@@ -2276,10 +2701,14 @@ impl Service {
                 let token = owner_token.as_deref().ok_or_else(|| {
                     Error::new("MODULE_OWNER_IDENTITY_INVALID", "owner token is missing")
                 })?;
+                let final_observation_deadline = Instant::now() + OWNER_FINAL_OBSERVATION_TIMEOUT;
                 loop {
-                    if departed_empty(&owner["process"], token)? {
-                        break;
-                    }
+                    let family_observation_unknown =
+                        match observe_process_family(&owner["process"], token) {
+                            ProcessFamilyObservation::ConfirmedEmpty => break,
+                            ProcessFamilyObservation::Retained => false,
+                            ProcessFamilyObservation::Unknown(_) => true,
+                        };
                     if self.observe_owned_worker(
                         boot_id,
                         helper_identity,
@@ -2288,6 +2717,20 @@ impl Service {
                         let now = Instant::now();
                         worker_started_at.get_or_insert(now);
                         worker_last_live_at = Some(now);
+                    }
+                    if Instant::now() >= final_observation_deadline {
+                        let (code, message) = if family_observation_unknown {
+                            (
+                                "MODULE_FINAL_FAMILY_OBSERVATION_UNKNOWN",
+                                "exact owner-family state remained unavailable after direct helper exit",
+                            )
+                        } else {
+                            (
+                                "MODULE_FINAL_FAMILY_OBSERVATION_TIMEOUT",
+                                "exact owner family remained after direct helper exit",
+                            )
+                        };
+                        return Err(Error::new(code, message));
                     }
                     time::sleep(OWNER_DRAIN_POLL).await;
                 }
@@ -2361,6 +2804,14 @@ impl Service {
                 let now = Instant::now();
                 worker_started_at.get_or_insert(now);
                 worker_last_live_at = Some(now);
+            }
+            let startup_receipt_observed = owner_record.is_some()
+                && ((worker_record.is_some() && worker_validated) || launch_result.is_some());
+            if !startup_receipt_observed && Instant::now() >= receipt_deadline {
+                return Err(Error::new(
+                    "MODULE_START_RECEIPT_TIMEOUT",
+                    "exact helper startup owner and worker or pre-spawn receipts were not observed before the bounded deadline",
+                ));
             }
             time::sleep(HELPER_START_POLL).await;
         }
@@ -2553,6 +3004,7 @@ impl Service {
     }
 
     async fn wait_for_prior_owner_to_depart(&self) -> Result<Option<VerifiedDepartedOwner>> {
+        let observation_deadline = Instant::now() + PRIOR_OWNER_OBSERVATION_TIMEOUT;
         let attempt_path = self.state_dir.join("launch-attempt.json");
         let attempt = read_json_receipt_optional(&attempt_path, LAUNCH_RECORD_LIMIT)?;
         let mut attempt_boot_id = None::<String>;
@@ -2679,6 +3131,12 @@ impl Service {
 
         let mut prior_start_proved = attempt.is_none();
         loop {
+            if Instant::now() >= observation_deadline {
+                return Err(Error::new(
+                    "MODULE_PRIOR_OWNER_WAIT_TIMEOUT",
+                    "prior exact helper or owner family did not prove departure before the bounded wait expired",
+                ));
+            }
             if let Some(helper) = attempted_helper.as_ref()
                 && process_identity_is_live(helper)?
             {
@@ -2730,7 +3188,11 @@ impl Service {
                     status.worker = attached_worker.clone();
                     status.worker_boot_id = boot_id.clone();
                 });
-                time::sleep(OWNER_DRAIN_POLL).await;
+                time::sleep(
+                    OWNER_DRAIN_POLL
+                        .min(observation_deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
                 continue;
             }
             if prior_owner.is_none() {
@@ -2788,30 +3250,47 @@ impl Service {
                 }
                 prior_start_proved = true;
             }
-            if departed_empty(&owner["process"], token)? {
-                return Ok(Some(VerifiedDepartedOwner {
-                    receipt: owner.clone(),
-                    token: token.clone(),
-                }));
-            }
+            let retained_reason = match observe_process_family(&owner["process"], token) {
+                ProcessFamilyObservation::ConfirmedEmpty => {
+                    return Ok(Some(VerifiedDepartedOwner {
+                        receipt: owner.clone(),
+                        token: token.clone(),
+                    }));
+                }
+                ProcessFamilyObservation::Retained => OwnerRetainedReason::OwnerFamilyNotEmpty,
+                ProcessFamilyObservation::Unknown(_) => {
+                    OwnerRetainedReason::OwnerFamilyObservationUnknown
+                }
+            };
             let owner_pid = prior_owner
                 .as_ref()
                 .and_then(|(owner, _)| owner["process"]["pid"].as_u64())
                 .and_then(|value| u32::try_from(value).ok())
                 .or_else(|| attempted_helper.as_ref().map(|helper| helper.pid))
                 .ok_or_else(|| Error::invalid("module owner process PID is invalid"))?;
+            let owner_identity =
+                serde_json::from_value::<ProcessIdentity>(owner["process"].clone()).ok();
             self.update_status(|status| {
                 status.lifecycle = LifecycleState::OwnerGroupRetained {
                     owner_pid,
-                    reason: OwnerRetainedReason::OwnerFamilyNotEmpty,
+                    reason: retained_reason,
                 };
-                status.owner = None;
-                status.worker = None;
-                status.worker_boot_id = None;
+                if let Some(owner_identity) = owner_identity {
+                    status.owner = Some(owner_identity);
+                }
+                if let Some(boot_id) = attempt_boot_id.as_ref() {
+                    status.worker_boot_id = Some(boot_id.clone());
+                }
+                status.readback_required = true;
             });
+            self.readback_required.store(true, Ordering::Release);
             // Never adopt or signal a surviving helper/group. It must prove
             // family departure before this scope can receive a new helper.
-            time::sleep(OWNER_DRAIN_POLL).await;
+            time::sleep(
+                OWNER_DRAIN_POLL
+                    .min(observation_deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
     }
 

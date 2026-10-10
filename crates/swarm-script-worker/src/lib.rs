@@ -15,15 +15,14 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use swarm_contracts::error::{Error, Result};
-use swarm_process::{Group, private_permissions, write_private_new};
+use swarm_process::{
+    CapturePair, CaptureReceipt, CaptureStream, Group, PipeWrite, PollableRead, PollableWrite,
+    create_output, private_permissions, sync_parent_directory, write_private_new,
+};
 use swarm_scripts::{
     MAX_ARGUMENT_BYTES, MAX_ARGUMENTS, MAX_BUNDLE_BYTES, MAX_BUNDLE_FILE_BYTES,
     MAX_CONTROLLER_EFFECTS, MAX_ENVIRONMENT_BYTES, MAX_ENVIRONMENT_VALUE_BYTES,
@@ -34,7 +33,7 @@ use swarm_scripts::{
         ProcessPlan, plan_process,
     },
     protocol::{ScriptEffectRequest, ScriptInvocation, validate_invocation_size},
-    result::{ProcessExit, ProcessOutcome, project_completion},
+    result::{ProcessExit, ReaderCompletionInput, project_completion_from_reader},
     schema::{
         InterpreterKind, MAX_SCHEMA_BYTES, ScriptControllerEffect, ScriptValueSchema,
         validate_bundle_path,
@@ -46,8 +45,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const START_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
-const CAPTURE_STOP_GRACE: Duration = Duration::from_millis(250);
 const TERMINATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const PIPE_IO_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_TERMINATION_ATTEMPTS: u8 = 3;
 const MAX_INTERPRETER_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -248,22 +247,6 @@ struct Completion {
     process_facts: Value,
 }
 
-#[derive(Debug, Clone, Default)]
-struct Captured {
-    started: bool,
-    bytes: Vec<u8>,
-    bytes_observed: u64,
-    overflow: bool,
-    capture_complete: bool,
-    capture_error: Option<String>,
-}
-
-struct CaptureTask {
-    reader: thread::JoinHandle<()>,
-    stop: Arc<AtomicBool>,
-    captured: Arc<Mutex<Captured>>,
-}
-
 #[derive(Default)]
 struct ProcessTermination {
     started: Option<Instant>,
@@ -272,9 +255,68 @@ struct ProcessTermination {
     request_unconfirmed: bool,
 }
 
+struct InputPipeWriter<W: PollableWrite> {
+    writer: Option<W>,
+    input: Vec<u8>,
+    offset: usize,
+}
+
+impl<W: PollableWrite> InputPipeWriter<W> {
+    fn new(writer: W, input: Vec<u8>) -> io::Result<Self> {
+        writer.make_nonblocking()?;
+        Ok(Self {
+            writer: Some(writer),
+            input,
+            offset: 0,
+        })
+    }
+
+    /// Writes no more than one bounded chunk and never waits for pipe space.
+    fn poll(&mut self) -> Option<bool> {
+        if self.writer.is_none() {
+            return Some(self.offset == self.input.len());
+        }
+        if self.offset == self.input.len() {
+            self.writer.take();
+            return Some(true);
+        }
+        let end = self
+            .offset
+            .saturating_add(PIPE_IO_CHUNK_BYTES)
+            .min(self.input.len());
+        let result = self
+            .writer
+            .as_mut()
+            .expect("pending input writer retains its pipe")
+            .write_available(&self.input[self.offset..end]);
+        match result {
+            Ok(PipeWrite::Pending) => None,
+            Ok(PipeWrite::Data(written)) if written > 0 && written <= end - self.offset => {
+                self.offset += written;
+                if self.offset == self.input.len() {
+                    self.writer.take();
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Ok(PipeWrite::Data(_)) | Ok(PipeWrite::Closed) | Err(_) => {
+                self.writer.take();
+                Some(false)
+            }
+        }
+    }
+
+    fn stop(&mut self) -> bool {
+        let complete = self.offset == self.input.len();
+        self.writer.take();
+        complete
+    }
+}
+
 struct CompletionPublication<'a> {
-    stdout: &'a [u8],
-    stderr: &'a [u8],
+    stdout: &'a CaptureReceipt,
+    stderr: &'a CaptureReceipt,
     result_value: Option<Value>,
     controller_effects: &'a [ScriptEffectRequest],
     error_code: Option<String>,
@@ -287,11 +329,21 @@ struct CompletionPublication<'a> {
 
 struct CleanupPendingPublication<'a> {
     process: &'a Value,
-    stdout_capture: &'a Captured,
-    stderr_capture: &'a Captured,
+    stdout_capture: &'a CaptureReceipt,
+    stderr_capture: &'a CaptureReceipt,
     process_facts: Value,
     started_at_ms: Option<i64>,
     exit_code: Option<i32>,
+    error_code: Option<String>,
+}
+
+#[derive(Clone)]
+struct ScriptExecutionSnapshot {
+    stdout: CaptureReceipt,
+    stderr: CaptureReceipt,
+    started_at_ms: Option<i64>,
+    exit_code: Option<i32>,
+    process_facts: Value,
     error_code: Option<String>,
 }
 
@@ -414,20 +466,35 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
             "a prior script worker started; code will not be repeated",
         ));
     }
+    let ready_at_ms = now_ms()?;
     let group = Group::enter_script(&work.token)?;
     let identity = json!({
         "run_id":work.run_id,
         "operation_id":work.operation_id,
         "token":work.token,
-        "ready_at_ms":now_ms()?,
+        "ready_at_ms":ready_at_ms,
         "control_version":1,
         "process":group.identity
     });
     let mut group = Some(group);
-    write_once(
-        &dir.join("worker.json"),
-        &canonical_json(&identity)?.into_bytes(),
-    )?;
+    let worker_publication = (|| -> Result<()> {
+        let bytes = canonical_json(&identity)?.into_bytes();
+        write_once(&dir.join("worker.json"), &bytes)
+    })();
+    if let Err(error) = worker_publication {
+        let mut termination = ProcessTermination::default();
+        let mut cancellation_failure_reported = false;
+        if let Some(owner) = group.as_ref() {
+            retain_script_group_until_released(
+                &work,
+                owner,
+                &identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
+        }
+        return Err(error);
+    }
 
     if let Err(error) = stage_bundle(&work, &dir) {
         return finish_worker_error(
@@ -436,6 +503,7 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
             &identity,
             error.code,
             "failed",
+            None,
         );
     }
     if let Err(error) = wait_for_start_decision(&work, &dir) {
@@ -445,6 +513,7 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
             &identity,
             error.code,
             "failed",
+            None,
         );
     }
     let plan = match wait_for_plan(&work, &work_sha256, &dir) {
@@ -456,13 +525,29 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
                 &identity,
                 error.code,
                 "failed",
+                None,
             );
         }
     };
-    match execute(&work, &plan, &dir, &mut group, &identity) {
+    let mut execution_snapshot = None;
+    match execute(
+        &work,
+        &plan,
+        &dir,
+        &mut group,
+        &identity,
+        &mut execution_snapshot,
+    ) {
         Ok(()) => Ok(()),
         Err(error) => match group.as_ref() {
-            Some(group) => finish_worker_error(&work, group, &identity, error.code, "failed"),
+            Some(group) => finish_worker_error(
+                &work,
+                group,
+                &identity,
+                error.code,
+                "failed",
+                execution_snapshot.as_ref(),
+            ),
             None => Err(error),
         },
     }
@@ -1284,12 +1369,18 @@ fn execute(
     dir: &Path,
     group_slot: &mut Option<Group>,
     identity: &Value,
+    execution_snapshot: &mut Option<ScriptExecutionSnapshot>,
 ) -> Result<()> {
     let input = validate_invocation_size(&plan.invocation).map_err(script_error)?;
     if input.len() > MAX_INVOCATION_BYTES {
         return Err(Error::invalid("script invocation exceeds 260 KiB"));
     }
     verify_interpreter(&work.interpreter)?;
+    let artifacts = ArtifactFiles::new(&work.data_dir)?;
+    let stdout_path = artifacts.output_path(work, "stdout")?;
+    let stderr_path = artifacts.output_path(work, "stderr")?;
+    let stdout_file = create_output(&stdout_path)?;
+    let stderr_file = create_output(&stderr_path)?;
     let mut command = Command::new(&plan.process.executable);
     command
         .args(&plan.process.arguments)
@@ -1315,23 +1406,30 @@ fn execute(
         let _ = error;
         primary_error_code = Some("SCRIPT_START_RECEIPT_FAILED".to_owned());
     }
-    let overflow = Arc::new(AtomicBool::new(false));
-    let stdout_flag = Arc::clone(&overflow);
-    let stdout_reader = child
-        .stdout
-        .take()
-        .and_then(|pipe| start_capture(pipe, MAX_RESULT_BYTES, stdout_flag).ok());
-    let stderr_flag = Arc::clone(&overflow);
-    let stderr_reader = child
-        .stderr
-        .take()
-        .and_then(|pipe| start_capture(pipe, MAX_STDERR_BYTES, stderr_flag).ok());
-    let input_writer = child.stdin.take().and_then(|mut stdin| {
-        thread::Builder::new()
-            .name("script-stdin".into())
-            .spawn(move || stdin.write_all(&input))
-            .ok()
+    let stdout_capture = child.stdout.take().and_then(|pipe| {
+        CaptureStream::new(
+            stdout_path.clone(),
+            stdout_file,
+            pipe,
+            MAX_RESULT_BYTES as u64,
+        )
+        .ok()
     });
+    let stderr_capture = child.stderr.take().and_then(|pipe| {
+        CaptureStream::new(
+            stderr_path.clone(),
+            stderr_file,
+            pipe,
+            MAX_STDERR_BYTES as u64,
+        )
+        .ok()
+    });
+    let mut captures = CapturePair::new(stdout_path, stdout_capture, stderr_path, stderr_capture);
+    let mut input_writer = child
+        .stdin
+        .take()
+        .and_then(|stdin| InputPipeWriter::new(stdin, input).ok());
+    let mut input_write = input_writer.is_none().then_some(false);
 
     let deadline =
         Instant::now() + Duration::from_millis(plan.process.timeout_ms.min(MAX_SCRIPT_DURATION_MS));
@@ -1339,7 +1437,7 @@ fn execute(
     let mut direct_exit = None::<Option<i32>>;
     let mut direct_observation_unknown = false;
     let mut termination = ProcessTermination::default();
-    if stdout_reader.is_none() || stderr_reader.is_none() || input_writer.is_none() {
+    if captures.has_setup_failure() || input_writer.is_none() {
         primary_error_code.get_or_insert_with(|| "SCRIPT_PIPE_SETUP_FAILED".to_owned());
     }
     if primary_error_code.is_some()
@@ -1354,7 +1452,31 @@ fn execute(
         );
     }
     loop {
-        if overflow.load(Ordering::Acquire)
+        captures.poll();
+        if input_write.is_none() && termination.started.is_none() {
+            let input_result = input_writer.as_mut().and_then(|writer| writer.poll());
+            if let Some(completed) = input_result {
+                input_write = Some(completed);
+                input_writer = None;
+                if !completed {
+                    primary_error_code
+                        .get_or_insert_with(|| "SCRIPT_INPUT_WRITE_FAILED".to_owned());
+                }
+            }
+        }
+        if (captures.truncated() || captures.has_reader_failure())
+            && termination.started.is_none()
+            && let Some(group) = group_slot.as_ref()
+        {
+            request_script_termination(
+                work,
+                group,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+            );
+        }
+        if primary_error_code.is_some()
             && termination.started.is_none()
             && let Some(group) = group_slot.as_ref()
         {
@@ -1414,6 +1536,13 @@ fn execute(
                 );
             }
         }
+        if termination.started.is_some() && input_write.is_none() {
+            input_write = Some(input_writer.as_mut().is_some_and(|writer| writer.stop()));
+            input_writer = None;
+            if input_write != Some(true) {
+                primary_error_code.get_or_insert_with(|| "SCRIPT_INPUT_WRITE_FAILED".to_owned());
+            }
+        }
         if termination
             .started
             .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
@@ -1427,6 +1556,7 @@ fn execute(
     let mut family_confirmed = false;
     let mut family_observation_unknown = false;
     while let Some(group) = group_slot.as_ref() {
+        captures.poll();
         match group.children_empty() {
             Ok(true) => {
                 family_confirmed = true;
@@ -1463,25 +1593,29 @@ fn execute(
 
     let process_identity = identity["process"].clone();
     let mut resource_released = false;
-    if let Some(group) = group_slot.take() {
-        if family_confirmed {
-            resource_released = group.disarm().is_ok();
-        }
-        drop(group);
+    if family_confirmed && let Some(group) = group_slot.as_ref() {
+        resource_released = group.disarm().is_ok();
     }
 
-    let (stdout, stderr) = finish_captures_bounded(stdout_reader, stderr_reader);
-    let input_writer_started = input_writer.is_some();
-    let mut input_write = finish_input_writer(input_writer);
-    if input_write.is_none() && !input_writer_started {
-        input_write = Some(false);
+    let (stdout, stderr) = finish_captures_bounded(captures);
+    if input_write.is_none() {
+        let input_deadline = Instant::now() + CAPTURE_DRAIN_GRACE;
+        while input_write.is_none() && Instant::now() < input_deadline {
+            let input_result = input_writer.as_mut().and_then(|writer| writer.poll());
+            if let Some(completed) = input_result {
+                input_write = Some(completed);
+                input_writer = None;
+            } else {
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+    if input_write.is_none() {
+        input_write = Some(input_writer.as_mut().is_some_and(|writer| writer.stop()));
+        drop(input_writer.take());
     }
     if input_write != Some(true) && primary_error_code.is_none() {
-        primary_error_code = Some(if input_write.is_none() {
-            "SCRIPT_INPUT_DRAIN_PENDING".to_owned()
-        } else {
-            "SCRIPT_INPUT_WRITE_FAILED".to_owned()
-        });
+        primary_error_code = Some("SCRIPT_INPUT_WRITE_FAILED".to_owned());
     }
 
     let direct_fact = match direct_exit {
@@ -1515,283 +1649,339 @@ fn execute(
         "input_write_complete":input_write,
         "primary_error_code":primary_error_code.clone(),
     });
+    *execution_snapshot = Some(ScriptExecutionSnapshot {
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+        started_at_ms: Some(started_at_ms),
+        exit_code: direct_exit.flatten(),
+        process_facts: process_facts.clone(),
+        error_code: primary_error_code.clone(),
+    });
 
     if cleanup_pending {
-        return publish_cleanup_pending(
+        return publish_then_release_owner(
             work,
-            CleanupPendingPublication {
-                process: &process_identity,
-                stdout_capture: &stdout,
-                stderr_capture: &stderr,
-                process_facts,
-                started_at_ms: Some(started_at_ms),
-                exit_code: direct_exit.flatten(),
-                error_code: primary_error_code,
-            },
+            group_slot,
+            identity,
+            &mut termination,
+            &mut cancellation_failure_reported,
+            execution_snapshot,
+            publish_cleanup_pending(
+                work,
+                CleanupPendingPublication {
+                    process: &process_identity,
+                    stdout_capture: &stdout,
+                    stderr_capture: &stderr,
+                    process_facts,
+                    started_at_ms: Some(started_at_ms),
+                    exit_code: direct_exit.flatten(),
+                    error_code: primary_error_code,
+                },
+            ),
         );
     }
 
     let Some(exit_code) = direct_exit else {
-        return publish_completion(
+        return publish_then_release_owner(
             work,
-            CompletionPublication {
-                stdout: &stdout.bytes,
-                stderr: &stderr.bytes,
-                result_value: None,
-                controller_effects: &[],
-                error_code: primary_error_code
-                    .or_else(|| Some("SCRIPT_PROCESS_OBSERVATION_UNKNOWN".to_owned())),
-                state: "incomplete",
-                started_at_ms: Some(started_at_ms),
-                exit_code: None,
-                process: &identity["process"],
-                process_facts,
-            },
+            group_slot,
+            identity,
+            &mut termination,
+            &mut cancellation_failure_reported,
+            execution_snapshot,
+            publish_completion(
+                work,
+                CompletionPublication {
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    result_value: None,
+                    controller_effects: &[],
+                    error_code: primary_error_code
+                        .or_else(|| Some("SCRIPT_PROCESS_OBSERVATION_UNKNOWN".to_owned())),
+                    state: "incomplete",
+                    started_at_ms: Some(started_at_ms),
+                    exit_code: None,
+                    process: &identity["process"],
+                    process_facts,
+                },
+            ),
         );
     };
     if primary_error_code.is_some() {
-        return publish_completion(
+        return publish_then_release_owner(
             work,
-            CompletionPublication {
-                stdout: &stdout.bytes,
-                stderr: &stderr.bytes,
-                result_value: None,
-                controller_effects: &[],
-                error_code: primary_error_code,
-                state: "incomplete",
-                started_at_ms: Some(started_at_ms),
-                exit_code,
-                process: &identity["process"],
-                process_facts,
-            },
-        );
-    }
-    let projection = match project_completion(
-        ProcessOutcome {
-            stdout: &stdout.bytes,
-            exit: ProcessExit::Observed { exit_code },
-            timed_out,
-            output_overflow: stdout.overflow || stderr.overflow,
-            input_failed: input_write != Some(true),
-        },
-        &work.operation_id,
-        &work.run_id,
-        &plan.result_schema,
-        &plan.granted_effects,
-    ) {
-        Ok(Some(projection)) => projection,
-        Ok(None) => {
-            return publish_completion(
+            group_slot,
+            identity,
+            &mut termination,
+            &mut cancellation_failure_reported,
+            execution_snapshot,
+            publish_completion(
                 work,
                 CompletionPublication {
-                    stdout: &stdout.bytes,
-                    stderr: &stderr.bytes,
+                    stdout: &stdout,
+                    stderr: &stderr,
                     result_value: None,
                     controller_effects: &[],
-                    error_code: Some("SCRIPT_OUTCOME_UNKNOWN".to_owned()),
+                    error_code: primary_error_code,
                     state: "incomplete",
                     started_at_ms: Some(started_at_ms),
                     exit_code,
                     process: &identity["process"],
                     process_facts,
                 },
+            ),
+        );
+    }
+
+    if output_record(&artifacts, work, "stdout", &stdout).is_err() {
+        return publish_then_release_owner(
+            work,
+            group_slot,
+            identity,
+            &mut termination,
+            &mut cancellation_failure_reported,
+            execution_snapshot,
+            publish_completion(
+                work,
+                CompletionPublication {
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    result_value: None,
+                    controller_effects: &[],
+                    error_code: Some("SCRIPT_OUTPUT_READBACK_FAILED".to_owned()),
+                    state: "incomplete",
+                    started_at_ms: Some(started_at_ms),
+                    exit_code,
+                    process: &identity["process"],
+                    process_facts,
+                },
+            ),
+        );
+    }
+    let stdout_file = match File::open(&stdout.path) {
+        Ok(file) => file,
+        Err(_) => {
+            return publish_then_release_owner(
+                work,
+                group_slot,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+                execution_snapshot,
+                publish_completion(
+                    work,
+                    CompletionPublication {
+                        stdout: &stdout,
+                        stderr: &stderr,
+                        result_value: None,
+                        controller_effects: &[],
+                        error_code: Some("SCRIPT_OUTPUT_READBACK_FAILED".to_owned()),
+                        state: "incomplete",
+                        started_at_ms: Some(started_at_ms),
+                        exit_code,
+                        process: &identity["process"],
+                        process_facts,
+                    },
+                ),
+            );
+        }
+    };
+    let projection = match project_completion_from_reader(ReaderCompletionInput {
+        exit: ProcessExit::Observed { exit_code },
+        timed_out,
+        output_overflow: stdout.truncated || stderr.truncated,
+        input_failed: input_write != Some(true),
+        stdout: stdout_file,
+        operation_id: &work.operation_id,
+        run_id: &work.run_id,
+        result_schema: &plan.result_schema,
+        granted_effects: &plan.granted_effects,
+    }) {
+        Ok(Some(projection)) => projection,
+        Ok(None) => {
+            return publish_then_release_owner(
+                work,
+                group_slot,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+                execution_snapshot,
+                publish_completion(
+                    work,
+                    CompletionPublication {
+                        stdout: &stdout,
+                        stderr: &stderr,
+                        result_value: None,
+                        controller_effects: &[],
+                        error_code: Some("SCRIPT_OUTCOME_UNKNOWN".to_owned()),
+                        state: "incomplete",
+                        started_at_ms: Some(started_at_ms),
+                        exit_code,
+                        process: &identity["process"],
+                        process_facts,
+                    },
+                ),
             );
         }
         Err(error) => {
             let error = script_error(error);
-            return publish_completion(
+            return publish_then_release_owner(
                 work,
-                CompletionPublication {
-                    stdout: &stdout.bytes,
-                    stderr: &stderr.bytes,
-                    result_value: None,
-                    controller_effects: &[],
-                    error_code: Some(error.code),
-                    state: "incomplete",
-                    started_at_ms: Some(started_at_ms),
-                    exit_code,
-                    process: &identity["process"],
-                    process_facts,
-                },
+                group_slot,
+                identity,
+                &mut termination,
+                &mut cancellation_failure_reported,
+                execution_snapshot,
+                publish_completion(
+                    work,
+                    CompletionPublication {
+                        stdout: &stdout,
+                        stderr: &stderr,
+                        result_value: None,
+                        controller_effects: &[],
+                        error_code: Some(error.code),
+                        state: "incomplete",
+                        started_at_ms: Some(started_at_ms),
+                        exit_code,
+                        process: &identity["process"],
+                        process_facts,
+                    },
+                ),
             );
         }
     };
-    publish_completion(
+    publish_then_release_owner(
         work,
-        CompletionPublication {
-            stdout: &stdout.bytes,
-            stderr: &stderr.bytes,
-            result_value: projection.result,
-            controller_effects: &projection.controller_effects,
-            error_code: projection.error_code,
-            state: &projection.state,
-            started_at_ms: Some(started_at_ms),
-            exit_code: projection.exit_code,
-            process: &identity["process"],
-            process_facts,
-        },
+        group_slot,
+        identity,
+        &mut termination,
+        &mut cancellation_failure_reported,
+        execution_snapshot,
+        publish_completion(
+            work,
+            CompletionPublication {
+                stdout: &stdout,
+                stderr: &stderr,
+                result_value: projection.result,
+                controller_effects: &projection.controller_effects,
+                error_code: projection.error_code,
+                state: &projection.state,
+                started_at_ms: Some(started_at_ms),
+                exit_code: projection.exit_code,
+                process: &identity["process"],
+                process_facts,
+            },
+        ),
     )
 }
 
-fn start_capture<R: PollableRead + Send + 'static>(
-    mut input: R,
-    limit: usize,
-    overflow_signal: Arc<AtomicBool>,
-) -> io::Result<CaptureTask> {
-    input.make_nonblocking()?;
-    let captured = Arc::new(Mutex::new(Captured {
-        started: true,
-        ..Captured::default()
-    }));
-    let thread_capture = Arc::clone(&captured);
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let reader = thread::Builder::new()
-        .name("script-output-capture".into())
-        .spawn(move || {
-            let mut buffer = [0u8; 16 * 1024];
-            loop {
-                if thread_stop.load(Ordering::Acquire) {
-                    capture_set_error(&thread_capture, "capture_drain_timeout");
-                    return;
-                }
-                match input.read_available(&mut buffer) {
-                    Ok(PipeRead::Pending) => thread::sleep(POLL_INTERVAL),
-                    Ok(PipeRead::Eof) => {
-                        capture_lock(&thread_capture).capture_complete = true;
-                        return;
-                    }
-                    Ok(PipeRead::Data(count)) => {
-                        let mut current = capture_lock(&thread_capture);
-                        current.bytes_observed =
-                            current.bytes_observed.saturating_add(count as u64);
-                        let remaining = limit.saturating_sub(current.bytes.len());
-                        let keep = remaining.min(count);
-                        current.bytes.extend_from_slice(&buffer[..keep]);
-                        if keep < count {
-                            current.overflow = true;
-                            overflow_signal.store(true, Ordering::Release);
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => {
-                        capture_set_error(&thread_capture, "capture_read_failed");
-                        return;
-                    }
-                }
+fn finish_captures_bounded<O: PollableRead, E: PollableRead>(
+    mut captures: CapturePair<O, E>,
+) -> (CaptureReceipt, CaptureReceipt) {
+    let deadline = Instant::now() + CAPTURE_DRAIN_GRACE;
+    while Instant::now() < deadline && (!captures.stdout_finished() || !captures.stderr_finished())
+    {
+        let progressed = captures.poll();
+        if !progressed {
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+    captures.finish()
+}
+
+fn publish_then_release_owner(
+    work: &ScriptWork,
+    group_slot: &mut Option<Group>,
+    identity: &Value,
+    termination: &mut ProcessTermination,
+    cancellation_failure_reported: &mut bool,
+    execution_snapshot: &mut Option<ScriptExecutionSnapshot>,
+    publication: Result<()>,
+) -> Result<()> {
+    if let Some(group) = group_slot.as_ref() {
+        retain_script_group_until_released(
+            work,
+            group,
+            identity,
+            termination,
+            cancellation_failure_reported,
+        );
+        refresh_script_snapshot_after_release(execution_snapshot, identity, termination);
+    }
+    if publication.is_ok() {
+        drop(group_slot.take());
+    }
+    publication
+}
+
+fn retain_script_group_until_released(
+    work: &ScriptWork,
+    group: &Group,
+    identity: &Value,
+    termination: &mut ProcessTermination,
+    cancellation_failure_reported: &mut bool,
+) {
+    // This synchronous loop keeps the Group in its worker while Store retains
+    // the worker Child. Termination attempts stay capped; bounded observations
+    // continue until both family departure and owner disarm are confirmed.
+    loop {
+        let family_departed = match group.children_empty() {
+            Ok(true) => true,
+            Ok(false) | Err(_) => false,
+        };
+        if family_departed {
+            if script_owner_release_authorized(family_departed, group.disarm().is_ok()) {
+                return;
             }
-        })?;
-    Ok(CaptureTask {
-        reader,
-        stop,
-        captured,
-    })
-}
-
-fn capture_lock(captured: &Mutex<Captured>) -> std::sync::MutexGuard<'_, Captured> {
-    captured
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn capture_set_error(captured: &Mutex<Captured>, code: &str) {
-    let mut current = capture_lock(captured);
-    if current.capture_error.is_none() {
-        current.capture_error = Some(code.to_owned());
-    }
-}
-
-fn finish_captures_bounded(
-    stdout: Option<CaptureTask>,
-    stderr: Option<CaptureTask>,
-) -> (Captured, Captured) {
-    let drain_deadline = Instant::now() + CAPTURE_DRAIN_GRACE;
-    while Instant::now() < drain_deadline
-        && (capture_task_pending(&stdout) || capture_task_pending(&stderr))
-    {
+        } else if termination.started.is_none() {
+            request_script_termination(
+                work,
+                group,
+                identity,
+                termination,
+                cancellation_failure_reported,
+            );
+        } else {
+            retry_script_termination(
+                work,
+                group,
+                identity,
+                termination,
+                cancellation_failure_reported,
+            );
+        }
         thread::sleep(POLL_INTERVAL);
     }
-    let stdout_pending = capture_task_pending(&stdout);
-    let stderr_pending = capture_task_pending(&stderr);
-    if let Some(task) = stdout.as_ref().filter(|_| stdout_pending) {
-        task.stop.store(true, Ordering::Release);
-    }
-    if let Some(task) = stderr.as_ref().filter(|_| stderr_pending) {
-        task.stop.store(true, Ordering::Release);
-    }
-    let stop_deadline = Instant::now() + CAPTURE_STOP_GRACE;
-    while Instant::now() < stop_deadline
-        && (capture_task_pending(&stdout) || capture_task_pending(&stderr))
-    {
-        thread::sleep(POLL_INTERVAL);
-    }
-    (
-        finish_capture_task(stdout, stdout_pending),
-        finish_capture_task(stderr, stderr_pending),
-    )
 }
 
-fn capture_task_pending(task: &Option<CaptureTask>) -> bool {
-    task.as_ref().is_some_and(|task| !task.reader.is_finished())
+fn script_owner_release_authorized(family_departed: bool, resource_released: bool) -> bool {
+    family_departed && resource_released
 }
 
-fn finish_capture_task(task: Option<CaptureTask>, stopped_at_deadline: bool) -> Captured {
-    let Some(task) = task else {
-        return capture_setup_failed();
+fn refresh_script_snapshot_after_release(
+    execution_snapshot: &mut Option<ScriptExecutionSnapshot>,
+    identity: &Value,
+    termination: &ProcessTermination,
+) {
+    let Some(snapshot) = execution_snapshot.as_mut() else {
+        return;
     };
-    let join_panicked = if task.reader.is_finished() {
-        task.reader.join().is_err()
-    } else {
-        false
-    };
-    let mut captured = capture_lock(&task.captured).clone();
-    if join_panicked && captured.capture_error.is_none() {
-        captured.capture_error = Some("capture_reader_panicked".to_owned());
-    }
-    if stopped_at_deadline && captured.capture_error.is_none() {
-        captured.capture_error = Some("capture_reader_stop_pending".to_owned());
-    }
-    captured
+    snapshot.process_facts["family_departure"] =
+        json!({"state":"confirmed","process":identity["process"]});
+    snapshot.process_facts["resource_released"] = json!(true);
+    let cleanup_pending = !snapshot.stdout.capture_complete
+        || !snapshot.stderr.capture_complete
+        || snapshot.process_facts["input_write_complete"]
+            .as_bool()
+            .is_none();
+    snapshot.process_facts["cleanup_pending"] = json!(cleanup_pending);
+    snapshot.process_facts["termination_attempts"] = json!(termination.attempts);
+    let termination_was_unconfirmed = snapshot.process_facts["termination_request_unconfirmed"]
+        .as_bool()
+        .unwrap_or(false);
+    snapshot.process_facts["termination_request_unconfirmed"] =
+        json!(termination_was_unconfirmed || termination.request_unconfirmed);
 }
-
-fn capture_setup_failed() -> Captured {
-    Captured {
-        started: true,
-        capture_error: Some("capture_setup_failed".to_owned()),
-        ..Captured::default()
-    }
-}
-
-fn capture_not_started() -> Captured {
-    Captured {
-        capture_error: Some("capture_not_started".to_owned()),
-        ..Captured::default()
-    }
-}
-
-fn capture_fact(captured: &Captured) -> Value {
-    json!({
-        "state": if !captured.started {"not_started"} else if captured.capture_complete {"complete"} else {"incomplete"},
-        "bytes_retained":captured.bytes.len() as u64,
-        "bytes_observed":captured.bytes_observed,
-        "truncated":captured.overflow,
-        "capture_complete":captured.capture_complete,
-        "capture_error":captured.capture_error.as_deref(),
-    })
-}
-
-fn finish_input_writer(writer: Option<thread::JoinHandle<io::Result<()>>>) -> Option<bool> {
-    let writer = writer?;
-    let deadline = Instant::now() + TERMINATION_GRACE;
-    while !writer.is_finished() && Instant::now() < deadline {
-        thread::sleep(POLL_INTERVAL);
-    }
-    if !writer.is_finished() {
-        return None;
-    }
-    Some(matches!(writer.join(), Ok(Ok(()))))
-}
-
 fn request_script_termination(
     work: &ScriptWork,
     group: &Group,
@@ -1830,114 +2020,23 @@ fn retry_script_termination(
     }
 }
 
-trait PollableRead: Read {
-    fn make_nonblocking(&self) -> io::Result<()>;
-    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead>;
-}
-
-enum PipeRead {
-    Data(usize),
-    Pending,
-    Eof,
-}
-
-#[cfg(target_os = "linux")]
-impl<T: Read + std::os::fd::AsRawFd> PollableRead for T {
-    fn make_nonblocking(&self) -> io::Result<()> {
-        const F_GETFL: i32 = 3;
-        const F_SETFL: i32 = 4;
-        const O_NONBLOCK: i32 = 0x800;
-        unsafe extern "C" {
-            fn fcntl(fd: i32, command: i32, ...) -> i32;
-        }
-        // SAFETY: fcntl reads and updates flags on this live child-pipe descriptor.
-        let flags = unsafe { fcntl(self.as_raw_fd(), F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_SETFL accepts the current flags plus O_NONBLOCK.
-        if unsafe { fcntl(self.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
-        match self.read(buffer) {
-            Ok(0) => Ok(PipeRead::Eof),
-            Ok(count) => Ok(PipeRead::Data(count)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl<T: Read + std::os::windows::io::AsRawHandle> PollableRead for T {
-    fn make_nonblocking(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<PipeRead> {
-        use std::ffi::c_void;
-        unsafe extern "system" {
-            fn PeekNamedPipe(
-                pipe: *mut c_void,
-                buffer: *mut c_void,
-                buffer_size: u32,
-                bytes_read: *mut u32,
-                total_available: *mut u32,
-                bytes_left: *mut u32,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
-        let mut available = 0u32;
-        // SAFETY: this is the live child-pipe handle and output points to local storage.
-        let ok = unsafe {
-            PeekNamedPipe(
-                self.as_raw_handle().cast(),
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let code = unsafe { GetLastError() };
-            if code == 109 {
-                return Ok(PipeRead::Eof);
-            }
-            return Err(io::Error::from_raw_os_error(code as i32));
-        }
-        if available == 0 {
-            return Ok(PipeRead::Pending);
-        }
-        let bound = buffer.len().min(available as usize);
-        match self.read(&mut buffer[..bound]) {
-            Ok(0) => Ok(PipeRead::Eof),
-            Ok(count) => Ok(PipeRead::Data(count)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::Pending),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-impl<T: Read> PollableRead for T {
-    fn make_nonblocking(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "bounded script pipe capture is unsupported on this platform",
-        ))
-    }
-
-    fn read_available(&mut self, _buffer: &mut [u8]) -> io::Result<PipeRead> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "bounded script pipe capture is unsupported on this platform",
-        ))
-    }
+fn capture_fact(receipt: &CaptureReceipt) -> Value {
+    let state = if !receipt.started {
+        "not_started"
+    } else if receipt.capture_complete {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    json!({
+        "state":state,
+        "bytes_retained":receipt.bytes_written,
+        "bytes_observed":receipt.bytes_observed,
+        "sha256":receipt.sha256,
+        "truncated":receipt.truncated,
+        "capture_complete":receipt.capture_complete,
+        "capture_error":receipt.capture_error.as_deref(),
+    })
 }
 
 fn publish_cleanup_pending(
@@ -1945,10 +2044,8 @@ fn publish_cleanup_pending(
     publication: CleanupPendingPublication<'_>,
 ) -> Result<()> {
     let files = ArtifactFiles::new(&work.data_dir)?;
-    let stdout = output_record(work, "stdout", &publication.stdout_capture.bytes);
-    let stderr = output_record(work, "stderr", &publication.stderr_capture.bytes);
-    files.publish(&stdout, &publication.stdout_capture.bytes)?;
-    files.publish(&stderr, &publication.stderr_capture.bytes)?;
+    let stdout = output_record(&files, work, "stdout", publication.stdout_capture)?;
+    let stderr = output_record(&files, work, "stderr", publication.stderr_capture)?;
     let pending = json!({
         "schema_version":1,
         "run_id":work.run_id,
@@ -1977,51 +2074,44 @@ fn finish_worker_error(
     identity: &Value,
     error_code: String,
     state: &str,
+    snapshot: Option<&ScriptExecutionSnapshot>,
 ) -> Result<()> {
     let mut cancellation_failure_reported = false;
     let mut termination = ProcessTermination::default();
-    let mut family_observation_unknown = false;
-    let family_confirmed = loop {
-        match group.children_empty() {
-            Ok(true) => break true,
-            Ok(false) => family_observation_unknown = false,
-            Err(_) => family_observation_unknown = true,
-        }
-        if termination.started.is_none() {
-            request_script_termination(
-                work,
-                group,
-                identity,
-                &mut termination,
-                &mut cancellation_failure_reported,
-            );
-        } else {
-            retry_script_termination(
-                work,
-                group,
-                identity,
-                &mut termination,
-                &mut cancellation_failure_reported,
-            );
-        }
-        if termination
-            .started
-            .is_some_and(|started| started.elapsed() >= TERMINATION_GRACE)
-        {
-            break false;
-        }
-        thread::sleep(POLL_INTERVAL);
-    };
-    let resource_released = family_confirmed && group.disarm().is_ok();
+    retain_script_group_until_released(
+        work,
+        group,
+        identity,
+        &mut termination,
+        &mut cancellation_failure_reported,
+    );
+    let family_confirmed = true;
+    let family_observation_unknown = false;
+    let resource_released = true;
     let dir = directory(&work.data_dir, &work.run_id)?;
-    let started_at_ms = if receipt_exists(&dir.join("started.json"))? {
+    let started_at_ms = if let Some(snapshot) = snapshot {
+        snapshot.started_at_ms
+    } else if receipt_exists(&dir.join("started.json"))? {
         read_json(&dir.join("started.json"))?["started_at_ms"].as_i64()
     } else {
         None
     };
+    if snapshot.is_none() && started_at_ms.is_some() {
+        return Err(Error::new(
+            "SCRIPT_EXECUTION_SNAPSHOT_MISSING",
+            "a started interpreter has no retained capture snapshot",
+        ));
+    }
     let process_identity = identity["process"].clone();
-    let stdout = capture_not_started();
-    let stderr = capture_not_started();
+    let files = ArtifactFiles::new(&work.data_dir)?;
+    let (stdout, stderr) = if let Some(snapshot) = snapshot {
+        (snapshot.stdout.clone(), snapshot.stderr.clone())
+    } else {
+        (
+            CaptureReceipt::not_started(files.output_path(work, "stdout")?),
+            CaptureReceipt::not_started(files.output_path(work, "stderr")?),
+        )
+    };
     let family_departure = if family_confirmed {
         json!({"state":"confirmed","process":process_identity.clone()})
     } else if family_observation_unknown {
@@ -2029,19 +2119,44 @@ fn finish_worker_error(
     } else {
         json!({"state":"cleanup_pending","process":process_identity.clone()})
     };
-    let process_facts = json!({
-        "schema_version":1,
-        "direct_exit":{"state":"not_started"},
-        "family_departure":family_departure,
-        "stdout_capture":capture_fact(&stdout),
-        "stderr_capture":capture_fact(&stderr),
-        "resource_released":resource_released,
-        "cleanup_pending":!resource_released,
-        "termination_attempts":termination.attempts,
-        "termination_request_unconfirmed":termination.request_unconfirmed,
-        "primary_error_code":error_code.clone(),
-    });
-    if !resource_released {
+    let mut process_facts = snapshot.map_or_else(
+        || {
+            json!({
+                "schema_version":1,
+                "direct_exit":{"state":"not_started"},
+                "family_departure":family_departure,
+                "stdout_capture":capture_fact(&stdout),
+                "stderr_capture":capture_fact(&stderr),
+                "resource_released":resource_released,
+                "cleanup_pending":!resource_released,
+                "termination_attempts":termination.attempts,
+                "termination_request_unconfirmed":termination.request_unconfirmed,
+                "primary_error_code":error_code.clone(),
+            })
+        },
+        |snapshot| snapshot.process_facts.clone(),
+    );
+    let capture_or_input_pending = snapshot.is_some()
+        && (!stdout.capture_complete
+            || !stderr.capture_complete
+            || process_facts["input_write_complete"].as_bool().is_none());
+    let cleanup_pending = !resource_released || capture_or_input_pending;
+    process_facts["family_departure"] = family_departure;
+    process_facts["resource_released"] = json!(resource_released);
+    process_facts["cleanup_pending"] = json!(cleanup_pending);
+    let previous_attempts = process_facts["termination_attempts"].as_u64().unwrap_or(0);
+    process_facts["termination_attempts"] =
+        json!(previous_attempts.saturating_add(u64::from(termination.attempts)));
+    process_facts["termination_request_unconfirmed"] = json!(
+        process_facts["termination_request_unconfirmed"] == true || termination.request_unconfirmed
+    );
+    if snapshot.is_some() {
+        process_facts["receipt_publication_error"] = json!(error_code);
+    }
+    let terminal_error = snapshot
+        .and_then(|snapshot| snapshot.error_code.clone())
+        .or(Some(error_code));
+    if cleanup_pending {
         return publish_cleanup_pending(
             work,
             CleanupPendingPublication {
@@ -2050,22 +2165,26 @@ fn finish_worker_error(
                 stderr_capture: &stderr,
                 process_facts,
                 started_at_ms,
-                exit_code: None,
-                error_code: Some(error_code),
+                exit_code: snapshot.and_then(|snapshot| snapshot.exit_code),
+                error_code: terminal_error,
             },
         );
     }
     publish_completion(
         work,
         CompletionPublication {
-            stdout: &stdout.bytes,
-            stderr: &stderr.bytes,
+            stdout: &stdout,
+            stderr: &stderr,
             result_value: None,
             controller_effects: &[],
-            error_code: Some(error_code),
-            state,
+            error_code: terminal_error,
+            state: if snapshot.is_some() {
+                "incomplete"
+            } else {
+                state
+            },
             started_at_ms,
-            exit_code: None,
+            exit_code: snapshot.and_then(|snapshot| snapshot.exit_code),
             process: &process_identity,
             process_facts,
         },
@@ -2074,8 +2193,8 @@ fn finish_worker_error(
 
 fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>) -> Result<()> {
     let CompletionPublication {
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+        stdout: stdout_capture,
+        stderr: stderr_capture,
         result_value,
         controller_effects,
         error_code,
@@ -2086,10 +2205,8 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
         process_facts,
     } = publication;
     let files = ArtifactFiles::new(&work.data_dir)?;
-    let stdout = output_record(work, "stdout", stdout_bytes);
-    let stderr = output_record(work, "stderr", stderr_bytes);
-    files.publish(&stdout, stdout_bytes)?;
-    files.publish(&stderr, stderr_bytes)?;
+    let stdout = output_record(&files, work, "stdout", stdout_capture)?;
+    let stderr = output_record(&files, work, "stderr", stderr_capture)?;
     let result_document = json!({
         "protocol_version":1,
         "run_id":work.run_id,
@@ -2140,20 +2257,30 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
     Ok(())
 }
 
-fn output_record(work: &ScriptWork, stream: &str, bytes: &[u8]) -> ArtifactRecord {
-    let mut identity = Vec::with_capacity(work.run_id.len() + stream.len() + 1);
-    identity.extend_from_slice(work.run_id.as_bytes());
-    identity.push(b':');
-    identity.extend_from_slice(stream.as_bytes());
-    let id = format!("scriptlog-{}", sha256_hex(&identity));
-    ArtifactRecord {
+fn output_record(
+    files: &ArtifactFiles,
+    work: &ScriptWork,
+    stream: &str,
+    receipt: &CaptureReceipt,
+) -> Result<ArtifactRecord> {
+    let id = output_artifact_id(work, stream)?;
+    let record = ArtifactRecord {
         kind: "script_output".into(),
         artifact_id: id.clone(),
         relative_path: format!("artifacts/{id}.bin"),
-        byte_length: bytes.len() as u64,
-        content_digest: sha256_hex(bytes),
+        byte_length: receipt.bytes_written,
+        content_digest: receipt.sha256.clone(),
         metadata: json!({"run_id":work.run_id,"operation_id":work.operation_id,"stream":stream}),
-    }
+    };
+    let maximum = if stream == "stdout" {
+        MAX_RESULT_BYTES as u64
+    } else if stream == "stderr" {
+        MAX_STDERR_BYTES as u64
+    } else {
+        return Err(Error::invalid("unsupported ScriptRun output stream"));
+    };
+    files.verify_capture(&record, receipt, maximum)?;
+    Ok(record)
 }
 
 fn stage_bundle(work: &ScriptWork, run_dir: &Path) -> Result<()> {
@@ -2344,6 +2471,19 @@ impl ArtifactFiles {
         Ok(self.root.join(format!("{}.bin", record.artifact_id)))
     }
 
+    fn output_path(&self, work: &ScriptWork, stream: &str) -> Result<PathBuf> {
+        let artifact_id = output_artifact_id(work, stream)?;
+        let record = ArtifactRecord {
+            kind: "script_output".into(),
+            relative_path: format!("artifacts/{artifact_id}.bin"),
+            artifact_id,
+            byte_length: 0,
+            content_digest: sha256_hex(&[]),
+            metadata: Value::Null,
+        };
+        self.path(&record)
+    }
+
     fn publish(&self, record: &ArtifactRecord, bytes: &[u8]) -> Result<()> {
         if bytes.len() as u64 != record.byte_length || sha256_hex(bytes) != record.content_digest {
             return Err(Error::invalid(
@@ -2352,23 +2492,17 @@ impl ArtifactFiles {
         }
         let destination = self.path(record)?;
         if receipt_exists(&destination)? {
-            return self.verify(record);
+            self.verify(record)?;
+            return sync_parent_directory(&destination);
         }
-        let temp = self
-            .root
-            .join(format!(".script-{}.tmp", uuid::Uuid::new_v4()));
-        let result = (|| -> Result<()> {
-            write_private_new(&temp, bytes)?;
-            match fs::hard_link(&temp, &destination) {
-                Ok(()) => private_permissions(&destination, false),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.verify(record)
-                }
-                Err(error) => Err(error.into()),
+        match write_private_new(&destination, bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+                self.verify(record)?;
+                sync_parent_directory(&destination)
             }
-        })();
-        let _ = fs::remove_file(&temp);
-        result
+            Err(error) => Err(error),
+        }
     }
 
     fn verify(&self, record: &ArtifactRecord) -> Result<()> {
@@ -2385,6 +2519,115 @@ impl ArtifactFiles {
         }
         Ok(())
     }
+
+    fn verify_capture(
+        &self,
+        record: &ArtifactRecord,
+        receipt: &CaptureReceipt,
+        maximum: u64,
+    ) -> Result<()> {
+        let path = self.path(record)?;
+        if record.kind != "script_output"
+            || receipt.path != path
+            || record.byte_length != receipt.bytes_written
+            || record.content_digest != receipt.sha256
+            || !valid_sha256(&receipt.sha256)
+            || receipt.bytes_written > maximum
+            || receipt.bytes_observed < receipt.bytes_written
+            || (receipt.capture_complete && receipt.capture_error.is_some())
+            || (!receipt.started
+                && (receipt.bytes_written != 0
+                    || receipt.bytes_observed != 0
+                    || receipt.truncated
+                    || receipt.capture_complete
+                    || receipt.sha256 != sha256_hex(&[])))
+        {
+            return Err(Error::new(
+                "SCRIPT_OUTPUT_CAPTURE_INVALID",
+                "captured output metadata differs from its immutable receipt",
+            ));
+        }
+
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && receipt.bytes_written == 0
+                    && !receipt.capture_complete =>
+            {
+                let file = create_output(&path)?;
+                file.sync_all()?;
+                drop(file);
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let (length, digest) = sha256_capture_file(&path, maximum)?;
+        if length != receipt.bytes_written || digest != receipt.sha256 {
+            return Err(Error::new(
+                "SCRIPT_OUTPUT_CAPTURE_INVALID",
+                "retained output file differs from its immutable capture receipt",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn output_artifact_id(work: &ScriptWork, stream: &str) -> Result<String> {
+    if !matches!(stream, "stdout" | "stderr") {
+        return Err(Error::invalid("unsupported ScriptRun output stream"));
+    }
+    let mut identity = Vec::with_capacity(work.run_id.len() + stream.len() + 1);
+    identity.extend_from_slice(work.run_id.as_bytes());
+    identity.push(b':');
+    identity.extend_from_slice(stream.as_bytes());
+    Ok(format!("scriptlog-{}", sha256_hex(&identity)))
+}
+
+fn sha256_capture_file(path: &Path, maximum: u64) -> Result<(u64, String)> {
+    let invalid = || {
+        Error::new(
+            "SCRIPT_OUTPUT_CAPTURE_INVALID",
+            "captured output is not a stable bounded regular file",
+        )
+    };
+    let entry = fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if is_link_or_reparse(&entry) || !entry.is_file() || entry.len() > maximum {
+        return Err(invalid());
+    }
+
+    let mut file = File::open(path).map_err(|_| invalid())?;
+    let before = file.metadata().map_err(|_| invalid())?;
+    if !before.is_file() || before.len() != entry.len() || before.len() > maximum {
+        return Err(invalid());
+    }
+    let modified = before.modified().map_err(|_| invalid())?;
+    let mut digest = Sha256::new();
+    let mut length = 0u64;
+    let mut buffer = [0u8; PIPE_IO_CHUNK_BYTES];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| invalid())?;
+        if count == 0 {
+            break;
+        }
+        length = length.checked_add(count as u64).ok_or_else(invalid)?;
+        if length > maximum {
+            return Err(invalid());
+        }
+        digest.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|_| invalid())?;
+    let after_entry = fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if is_link_or_reparse(&after_entry)
+        || !after_entry.is_file()
+        || length != before.len()
+        || after.len() != before.len()
+        || after.modified().map_err(|_| invalid())? != modified
+        || after_entry.len() != before.len()
+    {
+        return Err(invalid());
+    }
+    Ok((length, format!("{:x}", digest.finalize())))
 }
 
 fn verify_interpreter(interpreter: &InterpreterIdentity) -> Result<()> {
@@ -2623,4 +2866,19 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod publication_failure_fault_fixture {
+    use super::*;
+
+    #[test]
+    fn writer_error_does_not_release_pending_or_unknown_family_custody() {
+        let publication: Result<()> = Err(Error::new("FIXTURE_WRITE_FAILED", "injected"));
+        assert!(publication.is_err());
+        assert!(!script_owner_release_authorized(false, false));
+        assert!(!script_owner_release_authorized(false, true));
+        assert!(!script_owner_release_authorized(true, false));
+        assert!(script_owner_release_authorized(true, true));
+    }
 }
