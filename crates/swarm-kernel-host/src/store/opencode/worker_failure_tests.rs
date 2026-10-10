@@ -23,7 +23,7 @@ async fn start(fixture: &Fixture) -> (StoreOwner, Principal) {
         owned_service: None,
         alias: "fixture".into(),
         runtime: crate::runtime::opencode_v2::RUNTIME.into(),
-        module_artifact_id: crate::runtime::opencode_v2::ARTIFACT_ID.into(),
+        module_artifact_id: crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID.into(),
         enabled: true,
         native_options: json!(fixture.options),
     });

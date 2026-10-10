@@ -3017,10 +3017,16 @@ mod tests {
     }
 
     fn checked_fixture_git(command: &mut Command) -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+        }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "fixture Git command failed: {}",
+            "fixture Git command failed: status={:?}, stderr={}",
+            output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout

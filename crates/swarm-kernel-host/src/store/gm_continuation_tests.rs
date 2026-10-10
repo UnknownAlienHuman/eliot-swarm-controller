@@ -2,12 +2,19 @@
 use super::*;
 use rusqlite::params;
 use serde_json::{Value, json};
+use swarm_contracts::{
+    module_catalog::{ArtifactId, ArtifactVersion, LaunchSpec, ModuleId},
+    module_contract::ModuleContractTemplate,
+};
 
 const TASK_ID: &str = "task-gm-continuation";
 const ATTEMPT_ID: &str = "attempt-gm-continuation";
 const BINDING_ID: &str = "binding-gm-continuation";
 const MODULE_ID: &str = "module-gm-continuation";
 const MODULE_LINK: &str = "module-link-gm-continuation";
+const MODULE_ARTIFACT_ID: &str = "muse-sdk-1.3.0-bridge.5";
+const MODULE_ARTIFACT_VERSION: &str = "5";
+const ROUTE_ALIAS: &str = "gm-fixture";
 
 struct StoredOperationScope {
     caller_id: String,
@@ -37,6 +44,58 @@ fn fixture() -> Connection {
     db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     db.execute_batch(SCHEMA).unwrap();
     db.execute_batch(PROVIDER_CONDITION_SCHEMA).unwrap();
+
+    // task.dispatch admission now requires the binding's exact trusted descriptor
+    // selection. Register the artifact the muse route names so the managers that
+    // dispatch in this fixture can select it before any new binding is created.
+    let retained_selector = {
+        let tx = db.unchecked_transaction().unwrap();
+        let mut template = ModuleContractTemplate::codex_rust_controller_v5().unwrap();
+        template.module_id = ModuleId::new("muse").unwrap();
+        template.artifact.artifact_id = ArtifactId::new(MODULE_ARTIFACT_ID).unwrap();
+        template.artifact.version = ArtifactVersion::new(MODULE_ARTIFACT_VERSION).unwrap();
+        template
+            .capabilities
+            .insert(swarm_contracts::module_catalog::CapabilityId::new("agent.reply").unwrap());
+        let descriptor = template
+            .descriptor(
+                LaunchSpec {
+                    executable: if cfg!(windows) {
+                        std::path::PathBuf::from(r"C:\modules\muse.exe")
+                    } else {
+                        std::path::PathBuf::from("/modules/muse")
+                    },
+                    argv: Vec::new(),
+                    environment: Vec::new(),
+                    credential_ref: Some(
+                        swarm_contracts::module_catalog::ProtectedRef::new(
+                            "credential:muse-fixture",
+                        )
+                        .unwrap(),
+                    ),
+                    working_directory: None,
+                    inherited_environment_allowlist: Default::default(),
+                    executable_sha256: Some(
+                        swarm_contracts::module_catalog::Sha256Digest::new("c".repeat(64)).unwrap(),
+                    ),
+                },
+                swarm_contracts::module_catalog::LifecycleOwnership::OwnedService,
+                swarm_contracts::module_catalog::ActivationPolicy::OnDemand,
+                true,
+                swarm_contracts::module_catalog::RestartPolicy::default(),
+            )
+            .unwrap();
+        let registered =
+            super::module_handshake::register_trusted_descriptor(&tx, descriptor).unwrap();
+        tx.commit().unwrap();
+        json!({
+            "schema_version":1,
+            "module_id":registered["module_id"],
+            "artifact":registered["artifact"],
+            "registered_revision":registered["registered_revision"],
+            "selected_revision":registered["registered_revision"],
+        })
+    };
 
     for client_id in ["old-gm", "successor-gm", "replacement-gm", "unrelated"] {
         set_meta(
@@ -71,7 +130,8 @@ fn fixture() -> Connection {
         "connection":"connected",
         "module_client_id":MODULE_ID,
         "module_link_id":MODULE_LINK,
-        "bridge_boot_id":"fixture-boot"
+        "bridge_boot_id":"fixture-boot",
+        "module_contract_selector":retained_selector,
     });
     db.execute(
         "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
@@ -83,16 +143,32 @@ fn fixture() -> Connection {
         ],
     )
     .unwrap();
+    let spec = json!({
+        "objective":"Continue one retained Attempt across a General Manager handover",
+        "phase":"implementation",
+        "requirements":[{"id":"R1","statement":"Keep one dispatch and exact ownership"}],
+        "scope":{"initial_paths":["src/target.rs"]},
+        "owner_policy_id":crate::policy::OWNER_POLICY_V1_ID,
+    });
+    let typed_spec: crate::model::TaskSpec = serde_json::from_value(spec.clone()).unwrap();
+    let snapshot = json!({
+        "revision":1,
+        "spec":spec,
+        "brief":typed_spec.brief(),
+        "dependency_acceptances":[],
+        "baseline_candidate":null,
+        "owner_policy":crate::policy::accepted_edition(Some(crate::policy::OWNER_POLICY_V1_ID)).unwrap(),
+    });
     db.execute(
         "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) \
-         VALUES(?1,'gm-fixture-project',1,'open','{}',1,1)",
-        [TASK_ID],
+         VALUES(?1,'gm-fixture-project',1,'open',?2,1,1)",
+        params![TASK_ID, model::canonical(&spec).unwrap()],
     )
     .unwrap();
     db.execute(
         "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,created_at_ms,updated_at_ms) \
-         VALUES(?1,?2,1,'{}','old-gm','controller',?3,1,'reserved',1,1)",
-        params![ATTEMPT_ID, TASK_ID, BINDING_ID],
+         VALUES(?1,?2,1,?4,'old-gm','controller',?3,1,'reserved',1,1)",
+        params![ATTEMPT_ID, TASK_ID, BINDING_ID, model::canonical(&snapshot).unwrap()],
     )
     .unwrap();
     db
@@ -126,6 +202,27 @@ fn successor_gm_continues_exact_attempt_without_restarting_dispatch() {
     let replacement = principal("replacement-gm", Role::Manager, "replacement-link");
     let unrelated = principal("unrelated", Role::Manager, "unrelated-link");
     let module = principal(MODULE_ID, Role::Module, MODULE_LINK);
+
+    // Each manager that dispatches selects the registered descriptor for its own
+    // future bindings through the real Manager-scoped selection mutation.
+    for gm in [&old_gm, &successor, &replacement] {
+        let catalog = super::module_handshake::read_catalog(gm, &json!({}), &db).unwrap();
+        mutate(
+            &mut db,
+            gm,
+            "module.route.select",
+            &json!({
+                "client_request_id":format!("select-{}", gm.client_id),
+                "route_alias":ROUTE_ALIAS,
+                "module_id":"muse",
+                "artifact_id":MODULE_ARTIFACT_ID,
+                "version":MODULE_ARTIFACT_VERSION,
+                "expected_catalog_revision":catalog["catalog_revision"],
+            }),
+            &config,
+        )
+        .unwrap();
+    }
 
     let first_dispatch = mutate(
         &mut db,

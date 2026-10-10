@@ -30,7 +30,7 @@ fn pending_candidate_db() -> (Connection, String, String, String, i64) {
     entry.cron = Some(CronSettings {
         calendar: calendar.clone(),
         action: scheduler::ScheduleAction::CheckRun {
-            attempt_id: "missing-cron-attempt".to_owned(),
+            attempt_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             expected_task_revision: 1,
             candidate_ref: "source-candidate".to_owned(),
             profile_id: "strict".to_owned(),

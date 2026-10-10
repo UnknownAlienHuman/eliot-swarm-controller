@@ -4472,6 +4472,8 @@ mod launch_custody_fixtures {
 
     fn fixture() -> (PathBuf, Work) {
         let root = std::env::temp_dir().join(format!("swarm-check-custody-{}", model::new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
         let work = Work {
             check_id: model::new_id(),
             operation_id: model::new_id(),

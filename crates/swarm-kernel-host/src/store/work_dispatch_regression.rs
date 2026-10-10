@@ -15,6 +15,13 @@ use std::{
     process::Command,
     sync::Arc,
 };
+use swarm_contracts::{
+    module_catalog::{
+        ActivationPolicy, ArtifactId, ArtifactVersion, LaunchSpec, LifecycleOwnership, ModuleId,
+        ProtectedRef, RestartPolicy, Sha256Digest,
+    },
+    module_contract::ModuleContractTemplate,
+};
 
 async fn start_store() -> (StoreOwner, PathBuf, Principal) {
     let directory = std::env::temp_dir().join(format!(
@@ -83,11 +90,65 @@ async fn register_manager(store: &Store, operator: &Principal, client_id: &str) 
         .unwrap()
 }
 
+async fn select_regression_descriptor(store: &Store, manager: &Principal) {
+    let mut template = ModuleContractTemplate::codex_rust_controller_v5().unwrap();
+    template.module_id = ModuleId::new("regression-runtime").unwrap();
+    template.artifact.artifact_id = ArtifactId::new("regression-artifact").unwrap();
+    template.artifact.version = ArtifactVersion::new("5").unwrap();
+    let descriptor = template
+        .descriptor(
+            LaunchSpec {
+                executable: if cfg!(windows) {
+                    PathBuf::from(r"C:\modules\regression.exe")
+                } else {
+                    PathBuf::from("/modules/regression")
+                },
+                argv: Vec::new(),
+                environment: Vec::new(),
+                credential_ref: Some(ProtectedRef::new("credential:regression-fixture").unwrap()),
+                working_directory: None,
+                inherited_environment_allowlist: Default::default(),
+                executable_sha256: Some(Sha256Digest::new("d".repeat(64)).unwrap()),
+            },
+            LifecycleOwnership::OwnedService,
+            ActivationPolicy::OnDemand,
+            true,
+            RestartPolicy::default(),
+        )
+        .unwrap();
+    let registered = store
+        .run(move |db| {
+            let tx = db.unchecked_transaction()?;
+            let registered = super::module_handshake::register_trusted_descriptor(&tx, descriptor)?;
+            tx.commit()?;
+            Ok(registered)
+        })
+        .await
+        .unwrap();
+    write(
+        store,
+        manager,
+        "module.route.select",
+        json!({
+            "route_alias":"regression-route",
+            "module_id":"regression-runtime",
+            "artifact_id":"regression-artifact",
+            "version":"5",
+            "expected_catalog_revision":registered["catalog_revision"],
+        }),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot() {
     let (owner, directory, operator) = start_store().await;
     let manager = register_manager(&owner.store, &operator, "work-manager").await;
     let outsider = register_manager(&owner.store, &operator, "other-manager").await;
+
+    // Automatic admission requires the same exact trusted route selection as
+    // manual launch. This fixture never executes the descriptor's placeholder.
+    select_regression_descriptor(&owner.store, &manager).await;
 
     write(
         &owner.store,
@@ -166,7 +227,7 @@ async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot
         .unwrap()
         .iter()
         .find(|item| item["task_id"] == task_id)
-        .expect("the committed task.create fact is consumed");
+        .unwrap_or_else(|| panic!("the committed task.create fact is consumed: {applied}"));
     assert_eq!(recent["disposition"], "admitted");
     let operation_id = recent["operation_id"].as_str().unwrap().to_owned();
     let task_source_operation_id = task["operation_id"].as_str().unwrap().to_owned();

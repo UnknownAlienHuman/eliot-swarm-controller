@@ -2647,9 +2647,9 @@ mod journal_regression_tests {
 
         let latest: (String, i64, String) = db
             .query_row(
-                "SELECT json_extract(state_json,'$.observation.module_supervisor.actor_instance_id'),\
-                        json_extract(state_json,'$.observation.module_supervisor.sequence'),\
-                        json_extract(state_json,'$.observation.module_supervisor.phase')\
+                "SELECT json_extract(state_json,'$.module_supervisor.actor_instance_id'),\
+                        json_extract(state_json,'$.module_supervisor.sequence'),\
+                        json_extract(state_json,'$.module_supervisor.phase')\
                  FROM bindings WHERE binding_id=?1 AND generation=?2",
                 params![BINDING_ID, GENERATION as i64],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),

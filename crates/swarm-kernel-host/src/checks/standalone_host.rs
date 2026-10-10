@@ -1380,6 +1380,7 @@ mod execution_evidence_fixtures {
             crate::model::new_id()
         ));
         fs::create_dir_all(root.join("checks")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
         let files = ArtifactFiles::new(&root).unwrap();
         let manifest = SourceManifest {
             version: 1,

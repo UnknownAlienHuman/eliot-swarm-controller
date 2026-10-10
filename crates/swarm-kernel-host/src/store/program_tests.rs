@@ -1757,6 +1757,11 @@ fn repair_fixture_config() -> Config {
 }
 
 async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> String {
+    // The retained repair fixture is a real module runtime route, so its
+    // binding is seeded with the exact trusted descriptor its own artifact
+    // declares. This is required by the current admission guard and does not
+    // grant any native-effect authority: the fixture never starts a module.
+    let selector = register_repair_fixture_descriptor(store).await;
     let binding_id = format!("repair-binding-{}", subject.attempt_id);
     let module_client_id = format!("repair-module-{}", subject.attempt_id);
     let module_link_id = format!("repair-module-link-{}", subject.attempt_id);
@@ -1776,11 +1781,14 @@ async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> 
                 }),
             )?;
             let route = repair_fixture_route();
+            // A trusted descriptor selector is host metadata retained with
+            // the binding. It is never sent as native input.
             let state = json!({
                 "connection":"connected",
                 "module_client_id":module_client_id,
                 "module_link_id":module_link_id,
-                "bridge_boot_id":"repair-fixture-boot"
+                "bridge_boot_id":"repair-fixture-boot",
+                "module_contract_selector":selector,
             });
             tx.execute(
                 "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
@@ -1802,6 +1810,57 @@ async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> 
         .await
         .unwrap();
     returned_binding_id
+}
+
+/// Register the exact trusted descriptor that the repair fixture route's own
+/// artifact declares, and return the bounded selector a new binding retains.
+/// Registration is Store metadata only: no executable is inspected, no process
+/// is started and no native effect is authorized.
+async fn register_repair_fixture_descriptor(store: &Store) -> Value {
+    store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            let descriptor = json!({
+                "schema_version":1,
+                "module_id":"repair-fixture-module",
+                "artifact":{
+                    "artifact_id":"muse-sdk-1.3.0-bridge.5",
+                    "version":"5"
+                },
+                "launch":{
+                    "executable":if cfg!(windows) {
+                        r"C:\modules\muse-bridge"
+                    } else {
+                        "/modules/muse-bridge"
+                    },
+                    "argv":[],
+                    "environment":[],
+                    "inherited_environment_allowlist":[],
+                },
+                "command_schemas":[
+                    {"schema_id":"swarm.runtime_command","version":"1"},
+                ],
+                "event_schemas":[],
+                "protocol":{"minimum":{"major":1,"minor":0},"maximum":{"major":1,"minor":0}},
+                "capabilities":["agent.send"],
+                "lifecycle":"owned_service",
+                "activation":"on_demand",
+                "enabled":true,
+            });
+            let descriptor: swarm_contracts::module_catalog::ModuleDescriptor =
+                serde_json::from_value(descriptor)?;
+            let registered = super::module_handshake::register_trusted_descriptor(&tx, descriptor)?;
+            tx.commit()?;
+            Ok(json!({
+                "schema_version":1,
+                "module_id":registered["module_id"],
+                "artifact":registered["artifact"],
+                "registered_revision":registered["registered_revision"],
+                "selected_revision":registered["registered_revision"],
+            }))
+        })
+        .await
+        .unwrap()
 }
 
 async fn consume_repair_result_for_entry(
