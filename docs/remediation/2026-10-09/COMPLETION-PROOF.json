@@ -12,15 +12,15 @@
       {
         "item": "Connected code and strict production Clippy",
         "status": "verified",
-        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json; MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json; NATIVE-IMAGE-REPAIR-EVIDENCE.json; CATALOG-DIAGNOSTIC-REPAIR-EVIDENCE.json; HOST-SUPERVISOR-ENVIRONMENT-REPAIR-EVIDENCE.json; C7-MCP-REPAIR-EVIDENCE.json; CORE-ACK-HARNESS-REPAIR-EVIDENCE.json",
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json; MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json; NATIVE-IMAGE-REPAIR-EVIDENCE.json; CATALOG-DIAGNOSTIC-REPAIR-EVIDENCE.json; HOST-SUPERVISOR-ENVIRONMENT-REPAIR-EVIDENCE.json; C7-MCP-REPAIR-EVIDENCE.json; CORE-ACK-HARNESS-REPAIR-EVIDENCE.json; RETAINED-WORKER-READINESS-REPAIR-EVIDENCE.json",
         "residual_uncertainty": "Retained 24-package gate plus changed-package gates",
-        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases and five Windows/two Linux path cases on each platform"
+        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases and five Windows/two Linux path cases on each platform; latest strict supervisor+host Clippy Windows/Linux, supervisor21/22 and retained packet8 each plus26 pure harness cases, native Luna Max initial and follow-up review"
       },
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
         "evidence": "EXECUTION-RESULTS-M.json; exact eight clean694794f packages, genuine installed native Both and fresh core receipt; EXECUTION-RESULTS-M-CORE-CORRECTION.json",
-        "residual_uncertainty": "Three exact public core cases now observed against installed694794f; original M receipts unchanged. Optional-worker fault trigger unavailable. Native dispatch0: M stopped before task.dispatch at missing public module-supervisor ready proof. Independent Luna review found no C8 post-input deadlock; unknown session/provider evidence is valid pre-input. Supervisor transition cause remains under investigation. Antigravity lacks the documented assigned-session server/tool-schema proof. NATIVE-M-ADMISSION-DIAGNOSTIC.json is private diagnostic evidence, not public qualification.",
+        "residual_uncertainty": "M native dispatch0 stopped at public module-supervisor readiness. The polling source collision is repaired and source-verified; its exact causal role in M remains UNKNOWN. Fresh installed N qualification is pending. Corrected M core3 is retained historical evidence. Optional-worker installed fault/recovery and the Antigravity assigned-session proof remain unavailable.",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
       {
@@ -33,9 +33,16 @@
       {
         "item": "Observed GitHub dependency alerts",
         "status": "blocked",
-        "evidence": "DEPENDENCY-ALERTS.json: 13 open alerts, exact upstream pins and immutable donor; no verified supported patch",
+        "evidence": "DEPENDENCY-ALERTS.json: 13 open alerts, exact upstream pins and immutable donor; no verified supported patch; CODEX-DONOR-UPSTREAM-BLOCKER.json: canonical main806d9732 on2026-10-10 pins0.31.2; required floor0.64.0",
         "residual_uncertainty": "Immutable donor/exact pins and unpatched advisories",
         "verifier": "GitHub alerts and supported upstream package/immutable-donor checks, 2026-10-10"
+      },
+      {
+        "item": "R48 installed optional-worker fault and recovery",
+        "status": "not_verified",
+        "evidence": "OPTIONAL-WORKER-QUALIFICATION-GAP.json",
+        "verifier": "Supported admitted activation, actual fault, host survival and public retained-effect/recovery evidence",
+        "residual_uncertainty": "Current harness observes existing status; it has no supported public actual fault path for private fixed in-process optional workers."
       }
     ],
     "changed_files": [
@@ -101,7 +108,12 @@
       "modules/antigravity-rust/src/main.rs",
       "modules/antigravity-rust/src/process.rs",
       "tools/qualification/Invoke-CoreFailureQualification.ps1",
-      "tools/qualification/New-NativeQualification.ps1"
+      "tools/qualification/New-NativeQualification.ps1",
+      "crates/swarm-kernel-host/src/store/launcher_dispatch.rs",
+      "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs",
+      "docs/remediation/2026-10-09/RETAINED-WORKER-READINESS-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/OPTIONAL-WORKER-QUALIFICATION-GAP.json",
+      "docs/remediation/2026-10-09/CODEX-DONOR-UPSTREAM-BLOCKER.json"
     ],
     "checks_run": [
       "Windows/Linux strict host production Clippy",
@@ -183,13 +195,18 @@
       "One fresh M core contour and one native invocation per adapter, distinct IDs; both native blocked, zero dispatch",
       "PowerShell singleton-array bug reproduced and corrected; exact/wrong fixture and hook identity checks PASS; 15 Rust sources unchanged",
       "Closed-M private fixture diagnosis establishes missing serialized defaults; corrected complete fixture matches producer, no public qualification promoted",
-      "One justified corrected core contour on existing exact M binaries: dropped ACK same public Operation/Task receipt before/after restart observed; request-ID conflict observed; singleton hook restart/dedup observed; no native/model calls; native M not repeated"
+      "One justified corrected core contour on existing exact M binaries: dropped ACK same public Operation/Task receipt before/after restart observed; request-ID conflict observed; singleton hook restart/dedup observed; no native/model calls; native M not repeated",
+      "Latest retained-worker supervisor+host strict production Clippy PASS Windows/Linux; exact four-source hashes unchanged through checks",
+      "Latest supervisor library21 Windows/22 Linux passed,2 ignored each; unchanged packet8 each retained; prior host cohorts not repeated",
+      "Latest readiness parser and extracted pure helper26 cases PASS; no native/model effects",
+      "Native GPT-6 Luna Max four-source review found two P2 guards; both repaired, supervisor follow-up and exact-parent regressions verified; persisted models and source hashes bound",
+      "Current openai/codex main806d9732 canonical pyproject+uv.lock read-only check: datamodel-code-generator0.31.2 remains vulnerable"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "Native M unqualified: C8 first-dispatch evidence unknown and Antigravity MCP scope mismatch; zero dispatch/model execution not established. Corrected public core3 observed, optional-worker trigger unavailable. Exact causal native result,13 advisories and historical HIGH ledger limits retained.",
+    "remaining_uncertainty": "Fresh installed readiness qualification pending. Historical native M unqualified with dispatch0; repaired source collision does not establish M runtime liveness. Corrected M core3 retained; R48 actual optional-worker fault/recovery, exact causal native result, Antigravity assigned-session proof and13 upstream advisories remain open.",
     "final_status": "PARTIAL_PROGRESS"
   }
 }

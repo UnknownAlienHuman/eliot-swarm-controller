@@ -1,0 +1,140 @@
+{
+  "schema": "codex-donor-upstream-fix-readback.v1",
+  "verified_at_utc": "2026-10-10T12:26:34Z",
+  "result": "BLOCKED_CURRENT_CANONICAL_UPSTREAM_PIN_VULNERABLE",
+  "scope": "Read-only current upstream metadata check for the Codex Python SDK donor; no edits, installs, resolution, tests, Git operations, model calls, or protocol-content dumps.",
+  "upstream": {
+    "repository": "https://github.com/openai/codex",
+    "ref": "main",
+    "commit_sha": "806d9732c974bc8a51b8317c1bd8985544fe627c",
+    "commit_date_utc": "2026-10-10T08:51:21Z",
+    "commit_url": "https://github.com/openai/codex/commit/806d9732c974bc8a51b8317c1bd8985544fe627c",
+    "pyproject_url": "https://raw.githubusercontent.com/openai/codex/806d9732c974bc8a51b8317c1bd8985544fe627c/sdk/python/pyproject.toml",
+    "uv_lock_url": "https://raw.githubusercontent.com/openai/codex/806d9732c974bc8a51b8317c1bd8985544fe627c/sdk/python/uv.lock",
+    "pyproject_datamodel_code_generator_pin": "0.31.2",
+    "uv_lock_datamodel_code_generator_version": "0.31.2",
+    "lock_source": "https://pypi.org/simple"
+  },
+  "decision": {
+    "required_floor": ">=0.64.0",
+    "canonical_donor_pin": "0.31.2",
+    "pin_outside_all_nine_affected_ranges": false,
+    "affected_by_all_nine_alerts": true,
+    "pypi_release_alone_is_usable_donor_fix": false,
+    "blocker": "At this exact current main commit, sdk/python/pyproject.toml and sdk/python/uv.lock both pin 0.31.2, so the complete canonical donor remains inside all nine recorded vulnerable ranges."
+  },
+  "advisories": {
+    "local_snapshot_observed_at": "2026-10-10T05:14:27.3975353Z",
+    "package": "datamodel-code-generator",
+    "locked_version": "0.31.2",
+    "required_patched_floor": "0.64.0",
+    "records": [
+      {
+        "alert_number": 1,
+        "ghsa_id": "GHSA-rfr2-mq9m-x2qx",
+        "severity": "high",
+        "vulnerable_range": ">= 0.9.1, <= 0.60.2",
+        "first_patched": "0.61.0"
+      },
+      {
+        "alert_number": 2,
+        "ghsa_id": "GHSA-r5vv-ff45-prp2",
+        "severity": "low",
+        "vulnerable_range": "<= 0.62.0",
+        "first_patched": "0.63.0"
+      },
+      {
+        "alert_number": 3,
+        "ghsa_id": "GHSA-j884-q54q-mmx3",
+        "severity": "high",
+        "vulnerable_range": ">= 0.25.0, < 0.60.1",
+        "first_patched": "0.60.1"
+      },
+      {
+        "alert_number": 4,
+        "ghsa_id": "GHSA-5578-w22f-pfx9",
+        "severity": "high",
+        "vulnerable_range": ">= 0.11.6, <= 0.63.0",
+        "first_patched": "0.64.0"
+      },
+      {
+        "alert_number": 5,
+        "ghsa_id": "GHSA-954p-556p-r752",
+        "severity": "high",
+        "vulnerable_range": ">= 0.9.1, <= 0.60.2",
+        "first_patched": "0.61.0"
+      },
+      {
+        "alert_number": 6,
+        "ghsa_id": "GHSA-vx7x-vcc2-c44g",
+        "severity": "high",
+        "vulnerable_range": "<= 0.62.0",
+        "first_patched": "0.63.0"
+      },
+      {
+        "alert_number": 7,
+        "ghsa_id": "GHSA-386q-5hp3-95m9",
+        "severity": "high",
+        "vulnerable_range": ">= 0.17.0, <= 0.60.1",
+        "first_patched": "0.60.2"
+      },
+      {
+        "alert_number": 8,
+        "ghsa_id": "GHSA-8359-h9fx-j6v9",
+        "severity": "high",
+        "vulnerable_range": "<= 0.61.0",
+        "first_patched": "0.62.0"
+      },
+      {
+        "alert_number": 9,
+        "ghsa_id": "GHSA-wjv6-jcfj-mf9r",
+        "severity": "high",
+        "vulnerable_range": ">= 0.14.1, <= 0.60.1",
+        "first_patched": "0.60.2"
+      }
+    ]
+  },
+  "generated_protocol_availability": {
+    "checked_at_same_commit": "806d9732c974bc8a51b8317c1bd8985544fe627c",
+    "paths": [
+      {
+        "name": "notification_registry.py",
+        "path": "sdk/python/src/openai_codex/generated/notification_registry.py",
+        "git_blob_sha": "2c1212bd8a8c67705105d3c0eb22b9b8c40343eb"
+      },
+      {
+        "name": "v2_all.py",
+        "path": "sdk/python/src/openai_codex/generated/v2_all.py",
+        "git_blob_sha": "0faaa9e074c4de86f9087d4e355bd1ebee42c2b9"
+      }
+    ],
+    "local_donor_has_same_model_filenames": true,
+    "availability": "Both generated model files are present in the upstream tree at this commit and their filenames match the local donor. File contents and runtime compatibility were not audited because this candidate is pin-blocked."
+  },
+  "existing_immutable_donor": {
+    "manifest": "docs/agent_swarm.donors-20260929.toml",
+    "module_update": "modules/codex/UPDATE.md",
+    "upstream_commit_file": "modules/codex/vendor_bridge/UPSTREAM_COMMIT",
+    "current_commit": "18194bfd3534ca567d886eac454028dafaa68b6c",
+    "supplier": "https://github.com/openai/codex/sdk/python",
+    "manifest_source_unit": "sdk/python"
+  },
+  "documented_refresh_scope": [
+    "Select one exact upstream commit whose sdk/python manifest, uv.lock, and generated protocol models belong to the same revision.",
+    "Replace modules/codex/vendor_bridge wholesale with that upstream SDK unit and its license; update UPSTREAM_COMMIT and regenerate SHA256SUMS from the resulting donor bytes.",
+    "Synchronize runtime dependencies from that same donor uv.lock; re-derive the shared-WebSocket transport adaptation and server-request replies from the new client and protocol models.",
+    "Synchronize bridge pins/constants, module example, and README; bump the artifact ID if the module contract changes.",
+    "Run the documented vendor verifier and fixture tests; fixture validation and live app-server/provider qualification remain separate evidence."
+  ],
+  "limitations": [
+    "This verifies the current canonical main snapshot only; it does not establish that no other upstream branch or historical commit has a fixed pin.",
+    "Generated model path availability is verified from GitHub tree metadata; generated-file contents and compatibility were not reviewed.",
+    "No implementation acceptance commands were run."
+  ],
+  "sources": [
+    "https://github.com/openai/codex/commit/806d9732c974bc8a51b8317c1bd8985544fe627c",
+    "https://raw.githubusercontent.com/openai/codex/806d9732c974bc8a51b8317c1bd8985544fe627c/sdk/python/pyproject.toml",
+    "https://raw.githubusercontent.com/openai/codex/806d9732c974bc8a51b8317c1bd8985544fe627c/sdk/python/uv.lock",
+    "https://github.com/openai/codex/tree/806d9732c974bc8a51b8317c1bd8985544fe627c/sdk/python/src/openai_codex/generated"
+  ]
+}

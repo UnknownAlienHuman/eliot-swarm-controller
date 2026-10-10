@@ -543,15 +543,155 @@ function Test-ExactObjectKeys {
 }
 
 function Get-OptionalField {
-    param([AllowNull()] $Object, [Parameter(Mandatory)][string] $Name)
+    param([AllowNull()] $Object, [Parameter(Mandatory)][string] $Name, [switch] $PreserveCollection)
     if ($null -eq $Object) { return $null }
     if ($Object -is [System.Collections.IDictionary]) {
-        if ($Object.Contains($Name)) { return $Object[$Name] }
+        if ($Object.Contains($Name)) {
+            if ($PreserveCollection) { return ,$Object[$Name] }
+            return $Object[$Name]
+        }
         return $null
     }
     $property = $Object.PSObject.Properties[$Name]
-    if ($null -ne $property) { return $property.Value }
+    if ($null -ne $property) {
+        if ($PreserveCollection) { return ,$property.Value }
+        return $property.Value
+    }
     return $null
+}
+
+function Test-ReadinessRecordShape {
+    param([AllowNull()] $Value)
+    if ($null -eq $Value -or $Value -is [System.Collections.IList]) { return $false }
+    return ($Value -is [System.Collections.IDictionary] -or $Value -is [pscustomobject])
+}
+
+function Get-SafeReadinessErrorCode {
+    param([AllowNull()] $Value)
+    if ($Value -isnot [string]) { return $null }
+    if ($Value -cmatch '\A[A-Z0-9_]{1,64}\z') { return $Value }
+    return $null
+}
+
+function Get-SafeReadinessBindingState {
+    param([AllowNull()] $Value)
+    if ($Value -isnot [string]) { return $null }
+    if ($Value -cin @('opening', 'ready', 'reconciling', 'closed')) { return $Value }
+    return $null
+}
+
+function Get-SafeReadinessSupervisorPhase {
+    param([AllowNull()] $Value)
+    if ($Value -isnot [string]) { return $null }
+    if ($Value -cin @(
+            'waiting_for_demand', 'waiting_for_kernel', 'starting', 'ready', 'restart_backoff',
+            'exited', 'exited_proven', 'owner_retained', 'identity_unknown', 'completed', 'isolated')) {
+        return $Value
+    }
+    return $null
+}
+
+function Get-SafeReadinessProjection {
+    param([AllowNull()] $AgentState)
+
+    $bindingState = Get-SafeReadinessBindingState (Get-OptionalField -Object $AgentState -Name 'state' -PreserveCollection)
+
+    $supervisor = $null
+    if (Test-ReadinessRecordShape $AgentState) {
+        $observation = Get-OptionalField -Object $AgentState -Name 'observation' -PreserveCollection
+        if (Test-ReadinessRecordShape $observation) {
+            $candidate = Get-OptionalField -Object $observation -Name 'module_supervisor' -PreserveCollection
+            if (Test-ReadinessRecordShape $candidate) { $supervisor = $candidate }
+        }
+    }
+
+    $phase = Get-SafeReadinessSupervisorPhase (Get-OptionalField -Object $supervisor -Name 'phase' -PreserveCollection)
+
+    $errorCode = Get-SafeReadinessErrorCode (Get-OptionalField -Object $supervisor -Name 'error_code' -PreserveCollection)
+    return [pscustomobject]@{
+        binding_state = $bindingState
+        supervisor_phase = $phase
+        error_code = $errorCode
+    }
+}
+
+function Test-ReadinessStringEquals {
+    param([AllowNull()] $Value, [AllowNull()][string] $Expected)
+    if ($Value -isnot [string] -or $null -eq $Expected) { return $false }
+    return ($Value -ceq $Expected)
+}
+
+function Test-ReadinessLaunchParent {
+    param(
+        [AllowNull()] $Operation,
+        [AllowNull()][string] $OperationId,
+        [AllowNull()][string] $TaskId,
+        [AllowNull()][string] $AttemptId
+    )
+
+    if (-not (Test-ReadinessRecordShape $Operation)) { return $false }
+    return (
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $Operation -Name 'operation_id' -PreserveCollection) $OperationId) -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $Operation -Name 'method' -PreserveCollection) 'swarm.launch') -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $Operation -Name 'task_id' -PreserveCollection) $TaskId) -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $Operation -Name 'attempt_id' -PreserveCollection) $AttemptId)
+    )
+}
+
+function Test-ReadinessGenerationEquals {
+    param([AllowNull()] $Value, [long] $Expected)
+    if ($Value -isnot [int] -and $Value -isnot [long]) { return $false }
+    return ([long]$Value -eq $Expected)
+}
+
+function Get-SafeReadinessIdentifier {
+    param([AllowNull()] $Value)
+    if ($Value -isnot [string]) { return $null }
+    if ($Value.Length -le 256 -and $Value -cmatch '\A[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\z') { return $Value }
+    return $null
+}
+
+function New-ReadinessFailureFacts {
+    param(
+        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch')][string] $Reason,
+        [AllowNull()] $TaskId,
+        [AllowNull()] $AttemptId,
+        [AllowNull()] $ModuleId,
+        [AllowNull()] $ArtifactId,
+        [AllowNull()] $ArtifactVersion,
+        [AllowNull()] $BindingId,
+        [long] $Generation,
+        [AllowNull()] $Projection,
+        [AllowNull()] $ErrorCode
+    )
+
+    $projectionIsSafe = Test-ReadinessRecordShape $Projection
+    $observedBindingState = if ($projectionIsSafe) { Get-OptionalField -Object $Projection -Name 'binding_state' -PreserveCollection } else { $null }
+    $observedSupervisorPhase = if ($projectionIsSafe) { Get-OptionalField -Object $Projection -Name 'supervisor_phase' -PreserveCollection } else { $null }
+    $observedErrorCode = if ($null -ne $ErrorCode) {
+        Get-SafeReadinessErrorCode $ErrorCode
+    }
+    elseif ($projectionIsSafe) {
+        Get-SafeReadinessErrorCode (Get-OptionalField -Object $Projection -Name 'error_code' -PreserveCollection)
+    }
+    else { $null }
+
+    $expectedGeneration = if ($Generation -gt 0) { $Generation } else { $null }
+    return [ordered]@{
+        reason = $Reason
+        expected_binding_scope = [ordered]@{
+            task_id = Get-SafeReadinessIdentifier $TaskId
+            attempt_id = Get-SafeReadinessIdentifier $AttemptId
+            module_id = Get-SafeReadinessIdentifier $ModuleId
+            artifact_id = Get-SafeReadinessIdentifier $ArtifactId
+            artifact_version = Get-SafeReadinessIdentifier $ArtifactVersion
+            binding_id = Get-SafeReadinessIdentifier $BindingId
+            generation = $expectedGeneration
+        }
+        observed_binding_state = Get-SafeReadinessBindingState $observedBindingState
+        observed_supervisor_phase = Get-SafeReadinessSupervisorPhase $observedSupervisorPhase
+        error_code = $observedErrorCode
+    }
 }
 
 function Test-ObjectFieldPresent {
@@ -1442,11 +1582,25 @@ function Test-PublicAppliedOperationReadback {
     param([Parameter(Mandatory)] $Operation, [Parameter(Mandatory)][string] $OperationId,
         [Parameter(Mandatory)][string] $Method, [Parameter(Mandatory)][string] $BindingId,
         [Parameter(Mandatory)][long] $Generation)
-    $result = Get-OptionalField $Operation 'result'
-    return ($Operation.operation_id -ceq $OperationId -and $Operation.method -ceq $Method -and
-        $Operation.binding_id -ceq $BindingId -and [long]$Operation.binding_generation -eq $Generation -and
-        $null -ne $result -and (Get-OptionalField $result 'operation_id') -ceq $OperationId -and
-        (Get-OptionalField $result 'outcome') -ceq 'applied')
+    if (-not (Test-ReadinessRecordShape $Operation)) { return $false }
+    $result = Get-OptionalField -Object $Operation -Name 'result' -PreserveCollection
+    if (-not (Test-ReadinessRecordShape $result)) { return $false }
+
+    $observedOperationId = Get-OptionalField -Object $Operation -Name 'operation_id' -PreserveCollection
+    $observedMethod = Get-OptionalField -Object $Operation -Name 'method' -PreserveCollection
+    $observedBindingId = Get-OptionalField -Object $Operation -Name 'binding_id' -PreserveCollection
+    $observedGeneration = Get-OptionalField -Object $Operation -Name 'binding_generation' -PreserveCollection
+    $observedResultOperationId = Get-OptionalField -Object $result -Name 'operation_id' -PreserveCollection
+    $observedOutcome = Get-OptionalField -Object $result -Name 'outcome' -PreserveCollection
+    if ($observedOperationId -isnot [string] -or $observedOperationId -cne $OperationId -or
+        $observedMethod -isnot [string] -or $observedMethod -cne $Method -or
+        $observedBindingId -isnot [string] -or $observedBindingId -cne $BindingId -or
+        (($observedGeneration -isnot [int]) -and ($observedGeneration -isnot [long])) -or
+        $observedResultOperationId -isnot [string] -or $observedResultOperationId -cne $OperationId -or
+        $observedOutcome -isnot [string] -or $observedOutcome -cne 'applied') {
+        return $false
+    }
+    return ([long]$observedGeneration -eq $Generation)
 }
 
 function Get-ExactAgentState {
@@ -1817,43 +1971,141 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $readyProof = $null
     $launchReadbackFailure = $null
+    $readinessFailureReason = 'operation_count_scope'
+    $readinessBindingId = $null
+    [long]$readinessGeneration = 0
+    $lastReadinessProjection = Get-SafeReadinessProjection $null
+    $lastReadinessErrorCode = Get-SafeReadinessErrorCode $launch.error_code
     while ([DateTime]::UtcNow -lt $deadline) {
         $operations = Get-Operations -TimeoutMilliseconds 30000
-        if (-not $operations.success) { $launchReadbackFailure = $operations.code; Start-Sleep -Milliseconds 750; continue }
+        if (-not $operations.success) {
+            $readinessFailureReason = 'operation_count_scope'
+            $lastReadinessErrorCode = Get-SafeReadinessErrorCode $operations.code
+            $launchReadbackFailure = $operations.code
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+        $lastReadinessErrorCode = $null
         if ([string]::IsNullOrWhiteSpace($parentOperationId)) {
             $parents = @($operations.items | Where-Object { $_.method -eq 'swarm.launch' -and $_.task_id -eq $taskId -and $_.attempt_id -eq $attemptId })
             if ($parents.Count -eq 1) { $parentOperationId = [string]$parents[0].operation_id }
         }
-        if ([string]::IsNullOrWhiteSpace($parentOperationId)) { Start-Sleep -Milliseconds 750; continue }
+        if ([string]::IsNullOrWhiteSpace($parentOperationId)) {
+            $readinessFailureReason = 'operation_count_scope'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
         $openOps = @($operations.items | Where-Object { $_.method -eq 'agent.open' -and $_.prerequisite_operation_id -eq $parentOperationId -and $_.task_id -eq $taskId -and $_.attempt_id -eq $attemptId })
-        if ($openOps.Count -ne 1) { Start-Sleep -Milliseconds 750; continue }
+        if ($openOps.Count -ne 1) {
+            $readinessFailureReason = 'operation_count_scope'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
         $parentCall = Invoke-ManagerCall -Method 'operation.get' -Params ([ordered]@{ operation_id = $parentOperationId }) -TimeoutMilliseconds 30000
         $openCall = Invoke-ManagerCall -Method 'operation.get' -Params ([ordered]@{ operation_id = [string]$openOps[0].operation_id }) -TimeoutMilliseconds 30000
-        if (-not $parentCall.completed -or $parentCall.exit_code -ne 0 -or -not $openCall.completed -or $openCall.exit_code -ne 0) { Start-Sleep -Milliseconds 750; continue }
+        if (-not $parentCall.completed -or $parentCall.exit_code -ne 0 -or -not $openCall.completed -or $openCall.exit_code -ne 0) {
+            $readinessFailureReason = 'applied_readback'
+            $failedReadback = if (-not $openCall.completed -or $openCall.exit_code -ne 0) { $openCall } else { $parentCall }
+            $lastReadinessErrorCode = Get-SafeReadinessErrorCode $failedReadback.error_code
+            Start-Sleep -Milliseconds 750
+            continue
+        }
         $parentOp = $parentCall.value
         $openOp = $openCall.value
-        $bindingId = [string]$openOp.binding_id
-        $generation = [long]$openOp.binding_generation
+        if (-not (Test-ReadinessRecordShape $parentOp) -or -not (Test-ReadinessRecordShape $openOp)) {
+            $readinessFailureReason = 'applied_readback'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+
+        $openBindingId = Get-OptionalField -Object $openOp -Name 'binding_id' -PreserveCollection
+        $openGeneration = Get-OptionalField -Object $openOp -Name 'binding_generation' -PreserveCollection
+        $bindingId = if ($openBindingId -is [string]) { $openBindingId } else { '' }
+        $generation = if ($openGeneration -is [int] -or $openGeneration -is [long]) { [long]$openGeneration } else { 0L }
+        $readinessBindingId = $bindingId
+        $readinessGeneration = $generation
+        $openState = Get-OptionalField -Object $openOp -Name 'state' -PreserveCollection
+        $openResult = Get-OptionalField -Object $openOp -Name 'result' -PreserveCollection
+        $openOutcome = if (Test-ReadinessRecordShape $openResult) {
+            Get-OptionalField -Object $openResult -Name 'outcome' -PreserveCollection
+        }
+        else { $null }
         if ([string]::IsNullOrWhiteSpace($bindingId) -or $generation -le 0 -or
-            $openOp.state -ne 'settled' -or $openOp.result.outcome -ne 'applied' -or
-            $openOp.prerequisite_operation_id -ne $parentOperationId -or
-            $openOp.task_id -ne $taskId -or $openOp.attempt_id -ne $attemptId -or
-            $parentOp.method -ne 'swarm.launch' -or $parentOp.task_id -ne $taskId -or $parentOp.attempt_id -ne $attemptId) {
+            -not (Test-ReadinessStringEquals $openState 'settled') -or
+            -not (Test-ReadinessStringEquals $openOutcome 'applied')) {
+            $readinessFailureReason = 'applied_readback'
             Start-Sleep -Milliseconds 750; continue
         }
+
+        $scopeMismatch =
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $openOp -Name 'prerequisite_operation_id' -PreserveCollection) $parentOperationId) -or
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $openOp -Name 'task_id' -PreserveCollection) $taskId) -or
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $openOp -Name 'attempt_id' -PreserveCollection) $attemptId) -or
+            -not (Test-ReadinessLaunchParent -Operation $parentOp -OperationId $parentOperationId -TaskId $taskId -AttemptId $attemptId)
+        if ($scopeMismatch) {
+            $readinessFailureReason = 'operation_count_scope'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+
         if (-not (Test-PublicAppliedOperationReadback -Operation $openOp -OperationId ([string]$openOps[0].operation_id) -Method 'agent.open' -BindingId $bindingId -Generation $generation)) {
+            $readinessFailureReason = 'applied_readback'
             $launchReadbackFailure = 'OPEN_PUBLIC_OPERATION_READBACK_MISMATCH'
             Start-Sleep -Milliseconds 750; continue
         }
         $agentState = Get-ExactAgentState -BindingId $bindingId -Generation $generation -TimeoutMilliseconds 30000
-        if (-not $agentState.completed -or $agentState.exit_code -ne 0 -or $null -eq $agentState.value) { Start-Sleep -Milliseconds 750; continue }
+        if (-not $agentState.completed -or $agentState.exit_code -ne 0 -or $null -eq $agentState.value) {
+            $readinessFailureReason = 'agent_state'
+            $lastReadinessErrorCode = Get-SafeReadinessErrorCode $agentState.error_code
+            Start-Sleep -Milliseconds 750
+            continue
+        }
         $state = $agentState.value
-        $supervisor = $state.observation.module_supervisor
-        if ($state.binding_id -ne $bindingId -or $state.generation -ne $generation -or
-            $state.state -ne 'ready' -or $supervisor.phase -ne 'ready' -or
-            $supervisor.module_id -ne $contract.module_id -or $supervisor.artifact_id -ne $contract.artifact_id -or
-            $supervisor.artifact_version -ne $contract.version -or
-            $supervisor.binding_id -ne $bindingId -or $supervisor.generation -ne $generation) {
+        $lastReadinessProjection = Get-SafeReadinessProjection -AgentState $state
+        $lastReadinessErrorCode = $lastReadinessProjection.error_code
+        if (-not (Test-ReadinessRecordShape $state)) {
+            $readinessFailureReason = 'agent_state'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+
+        $stateBindingId = Get-OptionalField -Object $state -Name 'binding_id' -PreserveCollection
+        $stateGeneration = Get-OptionalField -Object $state -Name 'generation' -PreserveCollection
+        if (-not (Test-ReadinessStringEquals $stateBindingId $bindingId) -or
+            -not (Test-ReadinessGenerationEquals $stateGeneration $generation)) {
+            $readinessFailureReason = 'selector_mismatch'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+
+        $stateValue = Get-OptionalField -Object $state -Name 'state' -PreserveCollection
+        if (-not (Test-ReadinessStringEquals $stateValue 'ready')) {
+            $readinessFailureReason = 'agent_state'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+
+        $observation = Get-OptionalField -Object $state -Name 'observation' -PreserveCollection
+        $supervisor = $null
+        if (Test-ReadinessRecordShape $observation) {
+            $candidate = Get-OptionalField -Object $observation -Name 'module_supervisor' -PreserveCollection
+            if (Test-ReadinessRecordShape $candidate) { $supervisor = $candidate }
+        }
+        $supervisorPhase = Get-OptionalField -Object $supervisor -Name 'phase' -PreserveCollection
+        if (-not (Test-ReadinessStringEquals $supervisorPhase 'ready')) {
+            $readinessFailureReason = 'supervisor_phase'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+
+        $selectorMismatch =
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $supervisor -Name 'module_id' -PreserveCollection) $contract.module_id) -or
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $supervisor -Name 'artifact_id' -PreserveCollection) $contract.artifact_id) -or
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $supervisor -Name 'artifact_version' -PreserveCollection) $contract.version) -or
+            -not (Test-ReadinessStringEquals (Get-OptionalField -Object $supervisor -Name 'binding_id' -PreserveCollection) $bindingId) -or
+            -not (Test-ReadinessGenerationEquals (Get-OptionalField -Object $supervisor -Name 'generation' -PreserveCollection) $generation)
+        if ($selectorMismatch) {
+            $readinessFailureReason = 'selector_mismatch'
             Start-Sleep -Milliseconds 750; continue
         }
         $readyProof = [pscustomobject]@{
@@ -1864,7 +2116,15 @@ try {
     }
     if ($null -eq $readyProof) {
         $code = if ($launch.error_code) { $launch.error_code } elseif ($launchReadbackFailure) { $launchReadbackFailure } else { 'LAUNCH_READY_READBACK_TIMEOUT' }
-        Add-Stage -Name 'module_open_and_hello' -Status 'unknown' -Code $code -Facts ([ordered]@{ parent_operation_id = $parentOperationId; dispatch_started = $false })
+        $readinessFailureFacts = New-ReadinessFailureFacts -Reason $readinessFailureReason `
+            -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id `
+            -ArtifactVersion $contract.version -BindingId $readinessBindingId -Generation $readinessGeneration `
+            -Projection $lastReadinessProjection -ErrorCode $lastReadinessErrorCode
+        Add-Stage -Name 'module_open_and_hello' -Status 'unknown' -Code $code -Facts ([ordered]@{
+            parent_operation_id = $parentOperationId
+            dispatch_started = $false
+            readiness_failure = $readinessFailureFacts
+        })
         Stop-Qualification $code
     }
     $parentOperationId = [string]$readyProof.parent.operation_id

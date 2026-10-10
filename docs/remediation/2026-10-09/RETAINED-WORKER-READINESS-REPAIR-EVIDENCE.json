@@ -1,0 +1,201 @@
+{
+  "schema": "eliot.v27_retained_worker_readiness_repair.v1",
+  "observed_at_utc": "2026-10-10T12:51:38.4391467Z",
+  "source_head_before_commit": "fdc8736428df981670a93023890bcc5acbde2df0",
+  "source_sha256": {
+    "crates/swarm-supervisor/src/supervisor.rs": "a75136a54cce45db804ec9dc59abe9d48e5ff1e66103360b5f34af3ee16caf68",
+    "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+    "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+    "tools/qualification/New-NativeQualification.ps1": "7e50b6fc32212e1bc73622d44b989e5c5a3b51c0e97d9b74025305777c45eaf6"
+  },
+  "source_status": "verified_at_bounded_source_scope",
+  "installed_status": "not_verified",
+  "root_cause": "Helper-exit drain polling unconditionally wrote OwnerGroupRetained, while normal polling could preserve an exact previously hello-confirmed live worker. This source collision can mask late hello and overwrite Ready.",
+  "runtime_cause_in_M": "UNKNOWN: preserved M diagnostics do not prove the exact worker was live at confirmation; descendants may have retained the owner family.",
+  "repair": [
+    "Normal and helper-exit drain polling share observe_owned_worker with the existing OS pid/birth/image liveness predicate.",
+    "Live unconfirmed workers stay Starting; only the exact already confirmed boot and process identity preserve ProcessRunning.",
+    "Normal/drain and prior-owner recovery use one current-status hello-confirmation predicate including image equality. Recovery requires OS liveness and does not restore Ready from a stale status snapshot.",
+    "Dead or absent workers stay OwnerGroupRetained; owner token, receipt, membership and family departure proofs remain.",
+    "Both polling paths account for exact live-worker observations in the healthy interval used by the bounded restart budget.",
+    "The qualifier records the last failed readiness gate, exact expected scope, bounded public phase/state/error code, and rejects array-shaped or case-changed scope records. Returned launch-parent identity must match its requested Operation ID.",
+    "Eight pre-input packet regressions retain canonical tool schemas and exact assignment/server/route scope; production dispatch logic is unchanged."
+  ],
+  "clippy": {
+    "windows": {
+      "exit_code": 0,
+      "platform": "windows",
+      "source_head": "fdc8736428df981670a93023890bcc5acbde2df0",
+      "source_sha256": {
+        "crates/swarm-supervisor/src/supervisor.rs": "a75136a54cce45db804ec9dc59abe9d48e5ff1e66103360b5f34af3ee16caf68",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+        "tools/qualification/New-NativeQualification.ps1": "7e50b6fc32212e1bc73622d44b989e5c5a3b51c0e97d9b74025305777c45eaf6"
+      },
+      "packages": [
+        "swarm-supervisor",
+        "swarm-kernel-host"
+      ],
+      "arguments": "--locked --lib --bins --no-deps -- -D warnings",
+      "log": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\windows-n-readiness-clippy.log",
+      "log_sha256": "815434208b9b0239a95b632a139ac255c95296f0a47ebef01b171f06d1a7eb49",
+      "started_at_utc": "2026-10-10T12:48:03.8825167Z",
+      "completed_at_utc": "2026-10-10T12:48:43.5783947Z"
+    },
+    "linux": {
+      "exit_code": 0,
+      "platform": "linux",
+      "source_head": "fdc8736428df981670a93023890bcc5acbde2df0",
+      "source_sha256": {
+        "crates/swarm-supervisor/src/supervisor.rs": "a75136a54cce45db804ec9dc59abe9d48e5ff1e66103360b5f34af3ee16caf68",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+        "tools/qualification/New-NativeQualification.ps1": "7e50b6fc32212e1bc73622d44b989e5c5a3b51c0e97d9b74025305777c45eaf6"
+      },
+      "packages": [
+        "swarm-supervisor",
+        "swarm-kernel-host"
+      ],
+      "arguments": "--locked --lib --bins --no-deps -- -D warnings",
+      "log": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\linux-n-readiness-clippy.log",
+      "log_sha256": "fba29d347aef9b33339dba328a86dc0f3a46053319cf36bc115985780c0a29d6",
+      "started_at_utc": "2026-10-10T12:48:03.808136Z",
+      "completed_at_utc": "2026-10-10T12:48:44.2368632Z"
+    }
+  },
+  "tests": {
+    "windows": {
+      "exit_code": 0,
+      "platform": "windows",
+      "source_sha256": {
+        "crates/swarm-supervisor/src/supervisor.rs": "a75136a54cce45db804ec9dc59abe9d48e5ff1e66103360b5f34af3ee16caf68",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+        "tools/qualification/New-NativeQualification.ps1": "7e50b6fc32212e1bc73622d44b989e5c5a3b51c0e97d9b74025305777c45eaf6"
+      },
+      "scope": "Affected supervisor library after image/boot preservation fix; unchanged eight pre-input cases retained from prior pass",
+      "log": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\windows-n-readiness-supervisor-final-tests.log",
+      "log_sha256": "be17ccd88967f6a2ac5333f9f06d6b70e34b4415eb0a9ab4507c4dafb164f670",
+      "summaries": [
+        "test result: ok. 21 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.63s\r"
+      ],
+      "started_at_utc": "2026-10-10T12:48:53.7234171Z",
+      "completed_at_utc": "2026-10-10T12:48:57.754759Z"
+    },
+    "linux": {
+      "exit_code": 0,
+      "platform": "linux",
+      "source_sha256": {
+        "crates/swarm-supervisor/src/supervisor.rs": "a75136a54cce45db804ec9dc59abe9d48e5ff1e66103360b5f34af3ee16caf68",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+        "tools/qualification/New-NativeQualification.ps1": "7e50b6fc32212e1bc73622d44b989e5c5a3b51c0e97d9b74025305777c45eaf6"
+      },
+      "scope": "Affected supervisor library after image/boot preservation fix; unchanged eight pre-input cases retained from prior pass",
+      "log": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\linux-n-readiness-supervisor-final-tests.log",
+      "log_sha256": "95d933972837c2e8c93f60fbb93d762df06d827d94fb46f9196d55540a897061",
+      "summaries": [
+        "test result: ok. 22 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.55s\r",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 0.02s\r"
+      ],
+      "started_at_utc": "2026-10-10T12:48:53.7233069Z",
+      "completed_at_utc": "2026-10-10T12:50:09.6518275Z",
+      "runner_note": "The scalar PowerShell splat lost the supervisor-only argument. Final Linux run also repeated the eight unchanged packet tests; all passed. Runner now passes the scope argument explicitly; no further test rerun."
+    },
+    "retained_packet_windows": {
+      "exit_code": 0,
+      "platform": "windows",
+      "source_sha256": {
+        "crates/swarm-supervisor/src/supervisor.rs": "ffc86d5f30f70cdbbf7d02e990849ef2de640801dceffd9439d55185fe1884f3",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+        "tools/qualification/New-NativeQualification.ps1": "7ca639e2a05156ad8084e792e01a300df1a3c3999283b3481f7457b3ff04e747"
+      },
+      "scope": "Affected supervisor library plus eight new pre-input packet regressions; earlier host library cohorts not repeated",
+      "log": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\windows-n-readiness-tests.log",
+      "log_sha256": "568b61237206b4d307da8c193a6242dfe7ad3fc5bcf05036ea95517b4b3fda4f",
+      "summaries": [
+        "test result: ok. 20 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.27s\r",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 385 filtered out; finished in 0.02s\r"
+      ],
+      "started_at_utc": "2026-10-10T12:32:14.5065244Z",
+      "completed_at_utc": "2026-10-10T12:33:56.1263006Z"
+    },
+    "retained_packet_linux": {
+      "exit_code": 0,
+      "platform": "linux",
+      "source_sha256": {
+        "crates/swarm-supervisor/src/supervisor.rs": "ffc86d5f30f70cdbbf7d02e990849ef2de640801dceffd9439d55185fe1884f3",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "d7fda219965fd41e3e981cff6738e6cc51358ed14348af49ba1d487921878ccc",
+        "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "c6996223ad6469e44b8c7f3249ff87ac66baa6d8e0e76b2801847d13c2463bcc",
+        "tools/qualification/New-NativeQualification.ps1": "7ca639e2a05156ad8084e792e01a300df1a3c3999283b3481f7457b3ff04e747"
+      },
+      "scope": "Affected supervisor library plus eight new pre-input packet regressions; earlier host library cohorts not repeated",
+      "log": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\linux-n-readiness-tests.log",
+      "log_sha256": "46155da0340ba3533db56cd8764d18a51b79ce2e2f4500812f6b02d2a61ee5de",
+      "summaries": [
+        "test result: ok. 21 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.47s\r",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 0.02s\r"
+      ],
+      "started_at_utc": "2026-10-10T12:32:14.5827485Z",
+      "completed_at_utc": "2026-10-10T12:33:45.7835141Z"
+    },
+    "supervisor_ignored_each": 2,
+    "ignored_scope": "Existing installed fixture plus child-process fixture invoked only by the OS-backed lifecycle tests",
+    "harness": {
+      "status": "PASS",
+      "scope": "Parser and extracted pure helper cases only; no qualification invocation",
+      "source_sha256": "7e50b6fc32212e1bc73622d44b989e5c5a3b51c0e97d9b74025305777c45eaf6",
+      "cases": [
+        "public_scalar_projection",
+        "private_fields_excluded",
+        "array_shape_rejected_0",
+        "array_shape_rejected_1",
+        "array_shape_rejected_2",
+        "failure_gate_retained",
+        "failure_facts_private_fields_excluded",
+        "unclosed_code_rejected",
+        "case_changed_scope_rejected",
+        "array_state_rejected",
+        "noninteger_generation_rejected_10",
+        "noninteger_generation_rejected_11",
+        "noninteger_generation_rejected_12",
+        "noninteger_generation_rejected_13",
+        "exact_applied_readback_accepted",
+        "array_result_rejected",
+        "different_result_operation_rejected",
+        "launch_parent_identity_accepted",
+        "different_parent_operation_id_rejected",
+        "case_changed_parent_operation_id_rejected",
+        "nonstring_parent_operation_id_rejected",
+        "array_parent_operation_id_rejected",
+        "launch_parent_method_mismatch_rejected",
+        "launch_parent_task_mismatch_rejected",
+        "launch_parent_attempt_mismatch_rejected",
+        "array_shaped_launch_parent_rejected"
+      ],
+      "native_calls": 0,
+      "model_calls": 0,
+      "verified_at_utc": "2026-10-10T12:47:35.2945099Z"
+    },
+    "limitations": "Lifecycle tests exercise the supervisor liveness/hello seam; they do not qualify installed process ownership or native execution. Windows retains the eight unchanged packet tests; Linux also repeated those eight due to the documented runner argument bug, all passed. Existing host test compilation warnings remain; production Clippy is strict and clean."
+  },
+  "independent_review": {
+    "model": "gpt-6-luna",
+    "effort": "max",
+    "initial_agent_id": "01a125ca-0aee-7461-bd8d-33b974d195b9",
+    "initial_report_sha256": "fad5eb55ad4ea4a478153442ee73c99bd20b3e444e18b8f173bfe40cae9afb31",
+    "initial_findings": "Two P2 guards: exact parent Operation ID and full image continuity",
+    "followup_agent_id": "01a125d6-b8dc-7e31-b4ad-c282f8eba2de",
+    "followup_report_sha256": "e7f15aa8df9690289a8c4c1da2422e12a24b5729a9420dc3d3970dc229ad942d",
+    "scope": "Initial four-file review; corrected supervisor follow-up review and local exact-parent regressions",
+    "status": "findings_fixed_and_verified_at_bounded_source_scope"
+  },
+  "retained_evidence": [
+    "M core3 public observations remain bound to installed 694794f and are not new-candidate qualification.",
+    "Historical M native receipts remain unqualified with dispatch0.",
+    "R48 optional-worker installed fault/recovery remains not_verified; see OPTIONAL-WORKER-QUALIFICATION-GAP.json.",
+    "Thirteen dependency alerts remain open; current Codex canonical main still pins datamodel-code-generator0.31.2; see CODEX-DONOR-UPSTREAM-BLOCKER.json."
+  ],
+  "next_verifier": "After clean commit: eight exact provenance packages, genuine install and one fresh OpenCode native contour. Unchanged Antigravity refusal is not replayed."
+}

@@ -1,0 +1,45 @@
+{
+  "schema": "eliot.v27_optional_worker_qualification_gap.v1",
+  "requirement": "V27 R48: an optional worker failure leaves the host running and retains uncertain effect receipts; installed acceptance requires an exercised fault and recovery contour.",
+  "status": "not_verified",
+  "classification": "product_and_qualification_capability_gap",
+  "source_commit_reviewed": "fdc8736428df981670a93023890bcc5acbde2df0",
+  "review_model": "gpt-6-luna",
+  "reasoning_effort": "max",
+  "findings": [
+    {
+      "source": "tools/qualification/Invoke-CoreFailureQualification.ps1:1450",
+      "fact": "The scenario observes existing failure status only. It has no public fault trigger; the observed branch also records that this harness did not inject the failure.",
+      "code": "NO_PUBLIC_OPTIONAL_WORKER_FAULT_TRIGGER"
+    },
+    {
+      "source": "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs:31",
+      "fact": "The coordinator uses a private fixed set of eleven in-process worker types; the inspected public contract does not admit a new owned test worker."
+    },
+    {
+      "source": "tools/qualification/Invoke-CoreFailureQualification.ps1:1094",
+      "fact": "The worker status summary contains state, failure count and error code; it contains no worker process identity."
+    },
+    {
+      "source": "crates/swarm-supervisor/src/control.rs:127",
+      "fact": "Module supervision has a separate owned-child PID/birth/image contract; it cannot be substituted for the legacy optional-worker contour."
+    },
+    {
+      "source": "crates/swarm-kernel-host/src/store/mod.rs:2172",
+      "fact": "Module health recording requires supervisor scope; manufacturing a health record would not demonstrate an actual worker fault."
+    }
+  ],
+  "required_evidence": [
+    "A supported admitted worker activation and actual fault path for the worker type under test",
+    "Exact ownership and lifecycle evidence appropriate to that worker implementation",
+    "Public host survival and retained uncertain effect receipts after the actual fault",
+    "Public recovery evidence rather than observation of a pre-existing failure"
+  ],
+  "execution": {
+    "faults_injected": 0,
+    "process_control_calls": 0,
+    "models_called": 0,
+    "runtime_or_database_mutations": 0
+  },
+  "interpretation": "This source audit explains why the corrected M core receipt remains not qualified. It does not upgrade existing failure observations to fault-injection or recovery acceptance."
+}

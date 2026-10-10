@@ -2,6 +2,31 @@
 
 ## Current state
 
+### Published process custody assembly — 2026-10-10
+
+The current source assembly is published on `main` at
+`4e470821beae15f091547ea7fba4c1d329e219ba`. It adds shared bounded capture,
+durable artifact publication, scheduler source isolation, exact module actor
+fencing and host-owned shutdown custody. Actual process owners survive failed
+publication and persistence; Store and the runtime stay alive until their
+registered owners have a confirmed disposition. The
+[assembly record](remediation/2026-10-10/PROCESS-CUSTODY-ASSEMBLY.md) describes
+the source boundaries.
+
+Rust 1.98.1 production Clippy passed all 24 owned packages on Windows and Linux
+with zero errors and zero warnings. Owned-package formatting passed. The
+[GitHub CI run](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/38085558859)
+passed on the published SHA. Host test-target compilation passed with 21
+retained test-only warnings; compilation does not establish test execution.
+
+Full owned-package qualification is now running on Windows and Ubuntu from a
+clean managed checkout of that exact SHA. All 29 recorded assembly source hashes
+match the checkout. Fresh host and worker binaries precede the test execution.
+Fresh installed native/model qualification remains pending, including Step 5
+free with high reasoning and Antigravity Gemini 3.8. The historical M receipts,
+R48 installed fault/recovery gap and dependency alerts retain their recorded
+limits. Project status remains `PARTIAL_PROGRESS`.
+
 ### V27 audit and installed qualification — 2026-10-10
 
 The owner resumed development with the V27 audit and supplied HIGH appendix.
@@ -13,6 +38,15 @@ Windows and Linux. The affected library cohorts retain 399/412 unique passing
 tests, with one ignored case on each platform; independent native GPT-6 Luna Max
 source review found no confirmed C7 defect.
 
+The latest retained-worker readiness repair shares exact live-worker observation
+between both supervisor polling paths and preserves confirmed Ready only for the
+same boot and pid/birth/image. Both paths retain healthy restart-budget accounting.
+Strict affected production Clippy passes on Windows/Linux; supervisor tests pass
+21/22 cases, with two ignored fixtures each, and eight new pre-input contract cases
+pass on each platform. The qualification helpers pass 26 pure offline checks.
+Fresh installed qualification for this repair remains pending; M's exact runtime
+cause is still unknown.
+
 Fresh M installed core and native execution completed on eight exact `694794f`
 packages. Both native runs remain unqualified with zero dispatch. OpenCode C7
 applied its assigned-session observation; C8 retained unknown session/provider
@@ -22,6 +56,8 @@ model execution is not established. The corrected public core contour observed
 all three manager/hook cases against the exact M binaries, with no native/model
 calls; optional-worker fault injection remains unavailable. The unsupported
 result contracts and 13 upstream dependency alerts remain open.
+Current canonical Codex main `806d9732`, dated 2026-10-10, still pins the vulnerable
+generator `0.31.2`; a supported fixed immutable donor has not been verified.
 Current evidence and limits are recorded in the
 [V27 audit ledger](remediation/2026-10-09/CURRENT-AUDIT.md). Product status remains
 `PARTIAL_PROGRESS`; the dated closeout below is historical.
