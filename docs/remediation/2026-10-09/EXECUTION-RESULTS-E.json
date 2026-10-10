@@ -1,0 +1,605 @@
+{
+  "schema": "eliot.v27_execution_results.v1",
+  "observed_at_utc": "2026-10-10T07:00:39.5943564Z",
+  "candidate_commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+  "binding_receipt_sha256": "70e742c1212d5224c6027b5b8cbf58ada5b4e716446bd43b2b587770293bd137",
+  "execution_scope": "native_only; previous C core/load evidence was not replayed or promoted",
+  "build_packages": [
+    {
+      "package": "host_runtime",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "3e191e588e39789e1ec98bf9578848c6089a7b02784d0f53dfd30c26cc1c9eb4"
+    },
+    {
+      "package": "host_supervisor",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "ab7ae17e442177f7aed198ed2d6239ae52e2c97bba7e19ac8547e3088bc0e53a"
+    },
+    {
+      "package": "host_launcher",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "1609f14e2b007dbd55412362332e93f93040c033d0e759289252e3c92bde1457"
+    },
+    {
+      "package": "public_cli",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "2380f2bc10ccf536cd0da579a1eadea6e0f7f00b774b8c66d9d706ed778332b4"
+    },
+    {
+      "package": "process_owner_helper",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "9ec21d93bcca63fa655d19543729a379a1b4d1db1f346727398080570756cc74"
+    },
+    {
+      "package": "opencode_module",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "0a2395c86534adacd0251b5cdd9e35654a93657e7e45fc1c99e29e2bb7c82238"
+    },
+    {
+      "package": "antigravity_module",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "71f6c51a05df3777036d4b79b32d79ac31c766fa8ff2483ec6b3dcf59e2581e2"
+    },
+    {
+      "package": "swarm_mcp",
+      "commit": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "a9962a0513247d437b065eb0c17dcc7809b550ed808a61da2587b0f8bd6c68f8"
+    }
+  ],
+  "host_resource_install": {
+    "install_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010e\\candidate-build\\host-stack",
+    "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010e\\candidate-build\\host-stack\\swarm-kernel-host.install-receipt.json",
+    "receipt_sha256": "e033758d692ba7231db18e5762af98e32ad4a2da29ce68454fb7f5d89fe3f89a",
+    "build_manifest_sha256": "3e191e588e39789e1ec98bf9578848c6089a7b02784d0f53dfd30c26cc1c9eb4",
+    "installer_readback_path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\candidate-install-readback.json",
+    "installer_readback_sha256": "8ec47caff16c05c7a34a4d6c39d9842bd7da0c706ac6505faa753e85024e2068",
+    "resource_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010e\\candidate-build\\host-stack\\resources\\modules\\opencode",
+    "server_program": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010e\\candidate-build\\host-stack\\resources\\modules\\opencode\\serve.mjs",
+    "server_program_sha256": "d36394f227d272e91150ce3cf6e469b6c8bfae9997ad957306518bbeb49c956c",
+    "dependency_closure_manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010e\\candidate-build\\host-stack\\resources\\modules\\opencode\\dependency-closure.json",
+    "dependency_closure_sha256": "97600fed55ff73d59010df77be16c99d5488fe595aa95c3e9511183a26449519",
+    "dependency_tree_sha256": "396ef448a1494e29ae8a599ceee7827afeb88787487f88394cbf22e90e9fd486",
+    "dependency_file_count": 34060,
+    "unchanged_after_runner": true
+  },
+  "model_coordinates": {
+    "opencode": "opencode/step-5-preview-free, high",
+    "antigravity": "gemini-3.8-flash-high",
+    "fallback": "none"
+  },
+  "retained_contours": {
+    "candidate": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+    "source": "EXECUTION-RESULTS-C.json",
+    "core_failure_execution_status": "not_repeated",
+    "host_load_execution_status": "not_repeated",
+    "new_candidate_core_qualification": "not_claimed",
+    "new_candidate_load_qualification": "not_claimed"
+  },
+  "native": [
+    {
+      "adapter": "OpenCode",
+      "run_id": "3ca4fb49-8fdd-47e2-a036-37d864d0f267",
+      "receipt_sha256": "47c79cd910fead496eb629e4dc740e90f585b7073e82c3c0301302a56f7446a0",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "limits": {
+        "task_dispatch_calls_max": 1,
+        "task_dispatch_calls": 0,
+        "mutation_replay": false,
+        "raw_request_or_result_saved": "no raw content is included in the receipt; request files are private transient inputs and remain only if their CLI process has not exited",
+        "provider_account_identity": "not_proven_by_harness",
+        "model_consumption": "not_proven_by_harness",
+        "task_completion": "not_claimed",
+        "binary_source_revision": "not_attested_by_executable_hash_alone",
+        "native_process_management": "attach_only_for_codex; no native process start/stop/reconfigure/kill",
+        "unsupported": [],
+        "private_harness_diagnostic": "saved"
+      },
+      "native_selected_agent_model_readback": "UNKNOWN; current public qualification receipt does not surface the adapter snapshot fields",
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "facts": {
+            "kernel_host_binary_sha256": "4fbf77bc940909c94a827b5d8d23e6de17cbff5a6ef5ca084960c726027679c6",
+            "host_launcher_binary_sha256": "e1420b0d5b02e690009e7309f2f2d242662b3fff9f61f41d71b7afc38916c2b7",
+            "host_supervisor_binary_sha256": "e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84",
+            "public_cli_sha256": "e305dfe4eee4725e8bcd4dcba29fe2e42cdd99f9f6542bca0ee58e0e14ecf8da",
+            "module_executable_sha256": "b441dd6d361394acafbe7150282d5acfce0e3af78c5716da584da10c110e3c11",
+            "descriptor_sha256": "fb0d53270cad6e541ecb337fa0306cf327edffeb484c516b5fce00dc2bb2469d",
+            "install_receipt_sha256": "6a7ccb00e2c12bb46868fae24099cffab5efb7a0c160c36557848af1b9684af3",
+            "module_identity": {
+              "module_id": "eliot.opencode.v2",
+              "artifact_id": "eliot-opencode-v2.rust-http.1",
+              "version": "0.5.0",
+              "build_id": null,
+              "executable_sha256": "b441dd6d361394acafbe7150282d5acfce0e3af78c5716da584da10c110e3c11",
+              "descriptor_sha256": "fb0d53270cad6e541ecb337fa0306cf327edffeb484c516b5fce00dc2bb2469d"
+            }
+          }
+        },
+        {
+          "name": "isolated_host",
+          "status": "passed",
+          "facts": {
+            "isolated_data_root": true,
+            "kernel_process_id": 72048,
+            "kernel_image_sha256": "4fbf77bc940909c94a827b5d8d23e6de17cbff5a6ef5ca084960c726027679c6",
+            "host_launcher_image_sha256": "e1420b0d5b02e690009e7309f2f2d242662b3fff9f61f41d71b7afc38916c2b7",
+            "host_supervisor_image_sha256": "e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84",
+            "public_cli_image_sha256": "e305dfe4eee4725e8bcd4dcba29fe2e42cdd99f9f6542bca0ee58e0e14ecf8da",
+            "host_readiness": {
+              "host_epoch": 1,
+              "kernel_lifecycle_state": "running",
+              "module_supervisor_state": "dormant",
+              "child_exit_category": "exited",
+              "child_exit_code": 0,
+              "module_supervisor_image_sha256": "sha256:e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84"
+            },
+            "operator_credential_created": true
+          }
+        },
+        {
+          "name": "manager_admission",
+          "status": "passed",
+          "facts": {
+            "role": "manager",
+            "client_id": "native-qualification-19941a03bfc842c2b611be9c6a68e7c3",
+            "credential_created_for_private_run": true,
+            "credential_material_in_receipt": false,
+            "gm_handover": true,
+            "gm_epoch": 1
+          }
+        },
+        {
+          "name": "trusted_descriptor",
+          "status": "passed",
+          "facts": {
+            "module_id": "eliot.opencode.v2",
+            "artifact_id": "eliot-opencode-v2.rust-http.1",
+            "version": "0.5.0",
+            "registered_revision": 1,
+            "catalog_revision": 1,
+            "protocol": "1.0",
+            "capability_count": 13
+          }
+        },
+        {
+          "name": "route_configuration",
+          "status": "passed",
+          "facts": {
+            "route_alias": "native-prereq-opencode",
+            "runtime": "module",
+            "artifact_id": "eliot-opencode-v2.rust-http.1",
+            "model_id": "step-5-preview-free",
+            "provider_id": "opencode",
+            "variant": "high",
+            "requested_model_ref": "opencode/step-5-preview-free"
+          }
+        },
+        {
+          "name": "manager_route_selection",
+          "status": "passed",
+          "facts": {
+            "route_alias": "native-prereq-opencode",
+            "module_id": "eliot.opencode.v2",
+            "artifact_id": "eliot-opencode-v2.rust-http.1",
+            "selected_revision": 2,
+            "scope": "manager_future_bindings_only"
+          }
+        },
+        {
+          "name": "task_create",
+          "status": "passed",
+          "facts": {
+            "task_id": "650b171f-ef17-4b07-afb8-558fbff7f3ae",
+            "revision": 1,
+            "project_id": "native-qualification-fixture-20261009",
+            "source": "caller_supplied_task_spec"
+          }
+        },
+        {
+          "name": "task_claim",
+          "status": "passed",
+          "facts": {
+            "task_id": "650b171f-ef17-4b07-afb8-558fbff7f3ae",
+            "attempt_id": "3d626cab-4a5a-40da-9c87-8820cb2f7f32",
+            "owner_id": "native-qualification-19941a03bfc842c2b611be9c6a68e7c3",
+            "start_owner": "controller"
+          }
+        },
+        {
+          "name": "launcher_preview",
+          "status": "passed",
+          "facts": {
+            "plan_digest": "sha256:0d49247da77738847ac6507c2a5ee30ecc9f873b1375c1d1c439fc3f694fe6e9",
+            "hard_blocks": [],
+            "attempt_id": "3d626cab-4a5a-40da-9c87-8820cb2f7f32",
+            "workspace_policy": "manager_owned_worktree"
+          }
+        },
+        {
+          "name": "module_open_and_hello",
+          "status": "unknown",
+          "code": "LAUNCH_READY_READBACK_TIMEOUT",
+          "facts": {
+            "parent_operation_id": "4d107509-940a-40a0-9f0c-316b28b0e83d",
+            "dispatch_started": false
+          }
+        }
+      ],
+      "safe_facts": {
+        "host_readiness": {
+          "host_epoch": 1,
+          "kernel_lifecycle_state": "running",
+          "module_supervisor_state": "dormant",
+          "child_exit_category": "exited",
+          "child_exit_code": 0,
+          "module_supervisor_image_sha256": "sha256:e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84"
+        },
+        "route": {
+          "alias": "native-prereq-opencode",
+          "runtime": "module",
+          "artifact_id": "eliot-opencode-v2.rust-http.1",
+          "model_id": "step-5-preview-free",
+          "provider_id": "opencode",
+          "variant": "high",
+          "requested_model_ref": "opencode/step-5-preview-free"
+        },
+        "task_id": "650b171f-ef17-4b07-afb8-558fbff7f3ae",
+        "host_shutdown": {
+          "graceful_eof_sent": true,
+          "kernel_process_id": 72048,
+          "exited": true,
+          "force_terminated": false
+        }
+      }
+    },
+    {
+      "adapter": "Antigravity",
+      "run_id": "ef2f32e1-4dba-4738-b72e-6f4749e79604",
+      "receipt_sha256": "42ee2d70761d116bd2ae572f65ae03c3d1ba94c8d00877f07161018a6d480c99",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "limits": {
+        "task_dispatch_calls_max": 1,
+        "task_dispatch_calls": 0,
+        "mutation_replay": false,
+        "raw_request_or_result_saved": "no raw content is included in the receipt; request files are private transient inputs and remain only if their CLI process has not exited",
+        "provider_account_identity": "not_proven_by_harness",
+        "model_consumption": "not_proven_by_harness",
+        "task_completion": "not_claimed",
+        "binary_source_revision": "not_attested_by_executable_hash_alone",
+        "native_process_management": "attach_only_for_codex; no native process start/stop/reconfigure/kill",
+        "unsupported": [],
+        "private_harness_diagnostic": "saved"
+      },
+      "native_selected_agent_model_readback": "UNKNOWN; current public qualification receipt does not surface the adapter snapshot fields",
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "facts": {
+            "kernel_host_binary_sha256": "4fbf77bc940909c94a827b5d8d23e6de17cbff5a6ef5ca084960c726027679c6",
+            "host_launcher_binary_sha256": "e1420b0d5b02e690009e7309f2f2d242662b3fff9f61f41d71b7afc38916c2b7",
+            "host_supervisor_binary_sha256": "e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84",
+            "public_cli_sha256": "e305dfe4eee4725e8bcd4dcba29fe2e42cdd99f9f6542bca0ee58e0e14ecf8da",
+            "module_executable_sha256": "00365b64bb05bb99639f735abdec9dcf574b4682ebe712d7c2ac85fb3c25b940",
+            "descriptor_sha256": "e6c8355a69677ce11515b361f5e8cd332bc7230d02e4f607a3d26abd27249d67",
+            "install_receipt_sha256": "4901ca11352717725915010509021474e22811c1d141fe121bb26d32fb8356b5",
+            "module_identity": {
+              "module_id": "antigravity",
+              "artifact_id": "eliot-antigravity.rust-headless.1",
+              "version": "5",
+              "build_id": null,
+              "executable_sha256": "00365b64bb05bb99639f735abdec9dcf574b4682ebe712d7c2ac85fb3c25b940",
+              "descriptor_sha256": "e6c8355a69677ce11515b361f5e8cd332bc7230d02e4f607a3d26abd27249d67"
+            }
+          }
+        },
+        {
+          "name": "isolated_host",
+          "status": "passed",
+          "facts": {
+            "isolated_data_root": true,
+            "kernel_process_id": 69216,
+            "kernel_image_sha256": "4fbf77bc940909c94a827b5d8d23e6de17cbff5a6ef5ca084960c726027679c6",
+            "host_launcher_image_sha256": "e1420b0d5b02e690009e7309f2f2d242662b3fff9f61f41d71b7afc38916c2b7",
+            "host_supervisor_image_sha256": "e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84",
+            "public_cli_image_sha256": "e305dfe4eee4725e8bcd4dcba29fe2e42cdd99f9f6542bca0ee58e0e14ecf8da",
+            "host_readiness": {
+              "host_epoch": 1,
+              "kernel_lifecycle_state": "running",
+              "module_supervisor_state": "dormant",
+              "child_exit_category": "exited",
+              "child_exit_code": 0,
+              "module_supervisor_image_sha256": "sha256:e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84"
+            },
+            "operator_credential_created": true
+          }
+        },
+        {
+          "name": "manager_admission",
+          "status": "passed",
+          "facts": {
+            "role": "manager",
+            "client_id": "native-qualification-ee9dbbf504f84aa89670d12f370a9231",
+            "credential_created_for_private_run": true,
+            "credential_material_in_receipt": false,
+            "gm_handover": true,
+            "gm_epoch": 1
+          }
+        },
+        {
+          "name": "trusted_descriptor",
+          "status": "passed",
+          "facts": {
+            "module_id": "antigravity",
+            "artifact_id": "eliot-antigravity.rust-headless.1",
+            "version": "5",
+            "registered_revision": 1,
+            "catalog_revision": 1,
+            "protocol": "1.0",
+            "capability_count": 6
+          }
+        },
+        {
+          "name": "route_configuration",
+          "status": "passed",
+          "facts": {
+            "route_alias": "native-prereq-antigravity",
+            "runtime": "antigravity",
+            "artifact_id": "eliot-antigravity.rust-headless.1",
+            "model_id": "gemini-3.8-flash-high",
+            "provider_id": null,
+            "variant": null,
+            "requested_model_ref": null
+          }
+        },
+        {
+          "name": "manager_route_selection",
+          "status": "passed",
+          "facts": {
+            "route_alias": "native-prereq-antigravity",
+            "module_id": "antigravity",
+            "artifact_id": "eliot-antigravity.rust-headless.1",
+            "selected_revision": 2,
+            "scope": "manager_future_bindings_only"
+          }
+        },
+        {
+          "name": "task_create",
+          "status": "passed",
+          "facts": {
+            "task_id": "7751b11b-3125-48e9-b612-5a8533ab921b",
+            "revision": 1,
+            "project_id": "native-qualification-fixture-20261009",
+            "source": "caller_supplied_task_spec"
+          }
+        },
+        {
+          "name": "task_claim",
+          "status": "passed",
+          "facts": {
+            "task_id": "7751b11b-3125-48e9-b612-5a8533ab921b",
+            "attempt_id": "958925fc-d533-4066-b7ea-870a0da2471f",
+            "owner_id": "native-qualification-ee9dbbf504f84aa89670d12f370a9231",
+            "start_owner": "controller"
+          }
+        },
+        {
+          "name": "launcher_preview",
+          "status": "passed",
+          "facts": {
+            "plan_digest": "sha256:52887569cbf2d8d6c2abc1952bf3de2e1bde754b8441c1deb35a5907e3986188",
+            "hard_blocks": [],
+            "attempt_id": "958925fc-d533-4066-b7ea-870a0da2471f",
+            "workspace_policy": "manager_owned_worktree"
+          }
+        },
+        {
+          "name": "module_open_and_hello",
+          "status": "unknown",
+          "code": "LAUNCH_READY_READBACK_TIMEOUT",
+          "facts": {
+            "parent_operation_id": "28516234-0996-4907-8dd4-2087a68a9f22",
+            "dispatch_started": false
+          }
+        }
+      ],
+      "safe_facts": {
+        "host_readiness": {
+          "host_epoch": 1,
+          "kernel_lifecycle_state": "running",
+          "module_supervisor_state": "dormant",
+          "child_exit_category": "exited",
+          "child_exit_code": 0,
+          "module_supervisor_image_sha256": "sha256:e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84"
+        },
+        "route": {
+          "alias": "native-prereq-antigravity",
+          "runtime": "antigravity",
+          "artifact_id": "eliot-antigravity.rust-headless.1",
+          "model_id": "gemini-3.8-flash-high",
+          "provider_id": null,
+          "variant": null,
+          "requested_model_ref": null
+        },
+        "task_id": "7751b11b-3125-48e9-b612-5a8533ab921b",
+        "host_shutdown": {
+          "graceful_eof_sent": true,
+          "kernel_process_id": 69216,
+          "exited": true,
+          "force_terminated": false
+        }
+      }
+    }
+  ],
+  "root_script_sha256": "5a0bff3552758e63e6ada9fd1baae4f6b700db6d2d27417fcd0351428780cf3d",
+  "runner_script_sha256": "f23412d1392c383ff55f725354851df43b2fc7cc00ab210dd45dae8bf7603159",
+  "interpretation": "Use exact per-stage outcomes as recorded. Native configuration, launch, input admission, model consumption and causally bound result are distinct facts. Prior C load/core receipts are not E qualification. No uncertain dispatch was replayed.",
+  "diagnostic_only_final_readback": [
+    {
+      "run_id": "3ca4fb49-8fdd-47e2-a036-37d864d0f267",
+      "bindings": [
+        {
+          "state": "opening",
+          "binding_id": "fed2d191-8a85-40ce-8a0a-b84177672ff5",
+          "generation": 1
+        }
+      ],
+      "binding_observations": [
+        {
+          "binding_id": "fed2d191-8a85-40ce-8a0a-b84177672ff5",
+          "keys": [
+            "execution",
+            "family_completeness",
+            "module_contract_selector",
+            "waiting_for",
+            "module_credential_provision",
+            "module_client_id",
+            "module_supervisor"
+          ],
+          "observation_keys": [
+            "execution",
+            "family_completeness",
+            "module_contract_selector",
+            "waiting_for",
+            "module_credential_provision",
+            "module_client_id",
+            "module_supervisor"
+          ],
+          "module_supervisor": {
+            "phase": "isolated",
+            "module_id": "eliot.opencode.v2",
+            "artifact_id": "eliot-opencode-v2.rust-http.1",
+            "artifact_version": "0.5.0",
+            "error_code": "IO_ERROR"
+          }
+        }
+      ],
+      "launch_readback": [
+        {
+          "operation_id": "4d107509-940a-40a0-9f0c-316b28b0e83d",
+          "keys": [
+            "attempt_action",
+            "attempt_id",
+            "binding",
+            "capability_state",
+            "gaps",
+            "launch_state",
+            "native_effect",
+            "operation_id",
+            "plan_digest",
+            "state",
+            "task_dispatch",
+            "task_id",
+            "task_revision",
+            "workspace_lease",
+            "workspace_manifest_digest"
+          ],
+          "safe": {
+            "state": "queued",
+            "launch_state": "awaiting_binding",
+            "native_effect": "not_observed",
+            "gaps": [
+              "runtime_binding_readback_pending",
+              "scoped_participant_credential_issuance_is_not_available",
+              "native_mcp_capability_readback_is_not_recorded"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "run_id": "ef2f32e1-4dba-4738-b72e-6f4749e79604",
+      "bindings": [
+        {
+          "state": "opening",
+          "binding_id": "b7634133-c49e-42a0-9dc3-f7c8af10d59f",
+          "generation": 1
+        }
+      ],
+      "binding_observations": [
+        {
+          "binding_id": "b7634133-c49e-42a0-9dc3-f7c8af10d59f",
+          "keys": [
+            "execution",
+            "family_completeness",
+            "module_contract_selector",
+            "waiting_for",
+            "module_credential_provision",
+            "module_client_id",
+            "module_supervisor"
+          ],
+          "observation_keys": [
+            "execution",
+            "family_completeness",
+            "module_contract_selector",
+            "waiting_for",
+            "module_credential_provision",
+            "module_client_id",
+            "module_supervisor"
+          ],
+          "module_supervisor": {
+            "phase": "isolated",
+            "module_id": "antigravity",
+            "artifact_id": "eliot-antigravity.rust-headless.1",
+            "artifact_version": "5",
+            "error_code": "IO_ERROR"
+          }
+        }
+      ],
+      "launch_readback": [
+        {
+          "operation_id": "28516234-0996-4907-8dd4-2087a68a9f22",
+          "keys": [
+            "attempt_action",
+            "attempt_id",
+            "binding",
+            "capability_state",
+            "gaps",
+            "launch_state",
+            "native_effect",
+            "operation_id",
+            "plan_digest",
+            "state",
+            "task_dispatch",
+            "task_id",
+            "task_revision",
+            "workspace_lease",
+            "workspace_manifest_digest"
+          ],
+          "safe": {
+            "state": "queued",
+            "launch_state": "awaiting_binding",
+            "native_effect": "not_observed",
+            "gaps": [
+              "runtime_binding_readback_pending",
+              "scoped_participant_credential_issuance_is_not_available",
+              "native_mcp_capability_readback_is_not_recorded"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

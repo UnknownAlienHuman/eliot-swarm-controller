@@ -1,0 +1,64 @@
+{
+  "schema": "eliot.v27_module_startup_repair.v1",
+  "observed_at_utc": "2026-10-10T07:03:23.5064630Z",
+  "prior_candidate": "45bf95be19fc8e4a1af9b3901b9fa2b0b023efb8",
+  "prior_execution": "EXECUTION-RESULTS-E.json",
+  "diagnosis": [
+    "Fresh scope restart budget temporary file was opened before private scope initialization",
+    "The supervisor own validated restart history was subsequently treated as orphan process state"
+  ],
+  "changed_source": {
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+    },
+    "crates/swarm-kernel-host/src/workspace.rs": {
+      "baseline_sha256": "03d1d805b0d49e88e1d22daaac77405b200e03ae26b58692d5daf949edf14549",
+      "current_sha256": "30b0609583f16907486a06d69bd8a5e3af82e779458d86289413b8614722643a"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    },
+    "crates/swarm-supervisor/src/descriptor.rs": {
+      "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+      "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+    },
+    "crates/swarm-supervisor/src/supervisor.rs": {
+      "baseline_sha256": "d81cfef59a1730a7a957d887c923da99c107c2cbb9a9fb27a9cac16efc6aa676",
+      "current_sha256": "a7450f41e7e57e360ec646423732e7afc2e7550aef9db4dee73058af1d9b7fa5"
+    }
+  },
+  "unchanged_baseline_source_count": 403,
+  "logs": {
+    "windows-module-startup-clippy.log": "1901e06c227f1cb7944229c9087ba907a84731d7c22ffad8dcbf0b8188e133fd",
+    "windows-module-startup-tests.log": "370a903f6e0b3d0f4dd56f219de8cd3a71308e3501076fa2bef2226864b26516",
+    "linux-module-startup-clippy.log": "ad244b6deae4c78dfdf7ecae4b7cb44cf78ca762f36757ac6098b4125a27314b",
+    "linux-module-startup-tests.log": "0b0b6dde7e1a00cacfb30c1ad6923de5fb0b93715c714da3d8b89f6f18d2ed52"
+  },
+  "understanding_proof_sha256": "216d0daca96e755b30804b06976ebcaff76303a8beb53da673bbfe68cc8cbdf9",
+  "installed_e_final_diagnostic_sha256": "9185c0d5d0bc47e2aa7d39334cf4bffc36b2c75d6aa5478cc5b123e00864aab8",
+  "review": {
+    "model": "gpt-6-luna",
+    "reasoning_effort": "max",
+    "provider": "openai",
+    "classification": "AuditFindingCandidate",
+    "result": "**PASS** — No introduced custody or replay issue found. `run_lifecycle` prepares the private scope before reading restart history and keeps the prelaunch validation at lines 1213–15 and 1339. The ownerless-state exception permits only `restart-history.json` and validates it through the existing bounded reader and scope checks at lines 2500–11, 2761–83, and 3096–13. Observed symlinks, non-files, oversized or malformed receipts, and foreign scopes fail closed. A launch intent with null helper identity still returns `MODULE_LAUNCH_INTENT_UNKNOWN` at lines 2469–75.\n\nThe six tests cover fresh startup and budget retention, history-only state, orphan entries, foreign scope, null intent, and a non-directory path component.",
+    "output_sha256": "2da9cb19b4b481a8be55f6f0bb761ca18014f10b6004a4b9d06fc509e74e9894",
+    "identity_readback_sha256": "ba8b634344887a3064b611900f1c6765fe9672856aa1b483d92297d082411625",
+    "initial_route": "kilo/stepfun-step-5-preview-free",
+    "initial_failure": "429 Too Many Requests",
+    "source_delivery": "Exact root-supplied diff and bounded source; nested read-only shell was blocked, no tools in resumed review"
+  },
+  "invariants": [
+    "Private hashed scope is prepared and canonicalized before history read/write; existing prelaunch revalidation retained",
+    "Only exact bounded typed scope-matching restart history may exist without owner/launch intent",
+    "Orphan worker, launch plan/result, connection config and unknown entry remain refused",
+    "Null launch intent remains MODULE_LAUNCH_INTENT_UNKNOWN; no presumed owner departure",
+    "No native process or model input in regression fixtures; exhausted budget retained",
+    "E outcomes are historical and never replayed"
+  ],
+  "production_clippy": "Fresh affected supervisor library+binaries strict Windows/Linux PASS; unchanged 24-package baseline retained",
+  "regression": "Six actual lifecycle/custody regressions PASS on each platform; fresh scope reaches intentionally absent executable gate, plus valid budget, orphan entries, foreign budget, null launch intent and unsafe component",
+  "installed_verification": "Fresh F candidate pending; E workspace and binding creation succeeded but modules isolated with IO_ERROR before dispatch"
+}

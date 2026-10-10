@@ -1208,7 +1208,12 @@ impl Service {
 
     async fn run_lifecycle(self: Arc<Self>) {
         let policy = self.descriptor.restart;
-        let mut starts = match self.read_restart_history() {
+        // A fresh binding has no scope directory yet. Verify/create the private
+        // path before either reading its history or persisting the first budget.
+        let mut starts = match self
+            .prepare_state_dir()
+            .and_then(|()| self.read_restart_history())
+        {
             Ok(starts) => starts,
             Err(error) => {
                 self.record_failure(
@@ -2493,11 +2498,16 @@ impl Service {
         let owner_path = self.state_dir.join("owner.json");
         let mut prior_owner = read_owner_receipt_optional(&owner_path)?;
         if attempted_helper.is_none() && prior_owner.is_none() {
-            if fs::read_dir(&self.state_dir)?.next().transpose()?.is_some() {
-                return Err(Error::new(
-                    "MODULE_OWNER_IDENTITY_MISSING",
-                    "module state exists without its prior owner receipt; no process was started",
-                ));
+            for entry in fs::read_dir(&self.state_dir)? {
+                if entry?.file_name() != "restart-history.json" {
+                    return Err(Error::new(
+                        "MODULE_OWNER_IDENTITY_MISSING",
+                        "module state exists without its prior owner receipt; no process was started",
+                    ));
+                }
+                // Accounting is written before any launch intent. It is not
+                // process custody; accept only its exact validated shape/scope.
+                self.read_restart_history()?;
             }
             return Ok(None);
         }
@@ -3259,6 +3269,216 @@ fn unix_time_ms() -> Result<u64> {
             "system clock exceeds the restart timestamp range",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoResolver;
+
+    impl ProtectedResolver for NoResolver {
+        fn resolver_map_path(&self, _: &ProtectedResolverContext) -> Result<PathBuf> {
+            panic!("startup fixtures must stop before resolver or process creation")
+        }
+    }
+
+    struct StartupFixture {
+        root: PathBuf,
+        service: Arc<Service>,
+    }
+
+    impl StartupFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("swarm-startup-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            swarm_process::private_permissions(&root, true).unwrap();
+            let descriptor: ModuleDescriptor = serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "module_id": "fixture",
+                "artifact": {"artifact_id": "fixture.adapter", "version": "1"},
+                "launch": {
+                    "executable": root.join("missing-adapter"),
+                    "executable_sha256": "11".repeat(32)
+                },
+                "protocol": {
+                    "minimum": {"major": 1, "minor": 0},
+                    "maximum": {"major": 1, "minor": 0}
+                },
+                "lifecycle": "owned_service",
+                "activation": "on_demand",
+                "enabled": true
+            }))
+            .unwrap();
+            let mut descriptor = descriptor;
+            descriptor.restart.max_starts = 1;
+            descriptor.validate().unwrap();
+            let scope = ServiceScope {
+                binding_id: Uuid::new_v4().to_string(),
+                generation: 1,
+            };
+            let (admission, _) = watch::channel(AdmissionState::Open);
+            let service = Arc::new(Service::new(ServiceInitialization {
+                state_dir: service_state_dir(&root, &descriptor, &scope).unwrap(),
+                state_root: root.clone(),
+                host_data_dir: root.clone(),
+                descriptor: Arc::new(descriptor),
+                descriptor_fingerprint: "22".repeat(32),
+                scope,
+                ipc: IpcConfig::default(),
+                launch_config: BindingLaunchConfig::default(),
+                module_client_id: "fixture.client".to_owned(),
+                protocol: ProtocolVersion { major: 1, minor: 0 },
+                module_contract_json: "{}".to_owned(),
+                owner_executable: ModuleOwnerExecutable {
+                    path: root.join("missing-owner"),
+                    sha256: crate::Sha256Digest::new("33".repeat(32)).unwrap(),
+                },
+                resolver: Arc::new(NoResolver),
+                admission,
+                demand_gate: Arc::new(AsyncMutex::new(())),
+            }));
+            Self { root, service }
+        }
+    }
+
+    impl Drop for StartupFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_fresh_scope_reaches_executable_gate_and_retains_budget() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        assert!(!service.state_dir.exists());
+        lock(&service.demands).insert("fixture-demand".to_owned(), 1);
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        let status = service.current_status();
+        assert_eq!(
+            status.last_failure.unwrap().code,
+            "MODULE_EXECUTABLE_UNAVAILABLE"
+        );
+        assert!(status.restart.exhausted);
+        assert_eq!(service.read_restart_history().unwrap().len(), 1);
+        assert!(
+            service
+                .wait_for_prior_owner_to_depart()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!service.state_dir.join("launch-attempt.json").exists());
+        assert!(!service.state_dir.join("owner.json").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_valid_budget_alone_does_not_invent_prior_owner() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        service.prepare_state_dir().unwrap();
+        service
+            .write_restart_history(&VecDeque::from([unix_time_ms().unwrap()]))
+            .unwrap();
+        assert!(
+            service
+                .wait_for_prior_owner_to_depart()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_orphan_receipts_and_unknown_entries_remain_closed() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        service.prepare_state_dir().unwrap();
+        service.write_restart_history(&VecDeque::new()).unwrap();
+        for name in [
+            "worker.json",
+            "launch-result.json",
+            "launch-orphan.json",
+            "module-host-connection.json",
+            "unknown",
+        ] {
+            let path = service.state_dir.join(name);
+            fs::write(&path, b"{}").unwrap();
+            assert_eq!(
+                service
+                    .wait_for_prior_owner_to_depart()
+                    .await
+                    .unwrap_err()
+                    .code,
+                "MODULE_OWNER_IDENTITY_MISSING"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_budget_from_another_scope_remains_closed() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        service.prepare_state_dir().unwrap();
+        service.write_restart_history(&VecDeque::new()).unwrap();
+        let path = service.state_dir.join("restart-history.json");
+        let mut history: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        history["scope"]["generation"] = serde_json::json!(2);
+        fs::write(path, serde_json::to_vec(&history).unwrap()).unwrap();
+        assert_eq!(
+            service
+                .wait_for_prior_owner_to_depart()
+                .await
+                .unwrap_err()
+                .code,
+            "MODULE_RESTART_HISTORY_INVALID"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_launch_intent_without_helper_identity_remains_unknown() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        service.prepare_state_dir().unwrap();
+        service.write_restart_history(&VecDeque::new()).unwrap();
+        service
+            .write_launch_attempt(&Uuid::new_v4().to_string(), None)
+            .unwrap();
+        assert_eq!(
+            service
+                .wait_for_prior_owner_to_depart()
+                .await
+                .unwrap_err()
+                .code,
+            "MODULE_LAUNCH_INTENT_UNKNOWN"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_non_directory_scope_component_is_refused_before_accounting() {
+        let fixture = StartupFixture::new();
+        let service = &fixture.service;
+        let first = service
+            .state_dir
+            .strip_prefix(&fixture.root)
+            .unwrap()
+            .components()
+            .next()
+            .unwrap();
+        fs::write(fixture.root.join(first), b"foreign").unwrap();
+        lock(&service.demands).insert("fixture-demand".to_owned(), 1);
+        service.clone().run_lifecycle().await;
+        assert_eq!(
+            service.current_status().last_failure.unwrap().code,
+            "MODULE_STATE_PATH_UNSAFE"
+        );
+        assert!(!service.state_dir.exists());
+    }
 }
 
 fn prune_starts(starts: &mut VecDeque<u64>, window_ms: u64, now_ms: u64) {
