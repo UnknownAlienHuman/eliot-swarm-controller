@@ -406,6 +406,84 @@ fn assignment_observation(db: &Connection, assignment_id: &str) -> Result<Value>
     Ok(record)
 }
 
+/// Restore the assigned reviewer's exact Operation receipt relation without
+/// widening Participant access to other Operations on the same Task. The
+/// assignment Operation may use retained historical scope; its applied
+/// submission remains readable only while the review scope is current.
+pub(super) fn authorize_assigned_reviewer_operation_read(
+    db: &Connection,
+    principal: &Principal,
+    operation: &super::object_scope::OperationRow,
+) -> Result<bool> {
+    if principal.role != Role::Participant
+        || !matches!(operation.method.as_str(), "review.assign" | "task.submit")
+    {
+        return Ok(false);
+    }
+    let Some(registration) = super::meta(db, &format!("client:{}", principal.client_id))? else {
+        return Ok(false);
+    };
+    if registration["role"] != "participant"
+        || registration["disabled"] == true
+        || registration["participation_basis"]["kind"] != "sponsored_reviewer"
+    {
+        return Ok(false);
+    }
+    let Some(assignment_id) = registration["participation_basis"]["review_scope"]
+        .get("review_assignment_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+    else {
+        return Ok(false);
+    };
+    let assignment = assignment_observation(db, assignment_id)?;
+    if assignment["reviewer_client_id"].as_str() != Some(principal.client_id.as_str()) {
+        return Ok(false);
+    }
+    let identity: ReviewSlotIdentity = serde_json::from_value(assignment["identity"].clone())?;
+    let result: Value = operation
+        .result_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or(Value::Null);
+
+    let exact_assignment_operation = operation.method == "review.assign"
+        && operation.state == "settled"
+        && assignment["operation_id"].as_str() == Some(operation.operation_id.as_str())
+        && operation.task_id.as_deref() == Some(identity.task_id.as_str())
+        && operation.attempt_id.as_deref() == Some(identity.attempt_id.as_str())
+        && result["operation_id"].as_str() == Some(operation.operation_id.as_str())
+        && result["review_assignment_id"].as_str() == Some(assignment_id)
+        && result["identity"] == assignment["identity"];
+
+    let exact_applied_submission = if operation.method == "task.submit"
+        && operation.state == "settled"
+        && operation.task_id.as_deref() == Some(identity.task_id.as_str())
+        && operation.attempt_id.as_deref() == Some(identity.attempt_id.as_str())
+        && result["operation_id"].as_str() == Some(operation.operation_id.as_str())
+        && result["attempt_id"].as_str() == Some(identity.attempt_id.as_str())
+        && result["outcome"] == "applied"
+        && result["submission_ref"].as_str() == Some(identity.submission_ref.as_str())
+        && result["candidate_ref"].as_str() == Some(identity.candidate_ref.as_str())
+    {
+        let document = submissions::document(db, &identity.submission_ref)?;
+        document["operation_id"].as_str() == Some(operation.operation_id.as_str())
+            && document["task_id"].as_str() == Some(identity.task_id.as_str())
+            && document["attempt_id"].as_str() == Some(identity.attempt_id.as_str())
+            && document["task_revision"] == identity.task_revision
+            && document["candidate_ref"].as_str() == Some(identity.candidate_ref.as_str())
+    } else {
+        false
+    };
+
+    if !exact_assignment_operation && !exact_applied_submission {
+        return Ok(false);
+    }
+    authorize_assignment_read(db, principal, &assignment, exact_assignment_operation)?;
+    Ok(true)
+}
+
 fn result_observation(db: &Connection, assignment_id: &str) -> Result<Option<Value>> {
     let key = format!("result:{assignment_id}");
     let raw: Option<(String, String)> = db

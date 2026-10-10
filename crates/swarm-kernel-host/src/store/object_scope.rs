@@ -28,6 +28,10 @@ use crate::model::{self, Principal, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+#[path = "object_scope_review_tests.rs"]
+mod assigned_reviewer_operation_tests;
+
 /// Exact Task graph identity, loaded from a retained object.
 ///
 /// `project_id`/`task_id` are always present so an unclaimed Task keeps a resolvable
@@ -89,6 +93,7 @@ pub(crate) enum OperationReadBasis {
     LocalOperator,
     ExactCaller,
     RetainedAttemptOwner,
+    RetainedAssignedReviewer,
     CurrentTaskManager,
     CurrentGmTaskScope,
     OnBehalfLink,
@@ -878,6 +883,16 @@ pub(crate) fn resolve_operation_read(
     // absent or damaged. This relation never grants diagnostic attachments.
     if operation.caller_id == principal.client_id {
         return Ok(Some(granted_receipt(OperationReadBasis::ExactCaller)));
+    }
+    match super::reviews::authorize_assigned_reviewer_operation_read(db, principal, &operation) {
+        Ok(true) => {
+            return Ok(Some(granted_receipt(
+                OperationReadBasis::RetainedAssignedReviewer,
+            )));
+        }
+        Ok(false) => {}
+        Err(error) if known_scope_denial(&error) => {}
+        Err(error) => return Err(error),
     }
     let identity = operation_task_identity(db, &operation)?;
     if retained_launch_attempt_owner(db, principal, &operation, identity.as_ref())? {
