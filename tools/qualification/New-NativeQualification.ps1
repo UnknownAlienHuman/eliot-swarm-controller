@@ -482,7 +482,7 @@ function New-PrivateRunDirectory {
         }
         catch [System.IO.IOException] { Stop-Qualification 'RUN_ID_NOT_FRESH' }
         if (Test-Path -LiteralPath $path) { Stop-Qualification 'RUN_DIRECTORY_ALREADY_EXISTS' }
-        [void][System.IO.Directory]::CreateDirectory($path, $security)
+        [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path)
         [void](Assert-NoReparseTraversal $path)
         $script:RunDirectory = $path
         $script:RequestDirectory = Join-Path $path 'requests'
@@ -558,14 +558,56 @@ function New-RequestId {
 function Get-SafeErrorCode {
     param([AllowNull()][string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return 'CLI_EXIT' }
-    try {
-        $value = $Text | ConvertFrom-Json -AsHashtable -Depth 16
-        $code = $value.error.data.code
-        if ([string]::IsNullOrWhiteSpace($code)) { $code = $value.error.code }
-        if ($code -is [string] -and $code -match '\A[A-Z0-9_]{1,64}\z') { return $code }
+    foreach ($line in $Text -split "`n") {
+        try {
+            $value = $line | ConvertFrom-Json -AsHashtable -Depth 16
+            if ($value -isnot [Collections.IDictionary] -or $value['error'] -isnot [Collections.IDictionary]) { continue }
+            $errorValue = $value['error']
+            $code = if ($errorValue['data'] -is [Collections.IDictionary]) { $errorValue['data']['code'] } else { $null }
+            if ([string]::IsNullOrWhiteSpace([string]$code)) { $code = $errorValue['code'] }
+            if ($code -is [string] -and $code -cmatch '\A[A-Z0-9_]{1,64}\z') { return $code }
+        } catch { }
     }
-    catch { }
     return 'CLI_EXIT'
+}
+
+function New-NativeCaptureState {
+    if (-not ('Eliot.NativeQualification.BoundedOutput' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+namespace Eliot.NativeQualification {
+    public sealed class BoundedOutput {
+        public readonly StringBuilder Stdout = new StringBuilder();
+        public readonly StringBuilder Stderr = new StringBuilder();
+        public readonly object Sync = new object();
+        public bool Overflow;
+        public bool ReadFailed;
+        private readonly int maximum;
+        public BoundedOutput(int maximum) { this.maximum = maximum; }
+        public async Task DrainAsync(StreamReader reader, bool stdout) {
+            var buffer = new char[4096];
+            var target = stdout ? Stdout : Stderr;
+            while (true) {
+                int count;
+                try { count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false); }
+                catch (ObjectDisposedException) { lock (Sync) { ReadFailed = true; } return; }
+                catch (IOException) { lock (Sync) { ReadFailed = true; } return; }
+                if (count == 0) return;
+                lock (Sync) {
+                    int take = Math.Min(count, Math.Max(0, maximum - target.Length));
+                    if (take > 0) target.Append(buffer, 0, take);
+                    if (take < count) Overflow = true;
+                }
+            }
+        }
+    }
+}
+'@
+    }
+    return [Eliot.NativeQualification.BoundedOutput]::new(1MB)
 }
 
 function Invoke-SwarmProcess {
@@ -587,35 +629,67 @@ function Invoke-SwarmProcess {
     foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add([string]$argument) }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $start
+    $processStarted = $false
+    $processId = $null
+    $stdoutDrain = $null
+    $stderrDrain = $null
     try {
         if (-not $process.Start()) { return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_START_FAILED'; stdout = $null; process_id = $null } }
+        $processStarted = $true
         $processId = $process.Id
         if ($HostProcess) {
             $stdoutDrain = $process.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
             $stderrDrain = $process.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
             return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = $null; stdout = $null; process_id = $processId; process = $process; stdout_drain = $stdoutDrain; stderr_drain = $stderrDrain }
         }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $capture = New-NativeCaptureState
+        $drainTasks = [System.Threading.Tasks.Task[]]@(
+            $capture.DrainAsync($process.StandardOutput, $true),
+            $capture.DrainAsync($process.StandardError, $false)
+        )
         $completed = $process.WaitForExit($TimeoutMilliseconds)
         if (-not $completed) {
             $script:PublicCliProcessIdsPending.Add($processId)
             return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'; stdout = $null; process_id = $processId }
         }
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        if ($stdout.Length -gt $script:MaxCliOutputCharacters) {
+        if (-not [System.Threading.Tasks.Task]::WaitAll($drainTasks, 1000)) {
+            return [pscustomobject]@{ started = $true; completed = $true; exit_code = $process.ExitCode; error_code = 'CLI_OUTPUT_DRAIN_PENDING'; stdout = $null; process_id = $processId }
+        }
+        if ($capture.ReadFailed) {
+            return [pscustomobject]@{ started = $true; completed = $true; exit_code = $process.ExitCode; error_code = 'PROCESS_IO_FAILED'; stdout = $null; process_id = $processId }
+        }
+        [System.Threading.Monitor]::Enter($capture.Sync)
+        try {
+            $stdout = $capture.Stdout.ToString()
+            $stderr = $capture.Stderr.ToString()
+            $overflow = [bool]$capture.Overflow
+        }
+        finally { [System.Threading.Monitor]::Exit($capture.Sync) }
+        if ($overflow) {
             return [pscustomobject]@{ started = $true; completed = $true; exit_code = $process.ExitCode; error_code = 'CLI_OUTPUT_LIMIT'; stdout = $null; process_id = $processId }
         }
         $safeCode = if ($process.ExitCode -eq 0) { $null } else { Get-SafeErrorCode $stderr }
         return [pscustomobject]@{ started = $true; completed = $true; exit_code = $process.ExitCode; error_code = $safeCode; stdout = $stdout; process_id = $processId }
     }
     catch {
+        if ($processStarted) {
+            $stillRunning = $true
+            try { $stillRunning = -not $process.HasExited } catch { }
+            if ($stillRunning -and $HostProcess) {
+                return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = $null; process_id = $processId; process = $process; stdout_drain = $stdoutDrain; stderr_drain = $stderrDrain }
+            }
+            if ($stillRunning) {
+                if ($null -ne $processId -and -not $script:PublicCliProcessIdsPending.Contains($processId)) { $script:PublicCliProcessIdsPending.Add($processId) }
+                return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'; stdout = $null; process_id = $processId }
+            }
+            return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = $null; process_id = $processId }
+        }
         return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = $null; process_id = $null }
     }
     finally {
-        if (-not $HostProcess -or $process.HasExited) { $process.Dispose() }
+        $disposeProcess = -not $HostProcess -or -not $processStarted
+        if (-not $disposeProcess) { try { $disposeProcess = $process.HasExited } catch { } }
+        if ($disposeProcess) { $process.Dispose() }
     }
 }
 
@@ -1175,10 +1249,13 @@ function Get-Operations {
         $call = Invoke-ManagerCall -Method 'operation.list' -Params ([ordered]@{ after = $after; limit = 50 }) -TimeoutMilliseconds $TimeoutMilliseconds
         if (-not $call.completed -or $call.exit_code -ne 0 -or $null -eq $call.value) { return [pscustomobject]@{ success = $false; code = $call.error_code; items = @() } }
         foreach ($item in $call.value.items) { $all.Add($item) }
+        if ($call.value['coverage_complete'] -ne $true -or $call.value['has_newer'] -isnot [bool]) {
+            return [pscustomobject]@{ success = $false; code = 'OPERATION_COVERAGE_INCOMPLETE'; items = @() }
+        }
+        if ($call.value['has_newer'] -eq $false) { return [pscustomobject]@{ success = $true; code = $null; items = @($all.ToArray()) } }
         $next = $call.value.next_after
-        if ($null -eq $next) { return [pscustomobject]@{ success = $true; code = $null; items = @($all.ToArray()) } }
-        if ([int]$next -le $after) { return [pscustomobject]@{ success = $false; code = 'OPERATION_CURSOR_INVALID'; items = @() } }
-        $after = [int]$next
+        if ($null -eq $next -or [long]$next -le $after) { return [pscustomobject]@{ success = $false; code = 'OPERATION_CURSOR_INVALID'; items = @() } }
+        $after = [long]$next
     }
     return [pscustomobject]@{ success = $false; code = 'OPERATION_PAGE_LIMIT'; items = @() }
 }
@@ -1374,6 +1451,7 @@ try {
     $script:HostProcessId = [int]$hostStart.process_id
     $script:HostOutputDrainTasks = @($hostStart.stdout_drain, $hostStart.stderr_drain)
     $script:HostInputOpen = $true
+    if ($hostStart.error_code) { Stop-Qualification $hostStart.error_code }
     $script:OperatorCredentialPath = Join-Path $script:StateDirectory 'operator.json'
     $hostReady = $false
     $readinessCode = 'HOST_NOT_READY'
@@ -1445,7 +1523,16 @@ try {
     $managerCredential = Read-JsonFile $script:ManagerCredentialPath
     if ($managerCredential.client_id -ne $managerId -or [string]::IsNullOrWhiteSpace([string]$managerCredential.token)) { Stop-Qualification 'MANAGER_CREDENTIAL_INVALID' }
     $script:Report.safe_facts.manager_client_id = $managerId
-    Add-Stage -Name 'manager_admission' -Status 'passed' -Facts ([ordered]@{ role = 'manager'; client_id = $managerId; credential_created_for_private_run = $true; credential_material_in_receipt = $false; gm_handover = $false })
+    $handover = Invoke-ApplicationCall -CredentialPath $script:OperatorCredentialPath -Method 'gm.handover' -Params ([ordered]@{ client_request_id = 'native-gm:' + [Guid]::NewGuid().ToString('N'); client_id = $managerId }) -TimeoutMilliseconds 30000
+    if (-not $handover.completed -or $handover.exit_code -ne 0 -or $null -eq $handover.value) {
+        Add-Stage -Name 'manager_admission' -Status 'unknown' -Code $(if ($handover.error_code) { $handover.error_code } else { 'GM_DESIGNATION_UNKNOWN' })
+        Stop-Qualification 'GM_DESIGNATION_UNKNOWN'
+    }
+    $managerStatus = Invoke-ManagerCall -Method 'host.status' -Params ([ordered]@{})
+    if (-not $managerStatus.completed -or $managerStatus.exit_code -ne 0 -or $null -eq $managerStatus.value -or $managerStatus.value['gm'] -isnot [Collections.IDictionary] -or
+        $managerStatus.value.gm['state'] -cne 'current' -or $managerStatus.value.gm['client_id'] -cne $managerId -or
+        $managerStatus.value.gm['epoch'] -ne $handover.value['gm_epoch'] -or $managerStatus.value.gm['epoch'] -le 0) { Stop-Qualification 'GM_DESIGNATION_READBACK_MISMATCH' }
+    Add-Stage -Name 'manager_admission' -Status 'passed' -Facts ([ordered]@{ role = 'manager'; client_id = $managerId; credential_created_for_private_run = $true; credential_material_in_receipt = $false; gm_handover = $true; gm_epoch = [long]$managerStatus.value.gm['epoch'] })
 
     $script:CurrentStage = 'trusted_descriptor'
     $catalog = $null

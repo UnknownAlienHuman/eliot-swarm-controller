@@ -1,6 +1,6 @@
 # V27 candidate qualification
 
-Status: execution in progress. The initial connected production-only warnings-denied Clippy gate passed for all 24 owned packages. Tests exposed stale fixture contracts; those are being migrated to the current APIs. The subsequent Concilium admission repair passed scoped production Clippy before further tests. This plan uses the actual checkout after upstream TaskPrompt PR #107; historical audit verdicts are not qualification results.
+Status, 2026-10-10: final public harness repair and native execution in progress. Strict production Clippy passed for all 24 owned packages on Windows and Linux, with 408 matching source hashes. Host fixture coverage is a retained per-case union (Windows 371 PASS / 1 ignored; Linux 385 PASS / 1 ignored), rather than a new full run on the delivery SHA. The five MCP fixture gaps have exact retained PASS evidence on both platforms. Full installed native results, public fault qualification and the full current host-load contour remain open. This plan uses the actual checkout after upstream TaskPrompt PR #107; historical audit verdicts are not qualification results.
 
 ## Connected source gate
 

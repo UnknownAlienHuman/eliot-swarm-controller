@@ -41,7 +41,6 @@ import math
 import os
 import platform
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -314,7 +313,8 @@ async def run(args):
     host_log_path = data_dir.rstrip(os.sep) + ".host-stderr.log"
     host_log = open(host_log_path, "wb")
     host = subprocess.Popen(
-        [host_executable, "--data-dir", data_dir, "host"],
+        [host_executable, "--data-dir", data_dir, "host", "--stop-on-stdin-eof"],
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=host_log,
     )
@@ -578,30 +578,28 @@ async def run(args):
         return result
     finally:
         if host.poll() is None:
-            if os.name == "nt":
-                # This fixture host owns no native agents or checks. Terminate
-                # only the Popen process created above; never a shared host.
-                host.terminate()
-                result["shutdown_disposition"] = "owned_fixture_host_terminated"
-            else:
-                host.send_signal(signal.SIGINT)
-                result["shutdown_disposition"] = "owned_fixture_host_sigint"
+            # The public host EOF mode shuts down this exact fixture normally.
+            # Retain any process that outlives the bound and its private state.
+            host.stdin.close()
+            result["shutdown_disposition"] = "owned_fixture_host_stdin_eof"
             try:
                 host.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                host.kill()
-                host.wait(timeout=5)
+                result["shutdown_disposition"] = "owned_fixture_host_stop_pending"
+                result["pending_host_pid"] = host.pid
+        else:
+            result["shutdown_disposition"] = "owned_fixture_host_already_exited"
         host_log.close()
         result["host_exit_code"] = host.returncode
-        if not args.keep_data_dir and not args.data_dir:
+        if host.returncode is None or args.keep_data_dir:
+            result["data_dir"] = data_dir
+            result["host_log"] = host_log_path
+        elif not args.data_dir:
             shutil.rmtree(data_dir, ignore_errors=True)
             try:
                 os.unlink(host_log_path)
             except OSError:
                 pass
-        elif args.keep_data_dir:
-            result["data_dir"] = data_dir
-            result["host_log"] = host_log_path
 
 
 def main():
@@ -653,6 +651,9 @@ def main():
             fh.write(text + "\n")
     if not result["verification_drain"]["matches_admissions"]:
         print("MISMATCH: drained message.send events != admitted sends", file=sys.stderr)
+        return 1
+    if result["host_exit_code"] != 0:
+        print("Host did not confirm clean shutdown; retain its state and receipt", file=sys.stderr)
         return 1
     return 0
 

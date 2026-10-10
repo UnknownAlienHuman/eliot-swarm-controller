@@ -2,9 +2,13 @@
 
 Date: 2026-10-09. Source baseline: `953efa153cded25f5649719f2aa194182dc3e57f`.
 
-Integration baseline: `88264832b7cde56b917728830666f27b29fc515e`. Upstream TaskPrompt PR #107 was merged at `9952374`; connected host and adapter repairs are committed through `85189dd`. Command ACP passed the connected production Clippy gate and its Rust package tests. The final candidate has not been pushed or qualified by the full execution suite.
+Integration baseline: `88264832b7cde56b917728830666f27b29fc515e`. Upstream TaskPrompt PR #107 was merged at `9952374`; connected production repairs are committed through `d5ed429`, with installer and verifier follow-ups through `f77c3b3`. The candidate has not yet been pushed or accepted for full native results.
 
 Status: finite current-source HIGH audit closed with explicit evidence gaps; execution qualification and resulting repairs in progress. This ledger does not claim release qualification.
+
+Current evidence, 2026-10-10: strict production Clippy passed for 24 owned packages on Windows and Linux; all 408 recorded source hashes match. The host fixture ledger is the union of the initial full runs and subsequent affected cohorts: Windows 371 PASS / 1 ignored across 372 current cases; Linux 385 PASS / 1 ignored across 386 cases, with no unresolved named failures. This is not a new full run on the delivery SHA. HIGH-0418/0419/0420/0421/0431 now retain exact MCP fixture PASS lines and log hashes for both platforms; their historical verdicts remain unchanged. HIGH-0362 retains its original UNKNOWN and pending scope.
+
+The genuine installer chain completed for `c8a2469` and `f77c3b3`, including the locked OpenCode resource closure and participant MCP. Qualification repairs address private-directory ACL creation, bounded native process output, safe CLI error parsing, explicit isolated GM designation, current public pagination and owned-host EOF shutdown. A small actual Windows load-verifier run retained 114 admitted and 114 drained events with host exit 0; it establishes the shutdown seam only. Full host-load and the one-dispatch-per-adapter native runs remain pending. Earlier receipts and failures are preserved.
 
 The manager fetched `origin`, verified a clean checkout, and fast-forwarded `main` from `40591a2` to this baseline. The initial GitHub inventory listed 37 open PRs and 8 open Issues; documentation-only PR #106 appeared in a subsequent check. Documentation handoffs are implementation instructions, not delivered production code.
 

@@ -325,7 +325,7 @@ function New-PrivateDirectory {
         [System.Security.AccessControl.AccessControlType]::Allow
     )
     [void]$security.AddAccessRule($rule)
-    [void][System.IO.Directory]::CreateDirectory($Path, $security)
+    [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $Path)
     [void](Assert-SafeAbsolutePath -Path $Path -MustExist -Directory)
 }
 
@@ -350,39 +350,56 @@ function Add-Scenario {
 function Get-SafeErrorCode {
     param([AllowNull()][string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return 'CLI_EXIT' }
-    try {
-        $value = $Text | ConvertFrom-Json -AsHashtable -Depth 16
-        $code = $value.error.data.code
-        if ([string]::IsNullOrWhiteSpace([string]$code)) { $code = $value.error.code }
-        if ($code -is [string] -and $code -match '\A[A-Z0-9_]{1,64}\z') { return $code }
+    foreach ($line in $Text -split "`n") {
+        try {
+            $value = $line | ConvertFrom-Json -AsHashtable -Depth 16
+            if ($value -isnot [Collections.IDictionary] -or $value['error'] -isnot [Collections.IDictionary]) { continue }
+            $errorValue = $value['error']
+            $code = if ($errorValue['data'] -is [Collections.IDictionary]) { $errorValue['data']['code'] } else { $null }
+            if ([string]::IsNullOrWhiteSpace([string]$code)) { $code = $errorValue['code'] }
+            if ($code -is [string] -and $code -cmatch '\A[A-Z0-9_]{1,64}\z') { return $code }
+        } catch { }
     }
-    catch { }
     return 'CLI_EXIT'
 }
 
 function New-CaptureState {
-    return [pscustomobject]@{
-        stdout = [System.Text.StringBuilder]::new()
-        stderr = [System.Text.StringBuilder]::new()
-        sync = [object]::new()
-        overflow = $false
+    if (-not ('Eliot.Qualification.BoundedOutput' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+namespace Eliot.Qualification {
+    public sealed class BoundedOutput {
+        public readonly StringBuilder Stdout = new StringBuilder();
+        public readonly StringBuilder Stderr = new StringBuilder();
+        public readonly object Sync = new object();
+        public bool Overflow;
+        public bool ReadFailed;
+        private readonly int maximum;
+        public BoundedOutput(int maximum) { this.maximum = maximum; }
+        public async Task DrainAsync(StreamReader reader, bool stdout) {
+            var buffer = new char[4096];
+            var target = stdout ? Stdout : Stderr;
+            while (true) {
+                int count;
+                try { count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false); }
+                catch (ObjectDisposedException) { lock (Sync) { ReadFailed = true; } return; }
+                catch (IOException) { lock (Sync) { ReadFailed = true; } return; }
+                if (count == 0) return;
+                lock (Sync) {
+                    int take = Math.Min(count, Math.Max(0, maximum - target.Length));
+                    if (take > 0) target.Append(buffer, 0, take);
+                    if (take < count) Overflow = true;
+                }
+            }
+        }
     }
 }
-
-function Add-CapturedLine {
-    param([Parameter(Mandatory)] $State, [Parameter(Mandatory)][string] $StreamName, [AllowNull()][string] $Line)
-    if ($null -eq $Line) { return }
-    [System.Threading.Monitor]::Enter($State.sync)
-    try {
-        $buffer = $State.$StreamName
-        $remaining = $script:MaxCliOutputCharacters - $buffer.Length
-        if ($remaining -le 0) { $State.overflow = $true; return }
-        $take = [Math]::Min($remaining, $Line.Length + 1)
-        if ($take -lt $Line.Length + 1) { $State.overflow = $true }
-        if ($take -gt 1) { [void]$buffer.Append($Line.Substring(0, [Math]::Min($Line.Length, $take - 1))) }
-        [void]$buffer.Append("`n")
+'@
     }
-    finally { [System.Threading.Monitor]::Exit($State.sync) }
+    return [Eliot.Qualification.BoundedOutput]::new($script:MaxCliOutputCharacters)
 }
 
 function Start-BoundedProcess {
@@ -400,21 +417,26 @@ function Start-BoundedProcess {
     $capture = New-CaptureState
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $start
-    $outHandler = [System.Diagnostics.DataReceivedEventHandler]{ param($sender, $eventArgs) Add-CapturedLine -State $capture -StreamName 'stdout' -Line $eventArgs.Data }.GetNewClosure()
-    $errHandler = [System.Diagnostics.DataReceivedEventHandler]{ param($sender, $eventArgs) Add-CapturedLine -State $capture -StreamName 'stderr' -Line $eventArgs.Data }.GetNewClosure()
-    $process.add_OutputDataReceived($outHandler)
-    $process.add_ErrorDataReceived($errHandler)
+    $processId = $null
+    $processStarted = $false
+    $drainTasks = [System.Threading.Tasks.Task[]]@()
     try {
-        if (-not $process.Start()) { return [pscustomobject]@{ started = $false; completed = $true; error_code = 'PROCESS_START_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $null; overflow = $false } }
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
-        if ($LongLived) { return [pscustomobject]@{ started = $true; completed = $false; error_code = $null; stdout = ''; stderr = ''; process = $process; process_id = $process.Id; overflow = $false } }
+        if (-not $process.Start()) { return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_START_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $null; overflow = $false } }
+        $processStarted = $true
+        $processId = [int]$process.Id
+        $drainTasks = [System.Threading.Tasks.Task[]]@($capture.DrainAsync($process.StandardOutput, $true), $capture.DrainAsync($process.StandardError, $false))
+        if ($LongLived) { return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = $null; stdout = ''; stderr = ''; process = $process; process_id = $processId; overflow = $false; capture = $capture; drain_tasks = $drainTasks } }
         $completed = $process.WaitForExit($TimeoutMilliseconds)
         if (-not $completed) {
-            $script:PendingPublicCliPids.Add([int]$process.Id)
-            return [pscustomobject]@{ started = $true; completed = $false; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'; stdout = ''; stderr = ''; process = $null; process_id = $process.Id; overflow = $false }
+            $script:PendingPublicCliPids.Add($processId)
+            return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'; stdout = ''; stderr = ''; process = $null; process_id = $processId; overflow = $false }
         }
-        $process.WaitForExit()
+        if (-not [System.Threading.Tasks.Task]::WaitAll($drainTasks, 1000)) {
+            return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'CLI_OUTPUT_DRAIN_PENDING'; stdout = ''; stderr = ''; process = $null; process_id = $processId; overflow = $false }
+        }
+        if ($capture.ReadFailed) {
+            return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $processId; overflow = $false }
+        }
         [System.Threading.Monitor]::Enter($capture.sync)
         try {
             $stdout = $capture.stdout.ToString()
@@ -422,45 +444,67 @@ function Start-BoundedProcess {
             $overflow = [bool]$capture.overflow
         }
         finally { [System.Threading.Monitor]::Exit($capture.sync) }
-        return [pscustomobject]@{ started = $true; completed = $true; exit_code = $process.ExitCode; error_code = $(if ($process.ExitCode -eq 0) { $null } else { Get-SafeErrorCode $stderr }); stdout = $stdout; stderr = $stderr; process = $null; process_id = $process.Id; overflow = $overflow }
+        return [pscustomobject]@{ started = $true; completed = $true; exit_code = $process.ExitCode; error_code = $(if ($process.ExitCode -eq 0) { $null } else { Get-SafeErrorCode $stderr }); stdout = $stdout; stderr = $stderr; process = $null; process_id = $processId; overflow = $overflow }
     }
     catch {
-        return [pscustomobject]@{ started = $false; completed = $true; error_code = 'PROCESS_IO_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $null; overflow = $false }
+        if ($processStarted) {
+            if ($null -eq $processId) { try { $processId = [int]$process.Id } catch { } }
+            $stillRunning = $true
+            try { $stillRunning = -not $process.HasExited } catch { $stillRunning = $true }
+            if ($stillRunning -and $LongLived) {
+                return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = ''; stderr = ''; process = $process; process_id = $processId; overflow = $false; capture = $capture; drain_tasks = $drainTasks }
+            }
+            if ($stillRunning) {
+                if ($null -ne $processId -and -not $script:PendingPublicCliPids.Contains($processId)) { $script:PendingPublicCliPids.Add($processId) }
+                return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'; stdout = ''; stderr = ''; process = $null; process_id = $processId; overflow = $false }
+            }
+            if ($LongLived) { return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $processId; overflow = $false } }
+            return [pscustomobject]@{ started = $true; completed = $true; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $processId; overflow = $false }
+        }
+        return [pscustomobject]@{ started = $false; completed = $true; exit_code = $null; error_code = 'PROCESS_IO_FAILED'; stdout = ''; stderr = ''; process = $null; process_id = $null; overflow = $false }
     }
     finally {
-        if (-not $LongLived -or $null -eq $process -or $process.HasExited) { $process.Dispose() }
+        $disposeProcess = -not $LongLived -or -not $processStarted
+        if (-not $disposeProcess) {
+            try { $disposeProcess = $process.HasExited } catch { $disposeProcess = $false }
+        }
+        if ($disposeProcess) { $process.Dispose() }
     }
-}
-
-function Get-PipeName {
-    param([Parameter(Mandatory)][string] $DataDirectory)
-    $canonical = [System.IO.Path]::GetFullPath($DataDirectory).ToLowerInvariant()
-    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($canonical)
-    $hash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-    return 'eliot-swarm-' + $hash.Substring(0, 32)
 }
 
 function Read-RpcResponse {
-    param([Parameter(Mandatory)][System.IO.StreamReader] $Reader, [Parameter(Mandatory)][string] $ExpectedId)
-    $line = $Reader.ReadLine()
+    param(
+        [Parameter(Mandatory)][System.IO.StreamReader] $Reader,
+        [Parameter(Mandatory)][string] $ExpectedId,
+        [Parameter(Mandatory)][System.Threading.CancellationToken] $CancellationToken
+    )
+    try { $line = $Reader.ReadLineAsync($CancellationToken).GetAwaiter().GetResult() }
+    catch [System.OperationCanceledException] { return [pscustomobject]@{ success = $false; code = 'RPC_READ_TIMEOUT'; value = $null; response_received = $false } }
+    catch [System.IO.IOException] { return [pscustomobject]@{ success = $false; code = 'RPC_READ_FAILED'; value = $null; response_received = $false } }
+    if ($null -eq $line) { return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null; response_received = $false } }
     if ([string]::IsNullOrWhiteSpace($line) -or [System.Text.Encoding]::UTF8.GetByteCount($line) -gt $script:MaxFrameBytes) {
-        return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null }
+        return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null; response_received = $true }
     }
     try { $reply = $line | ConvertFrom-Json -AsHashtable -Depth 32 }
-    catch { return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null } }
-    if ($reply.jsonrpc -cne '2.0' -or $reply.id -cne $ExpectedId) { return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_MISMATCH'; value = $null } }
-    if ($reply.Contains('error')) {
-        $code = [string]$reply.error.data.code
-        if ($code -notmatch '\A[A-Z0-9_]{1,64}\z') { $code = 'RPC_ERROR' }
-        return [pscustomobject]@{ success = $false; code = $code; value = $null }
+    catch { return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null; response_received = $true } }
+    if ($reply -isnot [Collections.IDictionary] -or $reply['jsonrpc'] -cne '2.0' -or $reply['id'] -cne $ExpectedId) {
+        return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_MISMATCH'; value = $null; response_received = $true }
     }
-    if (-not $reply.Contains('result')) { return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null } }
-    return [pscustomobject]@{ success = $true; code = $null; value = $reply.result }
+    if ($reply.Contains('error')) {
+        $errorValue = $reply['error']
+        $errorData = if ($errorValue -is [Collections.IDictionary]) { $errorValue['data'] } else { $null }
+        $code = if ($errorData -is [Collections.IDictionary]) { $errorData['code'] } else { $null }
+        if ($code -isnot [string] -or $code -cnotmatch '\A[A-Z0-9_]{1,64}\z') { $code = 'RPC_ERROR' }
+        return [pscustomobject]@{ success = $false; code = $code; value = $null; response_received = $true }
+    }
+    if (-not $reply.Contains('result')) { return [pscustomobject]@{ success = $false; code = 'RPC_RESPONSE_INVALID'; value = $null; response_received = $true } }
+    return [pscustomobject]@{ success = $true; code = $null; value = $reply['result']; response_received = $true }
 }
 
 function Invoke-DroppedReplyRpc {
     param(
         [Parameter(Mandatory)][string] $DataDirectory,
+        [Parameter(Mandatory)][ValidatePattern('\Aeliot-swarm-[a-f0-9]{32}\z')][string] $PipeName,
         [Parameter(Mandatory)][System.Collections.IDictionary] $Credential,
         [Parameter(Mandatory)][string] $Method,
         [Parameter(Mandatory)][System.Collections.IDictionary] $Params
@@ -468,41 +512,60 @@ function Invoke-DroppedReplyRpc {
     if ($Method -notin @('task.create', 'hook.emit')) { Stop-Harness 'FAULT_TRANSPORT_METHOD_NOT_ALLOWED' }
     $pipe = $null
     $reader = $null
-    $writer = $null
-    $applicationSent = $false
+    $cancellation = $null
+    $applicationAttempted = $false
+    $stage = 'CONNECT'
     $helloId = [Guid]::NewGuid().ToString('D')
     $requestId = [Guid]::NewGuid().ToString('D')
+    $ioTimeoutMilliseconds = [Math]::Min(10000, $TimeoutSeconds * 1000)
     try {
-        $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', (Get-PipeName $DataDirectory), [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::None)
-        $pipe.Connect([Math]::Min(10000, $TimeoutSeconds * 1000))
+        $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $PipeName, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+        $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds($ioTimeoutMilliseconds))
+        $pipe.ConnectAsync($ioTimeoutMilliseconds, $cancellation.Token).GetAwaiter().GetResult()
+        $cancellation.Dispose(); $cancellation = $null
         $encoding = [System.Text.UTF8Encoding]::new($false)
         $reader = [System.IO.StreamReader]::new($pipe, $encoding, $false, 4096, $true)
-        $writer = [System.IO.StreamWriter]::new($pipe, $encoding, 4096, $true)
-        $writer.AutoFlush = $true
         $hello = [ordered]@{ jsonrpc = '2.0'; id = $helloId; method = 'client.hello'; params = $Credential }
         $helloLine = $hello | ConvertTo-Json -Depth 24 -Compress
-        if ([System.Text.Encoding]::UTF8.GetByteCount($helloLine) -gt $script:MaxFrameBytes) { return [pscustomobject]@{ sent = $false; response_known = $true; success = $false; code = 'RPC_FRAME_TOO_LARGE'; value = $null } }
-        $writer.WriteLine($helloLine)
-        $helloReply = Read-RpcResponse -Reader $reader -ExpectedId $helloId
-        if (-not $helloReply.success -or $helloReply.value.client_id -cne [string]$Credential.client_id) {
-            return [pscustomobject]@{ sent = $false; response_known = $true; success = $false; code = $(if ($helloReply.code) { $helloReply.code } else { 'RPC_AUTH_MISMATCH' }); value = $null }
+        if ([System.Text.Encoding]::UTF8.GetByteCount($helloLine) -gt $script:MaxFrameBytes) { return [pscustomobject]@{ sent = $false; effect_possible = $false; response_known = $true; success = $false; code = 'RPC_FRAME_TOO_LARGE'; value = $null } }
+        $helloBytes = $encoding.GetBytes($helloLine + [Environment]::NewLine)
+        $stage = 'AUTH_WRITE'
+        $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds($ioTimeoutMilliseconds))
+        $pipe.WriteAsync($helloBytes, 0, $helloBytes.Length, $cancellation.Token).GetAwaiter().GetResult()
+        $cancellation.Dispose(); $cancellation = $null
+        $stage = 'AUTH_READ'
+        $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds($ioTimeoutMilliseconds))
+        $helloReply = Read-RpcResponse -Reader $reader -ExpectedId $helloId -CancellationToken $cancellation.Token
+        $cancellation.Dispose(); $cancellation = $null
+        $helloClientId = $null
+        if ($helloReply.success -and $helloReply.value -is [Collections.IDictionary]) { $helloClientId = [string]$helloReply.value['client_id'] }
+        if (-not $helloReply.success -or $helloClientId -cne [string]$Credential.client_id) {
+            return [pscustomobject]@{ sent = $false; effect_possible = $false; response_known = [bool]$helloReply.response_received; success = $false; code = $(if ($helloReply.code) { $helloReply.code } else { 'RPC_AUTH_MISMATCH' }); value = $null }
         }
         $request = [ordered]@{ jsonrpc = '2.0'; id = $requestId; method = $Method; params = $Params }
         $requestLine = $request | ConvertTo-Json -Depth 48 -Compress
-        if ([System.Text.Encoding]::UTF8.GetByteCount($requestLine) -gt $script:MaxFrameBytes) { return [pscustomobject]@{ sent = $false; response_known = $true; success = $false; code = 'RPC_FRAME_TOO_LARGE'; value = $null } }
-        $writer.WriteLine($requestLine)
-        $writer.Flush()
-        $applicationSent = $true
-        $writer.Dispose(); $writer = $null
+        if ([System.Text.Encoding]::UTF8.GetByteCount($requestLine) -gt $script:MaxFrameBytes) { return [pscustomobject]@{ sent = $false; effect_possible = $false; response_known = $true; success = $false; code = 'RPC_FRAME_TOO_LARGE'; value = $null } }
+        $requestBytes = $encoding.GetBytes($requestLine + [Environment]::NewLine)
+        $stage = 'APPLICATION_WRITE'
+        $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds($ioTimeoutMilliseconds))
+        $applicationAttempted = $true
+        $pipe.WriteAsync($requestBytes, 0, $requestBytes.Length, $cancellation.Token).GetAwaiter().GetResult()
+        $cancellation.Dispose(); $cancellation = $null
         $reader.Dispose(); $reader = $null
         $pipe.Dispose(); $pipe = $null
-        return [pscustomobject]@{ sent = $true; response_known = $false; success = $false; code = 'ACK_DROPPED_BY_HARNESS'; value = $null }
+        return [pscustomobject]@{ sent = $true; effect_possible = $true; response_known = $false; success = $false; code = 'ACK_DROPPED_BY_HARNESS'; value = $null }
+    }
+    catch [System.OperationCanceledException] {
+        return [pscustomobject]@{ sent = $applicationAttempted; effect_possible = $applicationAttempted; response_known = $false; success = $false; code = $(if ($applicationAttempted) { 'RPC_OUTCOME_UNKNOWN' } else { 'RPC_' + $stage + '_TIMEOUT' }); value = $null }
+    }
+    catch [System.TimeoutException] {
+        return [pscustomobject]@{ sent = $applicationAttempted; effect_possible = $applicationAttempted; response_known = $false; success = $false; code = $(if ($applicationAttempted) { 'RPC_OUTCOME_UNKNOWN' } else { 'RPC_' + $stage + '_TIMEOUT' }); value = $null }
     }
     catch {
-        return [pscustomobject]@{ sent = $applicationSent; response_known = $false; success = $false; code = $(if ($applicationSent) { 'RPC_OUTCOME_UNKNOWN' } else { 'RPC_CONNECT_FAILED' }); value = $null }
+        return [pscustomobject]@{ sent = $applicationAttempted; effect_possible = $applicationAttempted; response_known = $false; success = $false; code = $(if ($applicationAttempted) { 'RPC_OUTCOME_UNKNOWN' } elseif ($stage -eq 'CONNECT') { 'RPC_CONNECT_FAILED' } else { 'RPC_' + $stage + '_FAILED' }); value = $null }
     }
     finally {
-        if ($null -ne $writer) { $writer.Dispose() }
+        if ($null -ne $cancellation) { $cancellation.Dispose() }
         if ($null -ne $reader) { $reader.Dispose() }
         if ($null -ne $pipe) { $pipe.Dispose() }
     }
@@ -516,7 +579,7 @@ function New-ScenarioDirectory {
     $requests = Join-Path $path 'requests'
     New-PrivateDirectory -Path $state
     New-PrivateDirectory -Path $requests
-    return [pscustomobject]@{ name = $Name; path = $path; state = $state; requests = $requests; host = $null; operator_path = (Join-Path $state 'operator.json'); hook_credential_path = (Join-Path $path 'hook-credential.json') }
+    return [pscustomobject]@{ name = $Name; path = $path; state = $state; requests = $requests; host = $null; pipe_name = $null; operator_path = (Join-Path $state 'operator.json'); hook_credential_path = (Join-Path $path 'hook-credential.json') }
 }
 
 function Start-IsolatedHost {
@@ -527,11 +590,44 @@ function Start-IsolatedHost {
     $Scenario.host = $result.process
     $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(30, $TimeoutSeconds))
     while ([DateTime]::UtcNow -lt $deadline) {
-        if ($Scenario.host.HasExited) { return [pscustomobject]@{ ready = $false; code = 'HOST_EXITED_DURING_START'; host_pid = $Scenario.host.Id } }
+        if ($Scenario.host.HasExited) {
+            $drainCompleted = $false
+            try { $drainCompleted = [System.Threading.Tasks.Task]::WaitAll($result.drain_tasks, 1000) } catch { }
+            $capturePath = Join-Path $Scenario.path ('host-start-' + [Guid]::NewGuid().ToString('N') + '.json')
+            [System.Threading.Monitor]::Enter($result.capture.sync)
+            try {
+                Write-PrivateJson -Path $capturePath -Value ([ordered]@{
+                    exit_code = $Scenario.host.ExitCode
+                    capture_complete = $drainCompleted -and -not $result.capture.ReadFailed -and -not $result.capture.overflow
+                    drain_completed = $drainCompleted
+                    read_failed = [bool]$result.capture.ReadFailed
+                    overflow = [bool]$result.capture.overflow
+                    stdout = $result.capture.stdout.ToString()
+                    stderr = $result.capture.stderr.ToString()
+                })
+            } finally { [System.Threading.Monitor]::Exit($result.capture.sync) }
+            return [pscustomobject]@{ ready = $false; code = 'HOST_EXITED_DURING_START'; host_pid = $Scenario.host.Id }
+        }
         if (Test-Path -LiteralPath $Scenario.operator_path) {
             $credential = Read-JsonFile $Scenario.operator_path
             $status = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Scenario.operator_path -Method 'host.status' -Params ([ordered]@{})
-            if ($status.success -and $null -ne $status.value) { return [pscustomobject]@{ ready = $true; code = $null; host_pid = $Scenario.host.Id; epoch = [long]$status.value.host_epoch } }
+            if ($status.success -and $null -ne $status.value) {
+                [System.Threading.Monitor]::Enter($result.capture.sync)
+                try { $hostStderr = $result.capture.stderr.ToString() }
+                finally { [System.Threading.Monitor]::Exit($result.capture.sync) }
+                $prefix = 'swarm host ready: \\.\pipe\'
+                $pipeNames = @($hostStderr -split "`n" | ForEach-Object {
+                    $line = $_.TrimEnd("`r")
+                    if ($line.StartsWith($prefix, [StringComparison]::Ordinal)) {
+                        $name = $line.Substring($prefix.Length)
+                        if ($name -cmatch '\Aeliot-swarm-[a-f0-9]{32}\z') { $name }
+                    }
+                })
+                if ($pipeNames.Count -eq 1) {
+                    $Scenario.pipe_name = $pipeNames[0]
+                    return [pscustomobject]@{ ready = $true; code = $null; host_pid = $Scenario.host.Id; epoch = [long]$status.value.host_epoch }
+                }
+            }
         }
         Start-Sleep -Milliseconds 250
     }
@@ -576,7 +672,10 @@ function Invoke-SwarmCall {
     if ($process.completed) { try { [System.IO.File]::Delete($requestPath) } catch { } }
     if (-not $process.completed) { return [pscustomobject]@{ completed = $false; success = $false; code = $process.error_code; value = $null; public_cli_pid = $process.process_id } }
     if (-not $process.started -or $process.overflow) { return [pscustomobject]@{ completed = $true; success = $false; code = $(if ($process.overflow) { 'CLI_OUTPUT_LIMIT' } else { $process.error_code }); value = $null; public_cli_pid = $process.process_id } }
-    if ($process.exit_code -ne 0) { return [pscustomobject]@{ completed = $true; success = $false; code = $process.error_code; value = $null; public_cli_pid = $process.process_id } }
+    if ($process.exit_code -ne 0) {
+        Write-PrivateJson -Path (Join-Path $Scenario.path ('cli-error-' + [Guid]::NewGuid().ToString('N') + '.json')) -Value ([ordered]@{ method = $Method; exit_code = $process.exit_code; stdout = $process.stdout; stderr = $process.stderr })
+        return [pscustomobject]@{ completed = $true; success = $false; code = $process.error_code; value = $null; public_cli_pid = $process.process_id }
+    }
     try { $value = $process.stdout | ConvertFrom-Json -AsHashtable -Depth 48 }
     catch { return [pscustomobject]@{ completed = $true; success = $false; code = 'CLI_RESULT_INVALID'; value = $null; public_cli_pid = $process.process_id } }
     return [pscustomobject]@{ completed = $true; success = $true; code = $null; value = $value; public_cli_pid = $process.process_id }
@@ -592,7 +691,15 @@ function New-Manager {
     if (-not $result.completed -or $result.exit_code -ne 0 -or -not (Test-Path -LiteralPath $credentialPath)) { return [pscustomobject]@{ success = $false; code = $(if ($result.error_code) { $result.error_code } else { 'MANAGER_CREATE_UNKNOWN' }); id = $managerId; path = $credentialPath; credential = $null } }
     $credential = Read-JsonFile $credentialPath
     if ($credential.client_id -cne $managerId -or [string]::IsNullOrWhiteSpace([string]$credential.token)) { return [pscustomobject]@{ success = $false; code = 'MANAGER_CREDENTIAL_INVALID'; id = $managerId; path = $credentialPath; credential = $null } }
-    return [pscustomobject]@{ success = $true; code = $null; id = $managerId; path = $credentialPath; credential = $credential }
+    $handover = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Scenario.operator_path -Method 'gm.handover' -Params ([ordered]@{ client_request_id = 'core-gm:' + [Guid]::NewGuid().ToString('N'); client_id = $managerId })
+    if (-not $handover.success) { return [pscustomobject]@{ success = $false; code = $(if ($handover.code) { $handover.code } else { 'GM_DESIGNATION_UNKNOWN' }); id = $managerId; path = $credentialPath; credential = $null } }
+    $status = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $credentialPath -Method 'host.status' -Params ([ordered]@{})
+    if (-not $status.success -or $status.value['gm'] -isnot [Collections.IDictionary] -or
+        $status.value.gm['state'] -cne 'current' -or $status.value.gm['client_id'] -cne $managerId -or
+        $status.value.gm['epoch'] -ne $handover.value['gm_epoch'] -or $status.value.gm['epoch'] -le 0) {
+        return [pscustomobject]@{ success = $false; code = 'GM_DESIGNATION_READBACK_MISMATCH'; id = $managerId; path = $credentialPath; credential = $null }
+    }
+    return [pscustomobject]@{ success = $true; code = $null; id = $managerId; path = $credentialPath; credential = $credential; gm_epoch = [long]$status.value.gm['epoch'] }
 }
 
 function Read-TaskCreatedByOrigin {
@@ -601,13 +708,16 @@ function Read-TaskCreatedByOrigin {
     while ([DateTime]::UtcNow -lt $deadline) {
         $listed = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'task.list' -Params ([ordered]@{ after = 0; limit = 50 }) -TimeoutMilliseconds 10000
         if ($listed.success) {
+            if (@($listed.value.items | Where-Object { -not $_.Contains('origin_key') }).Count -gt 0) {
+                return [pscustomobject]@{ success = $false; code = 'PUBLIC_TASK_ORIGIN_UNAVAILABLE'; task = $null; operation = $null }
+            }
             $matches = @($listed.value.items | Where-Object { $_.origin_key -ceq $OriginKey })
             if ($matches.Count -gt 1) { return [pscustomobject]@{ success = $false; code = 'TASK_ORIGIN_NOT_UNIQUE'; task = $null; operation = $null } }
             if ($matches.Count -eq 1) {
                 $task = $matches[0]
                 $ops = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'operation.list' -Params ([ordered]@{ after = 0; limit = 50 }) -TimeoutMilliseconds 10000
                 if ($ops.success) {
-                    $opMatches = @($ops.value.items | Where-Object { $_.method -ceq 'task.create' -and $_.caller_id -ceq $Manager.id -and $_.task_id -ceq $task.task_id })
+                    $opMatches = @($ops.value.items | Where-Object { $_.method -ceq 'task.create' -and $_['diagnostic'] -is [Collections.IDictionary] -and $_.diagnostic['caller_id'] -ceq $Manager.id -and $_.task_id -ceq $task.task_id })
                     if ($opMatches.Count -gt 1) { return [pscustomobject]@{ success = $false; code = 'TASK_CREATE_OPERATION_NOT_UNIQUE'; task = $task; operation = $null } }
                     if ($opMatches.Count -eq 1) {
                         $read = Invoke-SwarmCall -Scenario $Scenario -CredentialPath $Manager.path -Method 'operation.get' -Params ([ordered]@{ operation_id = [string]$opMatches[0].operation_id }) -TimeoutMilliseconds 10000
@@ -688,20 +798,31 @@ function Invoke-ManagerDroppedAckScenario {
         $origin = 'core-failure:' + [Guid]::NewGuid().ToString('N')
         $logicalId = 'core-failure:' + [Guid]::NewGuid().ToString('N')
         $params = [ordered]@{ client_request_id = $logicalId; project_id = $ProjectId; origin_key = $origin; spec = $taskSpec }
-        $send = Invoke-DroppedReplyRpc -DataDirectory $scenario.state -Credential $manager.credential -Method 'task.create' -Params $params
+        $send = Invoke-DroppedReplyRpc -DataDirectory $scenario.state -PipeName $scenario.pipe_name -Credential $manager.credential -Method 'task.create' -Params $params
+        $result.facts.rpc_transport_code = [string]$send.code
+        $result.facts.application_effect_possible = [bool]$send.effect_possible
         if (-not $send.sent) { $result.code = $send.code; return $result }
+        if ($send.code -cne 'ACK_DROPPED_BY_HARNESS' -or -not $send.effect_possible) {
+            $result.status = 'unknown'
+            $result.code = $(if ($send.code) { $send.code } else { 'RPC_OUTCOME_UNKNOWN' })
+            $result.facts.manager_ack = 'unknown_after_possible_write'
+            return $result
+        }
         $result.facts.manager_ack = 'intentionally_not_read'
         $result.facts.logical_request_id = $logicalId
         $admitted = Read-TaskCreatedByOrigin -Scenario $scenario -Manager $manager -OriginKey $origin
-        if (-not $admitted.success -or $admitted.operation.state -cne 'settled' -or
-            $admitted.operation.result.task_id -cne $admitted.task.task_id -or
-            $admitted.operation.result.created -ne $true) {
+        $admissionIdentityVerified = $admitted.success -and $admitted.operation.state -ceq 'settled' -and
+            $admitted.operation.result.task_id -ceq $admitted.task.task_id
+        if (-not $admissionIdentityVerified) {
             $result.status = 'unknown'
             $result.code = $(if ($admitted.code) { $admitted.code } else { 'PRE_RESTART_ADMISSION_READBACK_MISMATCH' })
-            return $result
+            $result.facts.public_task_identity_before_restart = 'unknown'
+            $result.facts.public_task_identity_before_restart_code = $result.code
+        } else {
+            $result.facts.admitted_operation_before_restart = [string]$admitted.operation.operation_id
+            $result.facts.admitted_task_before_restart = [string]$admitted.task.task_id
+            $result.facts.public_task_identity_before_restart = 'verified'
         }
-        $result.facts.admitted_operation_before_restart = [string]$admitted.operation.operation_id
-        $result.facts.admitted_task_before_restart = [string]$admitted.task.task_id
         $stopped = Stop-IsolatedHost $scenario
         if (-not $stopped.stopped) { $result.status = 'pending'; $result.code = 'OWN_HOST_STOP_PENDING'; $result.facts.pending_host_pid = $stopped.pending_host_pid; return $result }
         $restarted = Start-IsolatedHost $scenario
@@ -714,14 +835,27 @@ function Invoke-ManagerDroppedAckScenario {
         $result.facts.host_epoch_after = [long]$restarted.epoch
         if ($restarted.epoch -le $hostStart.epoch) { $result.status = 'unknown'; $result.code = 'HOST_EPOCH_DID_NOT_ADVANCE'; return $result }
         $readback = Read-TaskCreatedByOrigin -Scenario $scenario -Manager $manager -OriginKey $origin
-        if (-not $readback.success) { $result.status = 'unknown'; $result.code = $readback.code; $result.facts.replayed = $false; return $result }
+        if (-not $readback.success) {
+            $result.status = 'unknown'
+            if ($admissionIdentityVerified -or -not $result.code) { $result.code = $readback.code }
+            $result.facts.public_task_identity_after_restart = 'unknown'
+            $result.facts.public_task_identity_after_restart_code = $readback.code
+            return $result
+        }
+        $result.facts.public_task_identity_after_restart = 'verified'
+        $result.facts.operation_id_after_restart = [string]$readback.operation.operation_id
+        $result.facts.task_id_after_restart = [string]$readback.task.task_id
+        if (-not $admissionIdentityVerified) {
+            $result.status = 'unknown'
+            return $result
+        }
         if ($readback.operation.operation_id -cne $admitted.operation.operation_id -or
             $readback.task.task_id -cne $admitted.task.task_id) {
             $result.status = 'unknown'; $result.code = 'POST_RESTART_IDENTITY_CHANGED'; return $result
         }
         $result.facts.operation_id = [string]$readback.operation.operation_id
         $result.facts.task_id = [string]$readback.task.task_id
-        if ($readback.operation.state -cne 'settled' -or $readback.operation.result.task_id -cne $readback.task.task_id -or $readback.operation.result.created -ne $true) {
+        if ($readback.operation.state -cne 'settled' -or $readback.operation.result.task_id -cne $readback.task.task_id) {
             $result.status = 'unknown'; $result.code = 'TASK_CREATE_DURABLE_RECEIPT_MISMATCH'; return $result
         }
         $after = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'operation.get' -Params ([ordered]@{ operation_id = [string]$readback.operation.operation_id })
@@ -780,8 +914,10 @@ function Invoke-ManagerConflictScenario {
         $result.facts.host_epoch_after = [long]$restarted.epoch
         $after = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'operation.get' -Params ([ordered]@{ operation_id = [string]$operations.value.operation_id })
         $tasks = Invoke-SwarmCall -Scenario $scenario -CredentialPath $manager.path -Method 'task.list' -Params ([ordered]@{ after = 0; limit = 50 })
-        $conflictingTasks = if ($tasks.success) { @($tasks.value.items | Where-Object { $_.origin_key -ceq $conflictOrigin }) } else { @() }
-        if (-not $after.success -or $after.value.operation_id -cne $operations.value.operation_id -or $after.value.result.task_id -cne $originalTaskId -or $conflictingTasks.Count -ne 0) {
+        $retainedTasks = @(if ($tasks.success) { $tasks.value.items })
+        if (-not $after.success -or $after.value.operation_id -cne $operations.value.operation_id -or $after.value.result.task_id -cne $originalTaskId -or
+            -not $tasks.success -or $tasks.value.coverage_complete -ne $true -or $tasks.value.has_newer -ne $false -or
+            $retainedTasks.Count -ne 1 -or $retainedTasks[0].task_id -cne $originalTaskId) {
             $result.status = 'unknown'; $result.code = 'DURABLE_CONFLICT_READBACK_MISMATCH'; return $result
         }
         $result.status = 'observed'
@@ -790,7 +926,9 @@ function Invoke-ManagerConflictScenario {
         $result.facts.original_task_id = $originalTaskId
         $result.facts.original_operation_state = [string]$after.value.state
         $result.facts.conflicting_task_created = $false
-        $result.facts.current_manager_handover = $false
+        $result.facts.complete_public_task_identity_set_verified = $true
+        $result.facts.current_manager_handover = $true
+        $result.facts.gm_epoch = $manager.gm_epoch
         return $result
     }
     finally {
@@ -803,6 +941,8 @@ function Invoke-ManagerConflictScenario {
 function Invoke-HookRestartDedupScenario {
     $scenario = New-ScenarioDirectory -Name 'hook-callback-restart-dedup'
     $result = [ordered]@{ name = $scenario.name; run_id = (Split-Path -Leaf $scenario.path); status = 'blocked'; code = $null; facts = [ordered]@{} }
+    $sourceId = $null
+    $sourceRevision = $null
     try {
         if ([string]::IsNullOrWhiteSpace($HookProjectId) -or [string]::IsNullOrWhiteSpace($HookCommitOid)) { $result.code = 'HOOK_FIXTURE_INPUTS_REQUIRED'; return $result }
         $hostStart = Start-IsolatedHost $scenario
@@ -813,17 +953,32 @@ function Invoke-HookRestartDedupScenario {
         }
         $result.facts.host_pid = [int]$hostStart.host_pid
         $result.facts.host_image_sha256 = $script:HostBuild.binary_sha256
-        $operator = Read-JsonFile $scenario.operator_path
-        $sourceId = [Guid]::NewGuid().ToString('D')
-        $token = [Guid]::NewGuid().ToString('D') + [Guid]::NewGuid().ToString('D')
-        $hookCredential = [ordered]@{ client_id = 'hook-source:' + $sourceId; token = $token }
-        $setup = [ordered]@{ client_request_id = 'core-failure:' + [Guid]::NewGuid().ToString('N'); project_id = $HookProjectId; source_id = $sourceId; credential = $hookCredential }
-        $setupResult = Invoke-SwarmCall -Scenario $scenario -CredentialPath $scenario.operator_path -Method 'hook.source.setup' -Params $setup
-        if (-not $setupResult.success -or $setupResult.value.source.source_id -cne $sourceId) { $result.code = $(if ($setupResult.code) { $setupResult.code } else { 'HOOK_SETUP_READBACK_MISMATCH' }); return $result }
+        $baseArgs = @('--config', $script:ConfigPath, '--data-dir', $scenario.state, '--credential', $scenario.operator_path, 'hook')
+        $previewResult = Start-BoundedProcess -Arguments ($baseArgs + @('install', 'preview', $HookProjectId)) -TimeoutMilliseconds 15000
+        if (-not $previewResult.started -or -not $previewResult.completed -or $previewResult.exit_code -ne 0) { $result.code = $previewResult.error_code; return $result }
+        $preview = $previewResult.stdout | ConvertFrom-Json -AsHashtable -Depth 16
+        $gitDirectory = Assert-SafeAbsolutePath -Path ([string]$preview.git_directory) -MustExist -Directory
+        $setupResult = Start-BoundedProcess -Arguments ($baseArgs + @('setup', $HookProjectId)) -TimeoutMilliseconds 30000
+        if (-not $setupResult.started -or -not $setupResult.completed -or $setupResult.exit_code -ne 0) { $result.code = $setupResult.error_code; return $result }
+        $setupValue = $setupResult.stdout | ConvertFrom-Json -AsHashtable -Depth 24
+        $sourceId = [Guid]::Parse([string]$setupValue.source.source_id).ToString('D')
+        $sourceRevision = [long]$setupValue.source.revision
+        if ($setupValue.credential_file_written -ne $true -or $setupValue.installation.wrapper_matches -ne $true -or $setupValue.installation.state -cne 'installed') { $result.code = 'HOOK_SETUP_READBACK_MISMATCH'; return $result }
+        $credentialPath = Assert-SafeAbsolutePath -Path (Join-Path $gitDirectory ('eliot-hook-sources\' + $sourceId + '\credential.json')) -MustExist
+        $hookCredential = Read-JsonFile $credentialPath
+        if ($hookCredential.client_id -cne ('hook-source:' + $sourceId)) { $result.code = 'HOOK_CREDENTIAL_IDENTITY_MISMATCH'; return $result }
         Write-PrivateJson -Path $scenario.hook_credential_path -Value $hookCredential
         $eventParams = [ordered]@{ source_id = $sourceId; commit_oid = $HookCommitOid.ToLowerInvariant() }
-        $dropped = Invoke-DroppedReplyRpc -DataDirectory $scenario.state -Credential $hookCredential -Method 'hook.emit' -Params $eventParams
+        $dropped = Invoke-DroppedReplyRpc -DataDirectory $scenario.state -PipeName $scenario.pipe_name -Credential $hookCredential -Method 'hook.emit' -Params $eventParams
+        $result.facts.rpc_transport_code = [string]$dropped.code
+        $result.facts.application_effect_possible = [bool]$dropped.effect_possible
         if (-not $dropped.sent) { $result.code = $dropped.code; return $result }
+        if ($dropped.code -cne 'ACK_DROPPED_BY_HARNESS' -or -not $dropped.effect_possible) {
+            $result.status = 'unknown'
+            $result.code = $(if ($dropped.code) { $dropped.code } else { 'RPC_OUTCOME_UNKNOWN' })
+            $result.facts.callback_ack = 'unknown_after_possible_write'
+            return $result
+        }
         $result.facts.callback_ack = 'intentionally_not_read'
         $result.facts.source_id = $sourceId
         $result.facts.commit_oid = $HookCommitOid.ToLowerInvariant()
@@ -860,6 +1015,13 @@ function Invoke-HookRestartDedupScenario {
         return $result
     }
     finally {
+        if ($null -ne $sourceId -and $null -ne $scenario.host -and -not $scenario.host.HasExited) {
+            $revokeArgs = @('--config', $script:ConfigPath, '--data-dir', $scenario.state, '--credential', $scenario.operator_path, 'hook', 'install', 'revoke', $HookProjectId, $sourceId, '--revision', [string]$sourceRevision)
+            $revocation = Start-BoundedProcess -Arguments $revokeArgs -TimeoutMilliseconds 30000
+            if (-not $revocation.started -or -not $revocation.completed -or $revocation.exit_code -ne 0) {
+                $result.status = 'pending'; $result.code = 'HOOK_INSTALL_CLEANUP_PENDING'
+            } else { $result.facts.fixture_hook_revoked_and_restored = $true }
+        }
         $stopped = Stop-IsolatedHost $scenario
         if (-not $stopped.stopped) { $result.facts.pending_host_pid = $stopped.pending_host_pid } else { Remove-OwnedCredentialFiles $scenario }
         Add-Scenario $result
@@ -927,8 +1089,9 @@ try {
     $output = Assert-SafeAbsolutePath -Path $OutputRoot -MustExist -Directory
     $script:TaskSpecPath = Assert-SafeAbsolutePath -Path $TaskSpecPath -MustExist
     $script:TaskSpecHash = Get-Sha256 $script:TaskSpecPath
-    $script:RunDirectory = Join-Path $output ([Guid]::NewGuid().ToString('D'))
-    New-PrivateDirectory -Path $script:RunDirectory
+    $runDirectory = Join-Path $output ([Guid]::NewGuid().ToString('D'))
+    New-PrivateDirectory -Path $runDirectory
+    $script:RunDirectory = $runDirectory
     $script:Summary.status = 'running'
     $script:Summary.host = [ordered]@{
         package = 'swarm-kernel-host'
@@ -995,11 +1158,15 @@ try {
     Write-Output (Join-Path $script:RunDirectory 'qualification-receipt.json')
 }
 catch {
+    $failure = $_
     $code = $_.Exception.Message
     if ($code -notmatch '\A[A-Z0-9_]{1,64}\z') { $code = 'HARNESS_PREFLIGHT_FAILED' }
     $script:Summary.status = 'blocked'
     $script:Summary.preflight_error_code = $code
-    if ($script:RunDirectory) { Save-Summary }
+    if ($script:RunDirectory) {
+        Write-PrivateJson -Path (Join-Path $script:RunDirectory 'harness-error.json') -Value ([ordered]@{ message = $failure.Exception.Message; position = $failure.InvocationInfo.PositionMessage; stack = $failure.ScriptStackTrace })
+        Save-Summary
+    }
     Write-Error $code
     exit 2
 }

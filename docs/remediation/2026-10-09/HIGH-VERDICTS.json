@@ -577,7 +577,24 @@
       "evidence": "crates/swarm-kernel-host/src/mcp_integration_tests/mod.rs:22 sets expected_client_id: credential.client_id.clone() inside public_facade(), and profiled_facade(&frontend, credential, Some(profile_name)) passes that same credential object, so the enforced value is by construction the value under test. The enforcement is real but lives outside the test: swarm-contracts/src/mcp_frontend.rs:139 selected_tool_profile() returns Error::new(PROFILE_MISMATCH, selected MCP profile is not bound to this ELIOT client) when profile.expected_client_id != client_id. Because the test injects a matching pair, a regression that deleted that check would still pass. No assertion in mcp_integration_tests references PROFILE_MISMATCH, and the swarm-mcp frontend_contract_tests.rs fixtures at lines 321 and 331 both use the identical literal same-principal for credential and expected_client_id, so they cannot construct the mismatch either. Production callers that bind genuinely distinct identities are never reached by this suite: participant_credentials.rs:408-409 derives expected_client_id from format!(participant-{}, &credential_index.identity_digest[..48]) and compares it, while store/launcher.rs:2833 and store/launcher_native_mcp.rs:280 and 514 compare profile.expected_client_id against principal.client_id.",
       "owner": "MCP boundary writer (R14/#40 line). Concretely: add a negative case in mcp_integration_tests that drives public_facade with a credential whose client_id differs from the profile expected_client_id (a fixed second literal such as other-client, never a clone of the credential under test) and asserts PROFILE_MISMATCH before tools/list is answered.",
       "remaining_gap": "The tautology lives in the shared fixture at mcp_integration_tests/mod.rs:13-29, so all three sibling modules (profiles.rs, tasks.rs, subscriptions.rs) inherit the same blind spot. Fixing one leaves the guard unexercised for the others.",
-      "implementation_status": "pending"
+      "implementation_status": "implemented",
+      "execution_qualification": {
+        "status": "PASS",
+        "scope": "dedicated MCP fixture on Windows and Linux",
+        "test_name": "distinct_expected_client_id_rejects_profile_binding",
+        "source_anchor": "d5ed429276be4dd02e97139b360a638db07fc3d0",
+        "windows": {
+          "log": ".local/manager-audit/rust-host-final-full-tests.log",
+          "line": 174,
+          "sha256": "c4792d576fff79715ddd62737f02a4cd6d8c2208df09ca0c4b139c09374f1420"
+        },
+        "linux": {
+          "log": ".local/manager-audit/linux-full-rust-tests.log",
+          "line": 408,
+          "sha256": "e72b1f5c88bc6852c14e2a8d7cd66f6ddc8b3acabcc40d25a9b50cbc2f8c6e02"
+        },
+        "limit": "Retained exact-case evidence; host coverage is a union, not a new full run on the delivery SHA"
+      }
     },
     {
       "id": "HIGH-0419",
@@ -589,7 +606,24 @@
       "evidence": "crates/swarm-kernel-host/src/mcp_integration_tests/profiles.rs:114-165 observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_ipc asserts only two wire facts: manually_addressed[code] == -32601 for tools/call message_cancel, and task_cancel[code] == -32601 for tasks/cancel. No Store or IPC side-effect assertion exists in the test body. Production ordering is genuinely ahead of IPC: swarm-mcp find_tool() (mcp/mod.rs:3845) resolves names against the static TOOLS table and returns None for unknown names, call_tool (mcp/mod.rs:4358-4360) returns McpError::method_not_found, and profile plus named-method refusal happens in ServerHandler::call_tool before any application IPC. But a facade variant that forwarded the unknown tool over IPC and remapped the Store NOT_FOUND or UNSUPPORTED error to -32601 would satisfy both assertions unchanged, because -32601 is the only observable captured. The test already runs a live IPC host (start_manager_host binds ipc::Listener and serves ipc::serve, profiles.rs:229-260), so a side-effect check needs no new infrastructure.",
       "owner": "MCP boundary writer (R14/#40 line). Concretely: after each expect_err assert a Store fact that only holds if nothing reached IPC, for example a host-side accepted-connection count of zero on that path, or an operation.list lookup showing no agent.open or message.send row for the attempted identity.",
       "remaining_gap": "The test name asserts a temporal property (before IPC) that the assertions never observe, on both rejected paths (manual tools/call and tasks/cancel). As written it is a contract check on the error code only.",
-      "implementation_status": "pending"
+      "implementation_status": "implemented",
+      "execution_qualification": {
+        "status": "PASS",
+        "scope": "dedicated MCP fixture on Windows and Linux",
+        "test_name": "observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_ipc",
+        "source_anchor": "d5ed429276be4dd02e97139b360a638db07fc3d0",
+        "windows": {
+          "log": ".local/manager-audit/rust-host-final-full-tests.log",
+          "line": 212,
+          "sha256": "c4792d576fff79715ddd62737f02a4cd6d8c2208df09ca0c4b139c09374f1420"
+        },
+        "linux": {
+          "log": ".local/manager-audit/linux-full-rust-tests.log",
+          "line": 410,
+          "sha256": "e72b1f5c88bc6852c14e2a8d7cd66f6ddc8b3acabcc40d25a9b50cbc2f8c6e02"
+        },
+        "limit": "Retained exact-case evidence; host coverage is a union, not a new full run on the delivery SHA"
+      }
     },
     {
       "id": "HIGH-0420",
@@ -601,7 +635,24 @@
       "evidence": "crates/swarm-kernel-host/src/mcp_integration_tests/profiles.rs:126-148 checks exactly four predicates over tools/list: presence of swarm_tools_search, presence of operation_get, that every returned tool has annotations.readOnlyHint == true, and absence of message_cancel. That is a partial enumeration, not a closed surface. A mutation tool surfaced under a different method name, or a mutable tool missing the readOnly annotation, is not covered, because nothing compares the returned set against the closed registry. The closed set is derivable from production source and is already validated elsewhere: swarm-mcp validate_registry_metadata() (mcp/catalog.rs:3034) enforces TOOL_METADATA.len() == TOOLS.len() plus required-field agreement, TOOLS (mcp/mod.rs:155-3837) holds one (bool read_only, ToolSpec) pair per method, and tool_from_spec (mcp/mod.rs:3830) applies with_annotations(ToolAnnotations::new().read_only(true)) only when read_only is set.",
       "owner": "MCP boundary writer (R14/#40 line). Concretely: derive the expected Observer name set from the registry (methods whose TOOLS read_only flag is true and profiles::exposes_method(Observer, method) holds, excluding swarm.tools.search) and assert set equality of returned tool names, replacing the four hand-picked predicates with a closed check.",
       "remaining_gap": "readOnlyHint is taken on trust here; nothing in this file validates that the annotation agrees with a production mutation-depth predicate. The only cross-profile ordering evidence in the file is the different property at profiles.rs:180-198 (Manager non-readOnly tools must require client_request_id, Full tools must not).",
-      "implementation_status": "pending"
+      "implementation_status": "implemented",
+      "execution_qualification": {
+        "status": "PASS",
+        "scope": "dedicated MCP fixture on Windows and Linux",
+        "test_name": "observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_ipc",
+        "source_anchor": "d5ed429276be4dd02e97139b360a638db07fc3d0",
+        "windows": {
+          "log": ".local/manager-audit/rust-host-final-full-tests.log",
+          "line": 212,
+          "sha256": "c4792d576fff79715ddd62737f02a4cd6d8c2208df09ca0c4b139c09374f1420"
+        },
+        "linux": {
+          "log": ".local/manager-audit/linux-full-rust-tests.log",
+          "line": 410,
+          "sha256": "e72b1f5c88bc6852c14e2a8d7cd66f6ddc8b3acabcc40d25a9b50cbc2f8c6e02"
+        },
+        "limit": "Retained exact-case evidence; host coverage is a union, not a new full run on the delivery SHA"
+      }
     },
     {
       "id": "HIGH-0421",
@@ -613,7 +664,24 @@
       "evidence": "crates/swarm-kernel-host/src/mcp_integration_tests/profiles.rs:170-215 restricted_mutations_require_caller_ids_before_ipc asserts only missing_tool_id[code] == -32602 for tools/call message_send without client_request_id, and missing_task_id[code] == -32602 for tasks/cancel. No Store or IPC side-effect assertion accompanies either. Production is ahead of IPC: swarm-mcp require_caller_request_id(params) (mcp/mod.rs:4722) raises McpError::invalid_params(PREKNOWN_REQUEST_ID_MESSAGE) and is invoked in ServerHandler::call_tool before the forwarded call path, keyed by mutation_requires_caller_request_id(profile, method, read_only) at mod.rs:4690. The blind spot is the same remap argument as row 419: a facade that forwarded the id-less mutation and coerced the Store error to -32602 would pass this file unchanged. The test already has a live StoreOwner and IPC listener (profiles.rs:229-260).",
       "owner": "MCP boundary writer (R14/#40 line). Concretely: after both expect_err calls assert the Store recorded no message.send Operation, via the existing operation_count helper or a direct store_call on operation.list for queued rows.",
       "remaining_gap": "Same temporal-claim-versus-observable gap as row 419, one level in: relocating caller-ID validation to behind IPC is not detected by a jsonrpc error code alone.",
-      "implementation_status": "pending"
+      "implementation_status": "implemented",
+      "execution_qualification": {
+        "status": "PASS",
+        "scope": "dedicated MCP fixture on Windows and Linux",
+        "test_name": "restricted_mutations_require_caller_ids_before_ipc",
+        "source_anchor": "d5ed429276be4dd02e97139b360a638db07fc3d0",
+        "windows": {
+          "log": ".local/manager-audit/rust-host-final-full-tests.log",
+          "line": 213,
+          "sha256": "c4792d576fff79715ddd62737f02a4cd6d8c2208df09ca0c4b139c09374f1420"
+        },
+        "linux": {
+          "log": ".local/manager-audit/linux-full-rust-tests.log",
+          "line": 411,
+          "sha256": "e72b1f5c88bc6852c14e2a8d7cd66f6ddc8b3acabcc40d25a9b50cbc2f8c6e02"
+        },
+        "limit": "Retained exact-case evidence; host coverage is a union, not a new full run on the delivery SHA"
+      }
     },
     {
       "id": "HIGH-0431",
@@ -625,7 +693,24 @@
       "evidence": "crates/swarm-kernel-host/src/mcp_integration_tests/tasks.rs:306-326 retried_mutation_with_caller_id_resolves_to_the_same_task issues two identical agent_open calls with the same client_request_id and asserts first[taskId] == second[taskId] plus stack.operation_count(agent.open) == 1. The taskId compared is whatever the responses returned; neither value is read back from the persisted Operation, and no assertion binds it to the stored row. A facade returning a constant fabricated task handle would still satisfy both assertions, since the equality holds and exactly one Operation exists, so deduplication evidence survives while handle identity stays unanchored. Anchors are available in the same file and harness: tasks.rs:113 operation_count reads the Store and tasks.rs:108 stack.store_call reaches the Store directly, so comparing the returned taskId to the stored operation_id is a small local addition.",
       "owner": "MCP boundary writer (R14/#40 line). Concretely: after the second call resolve the retained agent.open Operation through stack.store_call(operation.list) and assert first[taskId] equals that stored operation_id exactly, then assert tasks/get with that stored id projects the same task.",
       "remaining_gap": "Unanchored identity means a regression in task-handle derivation is invisible even though no second Operation is created. Production identity is protected elsewhere by the #89-#91 provenance work, so this is a test-coverage gap, not an enforcement gap.",
-      "implementation_status": "pending"
+      "implementation_status": "implemented",
+      "execution_qualification": {
+        "status": "PASS",
+        "scope": "dedicated MCP fixture on Windows and Linux",
+        "test_name": "retried_mutation_with_caller_id_resolves_to_the_same_task",
+        "source_anchor": "d5ed429276be4dd02e97139b360a638db07fc3d0",
+        "windows": {
+          "log": ".local/manager-audit/rust-host-final-full-tests.log",
+          "line": 196,
+          "sha256": "c4792d576fff79715ddd62737f02a4cd6d8c2208df09ca0c4b139c09374f1420"
+        },
+        "linux": {
+          "log": ".local/manager-audit/linux-full-rust-tests.log",
+          "line": 428,
+          "sha256": "e72b1f5c88bc6852c14e2a8d7cd66f6ddc8b3acabcc40d25a9b50cbc2f8c6e02"
+        },
+        "limit": "Retained exact-case evidence; host coverage is a union, not a new full run on the delivery SHA"
+      }
     },
     {
       "id": "HIGH-0439",
