@@ -1,0 +1,213 @@
+{
+  "schema": "eliot.v27_idle_catalogue_repair.v1",
+  "observed_at_utc": "2026-10-10T06:14:15.5432585Z",
+  "prior_candidate": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+  "prior_execution": "EXECUTION-RESULTS-C.json",
+  "unchanged_baseline_source_count": 405,
+  "changed_production_source": {
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    },
+    "crates/swarm-supervisor/src/descriptor.rs": {
+      "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+      "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+    }
+  },
+  "harness_source_sha256": "4e51c0110b75d940651bc8deb84aa8b686c03e4b978a79715afd170791e2281f",
+  "understanding_proof_sha256": "edeba79565de632f0a611822407e6f9e442c2ba8b2683cd7a2cdf36e0bcdc4aa",
+  "strict_host_clippy": {
+    "windows-idle-catalogue-clippy.log": "3bceed9a78dd38cfa48c8a643d6e3f4926ff6521706c5f2524de01fffd38f900",
+    "linux-idle-catalogue-clippy.log": "63f90ce2c89839055009b0466f00d735dfdac826e25467a3e6268547ad104c2e"
+  },
+  "harness_verifier": {
+    "status": "PASS",
+    "verifier": "Actual harness FunctionDefinitionAst bodies under StrictMode Latest; no full harness/native invocation",
+    "case_count": 34,
+    "cases": [
+      {
+        "name": "OpenCode actual installed descriptor vs retained public catalogue",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode object order reversal",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode schema-digest",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "OpenCode protocol-extra",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "OpenCode config-missing",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "OpenCode config-extra",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "OpenCode capability",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "OpenCode retained isolated supervisor refused",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode healthy dormant exact retained child",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode failed-exit dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode different-image dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode missing-exit dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode pid-mismatch dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode kernel-stopped dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "OpenCode zero-epoch dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity actual installed descriptor vs retained public catalogue",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity object order reversal",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity schema-digest",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "Antigravity protocol-extra",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "Antigravity config-missing",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "Antigravity config-extra",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "Antigravity capability",
+        "status": "PASS",
+        "expected_refusal": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+      },
+      {
+        "name": "Antigravity retained isolated supervisor refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity healthy dormant exact retained child",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity failed-exit dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity different-image dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity missing-exit dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity pid-mismatch dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity kernel-stopped dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Antigravity zero-epoch dormant refused",
+        "status": "PASS"
+      },
+      {
+        "name": "Array order significant",
+        "status": "PASS"
+      },
+      {
+        "name": "Null versus missing significant",
+        "status": "PASS"
+      },
+      {
+        "name": "Null versus value significant",
+        "status": "PASS"
+      },
+      {
+        "name": "Case of property name significant",
+        "status": "PASS"
+      }
+    ],
+    "inputs": [
+      {
+        "adapter": "OpenCode",
+        "descriptor_sha256": "19a65a42a11b223df7968e30ddde1706956ad01853d4acd187cff2bc4f3e2373",
+        "catalogue_revision": 1,
+        "run": "cf926247-292b-4268-a621-002c47a82dce"
+      },
+      {
+        "adapter": "Antigravity",
+        "descriptor_sha256": "173fe5cd19f140a17a6fa6bbcfb497e700274cff49e39ca536663ed8e8c91cde",
+        "catalogue_revision": 1,
+        "run": "8068edbf-04ff-435f-922c-e6c2a913bf63"
+      }
+    ],
+    "harness_sha256": "4e51c0110b75d940651bc8deb84aa8b686c03e4b978a79715afd170791e2281f",
+    "projection_sha256": "0ce39c6daca78b4f7789912135815093afbfd37441e3d74b9cdeac2ab8a1a5a7",
+    "health_sha256": "e7aef7bfd4a2abeb0ee5e2849f836ccab9d09b3d3a8d798411a36978c6db383c",
+    "verified_supervisor_sha256": "e0d1998266f1570d114782d1b131b8fa5133ab59c1ef7f3660fda5af6a249b84",
+    "observed_at_utc": "2026-10-10T06:14:04.4105037Z",
+    "limits": "Healthy dormant host envelope is a mutation fixture using exact retained C child; it is not an installed C qualification. Native starts, Cargo and dispatch calls: zero.",
+    "verifier_script_sha256": "1e0c498575c6ab7830424536d21e9713e18add5559e80c21532329120cff09cc",
+    "verifier_log_sha256": "d344747e92558b3eba2b79610bec2c047a9f509699ceee4b52b9861d2682ba84"
+  },
+  "harness_verifier_receipt_sha256": "07420effa4ce90ecb6a31e5258da83dd041956a4442e34d1203acb80af9c4251",
+  "invariants": [
+    "Initial configured catalogue owner starts before native demand",
+    "Exact successful Child.wait clears initial bootstrap latch; failed or unknown departure does not",
+    "Existing child custody and bounded retry guards remain",
+    "Dormant readiness requires verified supervisor image and exact successful child exit",
+    "Trusted descriptor remains a separate mandatory gate",
+    "JSON object property order is immaterial; missing fields, nulls, values and array order remain significant"
+  ],
+  "retained_checks": "24-package Windows/Linux strict production gate plus fresh changed-package gates; previously passed real-child custody fixture is retained, not rerun for this idle latch",
+  "installed_verification": "Fresh D installed native-only execution pending; unchanged C core/load receipts remain historical and are not promoted"
+}

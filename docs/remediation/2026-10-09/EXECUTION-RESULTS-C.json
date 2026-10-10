@@ -1,0 +1,264 @@
+{
+  "schema": "eliot.v27_execution_results.v1",
+  "observed_at_utc": "2026-10-10T06:00:39.7351978Z",
+  "candidate_commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+  "binding_receipt_sha256": "b762bce3c4880b8b66806afd0df43b93d746ea47d17bdf67edb2bb7b2bf7d036",
+  "build_packages": [
+    {
+      "package": "host_runtime",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "8888202613d9ec111471e7dd126b11d57e9e46e0be8a48b9fc95c60ebc8e4af6"
+    },
+    {
+      "package": "host_supervisor",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "d75f6501d4c23b84d91c8712268b502ecfc5f16a77db74007a2eee386b2b4b55"
+    },
+    {
+      "package": "host_launcher",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "a65703e1079a6e0c9fdbb338940d4716efb814a4b2be80d2abf870c8472ba84f"
+    },
+    {
+      "package": "public_cli",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "13a232089026ff04032140eadb4f167441eb7d039b55e6392a0ab43f966ec6a3"
+    },
+    {
+      "package": "process_owner_helper",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "86db96d20fafffff2eaad87d7f68ae01972fe1d5dfba0b16d704dcf274359a0a"
+    },
+    {
+      "package": "opencode_module",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "8ad004621007e881bc658d96505224ab7bbfe0074741625a61a1774379850497"
+    },
+    {
+      "package": "antigravity_module",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "4c6df397d06dc098830084d7fd647df80472a086a35d30d2208720852dcd0220"
+    },
+    {
+      "package": "swarm_mcp",
+      "commit": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+      "clean_before": true,
+      "clean_after": true,
+      "manifest_sha256": "f21ef1d9a369a314add2135925e547f232bb839599cc1de6b099a2def9e0fa38"
+    }
+  ],
+  "host_resource_install": {
+    "install_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010c\\candidate-build\\host-stack",
+    "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010c\\candidate-build\\host-stack\\swarm-kernel-host.install-receipt.json",
+    "receipt_sha256": "e5e86b739f683fc334f5ff4cc65aa979cab13b315544237dac59b2ad268c3e57",
+    "build_manifest_sha256": "8888202613d9ec111471e7dd126b11d57e9e46e0be8a48b9fc95c60ebc8e4af6",
+    "installer_readback_path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\candidate-install-readback.json",
+    "installer_readback_sha256": "49e6c166aa4393fb85f0cba06d40f884923095a6745466f92883360e51086793",
+    "resource_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010c\\candidate-build\\host-stack\\resources\\modules\\opencode",
+    "server_program": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010c\\candidate-build\\host-stack\\resources\\modules\\opencode\\serve.mjs",
+    "server_program_sha256": "d36394f227d272e91150ce3cf6e469b6c8bfae9997ad957306518bbeb49c956c",
+    "dependency_closure_manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010c\\candidate-build\\host-stack\\resources\\modules\\opencode\\dependency-closure.json",
+    "dependency_closure_sha256": "97600fed55ff73d59010df77be16c99d5488fe595aa95c3e9511183a26449519",
+    "dependency_tree_sha256": "396ef448a1494e29ae8a599ceee7827afeb88787487f88394cbf22e90e9fd486",
+    "dependency_file_count": 34060,
+    "unchanged_after_runner": true
+  },
+  "host_load": {
+    "status": "PASS",
+    "receipt_sha256": "634ede27c539425fb4efe35f486a45952ca73563bec9552320959ec8ea362499",
+    "scope": "host-only fixture load; no native runtimes, bridges or model calls",
+    "host_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+    "parameters": {
+      "clients": 200,
+      "senders": 32,
+      "duration_seconds": 20.0,
+      "tasks": 200,
+      "ipc_defaults": "max_connections=256, max_inflight_per_connection=8, max_frame_bytes=1048576 (config.rs defaults; no --config passed)"
+    },
+    "event_load": {
+      "seconds": 24.072,
+      "senders": 32,
+      "consumers": 168,
+      "message_send_ok": 3125,
+      "message_send_errors": 0,
+      "error_codes": {},
+      "events_per_second": 129.8,
+      "consumer_message_read_calls": 1936,
+      "consumer_items_read": 2517
+    },
+    "verification_drain": {
+      "events_after_baseline": 3125,
+      "message_send_events": 3125,
+      "matches_admissions": true,
+      "seconds": 0.279,
+      "events_per_second": 11216.9
+    },
+    "status_latency_under_load": {
+      "count": 351,
+      "min_ms": 0.403,
+      "p50_ms": 0.899,
+      "p95_ms": 1.313,
+      "p99_ms": 1.45,
+      "max_ms": 2.55,
+      "mean_ms": 0.915
+    },
+    "host_exit_code": 0,
+    "shutdown_disposition": "owned_fixture_host_stdin_eof"
+  },
+  "core_failure": {
+    "receipt_sha256": "ddd622f35157a4e1675b7a96f40736db717854e5d7e33f63e7cf81aff00cbb62",
+    "execution_status": "completed",
+    "qualification": "not_qualified",
+    "scenarios": [
+      {
+        "name": "manager-dropped-ack-restart",
+        "run_id": "manager-dropped-ack-restart-bcd1a75ee18d4b85837fc1579f2db964",
+        "status": "unknown",
+        "code": "PUBLIC_TASK_ORIGIN_UNAVAILABLE",
+        "facts": {
+          "host_pid": 34252,
+          "host_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "host_epoch_before": 1,
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "manager_ack": "intentionally_not_read",
+          "logical_request_id": "core-failure:c357bfce388a4bbb93dbe0d13412b68a",
+          "public_task_identity_before_restart": "unknown",
+          "public_task_identity_before_restart_code": "PUBLIC_TASK_ORIGIN_UNAVAILABLE",
+          "host_restart_pid": 53136,
+          "host_restart_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "host_epoch_after": 2,
+          "public_task_identity_after_restart": "unknown",
+          "public_task_identity_after_restart_code": "PUBLIC_TASK_ORIGIN_UNAVAILABLE"
+        }
+      },
+      {
+        "name": "manager-durable-request-conflict",
+        "run_id": "manager-durable-request-conflict-dbb403ea0bd44e99a8917a739c53fa67",
+        "status": "observed",
+        "code": null,
+        "facts": {
+          "host_pid": 55832,
+          "host_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "host_restart_pid": 79676,
+          "host_restart_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "host_epoch_after": 2,
+          "manager_error_code": "REQUEST_ID_CONFLICT",
+          "original_operation_id": "41a6c3e8-d1b4-414a-b952-728a5566a237",
+          "original_task_id": "1dff9613-b689-4bab-beb2-b1cbede4ac06",
+          "original_operation_state": "settled",
+          "conflicting_task_created": false,
+          "complete_public_task_identity_set_verified": true,
+          "current_manager_handover": true,
+          "gm_epoch": 1
+        }
+      },
+      {
+        "name": "hook-callback-restart-dedup",
+        "run_id": "hook-callback-restart-dedup-85019d627bdb4d2d9e0980ba3a231987",
+        "status": "unknown",
+        "code": "HOOK_EVENT_NOT_UNIQUE_AFTER_RESTART",
+        "facts": {
+          "host_pid": 82888,
+          "host_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "rpc_transport_code": "ACK_DROPPED_BY_HARNESS",
+          "application_effect_possible": true,
+          "callback_ack": "intentionally_not_read",
+          "source_id": "77993bc8-47eb-4c66-8ddb-6c0ba666f046",
+          "commit_oid": "5cc0d4a3241eee6e63fb72ac62d399a698bed0a3",
+          "host_restart_pid": 72176,
+          "host_restart_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "host_epoch_after": 2,
+          "fixture_hook_revoked_and_restored": true
+        }
+      },
+      {
+        "name": "optional-worker-observation",
+        "run_id": "optional-worker-observation-0b16e5dda89d4f6692cabcb910d349d0",
+        "status": "observed",
+        "code": null,
+        "facts": {
+          "host_pid": 53636,
+          "host_image_sha256": "06a5a3e58e304bb6b3a662ae083fdc7dbc88b2cc19bf73425fe0622221308bf8",
+          "manager_visible_workers": {
+            "module-supervisor": {
+              "state": "isolated",
+              "consecutive_failures": 5,
+              "last_error_code": "SUPERVISOR_STOPPED"
+            }
+          },
+          "failure_was_injected_by_harness": false,
+          "interpretation": "existing bounded health is Manager-visible; this harness has no public control that can induce a specific legacy worker failure"
+        }
+      }
+    ]
+  },
+  "native": [
+    {
+      "adapter": "OpenCode",
+      "run_id": "cf926247-292b-4268-a621-002c47a82dce",
+      "receipt_sha256": "4e9bf7c5ed2cac2104a5aba28ef0cfe276c7bc0f12015e9095ac312d212059cc",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "isolated_host",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "manager_admission",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "trusted_descriptor",
+          "status": "blocked",
+          "code": "TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH"
+        }
+      ]
+    },
+    {
+      "adapter": "Antigravity",
+      "run_id": "8068edbf-04ff-435f-922c-e6c2a913bf63",
+      "receipt_sha256": "a921ef6539be174d71b451dc8f87b8b66b20beeed396741919cbc223cceea64c",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "stages": [
+        {
+          "name": "preflight",
+          "status": "passed",
+          "code": null
+        },
+        {
+          "name": "isolated_host",
+          "status": "blocked",
+          "code": "HOST_SUPERVISOR_NOT_READY"
+        }
+      ]
+    }
+  ],
+  "supervisor_health_readback_sha256": "e7aef7bfd4a2abeb0ee5e2849f836ccab9d09b3d3a8d798411a36978c6db383c",
+  "interpretation": "OpenCode passed installed quiet-host readiness and Manager admission, then the strict descriptor comparison failed. Antigravity missed the transient running state. Both retained successful idle child exits and zero dispatches. Canonical JSON object comparison and an initial-only bootstrap latch are subsequent repairs; these historical outcomes remain not qualified."
+}

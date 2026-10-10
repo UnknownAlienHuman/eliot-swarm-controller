@@ -20,7 +20,7 @@
   "unchanged_baseline_source_count": 405,
   "diagnosis": "Canonical Windows root had a verbatim prefix while ordinary installed paths were compared lexically before normalization.",
   "invariants": [
-    "Reject raw parent/current components and links/reparse ancestors before canonicalization",
+    "Reject ParentDir components and links/reparse ancestors before canonicalization; Path::components normalizes internal current-directory components",
     "Require canonical root containment and regular files",
     "Retain descriptor/receipt identity, bounded JSON and all executable/descriptor hashes"
   ],

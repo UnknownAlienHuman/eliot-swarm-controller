@@ -1,0 +1,59 @@
+{
+  "CompletionProof": {
+    "task_goal": "Complete V27 source repairs and exact installed qualification",
+    "acceptance_items": [
+      {
+        "item": "Finite 62-row source audit",
+        "status": "verified",
+        "evidence": "docs/remediation/2026-10-09/HIGH-VERDICTS.json",
+        "residual_uncertainty": "Historical two UNKNOWN rows retain bounded execution scope"
+      },
+      {
+        "item": "Connected code and strict production Clippy",
+        "status": "verified",
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
+        "residual_uncertainty": "Retained 24-package gate plus changed-package gates"
+      },
+      {
+        "item": "Repaired installed core/native components",
+        "status": "not_verified",
+        "evidence": "A/B/C installed receipts preserved; fresh D native-only candidate pending",
+        "residual_uncertainty": "No model calls proven yet"
+      },
+      {
+        "item": "Full exact causal native result",
+        "status": "blocked",
+        "evidence": "OpenCode2.0.7 missing exact assistant/input parent; Antigravity RESULT_BODY_UNAVAILABLE",
+        "residual_uncertainty": "Unsupported public native identity/body contract"
+      },
+      {
+        "item": "Observed GitHub dependency alerts",
+        "status": "blocked",
+        "evidence": "DEPENDENCY-ALERTS.json: 13 open alerts, exact upstream pins and immutable donor; no verified supported patch",
+        "residual_uncertainty": "Immutable donor/exact pins and unpatched advisories"
+      }
+    ],
+    "changed_files": [
+      "crates/swarm-kernel-host/src/host_module_supervisor.rs",
+      "tools/qualification/New-NativeQualification.ps1",
+      "docs/remediation/2026-10-09/CURRENT-AUDIT.md",
+      "docs/remediation/2026-10-09/QUALIFICATION-PLAN.md",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-C.json",
+      "docs/remediation/2026-10-09/IDLE-CATALOGUE-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/DESCRIPTOR-REPAIR-EVIDENCE.json"
+    ],
+    "checks_run": [
+      "Windows/Linux strict host production Clippy",
+      "Actual-function StrictMode descriptor/readiness verifier",
+      "408-source baseline readback:405 unchanged and 3 changed with fresh affected gates",
+      "Retained prior real-child custody fixture",
+      "git diff --check"
+    ],
+    "checks_not_run_and_why": [
+      "Unchanged broad suites retained per user no-test-loops instruction",
+      "ELIOT MCP unavailable; documented standalone mode"
+    ],
+    "remaining_uncertainty": "Fresh installed native D execution pending; retained dropped-ACK origin, hook fact, exact result body and dependency blockers remain",
+    "final_status": "PARTIAL_PROGRESS"
+  }
+}

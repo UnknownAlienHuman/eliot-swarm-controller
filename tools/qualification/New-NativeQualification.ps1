@@ -545,10 +545,182 @@ function Test-ExactObjectKeys {
 function Get-OptionalField {
     param([AllowNull()] $Object, [Parameter(Mandatory)][string] $Name)
     if ($null -eq $Object) { return $null }
-    if ($Object -is [System.Collections.IDictionary]) { return $Object[$Name] }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -ne $property) { return $property.Value }
     return $null
+}
+
+function Test-ObjectFieldPresent {
+    param([AllowNull()] $Object, [Parameter(Mandatory)][string] $Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) { return $Object.Contains($Name) }
+    return ($null -ne $Object.PSObject.Properties[$Name])
+}
+
+function Test-JsonSemanticEquality {
+    param([AllowNull()] $Left, [AllowNull()] $Right)
+    if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
+
+    $jsonNodeType = [System.Type]::GetType('System.Text.Json.Nodes.JsonNode, System.Text.Json', $false)
+    if ($null -eq $jsonNodeType) { Stop-Qualification 'JSON_SEMANTIC_COMPARISON_UNAVAILABLE' }
+    $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static
+    $deepEquals = $jsonNodeType.GetMethod('DeepEquals', $flags, $null, [type[]]@($jsonNodeType, $jsonNodeType), $null)
+    if ($null -eq $deepEquals) { Stop-Qualification 'JSON_SEMANTIC_COMPARISON_UNAVAILABLE' }
+
+    try {
+        $leftJson = ConvertTo-Json -InputObject $Left -Depth 48 -Compress
+        $rightJson = ConvertTo-Json -InputObject $Right -Depth 48 -Compress
+        $leftNode = [System.Text.Json.Nodes.JsonNode]::Parse($leftJson)
+        $rightNode = [System.Text.Json.Nodes.JsonNode]::Parse($rightJson)
+        return [bool]$deepEquals.Invoke($null, [object[]]@($leftNode, $rightNode))
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-HostReadiness {
+    param([AllowNull()] $HostStatus,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $VerifiedSupervisorSha256)
+
+    $hostLifecycle = Get-OptionalField $HostStatus 'host_lifecycle'
+    $currentLifecycle = Get-OptionalField $hostLifecycle 'current'
+    $kernelState = [string](Get-OptionalField $currentLifecycle 'state')
+    $optionalWorkers = Get-OptionalField $hostLifecycle 'optional_workers'
+    $moduleSupervisor = Get-OptionalField $optionalWorkers 'module-supervisor'
+    $moduleSupervisorState = [string](Get-OptionalField $moduleSupervisor 'state')
+    [long]$hostEpoch = 0
+    $epochValue = Get-OptionalField $HostStatus 'host_epoch'
+    if ($null -ne $epochValue) { [void][long]::TryParse([string]$epochValue, [ref]$hostEpoch) }
+
+    $facts = [ordered]@{
+        host_epoch = $hostEpoch
+        kernel_lifecycle_state = $kernelState
+        module_supervisor_state = $moduleSupervisorState
+    }
+    if ($kernelState -cne 'running' -or $hostEpoch -le 0) {
+        return [pscustomobject]@{ ready = $false; code = 'HOST_NOT_READY'; facts = $facts }
+    }
+    if ($moduleSupervisorState -ceq 'running') {
+        return [pscustomobject]@{ ready = $true; code = $null; facts = $facts }
+    }
+    if ($moduleSupervisorState -cne 'dormant') {
+        return [pscustomobject]@{ ready = $false; code = 'HOST_SUPERVISOR_NOT_READY'; facts = $facts }
+    }
+
+    $consecutiveFailures = Get-OptionalField $moduleSupervisor 'consecutive_failures'
+    $lastErrorCode = Get-OptionalField $moduleSupervisor 'last_error_code'
+    $retryAfter = Get-OptionalField $moduleSupervisor 'retry_after_ms'
+    if (($consecutiveFailures -isnot [int] -and $consecutiveFailures -isnot [long]) -or
+        $consecutiveFailures -ne 0 -or $null -ne $lastErrorCode -or $null -ne $retryAfter) {
+        return [pscustomobject]@{ ready = $false; code = 'HOST_SUPERVISOR_NOT_READY'; facts = $facts }
+    }
+
+    $child = Get-OptionalField $moduleSupervisor 'child'
+    $process = Get-OptionalField $child 'process'
+    $processPid = Get-OptionalField $process 'pid'
+    $image = Get-OptionalField $process 'image'
+    $imagePid = Get-OptionalField $image 'pid'
+    $imageSha256 = Get-OptionalField $image 'image_sha256'
+    $exit = Get-OptionalField $child 'exit'
+    $exitCategory = Get-OptionalField $exit 'category'
+    $exitCode = Get-OptionalField $exit 'code'
+    $exitErrorCode = Get-OptionalField $exit 'error_code'
+    $secondaryCodes = Get-OptionalField $exit 'secondary_codes'
+    $stopState = Get-OptionalField $child 'stop'
+    $expectedImageSha256 = 'sha256:' + $VerifiedSupervisorSha256.ToLowerInvariant()
+    $validPid = ($processPid -is [int] -or $processPid -is [long]) -and $processPid -gt 0
+    $validImagePid = ($imagePid -is [int] -or $imagePid -is [long]) -and $imagePid -eq $processPid
+    $validExitCode = ($exitCode -is [int] -or $exitCode -is [long]) -and $exitCode -eq 0
+    $validSecondaryCodes = $null -eq $secondaryCodes -or
+        (($secondaryCodes -is [array] -or $secondaryCodes -is [System.Collections.Generic.List[object]]) -and $secondaryCodes.Count -eq 0)
+    if (-not $validPid -or -not $validImagePid -or
+        $stopState -cne 'not_requested' -or $exitCategory -cne 'exited' -or -not $validExitCode -or
+        $null -ne $exitErrorCode -or -not $validSecondaryCodes -or
+        $imageSha256 -cnotmatch '^sha256:[a-f0-9]{64}$' -or $imageSha256 -cne $expectedImageSha256) {
+        return [pscustomobject]@{ ready = $false; code = 'HOST_SUPERVISOR_NOT_READY'; facts = $facts }
+    }
+
+    $facts.child_exit_category = $exitCategory
+    $facts.child_exit_code = 0
+    $facts.module_supervisor_image_sha256 = $imageSha256
+    return [pscustomobject]@{ ready = $true; code = $null; facts = $facts }
+}
+
+function Assert-TrustedDescriptorContract {
+    param([Parameter(Mandatory)][object[]] $CatalogDescriptors,
+        [Parameter(Mandatory)] $ModuleDescriptor,
+        [Parameter(Mandatory)] $Contract,
+        [Parameter(Mandatory)][long] $CatalogRevision)
+
+    $descriptorEntry = @($CatalogDescriptors | Where-Object {
+        $artifact = Get-OptionalField $_ 'artifact'
+        (Get-OptionalField $_ 'module_id') -ceq $Contract.module_id -and
+        (Get-OptionalField $artifact 'artifact_id') -ceq $Contract.artifact_id -and
+        (Get-OptionalField $artifact 'version') -ceq $Contract.version
+    })
+    if ($descriptorEntry.Count -ne 1) { Stop-Qualification 'TRUSTED_DESCRIPTOR_NOT_REGISTERED_OR_INCOMPATIBLE' }
+
+    $entry = $descriptorEntry[0]
+    $protocol = Get-OptionalField $entry 'protocol'
+    $minimum = Get-OptionalField $protocol 'minimum'
+    $maximum = Get-OptionalField $protocol 'maximum'
+    $minimumMajor = Get-OptionalField $minimum 'major'
+    $minimumMinor = Get-OptionalField $minimum 'minor'
+    $maximumMajor = Get-OptionalField $maximum 'major'
+    $maximumMinor = Get-OptionalField $maximum 'minor'
+    if ((Get-OptionalField $entry 'enabled') -ne $true -or
+        $null -eq $minimumMajor -or $null -eq $minimumMinor -or $null -eq $maximumMajor -or $null -eq $maximumMinor -or
+        $minimumMajor -gt 1 -or $maximumMajor -lt 1 -or
+        ($minimumMajor -eq 1 -and $minimumMinor -gt 0) -or
+        ($maximumMajor -eq 1 -and $maximumMinor -lt 0)) {
+        Stop-Qualification 'TRUSTED_DESCRIPTOR_NOT_REGISTERED_OR_INCOMPATIBLE'
+    }
+
+    $catalogCaps = @((Get-OptionalField $entry 'capabilities') | ForEach-Object { [string]$_ } | Sort-Object)
+    $expectedCaps = @($Contract.capabilities | Sort-Object)
+    $expectedCommands = @($Contract.command_schemas | Sort-Object)
+    $expectedEvents = @($Contract.event_schemas | Sort-Object)
+    $catalogCommands = @((Get-OptionalField $entry 'command_schemas') | ForEach-Object { "{0}@{1}:{2}" -f (Get-OptionalField $_ 'schema_id'), (Get-OptionalField $_ 'version'), (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $catalogEvents = @((Get-OptionalField $entry 'event_schemas') | ForEach-Object { "{0}@{1}:{2}" -f (Get-OptionalField $_ 'schema_id'), (Get-OptionalField $_ 'version'), (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $localCommands = @((Get-OptionalField $ModuleDescriptor 'command_schemas') | ForEach-Object { "{0}@{1}:{2}" -f (Get-OptionalField $_ 'schema_id'), (Get-OptionalField $_ 'version'), (Get-OptionalField $_ 'sha256') } | Sort-Object)
+    $localEvents = @((Get-OptionalField $ModuleDescriptor 'event_schemas') | ForEach-Object { "{0}@{1}:{2}" -f (Get-OptionalField $_ 'schema_id'), (Get-OptionalField $_ 'version'), (Get-OptionalField $_ 'sha256') } | Sort-Object)
+
+    $catalogHasConfigSchema = Test-ObjectFieldPresent $entry 'config_schema'
+    $localHasConfigSchema = Test-ObjectFieldPresent $ModuleDescriptor 'config_schema'
+    $catalogHasProtocol = Test-ObjectFieldPresent $entry 'protocol'
+    $localHasProtocol = Test-ObjectFieldPresent $ModuleDescriptor 'protocol'
+    $configSchemaMatches = $catalogHasConfigSchema -eq $localHasConfigSchema -and
+        (Test-JsonSemanticEquality (Get-OptionalField $entry 'config_schema') (Get-OptionalField $ModuleDescriptor 'config_schema'))
+    $protocolMatches = $catalogHasProtocol -eq $localHasProtocol -and
+        (Test-JsonSemanticEquality (Get-OptionalField $entry 'protocol') (Get-OptionalField $ModuleDescriptor 'protocol'))
+    $catalogArtifact = Get-OptionalField $entry 'artifact'
+    $localArtifact = Get-OptionalField $ModuleDescriptor 'artifact'
+    if (($catalogCaps -join ',') -cne ($expectedCaps -join ',') -or
+        ($catalogCommands -join ',') -cne ($expectedCommands -join ',') -or
+        ($catalogEvents -join ',') -cne ($expectedEvents -join ',') -or
+        ($localCommands -join ',') -cne ($catalogCommands -join ',') -or
+        ($localEvents -join ',') -cne ($catalogEvents -join ',') -or
+        -not $configSchemaMatches -or -not $protocolMatches -or
+        (Get-OptionalField $catalogArtifact 'build_id') -ne (Get-OptionalField $localArtifact 'build_id') -or
+        (Get-OptionalField $entry 'lifecycle') -ne (Get-OptionalField $ModuleDescriptor 'lifecycle') -or
+        (Get-OptionalField $entry 'activation') -ne (Get-OptionalField $ModuleDescriptor 'activation')) {
+        Stop-Qualification 'TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH'
+    }
+
+    return [ordered]@{
+        module_id = $Contract.module_id
+        artifact_id = $Contract.artifact_id
+        version = $Contract.version
+        registered_revision = Get-OptionalField $entry 'registered_revision'
+        catalog_revision = $CatalogRevision
+        protocol = '1.0'
+        capability_count = $catalogCaps.Count
+    }
 }
 
 function New-RequestId {
@@ -1462,35 +1634,12 @@ try {
         if (Test-Path -LiteralPath $script:OperatorCredentialPath) {
             $operatorStatus = Invoke-ApplicationCall -CredentialPath $script:OperatorCredentialPath -Method 'host.status' -Params ([ordered]@{}) -TimeoutMilliseconds 10000
             if ($operatorStatus.completed -and $operatorStatus.exit_code -eq 0 -and $null -ne $operatorStatus.value) {
-                $kernelState = ''
-                $moduleSupervisorState = ''
-                $hostLifecycle = $operatorStatus.value.host_lifecycle
-                if ($hostLifecycle -is [System.Collections.IDictionary]) {
-                    $currentLifecycle = $hostLifecycle['current']
-                    if ($currentLifecycle -is [System.Collections.IDictionary]) {
-                        $kernelState = [string]$currentLifecycle['state']
-                    }
-                    $optionalWorkers = $hostLifecycle['optional_workers']
-                    if ($optionalWorkers -is [System.Collections.IDictionary]) {
-                        $moduleSupervisor = $optionalWorkers['module-supervisor']
-                        if ($moduleSupervisor -is [System.Collections.IDictionary]) {
-                            $moduleSupervisorState = [string]$moduleSupervisor['state']
-                        }
-                    }
-                }
-                [long]$hostEpoch = 0
-                [void][long]::TryParse([string]$operatorStatus.value.host_epoch, [ref]$hostEpoch)
-                if ($kernelState -ceq 'running' -and $hostEpoch -gt 0) {
-                    $readinessCode = 'HOST_SUPERVISOR_NOT_READY'
-                    if ($moduleSupervisorState -ceq 'running') {
-                        $hostReadinessFacts = [ordered]@{
-                            host_epoch = $hostEpoch
-                            kernel_lifecycle_state = $kernelState
-                            module_supervisor_state = $moduleSupervisorState
-                        }
-                        $hostReady = $true
-                        break
-                    }
+                $readiness = Get-HostReadiness -HostStatus $operatorStatus.value -VerifiedSupervisorSha256 $actualHostSupervisorHash
+                $readinessCode = $readiness.code
+                if ($readiness.ready) {
+                    $hostReadinessFacts = $readiness.facts
+                    $hostReady = $true
+                    break
                 }
             }
         }
@@ -1539,38 +1688,17 @@ try {
     $catalogDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(30, $TimeoutSeconds))
     do {
         $catalog = Get-ModuleCatalog -TimeoutMilliseconds 30000
-        if ($catalog.success -and @($catalog.descriptors | Where-Object { $_.module_id -eq $contract.module_id -and $_.artifact.artifact_id -eq $contract.artifact_id -and $_.artifact.version -eq $contract.version }).Count -eq 1) { break }
+        if ($catalog.success -and @($catalog.descriptors | Where-Object {
+            $artifact = Get-OptionalField $_ 'artifact'
+            (Get-OptionalField $_ 'module_id') -ceq $contract.module_id -and
+            (Get-OptionalField $artifact 'artifact_id') -ceq $contract.artifact_id -and
+            (Get-OptionalField $artifact 'version') -ceq $contract.version
+        }).Count -eq 1) { break }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $catalogDeadline -and -not $script:HostProcess.HasExited)
     if (-not $catalog.success) { Stop-Qualification $(if ($catalog.code) { $catalog.code } else { 'MODULE_CATALOG_UNAVAILABLE' }) }
-    $descriptorEntry = @($catalog.descriptors | Where-Object { $_.module_id -ceq $contract.module_id -and $_.artifact.artifact_id -ceq $contract.artifact_id -and $_.artifact.version -ceq $contract.version })
-    if ($descriptorEntry.Count -ne 1 -or $descriptorEntry[0].enabled -ne $true -or $descriptorEntry[0].protocol.minimum.major -gt 1 -or $descriptorEntry[0].protocol.maximum.major -lt 1 -or
-        ($descriptorEntry[0].protocol.minimum.major -eq 1 -and $descriptorEntry[0].protocol.minimum.minor -gt 0) -or
-        ($descriptorEntry[0].protocol.maximum.major -eq 1 -and $descriptorEntry[0].protocol.maximum.minor -lt 0)) {
-        Stop-Qualification 'TRUSTED_DESCRIPTOR_NOT_REGISTERED_OR_INCOMPATIBLE'
-    }
-    $catalogCaps = @($descriptorEntry[0].capabilities | ForEach-Object { [string]$_ } | Sort-Object)
-    $expectedCaps = @($contract.capabilities | Sort-Object)
-    $expectedCommands = @($contract.command_schemas | Sort-Object)
-    $expectedEvents = @($contract.event_schemas | Sort-Object)
-    $catalogCommands = @($descriptorEntry[0].command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
-    $catalogEvents = @($descriptorEntry[0].event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
-    $localCommands = @($module.descriptor.command_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
-    $localEvents = @($module.descriptor.event_schemas | ForEach-Object { "{0}@{1}:{2}" -f $_.schema_id, $_.version, (Get-OptionalField $_ 'sha256') } | Sort-Object)
-    $configSchemaMatches = (ConvertTo-Json -InputObject $descriptorEntry[0].config_schema -Depth 16 -Compress) -ceq (ConvertTo-Json -InputObject $module.descriptor.config_schema -Depth 16 -Compress)
-    $protocolMatches = (ConvertTo-Json -InputObject $descriptorEntry[0].protocol -Depth 16 -Compress) -ceq (ConvertTo-Json -InputObject $module.descriptor.protocol -Depth 16 -Compress)
-    if (($catalogCaps -join ',') -cne ($expectedCaps -join ',') -or
-        ($catalogCommands -join ',') -cne ($expectedCommands -join ',') -or
-        ($catalogEvents -join ',') -cne ($expectedEvents -join ',') -or
-        ($localCommands -join ',') -cne ($catalogCommands -join ',') -or
-        ($localEvents -join ',') -cne ($catalogEvents -join ',') -or
-        -not $configSchemaMatches -or -not $protocolMatches -or
-        $descriptorEntry[0].artifact.build_id -ne $module.descriptor.artifact.build_id -or
-        $descriptorEntry[0].lifecycle -ne $module.descriptor.lifecycle -or
-        $descriptorEntry[0].activation -ne $module.descriptor.activation) {
-        Stop-Qualification 'TRUSTED_DESCRIPTOR_CONTRACT_MISMATCH'
-    }
-    Add-Stage -Name 'trusted_descriptor' -Status 'passed' -Facts ([ordered]@{ module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; registered_revision = $descriptorEntry[0].registered_revision; catalog_revision = $catalog.revision; protocol = '1.0'; capability_count = $catalogCaps.Count })
+    $trustedDescriptorFacts = Assert-TrustedDescriptorContract -CatalogDescriptors @($catalog.descriptors) -ModuleDescriptor $module.descriptor -Contract $contract -CatalogRevision ([long]$catalog.revision)
+    Add-Stage -Name 'trusted_descriptor' -Status 'passed' -Facts $trustedDescriptorFacts
 
     $script:CurrentStage = 'route_configuration'
     $routeCall = Invoke-ManagerCall -Method 'route.list' -Params ([ordered]@{}) -TimeoutMilliseconds 30000

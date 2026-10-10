@@ -351,7 +351,7 @@ async fn run_supervisor_process_loop(
     let mut failures = 0_u32;
     let mut retry = SUPERVISOR_PROCESS_BASE_RETRY;
     // Configured descriptors need their catalogue owner before the first agent launch.
-    let catalog_needed = !bootstrap.config.descriptor_files.is_empty();
+    let mut catalog_needed = !bootstrap.config.descriptor_files.is_empty();
     let frame = match bootstrap.to_frame() {
         Ok(frame) => frame,
         Err(error) => {
@@ -635,6 +635,11 @@ async fn run_supervisor_process_loop(
         let child_health = supervisor_child_health(&child.identity, Some(child_exit), child_stop);
         if matches!(&exit, Some(Ok(_))) {
             let _ = child.take_child();
+        }
+        if matches!(&exit, Some(Ok(status)) if status.success()) {
+            // Registration completed before the standalone owner's normal idle exit.
+            // Future activation belongs to the durable demand watch.
+            catalog_needed = false;
         }
         let demanded = match module_supervisor_has_demand(&store).await {
             Ok(demanded) => catalog_needed || demanded,
