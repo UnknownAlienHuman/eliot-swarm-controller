@@ -1659,7 +1659,7 @@ fn validate_operation_ids(
             state.as_str(),
             "sending" | "native_accepted" | "outcome_unknown"
         ) {
-            if observation.phase == ModuleSupervisorPhase::Ready
+            if matches!(observation.phase, ModuleSupervisorPhase::Ready)
                 && matches!(state.as_str(), "settled" | "rejected" | "cancelled")
             {
                 // The immutable hello snapshot may wait behind delivery while

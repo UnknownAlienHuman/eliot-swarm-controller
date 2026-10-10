@@ -28,8 +28,7 @@ fn insert_operation(
     operation_id: &str,
     caller_id: &str,
     method: &str,
-    task_id: &str,
-    attempt_id: &str,
+    task_scope: (&str, &str),
     effective_request: &Value,
     result: &Value,
 ) {
@@ -42,8 +41,8 @@ fn insert_operation(
             format!("request-{operation_id}"),
             method,
             model::canonical(effective_request).unwrap(),
-            task_id,
-            attempt_id,
+            task_scope.0,
+            task_scope.1,
             model::canonical(result).unwrap(),
         ],
     )
@@ -166,8 +165,7 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
         SUBMISSION_OPERATION_ID,
         "submitter",
         "task.submit",
-        TASK_ID,
-        ATTEMPT_ID,
+        (TASK_ID, ATTEMPT_ID),
         &json!({"submission_document":submission_document,"private_contract":"private"}),
         &submission_result,
     );
@@ -186,8 +184,7 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
         ASSIGNMENT_OPERATION_ID,
         "review-manager",
         "review.assign",
-        TASK_ID,
-        ATTEMPT_ID,
+        (TASK_ID, ATTEMPT_ID),
         &json!({"review_assignment":assignment,"private_contract":"private"}),
         &assignment,
     );
@@ -289,8 +286,7 @@ fn another_reviewer_assignment_or_task_does_not_match_the_retained_relation() {
         other_assignment_operation,
         "review-manager",
         "review.assign",
-        TASK_ID,
-        ATTEMPT_ID,
+        (TASK_ID, ATTEMPT_ID),
         &json!({"review_assignment":other_assignment}),
         &other_assignment,
     );
@@ -302,8 +298,7 @@ fn another_reviewer_assignment_or_task_does_not_match_the_retained_relation() {
         mismatched_submission_operation,
         "review-manager",
         "task.submit",
-        TASK_ID,
-        ATTEMPT_ID,
+        (TASK_ID, ATTEMPT_ID),
         &json!({}),
         &json!({
             "operation_id":mismatched_submission_operation,
@@ -347,8 +342,7 @@ fn another_reviewer_assignment_or_task_does_not_match_the_retained_relation() {
         other_task_operation,
         "review-manager",
         "review.assign",
-        "other-task",
-        "other-attempt",
+        ("other-task", "other-attempt"),
         &json!({"review_assignment":other_task_result}),
         &other_task_result,
     );
@@ -360,8 +354,7 @@ fn another_reviewer_assignment_or_task_does_not_match_the_retained_relation() {
         unrelated_task_operation,
         "review-manager",
         "task.dispatch",
-        TASK_ID,
-        ATTEMPT_ID,
+        (TASK_ID, ATTEMPT_ID),
         &json!({}),
         &json!({"operation_id":unrelated_task_operation,"outcome":"applied"}),
     );
