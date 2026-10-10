@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 const REVIEW_STREAM: &str = "controller:review";
 const MAX_REPAIR_TEXT_BYTES: usize = 32 * 1024;
+const CURRENT_REPAIR_SLOT_SCHEMA_VERSION: u32 = 2;
 
 type RepairDeliveryOperationRow = (
     String,
@@ -89,6 +90,7 @@ pub(crate) struct RepairDispatchContext {
     binding_id: String,
     binding_generation: i64,
     semantic_slot_id: String,
+    retained_singleton_text: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -250,9 +252,11 @@ impl RepairDispatchContext {
             binding_id,
             binding_generation,
             semantic_slot_id: String::new(),
+            retained_singleton_text: false,
         };
         let mut context = context;
-        context.semantic_slot_id = context.compute_semantic_slot_id()?;
+        context.semantic_slot_id =
+            context.compute_semantic_slot_id(CURRENT_REPAIR_SLOT_SCHEMA_VERSION)?;
         context.require_committed_lineage(db)?;
         context.require_current_subject(db)?;
         Ok(context)
@@ -280,6 +284,8 @@ impl RepairDispatchContext {
         binding_id: &str,
         binding_generation: i64,
         semantic_slot_id: &str,
+        semantic_slot_schema_version: u32,
+        retained_singleton_text: bool,
         captured_transfer_gm_epoch: Option<i64>,
     ) -> Result<Self> {
         validate_identity_text(owner_manager_id, "owner_manager_id")?;
@@ -287,10 +293,16 @@ impl RepairDispatchContext {
         validate_identity_text(project_id, "project_id")?;
         validate_identity_text(binding_id, "binding_id")?;
         validate_identity_text(semantic_slot_id, "semantic_slot_id")?;
-        if automation_revision <= 0 || binding_generation <= 0 {
+        if automation_revision <= 0
+            || binding_generation <= 0
+            || !matches!(
+                semantic_slot_schema_version,
+                1 | CURRENT_REPAIR_SLOT_SCHEMA_VERSION
+            )
+        {
             return Err(source_damaged());
         }
-        let context = Self::from_retained_source(
+        let mut context = Self::from_retained_source(
             db,
             owner_manager_id,
             automation_id,
@@ -305,8 +317,15 @@ impl RepairDispatchContext {
             findings_package,
             binding_id,
             binding_generation,
+            semantic_slot_schema_version,
             captured_transfer_gm_epoch,
         )?;
+        if retained_singleton_text {
+            if semantic_slot_schema_version != 1 || context.findings_package.findings.len() != 1 {
+                return Err(source_damaged());
+            }
+            context.retained_singleton_text = true;
+        }
         if context.semantic_slot_id != semantic_slot_id {
             return Err(source_damaged());
         }
@@ -329,6 +348,7 @@ impl RepairDispatchContext {
         findings_package: ReviewFindingsPackage,
         expected_binding_id: &str,
         expected_binding_generation: i64,
+        semantic_slot_schema_version: u32,
         captured_transfer_gm_epoch: Option<i64>,
     ) -> Result<Self> {
         validate_identity_text(review_assignment_id, "review_assignment_id")?;
@@ -364,6 +384,7 @@ impl RepairDispatchContext {
             binding_id: expected_binding_id.to_owned(),
             binding_generation: expected_binding_generation,
             semantic_slot_id: String::new(),
+            retained_singleton_text: false,
         };
         let lineage = validate_committed_review_and_feedback(
             db,
@@ -405,7 +426,8 @@ impl RepairDispatchContext {
         } else {
             owner_lineage[..owner_lineage.len() - 1].to_vec()
         };
-        context.semantic_slot_id = context.compute_semantic_slot_id()?;
+        context.semantic_slot_id =
+            context.compute_semantic_slot_id(semantic_slot_schema_version)?;
         context.require_committed_lineage(db)?;
         Ok(context)
     }
@@ -700,16 +722,20 @@ impl RepairDispatchContext {
         Ok(())
     }
 
-    fn compute_semantic_slot_id(&self) -> Result<String> {
-        semantic_slot_id(
-            &self.effective_manager_id,
-            &self.identity,
-            self.findings_package.semantic_subject_key(),
-        )
+    fn compute_semantic_slot_id(&self, schema_version: u32) -> Result<String> {
+        let subject_key = self
+            .findings_package
+            .semantic_subject_key_for_schema(schema_version)
+            .ok_or_else(source_damaged)?;
+        semantic_slot_id(&self.effective_manager_id, &self.identity, subject_key)
     }
 
     pub(crate) fn delivery_request(&self) -> Result<RepairDeliveryRequest> {
-        let text = render_correction_text(&self.identity, &self.findings_package);
+        let text = if self.retained_singleton_text {
+            historical_singleton_text(&self.findings_package).ok_or_else(source_damaged)?
+        } else {
+            render_correction_text(&self.identity, &self.findings_package)
+        };
         if text.len() > MAX_REPAIR_TEXT_BYTES {
             return Err(Error::new(
                 "REPAIR_REQUEST_TOO_LARGE",
@@ -826,6 +852,16 @@ impl RepairDispatchContext {
             "decision_manager_id":self.decision_manager_id,
             "transfer_operation_ids":self.transfer_operation_ids
         });
+        if self.retained_singleton_text
+            && let Some(object) = cause.as_object_mut()
+        {
+            object.remove("findings_digest");
+            object.remove("finding_ids");
+            object.insert(
+                "finding_id".to_owned(),
+                json!(self.findings_package.findings[0].finding_id),
+            );
+        }
         if let (Some(object), Some(epoch)) =
             (cause.as_object_mut(), self.captured_transfer_gm_epoch)
         {
@@ -868,6 +904,41 @@ impl RepairDispatchContext {
             "cause":self.cause_value()
         })
     }
+}
+
+/// Reconstruct only the immutable singleton text used by retained v1 records
+/// before package rendering (3fff155). New delivery producers never use it.
+pub(crate) fn historical_singleton_text(package: &ReviewFindingsPackage) -> Option<String> {
+    if package.findings.len() != 1 {
+        return None;
+    }
+    let identity = &package.identity;
+    let finding = &package.findings[0];
+    let requirements = finding
+        .requirement_ids
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let evidence = finding
+        .evidence_refs
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "A manager applied this correction request to your current Task Attempt. Keep the same unreleased Attempt, address the exact finding and requirements below, and submit a new candidate linked to the prior submission.\n\nTask: {}\nTask revision: {}\nAttempt: {}\nPrior submission: {}\nPrior candidate: {}\nFinding: {}\n\nReason:\n{}\n\nRequested change:\n{}\n\nRequirements:\n{}\n\nEvidence references:\n{}",
+        identity.task_id,
+        identity.task_revision,
+        identity.attempt_id,
+        identity.submission_ref,
+        identity.candidate_ref,
+        finding.finding_id,
+        finding.reason,
+        finding.requested_change,
+        requirements,
+        evidence,
+    ))
 }
 
 /// Validate the live owner and binding for a direct Manager send that exactly

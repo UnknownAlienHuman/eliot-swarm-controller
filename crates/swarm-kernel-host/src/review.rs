@@ -213,13 +213,27 @@ impl ReviewFindingsPackage {
             .collect()
     }
 
-    /// Preserve the historical semantic key for a one-finding package while
-    /// using the full package digest whenever order or membership is plural.
+    /// New RepairDispatch identities always bind the complete retained package,
+    /// including when it contains one finding.
     pub(crate) fn semantic_subject_key(&self) -> &str {
+        &self.findings_digest
+    }
+
+    /// Reproduce the v1 RepairDispatch key only while decoding retained v1
+    /// slots and links. New producers must use `semantic_subject_key`.
+    pub(crate) fn historical_semantic_subject_key(&self) -> &str {
         if self.findings.len() == 1 {
             &self.findings[0].finding_id
         } else {
             &self.findings_digest
+        }
+    }
+
+    pub(crate) fn semantic_subject_key_for_schema(&self, schema_version: u32) -> Option<&str> {
+        match schema_version {
+            1 => Some(self.historical_semantic_subject_key()),
+            2 => Some(self.semantic_subject_key()),
+            _ => None,
         }
     }
 

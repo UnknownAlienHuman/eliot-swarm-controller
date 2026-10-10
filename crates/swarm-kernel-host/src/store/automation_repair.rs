@@ -11,7 +11,7 @@ use crate::{
     automation::{
         actions::AutomationStep,
         config::{self, AutomationEntry},
-        repair::{RepairDeliveryRequest, RepairDispatchContext},
+        repair::{RepairDeliveryRequest, RepairDispatchContext, historical_singleton_text},
     },
     error::{Error, Result},
     model,
@@ -22,8 +22,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const SLOT_SCHEMA_VERSION: u32 = 1;
-const LINK_SCHEMA_VERSION: u32 = 1;
+const LEGACY_REPAIR_SCHEMA_VERSION: u32 = 1;
+const SLOT_SCHEMA_VERSION: u32 = 2;
+const LINK_SCHEMA_VERSION: u32 = 2;
 const REVIEW_STREAM: &str = "controller:review";
 const SLOT_PREFIX: &str = "repair:v1:semantic-slot:";
 const OPERATION_LINK_PREFIX: &str = "repair:v1:operation-link:";
@@ -555,81 +556,113 @@ fn consume_transferred_repair_slot(
         .filter(|owner| owner.as_str() != current_context.effective_manager_id());
     let mut prior_slot: Option<(String, String, RepairSlotReceipt)> = None;
     for owner_id in prior_owners {
-        let semantic_slot_id = crate::automation::repair::semantic_slot_id(
-            owner_id,
-            current_context.identity(),
-            current_context.findings_package().semantic_subject_key(),
-        )?;
-        let Some(value) = config::read_record(
-            tx,
-            &slot_key(&semantic_slot_id),
-            "historical RepairDispatch semantic slot",
-        )?
-        else {
-            continue;
-        };
-        let receipt: RepairSlotReceipt = serde_json::from_value(value).map_err(|_| {
-            Error::new(
-                "REPAIR_SLOT_CORRUPT",
-                "historical RepairDispatch slot fields are invalid",
-            )
-        })?;
-        if receipt.schema_version != SLOT_SCHEMA_VERSION
-            || receipt.semantic_slot_id != semantic_slot_id
-            || receipt.effective_manager_id != owner_id.as_str()
-            || receipt.task_id != current_context.identity().task_id
-            || receipt.task_revision != current_context.identity().task_revision
-            || receipt.attempt_id != current_context.identity().attempt_id
-            || receipt.submission_ref != current_context.identity().submission_ref
-            || receipt.candidate_ref != current_context.identity().candidate_ref
-            || !receipt_matches_package(&receipt, current_context.findings_package())
-            || receipt
-                .source_attempt_owner_id
-                .as_deref()
-                .is_some_and(|source| source != current_context.source_attempt_owner_id())
-            || receipt
-                .review_assignment_sponsor_id
-                .as_deref()
-                .is_some_and(|sponsor| sponsor != current_context.review_assignment_sponsor_id())
-            || receipt
-                .decision_manager_id
-                .as_deref()
-                .is_some_and(|manager| manager != current_context.decision_manager_id())
-        {
-            return Err(Error::new(
-                "REPAIR_SLOT_CORRUPT",
-                "historical RepairDispatch slot belongs to another semantic subject",
-            ));
-        }
-
-        let request = normalized_repair_request(&current.request_value(), &semantic_slot_id)
-            .ok_or_else(|| {
-                Error::new(
-                    "REPAIR_OPERATION_CORRUPT",
-                    "current correction request has an invalid shape",
-                )
-            })?;
-        match resolve_slot_parts(
-            tx,
+        let candidates = semantic_slot_id_candidates(
             owner_id,
             current_context.identity(),
             current_context.findings_package(),
-            current_context.binding_id(),
-            current_context.binding_generation(),
-            &semantic_slot_id,
-            &request,
-            &current.request.parameters_digest()?,
-        )? {
-            RepairSlotResolution::Existing { operation_id, .. }
-                if operation_id == receipt.operation_id => {}
-            RepairSlotResolution::Conflict { .. } => {
+        )?;
+        let mut owner_slot: Option<(String, RepairSlotReceipt, RepairSlotResolution)> = None;
+        for semantic_slot_id in candidates {
+            let Some(value) = config::read_record(
+                tx,
+                &slot_key(&semantic_slot_id),
+                "historical RepairDispatch semantic slot",
+            )?
+            else {
+                continue;
+            };
+            let receipt: RepairSlotReceipt = serde_json::from_value(value).map_err(|_| {
+                Error::new(
+                    "REPAIR_SLOT_CORRUPT",
+                    "historical RepairDispatch slot fields are invalid",
+                )
+            })?;
+            if receipt.effective_manager_id != owner_id.as_str()
+                || receipt.task_id != current_context.identity().task_id
+                || receipt.task_revision != current_context.identity().task_revision
+                || receipt.attempt_id != current_context.identity().attempt_id
+                || receipt.submission_ref != current_context.identity().submission_ref
+                || receipt.candidate_ref != current_context.identity().candidate_ref
+            {
+                return Err(Error::new(
+                    "REPAIR_SLOT_CORRUPT",
+                    "historical RepairDispatch slot belongs to another semantic subject",
+                ));
+            }
+
+            let request = normalized_repair_request(&current.request_value(), &semantic_slot_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        "REPAIR_OPERATION_CORRUPT",
+                        "current correction request has an invalid shape",
+                    )
+                })?;
+            let request_digest = repair_request_digest(&request)?;
+            let resolution = resolve_slot_parts(
+                tx,
+                owner_id,
+                current_context.identity(),
+                current_context.findings_package(),
+                current_context.binding_id(),
+                current_context.binding_generation(),
+                &semantic_slot_id,
+                &request,
+                &request_digest,
+            )?;
+            if resolution == RepairSlotResolution::Vacant {
+                return Err(Error::new(
+                    "REPAIR_SLOT_CORRUPT",
+                    "historical RepairDispatch slot disappeared during readback",
+                ));
+            }
+            if owner_slot.is_some() {
+                return Err(Error::new(
+                    "REPAIR_SLOT_AMBIGUOUS",
+                    "both current and historical RepairDispatch slots are retained for a prior owner",
+                ));
+            }
+            owner_slot = Some((semantic_slot_id, receipt, resolution));
+        }
+        let Some((semantic_slot_id, receipt, resolution)) = owner_slot else {
+            continue;
+        };
+        match resolution {
+            RepairSlotResolution::Conflict { operation_id, .. }
+                if operation_id == receipt.operation_id =>
+            {
                 return Ok(Some(repair_skipped(
                     assignment_id,
                     result_operation_id,
                     "historical_repair_semantic_slot_conflict",
                 )));
             }
-            RepairSlotResolution::Existing { .. } | RepairSlotResolution::Vacant => {
+            RepairSlotResolution::Existing { operation_id, .. }
+                if operation_id == receipt.operation_id =>
+            {
+                if receipt
+                    .source_attempt_owner_id
+                    .as_deref()
+                    .is_some_and(|source| source != current_context.source_attempt_owner_id())
+                    || receipt
+                        .review_assignment_sponsor_id
+                        .as_deref()
+                        .is_some_and(|sponsor| {
+                            sponsor != current_context.review_assignment_sponsor_id()
+                        })
+                    || receipt
+                        .decision_manager_id
+                        .as_deref()
+                        .is_some_and(|manager| manager != current_context.decision_manager_id())
+                {
+                    return Err(Error::new(
+                        "REPAIR_SLOT_CORRUPT",
+                        "historical RepairDispatch slot has different retained source facts",
+                    ));
+                }
+            }
+            RepairSlotResolution::Conflict { .. }
+            | RepairSlotResolution::Existing { .. }
+            | RepairSlotResolution::Vacant => {
                 return Err(Error::new(
                     "REPAIR_SLOT_CORRUPT",
                     "historical RepairDispatch slot resolved to a different Operation",
@@ -709,6 +742,12 @@ fn consume_transferred_repair_slot(
             "historical RepairDispatch Operation is not the exact current review and feedback cause",
         ));
     }
+    let link = operation_link(tx, &receipt.operation_id)?.ok_or_else(|| {
+        Error::new(
+            "REPAIR_LINK_CORRUPT",
+            "historical repair has no validated link",
+        )
+    })?;
     let request = context.delivery_request()?;
     let expected_request = normalized_repair_request(&current.request_value(), &semantic_slot_id)
         .ok_or_else(|| {
@@ -717,7 +756,13 @@ fn consume_transferred_repair_slot(
             "current correction request has an invalid shape",
         )
     })?;
-    if model::canonical(&request.value())? != model::canonical(&expected_request)? {
+    if !package_request_matches(
+        &request.value(),
+        &expected_request,
+        &semantic_slot_id,
+        context.findings_package(),
+        link.schema_version == LEGACY_REPAIR_SCHEMA_VERSION && link.findings_package.is_none(),
+    ) {
         return Err(Error::new(
             "REPAIR_LINK_CORRUPT",
             "historical RepairDispatch request differs from the exact current correction",
@@ -1407,7 +1452,7 @@ pub(crate) fn resolve_direct_slot(
     db: &Connection,
     slot: &DirectRepairSlot,
 ) -> Result<RepairSlotResolution> {
-    resolve_slot_parts(
+    resolve_slot_candidates(
         db,
         &slot.manager_id,
         &slot.identity,
@@ -1420,14 +1465,14 @@ pub(crate) fn resolve_direct_slot(
     )
 }
 
-/// Resolve one durable manager/Task/finding slot before Operation creation.
+/// Resolve one durable manager/Task/package slot before Operation creation.
 /// Direct owner `agent.send` and selected automation must both call this
 /// helper when the send is the exact retained correction request.
 pub(crate) fn resolve_semantic_slot(
     db: &Connection,
     prepared: &PreparedRepairDispatch,
 ) -> Result<RepairSlotResolution> {
-    resolve_slot_parts(
+    resolve_slot_candidates(
         db,
         prepared.context.effective_manager_id(),
         prepared.context.identity(),
@@ -1438,6 +1483,162 @@ pub(crate) fn resolve_semantic_slot(
         &prepared.request_value(),
         &prepared.request.parameters_digest()?,
     )
+}
+
+#[allow(clippy::too_many_arguments)] // Every value is part of the exact direct/automatic slot proof.
+fn resolve_slot_candidates(
+    db: &Connection,
+    manager_id: &str,
+    identity: &ReviewSlotIdentity,
+    findings_package: &ReviewFindingsPackage,
+    expected_binding_id: &str,
+    binding_generation: i64,
+    current_semantic_slot_id: &str,
+    request: &Value,
+    parameters_digest: &str,
+) -> Result<RepairSlotResolution> {
+    let candidates = semantic_slot_id_candidates(manager_id, identity, findings_package)?;
+    if !candidates
+        .iter()
+        .any(|candidate| candidate == current_semantic_slot_id)
+    {
+        return Err(Error::new(
+            "REPAIR_SLOT_CORRUPT",
+            "RepairDispatch slot is not a recognized versioned package identity",
+        ));
+    }
+
+    let mut retained = None;
+    for semantic_slot_id in candidates {
+        let resolution = resolve_slot_parts(
+            db,
+            manager_id,
+            identity,
+            findings_package,
+            expected_binding_id,
+            binding_generation,
+            &semantic_slot_id,
+            request,
+            parameters_digest,
+        )?;
+        if resolution == RepairSlotResolution::Vacant {
+            continue;
+        }
+        if retained.is_some() {
+            return Err(Error::new(
+                "REPAIR_SLOT_AMBIGUOUS",
+                "both current and historical RepairDispatch slots are retained",
+            ));
+        }
+        retained = Some(resolution);
+    }
+    Ok(retained.unwrap_or(RepairSlotResolution::Vacant))
+}
+
+fn semantic_slot_id_candidates(
+    manager_id: &str,
+    identity: &ReviewSlotIdentity,
+    findings_package: &ReviewFindingsPackage,
+) -> Result<Vec<String>> {
+    let current =
+        semantic_slot_id_for_schema(manager_id, identity, findings_package, SLOT_SCHEMA_VERSION)?;
+    let historical = semantic_slot_id_for_schema(
+        manager_id,
+        identity,
+        findings_package,
+        LEGACY_REPAIR_SCHEMA_VERSION,
+    )?;
+    let mut candidates = vec![current];
+    if candidates[0] != historical {
+        candidates.push(historical);
+    }
+    Ok(candidates)
+}
+
+fn semantic_slot_id_for_schema(
+    manager_id: &str,
+    identity: &ReviewSlotIdentity,
+    findings_package: &ReviewFindingsPackage,
+    schema_version: u32,
+) -> Result<String> {
+    let subject_key = findings_package
+        .semantic_subject_key_for_schema(schema_version)
+        .ok_or_else(|| {
+            Error::new(
+                "REPAIR_SLOT_CORRUPT",
+                "RepairDispatch slot schema version is unsupported",
+            )
+        })?;
+    crate::automation::repair::semantic_slot_id(manager_id, identity, subject_key)
+}
+
+fn slot_subject_matches(
+    manager_id: &str,
+    identity: &ReviewSlotIdentity,
+    findings_package: &ReviewFindingsPackage,
+    semantic_slot_id: &str,
+    receipt: &RepairSlotReceipt,
+) -> Result<bool> {
+    Ok(slot_identity_matches(
+        manager_id,
+        identity,
+        findings_package,
+        semantic_slot_id,
+        receipt,
+    )? && receipt_matches_package(receipt, findings_package)
+        && receipt_schema_shape_matches(receipt, findings_package))
+}
+
+fn receipt_schema_shape_matches(
+    receipt: &RepairSlotReceipt,
+    findings_package: &ReviewFindingsPackage,
+) -> bool {
+    match (
+        receipt.schema_version,
+        receipt.finding_id.as_deref(),
+        receipt.findings_digest.as_deref(),
+    ) {
+        (LEGACY_REPAIR_SCHEMA_VERSION, None, Some(_)) => true,
+        (LEGACY_REPAIR_SCHEMA_VERSION, Some(finding_id), None) => {
+            findings_package.findings.len() == 1
+                && findings_package.findings[0].finding_id == finding_id
+        }
+        (SLOT_SCHEMA_VERSION, None, Some(findings_digest)) => {
+            findings_digest == findings_package.findings_digest
+        }
+        _ => false,
+    }
+}
+
+fn slot_identity_matches(
+    manager_id: &str,
+    identity: &ReviewSlotIdentity,
+    findings_package: &ReviewFindingsPackage,
+    semantic_slot_id: &str,
+    receipt: &RepairSlotReceipt,
+) -> Result<bool> {
+    if !supported_repair_schema_version(receipt.schema_version) {
+        return Ok(false);
+    }
+    let expected_id = semantic_slot_id_for_schema(
+        manager_id,
+        identity,
+        findings_package,
+        receipt.schema_version,
+    )?;
+    Ok(expected_id == semantic_slot_id && receipt.semantic_slot_id == semantic_slot_id)
+}
+
+fn supported_repair_schema_version(schema_version: u32) -> bool {
+    matches!(
+        schema_version,
+        LEGACY_REPAIR_SCHEMA_VERSION | SLOT_SCHEMA_VERSION
+    )
+}
+
+fn slot_schema_matches_link(link_schema_version: u32, slot_schema_version: u32) -> bool {
+    supported_repair_schema_version(link_schema_version)
+        && link_schema_version == slot_schema_version
 }
 
 #[allow(clippy::too_many_arguments)] // The resolver checks one exact slot and its immutable Task, finding, binding, and request evidence.
@@ -1462,15 +1663,20 @@ fn resolve_slot_parts(
             "retained RepairDispatch semantic slot fields are invalid",
         )
     })?;
-    if receipt.schema_version != SLOT_SCHEMA_VERSION
-        || receipt.semantic_slot_id != semantic_slot_id
-        || receipt.effective_manager_id != manager_id
+    if receipt.effective_manager_id != manager_id
         || receipt.task_id != identity.task_id
         || receipt.task_revision != identity.task_revision
         || receipt.attempt_id != identity.attempt_id
         || receipt.submission_ref != identity.submission_ref
         || receipt.candidate_ref != identity.candidate_ref
-        || !receipt_matches_package(&receipt, findings_package)
+        || !slot_identity_matches(
+            manager_id,
+            identity,
+            findings_package,
+            semantic_slot_id,
+            &receipt,
+        )?
+        || !receipt_schema_shape_matches(&receipt, findings_package)
     {
         return Err(Error::new(
             "REPAIR_SLOT_CORRUPT",
@@ -1496,6 +1702,12 @@ fn resolve_slot_parts(
     let original_request_id = original_value
         .get("client_request_id")
         .and_then(Value::as_str);
+    if repair_request_digest(request)? != parameters_digest {
+        return Err(Error::new(
+            "REPAIR_OPERATION_CORRUPT",
+            "repair request digest differs from its retained parameters",
+        ));
+    }
     let request_id_matches = if caller_is_automation {
         client_request_id == semantic_slot_id && original_request_id == Some(semantic_slot_id)
     } else if caller_is_manager {
@@ -1517,18 +1729,74 @@ fn resolve_slot_parts(
                 "repair slot request shape is invalid",
             )
         })?;
+    let allow_singleton_text = receipt.schema_version == LEGACY_REPAIR_SCHEMA_VERSION
+        && receipt.findings_digest.is_none()
+        && receipt.finding_id.is_some();
+    let normalized_request_matches = package_request_matches(
+        &normalized_original,
+        &normalized_request,
+        semantic_slot_id,
+        findings_package,
+        allow_singleton_text,
+    );
+    let legacy_digest = if receipt.schema_version == LEGACY_REPAIR_SCHEMA_VERSION
+        && findings_package.findings.len() == 1
+    {
+        let finding = &findings_package.findings[0];
+        let retained_digest =
+            rendered_singleton_package_digest(&original_value, identity, &finding.finding_id)
+                .or_else(|| {
+                    (allow_singleton_text && normalized_request_matches)
+                        .then(|| findings_package.findings_digest.clone())
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        "REPAIR_SLOT_CORRUPT",
+                        "legacy singleton Operation has no exact retained package digest text",
+                    )
+                })?;
+        let receipt_matches_legacy_shape = match (
+            receipt.findings_digest.as_deref(),
+            receipt.finding_id.as_deref(),
+        ) {
+            (Some(receipt_digest), None) => retained_digest == receipt_digest,
+            (None, Some(receipt_finding_id)) => receipt_finding_id == finding.finding_id,
+            _ => false,
+        };
+        if !receipt_matches_legacy_shape {
+            return Err(Error::new(
+                "REPAIR_SLOT_CORRUPT",
+                "legacy singleton slot digest or finding identity differs from its immutable Operation",
+            ));
+        }
+        Some(retained_digest)
+    } else {
+        None
+    };
+    let distinct_legacy_package = receipt.schema_version == LEGACY_REPAIR_SCHEMA_VERSION
+        && findings_package.findings.len() == 1
+        && legacy_digest
+            .as_deref()
+            .is_some_and(|digest| digest != findings_package.findings_digest);
     if method != "agent.send"
         || !request_id_matches
         || task_id.as_deref() != Some(identity.task_id.as_str())
         || attempt_id.as_deref() != Some(identity.attempt_id.as_str())
         || actual_binding_id.as_deref() != Some(expected_binding_id)
         || generation != Some(binding_generation)
-        || model::canonical(&normalized_original)? != model::canonical(&normalized_request)?
         || repair_request_digest(&original_value)? != receipt.parameters_digest
     {
         return Err(Error::new(
             "REPAIR_SLOT_CORRUPT",
             "retained repair slot does not match its immutable delivery Operation",
+        ));
+    }
+    if !distinct_legacy_package
+        && (!receipt_matches_package(&receipt, findings_package) || !normalized_request_matches)
+    {
+        return Err(Error::new(
+            "REPAIR_SLOT_CORRUPT",
+            "retained repair slot does not match its immutable package and delivery Operation",
         ));
     }
     if caller_is_automation {
@@ -1544,18 +1812,81 @@ fn resolve_slot_parts(
                 "automated correction link belongs to another Manager or semantic slot",
             ));
         }
+        let linked_package = findings_package_from_link(&link).map_err(|_| {
+            Error::new(
+                "REPAIR_LINK_CORRUPT",
+                "automated correction link has no validated retained package",
+            )
+        })?;
+        if distinct_legacy_package {
+            let finding_id = &findings_package.findings[0].finding_id;
+            if linked_package.identity != *identity
+                || linked_package.findings.len() != 1
+                || linked_package.findings[0].finding_id != *finding_id
+                || legacy_digest.as_deref() != Some(linked_package.findings_digest.as_str())
+                || linked_package.findings_digest == findings_package.findings_digest
+            {
+                return Err(Error::new(
+                    "REPAIR_LINK_CORRUPT",
+                    "historical automated slot does not prove its distinct retained package",
+                ));
+            }
+        } else if linked_package != *findings_package {
+            return Err(Error::new(
+                "REPAIR_LINK_CORRUPT",
+                "automated correction link package differs from the exact retained package",
+            ));
+        }
+    } else if caller_is_manager {
+        let has_automation_provenance = receipt.source_attempt_owner_id.is_some()
+            || receipt.review_assignment_sponsor_id.is_some()
+            || receipt.decision_manager_id.is_some()
+            || receipt.transfer_operation_ids.is_some()
+            || receipt.captured_transfer_gm_epoch.is_some();
+        if has_automation_provenance {
+            return Err(Error::new(
+                "REPAIR_SLOT_CORRUPT",
+                "direct correction slot unexpectedly carries automation provenance",
+            ));
+        }
     }
-    if receipt.parameters_digest == parameters_digest {
-        Ok(RepairSlotResolution::Existing {
+    if distinct_legacy_package {
+        return Ok(RepairSlotResolution::Conflict {
             operation_id: receipt.operation_id,
             operation_state: state,
-        })
-    } else {
-        Ok(RepairSlotResolution::Conflict {
-            operation_id: receipt.operation_id,
-            operation_state: state,
-        })
+        });
     }
+    Ok(RepairSlotResolution::Existing {
+        operation_id: receipt.operation_id,
+        operation_state: state,
+    })
+}
+
+fn rendered_singleton_package_digest(
+    request: &Value,
+    identity: &ReviewSlotIdentity,
+    finding_id: &str,
+) -> Option<String> {
+    let text = request.get("text")?.as_str()?;
+    let prefix = format!(
+        "A manager applied this ordered correction package to your current Task Attempt. Keep the same unreleased Attempt, address every finding in reviewer order, and submit a new candidate linked to the prior submission.\n\nTask: {}\nTask revision: {}\nAttempt: {}\nPrior submission: {}\nPrior candidate: {}\nFindings package digest: ",
+        identity.task_id,
+        identity.task_revision,
+        identity.attempt_id,
+        identity.submission_ref,
+        identity.candidate_ref,
+    );
+    let digest_and_findings = text.strip_prefix(&prefix)?;
+    let (digest, findings) = digest_and_findings.split_once("\n\n")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !findings.starts_with(&format!("Finding 1: {finding_id}\nReason:\n"))
+    {
+        return None;
+    }
+    Some(digest.to_owned())
 }
 
 fn receipt_matches_package(receipt: &RepairSlotReceipt, package: &ReviewFindingsPackage) -> bool {
@@ -1595,6 +1926,29 @@ fn normalized_repair_request(request: &Value, semantic_slot_id: &str) -> Option<
     }
     object.insert("client_request_id".to_owned(), json!(semantic_slot_id));
     Some(Value::Object(object))
+}
+
+fn package_request_matches(
+    original: &Value,
+    expected: &Value,
+    semantic_slot_id: &str,
+    package: &ReviewFindingsPackage,
+    allow_singleton_text: bool,
+) -> bool {
+    let Some(original) = normalized_repair_request(original, semantic_slot_id) else {
+        return false;
+    };
+    let Some(mut expected) = normalized_repair_request(expected, semantic_slot_id) else {
+        return false;
+    };
+    if original == expected {
+        return true;
+    }
+    if allow_singleton_text && let Some(text) = historical_singleton_text(package) {
+        expected["text"] = json!(text);
+        return original == expected;
+    }
+    false
 }
 
 /// Retain the automated on-behalf Operation link and semantic slot after the
@@ -1778,6 +2132,14 @@ fn retain_slot_parts(
     now_ms: i64,
     provenance: Option<RepairSourceFacts>,
 ) -> Result<()> {
+    let expected_semantic_slot_id =
+        crate::automation::repair::semantic_slot_id(manager_id, identity, findings_digest)?;
+    if expected_semantic_slot_id != semantic_slot_id {
+        return Err(Error::new(
+            "REPAIR_SLOT_CORRUPT",
+            "new RepairDispatch slot key does not match its full findings digest",
+        ));
+    }
     let key = slot_key(semantic_slot_id);
     if let Some(value) = config::read_record(tx, &key, "RepairDispatch semantic slot")? {
         let existing: RepairSlotReceipt = serde_json::from_value(value).map_err(|_| {
@@ -1788,7 +2150,9 @@ fn retain_slot_parts(
         })?;
         if existing.operation_id == operation_id
             && existing.parameters_digest == parameters_digest
+            && existing.schema_version == SLOT_SCHEMA_VERSION
             && existing.semantic_slot_id == semantic_slot_id
+            && existing.finding_id.is_none()
             && existing.findings_digest.as_deref() == Some(findings_digest)
         {
             return Ok(());
@@ -1956,6 +2320,8 @@ pub(crate) fn context_for_delivery_operation(
         &link.binding_id,
         link.binding_generation,
         &link.semantic_slot_id,
+        link.schema_version,
+        link.schema_version == LEGACY_REPAIR_SCHEMA_VERSION && link.findings_package.is_none(),
         link.captured_transfer_gm_epoch,
     )
 }
@@ -2032,7 +2398,7 @@ fn validate_operation_link(
     };
     let findings_package = findings_package_from_link(link).map_err(|_| corrupt())?;
     let identity = findings_package.identity.clone();
-    if link.schema_version != LINK_SCHEMA_VERSION
+    if !supported_repair_schema_version(link.schema_version)
         || link.operation_id != operation_id
         || link.technical_requester_id
             != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
@@ -2044,6 +2410,10 @@ fn validate_operation_link(
             findings_package.findings.len() != 1
                 || findings_package.findings[0].finding_id.as_str() != finding_id.as_str()
         })
+        || (link.schema_version == LINK_SCHEMA_VERSION
+            && (link.findings_package.is_none()
+                || link.finding_id.is_some()
+                || link.finding.is_some()))
     {
         return Err(corrupt());
     }
@@ -2063,6 +2433,8 @@ fn validate_operation_link(
         &link.binding_id,
         link.binding_generation,
         &link.semantic_slot_id,
+        link.schema_version,
+        link.schema_version == LEGACY_REPAIR_SCHEMA_VERSION && link.findings_package.is_none(),
         link.captured_transfer_gm_epoch,
     )
     .map_err(|_| corrupt())?;
@@ -2151,7 +2523,7 @@ fn validate_slot_for_link(db: &Connection, link: &RepairDispatchOperationLink) -
         )
     })?;
     let findings_package = findings_package_from_link(link)?;
-    if slot.schema_version != SLOT_SCHEMA_VERSION
+    if !slot_schema_matches_link(link.schema_version, slot.schema_version)
         || slot.semantic_slot_id != link.semantic_slot_id
         || slot.effective_manager_id != link.effective_manager_id
         || slot.task_id != link.task_id
@@ -2159,7 +2531,13 @@ fn validate_slot_for_link(db: &Connection, link: &RepairDispatchOperationLink) -
         || slot.attempt_id != link.attempt_id
         || slot.submission_ref != link.submission_ref
         || slot.candidate_ref != link.candidate_ref
-        || !receipt_matches_package(&slot, &findings_package)
+        || !slot_subject_matches(
+            &link.effective_manager_id,
+            &findings_package.identity,
+            &findings_package,
+            &link.semantic_slot_id,
+            &slot,
+        )?
         || slot.operation_id != link.operation_id
         || slot.parameters_digest != link.request_digest
         || slot.source_attempt_owner_id != link.source_attempt_owner_id
@@ -2263,21 +2641,37 @@ fn delivery_state(
     })?;
     let expected = prepared.request_value();
     let semantic_slot_id = prepared.context.semantic_slot_id();
+    if !matches!(
+        resolve_semantic_slot(db, prepared)?,
+        RepairSlotResolution::Existing { operation_id: retained, .. } if retained == operation_id
+    ) {
+        return Err(Error::new(
+            "REPAIR_OPERATION_CORRUPT",
+            "delivery readback has no exact retained semantic slot",
+        ));
+    }
     let caller_is_automation = caller == prepared.context.technical_requester_id();
     let caller_is_manager = caller == prepared.context.effective_manager_id();
     let original_request_id = request.get("client_request_id").and_then(Value::as_str);
     let request_id_matches = if caller_is_automation {
-        client_request_id == semantic_slot_id && original_request_id == Some(semantic_slot_id)
+        original_request_id == Some(client_request_id.as_str())
+            && semantic_slot_id_candidates(
+                prepared.context.effective_manager_id(),
+                prepared.context.identity(),
+                prepared.context.findings_package(),
+            )?
+            .contains(&client_request_id)
     } else if caller_is_manager {
         !client_request_id.is_empty() && original_request_id == Some(client_request_id.as_str())
     } else {
         false
     };
-    let normalized_request = normalized_repair_request(&request, semantic_slot_id);
-    let normalized_expected = normalized_repair_request(&expected, semantic_slot_id);
-    let exact_request = matches!(
-        (normalized_request, normalized_expected),
-        (Some(request), Some(expected)) if request == expected
+    let exact_request = package_request_matches(
+        &request,
+        &expected,
+        semantic_slot_id,
+        prepared.context.findings_package(),
+        true, // The exact retained slot was validated above, including its version and text.
     );
     if !request_id_matches || !exact_request {
         return Err(Error::new(
@@ -2323,6 +2717,10 @@ fn delivery_state(
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "automation_repair_slot_identity_fixtures.rs"]
+mod slot_identity_fixtures;
 
 enum DeliveryState {
     Verified,
