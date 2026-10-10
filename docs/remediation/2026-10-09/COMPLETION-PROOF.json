@@ -12,14 +12,14 @@
       {
         "item": "Connected code and strict production Clippy",
         "status": "verified",
-        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json; MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json; NATIVE-IMAGE-REPAIR-EVIDENCE.json; CATALOG-DIAGNOSTIC-REPAIR-EVIDENCE.json",
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json; MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json; NATIVE-IMAGE-REPAIR-EVIDENCE.json; CATALOG-DIAGNOSTIC-REPAIR-EVIDENCE.json; HOST-SUPERVISOR-ENVIRONMENT-REPAIR-EVIDENCE.json",
         "residual_uncertainty": "Retained 24-package gate plus changed-package gates",
         "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases and five Windows/two Linux path cases on each platform"
       },
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
-        "evidence": "EXECUTION-RESULTS-K.json; exact eight clean-candidate packages and genuine K installed native execution",
+        "evidence": "EXECUTION-RESULTS-L.json; exact eight clean-candidate packages and genuine L installed native execution",
         "residual_uncertainty": "Per-stage native receipts determine scope; core ACK origin and hook admission remain historical UNKNOWN",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
@@ -77,7 +77,9 @@
       "docs/remediation/2026-10-09/NATIVE-IMAGE-REPAIR-EVIDENCE.json",
       "docs/remediation/2026-10-09/EXECUTION-RESULTS-K.json",
       "crates/swarm-adapter-opencode/src/native.rs",
-      "docs/remediation/2026-10-09/CATALOG-DIAGNOSTIC-REPAIR-EVIDENCE.json"
+      "docs/remediation/2026-10-09/CATALOG-DIAGNOSTIC-REPAIR-EVIDENCE.json",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-L.json",
+      "docs/remediation/2026-10-09/HOST-SUPERVISOR-ENVIRONMENT-REPAIR-EVIDENCE.json"
     ],
     "checks_run": [
       "Windows/Linux strict host production Clippy",
@@ -145,13 +147,18 @@
       "Ordinary main push and remote SHA readback",
       "Affected Windows/Linux strict production Clippy: process, supervisor and OpenCode adapter",
       "Six catalogue/diagnostic regressions per platform PASS",
-      "Two native GPT-6 Luna Max bounded source reviews PASS; persisted provider/model/effort readback"
+      "Two native GPT-6 Luna Max bounded source reviews PASS; persisted provider/model/effort readback",
+      "Eight exact clean eade994 provenance builds",
+      "Fresh genuine L install and locked OpenCode resource closure",
+      "One L native qualification invocation per adapter with separate run ids",
+      "Ordinary main push and remote SHA readback",
+      "Affected Windows/Linux strict production host Clippy for first-hop shared launch environment"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "K proved owned service readiness after image validation but open rejected NATIVE_MODEL_UNAVAILABLE; precise catalogue subcause UNKNOWN. Fresh L qualification pending for catalogue wait and scoped Antigravity worker diagnostic. Full causal native result, retained core ACK/hook facts and dependency advisories remain open.",
+    "remaining_uncertainty": "L OpenCode exact open applied but native MCP snapshot rejects standalone module artifact with NATIVE_MCP_SCOPE_MISMATCH; dispatch0. L Antigravity emits NATIVE_SCOPE_UNAVAILABLE before hello: first host-to-supervisor hop removes home environment; bounded repair in progress. Full causal native result, C core receipt gaps and 13 dependency advisories remain open.",
     "final_status": "PARTIAL_PROGRESS"
   }
 }

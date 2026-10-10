@@ -1,0 +1,43 @@
+{
+  "schema": "eliot.v27_host_supervisor_environment_repair.v1",
+  "recorded_at_utc": "2026-10-10T10:08:32.5124251Z",
+  "source_parent_commit": "eade9948341efad4b73d6bd33b1d9dd8846a8db5",
+  "source_file": "crates/swarm-kernel-host/src/host_module_supervisor.rs",
+  "source_sha256": "8621baf96dd530929afb3cbcc849cb26f9d2f55d1ae8ee62e92c910061a388bd",
+  "historical_execution": "EXECUTION-RESULTS-L.json",
+  "diagnosis": {
+    "run_id": "00ead7a0-2d0d-449a-b149-e66360aa73f6",
+    "binding": "e9a67f85-b14e-47fb-aa8e-4f0b17b6a3a1",
+    "boot_id": "4f3a311b-4f6d-40f7-889c-8beda4d0f2a8",
+    "worker_error_code": "NATIVE_SCOPE_UNAVAILABLE",
+    "private_receipt_sha256": "87361996df2a68f517174efb25546c887ed31d7a77ff15b9188ddc8b6717505f",
+    "scope": "Exact helper receipt, not a publicly projected accepted supervisor diagnostic",
+    "source_fact": "Installed host first hop env_clear restores only SystemRoot, while Antigravity requires absolute USERPROFILE or HOME before hello. Later supervisor/owner hops already use shared Windows baseline.",
+    "historical_j_cause": "UNKNOWN; new L evidence does not rewrite J"
+  },
+  "repair": "Host calls swarm_process::module_owner::apply_launch_environment through Tokio Command::as_std_mut. All three launch hops now use the existing Windows OS/home/config allowlist; no provider/API/token inheritance or descriptor/protected-ref changes. Unix environment-clear behavior, IPC/bootstrap, process identity and non-killing custody unchanged.",
+  "verification": {
+    "rust": "1.98.1",
+    "production_clippy": "Windows/Linux swarm-kernel-host --locked --lib --bins --no-deps -- -D warnings PASS",
+    "logs_sha256": {
+      "windows-host-supervisor-environment-clippy.log": "d880546edfdc89988ac987dfe0a213673d512c0fee3a6f5f446161823d460e79",
+      "linux-host-supervisor-environment-clippy.log": "6c778e804e4f71c4f20af236e027ce7f0f0bfdfdca4fa8c285c85a6590f6490f"
+    },
+    "format_check": "cargo fmt -p swarm-kernel-host --check PASS",
+    "understanding_sha256": "5468c7c3067d3bb6b16caadf5e54e1dafba7b6bea986d51358eb5ac1edee7424",
+    "retained_boundary_tests": "Existing two-hop process fixture evidence retained; no new host first-hop regression or Linux native model qualification claimed",
+    "initial_linux_command": "First invocation failed at bash argument parsing before cargo started; corrected static PATH command completed final strict gate"
+  },
+  "source_review": {
+    "status": "PASS",
+    "provider": "openai",
+    "model": "gpt-6-luna",
+    "effort": "max",
+    "session_id": "01a1249c-8c7c-7863-ada0-f04ff76093e7",
+    "scope": "Exact diff and existing shared policy supplied through stdin, tools not used; source only, no runtime qualification",
+    "output_sha256": "e46f62a46514804c6d85331749dbeabf5e17505eb5243ca0d782730ee9289849",
+    "model_readback_sha256": "aede033663ded8c9acaf521b6c8526e87d874b21521bbec84e91fe41176a8389"
+  },
+  "installed_qualification": "Fresh installed candidate pending; L failure is historical and is not replayed",
+  "final_status": "PARTIAL_PROGRESS"
+}

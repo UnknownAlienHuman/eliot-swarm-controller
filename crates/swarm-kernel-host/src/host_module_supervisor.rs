@@ -1448,16 +1448,12 @@ async fn spawn_supervisor_child(
     frame: &[u8],
 ) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     let mut command = Command::new(executable);
+    swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
     command
-        .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
-    #[cfg(windows)]
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", system_root);
-    }
     let mut child = command.spawn().map_err(|_| {
         Error::new(
             "MODULE_SUPERVISOR_PROCESS_START_FAILED",
