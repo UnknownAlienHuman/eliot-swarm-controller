@@ -1,0 +1,27 @@
+name: Research or design
+description: Bounded read-only investigation without an implementation claim
+title: "[Research] "
+body:
+  - type: markdown
+    attributes:
+      value: "Research uses Issues or merged documentation, never a long-lived code PR. Do not mutate product files, run Cargo/native qualification or claim implementation ownership."
+  - type: textarea
+    id: question
+    attributes:
+      label: Exact question, invariant and frozen baseline
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Named sources and read-only scope
+      description: Exact files, symbols, commit range, current Issues and documented donor/API sources.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Required evidence and decision
+      description: Distinguish confirmed, refuted and unknown; name the consuming owner/Issue, remaining uncertainty and stop condition. No retroactive review claims.
+    validations:
+      required: true

@@ -27,13 +27,70 @@ on:
       - '**/npm-shrinkwrap.json'
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     # Intentionally no path filter: the scoped classifier must see tests/**,
     # tools/**, Justfile, workflow changes, documentation, and newly added paths.
   workflow_dispatch:
 permissions:
   contents: read
+  pull-requests: read
+  issues: read
 jobs:
+  pr-contract:
+    name: Base-owned PR contract
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-base
+          persist-credentials: false
+      - name: Validate event body and head using base policy and validator
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f trusted-base/tools/ci/pr-contract.py ]; then
+            echo 'Base validator absent: explicit owner-reviewed bootstrap required.' >&2
+            exit 1
+          fi
+          python trusted-base/tools/ci/pr-contract.py --event "$GITHUB_EVENT_PATH" --policy-root trusted-base --repository "$GITHUB_REPOSITORY"
+
+  pr-gate:
+    name: PR Gate
+    if: always() && github.event_name == 'pull_request'
+    needs: [pr-contract, scope, docs-only, tooling-scope, module-syntax, rust-format, scoped-rust, atlas-integrity, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every applicable result
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        shell: python
+        run: |
+          import json, os, sys
+          jobs = json.loads(os.environ['JOB_RESULTS'])
+          outputs = jobs['scope']['outputs']
+          required = {
+              'pr-contract': True,
+              'scope': True,
+              'docs-only': outputs.get('docs_changed') == 'true',
+              'tooling-scope': outputs.get('tooling_changed') == 'true',
+              'module-syntax': outputs.get('module_js_files', '[]') != '[]',
+              'rust-format': outputs.get('packages', '[]') != '[]',
+              'scoped-rust': outputs.get('clippy_packages', '[]') != '[]' or outputs.get('test_targets', '[]') != '[]',
+              'atlas-integrity': outputs.get('atlas_changed') == 'true',
+              'build': False,
+          }
+          failed = [name for name, job in jobs.items()
+                    if job['result'] not in ('success', 'skipped')
+                    or (required[name] and job['result'] != 'success')]
+          if failed:
+              print('PR Gate failed: ' + ', '.join(sorted(failed)))
+              sys.exit(1)
+          print('PR Gate passed; manual full qualification remains separate.')
+
   scope:
     name: Classify changed paths and package ownership
     runs-on: ubuntu-latest

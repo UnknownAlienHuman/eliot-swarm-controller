@@ -1,0 +1,49 @@
+name: Implementation slice
+description: One violated invariant, manager, write lease and connected production edge
+title: "[Implementation] "
+body:
+  - type: markdown
+    attributes:
+      value: "Use one current Issue per connected slice. PRs are frozen candidates; research belongs in a Research Issue. Product writes require active governance and an enabled base-owned track."
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Violated invariant and exact evidence
+      description: Name the producer, authority, retained fact/effect and current consumer with source anchors and baseline SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: claim
+    attributes:
+      label: Manager claim
+      description: Stable manager, track, branch, local worktree ID, base SHA, exact owned/forbidden files or prefixes, dependencies and write lease. Do not include secret local paths.
+    validations:
+      required: true
+  - type: textarea
+    id: edge
+    attributes:
+      label: Connected edge and deletion target
+      description: State the exact resulting producer -> fact/intent -> effect/readback -> consumer edge, helper/donor to reuse, replaced symbol/path, and cross-track seam dependency at merged SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance, negative and uncertainty cases
+      description: Include valid input, invalid input, uncertainty/readback case, public behavior and residual limits.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Non-goals and minimal source gate
+      description: Exact symbols/files, read-only neighbors, forbidden designs/paths, scoped rustfmt and smallest Clippy. Separate tests/native/load as later qualification.
+    validations:
+      required: true
+  - type: textarea
+    id: stop
+    attributes:
+      label: Stop rule and rollback
+      value: "After two failed approaches at the same boundary, release the write lease and publish a causal audit. Stop on an unowned dirty file or unexpected cross-track dependency. Preserve unknown effects and read back; never replay from chat intent. One squash revert is the rollback boundary; state migration caveats."
+    validations:
+      required: true
