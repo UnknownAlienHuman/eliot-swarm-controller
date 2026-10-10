@@ -189,6 +189,10 @@ pub struct SupervisorStatus {
     /// started or terminated by this supervisor.
     pub worker: Option<ProcessIdentity>,
     pub worker_boot_id: Option<String>,
+    /// Closed adapter error_code received only from this exact worker scope.
+    /// Diagnostic data does not replace the generic lifecycle failure code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_diagnostic_code: Option<String>,
     /// Native-effect certainty for the latest helper attempt. This is never
     /// inferred from IPC disconnect or process exit alone.
     pub effect_certainty: ModuleEffectCertainty,
@@ -853,12 +857,23 @@ struct ServiceInitialization {
 struct OwnerHelperExit {
     exit: ExitStatus,
     worker: Option<ProcessIdentity>,
+    worker_diagnostic_code: Option<String>,
     safe_to_replace: bool,
     family_departure_proven: bool,
     failure_code: Option<String>,
     failure_stage: Option<String>,
     effect_certainty: ModuleEffectCertainty,
     healthy_duration: Option<Duration>,
+}
+
+struct WorkerDiagnosticScope<'a> {
+    boot_id: &'a str,
+    module_id: &'a str,
+    binding_id: &'a str,
+    generation: u64,
+    artifact_id: &'a str,
+    artifact_version: &'a str,
+    build_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -891,6 +906,7 @@ impl Service {
             worker: None,
             owner: None,
             worker_boot_id: None,
+            worker_diagnostic_code: None,
             effect_certainty: ModuleEffectCertainty::Unknown,
             failure_stage: None,
             readback_required: prior_state,
@@ -1401,6 +1417,7 @@ impl Service {
                 status.owner = None;
                 status.worker = None;
                 status.worker_boot_id = Some(boot_id.clone());
+                status.worker_diagnostic_code = None;
                 status.effect_certainty = ModuleEffectCertainty::Unknown;
                 status.failure_stage = None;
                 status.last_failure = None;
@@ -1660,6 +1677,7 @@ impl Service {
                 status.owner = Some(helper_identity.clone());
                 status.worker = attempt.worker.clone();
                 status.worker_boot_id = Some(boot_id.clone());
+                status.worker_diagnostic_code = attempt.worker_diagnostic_code.clone();
                 status.readback_required = needs_operation_readback;
                 status.effect_certainty = attempt.effect_certainty;
                 status.failure_stage = attempt
@@ -2118,6 +2136,7 @@ impl Service {
                     return Ok(OwnerHelperExit {
                         exit,
                         worker: None,
+                        worker_diagnostic_code: None,
                         safe_to_replace: false,
                         family_departure_proven: false,
                         failure_code: Some("MODULE_LAUNCH_RESULT_MISSING".to_owned()),
@@ -2158,9 +2177,15 @@ impl Service {
                             "helper exited without an exact worker receipt or certified pre-spawn result",
                         )
                     })?;
+                    let worker_diagnostic_code = if exit.success() {
+                        None
+                    } else {
+                        self.worker_diagnostic_code(boot_id)
+                    };
                     return Ok(OwnerHelperExit {
                         exit,
                         worker: Some(worker),
+                        worker_diagnostic_code,
                         safe_to_replace: true,
                         // This is the only path with an exact worker receipt;
                         // departed_empty has already succeeded above.
@@ -2190,6 +2215,7 @@ impl Service {
                 return Ok(OwnerHelperExit {
                     exit,
                     worker: None,
+                    worker_diagnostic_code: None,
                     safe_to_replace: true,
                     // Certified pre-spawn means no adapter family existed.
                     family_departure_proven: false,
@@ -2325,6 +2351,28 @@ impl Service {
                 Ok(Some(worker))
             }
         }
+    }
+
+    fn worker_diagnostic_code(&self, boot_id: &str) -> Option<String> {
+        let path = self
+            .state_dir
+            .join(swarm_process::module_owner::WORKER_DIAGNOSTIC_FILE);
+        let receipt = read_canonical_json_receipt_optional(
+            &path,
+            swarm_process::module_owner::WORKER_DIAGNOSTIC_MAX_BYTES,
+        )?;
+        validate_worker_diagnostic_receipt(
+            &receipt,
+            WorkerDiagnosticScope {
+                boot_id,
+                module_id: self.descriptor.module_id.as_str(),
+                binding_id: self.scope.binding_id.as_str(),
+                generation: self.scope.generation,
+                artifact_id: self.descriptor.artifact.artifact_id.as_str(),
+                artifact_version: self.descriptor.artifact.version.as_str(),
+                build_id: self.descriptor.artifact.build_id.as_deref(),
+            },
+        )
     }
 
     fn validate_launch_result(&self, receipt: &Value, boot_id: &str, owner: &Value) -> Result<()> {
@@ -3125,6 +3173,77 @@ fn read_json_receipt_optional(path: &Path, limit: u64) -> Result<Option<Value>> 
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
+fn read_canonical_json_receipt_optional(path: &Path, limit: u64) -> Option<Value> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .ok()?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > limit {
+        return None;
+    }
+    let receipt: Value = serde_json::from_slice(&bytes).ok()?;
+    if serde_json::to_vec(&receipt).ok()?.as_slice() != bytes.as_slice() {
+        return None;
+    }
+    Some(receipt)
+}
+
+fn validate_worker_diagnostic_receipt(
+    receipt: &Value,
+    expected: WorkerDiagnosticScope<'_>,
+) -> Option<String> {
+    let object = receipt.as_object()?;
+    if object.len() != 9
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "version"
+                    | "boot_id"
+                    | "module"
+                    | "binding"
+                    | "generation"
+                    | "artifact_id"
+                    | "artifact_version"
+                    | "build_id"
+                    | "error_code"
+            )
+        })
+    {
+        return None;
+    }
+    let generation = expected.generation.to_string();
+    let build_id_matches = match (expected.build_id, receipt.get("build_id")) {
+        (None, Some(Value::Null)) => true,
+        (Some(expected), Some(Value::String(actual))) => expected == actual,
+        _ => false,
+    };
+    let error_code = receipt.get("error_code")?.as_str()?;
+    if receipt.get("version").and_then(Value::as_u64) != Some(1)
+        || receipt.get("boot_id").and_then(Value::as_str) != Some(expected.boot_id)
+        || receipt.get("module").and_then(Value::as_str) != Some(expected.module_id)
+        || receipt.get("binding").and_then(Value::as_str) != Some(expected.binding_id)
+        || receipt.get("generation").and_then(Value::as_str) != Some(generation.as_str())
+        || receipt.get("artifact_id").and_then(Value::as_str) != Some(expected.artifact_id)
+        || receipt.get("artifact_version").and_then(Value::as_str)
+            != Some(expected.artifact_version)
+        || !build_id_matches
+        || error_code.is_empty()
+        || error_code.len() > 64
+        || !error_code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    Some(error_code.to_owned())
+}
+
 fn read_owner_receipt_optional(path: &Path) -> Result<Option<(Value, String)>> {
     match fs::symlink_metadata(path) {
         Ok(_) => read_owner_receipt(path).map(Some),
@@ -3286,6 +3405,58 @@ fn unix_time_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_diagnostic_receipt_requires_exact_boot_scope_and_artifact() {
+        let receipt = serde_json::json!({
+            "version": 1,
+            "boot_id": "boot-1",
+            "module": "fixture",
+            "binding": "binding-1",
+            "generation": "7",
+            "artifact_id": "fixture.adapter",
+            "artifact_version": "3",
+            "build_id": null,
+            "error_code": "HOST_RETRY_EXHAUSTED",
+        });
+        let expected = |receipt: &Value| {
+            validate_worker_diagnostic_receipt(
+                receipt,
+                WorkerDiagnosticScope {
+                    boot_id: "boot-1",
+                    module_id: "fixture",
+                    binding_id: "binding-1",
+                    generation: 7,
+                    artifact_id: "fixture.adapter",
+                    artifact_version: "3",
+                    build_id: None,
+                },
+            )
+        };
+        assert_eq!(expected(&receipt), Some("HOST_RETRY_EXHAUSTED".to_owned()));
+
+        for field in [
+            "boot_id",
+            "module",
+            "binding",
+            "generation",
+            "artifact_id",
+            "artifact_version",
+            "build_id",
+        ] {
+            let mut mismatch = receipt.clone();
+            mismatch[field] = serde_json::json!("different");
+            assert!(expected(&mismatch).is_none(), "accepted mismatched {field}");
+        }
+
+        let mut extra = receipt.clone();
+        extra["detail"] = serde_json::json!("raw output is not admitted");
+        assert!(expected(&extra).is_none());
+
+        let mut invalid_code = receipt;
+        invalid_code["error_code"] = serde_json::json!("lowercase");
+        assert!(expected(&invalid_code).is_none());
+    }
 
     struct NoResolver;
 

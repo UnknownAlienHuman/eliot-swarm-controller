@@ -17,7 +17,8 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{ChildStderr, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
 use swarm_contracts::error::{Error, Result};
@@ -33,7 +34,98 @@ const MAX_CREDENTIAL_FILE_BYTES: u64 = 4_096;
 const MAX_PROTECTED_REF_FILE_BYTES: u64 = 65_536;
 const MODULE_CREDENTIAL_FILE_ENV: &str = "ELIOT_SWARM_MODULE_CREDENTIAL_FILE";
 const OWNER_MAX_BYTES: u64 = 65_536;
+pub const WORKER_DIAGNOSTIC_FILE: &str = "worker-diagnostic.json";
+pub const WORKER_DIAGNOSTIC_MAX_BYTES: u64 = 32_768;
+const MAX_WORKER_STDERR_BYTES: usize = 4_096;
+const MAX_WORKER_ERROR_CODE_BYTES: usize = 64;
 const MARKER: &str = "ELIOT_SWARM_MODULE_V1\n";
+
+struct WorkerStderrDrain {
+    stderr_sender: Option<Sender<ChildStderr>>,
+    diagnostic_receiver: Receiver<Option<String>>,
+}
+
+impl WorkerStderrDrain {
+    /// Start the reader before the worker. If the OS cannot create a thread,
+    /// callers keep the worker's previous inherited-stderr behavior.
+    fn start() -> Option<Self> {
+        let (stderr_sender, stderr_receiver) = mpsc::channel::<ChildStderr>();
+        let (diagnostic_sender, diagnostic_receiver) = mpsc::sync_channel(1);
+        let reader = std::thread::Builder::new()
+            .name("swarm-worker-stderr".to_owned())
+            .spawn(move || {
+                if let Ok(stderr) = stderr_receiver.recv() {
+                    let diagnostic = read_closed_worker_stderr(stderr);
+                    let _ = diagnostic_sender.send(diagnostic);
+                }
+            })
+            .ok()?;
+        drop(reader);
+        Some(Self {
+            stderr_sender: Some(stderr_sender),
+            diagnostic_receiver,
+        })
+    }
+
+    fn attach(&mut self, stderr: Option<ChildStderr>) {
+        let Some(sender) = self.stderr_sender.take() else {
+            return;
+        };
+        if let Some(stderr) = stderr {
+            let _ = sender.send(stderr);
+        }
+    }
+
+    fn try_closed_code(&self) -> Option<String> {
+        self.diagnostic_receiver.try_recv().ok().flatten()
+    }
+}
+
+fn read_closed_worker_stderr(mut stderr: ChildStderr) -> Option<String> {
+    let mut captured = Vec::with_capacity(MAX_WORKER_STDERR_BYTES);
+    let mut overflowed = false;
+    let mut chunk = [0_u8; 1_024];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                if !overflowed && captured.len().saturating_add(count) <= MAX_WORKER_STDERR_BYTES {
+                    captured.extend_from_slice(&chunk[..count]);
+                } else {
+                    overflowed = true;
+                    captured.clear();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    (!overflowed)
+        .then(|| parse_closed_worker_error_code(&captured))
+        .flatten()
+}
+
+fn parse_closed_worker_error_code(stderr: &[u8]) -> Option<String> {
+    if stderr.is_empty() || stderr.len() > MAX_WORKER_STDERR_BYTES {
+        return None;
+    }
+    let record = stderr
+        .strip_suffix(b"\r\n")
+        .or_else(|| stderr.strip_suffix(b"\n"))
+        .unwrap_or(stderr);
+    let code = record
+        .strip_prefix(b"{\"error_code\":\"")?
+        .strip_suffix(b"\"}")?;
+    if code.is_empty()
+        || code.len() > MAX_WORKER_ERROR_CODE_BYTES
+        || !code
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return None;
+    }
+    String::from_utf8(code.to_vec()).ok()
+}
 
 /// Only these non-secret Windows values are carried into the adapter child.
 /// Descriptor literals and late protected-reference paths are installed after
@@ -428,7 +520,11 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
         return Err(error);
     }
 
+    let mut stderr_drain = WorkerStderrDrain::start();
     let mut command = Command::new(&resolved.executable);
+    if stderr_drain.is_some() {
+        command.stderr(Stdio::piped());
+    }
     apply_launch_environment(&mut command);
     command
         .args(&resolved.argv)
@@ -456,6 +552,9 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
         command.env(name, value);
     }
     let mut child = command.spawn()?;
+    if let Some(stderr_drain) = stderr_drain.as_mut() {
+        stderr_drain.attach(child.stderr.take());
+    }
     let child_identity = process_image_identity(child.id());
     let worker_error = if let Ok(identity) = &child_identity {
         publish(
@@ -480,10 +579,30 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
         None
     };
     let status_result = child.wait();
+    let mut worker_diagnostic_code = stderr_drain
+        .as_ref()
+        .and_then(WorkerStderrDrain::try_closed_code);
     // Module groups are deliberately non-killing. Keep the OS lock and group
     // alive until the bridge and every native descendant have departed.
     while !group.children_empty()? {
+        if worker_diagnostic_code.is_none() {
+            worker_diagnostic_code = stderr_drain
+                .as_ref()
+                .and_then(WorkerStderrDrain::try_closed_code);
+        }
         std::thread::sleep(Duration::from_millis(500));
+    }
+    if worker_diagnostic_code.is_none() {
+        worker_diagnostic_code = stderr_drain
+            .as_ref()
+            .and_then(WorkerStderrDrain::try_closed_code);
+    }
+    if worker_error.is_none()
+        && child_identity.is_ok()
+        && status_result.as_ref().is_ok_and(|status| !status.success())
+        && let Some(error_code) = worker_diagnostic_code.as_deref()
+    {
+        let _ = publish_worker_diagnostic(&dir, &plan, error_code);
     }
     drop(group);
     drop(lock);
@@ -1191,6 +1310,26 @@ fn publish_pre_spawn_failure(
     )
 }
 
+fn publish_worker_diagnostic(dir: &Path, plan: &ModuleOwnerPlan, error_code: &str) -> Result<()> {
+    let receipt = json!({
+        "version": 1,
+        "boot_id": plan.boot_id.as_str(),
+        "module": plan.module.as_str(),
+        "binding": plan.binding.as_str(),
+        "generation": plan.generation.as_str(),
+        "artifact_id": plan.artifact_id.as_str(),
+        "artifact_version": plan.artifact_version.as_str(),
+        "build_id": plan.build_id.as_deref(),
+        "error_code": error_code,
+    });
+    if canonical_json(&receipt)?.len() as u64 > WORKER_DIAGNOSTIC_MAX_BYTES {
+        return Err(Error::invalid(
+            "worker diagnostic receipt exceeds its size limit",
+        ));
+    }
+    publish(&dir.join(WORKER_DIAGNOSTIC_FILE), &receipt)
+}
+
 fn publish(path: &Path, value: &Value) -> Result<()> {
     let temp = path.with_file_name(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -1264,6 +1403,103 @@ fn canonical_json(value: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_worker_error_code_parser_rejects_ambiguous_stderr() {
+        assert_eq!(
+            parse_closed_worker_error_code(b"{\"error_code\":\"HOST_RETRY_EXHAUSTED\"}\n"),
+            Some("HOST_RETRY_EXHAUSTED".to_owned())
+        );
+        for malformed in [
+            &b"{\"error_code\":\"FIRST\",\"error_code\":\"SECOND\"}\n"[..],
+            &b"{\"error_code\":\"FIRST\"}\n{\"error_code\":\"SECOND\"}\n"[..],
+            &b"{\"error_code\":\"lowercase\"}\n"[..],
+            &b"{\"error_code\":\"VALID\",\"detail\":\"discard\"}\n"[..],
+            &b"{not-json}\n"[..],
+        ] {
+            assert_eq!(parse_closed_worker_error_code(malformed), None);
+        }
+        assert_eq!(
+            parse_closed_worker_error_code(&vec![b'X'; MAX_WORKER_STDERR_BYTES + 1]),
+            None
+        );
+    }
+
+    #[test]
+    fn worker_stderr_drain_captures_a_closed_code_from_an_actual_child() {
+        assert_eq!(
+            run_worker_stderr_fixture("closed"),
+            Some("HOST_RETRY_EXHAUSTED".to_owned())
+        );
+    }
+
+    #[test]
+    fn worker_stderr_drain_consumes_oversized_child_output_without_retaining_it() {
+        assert_eq!(run_worker_stderr_fixture("oversized"), None);
+    }
+
+    fn run_worker_stderr_fixture(case: &str) -> Option<String> {
+        let mut drain = WorkerStderrDrain::start().expect("stderr reader thread starts");
+        let mut command = Command::new(env::current_exe().unwrap());
+        apply_launch_environment(&mut command);
+        command
+            .args([
+                "--exact",
+                "module_owner::tests::worker_stderr_fixture_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ELIOT_SWARM_WORKER_STDERR_FIXTURE", case)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        drain.attach(child.stderr.take());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stderr fixture child did not exit while its pipe was drained");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+        drain
+            .diagnostic_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("stderr reader reaches the child's closed pipe")
+    }
+
+    #[test]
+    #[ignore = "spawned by the worker stderr drainage regression only"]
+    fn worker_stderr_fixture_child() {
+        let Ok(case) = env::var("ELIOT_SWARM_WORKER_STDERR_FIXTURE") else {
+            return;
+        };
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        match case.as_str() {
+            "closed" => stderr
+                .write_all(b"{\"error_code\":\"HOST_RETRY_EXHAUSTED\"}\n")
+                .unwrap(),
+            "oversized" => {
+                let chunk = [b'X'; 1_024];
+                for _ in 0..128 {
+                    stderr.write_all(&chunk).unwrap();
+                }
+                stderr
+                    .write_all(b"{\"error_code\":\"HOST_RETRY_EXHAUSTED\"}\n")
+                    .unwrap();
+            }
+            _ => panic!("unknown stderr fixture case"),
+        }
+        stderr.flush().unwrap();
+    }
 
     #[test]
     fn launch_environment_survives_both_hops_without_ambient_values() {

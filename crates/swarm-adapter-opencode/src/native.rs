@@ -36,6 +36,8 @@ const SESSION_HISTORY_PAGE_LIMIT: usize = 100;
 const SESSION_HISTORY_MAX_PAGES: usize = 32;
 const SESSION_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MODEL_CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const MODEL_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,7 +253,7 @@ impl NativeClient {
     }
 
     pub async fn preflight_open(&self, options: &NativeOptions) -> Result<Value> {
-        self.check_route_model_available(options).await?;
+        self.wait_route_model_available(options).await?;
         self.location(options).await
     }
 
@@ -1057,6 +1059,28 @@ impl NativeClient {
             ));
         }
         Ok(json!({"directory":value["directory"]}))
+    }
+
+    async fn wait_route_model_available(&self, options: &NativeOptions) -> Result<()> {
+        // The pinned SDK can serve its bundled snapshot before the public
+        // catalogue refresh completes. Poll only this read before any root POST.
+        tokio::time::timeout(MODEL_CATALOG_READY_TIMEOUT, async {
+            loop {
+                match self.check_route_model_available(options).await {
+                    Err(error) if error.code == "NATIVE_MODEL_UNAVAILABLE" => {
+                        tokio::time::sleep(MODEL_CATALOG_POLL_INTERVAL).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::new(
+                "NATIVE_MODEL_UNAVAILABLE",
+                "exact route provider/model/variant did not become ready within the catalogue deadline",
+            ))
+        })
     }
 
     async fn check_route_model_available(&self, options: &NativeOptions) -> Result<()> {
@@ -2232,4 +2256,100 @@ pub fn input_id(operation: &str) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod catalog_readiness_tests {
+    use super::*;
+    use crate::config::ModelRef;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn catalog_fixture(
+        responses: Vec<Value>,
+    ) -> (NativeClient, NativeOptions, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let directory = std::env::current_dir().unwrap();
+        let options = NativeOptions {
+            service_id: "catalog-readiness-fixture".into(),
+            connection_file: directory.join("unused-connection.json"),
+            directory: directory.clone(),
+            model: ModelRef {
+                id: "step-5-preview-free".into(),
+                provider_id: "opencode".into(),
+                variant: "high".into(),
+            },
+        };
+        let server = tokio::spawn(async move {
+            for data in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                assert!(request.starts_with(b"GET /api/model?"));
+                let body = serde_json::to_vec(&json!({
+                    "location":{"directory":directory}, "data":data
+                }))
+                .unwrap();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let client = NativeClient {
+            client: Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
+            endpoint,
+            pid: std::process::id(),
+            version: "2.0.7".into(),
+        };
+        (client, options, server)
+    }
+
+    #[tokio::test]
+    async fn fresh_catalog_waits_for_exact_model_using_reads_only() {
+        let selected = json!([{
+            "id":"step-5-preview-free", "providerID":"opencode",
+            "enabled":true, "variants":[{"id":"high"}]
+        }]);
+        let (client, options, server) = catalog_fixture(vec![json!([]), selected]).await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.wait_route_model_available(&options),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_catalog_is_rejected_without_readiness_retry() {
+        let (client, options, server) = catalog_fixture(vec![Value::Null]).await;
+        let error = client
+            .wait_route_model_available(&options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NATIVE_MODEL_SCHEMA");
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

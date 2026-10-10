@@ -1,0 +1,190 @@
+{
+  "schema": "eliot.v27_catalog_diagnostic_repair.v1",
+  "recorded_at_utc": "2026-10-10T09:46:00.6662205Z",
+  "source_parent_commit": "75a6a33e4c39ecd214b29b326ac2d904685291c8",
+  "source_sha256": {
+    "crates/swarm-adapter-opencode/src/native.rs": "bee9eadeeb8ffd894aa712332824b70664767082c5cfa099b69c95593978ee8a",
+    "crates/swarm-process/src/module_owner.rs": "7ae4091fdb315c0916aa0c0bb9f7c285531b20a14e511ba629851a1c917ae6d7",
+    "crates/swarm-supervisor/src/supervisor.rs": "40d5c7432c8769a81f6bc8d5d6871c81026ee6d6fa9fac195521fbbb37cc8aa9"
+  },
+  "historical_execution": "EXECUTION-RESULTS-K.json",
+  "catalogue": {
+    "exact_k_readback": {
+      "run_id": "8677fb6b-a855-40b1-843f-accb7a958e4f",
+      "operation_id": "b02f31aa-d11a-449c-9617-0ac9ec85760a",
+      "state": "rejected",
+      "diagnostic_code": "NATIVE_MODEL_UNAVAILABLE",
+      "owned_service_ready_only": true,
+      "readiness_observed": true,
+      "service_version": "2.0.7",
+      "process_hash_matches_bun_pin": true,
+      "native_replay": false,
+      "selected_model": {
+        "id": "step-5-preview-free",
+        "providerID": "opencode",
+        "variant": "high"
+      }
+    },
+    "source_fact": "OpenCode core 2.0.7 populates bundled snapshot before asynchronous public refresh; bundled snapshot lacks step-5-preview-free",
+    "k_cause": "UNKNOWN: exact NATIVE_MODEL_UNAVAILABLE is observed; missing/disabled/variant subcause was not captured retrospectively",
+    "current_public_readback": {
+      "source": "https://models.opencode.ai/api.json",
+      "observed_at_utc": "2026-10-10T09:23:38.0566793Z",
+      "provider_present": true,
+      "model_present": true,
+      "model_id": "step-5-preview-free",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "cost": {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0
+      },
+      "release_date": "2026-09-16",
+      "last_updated": "2026-09-20"
+    },
+    "repair": "preflight_open performs bounded GET /api/model readiness wait: total 15 seconds, 200 ms interval, retry only NATIVE_MODEL_UNAVAILABLE; exact provider/model/enabled/variant retained; schema/transport/other failures return immediately; no root/session/prompt replay or model/provider override",
+    "understanding_sha256": "dba86eb727b74b25dc1c1fb44ffe9381cb265a81537e086615c0b644c6e61a7d"
+  },
+  "worker_diagnostic": {
+    "historical_antigravity": "J worker exit before accepted hello remains UNKNOWN; K Antigravity was not run",
+    "offline_probe_limit": "No-host bootstrap established owner/config/basic environment only; contract::claim and hello validation were not exercised",
+    "repair": "Reader starts before child; continuously drains piped stderr with 4096-byte transient limit; only one exact closed uppercase error_code JSON record is accepted. Raw/unrelated/duplicate/malformed/oversized output omitted. Thread-start failure retains inherited stderr. No blocking reader join or EOF wait. Private bounded canonical receipt published after nonzero worker exit while owner lock/group remain held. Supervisor accepts exact boot/module/binding/generation/artifact/version/build scope only after worker and family departure validation. Optional status diagnostic does not alter MODULE_EXITED, effect certainty, restart or no-replay authority; new boot clears it.",
+    "limitation": "Diagnostic may be absent when EOF/reader result is not ready at nonblocking snapshot; valid receipt is diagnostic data only",
+    "understanding_sha256": "e4390b0dbc47d7ac6b8885fad80ad11ee3eeda0e9ad1524b4013bb301b93c097"
+  },
+  "verification": {
+    "rust": "1.98.1",
+    "production_clippy": "Windows/Linux affected union swarm-process, swarm-supervisor, swarm-adapter-opencode --locked --lib --bins --no-deps -- -D warnings PASS",
+    "targeted_cases_per_platform": 6,
+    "targeted_scope": "Two real HTTP catalogue GET cases; strict closed stderr parser; two real child closed/128KiB flood drainage cases; exact diagnostic receipt scope/build/shape validation",
+    "logs_sha256": {
+      "windows-model-diagnostic-clippy.log": "a34d503442c6fb984c02ed13989f56151c2b66268fc0cd5872d546c6d908066e",
+      "windows-model-catalog-tests.log": "bd0e9e1b45ac307feaa72af7503d1abe61e734f5b9ccb1547f9aefaad25ee65e",
+      "windows-worker-diagnostic-parser-tests.log": "672ab0b173bd9d54b0f63cc1ce8c61e4b058c4de1c578461807c1ab53ce37be0",
+      "windows-worker-diagnostic-child-tests.log": "6980ab9aef0a1fe2e9d37d7072c2fa5e145421f8db7594e2253bb7a959026b69",
+      "windows-worker-diagnostic-scope-tests.log": "dda9276186235019b0d95dac1677128e735999c4e0da87181445743c104cfb73",
+      "linux-model-diagnostic-clippy.log": "7cc93f2352aaa0367b7ae91c496165bc4fed02857401c113ff49788851299f96",
+      "linux-model-catalog-tests.log": "cbca7fce4b0d45b0b58364ab7d92e76b88a62da4307a778862ac4fdf2c94db09",
+      "linux-worker-diagnostic-parser-tests.log": "ae427e1608f17b1a53ccaa9518e12e84283470e926b8c7611767e18826ed15f7",
+      "linux-worker-diagnostic-child-tests.log": "736c207386069585b1f5321b7bf089a0f0cd2daf8ff29b91e012ee4c05c36180",
+      "linux-worker-diagnostic-scope-tests.log": "7af26e8a881b1e55fbf3e9cfa5001abc2b6e036ad9ca21e952f4acdbb401a8ed"
+    },
+    "formatting_and_diff_check": "scoped three packages and git diff --check PASS",
+    "temporary_logs": "Earlier linux-model-catalog-clippy failed on incomplete concurrent worker edit; superseded by final affected union, retained without promotion"
+  },
+  "independent_reviews": {
+    "model-catalog": {
+      "status": "PASS",
+      "scope": "bounded source review only; no runtime qualification",
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "session_id": "01a1249c-8c7c-7863-ada0-f04ff76093e7",
+      "output_sha256": "3c085795db715ffe12a592164c053cee272cf59fc438b111693a06d590aa35ba"
+    },
+    "worker-diagnostic": {
+      "status": "PASS",
+      "scope": "bounded source review only; no runtime qualification",
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "session_id": "01a1249c-8c7c-7863-ada0-f04ff76093e7",
+      "output_sha256": "f835d4e105cee9e8dac7ea12d4ef57f7a5830447c7d7181dff8cbaea1fb505a8"
+    }
+  },
+  "review_model_readback_sha256": "9855c0906ad3f3b9cc6948f54704deaa1bd66f3d07648882eefb228087118b95",
+  "retained_source_gate": {
+    "baseline_hashes": 408,
+    "unchanged": 389,
+    "changed": {
+      "crates/swarm-adapter-opencode/src/native_owner.rs": {
+        "baseline_sha256": "e10a56084f48fb7dc879a5eb4c5d0f77baef1801deaf4286b1e7ee8af26fa59f",
+        "current_sha256": "2f184117a4855c9ecc786ddc206f6653030bbc7c80d514868570b1f17d457f18"
+      },
+      "crates/swarm-adapter-opencode/src/native.rs": {
+        "baseline_sha256": "90586723204c7090e0441fbbaf5d219de8237c120d2542261a33fe7b1f9c2998",
+        "current_sha256": "bee9eadeeb8ffd894aa712332824b70664767082c5cfa099b69c95593978ee8a"
+      },
+      "crates/swarm-bus/src/managed_worker_config.rs": {
+        "baseline_sha256": "26fa8b6f8437998e55e5e650dd3fa96a5fad520570e61071d3c5e9cdea99b43f",
+        "current_sha256": "b20093732eedad40b20be8e3620d5241c8ad033b63496c4cb4a1ad4abf48730d"
+      },
+      "crates/swarm-kernel-host/src/host_bus_supervisor.rs": {
+        "baseline_sha256": "67407990154ef57f1e21ec3dd5a261c88322391d634e84760e70ee76d54ee4e3",
+        "current_sha256": "07018a3cc27ef318b5795accd0977605ae1508670da9e8a60679500845110b5e"
+      },
+      "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+        "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+        "current_sha256": "3a1cc483fcef2c0daaf4b6b73b2bc085f6c11d6068038e5cf5f887c0e24ad64c"
+      },
+      "crates/swarm-kernel-host/src/store/launcher_owned_service.rs": {
+        "baseline_sha256": "30ff9005795f924d51e664c8d511919dc8ead50f0e11acd3d6a09193e94e0ebf",
+        "current_sha256": "696882dfccd37287c3dc813ecf8188ab816af9b49b50da9d4df246b562255516"
+      },
+      "crates/swarm-kernel-host/src/store/mod.rs": {
+        "baseline_sha256": "e078997a23c4db1116f84d1fa7841138c7564f96fe9fc8a5e2670da1c6e461ba",
+        "current_sha256": "447dbc9c4cb7b0fc31011b9c85e91c4be792bbe8c7d7b4be5a370048d8367f26"
+      },
+      "crates/swarm-kernel-host/src/store/owned_actor_provenance_tests.rs": {
+        "baseline_sha256": "2deae7f7250a71b9fb7ad5ed521a993705e93e776a69a6e2c31e4a3bb34e740b",
+        "current_sha256": "624b55bf990791afc4c16bbd79c1ba3cc12143be76fc1a5eb31f2f59a245ba9e"
+      },
+      "crates/swarm-kernel-host/src/store/runtime_admission_tests.rs": {
+        "baseline_sha256": "d1d0e3e2a24e39f43b6b851e99644ee8f299fa8e45761b1ab2a8b28d132a8b34",
+        "current_sha256": "1b6b98559eb6c3d7dda020f8766b1b0c3d86027db368d1805c2974cf62608a5c"
+      },
+      "crates/swarm-kernel-host/src/store/runtime.rs": {
+        "baseline_sha256": "71cdcef58ffa35a0517dea7ad111ebe35b994ed81312d155956d249ac08baefa",
+        "current_sha256": "e38a533de00b780e372f6e0aea99c511f8fc7492f09f4f0c476f030d87981cef"
+      },
+      "crates/swarm-kernel-host/src/workspace.rs": {
+        "baseline_sha256": "03d1d805b0d49e88e1d22daaac77405b200e03ae26b58692d5daf949edf14549",
+        "current_sha256": "30b0609583f16907486a06d69bd8a5e3af82e779458d86289413b8614722643a"
+      },
+      "crates/swarm-observer/src/metrics_cli.rs": {
+        "baseline_sha256": "db6edbde6920c9d578b14c0a32bb0c129546eab55cd06d56d668c690c647ffba",
+        "current_sha256": "211d7445414a9813d4f251d788a8b2030de8adda184914c18279bddae4432bc8"
+      },
+      "crates/swarm-process/src/module_owner.rs": {
+        "baseline_sha256": "07e1c05a5993f5005941fc66a097d10927a7a7ecf1da3f8138a78e7653226b17",
+        "current_sha256": "7ae4091fdb315c0916aa0c0bb9f7c285531b20a14e511ba629851a1c917ae6d7"
+      },
+      "crates/swarm-process/src/permissions.rs": {
+        "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+        "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+      },
+      "crates/swarm-supervisor/src/descriptor.rs": {
+        "baseline_sha256": "86fc7170bf5c55f25bf87538022961294efe165cf095592a876dd2c9480857b3",
+        "current_sha256": "99989db273cfc67a45b4a38af6d03f22b07de6e3f2411428baae18c1e83531a5"
+      },
+      "crates/swarm-supervisor/src/supervisor.rs": {
+        "baseline_sha256": "d81cfef59a1730a7a957d887c923da99c107c2cbb9a9fb27a9cac16efc6aa676",
+        "current_sha256": "40d5c7432c8769a81f6bc8d5d6871c81026ee6d6fa9fac195521fbbb37cc8aa9"
+      },
+      "modules/antigravity-rust/src/ipc.rs": {
+        "baseline_sha256": "17229e367bc79535ff85c38543eb0d23d59bb68a540d525b22e92ce9e51f65ef",
+        "current_sha256": "23029a748dfb24c104c046d449d11cad188228fdce8f5a0df844551457aecb2e"
+      },
+      "modules/antigravity-rust/src/main.rs": {
+        "baseline_sha256": "c85655d5c99b133689d71574a0c003e9da3296d51e9e080ac5d8e17cd9d519fc",
+        "current_sha256": "b64b80302e17d8151ab477cc1662017f30ee0af1ee1d7252151d38a4d52d35b1"
+      },
+      "modules/antigravity-rust/src/process.rs": {
+        "baseline_sha256": "e76c90798e6ba8093ad5a208e597f4142ed693971a7dadd093d4bf2af24563b9",
+        "current_sha256": "c4ba5b92a249ded3fe1b4c1c475fbb2a32cd0eb4315294b5205c4698d9563d8c"
+      }
+    },
+    "qualification": "Retained 24-package Windows/Linux gate plus affected source gates; not a fresh full final-SHA suite"
+  },
+  "native_qualification": "Fresh L installed execution pending; J/K historical operations are never replayed",
+  "final_status": "PARTIAL_PROGRESS"
+}
