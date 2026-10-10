@@ -259,6 +259,7 @@ fn assigned_reviewer_reads_only_closed_assignment_and_applied_submission_receipt
     assert!(assignment_receipt.get("diagnostic").is_none());
     assert!(assignment_receipt.get("native_refs").is_none());
     assert!(assignment_receipt.get("caller_id").is_none());
+    assert!(assignment_receipt.get("client_request_id").is_none());
     assert!(assignment_receipt.get("private_contract").is_none());
 
     let submission_receipt =
@@ -273,6 +274,65 @@ fn assigned_reviewer_reads_only_closed_assignment_and_applied_submission_receipt
     assert!(submission_receipt.get("diagnostic").is_none());
     assert!(submission_receipt.get("native_refs").is_none());
     assert!(submission_receipt.get("caller_id").is_none());
+    assert!(submission_receipt.get("client_request_id").is_none());
+}
+
+#[test]
+fn exact_caller_correlates_unscoped_rejections_by_retained_request_id() {
+    let (db, _, _, _) = review_fixture();
+    let caller = principal("dispatch-caller");
+    let operation_ids = ["dispatch-rejected-first", "dispatch-rejected-sibling"];
+    for operation_id in operation_ids {
+        insert_operation(
+            &db,
+            operation_id,
+            &caller.client_id,
+            "task.dispatch",
+            (TASK_ID, ATTEMPT_ID),
+            &json!({}),
+            &json!({"ok":false,"code":"STALE_LAUNCH_DISPATCH_SCOPE","message":"private"}),
+        );
+        db.execute(
+            "UPDATE operations SET task_id=NULL,attempt_id=NULL,state='rejected' WHERE operation_id=?1",
+            [operation_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:read-position:operation',?1,?1,'operation.position','{}',1)",
+            [operation_id],
+        )
+        .unwrap();
+        let receipt = super::super::object_reads::operation(&db, &caller, operation_id).unwrap();
+        assert_eq!(
+            receipt["client_request_id"],
+            format!("request-{operation_id}")
+        );
+        assert_eq!(receipt["state"], "rejected");
+        assert!(receipt["task_id"].is_null());
+        assert!(receipt["attempt_id"].is_null());
+        assert!(receipt["result"].get("message").is_none());
+        assert!(receipt.get("caller_id").is_none());
+        assert!(receipt.get("original_request").is_none());
+        assert_no_grant(&db, &principal("other-reviewer"), operation_id);
+    }
+    let page = super::super::object_reads::list(
+        &db,
+        &caller,
+        super::super::object_reads::ObjectKind::Operation,
+        &json!({"limit":10,"state":"rejected"}),
+    )
+    .unwrap();
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]["client_request_id"],
+        "request-dispatch-rejected-first"
+    );
+    assert_eq!(
+        items[1]["client_request_id"],
+        "request-dispatch-rejected-sibling"
+    );
+    assert_ne!(items[0]["client_request_id"], items[1]["client_request_id"]);
 }
 
 #[test]

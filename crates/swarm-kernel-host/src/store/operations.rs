@@ -45,6 +45,7 @@ fn operation_for_public_projection(db: &Connection, id: &str) -> Result<(Value, 
         .query_row(
             r#"SELECT json_object(
                 'operation_id',operation_id,'caller_id',caller_id,'method',method,
+                'client_request_id',client_request_id,
                 'state',state,'task_id',task_id,'attempt_id',attempt_id,
                 'binding_id',binding_id,'binding_generation',binding_generation,
                 'prerequisite_operation_id',prerequisite_operation_id,
@@ -95,6 +96,11 @@ pub(super) fn project_operation(
         "state":retained["state"], "created_at_ms":retained["created_at_ms"],
         "updated_at_ms":retained["updated_at_ms"],
     });
+    // Only the producing caller receives its correlation key. Other valid
+    // receipt readers keep their existing projection and object grants.
+    if retained["caller_id"].as_str() == Some(p.client_id.as_str()) {
+        operation["client_request_id"] = retained["client_request_id"].clone();
+    }
     if grant.level >= OperationReadLevel::Receipt {
         for field in [
             "task_id",

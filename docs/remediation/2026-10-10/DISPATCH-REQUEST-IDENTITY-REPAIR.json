@@ -1,0 +1,60 @@
+{
+  "schema": "eliot.dispatch_request_identity_repair.v1",
+  "date": "2026-10-10",
+  "final_status": "PARTIAL_PROGRESS",
+  "source_base_commit": "3d39a0d4567011a33c5b153e0856ee512c068590",
+  "scope": "Caller-owned public Operation request identity; qualification harness follow-up pending",
+  "production_files": [
+    "crates/swarm-kernel-host/src/store/operations.rs"
+  ],
+  "source_sha256": "2a3da187dcb0450c5db8d8d882a87e7c44a5aaf1255ec2c6e04840f8ef82f01d",
+  "invariants": [
+    "Only actual producing caller receives client_request_id",
+    "Existing Operation grants unchanged",
+    "No original request or raw error envelope disclosed",
+    "Strict dispatch admission guard unchanged"
+  ],
+  "verification": [
+    {
+      "platform": "Windows",
+      "production_clippy": "PASS",
+      "affected_fixture_tests": "5 PASS",
+      "gate_record_sha256": "8dcc7540c04b177bf3f654a6fe2f401a48e38b2cafa296cfdc2d9ce8cb6076c3",
+      "source_hashes": [
+        {
+          "path": "crates/swarm-kernel-host/src/store/operations.rs",
+          "sha256": "2a3da187dcb0450c5db8d8d882a87e7c44a5aaf1255ec2c6e04840f8ef82f01d"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/store/object_scope_review_tests.rs",
+          "sha256": "a53174288824abf66898379fcf48962c5590794c4d2d655911f88296ec570859"
+        }
+      ]
+    },
+    {
+      "platform": "Linux",
+      "production_clippy": "PASS",
+      "affected_fixture_tests": "5 PASS",
+      "gate_record_sha256": "a6750f7801796a960f77cb75029d9a8064011257c80309c593455251c2b956a0",
+      "source_hashes": [
+        {
+          "path": "crates/swarm-kernel-host/src/store/operations.rs",
+          "sha256": "2a3da187dcb0450c5db8d8d882a87e7c44a5aaf1255ec2c6e04840f8ef82f01d"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/store/object_scope_review_tests.rs",
+          "sha256": "a53174288824abf66898379fcf48962c5590794c4d2d655911f88296ec570859"
+        }
+      ]
+    }
+  ],
+  "native_qualification": "pending fresh candidate",
+  "historical_candidate_O": "read-only exact1ad4209 retained",
+  "independent_review": {
+    "decision": "ACCEPT",
+    "reviewer": "KiloStep5 (stepfun/step-5-preview-free, High) independent subagent",
+    "reviewed_at_utc": "2026-10-10T23:57:23Z",
+    "review_sha256": "02ccd089a8a2a395ea8587b2fb26cffde4fa20be6d4f392cf88ae2b8e2009663"
+  },
+  "harness_verification": "pending Kilo completion"
+}
