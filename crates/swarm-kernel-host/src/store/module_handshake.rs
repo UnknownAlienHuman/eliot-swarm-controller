@@ -334,17 +334,30 @@ pub(super) fn descriptor_for_new_binding(
     db: &Connection,
     owner_manager_id: &str,
     route_alias: &str,
-    _route_runtime: &str,
+    route_runtime: &str,
     configured_artifact_id: &str,
 ) -> Result<Option<NewBindingDescriptorContract>> {
     let registry = load_registry(db)?;
-    let Some(selection) = registry
+    let selection = registry
         .selections
         .get(owner_manager_id)
-        .and_then(|routes| routes.get(route_alias))
-    else {
-        return Ok(None);
-    };
+        .and_then(|routes| routes.get(route_alias));
+    if crate::config::is_selectorless_builtin_route(route_runtime, configured_artifact_id) {
+        return if selection.is_some() {
+            Err(Error::new(
+                "MODULE_ROUTE_STALE",
+                "built-in route cannot use a module descriptor selection",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    let selection = selection.ok_or_else(|| {
+        Error::new(
+            "MODULE_CONTRACT_REQUIRED",
+            "new module binding requires the Manager's exact trusted descriptor selection",
+        )
+    })?;
     if selection.artifact.artifact_id.as_str() != configured_artifact_id {
         return Err(Error::new(
             "MODULE_ROUTE_STALE",
@@ -763,15 +776,30 @@ pub(super) fn retained_contract_identity(
 /// Reject a native runtime command that is outside the exact descriptor
 /// retained by this binding. Capabilities are compatibility metadata only;
 /// the existing Store authorization and reservation checks remain authoritative.
-/// A missing selector preserves the legacy route contract.
+/// Only exact built-in route pairs retain selector-less command compatibility.
 pub(super) fn require_selected_native_command(
     db: &Connection,
     binding_id: &str,
-    binding_artifact_id: &str,
+    (binding_runtime, binding_artifact_id): (&str, &str),
     selector: Option<&Value>,
     method: &str,
     input: &Value,
 ) -> Result<()> {
+    let selector = selector.filter(|value| !value.is_null());
+    let selectorless_builtin =
+        crate::config::is_selectorless_builtin_route(binding_runtime, binding_artifact_id);
+    if selectorless_builtin && selector.is_some() {
+        return Err(Error::new(
+            "MODULE_ROUTE_STALE",
+            "built-in route cannot retain a module descriptor selection",
+        ));
+    }
+    if !selectorless_builtin && selector.is_none() {
+        return Err(Error::new(
+            "MODULE_CONTRACT_REQUIRED",
+            "module runtime command requires the binding's exact trusted descriptor",
+        ));
+    }
     match selected_native_command_supported(db, binding_artifact_id, selector, method, input)? {
         None | Some(true) => Ok(()),
         Some(false) => Err(Error::new(
@@ -1179,7 +1207,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(one_binding["artifact"]["version"], "2.1.0");
-        assert!(
+        assert_eq!(
             selection_for_new_binding(
                 &tx,
                 &manager_two.client_id,
@@ -1187,8 +1215,9 @@ mod tests {
                 first.module_id.as_str(),
                 first.artifact.artifact_id.as_str(),
             )
-            .unwrap()
-            .is_none()
+            .unwrap_err()
+            .code,
+            "MODULE_CONTRACT_REQUIRED"
         );
 
         select_route(&tx, &manager_two, &select("3.0.0", 3), &config, "op-two").unwrap();
@@ -1221,6 +1250,130 @@ mod tests {
             read_catalog(&manager_one, &json!({}), &tx).unwrap()["route_selections"]["default"]["artifact"]
                 ["version"],
             "2.1.0"
+        );
+    }
+
+    #[test]
+    fn new_module_work_requires_selection_independently_of_artifact_ids() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        for (runtime, artifact) in [
+            ("module", "future-artifact-not-in-any-current-list"),
+            ("module", crate::config::OPENCODE_RUST_ARTIFACT_ID),
+            ("module", crate::runtime::zed::ARTIFACT_ID),
+        ] {
+            assert_eq!(
+                descriptor_for_new_binding(&db, "manager", "route", runtime, artifact)
+                    .unwrap_err()
+                    .code,
+                "MODULE_CONTRACT_REQUIRED"
+            );
+            for selector in [None, Some(&Value::Null)] {
+                assert_eq!(
+                    require_selected_native_command(
+                        &db,
+                        "binding",
+                        (runtime, artifact),
+                        selector,
+                        "agent.send",
+                        &json!({"text":"new input"}),
+                    )
+                    .unwrap_err()
+                    .code,
+                    "MODULE_CONTRACT_REQUIRED"
+                );
+            }
+            // Historical decoding does not authorize either new admission.
+            assert!(
+                retained_contract_identity(&db, artifact, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM meta", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn future_module_artifact_uses_exact_manager_selection_and_shared_admission() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let trusted = descriptor();
+        register_trusted_descriptor(&tx, trusted.clone()).unwrap();
+        let route = Route {
+            alias: "future".into(),
+            runtime: "module".into(),
+            module_artifact_id: trusted.artifact.artifact_id.to_string(),
+            enabled: true,
+            native_options: json!({}),
+            workspace_option: None,
+            admission_policy: None,
+            owned_service: None,
+        };
+        let config = Config {
+            routes: vec![route.clone()],
+            ..Config::default()
+        };
+        let manager = Principal {
+            link_id: "link".into(),
+            client_id: "manager".into(),
+            role: Role::Manager,
+        };
+        select_route(
+            &tx,
+            &manager,
+            &json!({
+                "route_alias":"future", "module_id":trusted.module_id,
+                "artifact_id":trusted.artifact.artifact_id, "version":trusted.artifact.version,
+                "expected_catalog_revision":1,
+            }),
+            &config,
+            "select-future",
+        )
+        .unwrap();
+        let selected = selection_for_new_binding(
+            &tx,
+            &manager.client_id,
+            &route.alias,
+            &route.runtime,
+            &route.module_artifact_id,
+        )
+        .unwrap()
+        .unwrap();
+        super::super::task_prompt::require_new_binding(&route, Some(&selected)).unwrap();
+        let retained = retained_contract_identity(&tx, &route.module_artifact_id, Some(&selected))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.artifact, trusted.artifact);
+        assert_eq!(
+            descriptor_for_new_binding(
+                &tx,
+                &manager.client_id,
+                &route.alias,
+                "module",
+                "other-artifact"
+            )
+            .unwrap_err()
+            .code,
+            "MODULE_ROUTE_STALE"
+        );
+        assert_eq!(
+            descriptor_for_new_binding(
+                &tx,
+                "unselected-manager",
+                &route.alias,
+                "module",
+                &route.module_artifact_id
+            )
+            .unwrap_err()
+            .code,
+            "MODULE_CONTRACT_REQUIRED"
         );
     }
 

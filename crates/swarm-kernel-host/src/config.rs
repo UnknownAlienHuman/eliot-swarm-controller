@@ -35,6 +35,16 @@ pub(crate) fn opencode_route_kind(runtime: &str, artifact_id: &str) -> Option<Op
     }
 }
 
+/// The built-in OpenCode and Zed decoders retain their bounded selector-less
+/// route contract. Every other runtime/artifact topology is module-backed and
+/// requires an exact trusted descriptor for new work.
+pub(crate) fn is_selectorless_builtin_route(runtime: &str, artifact_id: &str) -> bool {
+    opencode_route_kind(runtime, artifact_id) == Some(OpenCodeRouteKind::Builtin)
+        || (runtime == crate::runtime::zed::RUNTIME
+            && (artifact_id == crate::runtime::zed::ARTIFACT_ID
+                || artifact_id == crate::runtime::zed::LEGACY_ARTIFACT_ID))
+}
+
 /// Trusted local recorder settings. This controls optional diagnostic
 /// metadata and explicitly selected redacted text; it never disables or
 /// redirects Store/business receipts.
@@ -270,11 +280,24 @@ impl Route {
             ));
         }
 
+        if self.runtime == crate::runtime::zed::RUNTIME
+            && self.module_artifact_id != crate::runtime::zed::ARTIFACT_ID
+            && self.module_artifact_id != crate::runtime::zed::LEGACY_ARTIFACT_ID
+        {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "Zed routes require the current or explicitly retained legacy artifact",
+            ));
+        }
+
         let (runtime, workspace_field) = match self.module_artifact_id.as_str() {
             CODEX_RUST_ARTIFACT_ID => ("codex", "workspaceRoot"),
             OPENCODE_RUST_ARTIFACT_ID => ("module", "directory"),
             COMMAND_RUST_ARTIFACT_ID | COMMAND_ACP_ARTIFACT_ID => ("command", "workspaceRoot"),
             ANTIGRAVITY_RUST_ARTIFACT_ID => ("antigravity", "workspaceRoot"),
+            // Generic module routes get their exact launch contract from the
+            // selected trusted descriptor, not an artifact-ID allowlist here.
+            _ if self.runtime == "module" => return Ok(()),
             _ if self.workspace_option.is_some() => {
                 return Err(Error::new(
                     "CONFIG_ERROR",

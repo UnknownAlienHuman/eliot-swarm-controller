@@ -504,25 +504,60 @@ pub(super) fn pending(
         {
             continue;
         }
-        let selector = binding["observation"].get("module_contract_selector");
-        let retained = match module_handshake::retained_contract_identity(
-            db,
-            binding["module_artifact_id"].as_str().unwrap_or_default(),
-            selector,
-        ) {
-            Ok(Some(retained)) => retained,
-            Ok(None) => continue, // Legacy bindings are not inferred as modules.
-            Err(error) => {
-                output.blocked.push(ModuleDemandBlock {
-                    binding_id: operation.binding_id,
-                    generation,
-                    operation_id: operation.operation_id,
-                    error_code: error.code,
-                    descriptor: None,
-                });
-                continue;
-            }
+        let selector = binding["observation"]
+            .get("module_contract_selector")
+            .filter(|value| !value.is_null());
+        let route_runtime = binding["route"]["runtime"].as_str().unwrap_or_default();
+        let artifact_id = binding["module_artifact_id"].as_str().unwrap_or_default();
+        let selectorless_builtin =
+            crate::config::is_selectorless_builtin_route(route_runtime, artifact_id);
+        if selector.is_none() && selectorless_builtin {
+            continue;
+        }
+        if selectorless_builtin {
+            output.blocked.push(ModuleDemandBlock {
+                binding_id: operation.binding_id.clone(),
+                generation,
+                operation_id: operation.operation_id.clone(),
+                error_code: "MODULE_ROUTE_STALE".to_owned(),
+                descriptor: None,
+            });
+            continue;
+        }
+        let Some(selector) = selector else {
+            output.blocked.push(ModuleDemandBlock {
+                binding_id: operation.binding_id.clone(),
+                generation,
+                operation_id: operation.operation_id.clone(),
+                error_code: "MODULE_CONTRACT_REQUIRED".to_owned(),
+                descriptor: None,
+            });
+            continue;
         };
+        let retained =
+            match module_handshake::retained_contract_identity(db, artifact_id, Some(selector)) {
+                Ok(Some(retained)) => retained,
+                Ok(None) => {
+                    output.blocked.push(ModuleDemandBlock {
+                        binding_id: operation.binding_id,
+                        generation,
+                        operation_id: operation.operation_id,
+                        error_code: "MODULE_DESCRIPTOR_MISSING".to_owned(),
+                        descriptor: None,
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    output.blocked.push(ModuleDemandBlock {
+                        binding_id: operation.binding_id,
+                        generation,
+                        operation_id: operation.operation_id,
+                        error_code: error.code,
+                        descriptor: None,
+                    });
+                    continue;
+                }
+            };
         let descriptor = match module_handshake::retained_descriptor(db, &retained) {
             Ok(descriptor) => descriptor,
             Err(error) => {

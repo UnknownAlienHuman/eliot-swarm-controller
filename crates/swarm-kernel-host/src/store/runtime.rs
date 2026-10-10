@@ -1486,7 +1486,10 @@ fn next_internal(
             super::module_handshake::require_selected_native_command(
                 &tx,
                 &id,
-                model::text(&b, "module_artifact_id")?,
+                (
+                    model::text(&b["route"], "runtime")?,
+                    model::text(&b, "module_artifact_id")?,
+                ),
                 b["observation"].get("module_contract_selector"),
                 &method,
                 &input,
@@ -5202,7 +5205,10 @@ fn user_command_with_actor(
             super::module_handshake::require_selected_native_command(
                 tx,
                 id,
-                model::text(&b, "module_artifact_id")?,
+                (
+                    model::text(&b["route"], "runtime")?,
+                    model::text(&b, "module_artifact_id")?,
+                ),
                 Some(selector),
                 method,
                 v,
@@ -5217,7 +5223,10 @@ fn user_command_with_actor(
             super::module_handshake::require_selected_native_command(
                 tx,
                 id,
-                model::text(&b, "module_artifact_id")?,
+                (
+                    model::text(&b["route"], "runtime")?,
+                    model::text(&b, "module_artifact_id")?,
+                ),
                 Some(selector),
                 target_method,
                 &target_input,
@@ -5249,7 +5258,10 @@ fn user_command_with_actor(
     super::module_handshake::require_selected_native_command(
         tx,
         id,
-        model::text(&b, "module_artifact_id")?,
+        (
+            model::text(&b["route"], "runtime")?,
+            model::text(&b, "module_artifact_id")?,
+        ),
         b["observation"].get("module_contract_selector"),
         method,
         v,

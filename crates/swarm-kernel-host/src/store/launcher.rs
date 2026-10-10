@@ -5093,6 +5093,7 @@ fn launch_preview_inner(
         .iter()
         .find(|route| route.alias == request.route)
     {
+        let mut selection_unavailable = false;
         let selector = match super::module_handshake::selection_for_new_binding(
             db,
             actor.effective_manager_id(),
@@ -5105,16 +5106,33 @@ fn launch_preview_inner(
                 if matches!(
                     error.code.as_str(),
                     "TASK_PROMPT_CONTRACT_REQUIRED"
+                        | "MODULE_CONTRACT_REQUIRED"
                         | "MODULE_ROUTE_STALE"
                         | "MODULE_DESCRIPTOR_MISSING"
                 ) =>
             {
-                hard_blocks.push("selected_module_contract_unavailable");
+                selection_unavailable = true;
+                if error.code == "MODULE_CONTRACT_REQUIRED" {
+                    match super::task_prompt::require_new_binding(selected, None) {
+                        Err(retired) if retired.code == "ARTIFACT_RETIRED" => {
+                            hard_blocks.push("route_artifact_retired")
+                        }
+                        Err(required) if required.code == "MODULE_CONTRACT_REQUIRED" => {
+                            hard_blocks.push("current_module_contract_not_selected")
+                        }
+                        Err(other) => return Err(other),
+                        Ok(()) => hard_blocks.push("selected_module_contract_unavailable"),
+                    }
+                } else {
+                    hard_blocks.push("selected_module_contract_unavailable");
+                }
                 None
             }
             Err(error) => return Err(error),
         };
-        if let Err(error) = super::task_prompt::require_new_binding(selected, selector.as_ref()) {
+        if !selection_unavailable
+            && let Err(error) = super::task_prompt::require_new_binding(selected, selector.as_ref())
+        {
             match error.code.as_str() {
                 "ARTIFACT_RETIRED" => hard_blocks.push("route_artifact_retired"),
                 "MODULE_CONTRACT_REQUIRED" => {

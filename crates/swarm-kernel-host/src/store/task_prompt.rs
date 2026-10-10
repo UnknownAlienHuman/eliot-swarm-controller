@@ -54,6 +54,7 @@ pub(super) fn require_new_binding(
     route: &crate::config::Route,
     selector: Option<&Value>,
 ) -> Result<()> {
+    let selector = selector.filter(|value| !value.is_null());
     if matches!(
         route.module_artifact_id.as_str(),
         "eliot-zed.eval-cli.1"
@@ -70,22 +71,18 @@ pub(super) fn require_new_binding(
             "this retained artifact is unavailable for new bindings",
         ));
     }
-    if selector.is_none()
-        && matches!(
-            route.module_artifact_id.as_str(),
-            "codex-rust-controller.1"
-                | "eliot-command.rust-headless.1"
-                | "eliot-command.acp-rust.1"
-                | "eliot-opencode-v2.rust-http.1"
-                | "eliot-antigravity.rust-headless.1"
-                | "claude-agent-sdk-rust-controller.5"
-                | "muse-sdk-1.3.0-bridge.9"
-                | "command-mod-0.1.0-glue.5"
-        )
-    {
+    let selectorless_builtin =
+        crate::config::is_selectorless_builtin_route(&route.runtime, &route.module_artifact_id);
+    if selectorless_builtin && selector.is_some() {
+        return Err(Error::new(
+            "MODULE_ROUTE_STALE",
+            "built-in route cannot retain a module descriptor selection",
+        ));
+    }
+    if !selectorless_builtin && selector.is_none() {
         return Err(Error::new(
             "MODULE_CONTRACT_REQUIRED",
-            "current artifact requires its exact trusted descriptor for a new binding",
+            "new module binding requires its exact trusted descriptor selection",
         ));
     }
     Ok(())

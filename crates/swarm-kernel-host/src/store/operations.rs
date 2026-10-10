@@ -2887,7 +2887,7 @@ fn reserve_open_route(
     super::module_handshake::require_selected_native_command(
         tx,
         &binding,
-        &route.module_artifact_id,
+        (&route.runtime, &route.module_artifact_id),
         module_contract_selector.as_ref(),
         "agent.open",
         &json!({}),
@@ -3200,7 +3200,10 @@ pub(super) fn dispatch(
     super::module_handshake::require_selected_native_command(
         tx,
         binding,
-        model::text(&b, "module_artifact_id")?,
+        (
+            model::text(&b["route"], "runtime")?,
+            model::text(&b, "module_artifact_id")?,
+        ),
         b["observation"].get("module_contract_selector"),
         "task.dispatch",
         v,
