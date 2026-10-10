@@ -1,0 +1,96 @@
+{
+  "schema": "eliot.v27_late_repair_evidence.v1",
+  "observed_at_utc": "2026-10-10T05:25:44.7246112Z",
+  "prior_delivery": "aa8452011c6a13dd3c5b119ec609422778ccc126",
+  "baseline_24_package_gate": {
+    "windows": {
+      "status": "PASS",
+      "log": "receipt-windows-production-clippy.log",
+      "log_sha256": "cc856e5b03971ab57556dcfc1d4a104a570902a6508fdf45080cbe0487c3792f",
+      "completed_at": "2026-10-10T03:06:28.0360782Z"
+    },
+    "linux": {
+      "status": "PASS",
+      "log": "receipt-linux-production-clippy.log",
+      "log_sha256": "44f78d1b915ca934aa503e115e9d9a70677762cdafa031b388591a752758b78c",
+      "completed_at": "2026-10-10T03:06:35.2716707Z"
+    }
+  },
+  "baseline_recorded_source_count": 408,
+  "unchanged_source_count": 406,
+  "changed_source": {
+    "crates/swarm-kernel-host/src/host_module_supervisor.rs": {
+      "baseline_sha256": "cc3f856ac1044b195fcc67aedc8655bbe120153438756dfb627e93e64daf31f1",
+      "current_sha256": "08ad144b85c893f96c64ce08e0e1319fddc0c0845a08035b76775735ba12ab47"
+    },
+    "crates/swarm-process/src/permissions.rs": {
+      "baseline_sha256": "48961c2d16a2970beb4e3f74e426a51cc9be18b1c9dc060f6dec07f70157fda2",
+      "current_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b"
+    }
+  },
+  "affected_gates": {
+    "windows-late-permissions-clippy-proof.json": {
+      "package": "swarm-process",
+      "status": "PASS",
+      "exit_code": 0,
+      "source_sha256": "7cc7026d183f5860ae930c2580c05e5960ee3cbfd52b76062fe3160ff191cb7b",
+      "source_unchanged": true,
+      "log_sha256": "82523ecdeefe029962a365f30b6aabc02af8548b153c85f1de2a0528fbaf2419",
+      "flags": "--locked --lib --bins --no-deps -- -D warnings",
+      "observed_at_utc": "2026-10-10T05:08:30.2913686Z"
+    },
+    "windows-late-supervisor-clippy-result.json": {
+      "exit_code": 0,
+      "completed_at_utc": "2026-10-10T05:18:40.4029096Z",
+      "packages": [
+        "swarm-process",
+        "swarm-kernel-host"
+      ],
+      "log": "windows-late-supervisor-production-clippy.log",
+      "log_sha256": "4e563d5822643246b40a19888d0df329dc8b782bac63bb1d10b4fbaf8d69a49e"
+    },
+    "linux-late-supervisor-clippy-result.json": {
+      "exit_code": 0,
+      "completed_at_utc": "2026-10-10T05:18:42.5170231Z",
+      "packages": [
+        "swarm-process",
+        "swarm-kernel-host"
+      ],
+      "log": "linux-late-supervisor-production-clippy.log",
+      "log_sha256": "1327f3f042adaa0e122e67b387b1d699ca068dfa9cb0fec38c874fc4be84a013"
+    },
+    "windows-catalogue-restart-clippy-result.json": {
+      "exit_code": 0,
+      "source_sha256": "08ad144b85c893f96c64ce08e0e1319fddc0c0845a08035b76775735ba12ab47",
+      "log": "windows-catalogue-restart-clippy.log",
+      "log_sha256": "072d3d9f27809cc488fb5a2c55b4832750293a6bbf7a920fa33303373de984fa",
+      "completed_at_utc": "2026-10-10T05:22:52.7958124Z"
+    },
+    "linux-catalogue-restart-clippy-result.json": {
+      "exit_code": 0,
+      "source_sha256": "08ad144b85c893f96c64ce08e0e1319fddc0c0845a08035b76775735ba12ab47",
+      "log": "linux-catalogue-restart-clippy.log",
+      "log_sha256": "3b8279d095363db69ca59ea234a0be5e6715d7545952319df7bc01aeae4d82b9",
+      "completed_at_utc": "2026-10-10T05:23:06.2121457Z"
+    },
+    "windows-catalogue-custody-result.json": {
+      "exit_code": 0,
+      "scope": "Existing exact real-child custody fault and restart fixture",
+      "source_sha256": "08ad144b85c893f96c64ce08e0e1319fddc0c0845a08035b76775735ba12ab47",
+      "log_sha256": "265d248d597e11630152e2bb2852bac7192eac9a7a6d53cfec512435b0380d7a"
+    },
+    "linux-catalogue-custody-result.json": {
+      "exit_code": 0,
+      "scope": "Existing exact real-child custody fault and restart fixture",
+      "source_sha256": "08ad144b85c893f96c64ce08e0e1319fddc0c0845a08035b76775735ba12ab47",
+      "log_sha256": "ce53d5157f90bcd005053a3f9aca7d48bf2a6a5b523dcf6a193f11273fc6b3f9"
+    }
+  },
+  "supervisor_behavior": "Configured installed descriptors bootstrap their existing independent catalogue owner before first agent demand; post-exit restart uses the same capped retry and custody fencing.",
+  "scope_limits": [
+    "Custody fixture is the existing HIGH-0362 bounded real-child case, not full installed supervisor qualification.",
+    "Source evidence is the unchanged baseline plus fresh affected gates, not a new full workspace test run.",
+    "Installed repaired candidate and supported native model components are pending."
+  ],
+  "qualification": "not_qualified"
+}

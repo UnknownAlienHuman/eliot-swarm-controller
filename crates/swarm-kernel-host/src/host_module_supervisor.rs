@@ -350,6 +350,8 @@ async fn run_supervisor_process_loop(
     let mut demand_changes = store.subscribe_module_demand_changes();
     let mut failures = 0_u32;
     let mut retry = SUPERVISOR_PROCESS_BASE_RETRY;
+    // Configured descriptors need their catalogue owner before the first agent launch.
+    let catalog_needed = !bootstrap.config.descriptor_files.is_empty();
     let frame = match bootstrap.to_frame() {
         Ok(frame) => frame,
         Err(error) => {
@@ -370,30 +372,37 @@ async fn run_supervisor_process_loop(
         }
     };
     loop {
-        let demanded =
-            match wait_for_module_demand(&store, &mut demand_changes, &mut stopping).await {
-                Ok(demanded) => demanded,
-                Err(error) => {
-                    failures = failures.saturating_add(1).min(32);
-                    let (state, delay) = process_failure_state(failures, retry);
-                    if let Err(health_error) = record_module_actor_status(
-                        &control,
-                        state,
-                        failures,
-                        Some(&error.code),
-                        Some(delay),
-                    )
-                    .await
-                    {
-                        return Err(error.with_secondary_error(health_error));
-                    }
-                    if !wait_for_supervisor_backoff(delay, &mut stopping).await {
-                        return Ok(());
-                    }
-                    retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
-                    continue;
+        if *stopping.borrow() {
+            return Ok(());
+        }
+        let demanded = if catalog_needed {
+            Ok(true)
+        } else {
+            wait_for_module_demand(&store, &mut demand_changes, &mut stopping).await
+        };
+        let demanded = match demanded {
+            Ok(demanded) => demanded,
+            Err(error) => {
+                failures = failures.saturating_add(1).min(32);
+                let (state, delay) = process_failure_state(failures, retry);
+                if let Err(health_error) = record_module_actor_status(
+                    &control,
+                    state,
+                    failures,
+                    Some(&error.code),
+                    Some(delay),
+                )
+                .await
+                {
+                    return Err(error.with_secondary_error(health_error));
                 }
-            };
+                if !wait_for_supervisor_backoff(delay, &mut stopping).await {
+                    return Ok(());
+                }
+                retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
+                continue;
+            }
+        };
         if !demanded {
             return Ok(());
         }
@@ -628,7 +637,7 @@ async fn run_supervisor_process_loop(
             let _ = child.take_child();
         }
         let demanded = match module_supervisor_has_demand(&store).await {
-            Ok(demanded) => demanded,
+            Ok(demanded) => catalog_needed || demanded,
             Err(error) => {
                 failures = failures.saturating_add(1).min(32);
                 let (state, delay) = process_failure_state(failures, retry);
