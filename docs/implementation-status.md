@@ -69,10 +69,20 @@ Strict host production Clippy passed with zero warnings on both platforms, all
 review found no further finding. CI passed on that exact commit. These checks
 do not establish installed native/model qualification.
 
-Fresh installed qualification N remains pending from a separate clean candidate
-checkout, including Step 5 free with high reasoning and Antigravity Gemini 3.8.
-The historical M receipts, R48 installed fault/recovery gap and dependency alerts
-retain their recorded limits. Project status remains `PARTIAL_PROGRESS`.
+Fresh installed qualification N built all eight release packages from the clean
+`481e7fd` checkout and verified the installed five-binary stack plus its resource
+closure. Both native runs reached a ready binding but held dispatch with
+`LAUNCH_READY_READBACK_TIMEOUT`: the public supervisor phase was `owner_retained`
+with `MODULE_WORKER_EXITED`. Each dispatch count is zero, so Step 5 high and
+Gemini 3.8 model execution remain unqualified. A read-only post-receipt OS check
+still found Antigravity's exact worker PID/birth/image; its host shutdown remained
+pending. The error code alone does not prove that worker exited. OpenCode's host
+confirmed exit and its worker was absent. The shared worker/helper lifecycle seam
+is under source audit before any further native attempt. The
+[N execution record](remediation/2026-10-10/EXECUTION-RESULTS-N.json) preserves the
+receipts, exact source set, preflight repairs and pending departure. Historical
+M core/C load, R48 and dependency evidence retain their recorded limits.
+Project status remains `PARTIAL_PROGRESS`.
 
 ### V27 audit and installed qualification — 2026-10-10
 

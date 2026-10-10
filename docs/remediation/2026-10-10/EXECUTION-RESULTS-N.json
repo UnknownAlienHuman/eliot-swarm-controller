@@ -1,0 +1,389 @@
+{
+  "schema": "eliot.native_execution_results.v1",
+  "edition": "N",
+  "date": "2026-10-10",
+  "final_status": "PARTIAL_PROGRESS",
+  "candidate_commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+  "candidate_source": {
+    "path": "C:\\Users\\kleym\\.codex\\worktrees\\swarm-native-final-n\\eliot-swarm-controller",
+    "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+    "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+    "clean": true,
+    "evidence": "Exact SourceRepo Git readback before/after execution and eight clean package manifests; the root binding itself has no candidate_source field."
+  },
+  "execution_binding": {
+    "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\runs\\root-native-execution-binding-481e7fd6cadcaf0e46278a45471103b80ac8bf0a-e327beea3b8a4e06bbdb49fd58f6c24c.json",
+    "sha256": "55d5b133cd1fe73ec32315119c0e989826b2435bcd970d3f4f13d299fbb8abac"
+  },
+  "packages": [
+    {
+      "id": "host_runtime",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\host-runtime\\build-manifest.json",
+      "manifest_sha256": "d64f344175839bc290b7e5ec3bf3039ae64e19efa21559a70feef03e1290e7d0",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-kernel-host",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\host-runtime\\bin\\swarm-kernel-host.exe",
+          "sha256": "7ffcc5145651dd5fd64d387b95fa9e79217f85f72ef820d741648d6b3ae99dad",
+          "bytes": 54068224
+        }
+      ]
+    },
+    {
+      "id": "host_supervisor",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\host-supervisor\\build-manifest.json",
+      "manifest_sha256": "8568874030c4810fe562a8ec90045dd0000a816ceac08a042b513b360b6df768",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-supervisor",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\host-supervisor\\bin\\swarm-supervisor.exe",
+          "sha256": "0c4ebbd3b2015e06ad28c721032c690d88f7b7ddb38e195691396cb5039b62d9",
+          "bytes": 2895360
+        }
+      ]
+    },
+    {
+      "id": "host_launcher",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\host-launcher\\build-manifest.json",
+      "manifest_sha256": "afd42b4126a9fccf216b284e7e61eaa5f804b9dd8fd737b868fbed75462edd6f",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-host",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\host-launcher\\bin\\swarm-host.exe",
+          "sha256": "e187106545ea653f11d7e276c28caef9dba7be8030a8a10bd1333444aa980c9d",
+          "bytes": 459264
+        }
+      ]
+    },
+    {
+      "id": "public_cli",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\public-cli\\build-manifest.json",
+      "manifest_sha256": "ce384f78247c99640e92ea783dd400be560e9e44f83c2d6c5e4bc54d6fc127cd",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\public-cli\\bin\\swarm.exe",
+          "sha256": "826b6d01a0c79b6e70d7ad1381b81e81618d7d8582375ac45934c8fde99328af",
+          "bytes": 2724352
+        }
+      ]
+    },
+    {
+      "id": "process_owner_helper",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\process-owner\\build-manifest.json",
+      "manifest_sha256": "60aa9ae40969f9f6756b06a7d17fb8eacdb3120dbf9be622c1d95f49607c74a6",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-module-owner",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\process-owner\\bin\\swarm-module-owner.exe",
+          "sha256": "dfd31c15a91151d6ca57a48e3f71e8061ddb8acae8a71736d6d9e79461330b0a",
+          "bytes": 674816
+        }
+      ]
+    },
+    {
+      "id": "opencode_module",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\opencode-module\\build-manifest.json",
+      "manifest_sha256": "428c4c681d912906b34aaa2f9cf442b11a37f17f311d3b13efb5627382ee0728",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-adapter-opencode",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\opencode-module\\bin\\swarm-adapter-opencode.exe",
+          "sha256": "5aa25411f059e236fcd5bb1acf7da406dc363a5ef84ce8fe413c251271dc39b4",
+          "bytes": 5089280
+        }
+      ]
+    },
+    {
+      "id": "antigravity_module",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\antigravity-module\\build-manifest.json",
+      "manifest_sha256": "ae2df14cc614f38793b3fc5b42159bece5093a98b2960b60020f9b13a05ead30",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-antigravity",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\antigravity-module\\bin\\swarm-antigravity.exe",
+          "sha256": "16866c91eb4a4836c088c9ffdee2cf067cc0070942afe18a326c7232cf398621",
+          "bytes": 2132992
+        }
+      ]
+    },
+    {
+      "id": "swarm_mcp",
+      "manifest": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\swarm-mcp\\build-manifest.json",
+      "manifest_sha256": "067360629d8a90dd1d61ec7c131679d06c0209c792eb3f1227a546b6a25d4e9f",
+      "commit": "481e7fd6cadcaf0e46278a45471103b80ac8bf0a",
+      "tree": "4c899d349d557d6c19667112cd98fd0bae2f01f9",
+      "profile": "release",
+      "toolchain": "1.98.1",
+      "lock_sha256": "5743c18b866faf51153d5a09188f0c1355d0f503d5be6e0d1b1d5afb453670b7",
+      "clean_before": true,
+      "clean_after": true,
+      "artifacts": [
+        {
+          "target": "swarm-mcp",
+          "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-build\\swarm-mcp\\bin\\swarm-mcp.exe",
+          "sha256": "1d1fef4b3c6f8ca662f77289d12fc02271c8dbac6c2aa56e0c4d503ab804d8d2",
+          "bytes": 6103552
+        }
+      ]
+    }
+  ],
+  "package_count": 8,
+  "release_build": "PASS",
+  "installed_host_stack_readback": {
+    "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\candidate-install-n-readback.json",
+    "sha256": "e9c345cd082a3d598ee862d403f7ec439cef72a0496ad0b8d17489074b76529d",
+    "declared_file_hashes_verified": 16,
+    "independent_kilo_step5_high_provenance_review": "PASS"
+  },
+  "requested_models": {
+    "opencode": "opencode/step-5-preview-free, high",
+    "antigravity": "gemini-3.8-flash-high",
+    "model_execution": "not_established"
+  },
+  "native_results": [
+    {
+      "adapter": "OpenCode",
+      "run_id": "519046f9-a39e-4c0f-a39f-42e77bd711d4",
+      "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\runs\\519046f9-a39e-4c0f-a39f-42e77bd711d4\\qualification-receipt.json",
+      "receipt_sha256": "25f3e069bf1858fa95e060b8d4f1ef889c08cbb1ef981c7a16ea68fa18237c2f",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "passed_stages": [
+        "preflight",
+        "isolated_host",
+        "manager_admission",
+        "trusted_descriptor",
+        "route_configuration",
+        "manager_route_selection",
+        "task_create",
+        "task_claim",
+        "launcher_preview"
+      ],
+      "failed_stage": "module_open_and_hello",
+      "code": "LAUNCH_READY_READBACK_TIMEOUT",
+      "readiness_failure": {
+        "reason": "supervisor_phase",
+        "expected_binding_scope": {
+          "task_id": "337447e9-5cf9-4f74-8e04-af003afaed74",
+          "attempt_id": "195cc0bb-d49a-4efe-becd-17a9fdd77d45",
+          "module_id": "eliot.opencode.v2",
+          "artifact_id": "eliot-opencode-v2.rust-http.1",
+          "artifact_version": "0.5.0",
+          "binding_id": "8daa06b0-c215-406b-b638-94505b432cb8",
+          "generation": 1
+        },
+        "observed_binding_state": "ready",
+        "observed_supervisor_phase": "owner_retained",
+        "error_code": "MODULE_WORKER_EXITED"
+      },
+      "host_shutdown": {
+        "graceful_eof_sent": true,
+        "kernel_process_id": 14276,
+        "exited": true,
+        "force_terminated": false
+      },
+      "model_consumption": "not_proven_by_harness",
+      "task_completion": "not_claimed"
+    },
+    {
+      "adapter": "Antigravity",
+      "run_id": "3b3d3399-b20a-44ac-8c9d-480e2465ffca",
+      "receipt_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\runs\\3b3d3399-b20a-44ac-8c9d-480e2465ffca\\qualification-receipt.json",
+      "receipt_sha256": "3141c68695d9671d4af97db1af5d448c477d786f8a14e87cea0610c444020ae4",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "passed_stages": [
+        "preflight",
+        "isolated_host",
+        "manager_admission",
+        "trusted_descriptor",
+        "route_configuration",
+        "manager_route_selection",
+        "task_create",
+        "task_claim",
+        "launcher_preview"
+      ],
+      "failed_stage": "module_open_and_hello",
+      "code": "LAUNCH_READY_READBACK_TIMEOUT",
+      "readiness_failure": {
+        "reason": "supervisor_phase",
+        "expected_binding_scope": {
+          "task_id": "8c7d34ae-aa49-40ed-b2ee-29ad7b538e58",
+          "attempt_id": "da5ca900-888d-48ff-af47-986456f771e4",
+          "module_id": "antigravity",
+          "artifact_id": "eliot-antigravity.rust-headless.1",
+          "artifact_version": "5",
+          "binding_id": "d1b8c006-c4e8-4842-90fb-a805900f89a6",
+          "generation": 1
+        },
+        "observed_binding_state": "ready",
+        "observed_supervisor_phase": "owner_retained",
+        "error_code": "MODULE_WORKER_EXITED"
+      },
+      "host_shutdown": {
+        "graceful_eof_sent": true,
+        "kernel_process_id": 67724,
+        "pending_kernel_process_id": 67724,
+        "pending_host_process_id": 67724,
+        "force_terminated": false
+      },
+      "model_consumption": "not_proven_by_harness",
+      "task_completion": "not_claimed"
+    }
+  ],
+  "post_receipt_diagnostic": {
+    "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\n-worker-process-readback-20261010.json",
+    "sha256": "d7bc3b950b6779188b0ca6aaa749de0cd2b3e3a7489907d993574202d87f0cf9",
+    "observed_at_utc": "2026-10-10T22:51:29.0373675Z",
+    "interpretation": "Antigravity worker still matched the retained PID, Windows creation FILETIME and image hash after the public MODULE_WORKER_EXITED receipt; its host departure remained pending. OpenCode worker was absent and its host confirmed exit. The supervisor error code alone does not prove Antigravity worker departure.",
+    "rows": [
+      {
+        "adapter": "OpenCode",
+        "marker": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\runs\\519046f9-a39e-4c0f-a39f-42e77bd711d4\\state\\module-supervisor\\state\\edcdd42bc8e3752e7379b2077a6e90617c322e48f75bc9657854726667ae5d02\\823ffaf34c0e51628336dd1dd326d7031b95e030444499159527387fc63be95d\\92cd534f49ade6d080ac52c3498963b07325a9484c1eb3bd0ab060769220441f\\1\\worker.json",
+        "marker_sha256": "ea62e4ccd9901b90545f20d5dc2d78530f45e131fb4e4f3c5fe627b0ea92e71a",
+        "retained_identity": {
+          "creation_filetime": "134361457652188018",
+          "image_path": "\\\\?\\C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-install\\module-a\\artifact-4b4a03a8f4119eeaa11e42d25c7ef85124b4009a9e1eb640cb861837d9fb7690\\module.exe",
+          "image_sha256": "sha256:5aa25411f059e236fcd5bb1acf7da406dc363a5ef84ce8fe413c251271dc39b4",
+          "pid": 56268
+        },
+        "current_identity": null,
+        "pid_birth_hash_match": false,
+        "public_readiness_failure": {
+          "reason": "supervisor_phase",
+          "expected_binding_scope": {
+            "task_id": "337447e9-5cf9-4f74-8e04-af003afaed74",
+            "attempt_id": "195cc0bb-d49a-4efe-becd-17a9fdd77d45",
+            "module_id": "eliot.opencode.v2",
+            "artifact_id": "eliot-opencode-v2.rust-http.1",
+            "artifact_version": "0.5.0",
+            "binding_id": "8daa06b0-c215-406b-b638-94505b432cb8",
+            "generation": 1
+          },
+          "observed_binding_state": "ready",
+          "observed_supervisor_phase": "owner_retained",
+          "error_code": "MODULE_WORKER_EXITED"
+        },
+        "host_shutdown": {
+          "graceful_eof_sent": true,
+          "kernel_process_id": 14276,
+          "exited": true,
+          "force_terminated": false
+        }
+      },
+      {
+        "adapter": "Antigravity",
+        "marker": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\runs\\3b3d3399-b20a-44ac-8c9d-480e2465ffca\\state\\module-supervisor\\state\\ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32\\2e0b0f463c8d98351d0d6b5f31829a13cb407f4b3c50a92eb24aead19a1ec7d7\\5e4380df3713dc4363427db71140e9c349da735336a05b8989233495753d8306\\1\\worker.json",
+        "marker_sha256": "dea4922a75ac117746ab7af6a4ea629303977a7fbc1694e32f1a2749f800801d",
+        "retained_identity": {
+          "creation_filetime": "134361459536648290",
+          "image_path": "\\\\?\\C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-install\\module-b\\artifact-ff4f85c795d2eeb935c5359d08e6cf4f41e2092e409a09afbaabd2889267a127\\module.exe",
+          "image_sha256": "sha256:16866c91eb4a4836c088c9ffdee2cf067cc0070942afe18a326c7232cf398621",
+          "pid": 54328
+        },
+        "current_identity": {
+          "pid": 54328,
+          "image_path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010n\\candidate-install\\module-b\\artifact-ff4f85c795d2eeb935c5359d08e6cf4f41e2092e409a09afbaabd2889267a127\\module.exe",
+          "creation_filetime": "134361459536648290",
+          "image_sha256": "sha256:16866c91eb4a4836c088c9ffdee2cf067cc0070942afe18a326c7232cf398621"
+        },
+        "pid_birth_hash_match": true,
+        "public_readiness_failure": {
+          "reason": "supervisor_phase",
+          "expected_binding_scope": {
+            "task_id": "8c7d34ae-aa49-40ed-b2ee-29ad7b538e58",
+            "attempt_id": "da5ca900-888d-48ff-af47-986456f771e4",
+            "module_id": "antigravity",
+            "artifact_id": "eliot-antigravity.rust-headless.1",
+            "artifact_version": "5",
+            "binding_id": "d1b8c006-c4e8-4842-90fb-a805900f89a6",
+            "generation": 1
+          },
+          "observed_binding_state": "ready",
+          "observed_supervisor_phase": "owner_retained",
+          "error_code": "MODULE_WORKER_EXITED"
+        },
+        "host_shutdown": {
+          "graceful_eof_sent": true,
+          "kernel_process_id": 67724,
+          "pending_kernel_process_id": 67724,
+          "pending_host_process_id": 67724,
+          "force_terminated": false
+        }
+      }
+    ]
+  },
+  "preparation_repairs": {
+    "contract_repair_record": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\n-config-plan-contract-repair-20261010.json",
+    "empty_roots_preservation_record": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\n-empty-preflight-root-preservation-20261010.json",
+    "consumed_plan": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\n-config-preparation-consumed-20261010.json",
+    "consumed_plan_sha256": "a1d648742435f0dd58682cbccb201907ad4277815845d7248bc720d74ba0b80d",
+    "descriptive_metadata_correction": "Consumers validated repository.path and exact Git commit/tree/cleanliness independently. Descriptive legacy fields were not consumed as native authority. Raw consumed input is retained; this correction does not replace historical N receipt hashes or rerun qualification.",
+    "native_calls_before_preflight_repairs": 0,
+    "model_calls_before_preflight_repairs": 0
+  },
+  "retained_core_candidate": "694794f6158e92bdef3ab0eb4ceae9a4dd515b74",
+  "retained_load_candidate": "db0e4cf1c38d6bf89d0a6c3ee287b4697c8a1b76",
+  "retained_evidence_scope": "Historical M core/C load were not repeated or promoted to N",
+  "limitations": [
+    "Both native runs held dispatch with LAUNCH_READY_READBACK_TIMEOUT at supervisor phase. The exact worker/helper lifecycle cause is under bounded source audit.",
+    "Antigravity host shutdown remained pending; processes and receipts are retained without forced termination.",
+    "Zero task.dispatch calls: model consumption and causal results are not qualified.",
+    "R48 missing-binary isolation/supervisor restart is recorded separately; scheduler readiness and uncertain initial admission receipt/no-replay remain unverified.",
+    "Antigravity public assigned-session server/tool-schema proof remains unavailable.",
+    "13 upstream dependency alerts remain open."
+  ],
+  "next_step": "Resolve the concrete shared supervisor/module-worker lifecycle seam before another native run; use a new candidate snapshot and run IDs only after source changes and scoped qualification."
+}

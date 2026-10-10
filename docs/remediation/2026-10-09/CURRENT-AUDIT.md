@@ -1,5 +1,15 @@
 # Current-source audit and implementation ledger
 
+Fresh [N execution](../2026-10-10/EXECUTION-RESULTS-N.json) built and installed
+eight exact clean `481e7fd` release packages. Both native runs reached a ready
+binding but retained `owner_retained / MODULE_WORKER_EXITED` and zero dispatch;
+neither qualifies model consumption. Antigravity's exact worker PID, creation
+FILETIME and image SHA remained live in the subsequent OS readback, while its
+host departure remained pending. OpenCode's host exited and its worker was
+absent. A bounded shared worker/helper lifecycle audit is in progress; the
+closed error code is not an assertion that Antigravity's actual worker departed.
+No further native run is justified by repeating these unchanged sources.
+
 The [optional-worker recovery record](../2026-10-10/OPTIONAL-WORKER-RECOVERY-EVIDENCE.json)
 adds a real bounded installed contour: the exact N host observed missing-binary
 `retry_wait`, the existing installer applied its matching clean release package,
