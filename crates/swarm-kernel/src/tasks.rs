@@ -149,6 +149,17 @@ pub fn validate_spec(spec: &Value) -> Result<()> {
         ));
     }
 
+    // A source is included once, without sorting or normalizing its identity.
+    // Invalid/non-string refs were rejected above; this set borrows exact text.
+    let mut unique_source_refs = BTreeSet::new();
+    if source_refs
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|source_ref| !unique_source_refs.insert(source_ref))
+    {
+        return Err(ValidationError::invalid("source_refs must be unique"));
+    }
+
     let source_index = object
         .get("source_index")
         .and_then(Value::as_array)
