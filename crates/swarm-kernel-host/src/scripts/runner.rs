@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -1247,46 +1247,32 @@ fn ensure_private_directory(root: &Path, dir: &Path) -> Result<()> {
 }
 
 fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
-    if path.exists() {
-        if fs::read(path)? == bytes {
-            return Ok(());
-        }
-        return Err(Error::conflict("retained script control file differs"));
-    }
-    let temp = path.with_file_name(format!(".{}.tmp", model::new_id()));
-    let result = (|| -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        match fs::hard_link(&temp, path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if fs::read(path)? == bytes {
-                    Ok(())
-                } else {
-                    Err(Error::conflict("retained script control file differs"))
-                }
+    match swarm_process::write_private_new(path, bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+            if read_control_bytes(path)? == bytes {
+                Ok(())
+            } else {
+                Err(Error::conflict("retained script control file differs"))
             }
-            Err(error) => Err(error.into()),
         }
-    })();
-    let _ = fs::remove_file(&temp);
-    if result.is_ok() {
-        platform::private_permissions(path, false)?;
+        Err(error) => Err(error.into()),
     }
-    result
 }
 
 fn read_json(path: &Path) -> Result<Value> {
+    Ok(serde_json::from_slice(&read_control_bytes(path)?)?)
+}
+
+fn read_control_bytes(path: &Path) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(Error::invalid("script control file is a reparse point"));
+        }
+    }
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > CONTROL_LIMIT as u64
@@ -1295,11 +1281,14 @@ fn read_json(path: &Path) -> Result<Value> {
             "script control file must be a bounded regular file",
         ));
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(CONTROL_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > CONTROL_LIMIT {
         return Err(Error::invalid("script control file exceeds 16 MiB"));
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
 }
 
 fn validate_work(work: &Work) -> Result<()> {

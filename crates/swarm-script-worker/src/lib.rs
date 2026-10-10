@@ -2485,30 +2485,17 @@ fn now_ms() -> Result<i64> {
 }
 
 fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
-    if receipt_exists(path)? {
-        let existing = read_bytes(path, CONTROL_LIMIT as u64)?;
-        if existing == bytes {
-            return Ok(());
-        }
-        return Err(Error::conflict("retained ScriptRun control file differs"));
-    }
-    let temp = path.with_file_name(format!(".script-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        write_private_new(&temp, bytes)?;
-        match fs::hard_link(&temp, path) {
-            Ok(()) => private_permissions(path, false),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_bytes(path, CONTROL_LIMIT as u64)? == bytes {
-                    Ok(())
-                } else {
-                    Err(Error::conflict("retained ScriptRun control file differs"))
-                }
+    match write_private_new(path, bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+            if read_bytes(path, CONTROL_LIMIT as u64)? == bytes {
+                Ok(())
+            } else {
+                Err(Error::conflict("retained ScriptRun control file differs"))
             }
-            Err(error) => Err(error.into()),
         }
-    })();
-    let _ = fs::remove_file(&temp);
-    result
+        Err(error) => Err(error),
+    }
 }
 
 fn write_process_control_failure(

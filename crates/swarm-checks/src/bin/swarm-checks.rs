@@ -623,12 +623,18 @@ fn load_execution_plan(job_dir: &Path, owner: &OwnedCheckProcess) -> Result<Load
             "resolved output directory differs from the generated CheckRun directory",
         ));
     }
-    fs::remove_file(plan_path).map_err(|_| {
+    let removed = swarm_process::remove_private_durable(&plan_path).map_err(|_| {
         Error::new(
             "CHECK_PLAN_CLEANUP_FAILED",
             "the one-use resolved plan could not be removed before native execution",
         )
     })?;
+    if !removed {
+        return Err(Error::new(
+            "CHECK_PLAN_CLEANUP_FAILED",
+            "the one-use resolved plan disappeared before native execution",
+        ));
+    }
     Ok(LoadedPlan {
         plan,
         plan_sha256,
@@ -883,33 +889,17 @@ fn read_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>> {
 
 fn write_once(path: &Path, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    if path.try_exists()? {
-        if read_bytes(path, MAX_CONTROL_BYTES)? == bytes {
-            return Ok(());
-        }
-        return Err(Error::conflict("retained CheckRun receipt differs"));
-    }
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| Error::invalid("CheckRun receipt filename is invalid"))?;
-    let temp = path.with_file_name(format!(".{filename}.{}.tmp", std::process::id()));
-    let result = (|| -> Result<()> {
-        swarm_process::write_private_new(&temp, &bytes)?;
-        match fs::hard_link(&temp, path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_bytes(path, MAX_CONTROL_BYTES)? == bytes {
-                    Ok(())
-                } else {
-                    Err(Error::conflict("CheckRun receipt raced different bytes"))
-                }
+    match swarm_process::write_private_new(path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+            if read_bytes(path, MAX_CONTROL_BYTES)? == bytes {
+                Ok(())
+            } else {
+                Err(Error::conflict("retained CheckRun receipt differs"))
             }
-            Err(error) => Err(error.into()),
         }
-    })();
-    let _ = fs::remove_file(temp);
-    result
+        Err(error) => Err(error),
+    }
 }
 
 fn sha256(bytes: &[u8]) -> String {

@@ -30,11 +30,7 @@ pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
 pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
     let target = private_target_path(path)?;
     if target_is_regular_file(&target)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "private file already exists",
-        )
-        .into());
+        return Err(private_file_exists());
     }
     let temp = private_temp_path(&target)?;
     let result = (|| {
@@ -49,6 +45,19 @@ pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn private_file_exists() -> Error {
+    Error::new("PRIVATE_FILE_ALREADY_EXISTS", "private file already exists")
+}
+
+#[cfg(not(windows))]
+fn publication_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        private_file_exists()
+    } else {
+        error.into()
+    }
 }
 
 /// Atomically replace a regular private file using a synced same-directory
@@ -211,7 +220,7 @@ fn create_private_temp(path: &Path) -> Result<fs::File> {
 #[cfg(unix)]
 fn publish_new(temp: &Path, target: &Path) -> Result<()> {
     // Hard-link publication is atomic and fails if the target already exists.
-    fs::hard_link(temp, target)?;
+    fs::hard_link(temp, target).map_err(publication_error)?;
     fs::remove_file(temp)?;
     Ok(())
 }
@@ -223,7 +232,7 @@ fn publish_new(temp: &Path, target: &Path) -> Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 fn publish_new(temp: &Path, target: &Path) -> Result<()> {
-    fs::hard_link(temp, target)?;
+    fs::hard_link(temp, target).map_err(publication_error)?;
     fs::remove_file(temp)?;
     Ok(())
 }
@@ -411,7 +420,16 @@ mod windows {
         // SAFETY: both paths are NUL-terminated UTF-16 strings that remain
         // alive for the duration of the Win32 call.
         let ok = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
-        if ok == 0 { Err(last_error()) } else { Ok(()) }
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if !replace && error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(super::private_file_exists())
+            } else {
+                Err(error.into())
+            }
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn restrict_path(path: &Path, directory: bool) -> Result<()> {
@@ -431,6 +449,33 @@ mod windows {
             };
             if ok == 0 { Err(last_error()) } else { Ok(()) }
         })
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn existing_target_never_clobbers_and_publication_race_is_explicit() {
+        let root = std::env::temp_dir().join(format!("swarm-publication-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let target = root.join("receipt.json");
+        write_private_new(&target, b"original").unwrap();
+        assert_eq!(
+            write_private_new(&target, b"changed").unwrap_err().code,
+            "PRIVATE_FILE_ALREADY_EXISTS"
+        );
+        let temp = root.join("racing.tmp");
+        fs::write(&temp, b"racing").unwrap();
+        assert_eq!(
+            publish_new(&temp, &target).unwrap_err().code,
+            "PRIVATE_FILE_ALREADY_EXISTS"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read(&temp).unwrap(), b"racing");
+        assert!(write_private_new(&root, b"not-a-regular-file").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

@@ -169,40 +169,35 @@ pub fn directory(root: &Path, id: &str) -> Result<PathBuf> {
 }
 pub fn write_once(path: &Path, body: &Value) -> Result<()> {
     let bytes = model::canonical(body)?.into_bytes();
-    if path.exists() {
-        if fs::read(path)? == bytes {
-            return Ok(());
-        }
-        return Err(Error::conflict("retained check control file differs"));
-    }
-    let temp = path.with_file_name(format!(".{}.tmp", model::new_id()));
-    let result = (|| -> Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-        drop(f);
-        match fs::hard_link(&temp, path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if fs::read(path)? == bytes {
-                    Ok(())
-                } else {
-                    Err(Error::conflict(
-                        "check control publication raced different bytes",
-                    ))
-                }
+    match swarm_process::write_private_new(path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+            if read_control_bytes(path)? == bytes {
+                Ok(())
+            } else {
+                Err(Error::conflict("retained check control file differs"))
             }
-            Err(e) => Err(e.into()),
         }
-    })();
-    let _ = fs::remove_file(temp);
-    result
+        Err(error) => Err(error.into()),
+    }
 }
 fn read_value(path: &Path) -> Result<Value> {
+    Ok(serde_json::from_slice(&read_control_bytes(path)?)?)
+}
+
+fn read_control_bytes(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(Error::invalid("check control file is a reparse point"));
+        }
+    }
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::invalid("check control file is not a regular file"));
+    }
     let mut bytes = Vec::new();
     File::open(path)?.take(8_388_609).read_to_end(&mut bytes)?;
     if bytes.len() > 8_388_608 {
@@ -210,7 +205,7 @@ fn read_value(path: &Path) -> Result<Value> {
             "check control file exceeds metadata envelope",
         ));
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
 }
 
 fn profile_report_matches(work: &Work, reported: &Value) -> Result<bool> {
