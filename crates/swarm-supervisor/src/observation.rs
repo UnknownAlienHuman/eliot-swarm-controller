@@ -170,10 +170,13 @@ impl ModuleSupervisorObservation {
         for operation_id in &unknown_operation_ids {
             validate_token(operation_id, "operation_id")?;
         }
-        let error_code = status
-            .last_failure
-            .as_ref()
-            .map(|failure| failure.code.clone());
+        let error_code = match status.lifecycle {
+            LifecycleState::OwnerGroupRetained { reason, .. } => Some(reason.code().to_owned()),
+            _ => status
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.code.clone()),
+        };
         if let Some(code) = error_code.as_deref()
             && (code.len() > 128
                 || code.is_empty()

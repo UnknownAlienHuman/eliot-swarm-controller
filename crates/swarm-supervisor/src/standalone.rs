@@ -1338,10 +1338,11 @@ impl StandaloneSupervisor {
         pending: &mut VecDeque<ModuleSupervisorObservation>,
         sequence: &mut u64,
     ) -> Result<()> {
-        for status in self.registry.statuses().await {
+        for status in self.registry.observation_statuses().await {
             let key = (status.module_id.clone(), status.scope.clone());
             let fingerprint = serde_json::to_string(&status)?;
             if last_status.get(&key) == Some(&fingerprint) {
+                self.registry.acknowledge_ready_observation(&status).await;
                 continue;
             }
             let next = sequence.checked_add(1).ok_or_else(|| {
@@ -1359,6 +1360,7 @@ impl StandaloneSupervisor {
             *sequence = next;
             pending.push_back(event);
             last_status.insert(key, fingerprint);
+            self.registry.acknowledge_ready_observation(&status).await;
         }
         while let Some(event) = pending.front() {
             match self.control.record_observation(event).await {

@@ -34,8 +34,9 @@ pub use standalone::{
 };
 pub use supervisor::{
     AdmissionState, DemandCause, DemandLease, FailureSummary, KernelFault, LifecycleState,
-    ModuleDemandRequest, ModuleSupervisor, OperationReadback, OperationSnapshot, ProcessIdentity,
-    RestartStatus, SupervisorRegistry, SupervisorRegistryConfig, SupervisorStatus,
+    ModuleDemandRequest, ModuleSupervisor, OperationReadback, OperationSnapshot,
+    OwnerRetainedReason, ProcessIdentity, RestartStatus, SupervisorRegistry,
+    SupervisorRegistryConfig, SupervisorStatus,
 };
 
 pub use swarm_contracts::error::{Error, Result};

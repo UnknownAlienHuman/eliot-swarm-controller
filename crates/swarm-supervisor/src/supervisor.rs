@@ -127,6 +127,7 @@ pub enum LifecycleState {
     },
     OwnerGroupRetained {
         owner_pid: u32,
+        reason: OwnerRetainedReason,
     },
     OwnerIdentityUnknown,
     ProcessIdentityUnknown {
@@ -138,6 +139,27 @@ pub enum LifecycleState {
     Isolated {
         reason: String,
     },
+}
+
+/// Diagnostic causes only; none proves departure or grants dispatch authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerRetainedReason {
+    WorkerExited,
+    WorkerIdentityUnknown,
+    HelloUnconfirmed,
+    OwnerFamilyNotEmpty,
+}
+
+impl OwnerRetainedReason {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::WorkerExited => "MODULE_WORKER_EXITED",
+            Self::WorkerIdentityUnknown => "MODULE_WORKER_IDENTITY_UNKNOWN",
+            Self::HelloUnconfirmed => "MODULE_HELLO_UNCONFIRMED",
+            Self::OwnerFamilyNotEmpty => "MODULE_OWNER_FAMILY_NOT_EMPTY",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -762,6 +784,39 @@ impl SupervisorRegistry {
         });
         values
     }
+
+    /// Include an accepted Ready before its later sampled status. The retained
+    /// snapshot is acknowledged only after the existing delivery queue owns it.
+    pub(crate) async fn observation_statuses(&self) -> Vec<SupervisorStatus> {
+        let services = self.services.lock().await;
+        let mut values: Vec<_> = services
+            .values()
+            .flat_map(|service| service.observation_statuses())
+            .collect();
+        values.sort_by(|left, right| {
+            (
+                &left.module_id,
+                &left.scope.binding_id,
+                left.scope.generation,
+            )
+                .cmp(&(
+                    &right.module_id,
+                    &right.scope.binding_id,
+                    right.scope.generation,
+                ))
+        });
+        values
+    }
+
+    pub(crate) async fn acknowledge_ready_observation(&self, status: &SupervisorStatus) {
+        let services = self.services.lock().await;
+        if let Some(service) = services.values().find(|service| {
+            service.descriptor.module_id.as_str() == status.module_id
+                && service.scope == status.scope
+        }) {
+            service.acknowledge_ready_observation(status);
+        }
+    }
 }
 
 pub type ModuleSupervisor = SupervisorRegistry;
@@ -825,6 +880,7 @@ struct Service {
     resolver: Arc<dyn ProtectedResolver>,
     admission: watch::Sender<AdmissionState>,
     status: watch::Sender<SupervisorStatus>,
+    confirmed_ready: Mutex<Option<ConfirmedReady>>,
     demands: Mutex<HashMap<String, usize>>,
     /// Serializes replacement and demand for this exact module/scope across
     /// descriptor generations. It is an in-memory gate, not durable state.
@@ -834,6 +890,11 @@ struct Service {
     readback_required: AtomicBool,
     unknown_operation_ids: Mutex<BTreeSet<String>>,
     runner: AsyncMutex<Option<JoinHandle<()>>>,
+}
+
+struct ConfirmedReady {
+    status: SupervisorStatus,
+    queued: bool,
 }
 
 struct ServiceInitialization {
@@ -938,6 +999,7 @@ impl Service {
             resolver: initialization.resolver,
             admission: initialization.admission,
             status,
+            confirmed_ready: Mutex::new(None),
             demands: Mutex::new(HashMap::new()),
             demand_gate: initialization.demand_gate,
             demand_epoch,
@@ -1065,6 +1127,9 @@ impl Service {
         if self.has_demand()
             || self.readback_required.load(Ordering::Acquire)
             || !lock(&self.unknown_operation_ids).is_empty()
+            || lock(&self.confirmed_ready)
+                .as_ref()
+                .is_some_and(|ready| !ready.queued)
         {
             return false;
         }
@@ -1204,10 +1269,35 @@ impl Service {
                 ));
                 return false;
             }
+            let mut ready = lock(&self.confirmed_ready);
+            if let Some(previous) = ready.as_ref() {
+                if previous.status.worker_boot_id.as_deref() == Some(boot_id) {
+                    if !previous.status.worker.as_ref().is_some_and(|confirmed| {
+                        same_process_identity(confirmed, current_worker)
+                    }) {
+                        transition_error = Some((
+                            "MODULE_WORKER_IDENTITY_MISMATCH",
+                            "the confirmed worker identity changed within the same boot",
+                        ));
+                        return false;
+                    }
+                } else if !previous.queued {
+                    transition_error = Some((
+                        "MODULE_READY_OBSERVATION_PENDING",
+                        "the previous Ready must enter the observation queue before another boot is confirmed",
+                    ));
+                    return false;
+                }
+            }
             current.lifecycle = LifecycleState::ProcessRunning {
                 boot_id: boot_id.to_owned(),
             };
             current.readback_required = false;
+            if ready.as_ref().is_none_or(|previous| {
+                previous.status.worker_boot_id.as_deref() != Some(boot_id)
+            }) {
+                *ready = Some(ConfirmedReady { status: current.clone(), queued: false });
+            }
             true
         });
         if !transitioned {
@@ -2034,6 +2124,44 @@ impl Service {
         }
         Ok(())
     }
+
+    fn observe_owned_worker(
+        &self,
+        boot_id: &str,
+        helper_identity: &ProcessIdentity,
+        worker_identity: Option<&ProcessIdentity>,
+    ) -> Result<bool> {
+        let worker_live = match worker_identity {
+            Some(worker) => process_identity_is_live(worker)?,
+            None => false,
+        };
+        self.update_status(|status| {
+            // Liveness advances only to Starting. Preserve Ready only when
+            // Store already confirmed this exact boot and worker identity.
+            let hello_confirmed = worker_live
+                && worker_identity
+                    .is_some_and(|worker| worker_is_hello_confirmed(status, boot_id, worker));
+            if !worker_live {
+                status.lifecycle = LifecycleState::OwnerGroupRetained {
+                    owner_pid: helper_identity.pid,
+                    reason: if worker_identity.is_some() {
+                        OwnerRetainedReason::WorkerExited
+                    } else {
+                        OwnerRetainedReason::WorkerIdentityUnknown
+                    },
+                };
+            } else if !hello_confirmed {
+                status.lifecycle = LifecycleState::Starting {
+                    boot_id: boot_id.to_owned(),
+                };
+            }
+            status.owner = Some(helper_identity.clone());
+            status.worker = worker_identity.cloned();
+            status.worker_boot_id = Some(boot_id.to_owned());
+        });
+        Ok(worker_live)
+    }
+
     async fn monitor_owner_helper(
         &self,
         helper: &mut Child,
@@ -2152,14 +2280,15 @@ impl Service {
                     if departed_empty(&owner["process"], token)? {
                         break;
                     }
-                    self.update_status(|status| {
-                        status.lifecycle = LifecycleState::OwnerGroupRetained {
-                            owner_pid: helper_identity.pid,
-                        };
-                        status.owner = Some(helper_identity.clone());
-                        status.worker = worker_identity.clone();
-                        status.worker_boot_id = Some(boot_id.to_owned());
-                    });
+                    if self.observe_owned_worker(
+                        boot_id,
+                        helper_identity,
+                        worker_identity.as_ref(),
+                    )? {
+                        let now = Instant::now();
+                        worker_started_at.get_or_insert(now);
+                        worker_last_live_at = Some(now);
+                    }
                     time::sleep(OWNER_DRAIN_POLL).await;
                 }
 
@@ -2226,44 +2355,12 @@ impl Service {
                 });
             }
 
-            if let Some(worker) = worker_identity.as_ref() {
-                if process_identity_is_live(worker)? {
-                    let now = Instant::now();
-                    worker_started_at.get_or_insert(now);
-                    worker_last_live_at = Some(now);
-                    self.update_status(|status| {
-                        let hello_confirmed = matches!(
-                            &status.lifecycle,
-                            LifecycleState::ProcessRunning {
-                                boot_id: confirmed_boot
-                            } if confirmed_boot == boot_id
-                        ) && status.worker_boot_id.as_deref()
-                            == Some(boot_id)
-                            && status.worker.as_ref().is_some_and(|confirmed_worker| {
-                                same_process_identity(confirmed_worker, worker)
-                            });
-                        if !hello_confirmed {
-                            // A live receipt alone is not Ready. Preserve a
-                            // Store-confirmed ProcessRunning state for this
-                            // exact boot and worker instead of regressing it.
-                            status.lifecycle = LifecycleState::Starting {
-                                boot_id: boot_id.to_owned(),
-                            };
-                        }
-                        status.owner = Some(helper_identity.clone());
-                        status.worker = Some(worker.clone());
-                        status.worker_boot_id = Some(boot_id.to_owned());
-                    });
-                } else {
-                    self.update_status(|status| {
-                        status.lifecycle = LifecycleState::OwnerGroupRetained {
-                            owner_pid: helper_identity.pid,
-                        };
-                        status.owner = Some(helper_identity.clone());
-                        status.worker = Some(worker.clone());
-                        status.worker_boot_id = Some(boot_id.to_owned());
-                    });
-                }
+            if let Some(worker) = worker_identity.as_ref()
+                && self.observe_owned_worker(boot_id, helper_identity, Some(worker))?
+            {
+                let now = Instant::now();
+                worker_started_at.get_or_insert(now);
+                worker_last_live_at = Some(now);
             }
             time::sleep(HELPER_START_POLL).await;
         }
@@ -2605,38 +2702,30 @@ impl Service {
                     None => None,
                 };
                 let boot_id = attempt_boot_id.clone();
-                let prior_status = self.current_status();
-                let confirmed_boot = match (
-                    &prior_status.lifecycle,
-                    prior_status.worker.as_ref(),
-                    attached_worker.as_ref(),
-                    boot_id.as_deref(),
-                ) {
-                    (
-                        LifecycleState::ProcessRunning {
-                            boot_id: current_boot,
-                        },
-                        Some(previous),
-                        Some(current_worker),
-                        Some(attempt_boot),
-                    ) if current_boot == attempt_boot
-                        && previous.pid == current_worker.pid
-                        && previous.birth == current_worker.birth =>
-                    {
-                        Some(attempt_boot.to_owned())
-                    }
-                    _ => None,
+                let worker_live = match attached_worker.as_ref() {
+                    Some(worker) => process_identity_is_live(worker)?,
+                    None => false,
                 };
                 self.update_status(|status| {
-                    status.lifecycle = if let Some(confirmed_boot) = confirmed_boot.as_ref() {
-                        LifecycleState::ProcessRunning {
-                            boot_id: confirmed_boot.clone(),
-                        }
-                    } else {
-                        LifecycleState::OwnerGroupRetained {
+                    let hello_confirmed = worker_live
+                        && boot_id
+                            .as_deref()
+                            .zip(attached_worker.as_ref())
+                            .is_some_and(|(boot, worker)| {
+                                worker_is_hello_confirmed(status, boot, worker)
+                            });
+                    if !hello_confirmed {
+                        status.lifecycle = LifecycleState::OwnerGroupRetained {
                             owner_pid: helper.pid,
-                        }
-                    };
+                            reason: if worker_live {
+                                OwnerRetainedReason::HelloUnconfirmed
+                            } else if attached_worker.is_some() {
+                                OwnerRetainedReason::WorkerExited
+                            } else {
+                                OwnerRetainedReason::WorkerIdentityUnknown
+                            },
+                        };
+                    }
                     status.owner = Some(helper.clone());
                     status.worker = attached_worker.clone();
                     status.worker_boot_id = boot_id.clone();
@@ -2712,7 +2801,10 @@ impl Service {
                 .or_else(|| attempted_helper.as_ref().map(|helper| helper.pid))
                 .ok_or_else(|| Error::invalid("module owner process PID is invalid"))?;
             self.update_status(|status| {
-                status.lifecycle = LifecycleState::OwnerGroupRetained { owner_pid };
+                status.lifecycle = LifecycleState::OwnerGroupRetained {
+                    owner_pid,
+                    reason: OwnerRetainedReason::OwnerFamilyNotEmpty,
+                };
                 status.owner = None;
                 status.worker = None;
                 status.worker_boot_id = None;
@@ -2946,6 +3038,38 @@ impl Service {
         let mut value = self.status.borrow().clone();
         value.admission = self.admission.borrow().clone();
         value
+    }
+
+    fn observation_statuses(&self) -> Vec<SupervisorStatus> {
+        // Use the same lock order as confirmation: watch status, then Ready.
+        let current = self.status.borrow();
+        let ready = lock(&self.confirmed_ready);
+        let mut values = Vec::with_capacity(2);
+        if let Some(ready) = ready.as_ref().filter(|ready| !ready.queued) {
+            values.push(ready.status.clone());
+        }
+        let mut current = current.clone();
+        current.admission = self.admission.borrow().clone();
+        values.push(current);
+        values
+    }
+
+    fn acknowledge_ready_observation(&self, status: &SupervisorStatus) {
+        if !matches!(status.lifecycle, LifecycleState::ProcessRunning { .. }) {
+            return;
+        }
+        let mut ready = lock(&self.confirmed_ready);
+        if let Some(ready) = ready.as_mut()
+            && ready.status.worker_boot_id == status.worker_boot_id
+            && ready
+                .status
+                .worker
+                .as_ref()
+                .zip(status.worker.as_ref())
+                .is_some_and(|(expected, actual)| same_process_identity(expected, actual))
+        {
+            ready.queued = true;
+        }
     }
 }
 
@@ -3301,6 +3425,21 @@ fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> boo
     left.pid == right.pid && left.birth == right.birth && left.image == right.image
 }
 
+fn worker_is_hello_confirmed(
+    status: &SupervisorStatus,
+    boot_id: &str,
+    worker: &ProcessIdentity,
+) -> bool {
+    matches!(
+        &status.lifecycle,
+        LifecycleState::ProcessRunning { boot_id: confirmed_boot } if confirmed_boot == boot_id
+    ) && status.worker_boot_id.as_deref() == Some(boot_id)
+        && status
+            .worker
+            .as_ref()
+            .is_some_and(|confirmed_worker| same_process_identity(confirmed_worker, worker))
+}
+
 fn scalar_text(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -3405,6 +3544,12 @@ fn unix_time_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(windows, target_os = "linux"))]
+    use std::{
+        io::Read,
+        process::{Child as StdChild, Command as StdCommand, Stdio},
+        thread,
+    };
 
     #[test]
     fn worker_diagnostic_receipt_requires_exact_boot_scope_and_artifact() {
@@ -3538,6 +3683,423 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    struct WorkerProcessFixture {
+        child: StdChild,
+        _stdin: std::process::ChildStdin,
+        identity: ProcessIdentity,
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl WorkerProcessFixture {
+        fn new() -> Self {
+            let mut child = StdCommand::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::worker_process_fixture_waits_for_release",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ELIOT_SWARM_SUPERVISOR_WORKER_FIXTURE", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start OS-backed worker fixture");
+            let pid = child.id();
+            let stdin = child.stdin.take().expect("pipe worker fixture stdin");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let identity = loop {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("worker fixture identity was not readable before deadline");
+                }
+                match capture_identity(pid) {
+                    Ok(identity) => break identity,
+                    Err(error) if error.code == "PROCESS_GONE" => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("worker fixture identity failed: {}", error.code);
+                    }
+                }
+            };
+            Self {
+                child,
+                _stdin: stdin,
+                identity,
+            }
+        }
+
+        fn stop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl Drop for WorkerProcessFixture {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn set_worker_status(
+        service: &Service,
+        owner: &ProcessIdentity,
+        worker: &ProcessIdentity,
+        boot_id: &str,
+        lifecycle: LifecycleState,
+    ) {
+        service.update_status(|status| {
+            status.lifecycle = lifecycle;
+            status.owner = Some(owner.clone());
+            status.worker = Some(worker.clone());
+            status.worker_boot_id = Some(boot_id.to_owned());
+        });
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn confirmed_ready_is_retained_before_worker_departure_between_status_polls() {
+        let fixture = StartupFixture::new();
+        let mut worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        let boot_id = "lost-ready-fixture";
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            boot_id,
+            LifecycleState::Starting {
+                boot_id: boot_id.to_owned(),
+            },
+        );
+        fixture.service.confirm_module_hello(boot_id).unwrap();
+        fixture.service.confirm_module_hello(boot_id).unwrap();
+        worker.stop();
+        assert!(
+            !fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, Some(&worker.identity))
+                .unwrap()
+        );
+
+        let statuses = fixture.service.observation_statuses();
+        assert_eq!(statuses.len(), 2);
+        let ready =
+            crate::ModuleSupervisorObservation::from_status(&statuses[0], "fixture-actor", 1)
+                .unwrap();
+        let retained =
+            crate::ModuleSupervisorObservation::from_status(&statuses[1], "fixture-actor", 2)
+                .unwrap();
+        assert_eq!(ready.phase, crate::ModuleSupervisorPhase::Ready);
+        assert_eq!(retained.phase, crate::ModuleSupervisorPhase::OwnerRetained);
+        assert_eq!(retained.error_code.as_deref(), Some("MODULE_WORKER_EXITED"));
+        assert_eq!(ready.boot_id, retained.boot_id);
+        assert_eq!(ready.scope, retained.scope);
+        // Failed delivery leaves the immutable Ready available on the next poll.
+        assert_eq!(fixture.service.observation_statuses().len(), 2);
+        fixture.service.acknowledge_ready_observation(&statuses[0]);
+        assert_eq!(fixture.service.observation_statuses().len(), 1);
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::OwnerGroupRetained {
+                reason: OwnerRetainedReason::WorkerExited,
+                ..
+            }
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .confirm_module_hello(boot_id)
+                .unwrap_err()
+                .code,
+            "MODULE_WORKER_EXITED"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn unqueued_ready_cannot_be_overwritten_by_another_boot() {
+        let fixture = StartupFixture::new();
+        let worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            "first-boot",
+            LifecycleState::Starting {
+                boot_id: "first-boot".to_owned(),
+            },
+        );
+        fixture.service.confirm_module_hello("first-boot").unwrap();
+        let ready = fixture.service.observation_statuses().remove(0);
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            "second-boot",
+            LifecycleState::Starting {
+                boot_id: "second-boot".to_owned(),
+            },
+        );
+        assert_eq!(
+            fixture
+                .service
+                .confirm_module_hello("second-boot")
+                .unwrap_err()
+                .code,
+            "MODULE_READY_OBSERVATION_PENDING"
+        );
+        assert_eq!(
+            fixture.service.observation_statuses()[0]
+                .worker_boot_id
+                .as_deref(),
+            Some("first-boot")
+        );
+        fixture.service.acknowledge_ready_observation(&ready);
+        fixture.service.confirm_module_hello("second-boot").unwrap();
+        assert_eq!(
+            fixture.service.observation_statuses()[0]
+                .worker_boot_id
+                .as_deref(),
+            Some("second-boot")
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn rejected_hello_never_retains_ready() {
+        let fixture = StartupFixture::new();
+        let worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            "exact-boot",
+            LifecycleState::Starting {
+                boot_id: "exact-boot".to_owned(),
+            },
+        );
+        assert_eq!(
+            fixture
+                .service
+                .confirm_module_hello("wrong-boot")
+                .unwrap_err()
+                .code,
+            "MODULE_WORKER_BOOT_MISMATCH"
+        );
+        let mut changed_worker = worker.identity.clone();
+        changed_worker.image["sha256"] = serde_json::json!("wrong-image");
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &changed_worker,
+            "exact-boot",
+            LifecycleState::Starting {
+                boot_id: "exact-boot".to_owned(),
+            },
+        );
+        assert!(fixture.service.confirm_module_hello("exact-boot").is_err());
+        assert!(lock(&fixture.service.confirmed_ready).is_none());
+        assert_eq!(fixture.service.observation_statuses().len(), 1);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn live_owner_retained_worker_stays_starting_until_hello_and_ready_survives_next_poll() {
+        let fixture = StartupFixture::new();
+        let mut worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        let boot_id = "worker-live-fixture";
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            boot_id,
+            LifecycleState::OwnerGroupRetained {
+                owner_pid: owner.pid,
+                reason: OwnerRetainedReason::HelloUnconfirmed,
+            },
+        );
+
+        assert!(
+            fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, Some(&worker.identity))
+                .unwrap()
+        );
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::Starting { boot_id: current } if current == boot_id
+        ));
+
+        fixture.service.confirm_module_hello(boot_id).unwrap();
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::ProcessRunning { boot_id: current } if current == boot_id
+        ));
+        assert!(
+            fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, Some(&worker.identity))
+                .unwrap()
+        );
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::ProcessRunning { boot_id: current } if current == boot_id
+        ));
+        worker.stop();
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn mismatched_live_worker_stays_nonready() {
+        let fixture = StartupFixture::new();
+        let previous_worker = WorkerProcessFixture::new();
+        let observed_worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        let boot_id = "worker-mismatch-fixture";
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &previous_worker.identity,
+            boot_id,
+            LifecycleState::ProcessRunning {
+                boot_id: boot_id.to_owned(),
+            },
+        );
+
+        assert!(
+            fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, Some(&observed_worker.identity))
+                .unwrap()
+        );
+        let status = fixture.service.current_status();
+        assert!(matches!(
+            status.lifecycle,
+            LifecycleState::Starting { boot_id: current } if current == boot_id
+        ));
+        assert!(
+            status
+                .worker
+                .as_ref()
+                .is_some_and(|worker| { same_process_identity(worker, &observed_worker.identity) })
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn same_pid_and_birth_with_changed_image_requires_new_hello() {
+        let fixture = StartupFixture::new();
+        let worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        let boot_id = "worker-image-mismatch-fixture";
+        let mut previous = worker.identity.clone();
+        previous.image["sha256"] = serde_json::json!("different-previous-image");
+        assert_eq!(previous.pid, worker.identity.pid);
+        assert_eq!(previous.birth, worker.identity.birth);
+        assert_ne!(previous.image, worker.identity.image);
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &previous,
+            boot_id,
+            LifecycleState::ProcessRunning {
+                boot_id: boot_id.to_owned(),
+            },
+        );
+        assert!(!worker_is_hello_confirmed(
+            &fixture.service.current_status(),
+            boot_id,
+            &worker.identity,
+        ));
+        assert!(
+            fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, Some(&worker.identity))
+                .unwrap()
+        );
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::Starting { boot_id: current } if current == boot_id
+        ));
+        fixture.service.confirm_module_hello(boot_id).unwrap();
+        assert!(worker_is_hello_confirmed(
+            &fixture.service.current_status(),
+            boot_id,
+            &worker.identity,
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn dead_worker_stays_owner_group_retained() {
+        let fixture = StartupFixture::new();
+        let mut worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        let boot_id = "worker-dead-fixture";
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            boot_id,
+            LifecycleState::ProcessRunning {
+                boot_id: boot_id.to_owned(),
+            },
+        );
+        worker.stop();
+
+        assert!(
+            !fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, Some(&worker.identity))
+                .unwrap()
+        );
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::OwnerGroupRetained { owner_pid, reason: OwnerRetainedReason::WorkerExited } if owner_pid == owner.pid
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .confirm_module_hello(boot_id)
+                .unwrap_err()
+                .code,
+            "MODULE_WORKER_EXITED"
+        );
+
+        assert!(
+            !fixture
+                .service
+                .observe_owned_worker(boot_id, &owner, None)
+                .unwrap()
+        );
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::OwnerGroupRetained { owner_pid, reason: OwnerRetainedReason::WorkerIdentityUnknown } if owner_pid == owner.pid
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "spawned by the supervisor retained-worker lifecycle regressions"]
+    fn worker_process_fixture_waits_for_release() {
+        if std::env::var_os("ELIOT_SWARM_SUPERVISOR_WORKER_FIXTURE").is_none() {
+            return;
+        }
+        let mut byte = [0_u8; 1];
+        let _ = std::io::stdin().read_exact(&mut byte);
     }
 
     #[tokio::test]

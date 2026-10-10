@@ -325,6 +325,41 @@ pub(super) fn parse<T: Serialize>(value: T) -> Result<ModuleSupervisorObservatio
     Ok(observation)
 }
 
+/// The journal's closed, flat status projection predates the producer DTO's
+/// nested scope. Decode that retained format explicitly without changing any
+/// historical payload or accepting arbitrary projection metadata.
+fn parse_retained_observation(raw: &str) -> Result<ModuleSupervisorObservation> {
+    let mut value: Value = serde_json::from_str(raw)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("retained module observation must be an object"))?;
+    if object.remove("certainty_scope") != Some(json!("latest_helper_attempt_only"))
+        || object.remove("retry_authorized") != Some(json!(false))
+    {
+        return Err(invalid(
+            "retained module observation has invalid authority metadata",
+        ));
+    }
+    let binding_id = object
+        .remove("binding_id")
+        .ok_or_else(|| invalid("retained module observation omitted binding identity"))?;
+    let generation = object
+        .remove("generation")
+        .ok_or_else(|| invalid("retained module observation omitted generation"))?;
+    if object
+        .insert(
+            "scope".to_owned(),
+            json!({"binding_id":binding_id,"generation":generation}),
+        )
+        .is_some()
+    {
+        return Err(invalid(
+            "retained module observation contains conflicting scope",
+        ));
+    }
+    parse(value)
+}
+
 /// Append an immutable transition and update the binding's safe latest
 /// readback in one Store transaction. Exact callback retries return an
 /// `ObservationCommit` with `inserted: false` and no diagnostic candidate.
@@ -415,6 +450,7 @@ pub(super) fn record(
             observation,
             generation,
             transition,
+            operation_link.as_ref(),
             now_ms,
         )?;
     }
@@ -743,6 +779,7 @@ fn record_lifecycle_trigger(
     observation: &ModuleSupervisorObservation,
     generation: i64,
     transition: LifecycleTransition,
+    operation_link: Option<&ValidatedOperationLink>,
     now_ms: i64,
 ) -> Result<()> {
     let Some(boot_id) = observation.boot_id.as_deref() else {
@@ -757,12 +794,9 @@ fn record_lifecycle_trigger(
         &observation.event_id,
         event_kind,
     )?;
-    let operation_id = (observation.unknown_operation_count == 1
-        && observation.unknown_operation_ids.len() == 1
-        && !observation.unknown_operation_ids_truncated)
-        .then(|| observation.unknown_operation_ids[0].as_str());
+    let operation_id = operation_link.map(|link| link.operation_id.as_str());
     let payload = json!({
-        "schema_version":1,
+        "schema_version":if transition == LifecycleTransition::Ready { 2 } else { 1 },
         "event_kind":event_kind,
         "occurrence_phase":transition.occurrence_phase(),
         "occurrence_id":occurrence_id,
@@ -944,7 +978,8 @@ pub(super) fn verified_lifecycle_event(
         Ok(fact) => fact,
         Err(_) => return Ok(None),
     };
-    if fact.schema_version != 1
+    if !matches!(fact.schema_version, 1 | 2)
+        || (fact.schema_version == 2 && event.event_kind != READY_EVENT_KIND)
         || fact.event_kind != event.event_kind
         || fact.binding_id != binding_id
         || fact.generation != generation
@@ -1021,7 +1056,7 @@ pub(super) fn verified_lifecycle_event(
     {
         return Ok(None);
     }
-    let observation: ModuleSupervisorObservation = match serde_json::from_str(&original_raw) {
+    let observation = match parse_retained_observation(&original_raw) {
         Ok(observation) => observation,
         Err(_) => return Ok(None),
     };
@@ -1036,11 +1071,7 @@ pub(super) fn verified_lifecycle_event(
         || observation.phase.as_str() != fact.phase
         || observation.effect_certainty.as_str() != fact.effect_certainty
         || observation.stage.map(ModuleFailureStage::as_str) != fact.stage.as_deref()
-        || fact.operation_id.as_deref()
-            != (observation.unknown_operation_count == 1
-                && observation.unknown_operation_ids.len() == 1
-                && !observation.unknown_operation_ids_truncated)
-                .then(|| observation.unknown_operation_ids[0].as_str())
+        || !lifecycle_operation_link_matches(db, &fact, &observation)?
         || !lifecycle_fact_matches_observation(&event.event_kind, &observation)
     {
         return Ok(None);
@@ -1059,6 +1090,54 @@ pub(super) fn verified_lifecycle_event(
         occurrence_id: fact.occurrence_id,
         error_code: None,
     }))
+}
+
+fn lifecycle_operation_link_matches(
+    db: &rusqlite::Connection,
+    fact: &ModuleLifecycleTrigger,
+    observation: &ModuleSupervisorObservation,
+) -> Result<bool> {
+    let single_id = (observation.unknown_operation_count == 1
+        && observation.unknown_operation_ids.len() == 1
+        && !observation.unknown_operation_ids_truncated)
+        .then(|| observation.unknown_operation_ids[0].as_str());
+    // Retained v1 triggers linked the sole sampled ID regardless of its later
+    // state. Preserve that historical contract; v2 Ready links only the exact
+    // Operation that was still unresolved at commit time.
+    if fact.schema_version == 1 {
+        return Ok(fact.operation_id.as_deref() == single_id);
+    }
+    if fact.operation_id.is_some() && fact.operation_id.as_deref() != single_id {
+        return Ok(false);
+    }
+    for id in &observation.unknown_operation_ids {
+        let state: Option<String> = db
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id=?1 \
+                 AND binding_id=?2 AND binding_generation=?3",
+                params![id, fact.binding_id, fact.generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        let terminal = matches!(state.as_str(), "settled" | "rejected" | "cancelled");
+        if !terminal
+            && !matches!(
+                state.as_str(),
+                "sending" | "native_accepted" | "outcome_unknown"
+            )
+        {
+            return Ok(false);
+        }
+        // A historical active link remains valid after settlement. An absent
+        // sole-ID link requires terminal evidence, never an arbitrary omission.
+        if single_id == Some(id.as_str()) && fact.operation_id.is_none() && !terminal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn is_nonterminal_event_kind(event_kind: &str) -> bool {
@@ -1254,7 +1333,7 @@ fn verified_nonterminal_event(
     {
         return Ok(None);
     }
-    let observation: ModuleSupervisorObservation = match serde_json::from_str(&original_raw) {
+    let observation = match parse_retained_observation(&original_raw) {
         Ok(observation) => observation,
         Err(_) => return Ok(None),
     };
@@ -1580,6 +1659,14 @@ fn validate_operation_ids(
             state.as_str(),
             "sending" | "native_accepted" | "outcome_unknown"
         ) {
+            if observation.phase == ModuleSupervisorPhase::Ready
+                && matches!(state.as_str(), "settled" | "rejected" | "cancelled")
+            {
+                // The immutable hello snapshot may wait behind delivery while
+                // an exact scoped Operation settles. Keep the sampled ID but
+                // do not attach terminal work as an active lifecycle cause.
+                continue;
+            }
             return Err(Error::new(
                 "MODULE_OBSERVATION_OPERATION_TERMINAL",
                 "listed Operation in the exact binding generation is no longer pending",
@@ -1906,4 +1993,397 @@ fn valid_version(value: &str) -> Result<()> {
 
 fn invalid(message: &'static str) -> Error {
     Error::new("MODULE_OBSERVATION_INVALID", message)
+}
+
+#[cfg(test)]
+mod journal_regression_tests {
+    use super::*;
+    use rusqlite::{Connection, TransactionBehavior, params};
+    use serde_json::Value;
+    use swarm_supervisor::{
+        ModuleEffectCertainty as ProducerCertainty, ModuleFailureStage as ProducerStage,
+        ModuleSupervisorObservation as ProducerObservation, ModuleSupervisorPhase as ProducerPhase,
+        ServiceScope,
+    };
+
+    const BINDING_ID: &str = "binding-fixture";
+    const GENERATION: u64 = 7;
+    const MODULE_ID: &str = "module-fixture";
+    const ARTIFACT_ID: &str = "artifact-fixture";
+    const ARTIFACT_VERSION: &str = "1.2.3";
+    const BUILD_ID: &str = "build-fixture";
+    const ACTOR_INSTANCE_ID: &str = "actor-fixture";
+    const BOOT_ID: &str = "boot-fixture";
+
+    fn fixture_db() -> Connection {
+        let db = Connection::open_in_memory().expect("open in-memory Store database");
+        db.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable Store foreign keys");
+        db.execute_batch(include_str!("../../migrations/001_core.sql"))
+            .expect("install the real core Store schema");
+
+        let binding_state = json!({
+            "module_contract_selector": {
+                "schema_version": 1,
+                "registered_revision": 3,
+                "selected_revision": 3,
+                "module_id": MODULE_ID,
+                "artifact": {
+                    "artifact_id": ARTIFACT_ID,
+                    "version": ARTIFACT_VERSION,
+                    "build_id": BUILD_ID
+                }
+            }
+        });
+        db.execute(
+            "INSERT INTO bindings(
+                 binding_id,generation,lane_id,module_instance_id,module_artifact_id,
+                 state,native_scope_key,native_root_id,route_json,state_json,created_at_ms
+             ) VALUES(?1,?2,'lane-fixture','instance-fixture',?3,'ready',NULL,NULL,'{}',?4,1)",
+            params![
+                BINDING_ID,
+                GENERATION as i64,
+                ARTIFACT_ID,
+                model::canonical(&binding_state).expect("encode binding selector"),
+            ],
+        )
+        .expect("insert exact fixture binding");
+        db
+    }
+
+    fn producer_observation(
+        sequence: u64,
+        phase: ProducerPhase,
+        error_code: Option<&str>,
+    ) -> ProducerObservation {
+        ProducerObservation {
+            schema_version: 1,
+            actor_instance_id: ACTOR_INSTANCE_ID.to_owned(),
+            event_id: format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:{sequence}"),
+            sequence,
+            module_id: MODULE_ID.to_owned(),
+            artifact_id: ARTIFACT_ID.to_owned(),
+            artifact_version: ARTIFACT_VERSION.to_owned(),
+            build_id: Some(BUILD_ID.to_owned()),
+            scope: ServiceScope {
+                binding_id: BINDING_ID.to_owned(),
+                generation: GENERATION,
+            },
+            boot_id: Some(BOOT_ID.to_owned()),
+            phase,
+            effect_certainty: ProducerCertainty::Unknown,
+            stage: error_code.map(|_| ProducerStage::Worker),
+            error_code: error_code.map(str::to_owned),
+            unknown_operation_ids: Vec::new(),
+            unknown_operation_count: 0,
+            unknown_operation_ids_truncated: false,
+        }
+    }
+
+    fn record_in_transaction(
+        db: &mut Connection,
+        observation: &ProducerObservation,
+        now_ms: i64,
+    ) -> Result<ObservationCommit> {
+        let parsed = parse(observation)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let committed = record(&tx, &parsed, now_ms)?;
+        tx.commit()?;
+        Ok(committed)
+    }
+
+    fn expect_record_error(
+        db: &mut Connection,
+        observation: &ProducerObservation,
+        now_ms: i64,
+    ) -> Error {
+        match record_in_transaction(db, observation, now_ms) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched or conflicting observation was accepted"),
+        }
+    }
+
+    fn insert_operation(db: &Connection, id: &str, state: &str, scoped: bool) {
+        let terminal = matches!(state, "settled" | "rejected" | "cancelled");
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,
+                 original_request_json,effective_request_json,binding_id,binding_generation,
+                 state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms)
+             VALUES(?1,'caller-fixture',?1,'agent.send','{}','{}',?2,?3,?4,?5,1,?6,1,1)",
+            params![
+                id,
+                scoped.then_some(BINDING_ID),
+                scoped.then_some(GENERATION as i64),
+                state,
+                terminal.then_some("{}"),
+                terminal.then_some(2_i64),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn retained_event(db: &Connection, kind: &str) -> crate::automation::intake::ObservedEvent {
+        db.query_row(
+            "SELECT observation_id,source_stream_id,kind,operation_id,recorded_at_ms
+             FROM observations WHERE kind=?1 ORDER BY observation_id DESC LIMIT 1",
+            [kind],
+            |row| {
+                Ok(crate::automation::intake::ObservedEvent {
+                    observation_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    event_kind: row.get(2)?,
+                    operation_id: row.get(3)?,
+                    recorded_at_ms: row.get(4)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ready_preserves_terminal_ids_without_linking_terminal_work() {
+        for state in ["settled", "rejected", "cancelled"] {
+            let mut db = fixture_db();
+            insert_operation(&db, "operation-fixture", state, true);
+            let mut ready = producer_observation(1, ProducerPhase::Ready, None);
+            ready.unknown_operation_ids = vec!["operation-fixture".to_owned()];
+            ready.unknown_operation_count = 1;
+            assert!(
+                record_in_transaction(&mut db, &ready, 100)
+                    .unwrap()
+                    .inserted
+            );
+            let event = retained_event(&db, READY_EVENT_KIND);
+            assert!(event.operation_id.is_none());
+            assert!(verified_lifecycle_event(&db, &event).unwrap().is_some());
+            let raw: String = db
+                .query_row(
+                    "SELECT payload_json FROM observations WHERE kind=?1",
+                    [EVENT_KIND],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let original = parse_retained_observation(&raw).unwrap();
+            assert_eq!(original.unknown_operation_ids, ready.unknown_operation_ids);
+            assert_eq!(original.unknown_operation_count, 1);
+
+            // A terminal row remains invalid for ordinary sampled phases.
+            let mut starting = ready;
+            starting.phase = ProducerPhase::Starting;
+            starting.sequence = 2;
+            starting.event_id = format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:2");
+            assert_eq!(
+                expect_record_error(&mut db, &starting, 200).code,
+                "MODULE_OBSERVATION_OPERATION_TERMINAL"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_pending_link_survives_settlement_and_v1_facts_remain_readable() {
+        let mut db = fixture_db();
+        insert_operation(&db, "operation-fixture", "sending", true);
+        let mut ready = producer_observation(1, ProducerPhase::Ready, None);
+        ready.unknown_operation_ids = vec!["operation-fixture".to_owned()];
+        ready.unknown_operation_count = 1;
+        record_in_transaction(&mut db, &ready, 100).unwrap();
+        let event = retained_event(&db, READY_EVENT_KIND);
+        assert_eq!(event.operation_id.as_deref(), Some("operation-fixture"));
+        assert!(verified_lifecycle_event(&db, &event).unwrap().is_some());
+        db.execute(
+            "UPDATE operations SET state='settled',settled_at_ms=200,result_json='{}'
+                    WHERE operation_id='operation-fixture'",
+            [],
+        )
+        .unwrap();
+        assert!(verified_lifecycle_event(&db, &event).unwrap().is_some());
+        db.execute(
+            "UPDATE observations SET payload_json=json_set(payload_json,'$.schema_version',1)
+                    WHERE observation_id=?1",
+            [event.observation_id],
+        )
+        .unwrap();
+        assert!(verified_lifecycle_event(&db, &event).unwrap().is_some());
+    }
+
+    #[test]
+    fn ready_cannot_hide_unscoped_or_still_pending_ids() {
+        let mut db = fixture_db();
+        insert_operation(&db, "foreign-operation", "settled", false);
+        let mut ready = producer_observation(1, ProducerPhase::Ready, None);
+        ready.unknown_operation_ids = vec!["foreign-operation".to_owned()];
+        ready.unknown_operation_count = 1;
+        assert_eq!(
+            expect_record_error(&mut db, &ready, 100).code,
+            "MODULE_OBSERVATION_OPERATION_SCOPE"
+        );
+        insert_operation(&db, "operation-fixture", "sending", true);
+        ready.unknown_operation_ids = vec!["operation-fixture".to_owned()];
+        record_in_transaction(&mut db, &ready, 100).unwrap();
+        let mut event = retained_event(&db, READY_EVENT_KIND);
+        db.execute(
+            "UPDATE observations SET operation_id=NULL,
+                    payload_json=json_set(payload_json,'$.operation_id',NULL)
+                    WHERE observation_id=?1",
+            [event.observation_id],
+        )
+        .unwrap();
+        event.operation_id = None;
+        assert!(verified_lifecycle_event(&db, &event).unwrap().is_none());
+    }
+
+    #[test]
+    fn ready_occurrence_is_idempotent_and_owner_retained_remains_latest() {
+        let mut db = fixture_db();
+        let starting = producer_observation(1, ProducerPhase::Starting, None);
+        let ready = producer_observation(2, ProducerPhase::Ready, None);
+        let owner_retained = producer_observation(
+            3,
+            ProducerPhase::OwnerRetained,
+            Some("MODULE_WORKER_EXITED"),
+        );
+
+        assert!(
+            record_in_transaction(&mut db, &starting, 100)
+                .unwrap()
+                .inserted
+        );
+        assert!(
+            record_in_transaction(&mut db, &ready, 200)
+                .unwrap()
+                .inserted
+        );
+        assert!(
+            !record_in_transaction(&mut db, &ready, 201)
+                .unwrap()
+                .inserted,
+            "an identical Ready callback is an idempotent replay"
+        );
+
+        let mut changed_ready = ready.clone();
+        changed_ready.error_code = Some("MODULE_WORKER_EXITED".to_owned());
+        changed_ready.stage = Some(ProducerStage::Worker);
+        let conflict = expect_record_error(&mut db, &changed_ready, 202);
+        assert_eq!(conflict.code, "MODULE_OBSERVATION_CONFLICT");
+
+        assert!(
+            record_in_transaction(&mut db, &owner_retained, 300)
+                .unwrap()
+                .inserted
+        );
+
+        let ready_event_id = ready.event_id.as_str();
+        let ready_raw: String = db
+            .query_row(
+                "SELECT payload_json FROM observations
+                 WHERE source_stream_id=?1 AND source_event_key=?2 AND kind=?3",
+                params![
+                    format!("{STREAM_PREFIX}:{BINDING_ID}:{GENERATION}"),
+                    ready_event_id,
+                    EVENT_KIND,
+                ],
+                |row| row.get(0),
+            )
+            .expect("read serialized Ready producer DTO");
+        let ready_payload: Value =
+            serde_json::from_str(&ready_raw).expect("decode retained Ready DTO");
+        assert_eq!(ready_payload["event_id"], ready_event_id);
+        assert_eq!(ready_payload["sequence"], 2);
+        assert_eq!(ready_payload["phase"], "ready");
+        assert_eq!(ready_payload["binding_id"], BINDING_ID);
+        assert_eq!(ready_payload["generation"], GENERATION);
+        assert_eq!(ready_payload["module_id"], MODULE_ID);
+        assert_eq!(ready_payload["artifact_id"], ARTIFACT_ID);
+        assert_eq!(ready_payload["artifact_version"], ARTIFACT_VERSION);
+        assert_eq!(ready_payload["build_id"], BUILD_ID);
+        assert_eq!(ready_payload["boot_id"], BOOT_ID);
+
+        let mut statement = db
+            .prepare(
+                "SELECT kind,payload_json,length(CAST(payload_json AS BLOB))
+                 FROM observations
+                 WHERE binding_id=?1 AND binding_generation=?2
+                   AND kind IN (?3,?4)
+                 ORDER BY observation_id",
+            )
+            .expect("prepare lifecycle journal query");
+        let events = statement
+            .query_map(
+                params![
+                    BINDING_ID,
+                    GENERATION as i64,
+                    READY_EVENT_KIND,
+                    OWNER_RETAINED_EVENT_KIND
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("query lifecycle journal")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect lifecycle events");
+        assert_eq!(events.len(), 2, "Ready is written once before retention");
+        assert_eq!(events[0].0, READY_EVENT_KIND);
+        assert_eq!(events[1].0, OWNER_RETAINED_EVENT_KIND);
+
+        let owner_payload: Value =
+            serde_json::from_str(&events[1].1).expect("decode bounded retained occurrence");
+        assert_eq!(owner_payload["error_code"], "MODULE_WORKER_EXITED");
+        assert_eq!(owner_payload["phase"], "owner_retained");
+        assert!(owner_payload["occurrence_id"].as_str().is_some());
+        assert!((1..=4096).contains(&events[1].2));
+
+        let latest: String = db
+            .query_row(
+                "SELECT json_extract(state_json,'$.module_supervisor.phase')
+                 FROM bindings WHERE binding_id=?1 AND generation=?2",
+                params![BINDING_ID, GENERATION as i64],
+                |row| row.get(0),
+            )
+            .expect("read latest module supervisor phase");
+        assert_eq!(latest, "owner_retained");
+        assert_ne!(latest, "ready");
+        for kind in [READY_EVENT_KIND, OWNER_RETAINED_EVENT_KIND] {
+            assert!(
+                verified_lifecycle_event(&db, &retained_event(&db, kind))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_binding_artifact_and_generation_are_required() {
+        let mut db = fixture_db();
+        let base = producer_observation(1, ProducerPhase::Starting, None);
+
+        let mut wrong_binding = base.clone();
+        wrong_binding.scope.binding_id = "other-binding".to_owned();
+        let error = expect_record_error(&mut db, &wrong_binding, 100);
+        assert_eq!(error.code, "NOT_FOUND");
+
+        let mut wrong_generation = base.clone();
+        wrong_generation.scope.generation += 1;
+        let error = expect_record_error(&mut db, &wrong_generation, 101);
+        assert_eq!(error.code, "NOT_FOUND");
+
+        let mut wrong_artifact = base.clone();
+        wrong_artifact.artifact_id = "other-artifact".to_owned();
+        let error = expect_record_error(&mut db, &wrong_artifact, 102);
+        assert_eq!(error.code, "MODULE_OBSERVATION_IDENTITY_MISMATCH");
+
+        let mut wrong_version = base.clone();
+        wrong_version.artifact_version = "9.9.9".to_owned();
+        let error = expect_record_error(&mut db, &wrong_version, 103);
+        assert_eq!(error.code, "MODULE_OBSERVATION_IDENTITY_MISMATCH");
+
+        let mut wrong_build = base;
+        wrong_build.build_id = Some("other-build".to_owned());
+        let error = expect_record_error(&mut db, &wrong_build, 104);
+        assert_eq!(error.code, "MODULE_OBSERVATION_IDENTITY_MISMATCH");
+    }
 }
