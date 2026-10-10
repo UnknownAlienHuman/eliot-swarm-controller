@@ -1,0 +1,87 @@
+{
+  "schema": "eliot.generator_security_repair.v1",
+  "date": "2026-10-10",
+  "final_status": "PARTIAL_PROGRESS",
+  "scope": "Codex donor dev/test dependency only",
+  "source_base_commit": "1ad420977f994150dc12ea73709201b46af7f83b",
+  "upstream_base": "18194bfd3534ca567d886eac454028dafaa68b6c",
+  "package": "datamodel-code-generator",
+  "before": "0.31.2",
+  "after": "0.64.0",
+  "resolved_other_package_versions_changed": false,
+  "advisories": [
+    {
+      "ghsa_id": "GHSA-wjv6-jcfj-mf9r",
+      "first_patched_version": "0.60.2",
+      "vulnerable_version_range": ">= 0.14.1, <= 0.60.1"
+    },
+    {
+      "ghsa_id": "GHSA-8359-h9fx-j6v9",
+      "first_patched_version": "0.62.0",
+      "vulnerable_version_range": "<= 0.61.0"
+    },
+    {
+      "ghsa_id": "GHSA-386q-5hp3-95m9",
+      "first_patched_version": "0.60.2",
+      "vulnerable_version_range": ">= 0.17.0, <= 0.60.1"
+    },
+    {
+      "ghsa_id": "GHSA-vx7x-vcc2-c44g",
+      "first_patched_version": "0.63.0",
+      "vulnerable_version_range": "<= 0.62.0"
+    },
+    {
+      "ghsa_id": "GHSA-954p-556p-r752",
+      "first_patched_version": "0.61.0",
+      "vulnerable_version_range": ">= 0.9.1, <= 0.60.2"
+    },
+    {
+      "ghsa_id": "GHSA-5578-w22f-pfx9",
+      "first_patched_version": "0.64.0",
+      "vulnerable_version_range": ">= 0.11.6, <= 0.63.0"
+    },
+    {
+      "ghsa_id": "GHSA-j884-q54q-mmx3",
+      "first_patched_version": "0.60.1",
+      "vulnerable_version_range": ">= 0.25.0, < 0.60.1"
+    },
+    {
+      "ghsa_id": "GHSA-r5vv-ff45-prp2",
+      "first_patched_version": "0.63.0",
+      "vulnerable_version_range": "<= 0.62.0"
+    },
+    {
+      "ghsa_id": "GHSA-rfr2-mq9m-x2qx",
+      "first_patched_version": "0.61.0",
+      "vulnerable_version_range": ">= 0.9.1, <= 0.60.2"
+    }
+  ],
+  "verification": [
+    "Stock uv lock resolution and offline lock consistency passed",
+    "Isolated installed version and all 16 current CLI arguments passed",
+    "0.64.0 excluded from all nine audited affected ranges",
+    "Vendor verifier passed: all 89 files match patched SHA256SUMS",
+    "Original and patched dependency file hashes retained in modules/codex/VENDOR-SECURITY-PATCHES.md"
+  ],
+  "checksum_delta": [
+    {
+      "path": "pyproject.toml",
+      "upstream_sha256": "da5e5b8eca67f727c49befc1bec71ed72957c1358b3c055433af97a5c0bd4354",
+      "patched_sha256": "abedd9d3f6e32761239dfa7bcb25094c3675176302e32ba16bfc064ea866e6f4"
+    },
+    {
+      "path": "uv.lock",
+      "upstream_sha256": "ca4f631445c81b74b11b05305cc580fa399f1f9bfe80b12acea610ce331e0354",
+      "patched_sha256": "d758f8a09697c24368f0bd527925d2da5fad2bff4366897927e72c1c4b878fae"
+    }
+  ],
+  "worker_proof_sha256": "7f3b6ea8c95163275f83974c65382cc0da51c159ef2279db14d73bba1c9df567",
+  "worker_verified_at_utc": "2026-10-10 23:28:51 UTC",
+  "parent_vendor_verifier_at_utc": "2026-10-10T23:33:22.1780220Z",
+  "limitations": [
+    "Generated SDK output compatibility not verified; SDK output unchanged",
+    "Dependabot closure after push not yet observed",
+    "Four npm alerts retain separate upstream blockers",
+    "Native O ran against prior exact source1ad4209, not this dependency change"
+  ]
+}

@@ -53,9 +53,12 @@ lifecycle notifications are a bounded current-connection observation window and
 do not claim complete family or result coverage. Dynamic tool execution and
 auxiliary-provider affinity remain unavailable.
 
-The legacy `.3` `vendor_bridge/` is not edited. Its donor source, generated
-models, and pins remain unchanged; `verify_vendor.py` continues to hash the
-donor bytes.
+The legacy `.3` donor source and generated models retain the pinned upstream
+bytes. On 2026-10-10 the dev/test `datamodel-code-generator` pin and lockfile
+were updated to `0.64.0` to address nine security advisories. The binary pin
+remains `openai-codex-cli-bin==0.153.4`. The
+[security patch record](VENDOR-SECURITY-PATCHES.md) retains the original and
+patched hashes; `verify_vendor.py` checks the complete patched unit.
 
 ## Standalone Rust controller artifact `.1`, descriptor version `4`
 

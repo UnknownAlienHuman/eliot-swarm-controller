@@ -145,6 +145,8 @@ is:
 .venv\Scripts\python.exe -m unittest test_bridge.BridgeFixtureTests.test_controller_exact_model_and_dual_native_identity_readback test_bridge.BridgeFixtureTests.test_server_requests_get_schema_shaped_non_granting_replies -v
 ```
 
-The vendored `openai/codex/sdk/python` unit is kept byte-identical to upstream.
-All transport and controller adaptation is ELIOT-owned code outside
-`vendor_bridge/`.
+The vendored `openai/codex/sdk/python` source and generated models retain the
+pinned upstream bytes. The dev/test generator pin and lockfile carry the
+[documented security update](VENDOR-SECURITY-PATCHES.md) to `0.64.0`.
+`SHA256SUMS` verifies the complete unit with that delta. All transport and
+controller adaptation is ELIOT-owned code outside `vendor_bridge/`.
