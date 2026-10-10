@@ -4,6 +4,9 @@
 //! Store reconciliation pass and transaction-coupled occurrence ledger; it
 //! does not create another worker, timer, or authority principal.
 
+use super::automation_reconcile::{
+    QuarantineEvidence, SubjectDisposition, SubjectErrorDisposition,
+};
 use super::{Store, meta, set_meta};
 use crate::{
     automation::{
@@ -31,6 +34,12 @@ const RETRY_DELAY_MS: i64 = 60_000;
 const MAX_RECONCILE_BATCH: usize = 32;
 const ACTIVE_OPERATION_STATES: &[&str] =
     &["queued", "sending", "native_accepted", "outcome_unknown"];
+
+/// Durable quarantine namespace for isolated cron subjects. It is separate from the
+/// publication, goal-progression, github-projection, review-disposition and scheduler
+/// namespaces, so a cron subject can never be folded into another domain's evidence
+/// record and inherit that domain's cursor.
+const CRON_QUARANTINE_PREFIX: &str = "automation:v1:cron:quarantine:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -657,15 +666,26 @@ fn candidate_for_index(
         due.due_at_ms,
     ) {
         Ok(context) => context,
-        Err(error)
-            if error.code == "FORBIDDEN"
-                || error.code.starts_with("AUTOMATION_")
-                || error.code == "NOT_FOUND"
-                || error.code == "CHECK_SOURCE_REQUIRED" =>
-        {
-            return Ok(None);
+        Err(error) => {
+            // Exact-subject classification for this one occurrence. A prerequisite
+            // or action of the exact subject may still change, so those codes stay
+            // pending and are retried by a later pass. A retained row that cannot be
+            // decoded as the exact subject is recognized semantic damage and is
+            // isolated with bounded row identity, pointer and digest. Every other
+            // code, including SQL, savepoint and commit failures, aborts the whole
+            // batch transaction instead of silently dropping the occurrence.
+            match classify_cron_candidate(db, &index_key, error, now_ms)? {
+                SubjectDisposition::Applied(()) => {
+                    return Err(Error::new(
+                        "AUTOMATION_CRON_SUBJECT_DISPOSITION_INVALID",
+                        "cron subject classification returned applied for a failed subject",
+                    ));
+                }
+                SubjectDisposition::Pending { .. }
+                | SubjectDisposition::Skipped { .. }
+                | SubjectDisposition::Quarantined { .. } => return Ok(None),
+            }
         }
-        Err(error) => return Err(error),
     };
     Ok(Some(Candidate {
         index_key,
@@ -677,6 +697,118 @@ fn candidate_for_index(
     }))
 }
 
+/// Errors raised while validating the exact committed cron subject inside
+/// `candidate_for_index`. Each code names one reason this exact automation
+/// occurrence cannot be admitted now.
+///
+/// A prerequisite or action of the exact subject may still change, so those
+/// codes preserve pending semantics. A retained row that cannot be decoded as
+/// the exact subject is recognized semantic damage and is isolated with bounded
+/// row identity, pointer and digest. Everything else, including every SQL,
+/// savepoint and commit failure, is unrecognized and stays fatal, so the batch
+/// transaction aborts instead of silently dropping the occurrence.
+fn classify_cron_candidate_error(
+    error: &Error,
+    evidence: &QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    if !error.secondary_codes.is_empty() {
+        return None;
+    }
+    // These arms correspond to the committed-entry validation chain: entry
+    // decoding, manager registration, transfer lineage, occurrence identity,
+    // and the pinned Attempt lookup. Source resolution happens later and is
+    // deliberately outside this candidate classifier.
+    match error.code.as_str() {
+        "FORBIDDEN"
+        | "AUTOMATION_ACTION_UNAVAILABLE"
+        | "AUTOMATION_NOT_FOUND"
+        | "AUTOMATION_ATTEMPT_STALE"
+        | "AUTOMATION_ACTION_CHANGED" => Some(SubjectErrorDisposition::Pending {
+            code: error.code.clone(),
+            reason:
+                "an exact prerequisite or action of this cron subject may change in a later pass"
+                    .to_owned(),
+        }),
+        "AUTOMATION_RECORD_CORRUPT"
+        | "AUTOMATION_RECORD_INVALID"
+        | "AUTOMATION_RECORD_VERSION"
+        | "AUTOMATION_TRANSFER_CORRUPT"
+        | "AUTOMATION_OCCURRENCE_INVALID" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence: evidence.clone(),
+        }),
+        _ => None,
+    }
+}
+/// Bounded evidence for one exact cron subject. Identity, pointer and digest are
+/// derived from the retained metadata row so repeated observations of the same
+/// damage converge on one quarantine record instead of accumulating rows.
+fn cron_subject_evidence(subject_key: &str, source_raw: &str) -> QuarantineEvidence {
+    let key_digest = model::digest(subject_key.as_bytes());
+    QuarantineEvidence {
+        subject_identity: format!("cron-subject:meta-key-sha256:{key_digest}"),
+        source_pointer: Some(format!("meta/key-sha256:{key_digest}")),
+        source_digest: Some(model::digest(source_raw.as_bytes())),
+    }
+}
+/// Read the exact `value_json` string retained for one metadata row. Evidence and
+/// the compare-and-swap delete both bind these bytes, because reserializing a
+/// valid but noncanonical JSON value would make an unchanged immutable row look
+/// modified forever.
+fn exact_meta_value(db: &Connection, key: &str) -> Result<Option<String>> {
+    db.query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .map_err(Into::into)
+}
+/// Classify, and for recognized damage isolate, the exact cron subject behind the
+/// shared subject savepoint. Quarantine evidence and the release of the same
+/// retained row share one compare-and-swap boundary: if the row changed since the
+/// bounded batch read it, the whole reconcile pass aborts rather than quarantining
+/// an unrelated observation. A pending subject is rolled back unchanged so a later
+/// pass retries it.
+fn classify_cron_candidate(
+    tx: &Transaction<'_>,
+    index_key: &str,
+    error: Error,
+    now_ms: i64,
+) -> Result<SubjectDisposition<()>> {
+    let Some(source_raw) = exact_meta_value(tx, index_key)? else {
+        return Err(Error::new(
+            "AUTOMATION_CRON_SUBJECT_ABSENT",
+            "cron subject row disappeared before classification",
+        ));
+    };
+    let evidence = cron_subject_evidence(index_key, &source_raw);
+    let disposition = super::automation_reconcile::with_subject_savepoint(
+        tx,
+        || Err(error),
+        |error| classify_cron_candidate_error(error, &evidence),
+    )?;
+    if let SubjectDisposition::Quarantined { code, evidence } = &disposition {
+        let record_key =
+            super::automation_reconcile::quarantine_record_key(CRON_QUARANTINE_PREFIX, evidence)?;
+        super::automation_reconcile::persist_quarantine(
+            tx,
+            &record_key,
+            code,
+            evidence.clone(),
+            now_ms,
+        )?;
+        let released = tx.execute(
+            "DELETE FROM meta WHERE key=?1 AND value_json=?2",
+            params![index_key, source_raw],
+        )?;
+        if released != 1 {
+            return Err(Error::new(
+                "AUTOMATION_CRON_SUBJECT_CHANGED",
+                "cron subject row changed before quarantine compare-and-swap",
+            ));
+        }
+    }
+    Ok(disposition)
+}
 fn read_rows(
     db: &Connection,
     lower: &str,
@@ -1167,13 +1299,35 @@ impl Store {
             let context = candidate.context.clone();
             let resolution = match self.resolve_cron_check_plan(context).await {
                 Ok(resolution) => resolution,
-                Err(_) => {
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "AUTOMATION_ACTION_CHANGED" | "AUTOMATION_NOT_FOUND" | "FORBIDDEN"
+                    ) =>
+                {
                     let for_retry = candidate.clone();
                     let retry = self
                         .run(move |db| postpone_candidate(db, &for_retry, now_ms))
-                        .await?;
+                        .await;
+                    let retry = match retry {
+                        Ok(retry) => retry,
+                        Err(error) => {
+                            if wake_check_worker {
+                                self.changed
+                                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+                            }
+                            return Err(error);
+                        }
+                    };
                     next_due = min_due(next_due, retry);
                     continue;
+                }
+                Err(error) => {
+                    if wake_check_worker {
+                        self.changed
+                            .send_modify(|revision| *revision = revision.wrapping_add(1));
+                    }
+                    return Err(error);
                 }
             };
             let for_tx = candidate.clone();
@@ -1204,10 +1358,26 @@ impl Store {
                 {
                     let retry = self
                         .run(move |db| postpone_candidate(db, &candidate, now_ms))
-                        .await?;
+                        .await;
+                    let retry = match retry {
+                        Ok(retry) => retry,
+                        Err(error) => {
+                            if wake_check_worker {
+                                self.changed
+                                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+                            }
+                            return Err(error);
+                        }
+                    };
                     next_due = min_due(next_due, retry);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if wake_check_worker {
+                        self.changed
+                            .send_modify(|revision| *revision = revision.wrapping_add(1));
+                    }
+                    return Err(error);
+                }
             }
         }
         if prepared.due_remaining {
@@ -1220,6 +1390,10 @@ impl Store {
         Ok(next_due)
     }
 }
+
+#[cfg(test)]
+#[path = "automation_cron_candidate_fixture.rs"]
+mod candidate_fixture;
 
 #[cfg(test)]
 mod tests {

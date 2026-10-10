@@ -21,6 +21,7 @@ const GENERATION_KEY: &str = "automation_scheduler:v1:generation";
 const OWNER_KEY: &str = "automation_scheduler:v1:owner";
 const METHOD_SCOPE: [&str; 2] = ["automation.scheduler.page", "automation.scheduler.admit"];
 const MAX_SOURCE_PAGE: usize = 32;
+const MAX_CHECK_RECOVERY_ERROR_MESSAGE_CHARS: usize = 512;
 const CRON_DUE_PREFIX: &str = "automation:v1:cron:due:";
 const GOAL_DUE_PREFIX: &str = "goals:v1:due:";
 const SCHEDULE_REGISTRY_KEY: &str = "schedule_registry:v1";
@@ -28,9 +29,9 @@ const SCHEDULER_QUARANTINE_PREFIX: &str = "automation:v1:quarantine:scheduler:";
 type ScheduleCursor = (String, Option<i64>, Option<i64>, Option<i64>);
 
 #[derive(Debug, Clone)]
-struct DueSourceDamage {
+struct DueSourceEvidence {
     kind: &'static str,
-    code: &'static str,
+    code: String,
     evidence: super::automation_reconcile::QuarantineEvidence,
     source_key: Option<String>,
     source_raw: Option<String>,
@@ -41,7 +42,7 @@ struct DueIndexSnapshot {
     next_due_at_ms: Option<i64>,
     due_count: usize,
     rows: Vec<(String, String)>,
-    damaged_subjects: Vec<DueSourceDamage>,
+    damaged_subjects: Vec<DueSourceEvidence>,
 }
 
 struct ScheduleSourceSnapshot {
@@ -49,7 +50,7 @@ struct ScheduleSourceSnapshot {
     next_due_at_ms: Option<i64>,
     cursor_digest: String,
     schedule_cursors: Vec<ScheduleCursor>,
-    damaged_subjects: Vec<DueSourceDamage>,
+    damaged_subjects: Vec<DueSourceEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +95,7 @@ struct DueProjection {
     goal_digest: String,
     snapshot_sha256: String,
     schedule_next_due: Option<i64>,
-    damaged_subjects: Vec<DueSourceDamage>,
+    damaged_subjects: Vec<DueSourceEvidence>,
     schedule_cursors: Vec<ScheduleCursor>,
     cron_rows: Vec<(String, String)>,
     goal_rows: Vec<(String, String)>,
@@ -153,35 +154,179 @@ impl DueProjection {
         }
     }
 
-    fn source_outcome(&self, after: &Self, kind: &'static str, invoked: bool) -> Value {
+    fn source_outcome(
+        &self,
+        after: &Self,
+        kind: &'static str,
+        invoked: bool,
+        additional_damage: &[DueSourceEvidence],
+        additional_pending: &[DueSourceEvidence],
+    ) -> DueSourceOutcome {
         let damaged_subjects = self
             .damaged_subjects
             .iter()
+            .chain(additional_damage)
             .filter(|damage| damage.kind == kind)
-            .map(|damage| {
-                json!({
-                    "code":damage.code,
-                    "subject_identity":damage.evidence.subject_identity,
-                    "source_pointer":damage.evidence.source_pointer,
-                    "source_digest":damage.evidence.source_digest,
-                })
-            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let pending_subjects = additional_pending
+            .iter()
+            .filter(|pending| pending.kind == kind)
+            .cloned()
             .collect::<Vec<_>>();
         let cursor_advanced = self.cursor_advanced(after, kind);
-        let disposition = if !damaged_subjects.is_empty() {
-            "degraded"
+        let disposition =
+            DueSourceDisposition::observe(invoked, cursor_advanced, !damaged_subjects.is_empty());
+        DueSourceOutcome {
+            kind,
+            disposition,
+            cursor_advanced,
+            damaged_subjects,
+            pending_subjects,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueSourceDisposition {
+    Progressed,
+    Idle,
+    Degraded,
+}
+
+impl DueSourceDisposition {
+    fn observe(invoked: bool, cursor_advanced: bool, degraded: bool) -> Self {
+        if degraded {
+            Self::Degraded
         } else if invoked && cursor_advanced {
-            "progressed"
+            Self::Progressed
         } else {
-            "idle"
-        };
+            Self::Idle
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Progressed => "progressed",
+            Self::Idle => "idle",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DueSourceOutcome {
+    kind: &'static str,
+    disposition: DueSourceDisposition,
+    cursor_advanced: bool,
+    damaged_subjects: Vec<DueSourceEvidence>,
+    pending_subjects: Vec<DueSourceEvidence>,
+}
+
+impl DueSourceOutcome {
+    fn value(&self) -> Value {
+        let damaged_subjects = self
+            .damaged_subjects
+            .iter()
+            .map(due_source_evidence_value)
+            .collect::<Vec<_>>();
+        let pending_subjects = self
+            .pending_subjects
+            .iter()
+            .map(due_source_evidence_value)
+            .collect::<Vec<_>>();
         json!({
-            "kind":kind,
-            "disposition":disposition,
-            "cursor_advanced":cursor_advanced,
+            "kind":self.kind,
+            "disposition":self.disposition.as_str(),
+            "cursor_advanced":self.cursor_advanced,
             "damaged_subjects":damaged_subjects,
+            "pending_subjects":pending_subjects,
         })
     }
+}
+
+fn due_source_evidence_value(subject: &DueSourceEvidence) -> Value {
+    json!({
+        "code":subject.code,
+        "subject_identity":subject.evidence.subject_identity,
+        "source_pointer":subject.evidence.source_pointer,
+        "source_digest":subject.evidence.source_digest,
+    })
+}
+
+fn aggregate_source_disposition(outcomes: &[DueSourceOutcome]) -> DueSourceDisposition {
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.disposition == DueSourceDisposition::Degraded)
+    {
+        DueSourceDisposition::Degraded
+    } else if outcomes
+        .iter()
+        .any(|outcome| outcome.disposition == DueSourceDisposition::Progressed)
+    {
+        DueSourceDisposition::Progressed
+    } else {
+        DueSourceDisposition::Idle
+    }
+}
+
+fn aggregate_scheduler_disposition(
+    source_outcomes: &[DueSourceOutcome],
+    check_recovery_outcome: &Value,
+) -> DueSourceDisposition {
+    if check_recovery_outcome["disposition"] == "degraded" {
+        DueSourceDisposition::Degraded
+    } else {
+        aggregate_source_disposition(source_outcomes)
+    }
+}
+
+fn check_recovery_failure(error: Error) -> Result<Value> {
+    // Only closed malformed/mismatched receipt codes are degradable here.
+    // Custody uncertainty and infrastructure errors remain fatal.
+    let disposition = match error.code.as_str() {
+        "CHECK_LAUNCH_RECEIPT_INVALID"
+        | "CHECK_LAUNCH_RECEIPT_CONFLICT"
+        | "CHECK_LAUNCH_UNKNOWN_RECEIPT_INVALID"
+        | "CHECK_LAUNCH_DEPARTURE_INVALID"
+            if error.secondary_codes.is_empty() =>
+        {
+            super::automation_reconcile::DomainErrorDisposition::Degraded {
+                code: error.code.clone(),
+            }
+        }
+        _ => super::automation_reconcile::DomainErrorDisposition::Fatal(error.clone()),
+    };
+
+    let code = match disposition {
+        super::automation_reconcile::DomainErrorDisposition::Degraded { code } => code,
+        super::automation_reconcile::DomainErrorDisposition::Fatal(error) => return Err(error),
+    };
+    let mut message_chars = error.message.chars();
+    let message = message_chars
+        .by_ref()
+        .take(MAX_CHECK_RECOVERY_ERROR_MESSAGE_CHARS)
+        .collect::<String>();
+    let message_truncated = message_chars.next().is_some();
+    let evidence = json!({
+        "code":code,
+        "message":message,
+        "message_truncated":message_truncated,
+        "secondary_codes":error.secondary_codes,
+    });
+    let source_digest = digest_json(&evidence)?;
+    Ok(json!({
+        "invoked":true,
+        "disposition":"degraded",
+        "pending_error":{
+            "code":evidence["code"],
+            "message":evidence["message"],
+            "message_truncated":evidence["message_truncated"],
+            "secondary_codes":evidence["secondary_codes"],
+            "boundary":"check_run/recovery",
+            "error_digest":source_digest,
+        },
+    }))
 }
 
 fn schedule_cursor_advanced(before: &[ScheduleCursor], after: &[ScheduleCursor]) -> bool {
@@ -193,19 +338,21 @@ fn schedule_cursor_advanced(before: &[ScheduleCursor], after: &[ScheduleCursor])
         }
     }
 
-    before
-        .iter()
-        .any(|(schedule_id, observed, considered, admitted)| {
-            let Some((_, after_observed, after_considered, after_admitted)) = after
+    after.iter().any(
+        |(schedule_id, after_observed, after_considered, after_admitted)| {
+            let Some((_, observed, considered, admitted)) = before
                 .iter()
-                .find(|(after_id, _, _, _)| after_id == schedule_id)
+                .find(|(before_id, _, _, _)| before_id == schedule_id)
             else {
-                return false;
+                return after_observed.is_some()
+                    || after_considered.is_some()
+                    || after_admitted.is_some();
             };
             advanced(*observed, *after_observed)
                 || advanced(*considered, *after_considered)
                 || advanced(*admitted, *after_admitted)
-        })
+        },
+    )
 }
 
 fn source_row_removed(before: &[(String, String)], after: &[(String, String)]) -> bool {
@@ -693,21 +840,45 @@ pub(crate) async fn call(
         Err(receipt) => return Ok(receipt),
     };
     let due = cut.due_sources();
-    // Goal reminders are independent of check recovery and schedule admission.
-    // Reconcile them first so an unclassified prerequisite failure cannot
-    // starve an otherwise due reminder source.
+    // Goal reminders are independent of CheckRun recovery and schedule
+    // admission, so reconcile them before touching either source.
     let mut goal_next_due_at_ms = None;
     if due[2] {
         goal_next_due_at_ms = store.reconcile_goals_once(cut.observed_at_ms).await?;
     }
-    if due[0] || due[1] {
-        store.reconcile_checks_once().await?;
-    }
+    let mut schedule_pending = Vec::new();
     if due[0] {
         for schedule in store.schedule_configs() {
-            let _ = store
-                .consider_scheduled(schedule, cut.observed_at_ms)
-                .await?;
+            let result = store
+                .consider_scheduled(schedule.clone(), cut.observed_at_ms)
+                .await;
+            if let Err(error) = result {
+                let schedule = schedule.clone();
+                let pending = store
+                    .run(move |db| {
+                        let mut retained_pending = None;
+                        super::reconcile_automation_domain(
+                            db,
+                            "interval_schedule",
+                            |tx| {
+                                retained_pending =
+                                    Some(isolate_schedule_error(tx, &schedule, error)?);
+                                Ok(Value::Null)
+                            },
+                            |error| {
+                                super::automation_reconcile::DomainErrorDisposition::Fatal(error)
+                            },
+                        )?;
+                        retained_pending.ok_or_else(|| {
+                            Error::new(
+                                "SCHEDULER_SOURCE_DISPOSITION_MISSING",
+                                "schedule isolation committed without a retained pending disposition",
+                            )
+                        })
+                    })
+                    .await?;
+                schedule_pending.push(pending);
+            }
         }
     }
     let mut calendar_next_due_at_ms = None;
@@ -716,6 +887,17 @@ pub(crate) async fn call(
             .reconcile_automation_cron_once(MAX_SOURCE_PAGE, cut.observed_at_ms)
             .await?;
     }
+    // CheckRun recovery follows due automation work. Recognized receipt defects
+    // return a bounded degraded result; all other check and Store errors remain
+    // fatal after the independent due sources have completed.
+    let check_recovery_outcome = if due[0] || due[1] {
+        match store.reconcile_checks_once().await {
+            Ok(()) => json!({"invoked":true,"disposition":"completed"}),
+            Err(error) => check_recovery_failure(error)?,
+        }
+    } else {
+        json!({"invoked":false,"disposition":"not_due"})
+    };
     let scope = cut.scope.clone();
     let config = store.config.clone();
     let latest = store
@@ -736,23 +918,30 @@ pub(crate) async fn call(
         Ok(page) => page,
         Err(receipt) => return Ok(receipt),
     };
+    let source_outcomes = vec![
+        cut.source_outcome(&latest, "interval_schedule", due[0], &[], &schedule_pending),
+        cut.source_outcome(&latest, "manager_calendar", due[1], &[], &[]),
+        cut.source_outcome(&latest, "goal_reminder", due[2], &[], &[]),
+    ];
+    let disposition = aggregate_scheduler_disposition(&source_outcomes, &check_recovery_outcome);
+    // Keep the admission receipt accepted by the existing worker protocol;
+    // source_disposition carries the truthful aggregate for this Store call.
     Ok(json!({
         "schema_version":1,
         "scope":cut.scope,
         "disposition":"reconcilers_completed",
+        "source_disposition":disposition.as_str(),
         "reconcilers_invoked":{
             "interval_schedule":due[0],
             "manager_calendar":due[1],
             "goal_reminder":due[2],
+            "check_recovery":due[0] || due[1],
         },
+        "check_recovery":check_recovery_outcome,
         "calendar_next_due_at_ms":calendar_next_due_at_ms,
         "goal_next_due_at_ms":goal_next_due_at_ms,
         "next_due_at_ms":latest.next_due_at_ms,
-        "source_outcomes":[
-            cut.source_outcome(&latest, "interval_schedule", due[0]),
-            cut.source_outcome(&latest, "manager_calendar", due[1]),
-            cut.source_outcome(&latest, "goal_reminder", due[2]),
-        ],
+        "source_outcomes":source_outcomes.iter().map(DueSourceOutcome::value).collect::<Vec<_>>(),
     }))
 }
 
@@ -980,7 +1169,7 @@ fn prepare_admit(
 
 fn quarantine_due_source_damage(
     tx: &Transaction<'_>,
-    damage: &DueSourceDamage,
+    damage: &DueSourceEvidence,
     now_ms: i64,
 ) -> Result<()> {
     let quarantine_key = super::automation_reconcile::quarantine_record_key(
@@ -990,7 +1179,7 @@ fn quarantine_due_source_damage(
     super::automation_reconcile::persist_quarantine(
         tx,
         &quarantine_key,
-        damage.code,
+        &damage.code,
         damage.evidence.clone(),
         now_ms,
     )?;
@@ -1028,6 +1217,43 @@ fn quarantine_due_source_damage(
         ));
     }
     Ok(())
+}
+
+fn isolate_schedule_error(
+    tx: &Transaction<'_>,
+    schedule: &crate::scheduler::ScheduleConfig,
+    error: Error,
+) -> Result<DueSourceEvidence> {
+    let evidence = super::schedules::scheduler_source_evidence(schedule)?;
+    let disposition: super::automation_reconcile::SubjectDisposition<()> =
+        super::automation_reconcile::with_subject_savepoint(
+            tx,
+            || Err(error),
+            super::schedules::classify_scheduler_error,
+        )?;
+    let code = match disposition {
+        super::automation_reconcile::SubjectDisposition::Pending { code, .. } => code,
+        super::automation_reconcile::SubjectDisposition::Applied(()) => {
+            return Err(Error::new(
+                "SCHEDULER_SOURCE_DISPOSITION_INVALID",
+                "schedule error classifier returned an applied disposition for a failed subject",
+            ));
+        }
+        super::automation_reconcile::SubjectDisposition::Quarantined { .. }
+        | super::automation_reconcile::SubjectDisposition::Skipped { .. } => {
+            return Err(Error::new(
+                "SCHEDULER_SOURCE_DISPOSITION_INVALID",
+                "schedule capacity must remain pending and cannot be quarantined or skipped",
+            ));
+        }
+    };
+    Ok(DueSourceEvidence {
+        kind: "interval_schedule",
+        code,
+        evidence,
+        source_key: None,
+        source_raw: None,
+    })
 }
 
 fn project_due_page(
@@ -1183,9 +1409,9 @@ fn damaged_schedule_registry(
         next_due_at_ms: Some(0),
         cursor_digest,
         schedule_cursors: Vec::new(),
-        damaged_subjects: vec![DueSourceDamage {
+        damaged_subjects: vec![DueSourceEvidence {
             kind: "interval_schedule",
-            code,
+            code: code.to_owned(),
             evidence,
             source_key: None,
             source_raw: None,
@@ -1266,14 +1492,15 @@ fn due_index_snapshot(
     })
 }
 
-fn due_index_damage(kind: &'static str, key: &str, raw: &str) -> DueSourceDamage {
-    DueSourceDamage {
+fn due_index_damage(kind: &'static str, key: &str, raw: &str) -> DueSourceEvidence {
+    DueSourceEvidence {
         kind,
         code: match kind {
             "manager_calendar" => "AUTOMATION_CRON_STATE_INVALID",
             "goal_reminder" => "GOAL_RECORD_CORRUPT",
             _ => unreachable!("closed due source kind"),
-        },
+        }
+        .to_owned(),
         evidence: super::automation_reconcile::automation_entry_evidence(key, raw),
         source_key: Some(key.to_owned()),
         source_raw: Some(raw.to_owned()),
@@ -1376,3 +1603,7 @@ fn bounded_count(count: usize) -> u32 {
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+#[cfg(test)]
+#[path = "automation_scheduler_fixture.rs"]
+mod fixture;

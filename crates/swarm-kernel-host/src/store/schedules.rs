@@ -1,6 +1,7 @@
 //! Durable, transaction-coupled schedule admission using the existing meta
 //! and Operation records. There is no separate scheduler database/table.
 
+use super::automation_reconcile::{QuarantineEvidence, SubjectErrorDisposition};
 use super::{Store, meta, mutate_in_transaction_with_check_plan, set_meta};
 use crate::{
     config::Config,
@@ -94,7 +95,7 @@ fn save_registry(db: &Connection, registry: &Registry) -> Result<()> {
 
 /// Digest only execution-defining fields. Toggling `enabled` is a pause/resume
 /// switch and does not create a new schedule identity.
-fn definition_digest(schedule: &ScheduleConfig) -> Result<String> {
+pub(super) fn definition_digest(schedule: &ScheduleConfig) -> Result<String> {
     let definition = json!({
         "schema_version": REGISTRY_VERSION,
         "schedule_id": schedule.schedule_id,
@@ -103,6 +104,28 @@ fn definition_digest(schedule: &ScheduleConfig) -> Result<String> {
         "action": schedule.action,
     });
     Ok(model::digest(model::canonical(&definition)?.as_bytes()))
+}
+
+pub(super) fn scheduler_source_evidence(schedule: &ScheduleConfig) -> Result<QuarantineEvidence> {
+    Ok(QuarantineEvidence {
+        subject_identity: format!("schedule_id:{}", schedule.schedule_id),
+        source_pointer: Some(format!("config/schedules/{}", schedule.schedule_id)),
+        source_digest: Some(definition_digest(schedule)?),
+    })
+}
+
+pub(super) fn classify_scheduler_error(error: &Error) -> Option<SubjectErrorDisposition> {
+    if !error.secondary_codes.is_empty() {
+        return None;
+    }
+    match error.code.as_str() {
+        "SCHEDULE_REGISTRY_FULL" => Some(SubjectErrorDisposition::Pending {
+            code: error.code.clone(),
+            reason: "the bounded schedule registry is full; retain the due slot for a later wake"
+                .to_owned(),
+        }),
+        _ => None,
+    }
 }
 
 fn request_id(schedule_id: &str, slot: i64) -> Result<String> {
@@ -376,6 +399,7 @@ fn consider(
     if !registry.schedules.contains_key(&schedule.schedule_id)
         && registry.schedules.len() >= MAX_RETAINED_IDENTITIES
     {
+        tx.rollback()?;
         return Err(Error::new(
             "SCHEDULE_REGISTRY_FULL",
             "the bounded schedule registry has no free identity slots; disable and reuse an existing schedule ID",
