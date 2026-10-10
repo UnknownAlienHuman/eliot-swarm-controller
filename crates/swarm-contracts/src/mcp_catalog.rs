@@ -1457,25 +1457,26 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
     ),
     mutation(
         "task.request_changes",
-        "Return one anchored finding about the exact current submission/candidate.",
+        "Select findings from the exact current assigned review result. Finding text, requirements, requested changes, and evidence are copied from that retained result.",
         &[
+            f("schema_version", I),
             f("attempt_id", S),
             f("expected_revision", I),
             f("submission_ref", S),
             f("candidate_ref", S),
-            f("finding_id", S),
-            f("reason", S),
-            f("requirement_ids", A),
-            f("evidence", A),
+            f("review_assignment_id", S),
+            f("review_result_operation_id", S),
+            f("finding_ids", A),
         ],
         &[
+            "schema_version",
             "attempt_id",
             "expected_revision",
             "submission_ref",
             "candidate_ref",
-            "finding_id",
-            "reason",
-            "evidence",
+            "review_assignment_id",
+            "review_result_operation_id",
+            "finding_ids",
         ],
     ),
     mutation(
@@ -4914,17 +4915,20 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         Review,
         REVIEW_DISPOSITION_AUDIENCES,
         ManualOnly,
-        "Record an anchored change request for the exact current submission.",
-        "Use only for the existing legacy review-disposition path; it is not assigned-review evidence submission.",
-        &["review", "finding", "changes", "submission", "candidate"],
+        "Select exact retained findings for the current assigned review result and return the submission for correction.",
+        "Use as an authorized Manager for schema version 2. Provide the exact assignment and result Operation anchors plus finding IDs; the Store preserves the reviewer's ordered finding content.",
+        &["review", "findings", "changes", "submission", "candidate"],
         &[
+            "schema_version",
             "attempt_id",
             "expected_revision",
             "submission_ref",
             "candidate_ref",
-            "finding_id"
+            "review_assignment_id",
+            "review_result_operation_id",
+            "finding_ids"
         ],
-        "One revision-checked disposition with evidence."
+        "One revision-checked findings package and feedback disposition."
     ),
     entry!(
         "task.accept",

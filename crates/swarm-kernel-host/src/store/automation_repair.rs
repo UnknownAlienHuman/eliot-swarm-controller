@@ -1560,7 +1560,9 @@ fn resolve_slot_parts(
 
 fn receipt_matches_package(receipt: &RepairSlotReceipt, package: &ReviewFindingsPackage) -> bool {
     receipt.findings_digest.as_deref() == Some(package.findings_digest.as_str())
-        || (package.findings.len() == 1
+        || (receipt.findings_digest.is_none()
+            && receipt.schema_version == 1
+            && package.findings.len() == 1
             && receipt.finding_id.as_deref()
                 == package
                     .findings

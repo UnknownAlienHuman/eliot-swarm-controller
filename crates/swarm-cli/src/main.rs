@@ -439,7 +439,9 @@ enum TaskCommand {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
-    /// Return one anchored finding as the decision owner; never starts another worker.
+    /// Select retained findings from the exact current assigned review result as an authorized manager.
+    /// Input JSON uses schema_version 2, exact attempt/revision/submission/candidate and review anchors, and finding_ids.
+    /// The Store copies selected finding content from the retained result.
     RequestChanges {
         #[arg(long)]
         file: PathBuf,

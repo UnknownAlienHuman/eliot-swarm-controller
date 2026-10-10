@@ -699,14 +699,14 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         ],
         "task.request_changes" => &[
             "client_request_id",
+            "schema_version",
             "attempt_id",
             "expected_revision",
             "submission_ref",
             "candidate_ref",
-            "finding_id",
-            "reason",
-            "requirement_ids",
-            "evidence",
+            "review_assignment_id",
+            "review_result_operation_id",
+            "finding_ids",
         ],
         "task.create" => &["client_request_id", "project_id", "origin_key", "spec"],
         "task.revise" => &["client_request_id", "task_id", "expected_revision", "spec"],
@@ -932,7 +932,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             text(params, "operation_id")?;
         }
         "task.request_changes" => {
-            crate::submission::ChangeRequest::parse(params)?;
+            crate::submission::ChangeRequestV2::parse(params)?;
         }
         "module.route.select" => {
             for field in ["route_alias", "module_id", "artifact_id", "version"] {

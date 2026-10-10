@@ -1306,7 +1306,17 @@ pub(crate) fn validate_committed_review_and_feedback(
     };
     let result_value: Value =
         serde_json::from_str(&result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
-    let findings_value = serde_json::to_value(&findings_package.findings).map_err(|_| damaged())?;
+    let retained_findings: Vec<crate::review::ReviewFinding> =
+        serde_json::from_value(result_value["findings"].clone()).map_err(|_| damaged())?;
+    let selected_ids = findings_package
+        .findings
+        .iter()
+        .map(|finding| finding.finding_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_findings = retained_findings
+        .into_iter()
+        .filter(|finding| selected_ids.contains(finding.finding_id.as_str()))
+        .collect::<Vec<_>>();
     if method != "review.submit"
         || state != "settled"
         || reviewer_id
@@ -1323,7 +1333,7 @@ pub(crate) fn validate_committed_review_and_feedback(
         || result_value["candidate_ref"] != identity.candidate_ref
         || result_value["verdict"] != "changes_requested"
         || result_value["applicability"] != "current_candidate"
-        || result_value["findings"] != findings_value
+        || selected_findings != findings_package.findings
     {
         return Err(damaged());
     }
@@ -1420,10 +1430,7 @@ pub(crate) fn validate_committed_review_and_feedback(
             "client_request_id":request_client_request_id,
             "package":package_value
         });
-    let matches_package_feedback = feedback_client_request_id
-        == expected_feedback_client_request_id
-        && preserves_review_scope
-        && feedback_result["finding"].is_null()
+    let preserves_package_result = feedback_result["finding"].is_null()
         && feedback_result["findings_package"] == package_value
         && feedback_result["findings_digest"] == findings_package.findings_digest
         && feedback_result["text"]
@@ -1432,11 +1439,34 @@ pub(crate) fn validate_committed_review_and_feedback(
                 findings_package.findings_digest
             )
         && feedback_result["review_provenance"]["findings_package"] == package_value;
-    // The public direct producer also accepts one exact ChangeRequest. Its
-    // manager-authored feedback is distinct from the immutable reviewer finding;
-    // retain both, and still derive the repair input from the full review package.
-    // A malformed package request cannot fall back to this closed typed shape.
+    let matches_package_feedback = feedback_client_request_id
+        == expected_feedback_client_request_id
+        && preserves_review_scope
+        && preserves_package_result;
+    let matches_manual_package_feedback = if feedback_request_value.get("schema_version").is_some()
+    {
+        let input = crate::submission::ChangeRequestV2::parse(&feedback_request_value)
+            .map_err(|_| damaged())?;
+        feedback_caller == decision_manager_id
+            && input.attempt_id == identity.attempt_id
+            && input.expected_revision == identity.task_revision
+            && input.submission_ref == identity.submission_ref
+            && input.candidate_ref == identity.candidate_ref
+            && input.review_assignment_id == assignment_id
+            && input.review_result_operation_id == result_operation_id
+            && input.finding_ids.len() == selected_ids.len()
+            && input
+                .finding_ids
+                .iter()
+                .all(|id| selected_ids.contains(id.as_str()))
+            && preserves_package_result
+    } else {
+        false
+    };
+    // Retained unversioned feedback predates immutable package requests. A
+    // versioned or malformed package request cannot use that historical shape.
     let matches_single_finding_feedback = if feedback_request_value.get("package").is_none()
+        && feedback_request_value.get("schema_version").is_none()
         && findings_package.findings.len() == 1
     {
         let input = crate::submission::ChangeRequest::parse(&feedback_request_value)
@@ -1462,7 +1492,9 @@ pub(crate) fn validate_committed_review_and_feedback(
     if feedback_method != "task.request_changes"
         || feedback_state != "settled"
         || request_client_request_id != feedback_client_request_id
-        || !(matches_package_feedback || matches_single_finding_feedback)
+        || !(matches_package_feedback
+            || matches_manual_package_feedback
+            || matches_single_finding_feedback)
         || feedback_task.as_deref() != Some(identity.task_id.as_str())
         || feedback_attempt.as_deref() != Some(identity.attempt_id.as_str())
         || feedback_result["operation_id"] != feedback_operation_id

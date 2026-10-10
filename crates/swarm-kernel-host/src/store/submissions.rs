@@ -5,8 +5,8 @@ use crate::{
     automation::disposition::ReviewDispositionContext,
     error::{Error, Result},
     model::{self, Principal, Role, TaskSpec},
-    review::ReviewFindingsPackage,
-    submission::{ChangeRequest, SubmitRequest, claim_counts},
+    review::{ReviewFinding, ReviewFindingsPackage, ReviewSlotIdentity},
+    submission::{ChangeRequestV2, SubmitRequest, claim_counts},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -1371,8 +1371,98 @@ pub(super) fn request_changes(
     if p.role != Role::Manager {
         super::gm::require_authority(tx, p)?;
     }
-    let input = ChangeRequest::parse(v)?;
-    request_changes_core(tx, FeedbackActor::Direct(p), &input, None, id, now)
+    let input = ChangeRequestV2::parse(v)?;
+    let attempt = tasks::get_attempt(tx, &input.attempt_id)?;
+    authorize_direct_feedback(tx, p, &attempt)?;
+    let package = manual_findings_package(tx, &attempt, &input)?;
+    let subject = FeedbackSubject::from(&package.identity);
+    request_changes_core(tx, FeedbackActor::Direct(p), &subject, &package, id, now)
+}
+
+fn authorize_direct_feedback(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    attempt: &Value,
+) -> Result<()> {
+    if principal.role == Role::Manager && attempt["owner_id"] != principal.client_id {
+        super::gm::require_attempt_control(tx, principal, attempt)?;
+    }
+    let legacy_authority = principal.role == Role::Operator
+        || (principal.role == Role::Manager
+            && super::gm::read_current(tx)?
+                .is_some_and(|record| record.client_id == principal.client_id));
+    let scoped_manager = !legacy_authority
+        && principal.role == Role::Manager
+        && attempt["owner_id"] == principal.client_id
+        && crate::policy::allows_scoped_manager_feedback(&attempt["task_snapshot"]);
+    if !legacy_authority && !scoped_manager {
+        super::gm::require_authority(tx, principal)?;
+    }
+    Ok(())
+}
+
+fn manual_findings_package(
+    tx: &Transaction<'_>,
+    attempt: &Value,
+    input: &ChangeRequestV2,
+) -> Result<ReviewFindingsPackage> {
+    let task_id = model::text(attempt, "task_id")?;
+    let provenance = super::reviews::actionable_review_result(
+        tx,
+        task_id,
+        &input.attempt_id,
+        input.expected_revision,
+        &input.submission_ref,
+        &input.candidate_ref,
+    )?;
+    if provenance["review_assignment_id"] != input.review_assignment_id
+        || provenance["review_operation_id"] != input.review_result_operation_id
+    {
+        return Err(Error::new(
+            "REVIEW_ANCHOR_MISMATCH",
+            "request does not name the current assigned review result",
+        ));
+    }
+    let selected_ids = input
+        .finding_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained_findings = provenance["review_result"]["findings"]
+        .as_array()
+        .ok_or_else(|| {
+            Error::new(
+                "REVIEW_RESULT_DAMAGED",
+                "retained review result has no findings array",
+            )
+        })?;
+    let mut ordered_findings = Vec::with_capacity(selected_ids.len());
+    for retained in retained_findings {
+        let finding_id = model::text(retained, "finding_id")?;
+        if selected_ids.contains(finding_id) {
+            ordered_findings.push(
+                serde_json::from_value::<ReviewFinding>(retained.clone()).map_err(|_| {
+                    Error::new(
+                        "REVIEW_RESULT_DAMAGED",
+                        "retained review finding fields are invalid",
+                    )
+                })?,
+            );
+        }
+    }
+    if ordered_findings.len() != input.finding_ids.len() {
+        return Err(Error::new(
+            "REVIEW_FINDING_NOT_FOUND",
+            "one or more selected IDs are absent from the exact retained review result",
+        ));
+    }
+    let identity: ReviewSlotIdentity = serde_json::from_value(provenance["identity"].clone())?;
+    ReviewFindingsPackage::new(
+        identity,
+        input.review_assignment_id.clone(),
+        input.review_result_operation_id.clone(),
+        ordered_findings,
+    )
 }
 
 /// Apply the existing Task feedback transition for an authenticated manager's
@@ -1485,28 +1575,34 @@ pub(super) fn request_changes_package_on_behalf(
             "on-behalf feedback Operation link does not match its review cause",
         ));
     }
-    let request = ChangeRequest {
-        client_request_id,
-        attempt_id: package.identity.attempt_id.clone(),
-        expected_revision: package.identity.task_revision,
-        submission_ref: package.identity.submission_ref.clone(),
-        candidate_ref: package.identity.candidate_ref.clone(),
-        finding_id: package.findings_digest.clone(),
-        reason: format!(
-            "Exact ordered reviewer findings package {}",
-            package.findings_digest
-        ),
-        requirement_ids: Vec::new(),
-        evidence: Vec::new(),
-    };
+    let subject = FeedbackSubject::from(&package.identity);
     request_changes_core(
         tx,
         FeedbackActor::Automation(context),
-        &request,
-        Some(package),
+        &subject,
+        package,
         id,
         now,
     )
+}
+
+#[derive(Clone, Copy)]
+struct FeedbackSubject<'a> {
+    attempt_id: &'a str,
+    expected_revision: i64,
+    submission_ref: &'a str,
+    candidate_ref: &'a str,
+}
+
+impl<'a> From<&'a ReviewSlotIdentity> for FeedbackSubject<'a> {
+    fn from(identity: &'a ReviewSlotIdentity) -> Self {
+        Self {
+            attempt_id: &identity.attempt_id,
+            expected_revision: identity.task_revision,
+            submission_ref: &identity.submission_ref,
+            candidate_ref: &identity.candidate_ref,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1534,83 +1630,56 @@ impl<'a> FeedbackActor<'a> {
 fn request_changes_core(
     tx: &Transaction<'_>,
     actor: FeedbackActor<'_>,
-    input: &ChangeRequest,
-    package: Option<&ReviewFindingsPackage>,
+    input: &FeedbackSubject<'_>,
+    package: &ReviewFindingsPackage,
     id: &str,
     now: i64,
 ) -> Result<Value> {
     if let Some(context) = actor.automation_context() {
         context.require_current_action(tx)?;
     }
-    let a = tasks::get_attempt(tx, &input.attempt_id)?;
-    let scoped_manager = match actor {
-        FeedbackActor::Direct(p) => {
-            if p.role == Role::Manager && a["owner_id"] != p.client_id {
-                super::gm::require_attempt_control(tx, p, &a)?;
-            }
-            let legacy_authority = p.role == Role::Operator
-                || (p.role == Role::Manager
-                    && super::gm::read_current(tx)?
-                        .is_some_and(|record| record.client_id == p.client_id));
-            let scoped_manager = !legacy_authority
-                && p.role == Role::Manager
-                && a["owner_id"] == p.client_id
-                && crate::policy::allows_scoped_manager_feedback(&a["task_snapshot"]);
-            if !legacy_authority && !scoped_manager {
-                // Frozen v1, legacy, and unrecognized Attempts retain the historical
-                // local-Operator/current-GM guard. V2 adds one exact owner-scoped path.
-                super::gm::require_authority(tx, p)?;
-            }
-            scoped_manager
-        }
-        FeedbackActor::Automation(context) => {
-            if a["owner_id"] != context.attempt_owner_id()
-                || !crate::policy::allows_scoped_manager_feedback(&a["task_snapshot"])
-            {
-                return Err(Error::new(
-                    "FORBIDDEN",
-                    "manager-owned automation requires the exact transferred owner-policy-v2 Attempt",
-                ));
-            }
-            true
-        }
-    };
-    let doc = document(tx, &input.submission_ref)?;
+    let a = tasks::get_attempt(tx, input.attempt_id)?;
+    if let FeedbackActor::Automation(context) = actor
+        && (a["owner_id"] != context.attempt_owner_id()
+            || !crate::policy::allows_scoped_manager_feedback(&a["task_snapshot"]))
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "manager-owned automation requires the exact transferred owner-policy-v2 Attempt",
+        ));
+    }
+    let identity = &package.identity;
+    if identity.attempt_id != input.attempt_id
+        || identity.task_revision != input.expected_revision
+        || identity.submission_ref != input.submission_ref
+        || identity.candidate_ref != input.candidate_ref
+        || a["task_id"] != identity.task_id
+        || a["task_revision"] != identity.task_revision
+        || a["submission_ref"] != identity.submission_ref
+        || a["candidate_ref"] != identity.candidate_ref
+        || !a["released_at_ms"].is_null()
+        || !matches!(a["state"].as_str(), Some("submitted" | "needs_correction"))
+    {
+        return Err(Error::new(
+            "STALE_REVIEW_SUBJECT",
+            "findings package differs from the exact current Attempt subject",
+        ));
+    }
+    let doc = document(tx, input.submission_ref)?;
     if doc["attempt_id"] != input.attempt_id
         || doc["task_revision"] != input.expected_revision
         || doc["candidate_ref"] != input.candidate_ref
     {
         return Err(Error::invalid(
-            "review anchors do not match the named submission",
-        ));
-    }
-    let spec: TaskSpec = serde_json::from_value(a["task_snapshot"]["spec"].clone())?;
-    if input
-        .requirement_ids
-        .iter()
-        .any(|id| !spec.requirements.iter().any(|r| &r.id == id))
-    {
-        return Err(Error::invalid(
-            "review names a requirement outside this revision",
+            "findings package anchors do not match the named submission",
         ));
     }
     let decision_actor_id = actor.decision_actor_id();
     let automation_task = if let Some(context) = actor.automation_context() {
-        let identity = context.identity();
-        if input.attempt_id != identity.attempt_id
-            || input.expected_revision != identity.task_revision
-            || input.submission_ref != identity.submission_ref
-            || input.candidate_ref != identity.candidate_ref
-            || a["task_id"] != identity.task_id
-            || a["task_revision"] != identity.task_revision
-            || !a["released_at_ms"].is_null()
-            || !matches!(a["state"].as_str(), Some("submitted" | "needs_correction"))
-            || a["submission_ref"] != identity.submission_ref
-            || a["candidate_ref"] != identity.candidate_ref
-        {
+        if package.identity != *context.identity() {
             return Err(Error::new(
                 "STALE_REVIEW_SUBJECT",
-                "automation feedback must target its exact current assigned candidate",
+                "automation feedback package differs from its exact assigned candidate",
             ));
         }
         let task = tasks::get_task(tx, &identity.task_id)?;
@@ -1628,59 +1697,28 @@ fn request_changes_core(
     } else {
         None
     };
-    let automation_provenance = if let Some(context) = actor.automation_context() {
-        if let Some(package) = package {
-            Some(require_automation_review_package_provenance(
-                tx, context, package,
-            )?)
-        } else {
-            let identity = context.identity();
-            let provenance = super::reviews::actionable_finding(
-                tx,
-                &identity.task_id,
-                &identity.attempt_id,
-                identity.task_revision,
-                &identity.submission_ref,
-                &identity.candidate_ref,
-                &input.finding_id,
-            )?;
-            require_automation_review_provenance(tx, context, input, &provenance)?;
-            Some(provenance)
-        }
+    let review_provenance = if let Some(context) = actor.automation_context() {
+        require_automation_review_package_provenance(tx, context, package)?
     } else {
-        None
+        require_review_package_provenance(tx, package)?
     };
-    let (finding, key, package_value) = if let Some(package) = package {
-        let package_value = serde_json::to_value(package)?;
-        let key = format!(
-            "findings-package:{}",
-            model::digest(
-                model::canonical(&json!([
-                    decision_actor_id,
-                    input.submission_ref,
-                    package.findings_digest
-                ]))?
-                .as_bytes()
-            )
-        );
-        (Value::Null, key, Some(package_value))
-    } else {
-        let key = format!(
-            "finding:{}",
-            model::digest(
-                model::canonical(&json!([
-                    decision_actor_id,
-                    input.submission_ref,
-                    input.finding_id
-                ]))?
-                .as_bytes()
-            )
-        );
-        (input.finding(), key, None)
-    };
+    let finding = Value::Null;
+    let package_value = serde_json::to_value(package)?;
+    let key = format!(
+        "findings-package:{}",
+        model::digest(
+            model::canonical(&json!([
+                decision_actor_id,
+                identity.submission_ref,
+                identity.candidate_ref,
+                package.findings_digest
+            ]))?
+            .as_bytes()
+        )
+    );
     let t = match automation_task {
         Some(task) => task,
-        None => tasks::get_task(tx, model::text(&a, "task_id")?)?,
+        None => tasks::get_task(tx, &identity.task_id)?,
     };
     let applies = t["state"] == "open"
         && t["revision"] == input.expected_revision
@@ -1690,66 +1728,11 @@ fn request_changes_core(
         && a["submission_ref"] == input.submission_ref
         && a["candidate_ref"] == input.candidate_ref
         && matches!(a["state"].as_str(), Some("submitted" | "needs_correction"));
-    if scoped_manager && !applies {
+    if !applies {
         return Err(Error::new(
             "STALE_REVIEW_SUBJECT",
-            "owner-scoped feedback requires the exact current open Task submission",
+            "findings package requires the exact current open Task submission",
         ));
-    }
-    let review_provenance = if let Some(provenance) = automation_provenance {
-        Some(provenance)
-    } else if applies {
-        match super::reviews::actionable_finding(
-            tx,
-            model::text(&a, "task_id")?,
-            &input.attempt_id,
-            input.expected_revision,
-            &input.submission_ref,
-            &input.candidate_ref,
-            &input.finding_id,
-        ) {
-            Ok(provenance) => Some(provenance),
-            Err(error)
-                if !scoped_manager
-                    && matches!(
-                        error.code.as_str(),
-                        "REVIEW_FINDING_NOT_FOUND" | "REVIEW_FINDING_NOT_ACTIONABLE"
-                    ) =>
-            {
-                None
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        None
-    };
-    if scoped_manager && package.is_none() {
-        let provenance = review_provenance.as_ref().ok_or_else(|| {
-            Error::new(
-                "REVIEW_FINDING_NOT_FOUND",
-                "owner-scoped feedback requires a current assigned-auditor finding",
-            )
-        })?;
-        if provenance["finding"]["requirement_ids"] != json!(input.requirement_ids) {
-            return Err(Error::new(
-                "REVIEW_FINDING_MISMATCH",
-                "manager feedback must preserve the assigned finding's exact requirement scope",
-            ));
-        }
-        let review_evidence = provenance["finding"]["evidence_refs"]
-            .as_array()
-            .ok_or_else(|| Error::new("REVIEW_RESULT_DAMAGED", "finding evidence is missing"))?;
-        if review_evidence.iter().any(|reference| {
-            !input
-                .evidence
-                .iter()
-                .any(|provided| reference.as_str() == Some(provided.as_str()))
-        }) {
-            return Err(Error::new(
-                "REVIEW_EVIDENCE_MISMATCH",
-                "manager feedback must retain every evidence reference from the assigned finding",
-            ));
-        }
     }
     // Every receipt, including a semantic replay, carries its exact object
     // relation. Current applicability and reviewer provenance are checked before
@@ -1758,25 +1741,16 @@ fn request_changes_core(
         "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
         params![id, a["task_id"].as_str(), input.attempt_id],
     )?;
-    let feedback_text = package.map_or_else(
-        || input.reason.clone(),
-        |package| {
-            format!(
-                "Applied exact ordered reviewer findings package {}.",
-                package.findings_digest
-            )
-        },
+    let feedback_text = format!(
+        "Applied exact ordered reviewer findings package {}.",
+        package.findings_digest
     );
     let old: Option<String> = tx.query_row("SELECT payload_json FROM observations WHERE source_stream_id='controller:review' AND source_event_key=?1", [&key], |r| r.get(0)).optional()?;
     if let Some(raw) = old {
         let mut prior: Value = serde_json::from_str(&raw)?;
-        let matches_subject = package_value.as_ref().map_or_else(
-            || prior["finding"] == finding,
-            |package| prior.get("findings_package") == Some(package),
-        );
-        if !matches_subject {
+        if prior.get("findings_package") != Some(&package_value) {
             return Err(Error::new(
-                "FINDING_ID_CONFLICT",
+                "REVIEW_FINDINGS_PACKAGE_CONFLICT",
                 "feedback identity already names a different exact subject",
             ));
         }
@@ -1794,11 +1768,7 @@ fn request_changes_core(
             ).optional()?;
             prior = if let Some(raw) = retained_delivery {
                 let delivery: Value = serde_json::from_str(&raw)?;
-                let matches_subject = package_value.as_ref().map_or_else(
-                    || delivery["finding"] == finding,
-                    |package| delivery.get("findings_package") == Some(package),
-                );
-                if !matches_subject
+                if delivery.get("findings_package") != Some(&package_value)
                     || delivery["sender"] != decision_actor_id
                     || delivery["recipient"] != a["owner_id"]
                     || delivery["task_id"] != a["task_id"]
@@ -1821,12 +1791,8 @@ fn request_changes_core(
                     "coalesced_from_operation_id":original_feedback_operation_id,
                     "native_input_sent":false,"acceptance_changed":false,"repair_started":false,"publication_started":false,
                 });
-                if let Some(package) = package_value.as_ref() {
-                    delivery["findings_package"] = package.clone();
-                }
-                if let Some(package) = package {
-                    delivery["findings_digest"] = json!(package.findings_digest);
-                }
+                delivery["findings_package"] = package_value.clone();
+                delivery["findings_digest"] = json!(package.findings_digest);
                 tx.execute(
                     "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:review',?1,?2,'task.feedback',?3,?4)",
                     params![delivery_key,id,model::canonical(&delivery)?,now],
@@ -1836,25 +1802,22 @@ fn request_changes_core(
             feedback_operation_id = model::text(&prior, "operation_id")?.to_owned();
         }
         if applies {
-            if let Some(provenance) = review_provenance.as_ref() {
-                retain_review_disposition(
-                    tx,
-                    ReviewDispositionDelivery {
-                        operation_id: id,
-                        feedback_operation_id: &feedback_operation_id,
-                        decision_actor_id,
-                    },
-                    input,
-                    provenance,
-                    package,
-                    now,
-                )?;
-            }
+            retain_review_disposition(
+                tx,
+                ReviewDispositionDelivery {
+                    operation_id: id,
+                    feedback_operation_id: &feedback_operation_id,
+                    decision_actor_id,
+                },
+                &review_provenance,
+                package,
+                now,
+            )?;
             tx.execute(
                 "UPDATE attempts SET state='needs_correction',updated_at_ms=?2 WHERE attempt_id=?1",
                 params![input.attempt_id, now],
             )?;
-            super::capacity::sync_attempt(tx, &input.attempt_id, now)?;
+            super::capacity::sync_attempt(tx, input.attempt_id, now)?;
         }
         prior["operation_id"] = json!(id);
         prior["coalesced_from_operation_id"] = json!(original_feedback_operation_id);
@@ -1876,7 +1839,7 @@ fn request_changes_core(
         }
         return Ok(prior);
     }
-    if applies && let Some(provenance) = &review_provenance {
+    if applies {
         retain_review_disposition(
             tx,
             ReviewDispositionDelivery {
@@ -1884,8 +1847,7 @@ fn request_changes_core(
                 feedback_operation_id: id,
                 decision_actor_id,
             },
-            input,
-            provenance,
+            &review_provenance,
             package,
             now,
         )?;
@@ -1897,18 +1859,14 @@ fn request_changes_core(
         "delivery":if applies {"durable_mailbox_only"} else {"historical_evidence_only"},
         "review_provenance":review_provenance,
         "native_input_sent":false,"acceptance_changed":false,"repair_started":false,"publication_started":false});
-    if let Some(package) = package_value {
-        value["findings_package"] = package;
-    }
-    if let Some(package) = package {
-        value["findings_digest"] = json!(package.findings_digest);
-    }
+    value["findings_package"] = package_value;
+    value["findings_digest"] = json!(package.findings_digest);
     if applies {
         tx.execute(
             "UPDATE attempts SET state='needs_correction',updated_at_ms=?2 WHERE attempt_id=?1",
             params![input.attempt_id, now],
         )?;
-        super::capacity::sync_attempt(tx, &input.attempt_id, now)?;
+        super::capacity::sync_attempt(tx, input.attempt_id, now)?;
     }
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:review',?1,?2,?3,?4,?5)",
         params![key,id,if applies {"task.feedback"} else {"task.review_stale"},model::canonical(&value)?,now])?;
@@ -1924,9 +1882,8 @@ struct ReviewDispositionDelivery<'a> {
 fn retain_review_disposition(
     tx: &Transaction<'_>,
     delivery: ReviewDispositionDelivery<'_>,
-    input: &ChangeRequest,
     provenance: &Value,
-    package: Option<&ReviewFindingsPackage>,
+    package: &ReviewFindingsPackage,
     now: i64,
 ) -> Result<()> {
     let ReviewDispositionDelivery {
@@ -1956,11 +1913,7 @@ fn retain_review_disposition(
             || prior["review_result_operation_id"] != provenance["review_operation_id"]
             || prior["disposition"]
                 != review_contract::ReviewDisposition::ReturnForCorrection.as_str()
-            || prior["finding_ids"]
-                != package.map_or_else(
-                    || json!([input.finding_id]),
-                    |package| json!(package.finding_ids()),
-                )
+            || prior["finding_ids"] != json!(package.finding_ids())
             || prior["task_feedback_operation_id"] != feedback_operation_id
         {
             return Err(Error::new(
@@ -1970,37 +1923,18 @@ fn retain_review_disposition(
         }
         return Ok(());
     }
-    let finding_ids = package.map_or_else(
-        || json!([input.finding_id]),
-        |package| json!(package.finding_ids()),
+    let finding_ids = package.finding_ids();
+    let evidence_refs = package
+        .findings
+        .iter()
+        .flat_map(|finding| finding.evidence_refs.iter().cloned())
+        .collect::<Vec<_>>();
+    let reason = format!(
+        "Applied exact ordered reviewer findings package {}.",
+        package.findings_digest
     );
-    let evidence_refs = package.map_or_else(
-        || input.evidence.clone(),
-        |package| {
-            package
-                .findings
-                .iter()
-                .flat_map(|finding| finding.evidence_refs.iter().cloned())
-                .collect()
-        },
-    );
-    let reason = package.map_or_else(
-        || input.reason.clone(),
-        |package| {
-            format!(
-                "Applied exact ordered reviewer findings package {}.",
-                package.findings_digest
-            )
-        },
-    );
-    let identity = package.map_or_else(
-        || provenance["identity"].clone(),
-        |package| json!(package.identity),
-    );
-    let review_result_operation_id = package.map_or_else(
-        || provenance["review_operation_id"].clone(),
-        |package| json!(package.review_result_operation_id),
-    );
+    let identity = json!(package.identity);
+    let review_result_operation_id = json!(package.review_result_operation_id);
     let disposition = json!({
         "schema_version":1,
         "kind":"review.disposition",
@@ -2028,160 +1962,30 @@ fn retain_review_disposition(
     Ok(())
 }
 
-fn require_automation_review_provenance(
+fn require_review_package_provenance(
     tx: &Transaction<'_>,
-    context: &ReviewDispositionContext,
-    input: &ChangeRequest,
-    provenance: &Value,
-) -> Result<()> {
-    let damaged = || {
-        Error::new(
-            "REVIEW_RESULT_DAMAGED",
-            "automation feedback does not match its exact retained review result",
-        )
-    };
-    let identity = context.identity();
-    let finding = &provenance["finding"];
-    if provenance["review_assignment_id"] != context.review_assignment_id()
-        || provenance["review_operation_id"] != context.review_result_operation_id()
-        || provenance["identity"] != json!(identity)
-        || provenance["finding"]["finding_id"] != input.finding_id
-        || input.attempt_id != identity.attempt_id
-        || input.expected_revision != identity.task_revision
-        || input.submission_ref != identity.submission_ref
-        || input.candidate_ref != identity.candidate_ref
-        || json!(input.reason) != finding["reason"]
-        || json!(input.requirement_ids) != finding["requirement_ids"]
-        || json!(input.evidence) != finding["evidence_refs"]
-    {
-        return Err(damaged());
-    }
-
-    let assignment_key = format!("assignment:{}", context.review_assignment_id());
-    let assignment_row: Option<(String, String)> = tx
-        .query_row(
-            "SELECT payload_json,operation_id FROM observations \
-             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
-               AND kind='review.assignment'",
-            [&assignment_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((assignment_json, assignment_operation_id)) = assignment_row else {
-        return Err(damaged());
-    };
-    let assignment: Value = serde_json::from_str(&assignment_json).map_err(|_| damaged())?;
-    if assignment["review_assignment_id"] != context.review_assignment_id()
-        || assignment["operation_id"] != assignment_operation_id
-        || assignment["identity"] != json!(identity)
-        || assignment["sponsor_client_id"] != context.review_assignment_sponsor_id()
-        || assignment["reviewer_client_id"] != provenance["reviewer_client_id"]
-    {
-        return Err(damaged());
-    }
-    let assignment_result: Option<(String, String, Option<String>)> = tx
-        .query_row(
-            "SELECT method,state,result_json FROM operations WHERE operation_id=?1",
-            [&assignment_operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((method, state, result_json)) = assignment_result else {
-        return Err(damaged());
-    };
-    let assignment_operation_result: Value =
-        serde_json::from_str(&result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
-    if method != "review.assign"
-        || state != "settled"
-        || assignment_operation_result["review_assignment_id"] != context.review_assignment_id()
-        || assignment_operation_result["identity"] != json!(identity)
-        || assignment_operation_result["sponsor_client_id"]
-            != context.review_assignment_sponsor_id()
-    {
-        return Err(damaged());
-    }
-
-    let result_key = format!("result:{}", context.review_assignment_id());
-    let result_row: Option<(String, String)> = tx
-        .query_row(
-            "SELECT payload_json,operation_id FROM observations \
-             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
-               AND kind='review.result'",
-            [&result_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((result_json, result_operation_id)) = result_row else {
-        return Err(damaged());
-    };
-    let record: Value = serde_json::from_str(&result_json).map_err(|_| damaged())?;
-    let result_operation: Option<(String, String, Option<String>)> = tx
-        .query_row(
-            "SELECT caller_id,method,result_json FROM operations WHERE operation_id=?1 AND state='settled'",
-            [&result_operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((reviewer_id, method, result_operation_json)) = result_operation else {
-        return Err(damaged());
-    };
-    let result: Value =
-        serde_json::from_str(&result_operation_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
-    if result_operation_id != context.review_result_operation_id()
-        || record["review_assignment_id"] != context.review_assignment_id()
-        || record["operation_id"] != context.review_result_operation_id()
-        || record["identity"] != json!(identity)
-        || record["result"] != result
-        || reviewer_id != assignment["reviewer_client_id"]
-        || method != "review.submit"
-        || result["review_assignment_id"] != context.review_assignment_id()
-        || result["reviewer_client_id"] != assignment["reviewer_client_id"]
-        || result["sponsor_client_id"] != context.review_assignment_sponsor_id()
-        || result["task_id"] != identity.task_id
-        || result["attempt_id"] != identity.attempt_id
-        || result["task_revision"] != identity.task_revision
-        || result["submission_ref"] != identity.submission_ref
-        || result["candidate_ref"] != identity.candidate_ref
-        || result["verdict"] != "changes_requested"
-        || result["applicability"] != "current_candidate"
-    {
-        return Err(damaged());
-    }
-    Ok(())
-}
-
-fn require_automation_review_package_provenance(
-    tx: &Transaction<'_>,
-    context: &ReviewDispositionContext,
     package: &ReviewFindingsPackage,
 ) -> Result<Value> {
     let damaged = || {
         Error::new(
             "REVIEW_RESULT_DAMAGED",
-            "automation feedback package does not match its exact retained review result",
+            "feedback package does not match its exact retained review result",
         )
     };
     package.validate().map_err(|_| damaged())?;
-    let identity = context.identity();
-    if &package.identity != identity
-        || package.review_assignment_id != context.review_assignment_id()
-        || package.review_result_operation_id != context.review_result_operation_id()
-    {
-        return Err(damaged());
-    }
     for finding in &package.findings {
         let provenance = super::reviews::actionable_finding(
             tx,
-            &identity.task_id,
-            &identity.attempt_id,
-            identity.task_revision,
-            &identity.submission_ref,
-            &identity.candidate_ref,
+            &package.identity.task_id,
+            &package.identity.attempt_id,
+            package.identity.task_revision,
+            &package.identity.submission_ref,
+            &package.identity.candidate_ref,
             &finding.finding_id,
         )?;
-        if provenance["review_assignment_id"] != context.review_assignment_id()
-            || provenance["review_operation_id"] != context.review_result_operation_id()
-            || provenance["identity"] != json!(identity)
+        if provenance["review_assignment_id"] != package.review_assignment_id
+            || provenance["review_operation_id"] != package.review_result_operation_id
+            || provenance["identity"] != json!(package.identity)
             || provenance["finding"] != serde_json::to_value(finding)?
         {
             return Err(damaged());
@@ -2195,4 +1999,24 @@ fn require_automation_review_package_provenance(
         "findings_digest":package.findings_digest,
         "findings":package.findings
     }))
+}
+
+fn require_automation_review_package_provenance(
+    tx: &Transaction<'_>,
+    context: &ReviewDispositionContext,
+    package: &ReviewFindingsPackage,
+) -> Result<Value> {
+    let damaged = || {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "automation feedback package does not match its exact retained review result",
+        )
+    };
+    if &package.identity != context.identity()
+        || package.review_assignment_id != context.review_assignment_id()
+        || package.review_result_operation_id != context.review_result_operation_id()
+    {
+        return Err(damaged());
+    }
+    require_review_package_provenance(tx, package)
 }

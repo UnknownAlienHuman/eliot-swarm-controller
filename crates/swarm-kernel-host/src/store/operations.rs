@@ -434,6 +434,32 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
             projected.insert((*field).to_owned(), value.clone());
         }
     }
+    if method == "task.request_changes"
+        && let Ok(package) = serde_json::from_value::<crate::review::ReviewFindingsPackage>(
+            result["findings_package"].clone(),
+        )
+        && package.validate().is_ok()
+        && result["findings_digest"] == package.findings_digest
+        && result["review_provenance"]["review_assignment_id"] == package.review_assignment_id
+        && result["review_provenance"]["review_operation_id"] == package.review_result_operation_id
+        && public_token(&json!(package.review_assignment_id)).is_some()
+        && public_token(&json!(package.review_result_operation_id)).is_some()
+        && package
+            .findings
+            .iter()
+            .all(|finding| public_token(&json!(finding.finding_id)).is_some())
+    {
+        projected.insert("findings_digest".into(), json!(package.findings_digest));
+        projected.insert(
+            "review_assignment_id".into(),
+            json!(package.review_assignment_id),
+        );
+        projected.insert(
+            "review_result_operation_id".into(),
+            json!(package.review_result_operation_id),
+        );
+        projected.insert("finding_ids".into(), json!(package.finding_ids()));
+    }
     for field in ["failure", "error"] {
         if let Some(code) = result[field]["code"]
             .as_str()

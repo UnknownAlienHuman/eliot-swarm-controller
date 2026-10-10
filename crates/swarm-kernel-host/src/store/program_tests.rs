@@ -375,6 +375,26 @@ fn review_result_request(subject: &ReviewSubject, assignment_id: &str, request_i
     })
 }
 
+fn request_changes_v2(
+    subject: &ReviewSubject,
+    assignment_id: &str,
+    result_operation_id: &str,
+    request_id: &str,
+    finding_ids: &[&str],
+) -> Value {
+    json!({
+        "schema_version":2,
+        "client_request_id":request_id,
+        "attempt_id":subject.attempt_id,
+        "expected_revision":1,
+        "submission_ref":subject.submission_ref,
+        "candidate_ref":subject.candidate_ref,
+        "review_assignment_id":assignment_id,
+        "review_result_operation_id":result_operation_id,
+        "finding_ids":finding_ids,
+    })
+}
+
 fn passing_review_result_request(
     subject: &ReviewSubject,
     assignment_id: &str,
@@ -1232,12 +1252,30 @@ async fn sponsored_review_result_drives_only_exact_v2_owner_disposition_and_priv
     assert_eq!(bound_scope["submission_ref"], v2.submission_ref);
     assert_eq!(bound_scope["candidate_ref"], v2.candidate_ref);
 
+    let mut retained_review_request =
+        review_result_request(&v2, &assignment_id, "review-result-v2");
+    retained_review_request["findings"] = json!([
+        {
+            "finding_id":"missing-r1-evidence",
+            "requirement_ids":["R1"],
+            "reason":"The candidate omits the requested evidence.",
+            "evidence_refs":["evidence://review/r1"],
+            "requested_change":"Add the retained evidence for R1."
+        },
+        {
+            "finding_id":"missing-r1-verification",
+            "requirement_ids":["R1"],
+            "reason":"The candidate omits a verification record.",
+            "evidence_refs":["evidence://review/r1-verification"],
+            "requested_change":"Add the verification record for R1."
+        }
+    ]);
     let result = owner
         .store
         .call(
-            reviewer,
+            reviewer.clone(),
             "review.submit".into(),
-            review_result_request(&v2, &assignment_id, "review-result-v2"),
+            retained_review_request,
         )
         .await
         .unwrap();
@@ -1245,32 +1283,211 @@ async fn sponsored_review_result_drives_only_exact_v2_owner_disposition_and_priv
     assert_eq!(result["task_transition"], "none");
     assert_eq!(result["acceptance_changed"], false);
     assert_eq!(result["publication_started"], false);
+    let result_operation_id = result["operation_id"].as_str().unwrap().to_owned();
+
+    let reviewer_feedback = owner
+        .store
+        .call(
+            reviewer,
+            "task.request_changes".into(),
+            request_changes_v2(
+                &v2,
+                &assignment_id,
+                &result_operation_id,
+                "assigned-reviewer-cannot-dispose",
+                &["missing-r1-evidence"],
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reviewer_feedback.code, "FORBIDDEN");
+
+    let mut caller_authored = request_changes_v2(
+        &v2,
+        &assignment_id,
+        &result_operation_id,
+        "owner-v2-caller-authored",
+        &["missing-r1-evidence"],
+    );
+    caller_authored["reason"] = json!("manager-authored replacement");
+    caller_authored["requirement_ids"] = json!(["R1"]);
+    caller_authored["evidence"] = json!(["evidence://caller/forged"]);
+    assert!(
+        owner
+            .store
+            .call(
+                manager_v2.clone(),
+                "task.request_changes".into(),
+                caller_authored,
+            )
+            .await
+            .is_err()
+    );
+    let duplicate_ids = owner
+        .store
+        .call(
+            manager_v2.clone(),
+            "task.request_changes".into(),
+            request_changes_v2(
+                &v2,
+                &assignment_id,
+                &result_operation_id,
+                "owner-v2-duplicate-id",
+                &["missing-r1-evidence", "missing-r1-evidence"],
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(duplicate_ids.code.starts_with("INVALID"));
+    let unknown_id = owner
+        .store
+        .call(
+            manager_v2.clone(),
+            "task.request_changes".into(),
+            request_changes_v2(
+                &v2,
+                &assignment_id,
+                &result_operation_id,
+                "owner-v2-unknown-id",
+                &["not-retained"],
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown_id.code, "REVIEW_FINDING_NOT_FOUND");
+
+    let mut wrong_assignment = request_changes_v2(
+        &v2,
+        &assignment_id,
+        &result_operation_id,
+        "owner-v2-wrong-assignment",
+        &["missing-r1-evidence"],
+    );
+    wrong_assignment["review_assignment_id"] = json!("different-assignment");
+    let assignment_error = owner
+        .store
+        .call(
+            manager_v2.clone(),
+            "task.request_changes".into(),
+            wrong_assignment,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(assignment_error.code, "REVIEW_ANCHOR_MISMATCH");
+
+    let wrong_result = request_changes_v2(
+        &v2,
+        &assignment_id,
+        "different-review-result",
+        "owner-v2-wrong-result",
+        &["missing-r1-evidence"],
+    );
+    let result_error = owner
+        .store
+        .call(
+            manager_v2.clone(),
+            "task.request_changes".into(),
+            wrong_result,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(result_error.code, "REVIEW_ANCHOR_MISMATCH");
 
     let feedback = owner
         .store
         .call(
             manager_v2.clone(),
             "task.request_changes".into(),
-            json!({
-                "client_request_id":"owner-v2-disposition",
-                "attempt_id":v2.attempt_id,
-                "expected_revision":1,
-                "submission_ref":v2.submission_ref,
-                "candidate_ref":v2.candidate_ref,
-                "finding_id":"missing-r1-evidence",
-                "reason":"Add the retained evidence for R1.",
-                "requirement_ids":["R1"],
-                "evidence":["evidence://review/r1"],
-            }),
+            request_changes_v2(
+                &v2,
+                &assignment_id,
+                &result_operation_id,
+                "owner-v2-disposition",
+                &["missing-r1-verification", "missing-r1-evidence"],
+            ),
         )
         .await
         .unwrap();
     assert_eq!(feedback["applied"], true);
     assert_eq!(feedback["status"], "needs_correction");
+    assert!(feedback["finding"].is_null());
+    assert_eq!(feedback["native_input_sent"], false);
+    assert_eq!(feedback["repair_started"], false);
+    assert_eq!(feedback["publication_started"], false);
     assert_eq!(
-        feedback["review_provenance"]["review_assignment_id"],
-        assignment_id
+        feedback["findings_package"]["findings"][0]["finding_id"],
+        "missing-r1-evidence"
     );
+    assert_eq!(
+        feedback["findings_package"]["findings"][1]["finding_id"],
+        "missing-r1-verification"
+    );
+    assert_eq!(
+        feedback["findings_package"]["findings"][0]["reason"],
+        "The candidate omits the requested evidence."
+    );
+    assert_eq!(
+        feedback["findings_package"]["findings"][1]["evidence_refs"][0],
+        "evidence://review/r1-verification"
+    );
+    assert_eq!(
+        feedback["findings_package"]["review_result_operation_id"],
+        result_operation_id
+    );
+    assert_eq!(
+        feedback["review_provenance"]["findings_package"],
+        feedback["findings_package"]
+    );
+    let permuted_replay = owner
+        .store
+        .call(
+            manager_v2.clone(),
+            "task.request_changes".into(),
+            request_changes_v2(
+                &v2,
+                &assignment_id,
+                &result_operation_id,
+                "owner-v2-disposition-permuted",
+                &["missing-r1-evidence", "missing-r1-verification"],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(permuted_replay["coalesced"], true);
+    assert_eq!(
+        permuted_replay["coalesced_from_operation_id"],
+        feedback["operation_id"]
+    );
+    assert_eq!(
+        permuted_replay["findings_digest"],
+        feedback["findings_digest"]
+    );
+    assert_eq!(permuted_replay["message_id"], feedback["message_id"]);
+    let receipt = owner
+        .store
+        .call(
+            manager_v2.clone(),
+            "operation.get".into(),
+            json!({"operation_id":feedback["operation_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["result"]["findings_digest"],
+        feedback["findings_digest"]
+    );
+    assert_eq!(receipt["result"]["review_assignment_id"], assignment_id);
+    assert_eq!(
+        receipt["result"]["review_result_operation_id"],
+        result_operation_id
+    );
+    assert_eq!(
+        receipt["result"]["finding_ids"],
+        json!(["missing-r1-evidence", "missing-r1-verification"])
+    );
+    for private_field in ["findings_package", "review_provenance", "finding", "text"] {
+        assert!(receipt["result"].get(private_field).is_none());
+    }
     let review = owner
         .store
         .call(
@@ -1309,17 +1526,13 @@ async fn sponsored_review_result_drives_only_exact_v2_owner_disposition_and_priv
         .call(
             manager_v1,
             "task.request_changes".into(),
-            json!({
-                "client_request_id":"non-gm-v1-disposition",
-                "attempt_id":v1.attempt_id,
-                "expected_revision":1,
-                "submission_ref":v1.submission_ref,
-                "candidate_ref":v1.candidate_ref,
-                "finding_id":"missing-r1-evidence",
-                "reason":"Add the retained evidence for R1.",
-                "requirement_ids":["R1"],
-                "evidence":["evidence://review/r1"],
-            }),
+            request_changes_v2(
+                &v1,
+                "unavailable-assignment",
+                "unavailable-result",
+                "non-gm-v1-disposition",
+                &["missing-r1-evidence"],
+            ),
         )
         .await
         .unwrap_err();
@@ -1848,23 +2061,19 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
         .call(
             unrelated,
             "task.request_changes".into(),
-            json!({
-                "client_request_id":"unrelated-manager-successor-feedback",
-                "attempt_id":correction.attempt_id,
-                "expected_revision":1,
-                "submission_ref":correction.submission_ref,
-                "candidate_ref":correction.candidate_ref,
-                "finding_id":"missing-r1-evidence",
-                "reason":"Add the retained evidence for R1.",
-                "requirement_ids":["R1"],
-                "evidence":["evidence://review/r1"],
-            }),
+            request_changes_v2(
+                &correction,
+                &correction_assignment_id,
+                "review-result-not-submitted",
+                "unrelated-manager-successor-feedback",
+                &["missing-r1-evidence"],
+            ),
         )
         .await
         .unwrap_err();
     assert_eq!(denied.code, "FORBIDDEN");
 
-    owner
+    let correction_review_result = owner
         .store
         .call(correction_reviewer, "review.submit".into(), {
             let mut request = review_result_request(
@@ -1940,17 +2149,13 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
         .call(
             successor.clone(),
             "task.request_changes".into(),
-            json!({
-                "client_request_id":"retired-review-gm-successor-feedback",
-                "attempt_id":correction.attempt_id,
-                "expected_revision":1,
-                "submission_ref":correction.submission_ref,
-                "candidate_ref":correction.candidate_ref,
-                "finding_id":"missing-r1-evidence",
-                "reason":"Add the retained evidence for R1.",
-                "requirement_ids":["R1"],
-                "evidence":["evidence://review/r1"]
-            }),
+            request_changes_v2(
+                &correction,
+                &correction_assignment_id,
+                correction_review_result["operation_id"].as_str().unwrap(),
+                "retired-review-gm-successor-feedback",
+                &["missing-r1-evidence"],
+            ),
         )
         .await
         .unwrap_err();
@@ -2195,11 +2400,18 @@ async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_
     .await;
     let review_result = owner
         .store
-        .call(
-            reviewer,
-            "review.submit".into(),
-            review_result_request(&subject, &assignment_id, "successor-repair-result"),
-        )
+        .call(reviewer, "review.submit".into(), {
+            let mut request =
+                review_result_request(&subject, &assignment_id, "successor-repair-result");
+            request["findings"].as_array_mut().unwrap().push(json!({
+                "finding_id":"unselected-followup",
+                "requirement_ids":["R1"],
+                "reason":"An independent followup remains in the exact retained result.",
+                "evidence_refs":["evidence://review/followup"],
+                "requested_change":"Keep this separate followup outside this correction package."
+            }));
+            request
+        })
         .await
         .unwrap();
     assert_eq!(review_result["verdict"], "changes_requested");
@@ -2219,34 +2431,35 @@ async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_
         .call(
             decision_manager.clone(),
             "task.request_changes".into(),
-            json!({
-                "client_request_id":"successor-repair-return-for-correction",
-                "attempt_id":subject.attempt_id,
-                "expected_revision":1,
-                "submission_ref":subject.submission_ref,
-                "candidate_ref":subject.candidate_ref,
-                "finding_id":"missing-r1-evidence",
-                "reason":"Add the retained evidence for R1.",
-                "requirement_ids":["R1"],
-                "evidence":["evidence://review/r1"]
-            }),
+            request_changes_v2(
+                &subject,
+                &assignment_id,
+                &result_operation_id,
+                "successor-repair-return-for-correction",
+                &["missing-r1-evidence"],
+            ),
         )
         .await
         .unwrap();
     assert_eq!(feedback["applied"], true);
     assert_eq!(feedback["sender"], decision_manager.client_id);
     assert_eq!(feedback["recipient"], source_owner.client_id);
+    assert!(feedback["finding"].is_null());
+    assert_eq!(review_result["findings"].as_array().unwrap().len(), 2);
     assert_eq!(
-        feedback["finding"]["reason"],
-        "Add the retained evidence for R1."
+        feedback["findings_package"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
-    assert_ne!(
-        feedback["finding"]["reason"],
+    assert_eq!(
+        feedback["findings_package"]["findings"][0]["reason"],
         "The candidate omits the requested evidence."
     );
     assert_eq!(
-        feedback["review_provenance"]["review_assignment_id"],
-        assignment_id
+        feedback["review_provenance"]["findings_package"],
+        feedback["findings_package"]
     );
 
     let first_transfer = owner

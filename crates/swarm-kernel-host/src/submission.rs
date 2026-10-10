@@ -123,6 +123,8 @@ pub fn claim_counts(claims: &[RequirementClaim]) -> Value {
         "deferred":count(ClaimStatus::Deferred),"unreported":count(ClaimStatus::Unreported)})
 }
 
+/// Historical v1 single-finding request decoder. New mutations must use
+/// `ChangeRequestV2`; this shape remains only for retained legacy Operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRequest {
@@ -171,5 +173,115 @@ impl ChangeRequest {
             "submission_ref":self.submission_ref,"candidate_ref":self.candidate_ref,
             "finding_id":self.finding_id,"reason":self.reason,
             "requirement_ids":self.requirement_ids,"evidence":self.evidence})
+    }
+}
+
+/// A manager selects immutable findings from one exact retained review result.
+/// Finding content is deliberately absent from this request and is loaded by
+/// the Store from the anchored assignment/result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeRequestV2 {
+    pub schema_version: u32,
+    pub client_request_id: String,
+    pub attempt_id: String,
+    pub expected_revision: i64,
+    pub submission_ref: String,
+    pub candidate_ref: String,
+    pub review_assignment_id: String,
+    pub review_result_operation_id: String,
+    pub finding_ids: Vec<String>,
+}
+
+impl ChangeRequestV2 {
+    pub fn parse(v: &Value) -> Result<Self> {
+        let input: Self = serde_json::from_value(v.clone())?;
+        for field in [
+            "client_request_id",
+            "attempt_id",
+            "submission_ref",
+            "candidate_ref",
+            "review_assignment_id",
+            "review_result_operation_id",
+        ] {
+            model::text(v, field)?;
+        }
+        let mut ids = BTreeSet::new();
+        if input.schema_version != 2
+            || input.expected_revision < 1
+            || input.finding_ids.is_empty()
+            || input
+                .finding_ids
+                .iter()
+                .any(|id| id.trim().is_empty() || !ids.insert(id))
+        {
+            return Err(Error::invalid(
+                "task.request_changes v2 requires exact review anchors and unique nonempty finding IDs",
+            ));
+        }
+        Ok(input)
+    }
+}
+
+#[cfg(test)]
+mod change_request_tests {
+    use super::{ChangeRequest, ChangeRequestV2};
+    use serde_json::{Value, json};
+
+    fn request() -> Value {
+        json!({
+            "schema_version":2,
+            "client_request_id":"manual-feedback",
+            "attempt_id":"attempt-1",
+            "expected_revision":3,
+            "submission_ref":"submission-1",
+            "candidate_ref":"candidate-1",
+            "review_assignment_id":"assignment-1",
+            "review_result_operation_id":"review-result-1",
+            "finding_ids":["finding-a","finding-b"]
+        })
+    }
+
+    #[test]
+    fn request_v2_accepts_only_anchored_finding_selection() {
+        let parsed = ChangeRequestV2::parse(&request()).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.finding_ids, ["finding-a", "finding-b"]);
+
+        let mut caller_authored = request();
+        caller_authored["reason"] = json!("caller text");
+        caller_authored["requirement_ids"] = json!(["R1"]);
+        caller_authored["evidence"] = json!(["caller evidence"]);
+        caller_authored["requested_change"] = json!("caller change");
+        assert!(ChangeRequestV2::parse(&caller_authored).is_err());
+    }
+
+    #[test]
+    fn request_v2_rejects_empty_duplicate_and_unversioned_selection() {
+        let mut empty = request();
+        empty["finding_ids"] = json!([]);
+        assert!(ChangeRequestV2::parse(&empty).is_err());
+
+        let mut duplicate = request();
+        duplicate["finding_ids"] = json!(["finding-a", "finding-a"]);
+        assert!(ChangeRequestV2::parse(&duplicate).is_err());
+
+        let mut historical = request();
+        historical.as_object_mut().unwrap().remove("schema_version");
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("review_assignment_id");
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("review_result_operation_id");
+        historical.as_object_mut().unwrap().remove("finding_ids");
+        historical["finding_id"] = json!("finding-a");
+        historical["reason"] = json!("historical caller text");
+        historical["requirement_ids"] = json!(["R1"]);
+        historical["evidence"] = json!(["historical evidence"]);
+        assert!(ChangeRequestV2::parse(&historical).is_err());
+        assert!(ChangeRequest::parse(&historical).is_ok());
     }
 }

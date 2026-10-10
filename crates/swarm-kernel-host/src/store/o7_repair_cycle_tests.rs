@@ -246,15 +246,15 @@ async fn same_attempt_return_repair_fresh_review_and_acceptance_bind_to_candidat
             task_owner.clone(),
             "task.request_changes".into(),
             json!({
+                "schema_version":2,
                 "client_request_id":"return-o7-candidate-a",
                 "attempt_id":attempt_id,
                 "expected_revision":1,
                 "submission_ref":submission_a.submission_ref,
                 "candidate_ref":candidate_a,
-                "finding_id":"missing-r1-evidence",
-                "reason":"Add the required retained implementation evidence.",
-                "requirement_ids":["R1"],
-                "evidence":["evidence://review/r1"],
+                "review_assignment_id":assignment_a,
+                "review_result_operation_id":result_a["operation_id"].as_str().unwrap(),
+                "finding_ids":["missing-r1-evidence"],
             }),
         )
         .await
