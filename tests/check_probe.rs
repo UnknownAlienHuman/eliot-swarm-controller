@@ -154,6 +154,29 @@ fn shell() -> PathBuf {
     PathBuf::from("/bin/sh")
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "child process fixture invoked by the owned probe test"]
+fn probe_sleeping_child() {
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "parent process fixture invoked by the owned probe test"]
+fn probe_lingering_parent() {
+    let _child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "probe_sleeping_child",
+            "--nocapture",
+        ])
+        .spawn()
+        .unwrap();
+    std::process::exit(0);
+}
+
 #[test]
 fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
     #[cfg(target_os = "linux")]
@@ -219,29 +242,34 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
             response_summary(&overflow)
         );
 
-        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
-        let powershell = system_root.join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
-        if powershell.is_file() {
-            let timeout = run_probe(
-                &powershell,
-                &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
-                100,
-                1024,
-            );
-            assert!(
-                !timeout.success && timeout.timed_out && timeout.group_empty,
-                "timeout response: {}",
-                response_summary(&timeout)
-            );
-        }
+        let fixture = std::env::current_exe().unwrap();
+        let timeout = run_probe(
+            &fixture,
+            &[
+                "--ignored",
+                "--exact",
+                "probe_sleeping_child",
+                "--nocapture",
+            ],
+            100,
+            1024,
+        );
+        assert!(
+            !timeout.success && timeout.timed_out && timeout.group_empty,
+            "timeout response: {}",
+            response_summary(&timeout)
+        );
 
-        // Use a native command processor for the parent so cold PowerShell
-        // startup cannot consume the probe deadline before orphan detection.
-        // The started ping process remains alive while the parent exits.
-        let command_prompt = system_root.join("System32\\cmd.exe");
+        // These native fixtures inherit the actual Job and pipes. Their
+        // behavior does not depend on a system shell or console availability.
         let lingering_child = run_probe(
-            &command_prompt,
-            &["/d", "/c", "start /b ping.exe -n 30 127.0.0.1"],
+            &fixture,
+            &[
+                "--ignored",
+                "--exact",
+                "probe_lingering_parent",
+                "--nocapture",
+            ],
             5_000,
             64 * 1024,
         );
