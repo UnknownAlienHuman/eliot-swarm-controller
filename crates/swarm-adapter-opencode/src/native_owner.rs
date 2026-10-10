@@ -673,7 +673,8 @@ fn process_birth_token(identity: &Value) -> Result<String> {
 }
 
 fn validate_live_bun_identity(plan: &OwnerPlan, image: &Value) -> Result<()> {
-    if image["image_sha256"] != plan.config.bun_sha256 {
+    let expected_image_digest = format!("sha256:{}", plan.config.bun_sha256);
+    if image["image_sha256"].as_str() != Some(expected_image_digest.as_str()) {
         return Err(Error::new(
             "NATIVE_OWNER_IMAGE_MISMATCH",
             "spawned owner image differs from the pinned Bun executable",
@@ -994,5 +995,83 @@ fn safe_code(value: &str) -> &str {
         "PROCESS_IDENTITY_ERROR"
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelRef;
+
+    #[test]
+    fn live_image_accepts_exact_process_producer_and_rejects_changed_identity() {
+        let executable = std::env::current_exe().unwrap();
+        let directory = executable.parent().unwrap().to_path_buf();
+        let hash = digest_file(&executable, MAX_FILE_BYTES).unwrap();
+        let plan = OwnerPlan {
+            config: OwnedNativeOptions {
+                origin: "fresh_owned_service".into(),
+                owner_nonce: uuid::Uuid::new_v4().to_string(),
+                bun_executable: executable,
+                bun_sha256: hash.clone(),
+                server_program: directory.join("serve.mjs"),
+                server_program_sha256: "0".repeat(64),
+                state_root: directory.join("unused-state"),
+                password_file: directory.join("unused-state/server.password"),
+                port: 0,
+                model_catalog: "offline".into(),
+                provider_auth: None,
+            },
+            options: NativeOptions {
+                service_id: "image-validator-fixture".into(),
+                connection_file: directory.join("unused-state/connection.json"),
+                directory: directory.clone(),
+                model: ModelRef {
+                    id: "step-5-preview-free".into(),
+                    provider_id: "opencode".into(),
+                    variant: "high".into(),
+                },
+            },
+            workspace: directory.clone(),
+            config_digest: String::new(),
+            plugin_module_sha256: String::new(),
+            plugin_entrypoint_sha256: String::new(),
+        };
+        // Exercise the actual OS image producer; no child or native service is started.
+        let image = process_image_identity(std::process::id()).unwrap();
+        validate_live_bun_identity(&plan, &image).unwrap();
+
+        for digest in [
+            json!(hash),
+            json!(format!("sha256:{}", "0".repeat(64))),
+            json!(format!("sha256:sha256:{hash}")),
+            json!(format!("SHA256:{hash}")),
+            Value::Null,
+            json!(42),
+        ] {
+            let mut changed = image.clone();
+            changed["image_sha256"] = digest;
+            assert_eq!(
+                validate_live_bun_identity(&plan, &changed)
+                    .unwrap_err()
+                    .code,
+                "NATIVE_OWNER_IMAGE_MISMATCH"
+            );
+        }
+        let mut changed_path = image.clone();
+        changed_path["image_path"] = json!(directory);
+        assert_eq!(
+            validate_live_bun_identity(&plan, &changed_path)
+                .unwrap_err()
+                .code,
+            "NATIVE_OWNER_IMAGE_MISMATCH"
+        );
+        changed_path["image_path"] = Value::Null;
+        assert_eq!(
+            validate_live_bun_identity(&plan, &changed_path)
+                .unwrap_err()
+                .code,
+            "NATIVE_OWNER_IMAGE_MISMATCH"
+        );
     }
 }

@@ -1,0 +1,58 @@
+{
+  "schema": "eliot.v27_native_image_repair.v1",
+  "observed_at_utc": "2026-10-10T09:07:08.5797427Z",
+  "diagnosis": {
+    "candidate_commit": "e8ddeb67a202ddaf660f7d081826b50b5be24a93",
+    "run_id": "00dd41f9-617d-4c18-aea2-ae8226586100",
+    "open_operation_id": "d221a036-c30a-47de-b665-dbe1481e9260",
+    "outcome": "outcome_unknown",
+    "diagnostic_code": "NATIVE_OWNER_IMAGE_MISMATCH",
+    "effect_attempted": true,
+    "observed_digest": "sha256:627d2e4775c24bdedee2cd7ccc18dcadae061e5345274ab6e3c4c797927bfb8f",
+    "configured_digest": "627d2e4775c24bdedee2cd7ccc18dcadae061e5345274ab6e3c4c797927bfb8f",
+    "readiness_observed": true,
+    "exact_prefixed_match": true,
+    "original_operation_replayed": false,
+    "source": "EXECUTION-RESULTS-J.json plus exact read-only retained operation diagnostic"
+  },
+  "repair": {
+    "file": "crates/swarm-adapter-opencode/src/native_owner.rs",
+    "sha256": "2f184117a4855c9ecc786ddc206f6653030bbc7c80d514868570b1f17d457f18",
+    "invariant": "Require exact sha256:<raw pinned digest> from shared OS producer; canonical image path equality retained; malformed, wrong, missing and alternative digest shapes refused",
+    "understanding_proof_sha256": "abcc0349c556105efc3b623508f0c1016ce9793c36904caa879519099633f018"
+  },
+  "verification": {
+    "rust_version": "1.98.1",
+    "production_clippy": "Windows/Linux --locked --lib --bins --no-deps -- -D warnings PASS",
+    "regression": "One real current-process image identity regression per platform PASS; changed/missing path and six wrong digest values rejected; no native service/model started",
+    "initial_selection": "Initial binary-target selection executed zero cases; not counted. Actual --lib exact selection executed one case per platform.",
+    "logs_sha256": {
+      "windows-native-image-clippy.log": "65a8019e9d09c49b4d1e4e8e2eeca1b921c117af76b1c4e697b15c006bc8bd00",
+      "windows-native-image-lib-tests.log": "e4dd52ab027575c8ba8b7679131ab16409605872d01026e083552b00bddd21fc",
+      "linux-native-image-clippy.log": "fc0411be475ee341bfbbb97c7314a7daf4639b05d34e43a9ff0fc0cec10ecada",
+      "linux-native-image-lib-tests.log": "9dc3606bfe74fe6e049da89350d80139b223377b30a255900c6ef0d68083d191"
+    },
+    "source_review": {
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "status": "PASS",
+      "scope": "bounded source diff only",
+      "sha256": "970f7864fd577c46c0fe07b07bead7f2e39804fdcbdbb18fe79771154e762cf4"
+    }
+  },
+  "antigravity": {
+    "run_id": "914490be-867b-41e0-affa-ad10d0f1f4df",
+    "launch_operation_id": "4fb10c24-7b52-4236-ad71-883954020358",
+    "open_operation_id": "f578d89a-37e0-4add-bbb5-c7a4add7569a",
+    "stage": "before accepted module hello",
+    "open_state": "queued",
+    "supervisor_phase": "isolated",
+    "supervisor_code": "MODULE_EXITED",
+    "dispatch_calls": 0,
+    "root_cause": "UNKNOWN",
+    "original_operation_replayed": false
+  },
+  "native_qualification": "J historical failures retained. This repair has no fresh installed qualification yet.",
+  "final_status": "PARTIAL_PROGRESS"
+}
