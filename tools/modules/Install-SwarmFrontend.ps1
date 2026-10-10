@@ -118,7 +118,9 @@ function Assert-Hash([object] $Value, [string] $Field) {
 }
 
 function Get-ResourceSpecFiles([System.Collections.IDictionary] $Spec) {
-    if ($null -eq $Spec.resource_coordinate) { return @() }
+    if (-not $Spec.Contains('resource_coordinate') -or $null -eq $Spec['resource_coordinate']) {
+        return @()
+    }
     return @($Spec.resource_files)
 }
 
@@ -129,7 +131,7 @@ function Assert-ResourceManifest(
 ) {
     $expected = @(Get-ResourceSpecFiles $Spec)
     if ($expected.Count -eq 0) {
-        if ($null -ne $Manifest.resources) { throw "$Label advertises undeclared package resources." }
+        if ($null -ne $Manifest['resources']) { throw "$Label advertises undeclared package resources." }
         return $null
     }
     $resources = $Manifest.resources
@@ -326,24 +328,29 @@ function Invoke-LockedNpmInstall(
     }
     $nonce = [guid]::NewGuid().ToString('N')
     $configPath = Join-Path $ResourceRoot ('.npm-empty-config-' + $nonce)
+    $globalConfigPath = Join-Path $ResourceRoot ('.npm-empty-global-config-' + $nonce)
     $cachePath = Join-Path $ResourceRoot ('.npm-cache-' + $nonce)
     $configBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]::Empty)
-    $configStream = [IO.File]::Open($configPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try {
-        $configStream.Write($configBytes, 0, $configBytes.Length)
-        $configStream.Flush($true)
-    } finally { $configStream.Dispose() }
+    foreach ($emptyConfigPath in @($configPath, $globalConfigPath)) {
+        $configStream = [IO.File]::Open($emptyConfigPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $configStream.Write($configBytes, 0, $configBytes.Length)
+            $configStream.Flush($true)
+        } finally { $configStream.Dispose() }
+    }
     [void][IO.Directory]::CreateDirectory($cachePath)
     try {
         $arguments = @($Tools.npm_path) + @($Policy.arguments | ForEach-Object { [string]$_ }) + @(
             '--userconfig', $configPath,
-            '--globalconfig', $configPath,
+            '--globalconfig', $globalConfigPath,
             '--cache', $cachePath
         )
         [void](Invoke-BoundedInstallerProcess ([string]$Tools.node_path) $arguments $ResourceRoot ([int]$Policy.timeout_seconds) $false)
     } finally {
-        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-            Remove-Item -LiteralPath $configPath -Force -Confirm:$false
+        foreach ($emptyConfigPath in @($configPath, $globalConfigPath)) {
+            if (Test-Path -LiteralPath $emptyConfigPath -PathType Leaf) {
+                Remove-Item -LiteralPath $emptyConfigPath -Force -Confirm:$false
+            }
         }
         if (Test-Path -LiteralPath $cachePath) {
             Remove-Item -LiteralPath $cachePath -Recurse -Force -Confirm:$false
@@ -486,6 +493,7 @@ function New-DependencyClosureManifest(
         npm_version = [string]$Tools.npm.version
         npm_cli_sha256 = [string]$Tools.npm.cli_sha256
         npm_cli_file = [string]$Tools.npm.file
+        entry_count = [long]$tree.entry_count
         file_count = [long]$tree.files.Count
         total_bytes = [long]$tree.total_bytes
     }
@@ -518,12 +526,27 @@ function Assert-DependencyClosure(
     if ($manifest.schema_version -ne 1 -or
         $manifest.format -cne 'eliot.opencode_dependency_closure.v1' -or
         $manifest.coordinate -cne [string]$Spec.resource_coordinate -or
+        $manifest.node -isnot [System.Collections.IDictionary] -or
+        $manifest.npm -isnot [System.Collections.IDictionary] -or
         $manifest.files -isnot [array]) {
         throw "$Label dependency closure manifest has an unsupported format or coordinate."
     }
-    foreach ($field in @('package_json_sha256', 'package_lock_sha256', 'tree_sha256', 'node_version', 'node_executable_sha256', 'node_file', 'npm_version', 'npm_cli_sha256', 'npm_cli_file')) {
+    foreach ($field in @('package_json_sha256', 'package_lock_sha256', 'tree_sha256')) {
         if ([string]$manifest[$field] -cne [string]$pin[$field]) {
             throw "$Label dependency closure identity differs from its install receipt."
+        }
+    }
+    $toolIdentity = [ordered]@{
+        node_version = $manifest.node.version
+        node_executable_sha256 = $manifest.node.executable_sha256
+        node_file = $manifest.node.file
+        npm_version = $manifest.npm.version
+        npm_cli_sha256 = $manifest.npm.cli_sha256
+        npm_cli_file = $manifest.npm.file
+    }
+    foreach ($field in $toolIdentity.Keys) {
+        if ([string]$toolIdentity[$field] -cne [string]$pin[$field]) {
+            throw "$Label dependency closure tool identity differs from its install receipt."
         }
     }
     foreach ($field in @('node_executable_sha256', 'npm_cli_sha256', 'package_json_sha256', 'package_lock_sha256', 'tree_sha256')) {
@@ -624,7 +647,7 @@ function Assert-DependencyPins([object] $Manifest, [string] $Label) {
             }
             Assert-Hash $pin.manifest_sha256 "$Label.dependency_pins.manifest_sha256"
             Assert-Hash $pin.source_tree_sha256 "$Label.dependency_pins.source_tree_sha256"
-        } elseif ($null -ne $pin.checksum) {
+        } elseif ($null -ne $pin['checksum']) {
             Assert-Hash $pin.checksum "$Label.dependency_pins.checksum"
         } elseif ([string]$pin.source -notmatch '#[0-9a-f]{40,64}\z') {
             throw "$Label contains an external package without a content checksum or pinned Git revision."
@@ -746,10 +769,10 @@ function Assert-HostIpcCompatible([object] $Left, [string] $LeftLabel, [object] 
     $rightVersion = Get-HostIpcVersion $Right $RightLabel
     $leftTarget = [string]$Left.compatibility.target.rustc_host_triple
     $rightTarget = [string]$Right.compatibility.target.rustc_host_triple
-    $leftRuntime = if ($null -ne $Left.compatibility.host_runtime) { Get-HostRuntimeCoordinate $Left $LeftLabel } else { $null }
-    $rightRuntime = if ($null -ne $Right.compatibility.host_runtime) { Get-HostRuntimeCoordinate $Right $RightLabel } else { $null }
-    $leftSupervisor = if ($null -ne $Left.compatibility.host_supervisor) { Get-HostSupervisorCoordinate $Left $LeftLabel } else { $null }
-    $rightSupervisor = if ($null -ne $Right.compatibility.host_supervisor) { Get-HostSupervisorCoordinate $Right $RightLabel } else { $null }
+    $leftRuntime = if ($null -ne $Left.compatibility['host_runtime']) { Get-HostRuntimeCoordinate $Left $LeftLabel } else { $null }
+    $rightRuntime = if ($null -ne $Right.compatibility['host_runtime']) { Get-HostRuntimeCoordinate $Right $RightLabel } else { $null }
+    $leftSupervisor = if ($null -ne $Left.compatibility['host_supervisor']) { Get-HostSupervisorCoordinate $Left $LeftLabel } else { $null }
+    $rightSupervisor = if ($null -ne $Right.compatibility['host_supervisor']) { Get-HostSupervisorCoordinate $Right $RightLabel } else { $null }
     $runtimeMismatch = $null -ne $leftRuntime -and $null -ne $rightRuntime -and
         ($leftRuntime.package_name -cne $rightRuntime.package_name -or
          $leftRuntime.binary_target -cne $rightRuntime.binary_target -or
@@ -799,7 +822,7 @@ function Assert-SourceIdentity([object] $Source, [string] $Prefix, [bool] $Requi
         Assert-Hash $Source[$field] "$Prefix.$field"
     }
     Assert-Hash $Source.package_manifest_sha256 "$Prefix.package_manifest_sha256"
-    if ($null -ne $Source.workspace_cargo_toml_sha256) {
+    if ($null -ne $Source['workspace_cargo_toml_sha256']) {
         Assert-Hash $Source.workspace_cargo_toml_sha256 "$Prefix.workspace_cargo_toml_sha256"
         if ([string]$Source.workspace_cargo_toml_sha256 -cne [string]$Source.cargo_toml_sha256) {
             throw "$Prefix workspace Cargo.toml aliases do not match."
@@ -891,7 +914,7 @@ function Get-InstalledFrontend(
         Assert-DependencyClosure $installedResourceRoot $receipt.resources $resources $Spec "Installed frontend '$Name'"
     }
     Assert-Hash $receipt.package_manifest_sha256 'receipt.package_manifest_sha256'
-    if ($null -ne $manifest.source.package_manifest_path -and
+    if ($null -ne $manifest.source['package_manifest_path'] -and
         [string]$manifest.source.package_manifest_path -cne [string]$manifest.build.package_manifest) {
         throw "Installed frontend '$Name' selected package-manifest path differs between build and source provenance."
     }
@@ -899,7 +922,7 @@ function Get-InstalledFrontend(
     if ([string]$receipt.package_manifest_sha256 -cne $expectedPackageManifestHash) {
         throw "Installed frontend '$Name' package-manifest pin does not match its source manifest."
     }
-    $expectedWorkspaceManifestHash = if ($null -ne $manifest.source.workspace_cargo_toml_sha256) {
+    $expectedWorkspaceManifestHash = if ($null -ne $manifest.source['workspace_cargo_toml_sha256']) {
         [string]$manifest.source.workspace_cargo_toml_sha256
     } else {
         [string]$manifest.source.cargo_toml_sha256
@@ -995,7 +1018,7 @@ if ($provenance.schema_version -ne 1 -or
     throw 'Frontend build manifest package, binary, role, version, or release profile is not an approved exact coordinate.'
 }
 Assert-SourceIdentity $provenance.source 'Build source' $isHostPackage
-if ($null -ne $provenance.source.package_manifest_path -and
+if ($null -ne $provenance.source['package_manifest_path'] -and
     [string]$provenance.source.package_manifest_path -cne [string]$provenance.build.package_manifest) {
     throw 'Frontend selected package-manifest path differs between build and source provenance.'
 }
@@ -1149,7 +1172,7 @@ if ($null -ne $existing[$packageName]) {
                 $dependencyClosure = New-DependencyClosureManifest $stageResourceRoot $npmTools $selectedSpec
             }
             $packageManifestHash = [string]$provenance.source.package_manifest_sha256
-            $workspaceManifestHash = if ($null -ne $provenance.source.workspace_cargo_toml_sha256) {
+            $workspaceManifestHash = if ($null -ne $provenance.source['workspace_cargo_toml_sha256']) {
                 [string]$provenance.source.workspace_cargo_toml_sha256
             } else {
                 [string]$provenance.source.cargo_toml_sha256
