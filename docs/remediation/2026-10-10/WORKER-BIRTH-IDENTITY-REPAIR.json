@@ -1,0 +1,77 @@
+{
+  "schema": "eliot.worker_birth_identity_repair.v1",
+  "date": "2026-10-10",
+  "final_status": "PARTIAL_PROGRESS",
+  "source_base_commit": "9a1ca95e68e8bf5a8709b9333c96671ca7c0e6fe",
+  "changed_file": "crates/swarm-supervisor/src/supervisor.rs",
+  "source_sha256": "8a541c0190e20187f569d43e305b0633e9d7be128e53e7b0020b424dda46602f",
+  "root_cause": "Receipt-derived birth omitted platform. Strict equality with OS birth returned false for live workers on both Windows and Linux.",
+  "repair": "Restore OS platform discriminator in both birth projections; exact PID, birth, image and owner checks remain unchanged.",
+  "regression": "worker_receipt_identity_matches_live_os_birth_and_rejects_mismatches",
+  "verification_scope": "Changed supervisor package: production Clippy with warnings denied, then complete library suite with real OS live birth and negative birth/image checks.",
+  "checks": [
+    {
+      "platform": "windows",
+      "gate": "clippy",
+      "exit_code": 0,
+      "log_sha256": "9ec5a73ad9381b85da87ae76a4a217a93cb7bd19f3a5f65fd3fe567010f8fb3a",
+      "started_at_utc": "2026-10-10T23:06:19.6084775Z",
+      "completed_at_utc": "2026-10-10T23:06:29.9535341Z",
+      "summaries": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.13s"
+      ]
+    },
+    {
+      "platform": "windows",
+      "gate": "tests",
+      "exit_code": 0,
+      "log_sha256": "4359679e0846cc507637554d974eed58d3d465b746ef12ff60e2b69e2f71bd43",
+      "started_at_utc": "2026-10-10T23:06:44.6278813Z",
+      "completed_at_utc": "2026-10-10T23:07:03.0609942Z",
+      "summaries": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.00s",
+        "test result: ok. 25 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.31s"
+      ]
+    },
+    {
+      "platform": "linux",
+      "gate": "clippy",
+      "exit_code": 0,
+      "log_sha256": "81f5206e03d3241aacbd3f5adaa1c437fab777a6c4ca4444797db2f7fd75f399",
+      "started_at_utc": "2026-10-10T23:06:19.6324151Z",
+      "completed_at_utc": "2026-10-10T23:06:29.0771077Z",
+      "summaries": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.06s"
+      ]
+    },
+    {
+      "platform": "linux",
+      "gate": "tests",
+      "exit_code": 0,
+      "log_sha256": "b2bb76c57302414885d7484d51bd49c7d2de9ad0eb3295167bf11c3fa474ce06",
+      "started_at_utc": "2026-10-10T23:06:44.624205Z",
+      "completed_at_utc": "2026-10-10T23:06:56.7648873Z",
+      "summaries": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.99s",
+        "test result: ok. 26 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.54s"
+      ]
+    }
+  ],
+  "native_qualification": "not_verified_after_source_repair",
+  "prior_native_evidence": "EXECUTION-RESULTS-N.json",
+  "remaining_acceptance": [
+    "New clean native candidate and causal native/model outcomes",
+    "R48 scheduler owner, target eligibility and uncertain IPC receipt/no-replay",
+    "Antigravity public assigned-session MCP schema proof",
+    "Dependency alert remediation"
+  ],
+  "independent_review": {
+    "agent_id": "01a127ff-c270-7753-8611-9063abec22d0",
+    "model": "kilo/stepfun-step-5-preview-free",
+    "reasoning_effort": "high",
+    "verdict": "accept",
+    "reviewed_source_sha256": "8a541c0190e20187f569d43e305b0633e9d7be128e53e7b0020b424dda46602f",
+    "scope": "Exact final diff; platform producer/projection parity, unchanged PID/birth/image/owner invariants, OS regression branch coverage",
+    "independent_test_execution": false
+  }
+}

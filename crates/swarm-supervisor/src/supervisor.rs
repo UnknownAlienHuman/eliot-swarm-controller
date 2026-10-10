@@ -3668,12 +3668,14 @@ fn identity_from_process_image(image: &Value) -> Result<ProcessIdentity> {
         .ok_or_else(|| Error::invalid("worker image receipt has an invalid PID"))?;
     #[cfg(windows)]
     let birth = serde_json::json!({
+        "platform": "windows",
         "pid": pid,
         "creation_filetime": image.get("creation_filetime")
             .ok_or_else(|| Error::invalid("worker image receipt has no creation time"))?,
     });
     #[cfg(target_os = "linux")]
     let birth = serde_json::json!({
+        "platform": "linux",
         "pid": pid,
         "start_ticks": image.get("start_ticks")
             .ok_or_else(|| Error::invalid("worker image receipt has no start time"))?,
@@ -4029,6 +4031,34 @@ mod tests {
         process::{Child as StdChild, Command as StdCommand, Stdio},
         thread,
     };
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn worker_receipt_identity_matches_live_os_birth_and_rejects_mismatches() {
+        let pid = std::process::id();
+        let image = process_image_identity(pid).unwrap();
+        let identity = identity_from_process_image(&image).unwrap();
+        assert_eq!(identity.pid, pid);
+        assert_eq!(identity.image, image);
+        assert_eq!(
+            identity.birth,
+            process_birth_identity(pid).unwrap().unwrap()
+        );
+        assert!(process_identity_is_live(&identity).unwrap());
+
+        let mut wrong_birth = identity_from_process_image(&image).unwrap();
+        #[cfg(windows)]
+        let birth_field = "creation_filetime";
+        #[cfg(target_os = "linux")]
+        let birth_field = "start_ticks";
+        wrong_birth.birth[birth_field] = serde_json::json!("different-process-birth");
+        assert!(!process_identity_is_live(&wrong_birth).unwrap());
+
+        let mut wrong_image = identity_from_process_image(&image).unwrap();
+        wrong_image.image["image_sha256"] =
+            serde_json::json!(format!("sha256:{}", "00".repeat(32)));
+        assert!(!process_identity_is_live(&wrong_image).unwrap());
+    }
 
     #[test]
     fn worker_diagnostic_receipt_requires_exact_boot_scope_and_artifact() {
