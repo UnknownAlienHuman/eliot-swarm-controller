@@ -12,14 +12,14 @@
       {
         "item": "Connected code and strict production Clippy",
         "status": "verified",
-        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json",
+        "evidence": "LATE-REPAIR-EVIDENCE.json, DESCRIPTOR-REPAIR-EVIDENCE.json, IDLE-CATALOGUE-REPAIR-EVIDENCE.json; WORKSPACE-ROUTE-REPAIR-EVIDENCE.json; MODULE-STARTUP-REPAIR-EVIDENCE.json; MODULE-MARKER-REPAIR-EVIDENCE.json; BOOTSTRAP-PATH-REPAIR-EVIDENCE.json; MODULE-ROUTE-ENVIRONMENT-REPAIR-EVIDENCE.json; MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json",
         "residual_uncertainty": "Retained 24-package gate plus changed-package gates",
-        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases and five Windows/two Linux path cases on each platform; four new route/environment/boot cases per platform"
+        "verifier": "24-package retained Windows/Linux strict production Clippy, fresh affected package gates, focused real-Git registration regression, 34 contract/readiness cases and nine route-reader cases and nine actual marker/lifecycle/custody cases and five Windows/two Linux path cases on each platform; two reservation-validator cases on Windows/Linux"
       },
       {
         "item": "Repaired installed core/native components",
         "status": "not_verified",
-        "evidence": "EXECUTION-RESULTS-H.json; exact eight clean3200fc9 packages and genuine H installed execution; later route/environment/boot repair awaiting fresh I",
+        "evidence": "EXECUTION-RESULTS-I.json; exact eight clean 736f672 packages and genuine installed execution blocked before dispatch; subsequent first-open repair awaiting J",
         "residual_uncertainty": "Per-stage native receipts determine scope; core ACK origin and hook admission remain historical UNKNOWN",
         "verifier": "One New-NativeQualification invocation per adapter; source/install/resource/fixture/model guards; max one dispatch each"
       },
@@ -67,7 +67,11 @@
       "modules/antigravity-rust/src/ipc.rs",
       "modules/antigravity-rust/src/main.rs",
       "modules/antigravity-rust/src/process.rs",
-      "tools/qualification/New-NativeQualification.ps1"
+      "tools/qualification/New-NativeQualification.ps1",
+      "docs/remediation/2026-10-09/EXECUTION-RESULTS-I.json",
+      "crates/swarm-kernel-host/src/store/launcher_owned_service.rs",
+      "crates/swarm-kernel-host/src/store/owned_actor_provenance_tests.rs",
+      "docs/remediation/2026-10-09/MODULE-FIRST-OPEN-REPAIR-EVIDENCE.json"
     ],
     "checks_run": [
       "Windows/Linux strict host production Clippy",
@@ -115,13 +119,20 @@
       "Windows/Linux strict process+supervisor+host and Antigravity production Clippy",
       "Four focused route/environment/worker-identity cases per platform",
       "Native OpenAI GPT6 Luna Max bounded source reviews, exact provider/model/effort verified",
-      "H safe worker/owner/binding readbacks without credential/token output"
+      "H safe worker/owner/binding readbacks without credential/token output",
+      "Eight exact clean 736f672 provenance builds",
+      "Fresh genuine I install and locked OpenCode resource closure",
+      "One I native qualification invocation per adapter with separate run ids",
+      "Ordinary main push and remote SHA readback",
+      "Affected Windows/Linux host strict production Clippy for standalone first-open guard",
+      "Two reservation-validator regressions per platform; native Luna Max source review PASS",
+      "Offline Antigravity bootstrap without host/model; expected HOST_RETRY_EXHAUSTED"
     ],
     "checks_not_run_and_why": [
       "Unchanged broad suites retained per user no-test-loops instruction",
       "ELIOT MCP unavailable; documented standalone mode"
     ],
-    "remaining_uncertainty": "Fresh I installed hello/input; full causal native result, retained C ACK/hook and supported upstream dependency patches remain",
+    "remaining_uncertainty": "Fresh J installed native qualification pending; Antigravity I pre-hello exit code unknown; native causal result, core ACK origin/hook and advisory blockers remain",
     "final_status": "PARTIAL_PROGRESS"
   }
 }

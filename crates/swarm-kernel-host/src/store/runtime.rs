@@ -1400,9 +1400,15 @@ fn next_internal(
                         "owned open requires the current controller configuration",
                     )
                 })?;
-                super::launcher_owned_service::validate_owned_open_dispatch(
-                    &tx, config, &id, generation, &op,
-                )?;
+                if standalone_opencode_route(&b["route"]) {
+                    super::launcher_owned_service::validate_module_owned_open_dispatch(
+                        &tx, config, &id, generation, &op,
+                    )?;
+                } else {
+                    super::launcher_owned_service::validate_owned_open_dispatch(
+                        &tx, config, &id, generation, &op,
+                    )?;
+                }
             }
         } else {
             let rootless_open_reconcile =

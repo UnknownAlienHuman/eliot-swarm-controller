@@ -772,6 +772,57 @@ pub(crate) fn validate_owned_open_dispatch(
     Ok(())
 }
 
+/// The standalone module starts its service while consuming agent.open. Admit
+/// only its exact unused reservation; an observed or uncertain start cannot
+/// authorize another open. The built-in observed-service boundary is separate.
+pub(crate) fn validate_module_owned_open_dispatch(
+    db: &Connection,
+    config: &Config,
+    binding_id: &str,
+    generation: i64,
+    open_operation_id: &str,
+) -> Result<()> {
+    let scope = opening_scope(db, config, binding_id, generation)?;
+    if scope.open_operation_id != open_operation_id {
+        return Err(scope_changed());
+    }
+    let row = load_start_row(db, binding_id, generation)?.ok_or_else(|| {
+        Error::new(
+            "OWNED_SERVICE_INTENT_MISSING",
+            "owned module open has no retained start reservation",
+        )
+    })?;
+    validate_module_start_reservation(&scope, &row)?;
+    // This reader requires the concrete standalone artifact and verifies the
+    // retained launch/open requests, actor, lease and route against this row.
+    let (_, _, workspace, route) = retained_start_route(db, binding_id, generation, &row)?;
+    if workspace != scope.workspace_directory || route.route_digest()? != row.route_digest {
+        return Err(scope_changed());
+    }
+    Ok(())
+}
+
+fn validate_module_start_reservation(scope: &OpeningScope, row: &OwnedStartRow) -> Result<()> {
+    if row.state != "reserved"
+        || row.proof_json != "{}"
+        || row.process_id.is_some()
+        || row.process_birth_token.is_some()
+        || row.executable_sha256.is_some()
+    {
+        return Err(recovery_required(&row.state));
+    }
+    verify_scope_for_admission(scope, &scope.actor, row, &scope.workspace_directory)?;
+    let route = OwnedServiceRoute::from_config(&scope.service_config)?
+        .for_launch(&row.owner_nonce, &scope.workspace_directory)?;
+    if route.service_id() != row.service_id
+        || route.version() != row.service_version
+        || route.route_digest()? != row.route_digest
+    {
+        return Err(scope_changed());
+    }
+    Ok(())
+}
+
 fn opening_scope(
     db: &Connection,
     config: &Config,
