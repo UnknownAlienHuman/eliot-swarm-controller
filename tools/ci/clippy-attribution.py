@@ -73,7 +73,15 @@ def load_changed_lines(base: str, head: str) -> dict[str, list[Interval]]:
         "--",
         "*.rs",
     ]
-    result = subprocess.run(command, check=True, text=True, capture_output=True)
+    result = subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+    )
     return parse_changed_lines(result.stdout)
 
 
@@ -155,7 +163,7 @@ def run_clippy(args: argparse.Namespace) -> int:
         stderr=None,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors="strict",
     )
     assert process.stdout is not None
     diagnostics: list[dict] = []
@@ -239,6 +247,76 @@ def self_test() -> int:
     assert warning_is_owned(owned, changed)
     assert not warning_is_owned(historical, changed)
     assert warning_is_owned(windows, changed)
+
+    from unittest.mock import patch
+
+    unicode_diff = '''diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs
+--- a/crates/a/src/lib.rs
++++ b/crates/a/src/lib.rs
+@@ -1,0 +2 @@
++const NAME: &str = "Ł";
+'''
+    try:
+        unicode_diff.encode("utf-8").decode("cp1252")
+    except UnicodeDecodeError:
+        pass
+    else:
+        raise AssertionError("UTF-8 regression marker must fail under Windows CP1252")
+    emit_utf8 = "import sys; sys.stdout.buffer.write(sys.argv[1].encode('utf-8'))"
+    real_run = subprocess.run
+    git_options: dict = {}
+
+    def fake_git_run(command: list[str], **kwargs):
+        assert command[:2] == ["git", "diff"]
+        git_options.update(kwargs)
+        return real_run(
+            [sys.executable, "-c", emit_utf8, unicode_diff], **kwargs
+        )
+
+    with patch.object(subprocess, "run", side_effect=fake_git_run):
+        assert load_changed_lines("base", "head") == {
+            "crates/a/src/lib.rs": [Interval(2, 2)]
+        }
+    assert git_options["encoding"] == "utf-8"
+    assert git_options["errors"] == "strict"
+    assert git_options["stdout"] == subprocess.PIPE
+    assert git_options["stderr"] is None
+
+    clippy_payload = json.dumps(
+        {
+            "reason": "compiler-message",
+            "message": {"level": "note", "message": "Ł", "spans": []},
+        },
+        ensure_ascii=False,
+    ) + "\n"
+    real_popen = subprocess.Popen
+    clippy_options: dict = {}
+
+    def fake_clippy_popen(command: list[str], **kwargs):
+        assert command[0] == "cargo"
+        clippy_options.update(kwargs)
+        return real_popen(
+            [sys.executable, "-c", emit_utf8, clippy_payload], **kwargs
+        )
+
+    module = sys.modules[__name__]
+    clippy_args = argparse.Namespace(
+        packages_json='["swarm-kernel-host"]',
+        base="base",
+        head="head",
+        target_dir="target",
+    )
+    with (
+        patch.object(module, "load_changed_lines", return_value={}),
+        patch.object(module, "append_summary"),
+        patch.object(subprocess, "Popen", side_effect=fake_clippy_popen),
+    ):
+        assert run_clippy(clippy_args) == 0
+    assert clippy_options["encoding"] == "utf-8"
+    assert clippy_options["errors"] == "strict"
+    assert clippy_options["text"] is True
+    assert clippy_options["stderr"] is None
+
     print("clippy attribution self-test passed")
     return 0
 
