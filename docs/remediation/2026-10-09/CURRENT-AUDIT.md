@@ -1,14 +1,20 @@
 # Current-source audit and implementation ledger
 
-Fresh [N execution](../2026-10-10/EXECUTION-RESULTS-N.json) built and installed
-eight exact clean `481e7fd` release packages. Both native runs reached a ready
-binding but retained `owner_retained / MODULE_WORKER_EXITED` and zero dispatch;
-neither qualifies model consumption. Antigravity's exact worker PID, creation
-FILETIME and image SHA remained live in the subsequent OS readback, while its
-host departure remained pending. OpenCode's host exited and its worker was
-absent. A bounded shared worker/helper lifecycle audit is in progress; the
-closed error code is not an assertion that Antigravity's actual worker departed.
-No further native run is justified by repeating these unchanged sources.
+Fresh [O execution](../2026-10-10/EXECUTION-RESULTS-O.json) built and installed
+eight exact clean `1ad4209` release packages, with 16 installed hashes verified.
+OpenCode passed `module_open_and_hello` with supervisor readiness, confirming
+the [worker birth-identity repair](../2026-10-10/WORKER-BIRTH-IDENTITY-REPAIR.json).
+Its single host dispatch call was rejected before native admission with
+`STALE_LAUNCH_DISPATCH_SCOPE`; no native `task.dispatch` journal was written.
+The retained Store rejection corrects the historical harness classification
+`dispatch_outcome_unknown`. The binding had become disconnected/reconciling;
+its precise lifecycle cause remains under investigation. A single host epoch
+does not prove a restart. The O host exited after graceful EOF. Antigravity O
+was not started, and model consumption and Task completion remain unverified.
+
+[N execution](../2026-10-10/EXECUTION-RESULTS-N.json) remains historical. Its
+`owner_retained / MODULE_WORKER_EXITED` observation does not establish that the
+then-live Antigravity worker departed.
 
 The [optional-worker recovery record](../2026-10-10/OPTIONAL-WORKER-RECOVERY-EVIDENCE.json)
 adds a real bounded installed contour: the exact N host observed missing-binary
@@ -29,14 +35,14 @@ helper. Fresh strict host production Clippy passed on both platforms with zero
 warnings, and independent Luna Max review found no P1/P2 on the exact production
 hashes. Both verification checkouts match the same 17-path overlay and base SHA.
 No native/model calls ran in this cohort; installed N qualification, causal
-native-result evidence, Antigravity assigned-session MCP proof and the 13 upstream
+native-result evidence, Antigravity assigned-session MCP proof and remaining
 dependency alerts remain separate acceptance work.
 
 The [retained-worker readiness repair](RETAINED-WORKER-READINESS-REPAIR-EVIDENCE.json) resolves a source collision between normal helper polling and helper-exit drain polling. Both now use the same exact OS worker-liveness observation: an unconfirmed live worker stays `Starting`, an exact previously hello-confirmed boot and pid/birth/image stays `ProcessRunning`, and dead or missing evidence stays `OwnerGroupRetained`. Live observations in both paths contribute to the existing healthy restart-budget interval. Hello admission, receipts, owner tokens, membership and whole-family departure proofs remain unchanged. This source repair does not establish that the exact M worker was live; M's runtime cause remains `UNKNOWN`.
 
 The retained readiness source passes strict supervisor/host production Clippy on Windows and Linux. The affected supervisor library passes 21 Windows and 22 Linux tests, with two ignored fixtures on each platform; eight new pre-input packet cases pass on each platform. Twenty-six pure qualification-helper cases check bounded public failure projection, collection shape and exact scope without native effects. The lifecycle tests exercise the liveness/hello seam, not installed process-family qualification. Fresh installed qualification is still required.
 
-The [optional-worker gap](OPTIONAL-WORKER-QUALIFICATION-GAP.json) retains R48 as `not_verified`: the current harness observes existing failure status rather than exercising an actual supported fault and recovery path for private in-process workers. The [canonical Codex donor readback](CODEX-DONOR-UPSTREAM-BLOCKER.json) verifies upstream `main` commit `806d9732c974bc8a51b8317c1bd8985544fe627c`, dated 2026-10-10, still pins `datamodel-code-generator==0.31.2` in both its manifest and lockfile; the nine recorded advisories require at least `0.64.0`. A complete fixed canonical donor has not been verified. The 13 dependency alerts remain open.
+The optional-worker acceptance gaps remain in the newer [R48 recovery evidence](../2026-10-10/OPTIONAL-WORKER-RECOVERY-EVIDENCE.json): isolation and supervisor restart are observed; active scheduler ownership, target eligibility and uncertain initial admission/no-replay are not yet qualified. The [canonical Codex donor readback](CODEX-DONOR-UPSTREAM-BLOCKER.json) remains an exact historical upstream observation. The documented local dependency delta now uses `datamodel-code-generator==0.81.0`, including the fix for newly reported `GHSA-77xj-x4rm-935c`; [the current repair record](../2026-10-10/GENERATOR-SECURITY-REPAIR-081.json) retains lock, CLI, vendor and independent review evidence. GitHub confirmed all ten pip alerts fixed, including alert #17 at 2026-10-10 23:48:18 UTC; both delivery workflows passed. Four npm alerts retain separate upstream blockers.
 
 Fresh [M execution](EXECUTION-RESULTS-M.json) used eight clean provenance packages from `694794f`, a genuine installed resource closure and separate native run IDs. Both native receipts remain `blocked / not_qualified` with `LAUNCH_READY_READBACK_TIMEOUT` and zero dispatch. Private diagnostic rows show OpenCode C7's assigned-session child applied without replay; C8 install/arm/read applied, the server connected and native discovery observed 11 tools. Session context, provider request and model consumption stayed unknown. Independent native GPT-6 Luna Max source review found no C8 post-input deadlock: those unknown observations and `dispatch_permitted=false` are valid pre-input evidence, while `task.dispatch` performs a separate admission check. Antigravity's launch snapshot retained `NATIVE_MCP_SCOPE_MISMATCH`; its descriptor and documented headless readback do not support the required assigned-session server/tool-schema proof. These private rows and source review do not qualify public native execution.
 
