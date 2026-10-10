@@ -6,7 +6,7 @@ use crate::{
     model,
     platform::{
         self,
-        process_group::{departed_empty, spawned_departed, spawned_identity},
+        process_group::{departed_empty, spawned_departed},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -104,18 +104,16 @@ impl ScriptChildCustody {
         let mut owners = self.lock()?;
         if let Some(owner) = owners.get_mut(&work.run_id) {
             validate_script_child_owner(owner, work, work_digest)?;
+            if owner.launch.is_none() {
+                recover_script_child_launch(owner, &work.run_id)?;
+            }
             let Some(launch) = owner.launch.clone() else {
                 return Err(Error::new(
                     "SCRIPT_LAUNCH_UNKNOWN",
                     "this ScriptRun already has a Store-owned worker without a retained launch identity; it will not be respawned",
                 ));
             };
-            let dir = directory(&work.data_dir, &work.run_id)?;
-            write_once(
-                &dir.join("launch.json"),
-                &model::canonical(&launch)?.into_bytes(),
-            )?;
-            owner.launch_persistence_pending = false;
+            persist_script_child_launch(owner, &work.run_id)?;
             return Ok(launch);
         }
 
@@ -191,7 +189,8 @@ impl ScriptChildCustody {
             .get_mut(&work.run_id)
             .expect("spawned ScriptRun child is inserted into Store custody");
 
-        let (process, early_exit) = match spawned_identity(pid) {
+        let first_identity = capture_script_child_owner_identity(owner);
+        let (process, early_exit) = match first_identity {
             Ok(identity) => (Some(identity), None),
             Err(error) if error.code == "PROCESS_GONE" => {
                 let status = match owner.child.as_mut().and_then(|child| child.try_wait().ok()) {
@@ -231,10 +230,23 @@ impl ScriptChildCustody {
                 )
             }
             Err(error) => {
-                return Err(Error::new(
-                    "SCRIPT_LAUNCH_UNKNOWN",
-                    format!("worker started without a pinned launch identity: {error}"),
-                ));
+                if error.code == "SCRIPT_CHILD_PROVENANCE_CHANGED" {
+                    return Err(Error::new(
+                        "SCRIPT_LAUNCH_UNKNOWN",
+                        format!("worker launch identity provenance changed: {error}"),
+                    ));
+                }
+                match capture_script_child_owner_identity(owner) {
+                    Ok(identity) => (Some(identity), None),
+                    Err(recovery_error) => {
+                        return Err(Error::new(
+                            "SCRIPT_LAUNCH_UNKNOWN",
+                            format!(
+                                "worker started without a pinned launch identity; initial capture failed: {error}; bounded recovery failed: {recovery_error}"
+                            ),
+                        ));
+                    }
+                }
             }
         };
         let launch = json!({
@@ -248,11 +260,7 @@ impl ScriptChildCustody {
         validate_script_launch_identity(work, &launch)?;
         owner.launch = Some(launch.clone());
         owner.launch_persistence_pending = true;
-        write_once(
-            &dir.join("launch.json"),
-            &model::canonical(&launch)?.into_bytes(),
-        )?;
-        owner.launch_persistence_pending = false;
+        persist_script_child_launch(owner, &work.run_id)?;
         Ok(launch)
     }
 
@@ -266,6 +274,10 @@ impl ScriptChildCustody {
             return Ok(None);
         };
         validate_script_child_owner(owner, work, work_digest)?;
+        if owner.launch.is_none() && owner.child.is_some() {
+            // Recover before try_wait, which can discard Linux birth evidence.
+            recover_script_child_launch(owner, &work.run_id)?;
+        }
         match owner.child.as_mut().map(Child::try_wait) {
             Some(Ok(Some(status))) => {
                 owner.exit = Some(script_child_exit(status));
@@ -279,13 +291,8 @@ impl ScriptChildCustody {
                 ));
             }
         }
-        if let Some(launch) = owner.launch.as_ref() {
-            let dir = directory(&owner.data_dir, &work.run_id)?;
-            let launch_path = dir.join("launch.json");
-            if owner.launch_persistence_pending || !launch_path.try_exists()? {
-                write_once(&launch_path, &model::canonical(launch)?.into_bytes())?;
-                owner.launch_persistence_pending = false;
-            }
+        if owner.launch.is_some() {
+            persist_script_child_launch(owner, &work.run_id)?;
         }
         Ok(Some(ScriptChildObservation {
             launch: owner.launch.clone(),
@@ -302,6 +309,13 @@ impl ScriptChildCustody {
             return Err(Error::conflict(
                 "ScriptRun differs from its Store-owned Child operation identity",
             ));
+        }
+        if owner.launch.is_none() && owner.child.is_some() {
+            // Recover before try_wait, which can discard Linux birth evidence.
+            recover_script_child_launch(owner, run_id)?;
+        }
+        if owner.launch.is_some() {
+            persist_script_child_launch(owner, run_id)?;
         }
         match owner.child.as_mut().map(Child::try_wait) {
             Some(Ok(Some(status))) => {
@@ -327,6 +341,22 @@ impl ScriptChildCustody {
         };
         let mut release = Vec::new();
         for (run_id, owner) in owners.iter_mut() {
+            // Try to capture the launch identity while this exact Child is still
+            // retained. If capture remains uncertain, keep custody and never
+            // infer family departure from the direct PID alone.
+            if owner.launch.is_none() && owner.child.is_some() {
+                let _ = recover_script_child_launch(owner, run_id);
+            }
+            if owner.launch.is_none() && owner.child.is_some() {
+                // Keep the unreaped Child as the only remaining same-process
+                // birth authority; direct-child exit cannot prove family departure.
+                continue;
+            }
+            if owner.launch.is_some() && persist_script_child_launch(owner, run_id).is_err() {
+                // Keep the exact Child and recovered launch evidence until the
+                // identity receipt is durable; shutdown must retry publication.
+                continue;
+            }
             if let Some(Ok(Some(status))) = owner.child.as_mut().map(Child::try_wait) {
                 owner.exit = Some(script_child_exit(status));
                 drop(owner.child.take());
@@ -359,11 +389,14 @@ impl ScriptChildCustody {
                 "terminal ScriptRun differs from its Store-owned child identity",
             ));
         }
+        owner.release_when_exited = true;
+        if owner.launch.is_some() {
+            persist_script_child_launch(owner, run_id)?;
+        }
         if script_child_family_departed(owner) {
             drop(owners.remove(run_id));
             return Ok(true);
         }
-        owner.release_when_exited = true;
         Ok(false)
     }
 }
@@ -382,6 +415,16 @@ fn validate_script_child_owner(
             "Store-owned script Child identifies another retained run",
         ));
     }
+    if owner
+        .child
+        .as_ref()
+        .is_some_and(|child| child.id() != owner.pid)
+    {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "retained Child PID differs from its Store-owned launch provenance",
+        ));
+    }
     if let Some(launch) = owner.launch.as_ref() {
         validate_script_launch_identity(work, launch)?;
         let launch_pid = if launch["process"].is_null() {
@@ -396,6 +439,227 @@ fn validate_script_child_owner(
             ));
         }
     }
+    Ok(())
+}
+
+fn capture_script_child_owner_identity(owner: &mut ScriptChildOwner) -> Result<Value> {
+    let pid = owner.pid;
+    let child = owner.child.as_mut().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_LAUNCH_UNKNOWN",
+            "the Store-owned script Child is no longer available for identity recovery",
+        )
+    })?;
+    capture_script_child_identity(child, pid, script_child_birth_identity)
+}
+
+fn capture_script_child_identity(
+    child: &mut Child,
+    expected_pid: u32,
+    mut capture_birth: impl FnMut(&Child, u32) -> Result<Value>,
+) -> Result<Value> {
+    if child.id() != expected_pid {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "retained Child PID changed before launch identity capture",
+        ));
+    }
+    let before = capture_birth(child, expected_pid)?;
+    if before["scope"] != "launcher_spawned_process"
+        || before["purpose"] != "check"
+        || before["pid"].as_u64() != Some(u64::from(expected_pid))
+    {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "birth identity does not identify the retained Child process",
+        ));
+    }
+    let after = capture_birth(child, expected_pid)?;
+    if !script_child_birth_matches(&before, &after, expected_pid) {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "process birth identity changed while recovering the retained Child launch",
+        ));
+    }
+    Ok(before)
+}
+
+#[cfg(windows)]
+fn script_child_birth_identity(child: &Child, expected_pid: u32) -> Result<Value> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::{FILETIME, HANDLE},
+        System::Threading::GetProcessTimes,
+    };
+
+    if child.id() != expected_pid {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "retained Child PID changed during launch identity capture",
+        ));
+    }
+    let handle: HANDLE = child.as_raw_handle();
+    // SAFETY: `handle` is borrowed from the retained std Child and remains
+    // valid for read-only creation-time queries even after process exit.
+    unsafe {
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(json!({
+            "pid":expected_pid,
+            "creation_filetime":(((creation.dwHighDateTime as u64) << 32) | u64::from(creation.dwLowDateTime)),
+            "scope":"launcher_spawned_process",
+            "purpose":"check"
+        }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn script_child_birth_identity(child: &Child, expected_pid: u32) -> Result<Value> {
+    if child.id() != expected_pid {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "retained Child PID changed during launch identity capture",
+        ));
+    }
+    // Do not call Child::try_wait while launch identity is missing: waitpid
+    // would reap this process and release its PID. While this exact Child stays
+    // owned and unreaped, its PID cannot be recycled, including in zombie state.
+    let stat_path = format!("/proc/{expected_pid}/stat");
+    let stat = std::fs::read_to_string(&stat_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::new(
+                "PROCESS_GONE",
+                "unreaped Store-owned script Child is absent from procfs",
+            )
+        } else {
+            error.into()
+        }
+    })?;
+    let (pid_text, _) = stat
+        .split_once(' ')
+        .ok_or_else(|| Error::new("PROCESS_IDENTITY", "invalid proc stat PID"))?;
+    if pid_text.parse::<u32>().ok() != Some(expected_pid) {
+        return Err(Error::new(
+            "SCRIPT_CHILD_PROVENANCE_CHANGED",
+            "procfs PID differs from the retained Child",
+        ));
+    }
+    let tail = stat
+        .rsplit_once(')')
+        .ok_or_else(|| Error::new("PROCESS_IDENTITY", "invalid proc stat command"))?
+        .1;
+    let fields: Vec<_> = tail.split_whitespace().collect();
+    if fields.len() < 20 {
+        return Err(Error::new(
+            "PROCESS_IDENTITY",
+            "incomplete proc stat for retained Child",
+        ));
+    }
+    let process_group = fields[2]
+        .parse::<i32>()
+        .map_err(|_| Error::new("PROCESS_IDENTITY", "invalid process group"))?;
+    let start_ticks = fields[19];
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return Err(Error::new(
+            "PROCESS_IDENTITY",
+            "kernel boot identity is unavailable",
+        ));
+    }
+    Ok(json!({
+        "pid":expected_pid,
+        "spawned_pgid":process_group,
+        "start_ticks":start_ticks,
+        "boot_id":boot_id,
+        "scope":"launcher_spawned_process",
+        "purpose":"check"
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn script_child_birth_identity(_child: &Child, _expected_pid: u32) -> Result<Value> {
+    Err(Error::new(
+        "SCRIPT_LAUNCH_UNKNOWN",
+        "same-Child launch identity recovery is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn script_child_birth_matches(before: &Value, after: &Value, pid: u32) -> bool {
+    before["pid"].as_u64() == Some(u64::from(pid))
+        && after["pid"].as_u64() == Some(u64::from(pid))
+        && before["creation_filetime"].as_u64().is_some()
+        && before["creation_filetime"] == after["creation_filetime"]
+}
+
+#[cfg(target_os = "linux")]
+fn script_child_birth_matches(before: &Value, after: &Value, pid: u32) -> bool {
+    before["pid"].as_u64() == Some(u64::from(pid))
+        && after["pid"].as_u64() == Some(u64::from(pid))
+        && before["start_ticks"].as_str().is_some()
+        && before["start_ticks"] == after["start_ticks"]
+        && before["boot_id"].as_str().is_some()
+        && before["boot_id"] == after["boot_id"]
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn script_child_birth_matches(_before: &Value, _after: &Value, _pid: u32) -> bool {
+    false
+}
+
+fn recover_script_child_launch(owner: &mut ScriptChildOwner, run_id: &str) -> Result<()> {
+    if owner.launch.is_none() {
+        let process = capture_script_child_owner_identity(owner).map_err(|error| {
+            if error.code == "SCRIPT_CHILD_PROVENANCE_CHANGED" {
+                error
+            } else {
+                Error::new(
+                    "SCRIPT_LAUNCH_UNKNOWN",
+                    format!("retained script Child launch identity is still unknown: {error}"),
+                )
+            }
+        })?;
+        let launch = json!({
+            "run_id":run_id,
+            "operation_id":owner.operation_id,
+            "token":owner.token,
+            "spawned_at_ms":model::now_ms()?,
+            "process":process,
+            "early_exit":null
+        });
+        if launch["run_id"] != run_id
+            || launch["operation_id"] != owner.operation_id
+            || launch["token"] != owner.token
+            || launch["process"]["pid"].as_u64() != Some(u64::from(owner.pid))
+        {
+            return Err(Error::new(
+                "SCRIPT_CHILD_PROVENANCE_CHANGED",
+                "recovered launch receipt differs from Store-owned Child provenance",
+            ));
+        }
+        owner.launch = Some(launch);
+        owner.launch_persistence_pending = true;
+    }
+    Ok(())
+}
+
+fn persist_script_child_launch(owner: &mut ScriptChildOwner, run_id: &str) -> Result<()> {
+    let Some(launch) = owner.launch.as_ref() else {
+        return Err(Error::new(
+            "SCRIPT_LAUNCH_UNKNOWN",
+            "cannot persist a ScriptRun launch without a retained launch identity",
+        ));
+    };
+    owner.launch_persistence_pending = true;
+    let launch_path = directory(&owner.data_dir, run_id)?.join("launch.json");
+    write_once(&launch_path, &model::canonical(launch)?.into_bytes())?;
+    owner.launch_persistence_pending = false;
     Ok(())
 }
 
@@ -419,10 +683,13 @@ fn script_child_exit(status: ExitStatus) -> ScriptChildExit {
 }
 
 fn script_child_family_departed(owner: &ScriptChildOwner) -> bool {
-    if owner.child.is_some() || owner.exit.is_none() {
+    if owner.child.is_some() || owner.exit.is_none() || owner.launch_persistence_pending {
         return false;
     }
     let Some(launch) = owner.launch.as_ref() else {
+        // A later direct-child exit with no launch or Store-pinned worker
+        // identity leaves no trusted birth/group tuple. Mutable worker.json or
+        // bare PID absence cannot prove departure, so keep custody unknown.
         return false;
     };
     if launch["process"].is_null() {
@@ -1629,4 +1896,296 @@ fn standalone_worker_environment() -> BTreeMap<String, String> {
     std::env::vars()
         .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
         .collect()
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod child_identity_recovery_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    const FIXTURE_TOKEN_ENV: &str = "ELIOT_SCRIPT_CHILD_CUSTODY_FIXTURE_TOKEN";
+    const FIXTURE_READY_ENV: &str = "ELIOT_SCRIPT_CHILD_CUSTODY_FIXTURE_READY";
+    const FIXTURE_TEST: &str =
+        "scripts::runner::child_identity_recovery_tests::script_child_fixture";
+
+    struct FixtureCleanup {
+        custody: ScriptChildCustody,
+        data_dir: PathBuf,
+    }
+
+    impl Drop for FixtureCleanup {
+        fn drop(&mut self) {
+            let mut owners = match self.custody.owners.lock() {
+                Ok(owners) => owners,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for owner in owners.values_mut() {
+                if let Some(child) = owner.child.as_mut() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(b"release\n");
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            owners.clear();
+            let _ = fs::remove_dir_all(&self.data_dir);
+        }
+    }
+
+    #[test]
+    fn script_child_fixture() {
+        let Ok(token) = std::env::var(FIXTURE_TOKEN_ENV) else {
+            return;
+        };
+        let _group = platform::process_group::Group::enter_script(&token)
+            .expect("enter the exact token-owned script process family");
+        let ready_path = PathBuf::from(
+            std::env::var_os(FIXTURE_READY_ENV)
+                .expect("fixture readiness path is supplied by the parent"),
+        );
+        fs::write(ready_path, b"ready").expect("signal fixture readiness");
+        let mut release = String::new();
+        std::io::stdin()
+            .read_line(&mut release)
+            .expect("wait for fixture release");
+        assert_eq!(release.trim(), "release");
+    }
+
+    #[test]
+    fn transient_identity_fault_recovers_from_unreaped_exit_before_shutdown_release() {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        let data_dir = std::env::temp_dir().join(format!("script-child-custody-{run_id}"));
+        let run_dir = directory(&data_dir, &run_id).expect("build run directory");
+        fs::create_dir_all(&run_dir).expect("create isolated custody receipts directory");
+        let ready_path = run_dir.join("fixture.ready");
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable path"))
+            .args(["--exact", FIXTURE_TEST, "--nocapture"])
+            .env(FIXTURE_TOKEN_ENV, &token)
+            .env(FIXTURE_READY_ENV, &ready_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the isolated process-family fixture");
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.is_file() {
+            if child.try_wait().expect("observe fixture startup").is_some() {
+                panic!("process-family fixture exited before signaling readiness");
+            }
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("process-family fixture did not become ready within five seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let pid = child.id();
+        let custody = ScriptChildCustody::default();
+        custody.owners.lock().unwrap().insert(
+            run_id.clone(),
+            ScriptChildOwner {
+                data_dir: data_dir.clone(),
+                work_digest: "a".repeat(64),
+                operation_id,
+                token,
+                pid,
+                child: Some(child),
+                launch: None,
+                launch_persistence_pending: false,
+                exit: None,
+                release_when_exited: true,
+            },
+        );
+        let cleanup = FixtureCleanup {
+            custody: custody.clone(),
+            data_dir,
+        };
+
+        let first_capture = {
+            let mut owners = custody.owners.lock().unwrap();
+            let owner = owners.get_mut(&run_id).expect("retained fixture Child");
+            capture_script_child_identity(
+                owner.child.as_mut().expect("actual Child remains retained"),
+                pid,
+                |_, _| {
+                    Err(Error::new(
+                        "PROCESS_IDENTITY",
+                        "injected transient launch-identity observation failure",
+                    ))
+                },
+            )
+            .expect_err("the first launch identity capture is faulted")
+        };
+        assert_eq!(first_capture.code, "PROCESS_IDENTITY");
+        {
+            let owners = custody.owners.lock().unwrap();
+            let owner = owners.get(&run_id).expect("custody survives capture fault");
+            assert!(owner.child.is_some(), "the actual Child must remain owned");
+            assert!(owner.launch.is_none(), "failed identity stays unknown");
+        }
+
+        {
+            let mut owners = custody.owners.lock().unwrap();
+            let owner = owners
+                .get_mut(&run_id)
+                .expect("retained until fixture exit");
+            let child = owner.child.as_mut().expect("actual Child remains retained");
+            child
+                .stdin
+                .as_mut()
+                .expect("fixture stdin")
+                .write_all(b"release\n")
+                .expect("release fixture process");
+        }
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if platform::process_group::process_birth_identity(pid)
+                .expect("observe fixture exit without reaping the owned Child")
+                .is_none()
+            {
+                break;
+            }
+            if Instant::now() >= exit_deadline {
+                panic!("fixture did not exit within five seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let owners = custody.owners.lock().unwrap();
+            let owner = owners
+                .get(&run_id)
+                .expect("custody remains until recovered family proof");
+            assert!(owner.child.is_some(), "the exited Child remains unreaped");
+            assert!(
+                owner.launch.is_none(),
+                "birth is still unknown before recovery"
+            );
+        }
+        let launch_path = run_dir.join("launch.json");
+        fs::create_dir(&launch_path).expect("inject a blocked launch receipt destination");
+        assert!(
+            custody.poll_active_children(true),
+            "failed launch publication must keep shutdown pending after child exit"
+        );
+        {
+            let owners = custody.owners.lock().unwrap();
+            let owner = owners
+                .get(&run_id)
+                .expect("publication failure retains owner");
+            assert!(
+                owner.child.is_some(),
+                "the exact exited Child stays unreaped"
+            );
+            assert!(owner.launch.is_some(), "recovered birth stays retained");
+            assert!(owner.launch_persistence_pending);
+        }
+        fs::remove_dir(&launch_path).expect("resolve the injected publication failure");
+        assert!(
+            !custody.poll_active_children(true),
+            "shutdown recovers birth from the retained exited Child, then verifies family departure"
+        );
+        let recovered = read_json(&launch_path)
+            .expect("persist recovered launch identity before releasing custody");
+        assert_eq!(recovered["process"]["pid"].as_u64(), Some(u64::from(pid)));
+        assert!(
+            custody.owners.lock().unwrap().is_empty(),
+            "only confirmed family departure releases the retained owner"
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn reaped_early_exit_keeps_custody_until_launch_receipt_is_durable() {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        let data_dir = std::env::temp_dir().join(format!("script-early-exit-custody-{run_id}"));
+        let launch_path = directory(&data_dir, &run_id).unwrap().join("launch.json");
+        fs::create_dir_all(&launch_path).unwrap();
+        let launch = json!({
+            "run_id":run_id,
+            "operation_id":operation_id,
+            "token":token,
+            "spawned_at_ms":1,
+            "process":null,
+            "early_exit":EarlyExitReceipt {
+                schema_version: 1,
+                state: EarlyExitState::ExitedBeforeWorkerIdentity,
+                run_id: run_id.clone(),
+                operation_id: operation_id.clone(),
+                token: token.clone(),
+                pid: 42,
+                exit_code: Some(0),
+            },
+        });
+        let custody = ScriptChildCustody::default();
+        custody.owners.lock().unwrap().insert(
+            run_id.clone(),
+            ScriptChildOwner {
+                data_dir: data_dir.clone(),
+                work_digest: "c".repeat(64),
+                operation_id: operation_id.clone(),
+                token,
+                pid: 42,
+                child: None,
+                launch: Some(launch.clone()),
+                launch_persistence_pending: false,
+                exit: Some(ScriptChildExit { code: Some(0) }),
+                release_when_exited: false,
+            },
+        );
+        let cleanup = FixtureCleanup {
+            custody: custody.clone(),
+            data_dir,
+        };
+        assert!(
+            custody
+                .release_after_terminal(&run_id, &operation_id)
+                .is_err()
+        );
+        assert!(custody.owners.lock().unwrap()[&run_id].launch_persistence_pending);
+        assert!(custody.poll_active_children(true));
+        assert_eq!(custody.owners.lock().unwrap().len(), 1);
+        fs::remove_dir(&launch_path).unwrap();
+        assert!(!custody.poll_active_children(true));
+        assert_eq!(read_json(&launch_path).unwrap(), launch);
+        assert!(custody.owners.lock().unwrap().is_empty());
+        drop(cleanup);
+    }
+
+    #[test]
+    fn direct_exit_without_launch_identity_keeps_shutdown_custody_unknown() {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let custody = ScriptChildCustody::default();
+        custody.owners.lock().unwrap().insert(
+            run_id,
+            ScriptChildOwner {
+                data_dir: PathBuf::new(),
+                work_digest: "b".repeat(64),
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                token: uuid::Uuid::new_v4().to_string(),
+                pid: 42,
+                child: None,
+                launch: None,
+                launch_persistence_pending: false,
+                exit: Some(ScriptChildExit { code: Some(0) }),
+                release_when_exited: true,
+            },
+        );
+
+        assert!(
+            custody.poll_active_children(true),
+            "direct exit without captured family identity is not departure proof"
+        );
+        assert_eq!(custody.owners.lock().unwrap().len(), 1);
+    }
 }
