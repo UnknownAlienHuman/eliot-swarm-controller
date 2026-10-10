@@ -258,6 +258,7 @@ def review(contract, changed):
 
 def collisions(api, contract, policy, current):
     pulls = api.pages("pulls?state=open&sort=created&direction=asc", 6)
+    claims = [(current["created_at"], current["number"])]
     require(len({pr["number"] for pr in pulls}) == len(pulls), "unstable PR pagination")
     require(any(pr["number"] == current["number"] for pr in pulls), "current PR absent from open inventory")
     for other in pulls:
@@ -274,13 +275,16 @@ def collisions(api, contract, policy, current):
                     or overlap((candidate["owned_files"], candidate["owned_prefixes"]),
                                (contract["owned_files"], contract["owned_prefixes"])))
         if conflict:
-            require((current["created_at"], current["number"]) < (other["created_at"], other["number"]),
-                    "older active PR owns the manager/track/path claim")
+            claims.append((other["created_at"], other["number"]))
     def snapshot(rows):
         return sorted((p["number"], p["head"]["sha"], p["base"]["sha"],
                        p.get("body") or "", p.get("draft")) for p in rows)
     require(snapshot(pulls) == snapshot(api.pages("pulls?state=open&sort=created&direction=asc", 6)),
             "open PR inventory changed during collision check")
+    # Preserve oldest ownership, but never green either colliding candidate: a read-only
+    # job cannot revoke a sibling's cached success after an older claim is expanded.
+    require(len(claims) == 1,
+            f"overlapping claims: owner PR #{min(claims)[1]}; release other claims before approval")
 
 
 def validate(event, root, repository):
@@ -349,7 +353,8 @@ def main():
     args = parser.parse_args()
     try:
         validate(strict_json(args.event.read_text(encoding="utf-8")), args.policy_root, args.repository)
-    except (Invalid, KeyError, TypeError, json.JSONDecodeError, OSError) as error:
+    except (Invalid, KeyError, TypeError, json.JSONDecodeError, OSError,
+            UnicodeError, RecursionError, OverflowError) as error:
         # Never print API bodies, submitted PR fields, credentials or machine paths.
         message = str(error) if isinstance(error, Invalid) else "invalid metadata/schema or unavailable input"
         print(f"PR contract failed: {message}", file=sys.stderr)
