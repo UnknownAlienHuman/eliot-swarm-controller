@@ -1257,7 +1257,7 @@ function Get-AdapterContract {
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.opencode_interaction_observation@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '3'; expected_config_schema_sha256 = '070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e';
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
-                expected_provider = ($OpenCodeCommandTestModelRef -split '/', 2)[0]; expected_model = ($OpenCodeCommandTestModelRef -split '/', 2)[1]; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
+                expected_provider = ($OpenCodeCommandTestModelRef -split '/', 2)[0]; expected_model = ($OpenCodeCommandTestModelRef -split '/', 2)[1]; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = 'high'
             }
         }
         'Command' {
@@ -1313,6 +1313,445 @@ function Get-AdapterContract {
             }
         }
         default { Stop-Qualification 'ADAPTER_UNSUPPORTED' }
+    }
+}
+
+function Read-OpenCodeSelectedConnectionRecord {
+    param([Parameter(Mandatory)][string] $Path)
+    $stream = $null
+    $memory = $null
+    $document = $null
+    try {
+        if (-not [System.IO.Path]::IsPathFullyQualified($Path)) { throw 'invalid' }
+        $attributes = [System.IO.File]::GetAttributes($Path)
+        if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0 -or
+            ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'invalid' }
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if ($stream.Length -gt 65536) { throw 'invalid' }
+        $memory = [System.IO.MemoryStream]::new()
+        $buffer = [byte[]]::new(8192)
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $memory.Write($buffer, 0, $read)
+            if ($memory.Length -gt 65536) { throw 'invalid' }
+        }
+        $memory.Position = 0
+        $document = [System.Text.Json.JsonDocument]::Parse([System.IO.Stream]$memory, [System.Text.Json.JsonDocumentOptions]::new())
+        $root = $document.RootElement
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { throw 'invalid' }
+        $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($property in $root.EnumerateObject()) {
+            if (-not $names.Add($property.Name)) { throw 'invalid' }
+        }
+        $expectedNames = @('schema_version', 'endpoint', 'pid', 'username', 'password')
+        if ($names.Count -ne $expectedNames.Count) { throw 'invalid' }
+        foreach ($name in $expectedNames) { if (-not $names.Contains($name)) { throw 'invalid' } }
+        $schemaVersion = 0
+        $pidValue = [uint32]0
+        $schemaElement = $root.GetProperty('schema_version')
+        $pidElement = $root.GetProperty('pid')
+        if ($schemaElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
+            -not $schemaElement.TryGetInt32([ref]$schemaVersion) -or $schemaVersion -ne 1 -or
+            $pidElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
+            -not $pidElement.TryGetUInt32([ref]$pidValue) -or $pidValue -eq 0) { throw 'invalid' }
+        foreach ($name in @('endpoint', 'username', 'password')) {
+            if ($root.GetProperty($name).ValueKind -ne [System.Text.Json.JsonValueKind]::String) { throw 'invalid' }
+        }
+        $endpointText = $root.GetProperty('endpoint').GetString()
+        $username = $root.GetProperty('username').GetString()
+        $password = $root.GetProperty('password').GetString()
+        $endpoint = [Uri]::new($endpointText, [UriKind]::Absolute)
+        if ($endpoint.Scheme -cne 'http' -or -not $endpoint.IsLoopback -or
+            -not [string]::IsNullOrEmpty($endpoint.UserInfo) -or
+            -not [string]::IsNullOrEmpty($endpoint.Query) -or
+            -not [string]::IsNullOrEmpty($endpoint.Fragment) -or $endpoint.AbsolutePath -cne '/' -or
+            $endpoint.Port -le 0 -or [string]::IsNullOrEmpty($username) -or $username.Contains(':') -or
+            [string]::IsNullOrEmpty($password)) { throw 'invalid' }
+        return [pscustomobject]@{ endpoint = $endpoint; pid = [long]$pidValue; username = $username; password = $password }
+    }
+    catch { throw 'OPENCODE_SELECTED_CONNECTION_RECORD_INVALID' }
+    finally {
+        if ($null -ne $document) { $document.Dispose() }
+        if ($null -ne $memory) { $memory.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Invoke-OpenCodeSelectedJsonGet {
+    param(
+        [Parameter(Mandatory)][System.Net.Http.HttpClient] $Client,
+        [Parameter(Mandatory)][Uri] $Endpoint,
+        [Parameter(Mandatory)][string] $Path,
+        [string] $Directory,
+        [Parameter(Mandatory)][string] $AuthorizationToken,
+        [ValidateRange(1, 10)][int] $TimeoutSeconds = 3
+    )
+    $request = $null
+    $response = $null
+    $stream = $null
+    $memory = $null
+    $deadline = $null
+    $status = $null
+    try {
+        $uriText = $Endpoint.GetLeftPart([System.UriPartial]::Authority) + $Path
+        if ($PSBoundParameters.ContainsKey('Directory')) {
+            $fields = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+            $fields.Add('location[directory]', $Directory)
+            $form = [System.Net.Http.FormUrlEncodedContent]::new($fields)
+            try { $uriText += '?' + $form.ReadAsStringAsync().GetAwaiter().GetResult() }
+            finally { $form.Dispose() }
+        }
+        $uri = [Uri]::new($uriText, [UriKind]::Absolute)
+        $endpointAuthority = $Endpoint.GetLeftPart([System.UriPartial]::Authority)
+        $requestAuthority = $uri.GetLeftPart([System.UriPartial]::Authority)
+        if (-not $Endpoint.IsLoopback -or -not $uri.IsLoopback -or $requestAuthority -cne $endpointAuthority) {
+            return [ordered]@{ status = $null; body_sha256 = $null; body_bytes = 0; parse_status = 'request_rejected'; value = $null }
+        }
+        $deadline = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
+        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $uri)
+        $request.Headers.Accept.ParseAdd('application/json')
+        $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Basic', $AuthorizationToken)
+        $response = $Client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $deadline.Token).GetAwaiter().GetResult()
+        $status = [int]$response.StatusCode
+        if ($null -ne $response.Content.Headers.ContentLength -and $response.Content.Headers.ContentLength -gt 4194304) {
+            return [ordered]@{ status = $status; body_sha256 = $null; body_bytes = 4194305; parse_status = 'body_limit_exceeded'; value = $null }
+        }
+        $stream = $response.Content.ReadAsStreamAsync($deadline.Token).GetAwaiter().GetResult()
+        $memory = [System.IO.MemoryStream]::new()
+        $buffer = [byte[]]::new(16384)
+        while (($read = $stream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token).GetAwaiter().GetResult()) -gt 0) {
+            $memory.Write($buffer, 0, $read)
+            if ($memory.Length -gt 4194304) {
+                return [ordered]@{ status = $status; body_sha256 = $null; body_bytes = [long]$memory.Length; parse_status = 'body_limit_exceeded'; value = $null }
+            }
+        }
+        $bytes = $memory.ToArray()
+        $bodyHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        if ($status -ne 200) {
+            return [ordered]@{ status = $status; body_sha256 = $bodyHash; body_bytes = $bytes.Length; parse_status = 'http_status'; value = $null }
+        }
+        try {
+            $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $value = $utf8.GetString($bytes) | ConvertFrom-Json -AsHashtable -Depth 48 -ErrorAction Stop
+            return [ordered]@{ status = $status; body_sha256 = $bodyHash; body_bytes = $bytes.Length; parse_status = 'valid_json'; value = $value }
+        }
+        catch {
+            return [ordered]@{ status = $status; body_sha256 = $bodyHash; body_bytes = $bytes.Length; parse_status = 'invalid_json'; value = $null }
+        }
+    }
+    catch {
+        $failureStatus = if (($null -ne $deadline -and $deadline.IsCancellationRequested) -or
+            $_.Exception.GetBaseException() -is [System.OperationCanceledException]) { 'timeout' } else { 'transport_failed' }
+        return [ordered]@{ status = $status; body_sha256 = $null; body_bytes = 0; parse_status = $failureStatus; value = $null }
+    }
+    finally {
+        if ($null -ne $memory) { $memory.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $request) { $request.Dispose() }
+        if ($null -ne $deadline) { $deadline.Dispose() }
+    }
+}
+
+function Test-OpenCodeSelectedWorkspacePathMatch {
+    param([Parameter(Mandatory)][string] $Expected, [Parameter(Mandatory)][string] $Observed)
+    try {
+        if (-not [System.IO.Path]::IsPathFullyQualified($Expected) -or
+            -not [System.IO.Path]::IsPathFullyQualified($Observed)) { return $false }
+        $paths = @([System.IO.Path]::GetFullPath($Expected), [System.IO.Path]::GetFullPath($Observed))
+        for ($index = 0; $index -lt $paths.Count; $index++) {
+            $root = [System.IO.Path]::GetPathRoot($paths[$index])
+            if ($paths[$index].Length -gt $root.Length) {
+                $paths[$index] = $paths[$index].TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+            }
+        }
+        $comparison = if ([OperatingSystem]::IsWindows()) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        return [string]::Equals($paths[0], $paths[1], $comparison)
+    }
+    catch { return $false }
+}
+
+function Get-OpenCodeSelectedCatalogEvidence {
+    param(
+        [Parameter(Mandatory)] $Route,
+        [Parameter(Mandatory)] $RouteModel,
+        [Parameter(Mandatory)] $Contract,
+        [Parameter(Mandatory)][ValidateSet('pre_dispatch', 'rejected_open_diagnostic')][string] $Mode,
+        [System.Collections.IDictionary] $OperationScope
+    )
+    $evidence = [ordered]@{
+        schema_version = 1
+        captured_at_utc = [DateTime]::UtcNow.ToString('o')
+        capture_status = 'unavailable'
+        reason_code = 'OPENCODE_SELECTED_CONNECTION_IDENTITY_UNAVAILABLE'
+        scope = [ordered]@{ mode = $Mode }
+        endpoint_identity = $null
+        selected_pid = $null
+        responses = [ordered]@{ info = $null; location = $null; model_catalog = $null }
+        predicates = [ordered]@{
+            connection_record_schema_valid = $false
+            server_info_schema_valid = $false
+            server_pid_matches_selected_record = $false
+            location_http_ok = $false
+            location_project_identity_present = $false
+            location_workspace_matches_route = $false
+            catalog_http_ok = $false
+            catalog_location_matches_route = $false
+            catalog_shape_valid = $false
+            matching_model_count = 0
+            selected_model_enabled_is_true = $false
+            matching_variant_count = 0
+        }
+    }
+    if ($null -ne $OperationScope) {
+        foreach ($name in @('task_id', 'attempt_id', 'parent_operation_id', 'open_operation_id', 'binding_id')) {
+            $value = Get-OptionalField $OperationScope $name
+            if ($value -is [string] -and $value.Length -le 256 -and $value -match '^[A-Za-z0-9._:-]+$') {
+                $evidence.scope[$name] = $value
+            }
+        }
+        $generationValue = Get-OptionalField $OperationScope 'generation'
+        if (($generationValue -is [int] -or $generationValue -is [long]) -and $generationValue -gt 0) {
+            $evidence.scope.generation = [long]$generationValue
+        }
+    }
+    $alias = Get-OptionalField $Route 'alias'
+    if ($alias -is [string] -and $alias.Length -le 128 -and $alias -match '^[A-Za-z0-9._-]+$') { $evidence.scope.route_alias = $alias }
+    $evidence.scope.module_id = [string]$Contract.module_id
+    $evidence.scope.artifact_id = [string]$Contract.artifact_id
+    $evidence.scope.requested_model = [ordered]@{
+        provider_id = [string]$RouteModel.provider_id
+        model_id = [string]$RouteModel.model_id
+        variant = [string]$RouteModel.variant
+    }
+    if ((Get-OptionalField $Route 'enabled') -ne $true -or
+        (Get-OptionalField $Route 'runtime') -cne 'module' -or
+        (Get-OptionalField $Route 'module_artifact_id') -cne $Contract.artifact_id -or
+        $RouteModel.provider_id -cne $Contract.expected_provider -or
+        $RouteModel.model_id -cne $Contract.expected_model -or
+        $RouteModel.variant -cne $Contract.expected_effort) {
+        $evidence.reason_code = 'OPENCODE_SELECTED_ROUTE_IDENTITY_MISMATCH'
+        return $evidence
+    }
+    if ($null -ne (Get-OptionalField $Route 'owned_service')) {
+        $evidence.capture_status = 'unknown'
+        $evidence.reason_code = 'OPENCODE_SELECTED_CATALOG_IDENTITY_UNKNOWN'
+        $evidence.scope.identity_source = 'fresh_owned_service_route'
+        $evidence.scope.identity_limitation = 'No supported public post-launch projection exposes this binding service_id, connection_file, and workspace; selected catalog was not captured.'
+        return $evidence
+    }
+    $options = Get-OptionalField $Route 'native_options'
+    $serviceId = Get-OptionalField $options 'service_id'
+    $connectionFile = Get-OptionalField $options 'connection_file'
+    $directory = Get-OptionalField $options 'directory'
+    if ($serviceId -isnot [string] -or $serviceId.Length -gt 128 -or $serviceId -notmatch '^[A-Za-z0-9._-]+$' -or
+        $connectionFile -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($connectionFile) -or
+        $directory -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($directory)) { return $evidence }
+    $evidence.scope.service_id = $serviceId
+    if (-not [System.IO.Directory]::Exists($directory)) {
+        $evidence.reason_code = 'OPENCODE_SELECTED_WORKSPACE_UNAVAILABLE'
+        return $evidence
+    }
+    try {
+        $workspaceIdentity = [System.IO.Path]::GetFullPath($directory)
+        $workspaceRoot = [System.IO.Path]::GetPathRoot($workspaceIdentity)
+        if ($workspaceIdentity.Length -gt $workspaceRoot.Length) {
+            $workspaceIdentity = $workspaceIdentity.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        }
+        $evidence.scope.workspace_sha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($workspaceIdentity))).ToLowerInvariant()
+    }
+    catch {
+        $evidence.reason_code = 'OPENCODE_SELECTED_WORKSPACE_UNAVAILABLE'
+        return $evidence
+    }
+    $record = $null
+    try { $record = Read-OpenCodeSelectedConnectionRecord -Path $connectionFile }
+    catch {
+        $evidence.reason_code = 'OPENCODE_SELECTED_CONNECTION_RECORD_UNAVAILABLE'
+        return $evidence
+    }
+    $evidence.predicates.connection_record_schema_valid = $true
+    $evidence.selected_pid = [long]$record.pid
+    $origin = $record.endpoint.GetLeftPart([System.UriPartial]::Authority)
+    $evidence.endpoint_identity = [ordered]@{
+        scheme = 'http'
+        loopback = $true
+        origin_sha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($origin))).ToLowerInvariant()
+    }
+    $authToken = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$record.username + ':' + [string]$record.password))
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $handler.UseProxy = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(3)
+    try {
+        $info = Invoke-OpenCodeSelectedJsonGet -Client $client -Endpoint $record.endpoint -Path '/api/info' -AuthorizationToken $authToken
+        $evidence.responses.info = [ordered]@{ status = $info.status; body_sha256 = $info.body_sha256; body_bytes = $info.body_bytes; parse_status = $info.parse_status }
+        if ($info.status -ne 200 -or $info.parse_status -cne 'valid_json' -or $info.value -isnot [System.Collections.IDictionary]) {
+            $evidence.capture_status = 'partial'
+            $evidence.reason_code = 'OPENCODE_SELECTED_SERVER_INFO_UNAVAILABLE'
+            return $evidence
+        }
+        $serverPid = Get-OptionalField $info.value 'pid'
+        $serverVersion = Get-OptionalField $info.value 'version'
+        $serverUrls = Get-OptionalField $info.value 'urls' -PreserveCollection
+        $serverPaths = Get-OptionalField $info.value 'paths'
+        $serverTmp = Get-OptionalField $serverPaths 'tmp'
+        $serverInfoValid = ($serverPid -is [int] -or $serverPid -is [long]) -and $serverPid -gt 0 -and
+            $serverVersion -is [string] -and -not [string]::IsNullOrWhiteSpace($serverVersion) -and
+            [System.Text.Encoding]::UTF8.GetByteCount($serverVersion) -le 256 -and $serverVersion -notmatch '[\x00-\x1F\x7F]' -and
+            $serverUrls -is [System.Array] -and $serverUrls.Count -gt 0 -and
+            $serverTmp -is [string] -and -not [string]::IsNullOrWhiteSpace($serverTmp)
+        $evidence.predicates.server_info_schema_valid = [bool]$serverInfoValid
+        $evidence.predicates.server_pid_matches_selected_record = [bool]($serverInfoValid -and $serverPid -eq $record.pid)
+        if (-not $evidence.predicates.server_info_schema_valid) {
+            $evidence.capture_status = 'partial'
+            $evidence.reason_code = 'OPENCODE_SELECTED_SERVER_INFO_SCHEMA_INVALID'
+            return $evidence
+        }
+        if (-not $evidence.predicates.server_pid_matches_selected_record) {
+            $evidence.capture_status = 'partial'
+            $evidence.reason_code = 'OPENCODE_SELECTED_SERVICE_IDENTITY_MISMATCH'
+            return $evidence
+        }
+        $location = Invoke-OpenCodeSelectedJsonGet -Client $client -Endpoint $record.endpoint -Path '/api/location' -Directory $directory -AuthorizationToken $authToken
+        $evidence.responses.location = [ordered]@{ status = $location.status; body_sha256 = $location.body_sha256; body_bytes = $location.body_bytes; parse_status = $location.parse_status }
+        if ($location.status -ne 200 -or $location.parse_status -cne 'valid_json' -or $location.value -isnot [System.Collections.IDictionary]) {
+            $evidence.capture_status = 'partial'
+            $evidence.reason_code = 'OPENCODE_SELECTED_LOCATION_UNAVAILABLE'
+            return $evidence
+        }
+        $locationDirectory = Get-OptionalField $location.value 'directory'
+        $project = Get-OptionalField $location.value 'project'
+        $projectId = Get-OptionalField $project 'id'
+        $evidence.predicates.location_http_ok = $true
+        $evidence.predicates.location_project_identity_present = ($projectId -is [string] -and -not [string]::IsNullOrWhiteSpace($projectId))
+        $evidence.predicates.location_workspace_matches_route = ($locationDirectory -is [string] -and (Test-OpenCodeSelectedWorkspacePathMatch -Expected $directory -Observed $locationDirectory))
+        if (-not $evidence.predicates.location_project_identity_present -or -not $evidence.predicates.location_workspace_matches_route) {
+            $evidence.capture_status = 'partial'
+            $evidence.reason_code = 'OPENCODE_SELECTED_WORKSPACE_MISMATCH'
+            return $evidence
+        }
+        $catalog = Invoke-OpenCodeSelectedJsonGet -Client $client -Endpoint $record.endpoint -Path '/api/model' -Directory $directory -AuthorizationToken $authToken
+        $evidence.responses.model_catalog = [ordered]@{ status = $catalog.status; body_sha256 = $catalog.body_sha256; body_bytes = $catalog.body_bytes; parse_status = $catalog.parse_status }
+        if ($catalog.status -ne 200 -or $catalog.parse_status -cne 'valid_json' -or $catalog.value -isnot [System.Collections.IDictionary]) {
+            $evidence.capture_status = 'partial'
+            $evidence.reason_code = 'OPENCODE_SELECTED_CATALOG_UNAVAILABLE'
+            return $evidence
+        }
+        $evidence.capture_status = 'captured'
+        $models = Get-OptionalField $catalog.value 'data' -PreserveCollection
+        $catalogLocation = Get-OptionalField $catalog.value 'location'
+        $catalogDirectory = Get-OptionalField $catalogLocation 'directory'
+        $evidence.predicates.catalog_http_ok = $true
+        $evidence.predicates.catalog_location_matches_route = ($catalogDirectory -is [string] -and (Test-OpenCodeSelectedWorkspacePathMatch -Expected $directory -Observed $catalogDirectory))
+        if ($models -isnot [System.Array]) {
+            $evidence.reason_code = 'OPENCODE_SELECTED_CATALOG_SCHEMA_INVALID'
+            return $evidence
+        }
+        $shapeValid = $true
+        $modelCount = 0
+        $enabledTrue = $false
+        $variantCount = 0
+        foreach ($model in $models) {
+            if ($model -isnot [System.Collections.IDictionary]) { continue }
+            if ((Get-OptionalField $model 'providerID') -ceq $RouteModel.provider_id -and
+                (Get-OptionalField $model 'id') -ceq $RouteModel.model_id) {
+                $modelCount++
+                $enabled = Get-OptionalField $model 'enabled'
+                $enabledTrue = $enabled -is [bool] -and $enabled
+                $variants = Get-OptionalField $model 'variants' -PreserveCollection
+                if ($variants -isnot [System.Array] -or $variants.Count -gt 256) { $shapeValid = $false; continue }
+                $seenVariants = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($variant in $variants) {
+                    $variantId = Get-OptionalField $variant 'id'
+                    if ($variantId -isnot [string] -or [string]::IsNullOrWhiteSpace($variantId) -or
+                        [System.Text.Encoding]::UTF8.GetByteCount($variantId) -gt 256 -or $variantId -match '[\x00-\x1F\x7F]' -or
+                        -not $seenVariants.Add($variantId)) { $shapeValid = $false; continue }
+                    if ($variantId -ceq $RouteModel.variant) { $variantCount++ }
+                }
+            }
+        }
+        $evidence.predicates.catalog_shape_valid = [bool]$shapeValid
+        $evidence.predicates.matching_model_count = [int]$modelCount
+        $evidence.predicates.selected_model_enabled_is_true = [bool]($modelCount -eq 1 -and $enabledTrue)
+        $evidence.predicates.matching_variant_count = [int]$variantCount
+        if (-not $shapeValid) { $evidence.reason_code = 'OPENCODE_SELECTED_CATALOG_SCHEMA_INVALID' }
+        elseif (-not $evidence.predicates.catalog_location_matches_route -or $modelCount -ne 1 -or
+            -not $evidence.predicates.selected_model_enabled_is_true -or $variantCount -ne 1) {
+            $evidence.reason_code = 'OPENCODE_SELECTED_CATALOG_PREDICATE_MISMATCH'
+        }
+        else { $evidence.reason_code = $null }
+        return $evidence
+    }
+    finally {
+        $authToken = $null
+        $record.username = $null
+        $record.password = $null
+        $client.Dispose()
+    }
+}
+
+function Test-OpenCodeSelectedCatalogEvidence {
+    param([Parameter(Mandatory)] $Evidence, [Parameter(Mandatory)] $Contract)
+    $code = Get-OptionalField $Evidence 'reason_code'
+    if ([string]::IsNullOrWhiteSpace([string]$code)) { $code = 'OPENCODE_SELECTED_CATALOG_PREDICATE_MISMATCH' }
+    $captureStatus = Get-OptionalField $Evidence 'capture_status'
+    $scope = Get-OptionalField $Evidence 'scope'
+    $identitySource = Get-OptionalField $scope 'identity_source'
+    if ($captureStatus -ceq 'unknown' -and $identitySource -ceq 'fresh_owned_service_route' -and
+        $code -ceq 'OPENCODE_SELECTED_CATALOG_IDENTITY_UNKNOWN' -and
+        (Get-OptionalField $scope 'identity_limitation') -is [string]) {
+        return [pscustomobject]@{ passed = $false; dispatch_allowed = $true; qualified = $false; stage_status = 'unknown'; code = [string]$code }
+    }
+    $requestedModel = Get-OptionalField $scope 'requested_model'
+    $predicates = Get-OptionalField $Evidence 'predicates'
+    if ($captureStatus -cne 'captured' -or $null -eq $requestedModel -or $null -eq $predicates -or
+        (Get-OptionalField $requestedModel 'provider_id') -cne $Contract.expected_provider -or
+        (Get-OptionalField $requestedModel 'model_id') -cne $Contract.expected_model -or
+        (Get-OptionalField $requestedModel 'variant') -cne $Contract.expected_effort -or
+        (Get-OptionalField $predicates 'connection_record_schema_valid') -ne $true -or
+        (Get-OptionalField $predicates 'server_info_schema_valid') -ne $true -or
+        (Get-OptionalField $predicates 'server_pid_matches_selected_record') -ne $true -or
+        (Get-OptionalField $predicates 'location_http_ok') -ne $true -or
+        (Get-OptionalField $predicates 'location_project_identity_present') -ne $true -or
+        (Get-OptionalField $predicates 'location_workspace_matches_route') -ne $true -or
+        (Get-OptionalField $predicates 'catalog_http_ok') -ne $true -or
+        (Get-OptionalField $predicates 'catalog_location_matches_route') -ne $true -or
+        (Get-OptionalField $predicates 'catalog_shape_valid') -ne $true -or
+        (Get-OptionalField $predicates 'matching_model_count') -ne 1 -or
+        (Get-OptionalField $predicates 'selected_model_enabled_is_true') -ne $true -or
+        (Get-OptionalField $predicates 'matching_variant_count') -ne 1) {
+        return [pscustomobject]@{ passed = $false; dispatch_allowed = $false; qualified = $false; stage_status = 'blocked'; code = [string]$code }
+    }
+    foreach ($name in @('info', 'location', 'model_catalog')) {
+        $responses = Get-OptionalField $Evidence 'responses'
+        $response = Get-OptionalField $responses $name
+        $responseStatus = Get-OptionalField $response 'status'
+        $responseHash = Get-OptionalField $response 'body_sha256'
+        $responseBytes = Get-OptionalField $response 'body_bytes'
+        if ($null -eq $response -or $responseStatus -ne 200 -or
+            $responseHash -isnot [string] -or $responseHash -notmatch '^[0-9a-f]{64}$' -or
+            $responseBytes -isnot [int] -and $responseBytes -isnot [long] -or
+            $responseBytes -lt 0 -or $responseBytes -gt 4194304) {
+            return [pscustomobject]@{ passed = $false; dispatch_allowed = $false; qualified = $false; stage_status = 'blocked'; code = 'OPENCODE_SELECTED_CATALOG_EVIDENCE_INVALID' }
+        }
+    }
+    return [pscustomobject]@{ passed = $true; dispatch_allowed = $true; qualified = $true; stage_status = 'passed'; code = $null }
+}
+
+function Get-OpenCodeSelectedCatalogStageFacts {
+    param([Parameter(Mandatory)] $Evidence)
+    $scope = Get-OptionalField $Evidence 'scope'
+    $responses = Get-OptionalField $Evidence 'responses'
+    $catalog = Get-OptionalField $responses 'model_catalog'
+    return [ordered]@{
+        capture_status = Get-OptionalField $Evidence 'capture_status'
+        capture_reason = Get-OptionalField $Evidence 'reason_code'
+        identity_limitation = Get-OptionalField $scope 'identity_limitation'
+        service_id = Get-OptionalField $scope 'service_id'
+        selected_pid = Get-OptionalField $Evidence 'selected_pid'
+        catalog_body_sha256 = Get-OptionalField $catalog 'body_sha256'
+        predicates = Get-OptionalField $Evidence 'predicates'
     }
 }
 
@@ -2240,6 +2679,26 @@ try {
             $terminalCode = if ($terminalOpen.error_code) { $terminalOpen.error_code } else { 'NATIVE_OPEN_REJECTED' }
             $failureFacts = New-ReadinessFailureFacts -Reason 'terminal_open_rejection' -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id -ArtifactVersion $contract.version -BindingId $bindingId -Generation $generation -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase -DispatchCapabilityState $lastDispatchCapabilityState -ErrorCode $terminalOpen.error_code
             $failureFacts.catalog_failure_category = $terminalOpen.catalog_failure_category
+            if ($Adapter -eq 'OpenCode') {
+                try {
+                    $catalogDiagnostic = Get-OpenCodeSelectedCatalogEvidence -Route $route -RouteModel $routeModel -Contract $contract -Mode 'rejected_open_diagnostic' -OperationScope ([ordered]@{
+                        task_id = $taskId; attempt_id = $attemptId; parent_operation_id = $parentOperationId
+                        open_operation_id = [string]$openOp.operation_id; binding_id = $bindingId; generation = $generation
+                    })
+                }
+                catch {
+                    $catalogDiagnostic = [ordered]@{
+                        schema_version = 1
+                        captured_at_utc = [DateTime]::UtcNow.ToString('o')
+                        capture_status = 'unavailable'
+                        reason_code = 'OPENCODE_SELECTED_CATALOG_DIAGNOSTIC_UNAVAILABLE'
+                        scope = [ordered]@{ mode = 'rejected_open_diagnostic' }
+                    }
+                }
+                $script:Report.safe_facts.opencode_selected_catalog_diagnostic = $catalogDiagnostic
+                $failureFacts.selected_catalog_diagnostic_status = $catalogDiagnostic.capture_status
+                $failureFacts.selected_catalog_diagnostic_reason = $catalogDiagnostic.reason_code
+            }
             Add-Stage -Name 'module_open_and_hello' -Status 'blocked' -Code $terminalCode -Facts ([ordered]@{ parent_operation_id=$parentOperationId; open_operation_id=[string]$openOp.operation_id; dispatch_started=$false; readiness_failure=$failureFacts })
             Stop-Qualification $terminalCode
         }
@@ -2386,6 +2845,31 @@ try {
     $generation = [long]$readyProof.generation
     $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; launch_phase = 'awaiting_native_mcp'; native_dispatch_capability_state = 'ready'; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
     Add-Stage -Name 'module_open_and_hello' -Status 'passed' -Facts $script:Report.safe_facts.launch
+
+    if ($Adapter -eq 'OpenCode') {
+        $script:CurrentStage = 'selected_server_catalog'
+        try {
+            $catalogEvidence = Get-OpenCodeSelectedCatalogEvidence -Route $route -RouteModel $routeModel -Contract $contract -Mode 'pre_dispatch' -OperationScope ([ordered]@{
+                task_id = $taskId; attempt_id = $attemptId; parent_operation_id = $parentOperationId
+                open_operation_id = $openOperationId; binding_id = $bindingId; generation = $generation
+            })
+        }
+        catch {
+            $catalogEvidence = [ordered]@{
+                schema_version = 1
+                captured_at_utc = [DateTime]::UtcNow.ToString('o')
+                capture_status = 'unavailable'
+                reason_code = 'OPENCODE_SELECTED_CATALOG_CAPTURE_UNAVAILABLE'
+                scope = [ordered]@{ mode = 'pre_dispatch' }
+            }
+        }
+        $script:Report.safe_facts.opencode_selected_catalog = $catalogEvidence
+        $catalogGate = Test-OpenCodeSelectedCatalogEvidence -Evidence $catalogEvidence -Contract $contract
+        if (-not $catalogGate.qualified) { $script:Report.qualification = 'not_qualified' }
+        $catalogStageFacts = Get-OpenCodeSelectedCatalogStageFacts -Evidence $catalogEvidence
+        Add-Stage -Name 'selected_server_catalog' -Status $catalogGate.stage_status -Code $catalogGate.code -Facts $catalogStageFacts
+        if (-not $catalogGate.dispatch_allowed) { Stop-Qualification $catalogGate.code }
+    }
 
     $script:CurrentStage = 'single_task_dispatch'
     if ($Adapter -eq 'OpenCode') {
