@@ -1,5 +1,18 @@
 # Current-source audit and implementation ledger
 
+The [OpenCode result-page ACK repair](../2026-10-11/OPENCODE-RESULT-ACK-RECOVERY.json)
+extends the same stable-prefix repair to independently saved result pages.
+Production outbox preparation repairs/defer-isolates both outcome and result
+items; result acknowledgement is exact and idempotent. The connected result
+fixture reopens a torn saved page without an outcome, resends it once through
+the real drain with a fixture sender, delivers 33 independent pages across the
+batch bound, preserves complete corrupt bytes, refuses an altered page, and
+does not resend or append another ACK to an already acknowledged prefix.
+Strict affected production Clippy and both outcome/result drain regressions
+pass on Windows/Linux. The fixture sender does not execute a real ModuleLink
+or Store/native transport. Full PR65/public/installed/crash/load qualification
+remains pending.
+
 The [Antigravity child workspace update repair](../2026-10-11/AG-WORKSPACE-URI-EVIDENCE.json)
 preserves prior workspace URIs when a child update omits the field, clears them
 for an explicit empty array, and applies the existing bounds to a supplied array.
@@ -21,7 +34,11 @@ Strict production Clippy and all four selected regressions pass on Windows/Linux
 The Windows fixture also crosses a real denied-open boundary. The Node fake-SDK
 bridge selftest passes. These fixtures do not execute the Rust run_owned process
 loop or prove parent-owned family departure. Exited/stdout diagnostic ordering
-can still yield a generic exit reason. Installed/native/crash/load qualification
+can still yield a generic exit reason. The journal fixture manually acknowledges
+after a fixture recorded response; it does not execute production flush or a real
+ModuleLink. The existing exact SDK 0.3.287 gate still requires review against the
+capability/interface contract; no dependency update is made by this source slice.
+Installed/native/crash/load qualification
 remains pending; initial failed receipts are retained.
 
 The [OpenCode torn-ACK recovery repair](../2026-10-11/OPENCODE-TORN-ACK-RECOVERY.json)

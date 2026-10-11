@@ -2403,15 +2403,18 @@ fn prepare_outbox_batch(
     let mut prepared = Vec::with_capacity(items.len());
     let mut deferred_paths = Vec::new();
     for (path, item) in items {
-        if item.kind == "outcome" {
-            match journal.repair_torn_outcome_ack(&item.payload) {
-                Ok(_) => {}
-                Err(error) if error.code == "ADAPTER_JOURNAL_RECOVERY_UNKNOWN" => {
-                    deferred_paths.push(path);
-                    continue;
-                }
-                Err(error) => return Err(error),
+        let repair = match item.kind.as_str() {
+            "outcome" => journal.repair_torn_outcome_ack(&item.payload),
+            "result" => journal.repair_torn_result_ack(&item.payload),
+            _ => Ok(false),
+        };
+        match repair {
+            Ok(_) => {}
+            Err(error) if error.code == "ADAPTER_JOURNAL_RECOVERY_UNKNOWN" => {
+                deferred_paths.push(path);
+                continue;
             }
+            Err(error) => return Err(error),
         }
         prepared.push(PreparedOutboxItem { path, item });
     }
@@ -2754,6 +2757,179 @@ mod outbox_recovery_tests {
             model: json!({"id":"fixture-model"}),
             marker: json!({"fixture_native_effect_was_already_attempted":true}),
         }
+    }
+
+    #[tokio::test]
+    async fn consumer_recovers_result_page_ack_without_outcome_and_drains_past_corruption() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-opencode-result-ack-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let page = |operation_id: &str| {
+            json!({
+                "operation_id":operation_id,
+                "page":{"source":{"native_session_id":"fixture-root"},
+                    "text":format!("exact saved page {operation_id}"),"complete":true}
+            })
+        };
+        let recovered_id = "recovered-result";
+        let recovered = page(recovered_id);
+        let mut intent = fixture_effect_intent(recovered_id);
+        intent.method = "agent.result".to_owned();
+        journal.write_intent(&intent).unwrap();
+        journal.queue_result(&recovered).unwrap();
+        let mut expected_pages = HashMap::new();
+        expected_pages.insert(recovered_id.to_owned(), recovered.clone());
+        for index in 0..33 {
+            let operation_id = format!("independent-result-{index:02}");
+            let params = page(&operation_id);
+            journal.queue_result(&params).unwrap();
+            expected_pages.insert(operation_id, params);
+        }
+        let corrupt_id = "corrupt-result";
+        journal.queue_result(&page(corrupt_id)).unwrap();
+        let acknowledged_id = "already-acknowledged-result";
+        let acknowledged = page(acknowledged_id);
+        journal.queue_result(&acknowledged).unwrap();
+        journal.acknowledge_result(&acknowledged).unwrap();
+        let path = |operation_id: &str| {
+            root.join("operations")
+                .join(format!("{}.jsonl", operation_key(operation_id)))
+        };
+        let recovered_path = path(recovered_id);
+        let recovered_prefix = std::fs::read(&recovered_path).unwrap();
+        let acknowledged_path = path(acknowledged_id);
+        let acknowledged_prefix = std::fs::read(&acknowledged_path).unwrap();
+        for torn_path in [&recovered_path, &acknowledged_path] {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(torn_path)
+                .unwrap()
+                .write_all(b"{\"kind\":\"result_acknowledged\"")
+                .unwrap();
+        }
+        let corrupt_path = path(corrupt_id);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&corrupt_path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+        let unrepaired_bytes = std::fs::read(&recovered_path).unwrap();
+        let mut altered = recovered.clone();
+        altered["page"]["text"] = json!("altered page");
+        assert_eq!(
+            journal.repair_torn_result_ack(&altered).unwrap_err().code,
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+        );
+        assert_eq!(std::fs::read(&recovered_path).unwrap(), unrepaired_bytes);
+        assert!(journal.load(recovered_id).unwrap().outcome.is_none());
+        drop(journal);
+
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        journal.recover_outbox().unwrap();
+        let mut deliveries = Vec::new();
+        flush_outbox_with_sender(
+            &journal,
+            |method, payload| {
+                let operation_id = payload["operation_id"].as_str().unwrap();
+                let history = journal.load(operation_id).unwrap();
+                assert!(history.torn_tail_evidence.is_none());
+                assert!(
+                    history.outcome.is_none(),
+                    "a result page needs no outcome ACK"
+                );
+                assert!(history.result_acknowledged_sha256.is_none());
+                assert!(!history.native_replay_permitted());
+                if operation_id == recovered_id {
+                    assert_eq!(std::fs::read(&recovered_path).unwrap(), recovered_prefix);
+                }
+                let recorded =
+                    method == "module.result" && expected_pages.get(operation_id) == Some(&payload);
+                deliveries.push((method.to_owned(), payload));
+                async move {
+                    if recorded {
+                        Ok(())
+                    } else {
+                        Err(Error::new(
+                            "HOST_ACK_SCHEMA",
+                            "fixture rejected an unsaved result page",
+                        ))
+                    }
+                }
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(deliveries.len(), expected_pages.len());
+        assert!(
+            deliveries
+                .iter()
+                .all(|(method, _)| method == "module.result")
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|(_, payload)| payload["operation_id"] == recovered_id)
+                .count(),
+            1
+        );
+        assert!(
+            !deliveries
+                .iter()
+                .any(|(_, payload)| payload["operation_id"] == corrupt_id
+                    || payload["operation_id"] == acknowledged_id)
+        );
+        for (operation_id, params) in &expected_pages {
+            let history = journal.load(operation_id).unwrap();
+            assert!(history.outcome.is_none());
+            assert_eq!(history.result_params.as_ref(), Some(params));
+            assert_eq!(
+                history.result_acknowledged_sha256.as_deref(),
+                Some(digest_json(params).unwrap().as_str())
+            );
+        }
+        let repaired_bytes = std::fs::read(&recovered_path).unwrap();
+        let ack_suffix = repaired_bytes
+            .strip_prefix(recovered_prefix.as_slice())
+            .unwrap();
+        assert_eq!(ack_suffix.last(), Some(&b'\n'));
+        let ack_frame: Value = serde_json::from_slice(&ack_suffix[..ack_suffix.len() - 1]).unwrap();
+        assert_eq!(ack_frame["kind"], "result_acknowledged");
+        assert_eq!(ack_frame["result_sha256"], digest_json(&recovered).unwrap());
+        assert_eq!(
+            std::fs::read(&acknowledged_path).unwrap(),
+            acknowledged_prefix
+        );
+        journal.acknowledge_result(&acknowledged).unwrap();
+        assert_eq!(
+            std::fs::read(&acknowledged_path).unwrap(),
+            acknowledged_prefix
+        );
+        assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
+        let pending = journal.pending_items().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.key, corrupt_id);
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

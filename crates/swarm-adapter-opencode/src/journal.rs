@@ -113,6 +113,29 @@ pub struct OperationHistory {
     pub torn_tail_evidence: Option<TornTailEvidence>,
 }
 
+#[derive(Clone, Copy)]
+enum SavedAcknowledgement {
+    Outcome,
+    ResultPage,
+}
+
+impl SavedAcknowledgement {
+    fn fields(self, history: &OperationHistory) -> (Option<&Value>, Option<&str>, Option<&str>) {
+        match self {
+            Self::Outcome => (
+                history.outcome.as_ref(),
+                history.outcome_sha256.as_deref(),
+                history.acknowledged_sha256.as_deref(),
+            ),
+            Self::ResultPage => (
+                history.result_params.as_ref(),
+                history.result_sha256.as_deref(),
+                history.result_acknowledged_sha256.as_deref(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TornTailEvidence {
     pub valid_prefix_bytes: usize,
@@ -556,6 +579,16 @@ impl Journal {
                 "result acknowledgement differs from the saved page",
             ));
         }
+        if history.torn_tail_evidence.is_some() && !self.repair_torn_result_ack(params)? {
+            return Err(torn_ack_recovery_unknown());
+        }
+        let history = self.load(operation_id)?;
+        if history.result_acknowledged_sha256.as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
+        if history.result_acknowledged_sha256.is_some() {
+            return Err(torn_ack_recovery_unknown());
+        }
         self.append(
             operation_id,
             &JournalRecord {
@@ -865,10 +898,24 @@ impl Journal {
     /// Remove only a bounded torn suffix after rescanning the exact saved
     /// outcome prefix. The suffix never proves that the host acknowledged it.
     pub fn repair_torn_outcome_ack(&self, outcome: &Value) -> Result<bool> {
-        let operation_id = outcome["operation_id"].as_str().ok_or_else(|| {
-            Error::new("ADAPTER_OUTBOX", "acknowledged outcome has no operation ID")
+        self.repair_torn_ack(outcome, SavedAcknowledgement::Outcome)
+    }
+
+    /// A result page is retained independently of the Operation outcome.
+    /// Repair its exact saved prefix before resending it to Store; a torn ACK
+    /// never authorizes native result replay or proves Store acknowledgement.
+    pub fn repair_torn_result_ack(&self, params: &Value) -> Result<bool> {
+        self.repair_torn_ack(params, SavedAcknowledgement::ResultPage)
+    }
+
+    fn repair_torn_ack(&self, payload: &Value, kind: SavedAcknowledgement) -> Result<bool> {
+        let operation_id = payload["operation_id"].as_str().ok_or_else(|| {
+            Error::new(
+                "ADAPTER_OUTBOX",
+                "saved acknowledgement has no operation ID",
+            )
         })?;
-        let digest = digest_json(outcome)?;
+        let digest = digest_json(payload)?;
         let path = self.operation_path(operation_id);
         ensure_regular(&path, "operation journal").map_err(|_| torn_ack_recovery_unknown())?;
         let mut file = OpenOptions::new()
@@ -881,12 +928,10 @@ impl Journal {
         let Some(evidence) = opened_history.torn_tail_evidence.as_ref() else {
             return Ok(false);
         };
-        let acknowledged_sha256 = opened_history.acknowledged_sha256.clone();
-        if opened_history.outcome.as_ref() != Some(outcome)
-            || opened_history.outcome_sha256.as_deref() != Some(digest.as_str())
-            || acknowledged_sha256
-                .as_deref()
-                .is_some_and(|saved| saved != digest)
+        let (saved_payload, saved_digest, acknowledged_sha256) = kind.fields(&opened_history);
+        if saved_payload != Some(payload)
+            || saved_digest != Some(digest.as_str())
+            || acknowledged_sha256.is_some_and(|saved| saved != digest)
         {
             return Err(torn_ack_recovery_unknown());
         }
@@ -922,9 +967,8 @@ impl Journal {
             .map_err(|_| torn_ack_recovery_unknown())?;
         if verified_bytes != repaired_bytes
             || verified_history.torn_tail_evidence.is_some()
-            || verified_history.outcome.as_ref() != Some(outcome)
-            || verified_history.outcome_sha256.as_deref() != Some(digest.as_str())
-            || verified_history.acknowledged_sha256 != acknowledged_sha256
+            || kind.fields(&verified_history)
+                != (Some(payload), Some(digest.as_str()), acknowledged_sha256)
         {
             return Err(torn_ack_recovery_unknown());
         }
@@ -1302,7 +1346,7 @@ fn acknowledged_outcome_record(operation_id: &str, digest: &str) -> JournalRecor
 fn torn_ack_recovery_unknown() -> Error {
     Error::new(
         "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
-        "torn journal suffix could not be safely removed from the exact saved outcome prefix",
+        "torn journal suffix could not be safely removed from the exact saved payload prefix",
     )
 }
 

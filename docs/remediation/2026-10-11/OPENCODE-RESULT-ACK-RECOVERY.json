@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-11",
+  "source_base_commit": "3b26312ec3f8d13bb134d64ab4da0f3d2090be10",
+  "verification_checkout_base": "3e6009fee4d92655701e789856370ae64a352b0d",
+  "toolchain": "Rust 1.98.1",
+  "status": "result_and_outcome_source_drain_verified_full_PR65_qualification_pending",
+  "source_sha256": {
+    "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+    "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+    "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+    "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+  },
+  "source_chain": "handle_result/handle_assistant_result -> queue_result -> persisted result item -> prepare_outbox_batch -> shared stable-prefix repair -> flush_outbox_with_sender -> module.result -> acknowledge_result -> durable exact ACK",
+  "behavior": [
+    "One shared bounded/stable/opened-identity prefix repair for saved outcomes and independently saved result pages",
+    "Result ACK repair needs no saved Operation outcome, never synthesizes ACK and never authorizes native replay",
+    "Result corruption is deferred and excluded before subsequent batch limits, preserving unrelated drain",
+    "Matching saved ACK is idempotent; existing ACK prefix is preserved without resend or duplicate append"
+  ],
+  "checks": [
+    {
+      "platform": "windows",
+      "slice": "opencode",
+      "gate": "clippy",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-adapter-opencode",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "base_commit": "3e6009fee4d92655701e789856370ae64a352b0d",
+      "source_sha256_before": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_sha256_after": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_stable": true,
+      "started_at_utc": "2026-10-11T13:39:48.1472431Z",
+      "completed_at_utc": "2026-10-11T13:39:52.0491885Z",
+      "log_sha256": "b1ce793e4706753bd14b4662785d9fbda99e104cf6e5a789a7632e7f96fde7fd"
+    },
+    {
+      "platform": "windows",
+      "slice": "opencode",
+      "gate": "tests",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-adapter-opencode",
+        "--lib",
+        "-E",
+        "test(consumer_recovers_result_page_ack_without_outcome_and_drains_past_corruption) | test(consumer_resends_recovered_outcome_without_native_replay_and_drains_past_corruption)"
+      ],
+      "base_commit": "3e6009fee4d92655701e789856370ae64a352b0d",
+      "source_sha256_before": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_sha256_after": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_stable": true,
+      "started_at_utc": "2026-10-11T13:40:15.5708608Z",
+      "completed_at_utc": "2026-10-11T13:40:29.390432Z",
+      "log_sha256": "f727a54767c092c2dc9443aa00ae19e27d6a56668aab2a12f51d567ea0bf761a"
+    },
+    {
+      "platform": "linux",
+      "slice": "opencode",
+      "gate": "clippy",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-adapter-opencode",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "base_commit": "3e6009fee4d92655701e789856370ae64a352b0d",
+      "source_sha256_before": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_sha256_after": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_stable": true,
+      "started_at_utc": "2026-10-11T13:39:48.1539481Z",
+      "completed_at_utc": "2026-10-11T13:39:56.31069Z",
+      "log_sha256": "64676cf783ea1ba742bf686ec022957200af32fbac0b716ab8cb0afdf2956189"
+    },
+    {
+      "platform": "linux",
+      "slice": "opencode",
+      "gate": "tests",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-adapter-opencode",
+        "--lib",
+        "-E",
+        "test(consumer_recovers_result_page_ack_without_outcome_and_drains_past_corruption) | test(consumer_resends_recovered_outcome_without_native_replay_and_drains_past_corruption)"
+      ],
+      "base_commit": "3e6009fee4d92655701e789856370ae64a352b0d",
+      "source_sha256_before": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_sha256_after": {
+        "crates/swarm-adapter-opencode/src/journal.rs": "36cd098d2646dcc4dbe8675a12429285fc49c530ff1463e0ae124e6b34fece94",
+        "crates/swarm-adapter-opencode/src/lib.rs": "8722ca013d4112b1333df863203833840d918fad93e8f5999e148ef0c8b860d8",
+        "crates/swarm-process/src/lib.rs": "c8764c7e804ce575137529cfbcca7234b61d97c19e076c103aa4ede60139e0f6",
+        "crates/swarm-process/src/permissions.rs": "1434b744a84934e2a895424bf727273c57ab2f7c027ef4429cb92a6c5063f493"
+      },
+      "source_stable": true,
+      "started_at_utc": "2026-10-11T13:40:15.6181123Z",
+      "completed_at_utc": "2026-10-11T13:40:27.8518386Z",
+      "log_sha256": "3a2ee09d2524e0d05a0109315c7b9dd696ccad5ae1f3a62fa8827a6d70d0ba48"
+    }
+  ],
+  "test_results": {
+    "windows": {
+      "passed": 2,
+      "failed": 0,
+      "selected": 2
+    },
+    "linux": {
+      "passed": 2,
+      "failed": 0,
+      "selected": 2
+    }
+  },
+  "result_fixture_observations": [
+    "Reopen torn saved page with no outcome",
+    "Altered payload refuses repair and preserves bytes",
+    "Recovered page delivered once before ACK existed",
+    "Recovered page plus 33 independent pages drained",
+    "Complete corruption preserved and one corrupt pending item retained",
+    "Already ACKed torn prefix repaired without sending or adding an ACK"
+  ],
+  "limits": [
+    "Production drain/journal code runs with a fixture sender; no real ModuleLink, Store or native transport exercised",
+    "Existing unrelated test-only native_mcp.rs unused directory warning retained; strict production Clippy clean",
+    "No native/model effects or historical execution replay",
+    "Full PR65/public/installed/Windows/Linux/crash/load matrix remains pending"
+  ]
+}

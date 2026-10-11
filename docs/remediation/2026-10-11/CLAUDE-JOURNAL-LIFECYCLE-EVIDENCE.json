@@ -141,6 +141,8 @@
     "v2 Windows/Linux: 3 passed, 1 failed on stale diagnostic assertion; v3 affected-only repair passed; v4 final production change gates passed"
   ],
   "known_limits": [
+    "Journal fixture manually acknowledges after a fixture recorded:true response; it does not exercise production flush or actual ModuleLink",
+    "Existing exact SDK 0.3.287 gate remains under capability/interface-contract review; no SDK version change was made",
     "Rust fixture calls frame handler and callback retirement; run_owned loop/stdin-drop examined in source, not executed",
     "Node fixture uses a fake SDK; no paid/native model call",
     "NativeHarness Exited may arrive before stdout Unknown frame, producing a generic exit diagnostic",
