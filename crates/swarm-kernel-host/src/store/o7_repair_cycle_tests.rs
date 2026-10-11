@@ -196,6 +196,23 @@ async fn configure_review_repair_entry(store: &Store, manager_id: &str, automati
         .unwrap();
 }
 
+async fn set_repair_binding_state(store: &Store, binding_id: &str, state: &str) {
+    assert!(matches!(state, "ready" | "reconciling"));
+    let binding_id = binding_id.to_owned();
+    let state = state.to_owned();
+    store
+        .run(move |db| {
+            let changed = db.execute(
+                "UPDATE bindings SET state=?1 WHERE binding_id=?2 AND generation=1 AND released_at_ms IS NULL",
+                params![state, binding_id],
+            )?;
+            assert_eq!(changed, 1, "the exact fixture binding remains retained");
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
 async fn consume_review_disposition_and_repair(
     store: &Store,
     manager_id: &str,
@@ -1119,7 +1136,7 @@ async fn same_attempt_return_repair_fresh_review_and_acceptance_bind_to_candidat
 }
 
 #[tokio::test]
-async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_under_current_cause() {
+async fn delayed_first_repair_reuses_middle_same_content_slot_after_feedback_without_repair() {
     let (owner, directory, bootstrap) = start_store_with_config(
         "o7-cross-review-repair-content",
         super::repair_fixture_config(),
@@ -1151,6 +1168,7 @@ async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_und
     add_submission_source_fact(&owner.store, "o7-cross-review-repair", &subject).await;
     let attempt_id = subject.attempt_id.clone();
     let binding_id = attach_ready_repair_binding(&owner.store, &subject).await;
+    set_repair_binding_state(&owner.store, &binding_id, "reconciling").await;
 
     let (reviewer_one, assignment_one) = assign_sponsored_reviewer(
         &owner.store,
@@ -1191,6 +1209,37 @@ async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_und
         .await
         .unwrap();
 
+    let reviewer_three_id = "o7-cross-review-repair-reviewer-three";
+    let reviewer_three_token = "o7-cross-review-repair-token-three";
+    let pending_scope_three = json!({
+        "review_assignment_id":null,
+        "task_id":subject.task_id,
+        "attempt_id":subject.attempt_id,
+        "task_revision":1,
+        "submission_ref":subject.submission_ref,
+        "candidate_ref":subject.candidate_ref,
+    });
+    owner
+        .store
+        .call(
+            task_owner.clone(),
+            "coordination.participant.register".into(),
+            json!({
+                "client_request_id":"register-o7-cross-review-repair-reviewer-three",
+                "client_id":reviewer_three_id,
+                "token_hash":model::digest(reviewer_three_token.as_bytes()),
+                "task_id":subject.task_id,
+                "task_revision":1,
+                "attempt_id":subject.attempt_id,
+                "participation_basis":{
+                    "kind":"sponsored_reviewer",
+                    "review_scope":pending_scope_three
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
     let automation_id = "o7-cross-review-repair";
     configure_review_repair_entry(&owner.store, &task_owner.client_id, automation_id).await;
     let result_one = owner
@@ -1223,6 +1272,19 @@ async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_und
     assert_eq!(first["disposition_applied"], true, "{first}");
     assert_eq!(first["review_assignment_id"], assignment_one);
     assert_eq!(first["review_result_operation_id"], result_one_id);
+    assert_eq!(first["repair_dispatch"]["status"], "pending");
+    assert_eq!(
+        first["repair_dispatch"]["reason"],
+        "current_owner_binding_not_ready"
+    );
+    assert_eq!(
+        first["repair_dispatch"]["wake_when"],
+        json!(["owner_binding_ready"])
+    );
+    assert_eq!(
+        repair_dispatch_count_for_attempt(&owner.store, &attempt_id).await,
+        0
+    );
     let feedback_operation_id = first["feedback"]["operation_id"]
         .as_str()
         .unwrap()
@@ -1283,34 +1345,7 @@ async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_und
         first_disposition_before["task_feedback_operation_id"],
         feedback_operation_id
     );
-
-    let repair_operation_id =
-        repair_operation_for_review(&owner.store, &assignment_one, &result_one_id).await;
-    assert_eq!(
-        repair_dispatch_count_for_attempt(&owner.store, &attempt_id).await,
-        1
-    );
-    let repair_before = operation_byte_snapshot(&owner.store, &repair_operation_id).await;
-    let repair_request: Value = serde_json::from_str(&repair_before.3).unwrap();
-    assert_eq!(repair_request["binding_id"], binding_id);
-    assert_eq!(repair_request["generation"], 1);
-    let repair_link_key = format!("repair:v1:operation-link:{repair_operation_id}");
-    let repair_link_before = meta_json_bytes(&owner.store, &repair_link_key).await;
-    let repair_link_envelope: Value = serde_json::from_str(&repair_link_before).unwrap();
-    assert_eq!(repair_link_envelope["schema_version"], 1);
-    let repair_link = repair_link_envelope["record"].clone();
-    assert_eq!(
-        repair_link["schema_version"], 2,
-        "the retained RepairDispatch record has its own schema version inside the sealed v1 envelope"
-    );
-    assert_eq!(repair_link["operation_id"], repair_operation_id);
-    assert_eq!(repair_link["review_assignment_id"], assignment_one);
-    assert_eq!(repair_link["review_result_operation_id"], result_one_id);
-    let repair_slot_key = format!(
-        "repair:v1:semantic-slot:{}",
-        repair_link["semantic_slot_id"].as_str().unwrap()
-    );
-    let repair_slot_before = meta_json_bytes(&owner.store, &repair_slot_key).await;
+    set_repair_binding_state(&owner.store, &binding_id, "ready").await;
 
     let replacement = owner
         .store
@@ -1394,6 +1429,45 @@ async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_und
         result_two_id
     );
 
+    let repair_operation_id =
+        repair_operation_for_review(&owner.store, &assignment_two, &result_two_id).await;
+    assert_eq!(
+        repair_dispatch_count_for_attempt(&owner.store, &attempt_id).await,
+        1
+    );
+    let repair_before = operation_byte_snapshot(&owner.store, &repair_operation_id).await;
+    let repair_request: Value = serde_json::from_str(&repair_before.3).unwrap();
+    assert_eq!(repair_request["binding_id"], binding_id);
+    assert_eq!(repair_request["generation"], 1);
+    let repair_link_key = format!("repair:v1:operation-link:{repair_operation_id}");
+    let repair_link_before = meta_json_bytes(&owner.store, &repair_link_key).await;
+    let repair_link_envelope: Value = serde_json::from_str(&repair_link_before).unwrap();
+    assert_eq!(repair_link_envelope["schema_version"], 1);
+    let repair_link = repair_link_envelope["record"].clone();
+    assert_eq!(
+        repair_link["schema_version"], 2,
+        "the retained RepairDispatch record has its own schema version inside the sealed v1 envelope"
+    );
+    assert_eq!(repair_link["operation_id"], repair_operation_id);
+    assert_eq!(repair_link["review_assignment_id"], assignment_two);
+    assert_eq!(repair_link["review_result_operation_id"], result_two_id);
+    let package_two: crate::review::ReviewFindingsPackage =
+        serde_json::from_value(repair_link["findings_package"].clone()).unwrap();
+    assert_eq!(
+        package_two.findings_digest,
+        second["disposition"]["findings_digest"]
+    );
+    let content_digest_a = retained_feedback_package
+        .correction_content_digest()
+        .unwrap();
+    let content_digest_b = package_two.correction_content_digest().unwrap();
+    assert_eq!(content_digest_a, content_digest_b);
+    let repair_slot_key = format!(
+        "repair:v1:semantic-slot:{}",
+        repair_link["semantic_slot_id"].as_str().unwrap()
+    );
+    let repair_slot_before = meta_json_bytes(&owner.store, &repair_slot_key).await;
+
     let second_disposition = disposition_payload(&owner.store, &assignment_two).await;
     assert_eq!(second_disposition["review_assignment_id"], assignment_two);
     assert_eq!(
@@ -1414,11 +1488,129 @@ async fn content_key_feedback_from_replacement_review_reuses_repair_dispatch_und
     );
     assert_eq!(delivered_feedback_count(&owner.store).await, 1);
     assert_eq!(
-        repair_dispatch_count_for_attempt(&owner.store, &attempt_id).await,
-        1
+        repair_operation_for_review(&owner.store, &assignment_two, &result_two_id).await,
+        repair_operation_id
+    );
+
+    let replacement_three = owner
+        .store
+        .call(
+            task_owner.clone(),
+            "review.assign".into(),
+            json!({
+                "client_request_id":"assign-o7-cross-review-repair-reviewer-three",
+                "attempt_id":subject.attempt_id,
+                "expected_revision":1,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "reviewer_client_id":reviewer_three_id,
+                "replaces_review_assignment_id":assignment_two,
+                "replacement_reason":"a third review retains the same ordered correction content",
+                "replacement_evidence_refs":[subject.candidate_ref],
+            }),
+        )
+        .await
+        .unwrap();
+    let assignment_three = replacement_three["review_assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(assignment_three, assignment_two);
+    let reviewer_three = owner
+        .store
+        .authenticate(crate::model::Credential {
+            client_id: reviewer_three_id.to_owned(),
+            token: reviewer_three_token.to_owned(),
+        })
+        .await
+        .unwrap();
+    let result_three = owner
+        .store
+        .call(
+            reviewer_three,
+            "review.submit".into(),
+            review_result_request(
+                &subject,
+                &assignment_three,
+                "review-o7-cross-review-repair-three",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_three["verdict"], "changes_requested");
+    let result_three_id = result_three["operation_id"].as_str().unwrap().to_owned();
+    let third_consumed = consume_review_disposition_and_repair(
+        &owner.store,
+        &task_owner.client_id,
+        automation_id,
+        &assignment_three,
+        &result_three_id,
+        Some(&feedback_operation_id),
+    )
+    .await;
+    let package_three = crate::review::ReviewFindingsPackage::new(
+        package_two.identity.clone(),
+        assignment_three.clone(),
+        result_three_id.clone(),
+        package_two.findings.clone(),
+    )
+    .unwrap();
+    let content_digest = content_digest_b;
+    let third = match third_consumed {
+        Ok(value) => value,
+        Err((error, diagnostic)) => panic!(
+            "third same-content consumer failed after B queued its RepairDispatch; A/B/C provenance digests={}, {}, {}; common correction_content_digest={}; error={error:?}; diagnostic={diagnostic}",
+            retained_feedback_package.findings_digest,
+            package_two.findings_digest,
+            package_three.findings_digest,
+            content_digest,
+        ),
+    };
+    assert_eq!(third["disposition_applied"], true, "{third}");
+    assert_eq!(third["review_assignment_id"], assignment_three);
+    assert_eq!(third["review_result_operation_id"], result_three_id);
+    assert_eq!(third["feedback"]["operation_id"], feedback_operation_id);
+    assert_eq!(third["feedback"]["resend_suppressed"], true);
+    assert_eq!(third["repair_dispatch"]["status"], "pending");
+    assert_eq!(third["repair_dispatch"]["delivery_verified"], false);
+    assert_eq!(
+        third["repair_dispatch"]["wake_when"],
+        json!(["exact_delivery_operation_readback"])
     );
     assert_eq!(
-        repair_operation_for_review(&owner.store, &assignment_one, &result_one_id).await,
+        third["repair_dispatch"]["review_assignment_id"],
+        assignment_three
+    );
+    assert_eq!(
+        third["repair_dispatch"]["review_result_operation_id"],
+        result_three_id
+    );
+    let third_disposition = disposition_payload(&owner.store, &assignment_three).await;
+    assert_eq!(
+        third_disposition["task_feedback_operation_id"],
+        feedback_operation_id
+    );
+    assert_ne!(package_two.findings_digest, package_three.findings_digest);
+    assert_eq!(
+        retained_feedback_package
+            .correction_content_digest()
+            .unwrap(),
+        content_digest
+    );
+    assert_eq!(
+        package_three.correction_content_digest().unwrap(),
+        content_digest
+    );
+    assert_eq!(
+        repair_dispatch_count_for_attempt(&owner.store, &attempt_id).await,
+        1,
+        "C must reuse B's exact unresolved slot and Operation; A/B/C provenance digests={}, {}, {}; common correction_content_digest={content_digest}",
+        retained_feedback_package.findings_digest,
+        package_two.findings_digest,
+        package_three.findings_digest,
+    );
+    assert_eq!(
+        repair_operation_for_review(&owner.store, &assignment_two, &result_two_id).await,
         repair_operation_id
     );
 

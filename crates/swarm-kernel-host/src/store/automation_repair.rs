@@ -590,6 +590,7 @@ fn consume_transferred_repair_slot(
             current_context.findings_package(),
             current_context.feedback_findings_package(),
             &current.request_value(),
+            &[],
         )?;
         let Some(resolved) = resolve_slot_candidate_set(
             tx,
@@ -1493,6 +1494,7 @@ fn resolve_semantic_slot_candidate(
     db: &Connection,
     prepared: &PreparedRepairDispatch,
 ) -> Result<Option<ResolvedRepairSlotCandidate>> {
+    let retained_packages = retained_same_content_packages_for_entry(db, prepared)?;
     resolve_slot_candidate(
         db,
         prepared.context.effective_manager_id(),
@@ -1503,7 +1505,62 @@ fn resolve_semantic_slot_candidate(
         prepared.context.binding_generation(),
         prepared.context.semantic_slot_id(),
         &prepared.request_value(),
+        &retained_packages,
     )
+}
+
+fn retained_same_content_packages_for_entry(
+    db: &Connection,
+    prepared: &PreparedRepairDispatch,
+) -> Result<Vec<ReviewFindingsPackage>> {
+    let context = prepared.context();
+    let content_digest = context.findings_package().correction_content_digest()?;
+    let mut after_operation_id = String::new();
+    let mut packages = Vec::new();
+
+    loop {
+        let links = entry_operation_links(
+            db,
+            context.effective_manager_id(),
+            context.project_id(),
+            context.automation_id(),
+            &after_operation_id,
+            128,
+        )?;
+        if links.is_empty() {
+            break;
+        }
+        let has_more = links.len() == 128;
+        after_operation_id = links
+            .last()
+            .expect("a nonempty entry-link page has a last operation")
+            .operation_id
+            .clone();
+
+        for link in links {
+            if link.binding_id != context.binding_id()
+                || link.binding_generation != context.binding_generation()
+            {
+                continue;
+            }
+            let package = findings_package_from_link(&link)?;
+            if package.identity != *context.identity()
+                || package.correction_content_digest()? != content_digest
+                || packages.iter().any(|retained: &ReviewFindingsPackage| {
+                    retained.findings_digest == package.findings_digest
+                })
+            {
+                continue;
+            }
+            packages.push(package);
+        }
+
+        if !has_more {
+            break;
+        }
+    }
+
+    Ok(packages)
 }
 
 #[allow(clippy::too_many_arguments)] // Every value is part of the exact direct/automatic slot proof.
@@ -1528,6 +1585,7 @@ fn resolve_slot_candidates(
         binding_generation,
         current_semantic_slot_id,
         request_template,
+        &[],
     )?
     .map_or(RepairSlotResolution::Vacant, |resolved| resolved.resolution))
 }
@@ -1543,6 +1601,7 @@ fn resolve_slot_candidate(
     binding_generation: i64,
     current_semantic_slot_id: &str,
     request_template: &Value,
+    retained_packages: &[ReviewFindingsPackage],
 ) -> Result<Option<ResolvedRepairSlotCandidate>> {
     let current_ids = semantic_slot_id_candidates(manager_id, identity, findings_package)?;
     if !current_ids
@@ -1560,6 +1619,7 @@ fn resolve_slot_candidate(
         findings_package,
         feedback_findings_package,
         request_template,
+        retained_packages,
     )?;
     resolve_slot_candidate_set(
         db,
@@ -1577,6 +1637,7 @@ fn repair_slot_candidates(
     findings_package: &ReviewFindingsPackage,
     feedback_findings_package: &ReviewFindingsPackage,
     request_template: &Value,
+    retained_packages: &[ReviewFindingsPackage],
 ) -> Result<Vec<RepairSlotCandidate>> {
     if findings_package.identity != *identity || feedback_findings_package.identity != *identity {
         return Err(Error::new(
@@ -1592,12 +1653,24 @@ fn repair_slot_candidates(
             "current and retained feedback packages have different correction content",
         ));
     }
-    let mut packages = vec![findings_package];
-    if feedback_findings_package != findings_package {
-        packages.push(feedback_findings_package);
+    let content_digest = findings_package.correction_content_digest()?;
+    let mut packages: Vec<&ReviewFindingsPackage> = Vec::new();
+    for package in [findings_package, feedback_findings_package]
+        .into_iter()
+        .chain(retained_packages)
+    {
+        if !packages.contains(&package) {
+            packages.push(package);
+        }
     }
     let mut candidates = Vec::new();
     for package in packages {
+        if package.identity != *identity || package.correction_content_digest()? != content_digest {
+            return Err(Error::new(
+                "REPAIR_SLOT_CORRUPT",
+                "candidate RepairDispatch packages differ from the exact correction content",
+            ));
+        }
         for semantic_slot_id in semantic_slot_id_candidates(manager_id, identity, package)? {
             let mut request = normalized_repair_request(request_template, &semantic_slot_id)
                 .ok_or_else(|| {
