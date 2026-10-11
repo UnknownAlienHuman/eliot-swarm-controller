@@ -1,5 +1,15 @@
 # Current-source audit and implementation ledger
 
+The [installed R48 public-contract repair](../2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md)
+passes 15/15 on Windows and Linux, including real public entry, params-only CLI
+input, Operation/Check binding and actual-child idempotent EOF cleanup. The
+installed contour verified bootstrap seed/capture and controller continuity,
+then blocked on scheduler isolation. Its historical cleanup error is preserved;
+installed R48 remains unqualified. The [OpenCode S3 diagnosis](../2026-10-11/OPENCODE-S3-DIAGNOSIS.md)
+proves rejected `agent.open` with `NATIVE_MODEL_UNAVAILABLE`, zero dispatches and
+later graceful teardown. The specific catalog predicate is still unknown. No
+historical native run is replayed and no Task-completion claim is made.
+
 The [R48 source and packaging](../2026-10-10/R48-SOURCE-AND-PACKAGING.json)
 adds an explicit non-default qualification feature. The existing Store-owned
 worker withholds one matched admit reply at the real transport seam and follows

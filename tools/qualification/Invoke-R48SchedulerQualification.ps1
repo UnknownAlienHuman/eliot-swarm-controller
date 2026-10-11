@@ -111,7 +111,7 @@ $script:ContractBaseCommit = '410c327dd6172856bd8808da5938b2be9e1e4f9a'
 $script:AutomationPipePrefix = 'eliot-swarm-'
 
 $script:RunDirectory = $null
-$script:QRoot = $null
+# Run parameters already occupy script scope; initialize only derived state.
 $script:HostPath = $null
 $script:HostSupervisorPath = $null
 $script:HostLauncherPath = $null
@@ -120,12 +120,6 @@ $script:AutomationWorkerPath = $null
 $script:AutomationWorkerInstalledPath = $null
 $script:ConfigPath = $null
 $script:HostConfigTemplatePath = $null
-$script:TaskSpecPath = $null
-$script:GitExecutable = $null
-$script:SourceRepository = $null
-$script:SourceCommitOid = $null
-$script:ProjectId = $null
-$script:ScheduleId = $null
 $script:BootstrapScenario = $null
 $script:FinalScenario = $null
 $script:Manager = $null
@@ -202,7 +196,21 @@ function Assert-SafeAbsolutePath {
 function New-PrivateDirectory {
     param([Parameter(Mandatory)][string] $Path)
     if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        if ($IsWindows) {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $security = [Security.AccessControl.DirectorySecurity]::new()
+            $security.SetAccessRuleProtection($true, $false)
+            $security.SetOwner($identity.User)
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $identity.User, [Security.AccessControl.FileSystemRights]::FullControl,
+                ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),
+                [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$security.AddAccessRule($rule)
+            [void][IO.FileSystemAclExtensions]::CreateDirectory($security, $Path)
+        } else {
+            [void][IO.Directory]::CreateDirectory($Path, ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute))
+        }
     }
     return $Path
 }
@@ -238,6 +246,17 @@ function Get-StrictInt64 {
     )) { return [pscustomobject]@{ valid = $false; value = $null } }
     try { return [pscustomobject]@{ valid = $true; value = [long]$Value } }
     catch { return [pscustomobject]@{ valid = $false; value = $null } }
+}
+
+function Get-ControllerId {
+    param($Value)
+    $parsed = [Guid]::Empty
+    if ($Value -isnot [string] -or
+        -not [Guid]::TryParseExact($Value, 'D', [ref]$parsed) -or
+        $parsed -eq [Guid]::Empty -or $parsed.ToString('D') -cne $Value) {
+        return [pscustomobject]@{ valid = $false; value = $null }
+    }
+    return [pscustomobject]@{ valid = $true; value = $Value }
 }
 
 function Add-SubgateResult {
@@ -386,6 +405,8 @@ function Stop-OwnedHost {
     if ($null -eq $Scenario -or $null -eq $Scenario.host) { return [pscustomobject]@{ stopped = $true } }
     $process = $Scenario.host
     $stopped = $false
+    $lastPid = $null
+    try { $lastPid = [int]$process.Id } catch { }
     try {
         if (-not $process.HasExited) {
             $process.StandardInput.Close()
@@ -394,13 +415,11 @@ function Stop-OwnedHost {
         else { $stopped = $true }
     }
     catch {
-        try { $process.Dispose() } catch { }
         return [pscustomobject]@{ stopped = $false; pending_pid = $lastPid; note = 'host exit read failed' }
     }
-    $lastPid = $null
-    try { $lastPid = [int]$process.Id } catch { }
-    try { $process.Dispose() } catch { }
     if (-not $stopped) { return [pscustomobject]@{ stopped = $false; pending_pid = $lastPid } }
+    $Scenario.host = $null
+    try { $process.Dispose() } catch { }
     return [pscustomobject]@{ stopped = $true; pending_pid = $null }
 }
 
@@ -417,12 +436,7 @@ function Invoke-PublicCall {
         [Parameter(Mandatory)][System.Collections.IDictionary] $Params
     )
     $requestPath = Join-Path $Scenario.requests ([Guid]::NewGuid().ToString('N') + '.json')
-    Write-PrivateJson -Path $requestPath -Value ([ordered]@{
-        jsonrpc = '2.0'
-        id = [Guid]::NewGuid().ToString('D')
-        method = $Method
-        params = $Params
-    })
+    Write-PrivateJson -Path $requestPath -Value $Params
     $arguments = @(
         '--config', $script:ConfigPath,
         '--data-dir', $Scenario.state,
@@ -444,16 +458,8 @@ function Invoke-PublicCall {
     $parsed = $null
     try { $parsed = $result.stdout | ConvertFrom-Json -AsHashtable -Depth 32 } catch { return [pscustomobject]@{ success = $false; code = 'CLI_OUTPUT_NOT_JSON' } }
     if ($parsed -isnot [System.Collections.IDictionary]) { return [pscustomobject]@{ success = $false; code = 'CLI_OUTPUT_NOT_OBJECT' } }
-    # The public CLI prints an operation receipt envelope. Accept either a bare
-    # receipt object or a {"result":...} envelope without guessing the shape.
-    if ($parsed.Contains('result') -and $parsed['result'] -is [System.Collections.IDictionary]) {
-        $operation = $parsed['result']
-        if ($operation.Contains('code') -and $operation['code'] -is [string] -and
-            [string]$operation['code'] -match '\A[A-Z0-9_]{1,64}\z' -and -not $operation.Contains('operation_id')) {
-            return [pscustomobject]@{ success = $false; code = [string]$operation['code'] }
-        }
-        return [pscustomobject]@{ success = $true; code = $null; value = $operation }
-    }
+    # CLI call prints the application value directly. Its nested result belongs
+    # to the Operation and must remain attached to its method and identity.
     if ($parsed.Contains('code') -and $parsed['code'] -is [string] -and
         [string]$parsed['code'] -match '\A[A-Z0-9_]{1,64}\z' -and -not $parsed.Contains('operation_id')) {
         return [pscustomobject]@{ success = $false; code = [string]$parsed['code'] }
@@ -537,9 +543,9 @@ function Start-R48Host {
             if ($status.success -and $null -ne $status.value) {
                 $pipe = Get-PipeNameForDataDirectory -DataDirectory $Scenario.state
                 $Scenario.pipe_name = $pipe
-                $controllerId = Get-StrictInt64 -Value $status.value['controller_id']
+                $controllerId = Get-ControllerId -Value $status.value['controller_id']
                 $epoch = Get-StrictInt64 -Value $status.value['host_lifecycle']['current']['host_epoch']
-                if (-not $controllerId.valid -or -not $epoch.valid) { continue }
+                if (-not $controllerId.valid -or -not $epoch.valid -or $epoch.value -le 0) { continue }
                 return [pscustomobject]@{
                     ready = $true
                     code = $null
@@ -748,7 +754,7 @@ function Write-R48RunConfig {
 function Assert-SchedulerOwnerReady {
     param(
         [Parameter(Mandatory)] $Scenario,
-        [Parameter(Mandatory)][long] $ExpectedControllerId,
+        [Parameter(Mandatory)][string] $ExpectedControllerId,
         [Parameter(Mandatory)][long] $ExpectedHostEpoch,
         [Parameter(Mandatory)][int] $PollSeconds
     )
@@ -769,9 +775,9 @@ function Assert-SchedulerOwnerReady {
             Start-Sleep -Milliseconds 500
             continue
         }
-        $controllerId = Get-StrictInt64 -Value $status['controller_id']
+        $controllerId = Get-ControllerId -Value $status['controller_id']
         $currentEpoch = Get-StrictInt64 -Value $status['host_lifecycle']['current']['host_epoch']
-        $ownerControllerId = Get-StrictInt64 -Value $owner['host_scope']['controller_id']
+        $ownerControllerId = Get-ControllerId -Value $owner['host_scope']['controller_id']
         $ownerEpoch = Get-StrictInt64 -Value $owner['host_scope']['host_epoch']
         $observations.Add([ordered]@{
             observed_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -798,12 +804,12 @@ function Assert-SchedulerOwnerReady {
         if (-not $controllerId.valid -or -not $currentEpoch.valid) { $problems += 'current_identity_unreadable' }
         if (-not $ownerControllerId.valid -or -not $ownerEpoch.valid) { $problems += 'owner_scope_unreadable' }
         if ($problems.Count -eq 0) {
-            if ($ownerControllerId.value -ne $controllerId.value -or $ownerEpoch.value -ne $currentEpoch.value) {
+            if ($ownerControllerId.value -cne $controllerId.value -or $ownerEpoch.value -ne $currentEpoch.value) {
                 $problems += 'owner_scope_not_current_host'
             }
         }
         if ($problems.Count -eq 0) {
-            if ($controllerId.value -ne $ExpectedControllerId -or $currentEpoch.value -ne $ExpectedHostEpoch) {
+            if ($controllerId.value -cne $ExpectedControllerId -or $currentEpoch.value -ne $ExpectedHostEpoch) {
                 return [pscustomobject]@{
                     success = $false
                     code = 'HOST_IDENTITY_CHANGED'
@@ -848,14 +854,14 @@ function Assert-StaticScheduleShape {
     param(
         [Parameter(Mandatory)] $Scenario,
         [Parameter(Mandatory)][string] $ScheduleId,
-        [Parameter(Mandatory)][long] $ExpectedControllerId,
+        [Parameter(Mandatory)][string] $ExpectedControllerId,
         [Parameter(Mandatory)][long] $ExpectedHostEpoch
     )
     $call = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'host.status' -Params ([ordered]@{})
     if (-not $call.success) { return [pscustomobject]@{ success = $false; code = 'HOST_STATUS_READBACK_FAILED' } }
-    $controllerId = Get-StrictInt64 -Value $call.value['controller_id']
+    $controllerId = Get-ControllerId -Value $call.value['controller_id']
     $epoch = Get-StrictInt64 -Value $call.value['host_epoch']
-    if (-not $controllerId.valid -or $controllerId.value -ne $ExpectedControllerId) {
+    if (-not $controllerId.valid -or $controllerId.value -cne $ExpectedControllerId) {
         return [pscustomobject]@{ success = $false; code = 'HOST_CONTROLLER_ID_CHANGED' }
     }
     if (-not $epoch.valid -or $epoch.value -ne $ExpectedHostEpoch) {
@@ -927,16 +933,26 @@ function Wait-ForDueCheckRunOperation {
                         detail = $operation.code
                     }
                 }
+                $checkId = [string]$operation.value['result']['check_id']
+                if ([string]::IsNullOrWhiteSpace($checkId)) {
+                    return [pscustomobject]@{ success = $false; code = 'CHECK_ID_MISSING' }
+                }
+                $check = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'check.get' -Params ([ordered]@{ check_id = $checkId })
+                if (-not $check.success) {
+                    return [pscustomobject]@{ success = $false; code = 'CHECK_RECEIPT_READBACK_FAILED'; detail = $check.code }
+                }
                 $samples.Add([ordered]@{
                     observed_at_utc = [DateTime]::UtcNow.ToString('o')
                     schedule_last_operation = $lastOperation
                     operation = $operation.value
+                    check_receipt = $check.value
                 })
                 return [pscustomobject]@{
                     success = $true
                     code = $null
                     work_operation_id = $workOperationId
                     operation = $operation.value
+                    check_receipt = $check.value
                     samples = @($samples.ToArray())
                 }
             }
@@ -949,6 +965,7 @@ function Wait-ForDueCheckRunOperation {
 function Assert-EligibleCheckRunReceipt {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary] $Operation,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $CheckReceipt,
         [Parameter(Mandatory)][string] $AttemptId,
         [Parameter(Mandatory)][string] $CandidateRef,
         [Parameter(Mandatory)][string] $ProfileId,
@@ -956,13 +973,18 @@ function Assert-EligibleCheckRunReceipt {
     )
     $problems = @()
     if ([string]$Operation['method'] -cne 'check.run') { $problems += 'method_not_check_run' }
-    # The public projection may carry the request identity either at the top level
-    # or under a projected result receipt. Both are read; neither is invented.
+    if ([string]::IsNullOrWhiteSpace([string]$Operation['operation_id']) -or
+        [string]$CheckReceipt['operation_id'] -cne [string]$Operation['operation_id'] -or
+        [string]::IsNullOrWhiteSpace([string]$CheckReceipt['check_id']) -or
+        [string]$CheckReceipt['check_id'] -cne [string]$Operation['result']['check_id']) {
+        $problems += 'check_operation_link_mismatch'
+    }
+    # Profile identity comes from check.get; operation.get intentionally omits it.
     $attemptValues = @()
     $candidateValues = @()
     $profileIdValues = @()
     $profileRevisionValues = @()
-    foreach ($container in @($Operation, $Operation['result'])) {
+    foreach ($container in @($Operation, $Operation['result'], $CheckReceipt)) {
         if ($container -isnot [System.Collections.IDictionary]) { continue }
         if ($container.Contains('attempt_id')) { $attemptValues += [string]$container['attempt_id'] }
         if ($container.Contains('candidate_ref')) { $candidateValues += [string]$container['candidate_ref'] }
@@ -1183,14 +1205,14 @@ function Assert-HostRemainsAlive {
     $firstControllerId = $null
     $firstEpoch = $null
     for ($i = 0; $i -lt $Samples; $i++) {
-        $pid = $null
+        $observedPid = $null
         $startTime = $null
         try {
             $process = Get-Process -Id $ExpectedPid -ErrorAction Stop
-            $pid = [int]$process.Id
+            $observedPid = [int]$process.Id
             try { $startTime = $process.StartTime.ToUniversalTime() } catch { $startTime = $null }
         }
-        catch { $pid = $null }
+        catch { $observedPid = $null }
         $call = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'host.status' -Params ([ordered]@{})
         $lifecycleState = $null
         $controllerId = $null
@@ -1198,7 +1220,7 @@ function Assert-HostRemainsAlive {
         if ($call.success -and $call.value -is [System.Collections.IDictionary]) {
             $current = $call.value['host_lifecycle']['current']
             $lifecycleState = [string]$current['state']
-            $c = Get-StrictInt64 -Value $call.value['controller_id']
+            $c = Get-ControllerId -Value $call.value['controller_id']
             $e = Get-StrictInt64 -Value $current['host_epoch']
             $controllerId = $(if ($c.valid) { $c.value } else { $null })
             $epoch = $(if ($e.valid) { $e.value } else { $null })
@@ -1206,27 +1228,30 @@ function Assert-HostRemainsAlive {
         $observations.Add([ordered]@{
             sample_index = $i
             observed_at_utc = [DateTime]::UtcNow.ToString('o')
-            pid = $pid
+            pid = $observedPid
             process_start_time_utc = $(if ($null -ne $startTime) { $startTime.ToString('o') } else { $null })
             host_lifecycle_state = $lifecycleState
             controller_id = $controllerId
             host_epoch = $epoch
         })
-        if ($null -eq $pid) {
+        if ($null -eq $observedPid -or $Scenario.host.HasExited) {
             return [pscustomobject]@{ success = $false; code = 'HOST_PROCESS_GONE'; observations = @($observations.ToArray()) }
         }
+        if ($null -eq $controllerId -or $null -eq $epoch -or $epoch -le 0) {
+            return [pscustomobject]@{ success = $false; code = 'HOST_IDENTITY_UNREADABLE'; observations = @($observations.ToArray()) }
+        }
         if ($null -eq $firstPid) {
-            $firstPid = $pid
+            $firstPid = $observedPid
             $firstStart = $startTime
             $firstControllerId = $controllerId
             $firstEpoch = $epoch
         }
         else {
-            if ($pid -ne $firstPid) { return [pscustomobject]@{ success = $false; code = 'HOST_PID_CHANGED'; observations = @($observations.ToArray()) } }
+            if ($observedPid -ne $firstPid) { return [pscustomobject]@{ success = $false; code = 'HOST_PID_CHANGED'; observations = @($observations.ToArray()) } }
             if ($null -ne $startTime -and $null -ne $firstStart -and $startTime -ne $firstStart) {
                 return [pscustomobject]@{ success = $false; code = 'HOST_START_TIME_CHANGED'; observations = @($observations.ToArray()) }
             }
-            if ($null -ne $controllerId -and $null -ne $firstControllerId -and $controllerId -ne $firstControllerId) {
+            if ($controllerId -cne $firstControllerId) {
                 return [pscustomobject]@{ success = $false; code = 'CONTROLLER_ID_CHANGED'; observations = @($observations.ToArray()) }
             }
             if ($null -ne $epoch -and $null -ne $firstEpoch -and $epoch -ne $firstEpoch) {
@@ -1384,10 +1409,15 @@ function Invoke-BootstrapSeed {
     $taskId = [string]$create.value['task_id']
     if ([string]::IsNullOrWhiteSpace($taskId)) { $taskId = [string]$create.value['result']['task_id'] }
     if ([string]::IsNullOrWhiteSpace($taskId)) { return [pscustomobject]@{ success = $false; code = 'TASK_ID_MISSING' } }
+    $createdRevision = Get-StrictInt64 -Value $create.value['revision']
+    if (-not $createdRevision.valid -or $createdRevision.value -le 0) {
+        return [pscustomobject]@{ success = $false; code = 'TASK_REVISION_MISSING' }
+    }
 
     $claim = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'task.claim' -Params ([ordered]@{
         client_request_id = 'r48-seed-claim:' + [Guid]::NewGuid().ToString('N')
         task_id = $taskId
+        expected_revision = $createdRevision.value
     })
     if (-not $claim.success) { return [pscustomobject]@{ success = $false; code = 'TASK_CLAIM_FAILED'; detail = $claim.code } }
     $attemptId = [string]$claim.value['attempt_id']
@@ -1397,7 +1427,7 @@ function Invoke-BootstrapSeed {
     $capture = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'source.capture' -Params ([ordered]@{
         client_request_id = 'r48-seed-capture:' + [Guid]::NewGuid().ToString('N')
         attempt_id = $attemptId
-        expected_revision = 1
+        expected_revision = $createdRevision.value
         repository = $script:SourceRepository
         commit = $script:SourceCommitOid
     })
@@ -1438,7 +1468,7 @@ function Invoke-BootstrapSeed {
     if ($kind -cne 'source_snapshot') { return [pscustomobject]@{ success = $false; code = 'ARTIFACT_NOT_SOURCE_SNAPSHOT'; kind = $kind } }
     $metaAttempt = [string]$artifact.value['metadata']['attempt_id']
     $metaRevision = Get-StrictInt64 -Value $artifact.value['metadata']['task_revision']
-    if ($metaAttempt -cne $attemptId -or -not $metaRevision.valid -or $metaRevision.value -ne 1) {
+    if ($metaAttempt -cne $attemptId -or -not $metaRevision.valid -or $metaRevision.value -ne $createdRevision.value) {
         return [pscustomobject]@{ success = $false; code = 'SNAPSHOT_METADATA_MISMATCH' }
     }
     # The pinned Task revision the schedule must name, read from the durable snapshot.
@@ -1743,7 +1773,7 @@ if (-not $dueOperation.success) {
     })
     Stop-Harness $dueOperation.code
 }
-$receipt = Assert-EligibleCheckRunReceipt -Operation $dueOperation.operation -AttemptId $seed.attempt_id -CandidateRef $seed.candidate_ref -ProfileId $CheckProfileId -ProfileRevision $CheckProfileRevision
+$receipt = Assert-EligibleCheckRunReceipt -Operation $dueOperation.operation -CheckReceipt $dueOperation.check_receipt -AttemptId $seed.attempt_id -CandidateRef $seed.candidate_ref -ProfileId $CheckProfileId -ProfileRevision $CheckProfileRevision
 if (-not $receipt.success) {
     Add-SubgateResult -Name 'enabled_one_shot_checkrun_admitted' -Status 'not_verified' -Code $receipt.code -Evidence ([ordered]@{
         work_operation_id = $dueOperation.work_operation_id
