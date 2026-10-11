@@ -997,7 +997,9 @@ function Assert-EligibleCheckRunReceipt {
     if ($profileRevisionValues.Count -eq 0 -or ($profileRevisionValues | Where-Object { $_ -cne $ProfileRevision })) { $problems += 'profile_revision_mismatch' }
     $state = [string]$Operation['state']
     if ([string]::IsNullOrWhiteSpace($state)) { $state = [string]$Operation['result']['state'] }
-    if ($state -notin @('queued', 'sending', 'sent', 'succeeded', 'settled')) {
+    # Check execution retains native_accepted after the real child launch; it is
+    # still a durable admission, while unknown/rejected outcomes are not proof.
+    if ($state -notin @('queued', 'sending', 'native_accepted', 'settled')) {
         $problems += 'operation_not_durably_queued_or_settled'
     }
     if ($problems.Count -gt 0) {

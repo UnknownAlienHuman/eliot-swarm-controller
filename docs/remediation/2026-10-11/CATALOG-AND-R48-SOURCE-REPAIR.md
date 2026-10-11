@@ -21,7 +21,7 @@ qualify the full installed host/worker contour.
 
 ## Verification
 
-- Rust1.98.1 scoped formatting and `git diff --check` pass.
+- Rust 1.98.1 scoped formatting and `git diff --check` pass.
 - Strict production Clippy (`--lib --bins --no-deps -- -D warnings`) passes on
   Windows and Linux for OpenCode/host default code and the host qualification
   feature. The first run found an unused compatibility wrapper; it was removed
@@ -34,7 +34,7 @@ qualify the full installed host/worker contour.
   another method and an applied outcome. Its first run failed while inserting
   fixture rows without the schema-required terminal timestamp. The fixture now
   supplies the timestamp; only this failed selection was repeated.
-- The actual feature-worker parser checks above pass2/2 on Windows. The first
+- The actual feature-worker parser checks above pass 2/2 on Windows. The first
   wrapper assertion omitted the worker's legitimate bounded fault-armed line;
   the corrected closed output assertion passes and no worker defect is inferred
   from that wrapper failure.
@@ -45,7 +45,7 @@ terminal timestamp. Reversing those exact test edits reproduces the recorded
 Clippy hashes. Production bodies remain identical to the checked code; the
 catalog and public Store tests verify the final test source.
 
-The earlier Antigravity14 selection and full24-package Clippy are not repeated.
+The earlier Antigravity 14-case selection and full 24-package Clippy are not repeated.
 Fresh matching installed artifacts are required for the repaired Antigravity
 producer, OpenCode diagnostic and R48 host argv. Model consumption, native
 result-body causality and independent Task acceptance remain unverified.

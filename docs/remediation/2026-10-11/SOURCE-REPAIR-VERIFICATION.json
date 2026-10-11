@@ -1,0 +1,83 @@
+{
+  "CompletionProof": {
+    "remaining": [
+      "fresh installed/native execution",
+      "model consumption and result-body causality",
+      "Task acceptance",
+      "three dependency advisories"
+    ],
+    "final_status": "PARTIAL_PROGRESS"
+  },
+  "observed_at_utc": "2026-10-11T04:47:52.2265341Z",
+  "rust_version": "1.98.1",
+  "source_sha256": {
+    "crates/swarm-adapter-opencode/src/native.rs": "7df305076a689fde20b87d0c0a9647cc60a863ca8b9c6bca41776c44703af6fa",
+    "crates/swarm-adapter-opencode/src/lib.rs": "7a72d7a4946bcc9f3775a91188c2f0f366191f4b86cbc33b8146e112595ff421",
+    "crates/swarm-kernel-host/src/store/operations.rs": "159343cf713c38b4e878e6d823750f86808b1add3c96b2feb57c1018183b5cdb",
+    "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs": "c40dbbddf9a97933929ad06ea341adf7cb0de57ed4c0d3f8a48eea120eb06f38"
+  },
+  "schema": "eliot.source_repair_verification.v1",
+  "test_only_followup": {
+    "store_terminal_timestamp": true,
+    "reversing_exact_cfg_test_changes_reproduces_clippy_source_hashes": true,
+    "native_wrapped_error_accessor": true,
+    "production_code_unchanged_since_clippy": true
+  },
+  "source_tree": "76db5e7fefaf561646c076ba51bd6795a3fbd72a",
+  "limits": {
+    "installed_qualified": false,
+    "native_model_consumption": "unverified",
+    "ag_s2_resent": false,
+    "native_result_body_causality": "unverified",
+    "task_acceptance": "not_claimed",
+    "full_suite_repeated": false,
+    "oc3_replayed": false,
+    "pqr_replayed": false
+  },
+  "checks": [
+    {
+      "catalog_tests": {
+        "passed": 3,
+        "failed": 0,
+        "log_sha256": "923f3031d95b06a69a62fdcebca9692e8f344a42f9f25ea7a4e2f26c7d275e1c"
+      },
+      "public_store_receipt_test": {
+        "passed": 1,
+        "failed": 0,
+        "log_sha256": "584d1d37e66b05fa73ee5999a089c4e0260ea75fff67ad59a738760a7ee6e510"
+      },
+      "platform": "windows",
+      "production_clippy": {
+        "default": "PASS",
+        "receipt_sha256": "d4a00cd870eb7158d91a3180e619719e1a45e54f2f5255f6bfc292d467f2d7c2",
+        "receipt": ".local/manager-audit/windows-catalog-r48-repair-v2-clippy-result.json",
+        "qualification_faults": "PASS"
+      }
+    },
+    {
+      "catalog_tests": {
+        "passed": 3,
+        "failed": 0,
+        "log_sha256": "3f13551abb334ca9bc5362f48a492d89cf5a636d543d4eaaeddb1d96f3b57233"
+      },
+      "public_store_receipt_test": {
+        "passed": 1,
+        "failed": 0,
+        "log_sha256": "0af2ec9269c3db9e044531494fccf65993179908eaed789063d8ee76cbb7229b"
+      },
+      "platform": "linux",
+      "production_clippy": {
+        "default": "PASS",
+        "receipt_sha256": "8cc8e55d65776020a3b7d5b0dbb41614f57845ef5db512e8a4e1a693064057d1",
+        "receipt": ".local/manager-audit/linux-catalog-r48-repair-v2-clippy-result.json",
+        "qualification_faults": "PASS"
+      }
+    }
+  ],
+  "worker_parser": {
+    "passed": 2,
+    "receipt_sha256": "5690a7081af607d22b8aeb623ca850e84481ea59e2a2f6078936922001fb8c9d",
+    "failed": 0
+  },
+  "source_commit": "3449eefa32cb2043d95b7ebee2fd47cfa84d7f60"
+}

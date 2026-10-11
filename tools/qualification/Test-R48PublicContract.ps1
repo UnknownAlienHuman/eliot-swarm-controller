@@ -38,6 +38,13 @@ $check = @{
 }
 $receiptArgs = @{ Operation = $operation; CheckReceipt = $check; AttemptId = 'attempt-fixture'; CandidateRef = 'source-fixture'; ProfileId = 'fixture'; ProfileRevision = '1' }
 Assert-Case 'separate_check_profile_readback' (Assert-EligibleCheckRunReceipt @receiptArgs).success
+$operation.state = 'native_accepted'
+Assert-Case 'launched_check_retains_durable_admission' (Assert-EligibleCheckRunReceipt @receiptArgs).success
+$operation.state = 'outcome_unknown'
+Assert-Case 'unknown_check_not_upgraded' (-not (Assert-EligibleCheckRunReceipt @receiptArgs).success)
+$operation.state = 'rejected'
+Assert-Case 'rejected_check_not_admitted' (-not (Assert-EligibleCheckRunReceipt @receiptArgs).success)
+$operation.state = 'queued'
 $check.operation_id = 'foreign-operation'
 Assert-Case 'foreign_check_link_rejected' (-not (Assert-EligibleCheckRunReceipt @receiptArgs).success)
 $check.operation_id = 'operation-fixture'

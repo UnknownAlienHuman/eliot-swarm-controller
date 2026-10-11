@@ -1,5 +1,19 @@
 # Current-source audit and implementation ledger
 
+The [fresh installed R48 T observation](../2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md)
+verifies bootstrap and real scheduler-owner readiness on source3449. Its actual
+CheckRun Operation reached `native_accepted`; a harness whitelist mismatch
+stopped further qualification. The corrected assertion passes 18/18 on Windows
+and Linux. Full installed R48 remains pending a fresh run; historical receipts
+are unchanged.
+
+The [three remaining dependency advisories](../2026-10-11/DEPENDENCIES-REMAINING.md)
+were rechecked against live GitHub and registry metadata at 04:32UTC on 2026-10-11.
+Two have no newer leaf release outside their affected range; the cache package's
+4.3.0 candidate has no demonstrated fix in the named code path. Compatible
+ancestor removal remains under source/API assessment. The braces advisory is
+`<=3.0.3`, so 2.x is also affected. These gaps remain open.
+
 The [OpenCode catalog and R48 worker source repair](../2026-10-11/CATALOG-AND-R48-SOURCE-REPAIR.md)
 preserves a closed catalog subreason in public rejected-open receipts and fixes
 the actual host/worker qualification-flag order. Strict affected production

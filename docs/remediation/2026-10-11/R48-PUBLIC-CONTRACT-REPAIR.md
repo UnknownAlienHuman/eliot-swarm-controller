@@ -2,6 +2,39 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+## Fresh source3449 installed observation and admission repair
+
+The fresh T run `r48-0cfa2b5cbf32463393a9cc664d2c9162` used the rebuilt
+host/worker pair from `3449eefa32cb2043d95b7ebee2fd47cfa84d7f60`. Bootstrap
+seed/capture and epoch2 current-owner readiness are verified. The actual worker
+was running, current, active and ready with a validated owner receipt and group
+identity. The due schedule created Operation
+`84f9e28f-1f18-4efc-b10f-3e4a550d0649` and Check
+`997b6ffd-1de0-4156-9a15-3dd86dd2cee9`.
+
+The harness stopped at `RECEIPT_MISMATCH:operation_not_durably_queued_or_settled`
+because that Operation had the valid state `native_accepted`. The production
+`accept_check` path in `store/checks.rs` retains this state after recording the
+real child identity. The durable-admission assertion now accepts the actual
+closed states `queued`, `sending`, `native_accepted` and `settled`; invented
+`sent`/`succeeded` aliases were removed. Unknown and rejected outcomes remain
+failures, and all Operation/Check/Attempt/candidate/profile links remain checked.
+
+The current public-contract fixture passes **18/18 on Windows and Linux**,
+including native acceptance and explicit unknown/rejected rejection. Both logs
+have SHA-256 `59ee3226384392756191af89c586360372102a379f3eda510ecb5a1bce7db0e2`.
+Current sidecar SHA-256:
+`7d4133b53e2b024bbb2e2fa5c1ed2dc8505c2fb46cdf5d8feb59198eae33e6b9`.
+Current fixture SHA-256:
+`e4e379995d6680f1793749d988e9e50fef677d601ecba77fc2a6a30667dc9c9e`.
+
+T cleanup confirmed host exit. Its historical receipt remains unchanged; the
+one-shot admission, uncertain-admit no-replay and complete liveness subgates are
+not retroactively promoted. A fresh run must bind the new sidecar to the retained
+T preparation. This PowerShell-only follow-up requires no binary rebuild or
+repeat of the already-passed Rust gates. The older hashes and observations below
+describe the preceding edition only.
+
 The real installed runs exposed public entry and transport mismatches that the
 older 52-case helper fixture did not exercise. The sidecar now preserves bound
 Run parameters, reads the canonical UUID controller identity, supplies the real
@@ -27,6 +60,13 @@ Verified sidecar SHA-256:
 `d426a20811fdae27b28d2708276bb6942dc8c43b52e9fe5757504c248a5536d9`.
 Verified public-contract fixture SHA-256:
 `195a53218658f5d1a6ca32c490e945317cfca597eba6795cef1243d877e77bfd`.
+
+Independent Step 5 source review accepted these exact script/fixture hashes
+with no actionable P1/P2. The review checks UUID/revision wire contracts,
+Operation/Check projection and current-GM Evidence authorization, params-only
+CLI transport and retained ownership of unconfirmed process handles. It makes
+no installed-execution claim. Its report SHA-256 is
+`9fe0c97f62aa79350cf3c5a429cd65058f70bd3bbe3bc36f2da2ec3a24400539`.
 
 ## Retained installed observations
 
