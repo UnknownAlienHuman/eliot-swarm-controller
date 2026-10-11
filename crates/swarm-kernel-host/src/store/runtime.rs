@@ -2951,7 +2951,7 @@ pub(super) fn outcome_with_artifacts(
     if matches!(r.outcome, EffectOutcome::Accepted)
         && let Some(admission) = normalized_dispatch_admission.as_ref()
     {
-        producers::record_task_dispatch(&tx, &o, &r, admission, now)?;
+        producers::record_task_dispatch(&tx, &o, &r, admission, warm_producer.as_ref(), now)?;
     }
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
@@ -3002,7 +3002,14 @@ pub(super) fn outcome_with_artifacts(
             if sessionless_batch {
                 producers::record_batch(&tx, &o, &r, normalized_dispatch_admission.as_ref(), now)?;
             } else if let Some(admission) = normalized_dispatch_admission.as_ref() {
-                producers::record_task_dispatch(&tx, &o, &r, admission, now)?;
+                producers::record_task_dispatch(
+                    &tx,
+                    &o,
+                    &r,
+                    admission,
+                    warm_producer.as_ref(),
+                    now,
+                )?;
             } else if warm_producer.is_some() {
                 // Its terminal producer is recorded below for both successful
                 // and rejected native terminal outcomes.
@@ -3099,7 +3106,12 @@ pub(super) fn outcome_with_artifacts(
         };
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,reported_identity.0,reported_identity.1,model::canonical(&r.details)?])?;
     }
-    if let Some(producer) = warm_producer {
+    // The normalized dispatch already retained one producer for this exact
+    // Operation. Its warm receipt is validated above and retained on the
+    // Operation; appending another producer would duplicate its identity.
+    if normalized_dispatch_admission.is_none()
+        && let Some(producer) = warm_producer
+    {
         let attempt = model::text(&o, "attempt_id")?;
         tx.execute(
             "UPDATE attempts SET state=CASE WHEN state='reserved' THEN 'running' ELSE state END,producers_json=json_insert(producers_json,'$[#]',json(?2)),updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",

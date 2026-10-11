@@ -1,0 +1,101 @@
+{
+  "schema": "eliot.antigravity_terminal_repair_evidence.v1",
+  "source_base": "7f6eb065ab13b7537e47e3620f0272cce9fd05b2",
+  "verified_at_utc": "2026-10-11T03:54:17.6221140Z",
+  "source_repair_status": "DONE_VERIFIED",
+  "project_status": "PARTIAL_PROGRESS",
+  "production_clippy": {
+    "gate": "strict_production_clippy",
+    "source_base": "7f6eb065ab13b7537e47e3620f0272cce9fd05b2",
+    "toolchain": "1.98.1",
+    "arguments": [
+      "clippy",
+      "--locked",
+      "-p",
+      "swarm-kernel-host",
+      "-p",
+      "swarm-antigravity-adapter",
+      "--lib",
+      "--bins",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "windows": {
+      "exit_code": 0,
+      "log_sha256": "d64ba71807f984990eca07d2c2515bd8ebd50d538325e0bb391e1a42045c5a2c",
+      "log": ".local/manager-audit/agy-terminal-windows-clippy.log"
+    },
+    "linux": {
+      "exit_code": 0,
+      "log_sha256": "0a2fa29b7159947bb5cfa981ca2a58fba0b00c3b22a960fcf8dfb5b2f1b7191f",
+      "log": ".local/manager-audit/agy-terminal-linux-clippy.log"
+    },
+    "source_hashes": {
+      "modules/antigravity-rust/src/controller.rs": "02b125cbd01c87d755c9eee5bc567dec3219fa7711f365379e70b48e7ccc6a31",
+      "crates/swarm-kernel-host/src/store/producers.rs": "17a2db53cfa25c920c5b8c20841d745523e09ea28024e7d72e9e918af51fdd8f",
+      "crates/swarm-kernel-host/src/store/runtime.rs": "2103a4f6924b3111347d05906283e876cda4d1c1bf92a547ddda6784b77fc750",
+      "crates/swarm-kernel-host/Cargo.toml": "9c6d8c386fc36889c3fb2d7ac8f5cf3a3353babfe5ad2d04ff4beb07b83e54e4",
+      "Cargo.lock": "0911be3cb9658560d0e397865aa9b7057ebf110469b083c324b020c91de89658"
+    },
+    "verified_at_utc": "2026-10-11T03:45:19.6174557Z"
+  },
+  "source_review": {
+    "exact_hashes": {
+      "modules/antigravity-rust/src/controller.rs": {
+        "sha256": "02B125CBD01C87D755C9EEE5BC567DEC3219FA7711F365379E70B48E7CCC6A31",
+        "bytes": 38984,
+        "lines": 956
+      },
+      "crates/swarm-kernel-host/src/store/producers.rs": {
+        "sha256": "17A2DB53CFA25C920C5B8C20841D745523E09EA28024E7D72E9E918AF51FDD8F",
+        "bytes": 27864,
+        "lines": 662
+      },
+      "crates/swarm-kernel-host/src/store/runtime.rs": {
+        "sha256": "2103A4F6924B3111347D05906283E876CDA4D1C1BF92A547DDDA6784B77FC750",
+        "bytes": 250458,
+        "lines": 5742
+      }
+    },
+    "verdict": "ACCEPT",
+    "p2_findings": [],
+    "scope": "three changed production files; current working tree over source_base",
+    "p1_findings": []
+  },
+  "affected_tests": {
+    "arguments": [
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "swarm-kernel-host",
+      "--lib",
+      "-E",
+      "test(module_bridge_recovery_tests) | test(receipt_tests::warm_) | test(runtime::warm_stream::tests)"
+    ],
+    "regression": "store::module_bridge_recovery_tests::antigravity_terminal_receipt_needs_store_observation_and_keeps_task_unresolved",
+    "process_isolation": "descriptor claim inherited by one exact child test; no unsafe process environment mutation",
+    "linux": {
+      "log_sha256": "5654a8b9646b06ebe89a6563de0944746e61808d5a16f611a3aa9b77ce4111ca",
+      "skipped": 480,
+      "exit_code": 0,
+      "passed": 14
+    },
+    "test_source_sha256": "1fcf0acbfbadc0637ed5ecc10365bb70f0dcb7f27f929e8a36d72e10d3a6c792",
+    "windows": {
+      "log_sha256": "c251bc4c639c3871be9cfd0e5a8472e45999e34fee5b3bdedc15214e478352b6",
+      "skipped": 466,
+      "exit_code": 0,
+      "passed": 14
+    }
+  },
+  "remaining": [
+    "installed/native qualification of repaired Antigravity edition",
+    "fresh OpenCode preparation and execution",
+    "installed R48 sidecar execution",
+    "productive native response body and independent Task acceptance",
+    "three unresolved upstream dependency advisories"
+  ]
+}

@@ -4,7 +4,12 @@
 use super::*;
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use swarm_antigravity_adapter::controller::Controller;
 
 const PROMPT_RECOVERY_BINDING: &str = "binding-prompt-recovery";
 const PROMPT_RECOVERY_OPERATION: &str = "operation-prompt-recovery";
@@ -1164,4 +1169,421 @@ fn command_task_dispatch_execution_diagnostic_withholds_corrupt_assignment_bindi
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
+}
+
+const ANTIGRAVITY_TEST_ROOT: &str = "conversation-antigravity-terminal-regression";
+const ANTIGRAVITY_TEST_SCOPE: &str = "antigravity:terminal-regression";
+const ANTIGRAVITY_CONTRACT_ENV: &str = "ELIOT_SWARM_MODULE_CONTRACT";
+const ANTIGRAVITY_CHILD_MARKER_ENV: &str = "ELIOT_SWARM_ANTIGRAVITY_REGRESSION_CHILD";
+const ANTIGRAVITY_CHILD_MARKER_VALUE: &str = "terminal-observation-child-v1";
+const ANTIGRAVITY_CHILD_STARTED_MARKER: &str = "antigravity regression child reached";
+
+fn antigravity_descriptor() -> swarm_contracts::module_catalog::ModuleDescriptor {
+    let template = swarm_antigravity_adapter::contract::template().unwrap();
+    serde_json::from_value(json!({
+        "schema_version":1,
+        "module_id":template.module_id,
+        "artifact":template.artifact,
+        "launch":{
+            "executable":if cfg!(windows) {
+                r"C:\modules\antigravity"
+            } else {
+                "/modules/antigravity"
+            },
+            "argv":[],
+            "environment":[],
+            "inherited_environment_allowlist":[],
+        },
+        "config_schema":template.config_schema,
+        "workspace_option":template.workspace_option,
+        "pre_input_open":template.pre_input_open,
+        "command_schemas":template.command_schemas,
+        "event_schemas":template.event_schemas,
+        "protocol":template.protocol,
+        "capabilities":template.capabilities,
+        "lifecycle":"owned_service",
+        "activation":"on_demand",
+        "enabled":true,
+    }))
+    .unwrap()
+}
+
+fn antigravity_encoded_contract_claim() -> String {
+    let descriptor = antigravity_descriptor();
+    let claim = swarm_contracts::module_contract::ModuleContractClaim::from_descriptor(
+        &descriptor,
+        swarm_contracts::module_contract::MODULE_PROTOCOL_V1,
+    )
+    .unwrap();
+    serde_json::to_string(&claim).unwrap()
+}
+
+fn antigravity_dispatch_store() -> (PathBuf, Principal) {
+    let (path, module, _) = durable_prompt_store();
+    let db = Connection::open(&path).unwrap();
+    let descriptor = antigravity_descriptor();
+    let tx = db.unchecked_transaction().unwrap();
+    let registered = super::module_handshake::register_trusted_descriptor(&tx, descriptor).unwrap();
+    tx.commit().unwrap();
+    let selector = json!({
+        "schema_version":1,
+        "module_id":registered["module_id"],
+        "artifact":registered["artifact"],
+        "registered_revision":registered["registered_revision"],
+        "selected_revision":registered["registered_revision"],
+    });
+    let route = json!({
+        "alias":"antigravity-terminal-regression",
+        "runtime":"antigravity",
+        "module_artifact_id":swarm_antigravity_adapter::wire::ARTIFACT_ID,
+        "enabled":true,
+        "native_options":{}
+    });
+    let binding_state_raw: String = db
+        .query_row(
+            "SELECT state_json FROM bindings WHERE binding_id=?1 AND generation=1",
+            [PROMPT_RECOVERY_BINDING],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut binding_state: Value = serde_json::from_str(&binding_state_raw).unwrap();
+    binding_state["module_contract_selector"] = selector;
+    db.execute(
+        "UPDATE bindings SET module_artifact_id=?2,native_scope_key=?3,native_root_id=?4,route_json=?5,state_json=?6 WHERE binding_id=?1 AND generation=1",
+        params![
+            PROMPT_RECOVERY_BINDING,
+            swarm_antigravity_adapter::wire::ARTIFACT_ID,
+            ANTIGRAVITY_TEST_SCOPE,
+            ANTIGRAVITY_TEST_ROOT,
+            model::canonical(&route).unwrap(),
+            model::canonical(&binding_state).unwrap(),
+        ],
+    )
+    .unwrap();
+    let effective_raw: String = db
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [PROMPT_RECOVERY_OPERATION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut effective: Value = serde_json::from_str(&effective_raw).unwrap();
+    effective["route"] = route;
+    db.execute(
+        "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+        params![
+            PROMPT_RECOVERY_OPERATION,
+            model::canonical(&effective).unwrap(),
+        ],
+    )
+    .unwrap();
+    drop(db);
+    (path, module)
+}
+fn antigravity_result_line(conversation_id: &str, response: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "event":"result",
+        "conversation_id":conversation_id,
+        "result":{
+            "status":"SUCCESS",
+            "conversation_id":conversation_id,
+            "response":response
+        }
+    }))
+    .unwrap()
+}
+
+#[test]
+fn antigravity_terminal_receipt_needs_store_observation_and_keeps_task_unresolved() {
+    let child_mode = std::env::var(ANTIGRAVITY_CHILD_MARKER_ENV)
+        .map(|marker| marker == ANTIGRAVITY_CHILD_MARKER_VALUE)
+        .unwrap_or(false);
+    if child_mode {
+        println!("{ANTIGRAVITY_CHILD_STARTED_MARKER}");
+        run_antigravity_terminal_receipt_regression();
+        return;
+    }
+
+    let encoded_claim = antigravity_encoded_contract_claim();
+    let test_module_path = module_path!()
+        .split_once("::")
+        .map(|(_, module_path)| module_path)
+        .unwrap_or(module_path!());
+    let exact_test_name = format!(
+        "{test_module_path}::antigravity_terminal_receipt_needs_store_observation_and_keeps_task_unresolved"
+    );
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", exact_test_name.as_str(), "--nocapture"])
+        .env(ANTIGRAVITY_CONTRACT_ENV, encoded_claim)
+        .env(ANTIGRAVITY_CHILD_MARKER_ENV, ANTIGRAVITY_CHILD_MARKER_VALUE)
+        .output()
+        .expect("spawn isolated Antigravity regression child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "isolated Antigravity regression child failed with {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains(ANTIGRAVITY_CHILD_STARTED_MARKER),
+        "isolated test executable skipped the exact child test:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn run_antigravity_terminal_receipt_regression() {
+    let (path, module) = antigravity_dispatch_store();
+    assert_eq!(
+        std::env::var(ANTIGRAVITY_CONTRACT_ENV).unwrap(),
+        antigravity_encoded_contract_claim()
+    );
+    let mut db = Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+    let dispatch = runtime::next(&mut db, &module).unwrap();
+    assert_eq!(dispatch["command"]["method"], "task.dispatch");
+    assert_eq!(
+        dispatch["command"]["operation_id"],
+        PROMPT_RECOVERY_OPERATION
+    );
+    let command: swarm_contracts::runtime::RuntimeCommand =
+        serde_json::from_value(dispatch["command"].clone()).unwrap();
+    let context = &dispatch["command"]["input"]["task_dispatch_context"];
+    let prompt = &dispatch["command"]["input"]["task_prompt"];
+    assert_eq!(
+        command.native_root_id.as_deref(),
+        Some(ANTIGRAVITY_TEST_ROOT)
+    );
+    assert_eq!(context["task_id"], PROMPT_RECOVERY_TASK);
+    assert_eq!(context["task_revision"], 1);
+    assert_eq!(
+        context["source_text_sha256"],
+        model::digest(PROMPT_RECOVERY_TEXT.as_bytes())
+    );
+    assert_eq!(context["source_text_bytes"], PROMPT_RECOVERY_TEXT.len());
+
+    let mut controller = Controller::new(
+        context["worker_boot_id"].as_str().unwrap().to_owned(),
+        ANTIGRAVITY_TEST_SCOPE.to_owned(),
+        PROMPT_RECOVERY_BINDING.to_owned(),
+        1,
+        Some(ANTIGRAVITY_TEST_ROOT.to_owned()),
+        true,
+    );
+    controller.consume_line(
+        &serde_json::to_vec(&json!({
+            "event":"init",
+            "conversation_id":ANTIGRAVITY_TEST_ROOT,
+            "init":{"model":"fixture-model","tools":[]}
+        }))
+        .unwrap(),
+    );
+    let replayed_response = "prior terminal result replay";
+    controller.consume_line(&antigravity_result_line(
+        ANTIGRAVITY_TEST_ROOT,
+        replayed_response,
+    ));
+    assert!(controller.settle_terminal().is_none());
+    let _native_prompt_line = controller.begin_prompt(&command).unwrap();
+    assert!(controller.settle_terminal().is_none());
+    controller.consume_line(&antigravity_result_line(
+        "foreign-conversation",
+        "foreign result",
+    ));
+    assert!(controller.settle_terminal().is_none());
+    assert!(controller.pending_receipts().is_empty());
+
+    // The stream cannot distinguish this replay from a new same-conversation
+    // result. Store may retain its observed terminal receipt as admission only.
+    controller.consume_line(&antigravity_result_line(
+        ANTIGRAVITY_TEST_ROOT,
+        replayed_response,
+    ));
+    let terminal = controller.settle_terminal().unwrap();
+    assert_eq!(
+        terminal.outcome,
+        swarm_contracts::runtime::EffectOutcome::Applied
+    );
+    assert_eq!(
+        terminal.details["completion_condition"],
+        "native_terminal_result_observed"
+    );
+    assert_eq!(terminal.details["execution_complete"], false);
+    assert_eq!(terminal.details["task_completion"], "unknown");
+    let admission = terminal.details["dispatch_admission"].clone();
+    let admission_receipt: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
+        serde_json::from_value(admission.clone()).unwrap();
+    let dispatch_context: swarm_contracts::runtime::TaskDispatchContext =
+        serde_json::from_value(context.clone()).unwrap();
+    assert_eq!(admission_receipt.context(), dispatch_context);
+    assert_eq!(
+        admission_receipt.native_payload_sha256,
+        prompt["prompt_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        Some(admission_receipt.native_payload_bytes),
+        prompt["prompt_bytes"].as_u64()
+    );
+    assert_eq!(admission_receipt.native_input_id, None);
+
+    let unbound_receipt = controller.pending_receipts().into_iter().next().unwrap();
+    let module_receipt = &unbound_receipt["details"]["module_receipt"];
+    assert_eq!(admission["module_receipt"], *module_receipt);
+    assert_eq!(module_receipt["module_id"], "antigravity");
+    assert_eq!(
+        module_receipt["artifact"]["artifact_id"],
+        swarm_antigravity_adapter::wire::ARTIFACT_ID
+    );
+    assert_eq!(module_receipt["operation_id"], command.operation_id);
+    assert_eq!(module_receipt["binding_id"], command.binding_id);
+    assert_eq!(module_receipt["binding_generation"], command.generation);
+    assert_eq!(
+        module_receipt["input_sha256"],
+        command.input_sha256.as_deref().unwrap()
+    );
+    assert_eq!(
+        admission_receipt.module_receipt.input_sha256,
+        command.input_sha256.as_deref().unwrap()
+    );
+
+    let pending_observation = controller.prepare_observation();
+    let observed_state = pending_observation.state.clone();
+    let observation_ack = runtime::observe(
+        &mut db,
+        &module,
+        &json!({
+            "event_id":pending_observation.event_id,
+            "sequence":pending_observation.sequence,
+            "state":pending_observation.state
+        }),
+    )
+    .unwrap();
+    assert_eq!(observation_ack["recorded"], true);
+    let observation_id = observation_ack["observation_id"].as_i64().unwrap();
+    assert_eq!(
+        controller.acknowledge_observation(&observation_ack),
+        Some(observation_id)
+    );
+    let observed_results = observed_state["local_execution_results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(observed_results.len(), 1);
+    assert_eq!(
+        observed_results[0]["input_operation_id"],
+        command.operation_id
+    );
+    assert_eq!(
+        observed_results[0]["native_conversation_id"],
+        ANTIGRAVITY_TEST_ROOT
+    );
+    assert_eq!(
+        observed_results[0]["bridge_boot_id"],
+        context["worker_boot_id"]
+    );
+    assert_eq!(
+        observed_results[0]["response_sha256"],
+        model::digest(replayed_response.as_bytes())
+    );
+    assert_eq!(observed_results[0]["status"], "SUCCESS");
+
+    let mut forged_receipt = controller.pending_receipts().into_iter().next().unwrap();
+    forged_receipt["details"]["local_execution_ref"]["observation_id"] = json!(observation_id + 1);
+    let error = runtime::outcome(&mut db, &module, &forged_receipt).unwrap_err();
+    assert_eq!(error.code, "NATIVE_IDENTITY_MISMATCH");
+    let operation_state: String = db
+        .query_row(
+            "SELECT state FROM operations WHERE operation_id=?1",
+            [PROMPT_RECOVERY_OPERATION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(operation_state, "sending");
+    let producers_raw: String = db
+        .query_row(
+            "SELECT producers_json FROM attempts WHERE attempt_id=?1",
+            [PROMPT_RECOVERY_ATTEMPT],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&producers_raw).unwrap(),
+        json!([])
+    );
+
+    let mut bound_outcome: swarm_contracts::runtime::RuntimeOutcome =
+        serde_json::from_value(controller.pending_receipts()[0].clone()).unwrap();
+    controller
+        .bind_observation_id(&mut bound_outcome, observation_id)
+        .unwrap();
+    let bound_receipt = controller.pending_receipts().into_iter().next().unwrap();
+    assert_eq!(
+        bound_receipt["details"]["local_execution_ref"]["observation_id"],
+        observation_id
+    );
+    let recorded = runtime::outcome(&mut db, &module, &bound_receipt).unwrap();
+    assert_eq!(recorded["recorded"], true);
+    controller.acknowledge_outcome(&command.operation_id);
+
+    let producers_raw: String = db
+        .query_row(
+            "SELECT producers_json FROM attempts WHERE attempt_id=?1",
+            [PROMPT_RECOVERY_ATTEMPT],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let producers: Value = serde_json::from_str(&producers_raw).unwrap();
+    assert_eq!(producers.as_array().unwrap().len(), 1);
+    assert_eq!(producers[0]["assignment_id"], command.operation_id);
+    assert_eq!(producers[0]["dispatch_operation_id"], command.operation_id);
+    assert_eq!(producers[0]["admission_kind"], "normalized_task_dispatch");
+    assert_eq!(
+        producers[0]["completion_condition"],
+        "native_input_admitted"
+    );
+    assert_eq!(producers[0]["disposition"], "admitted");
+    assert_eq!(producers[0]["execution_complete"], false);
+    assert_eq!(producers[0]["task_completion"], "unknown");
+    assert_eq!(
+        producers[0]["task_snapshot_sha256"],
+        admission["task_snapshot_sha256"]
+    );
+    assert_eq!(
+        producers[0]["source_text_sha256"],
+        admission["source_text_sha256"]
+    );
+    assert_eq!(
+        producers[0]["source_text_bytes"],
+        admission["source_text_bytes"]
+    );
+    assert_eq!(
+        producers[0]["native_payload_sha256"],
+        admission["native_payload_sha256"]
+    );
+    assert_eq!(
+        producers[0]["native_payload_bytes"],
+        admission["native_payload_bytes"]
+    );
+    assert_eq!(producers[0]["module_receipt"], admission["module_receipt"]);
+    assert_eq!(producers[0]["native_session_id"], ANTIGRAVITY_TEST_ROOT);
+    assert_eq!(producers[0]["native_input_id"], Value::Null);
+
+    let task_state: String = db
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [PROMPT_RECOVERY_TASK],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(task_state, "open");
+    let stored_observation_id: i64 = db
+        .query_row(
+            "SELECT json_extract(state_json,'$.native_observation_id') FROM bindings WHERE binding_id=?1 AND generation=1",
+            [PROMPT_RECOVERY_BINDING],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_observation_id, observation_id);
+
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

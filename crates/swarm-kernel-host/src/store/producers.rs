@@ -434,6 +434,7 @@ pub(super) fn record_task_dispatch(
     operation: &Value,
     outcome: &RuntimeOutcome,
     admission: &swarm_contracts::runtime::TaskDispatchAdmissionReceipt,
+    terminal_observation: Option<&Value>,
     now: i64,
 ) -> Result<Value> {
     if operation["method"] != "task.dispatch"
@@ -480,11 +481,16 @@ pub(super) fn record_task_dispatch(
         }
         ("native_turn_completed", true, "completed")
     } else {
+        // A warm-stream terminal marker is admission-only here. The caller
+        // must already have validated its exact committed observation and
+        // local fingerprint; the marker alone is never evidence.
+        let observed_warm_result = reported_completion == Some("native_terminal_result_observed")
+            && terminal_observation.is_some();
         if reported_completion.is_some_and(|condition| {
             !matches!(
                 condition,
                 "native_input_admitted" | "native_result_observed"
-            )
+            ) && !observed_warm_result
         }) || reported_execution_complete.is_some_and(|value| value != false)
             || reported_task_completion.is_some_and(|value| value != "unknown")
             || !matches!(

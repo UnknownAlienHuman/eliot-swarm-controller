@@ -930,6 +930,11 @@ fn terminal_outcome(
     if matches!(disposition, TerminalDisposition::Applied)
         && let Some(admission) = dispatch_admission
     {
+        // The stream proves that this process observed a terminal result, but
+        // exposes no native input-parent edge. Retain dispatch admission without
+        // promoting the local ordinal into execution or Task completion proof.
+        details["execution_complete"] = json!(false);
+        details["task_completion"] = json!("unknown");
         details["dispatch_admission"] =
             serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
         details["prompt_contract_revision"] = json!(TASK_PROMPT_CONTRACT_REVISION);

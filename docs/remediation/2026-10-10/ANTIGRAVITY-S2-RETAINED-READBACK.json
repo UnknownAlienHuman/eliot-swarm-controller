@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "record_type": "agy_s2_retained_readback",
+  "scope": {
+    "repository": "C:\\Development\\Rust\\projects\\eliot-swarm-controller",
+    "run_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010s",
+    "run_id": "7e96b096-09a5-4dc0-84ff-a3d99e803bca",
+    "task_id": "96710f47-2237-47de-9e81-8bc408c48c45",
+    "attempt_id": "fe0487ee-7218-4c29-8c80-444eae3882d0",
+    "dispatch_operation_id": "96fbcca0-689b-4d39-bd9a-a9d7c4515aab",
+    "adapter": "Antigravity S2"
+  },
+  "method": {
+    "mode": "read-only retained-evidence investigation",
+    "sqlite_runtime": "Node.js v25.6.1 node:sqlite DatabaseSync with readOnly=true",
+    "sqlite_tables_read": [
+      "tasks",
+      "attempts",
+      "operations",
+      "observations",
+      "artifacts"
+    ],
+    "credential_values_read_or_emitted": false,
+    "raw_prompt_or_response_emitted": false,
+    "codebase_memory": {
+      "tool": "codebase-memory-mcp 0.9.0 local CLI",
+      "calls": [
+        "list_projects",
+        "index_status",
+        "search_code"
+      ],
+      "current_index_head": "7f6eb065ab13b7537e47e3620f0272cce9fd05b2",
+      "use": "source navigation only; run-specific source was inspected at the pinned revision below"
+    },
+    "eliot_surrealdb_mcp": "not exposed in this session; no memory-database query or write was made"
+  },
+  "conclusion": {
+    "exact_original_dispatch_text_retained": true,
+    "constructed_task_prompt_retained_and_digest_valid": true,
+    "evidence_correlation_without_resending": "YES: retained original/effective request bytes match, and a persisted adapter terminal-success fingerprint names this exact operation_id.",
+    "store_operation_finalized": false,
+    "store_operation_state": "outcome_unknown",
+    "resend_required_for_evidence_correlation": false,
+    "task_completion_or_acceptance_proven": false,
+    "direct_agent_reconcile_after_worker_exit": "The source path depends on the controller in-memory pending_receipts; absent a matching receipt it returns NATIVE_HISTORY_UNAVAILABLE. The run records graceful host exit, but live controller state was not queried. No reconcile call was made."
+  },
+  "input_evidence": {
+    "operation_original_request_json_text": {
+      "present": true,
+      "utf8_bytes": 147,
+      "sha256": "010566a17aadecc29d6e1077a02228c2c5a4f6c0351ab5ed3c347640d0811e49"
+    },
+    "operation_effective_request_json_input": {
+      "present": true,
+      "utf8_bytes": 147,
+      "sha256": "010566a17aadecc29d6e1077a02228c2c5a4f6c0351ab5ed3c347640d0811e49",
+      "byte_identical_to_original_request_text": true
+    },
+    "effective_task_prompt": {
+      "present": true,
+      "utf8_bytes": 2642,
+      "sha256": "e01b9ab85114ad08b9f1ce3bb600f40a915140f7411dc0723faec25c876fba21",
+      "embedded_sha256_valid": true,
+      "task_attempt_identity_matches": true,
+      "embedded_task_snapshot_matches_attempt_snapshot": true,
+      "dispatch_context_identity_and_snapshot_digest_match": true
+    },
+    "task_dispatch_operation_count_for_task": 1
+  },
+  "native_result_evidence": {
+    "pre_dispatch_refresh": {
+      "operation_id": "ed451318-75db-4aa7-9508-6e3d6c45e830",
+      "recorded_before_dispatch": true,
+      "stream_phase": "ready",
+      "native_events_seen": 1,
+      "result_ordinal": 0,
+      "gap_count": 0,
+      "turn_pending": false
+    },
+    "post_dispatch_runtime_snapshots": [
+      {
+        "observation_id": 37,
+        "native_events_seen": 2,
+        "result_ordinal": 0,
+        "gaps": 0
+      },
+      {
+        "observation_id": 38,
+        "native_events_seen": 5,
+        "result_ordinal": 0,
+        "gaps": 0
+      },
+      {
+        "observation_id": 39,
+        "recorded_at_ms": 1791689427877,
+        "stream_phase": "ready",
+        "native_events_seen": 10,
+        "result_ordinal": 1,
+        "gaps": 0,
+        "turn": {
+          "status": "SUCCESS",
+          "result_ordinal": 1,
+          "num_turns": 1,
+          "response_sha256": "26774ed53c25db699cec29b2b7b9b84c08d01bee678e8eec3b10709479aed7a5"
+        },
+        "local_execution_result": {
+          "input_operation_id": "96fbcca0-689b-4d39-bd9a-a9d7c4515aab",
+          "status": "SUCCESS",
+          "result_ordinal": 1,
+          "response_sha256": "26774ed53c25db699cec29b2b7b9b84c08d01bee678e8eec3b10709479aed7a5"
+        }
+      }
+    ],
+    "operation_outcome_unknown_observation": {
+      "observation_id": 40,
+      "recorded_at_ms": 1791689427881,
+      "error_code": "OUTCOME_UNKNOWN"
+    },
+    "interpretation": "The adapter snapshot records one successful terminal turn and correlates it to the dispatch operation. This is evidence of a successful local native turn; it is not provider-account, billing, or task-completion proof."
+  },
+  "store_state": {
+    "operation_state": "outcome_unknown",
+    "operation_settled_at_ms": null,
+    "native_refs_json_empty": true,
+    "stored_result_json": {
+      "state": "queued",
+      "admission": "durable_local",
+      "native_admission": "not_observed"
+    },
+    "attempt_state": "reserved",
+    "task_state": "open",
+    "accepted_attempt_id": null,
+    "accepted_operation_id": null,
+    "artifacts_table_rows": 0
+  },
+  "diagnostic": {
+    "worker_diagnostic_error_code": "TASK_DISPATCH_ADMISSION_INVALID",
+    "worker_diagnostic_retains_only_generic_code": true,
+    "specific_validator_branch_or_message_retained": false,
+    "source_note": "At the run-pinned host source revision, TASK_DISPATCH_ADMISSION_INVALID is emitted by Store-side dispatch-admission validation/production. That source records a local terminal result only after begin_prompt passes normalized admission. The worker artifact is v5 and declares TaskPrompt/dispatch-admission schemas, but its build metadata does not independently pin its source commit; the post-native Store-failure explanation is source-supported, not binary-attested. The precise failing predicate is absent."
+  },
+  "evidence_absent_from_scoped_run": [
+    {
+      "item": "raw native response body",
+      "retained": "response SHA-256 and status only; no response text/bytes in the runtime snapshot; artifacts table is empty",
+      "external_native_or_provider_history": "not inspected; may exist outside the supplied run root"
+    },
+    {
+      "item": "returned typed dispatch_admission receipt and exact Store validation error message",
+      "retained": "no committed runtime.outcome for the dispatch; operation result remains the initial queued projection; worker diagnostic stores only TASK_DISPATCH_ADMISSION_INVALID"
+    },
+    {
+      "item": "provider account identity, vendor-side model consumption, or billing evidence",
+      "retained": "not proven by the qualification harness"
+    },
+    {
+      "item": "task completion/acceptance",
+      "retained": "task remains open and attempt remains reserved; qualification receipt says task completion was not claimed"
+    },
+    {
+      "item": "live controller pending_receipts after shutdown",
+      "retained": "controller receipts are in-process state; qualification receipt records graceful host exit. No restart or reconcile was performed."
+    },
+    {
+      "item": "module adapter source-commit provenance",
+      "retained": "worker artifact version 5 and process image hash are recorded, but worker build_id is null and no source-commit mapping is retained"
+    }
+  ],
+  "source_anchors": [
+    {
+      "path": "runs/7e96b096-09a5-4dc0-84ff-a3d99e803bca/qualification-receipt.json",
+      "facts": [
+        "single_task_dispatch=unknown",
+        "task_dispatch_calls=1",
+        "host exited gracefully",
+        "raw request/result omitted from receipt",
+        "provider account/model consumption not proven"
+      ]
+    },
+    {
+      "path": "runs/7e96b096-09a5-4dc0-84ff-a3d99e803bca/state/swarm.db",
+      "anchors": [
+        "operations[operation_id].original_request_json",
+        "operations[operation_id].effective_request_json",
+        "operations[operation_id].state/result_json/native_refs_json",
+        "attempts[attempt_id].task_snapshot_json",
+        "tasks[task_id].state",
+        "observations[37..40]",
+        "artifacts"
+      ]
+    },
+    {
+      "path": "runs/7e96b096-09a5-4dc0-84ff-a3d99e803bca/state/module-supervisor/state/.../worker-diagnostic.json",
+      "fact": "error_code=TASK_DISPATCH_ADMISSION_INVALID; no lower-level reason field"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/runtime.rs",
+      "git_revision": "95b69d1d0e37487648df0161282551e2315ac18a",
+      "lines": "188-299, 2565-2588",
+      "fact": "Store validates returned admission after an Applied/Accepted RuntimeOutcome; several validation branches share TASK_DISPATCH_ADMISSION_INVALID"
+    },
+    {
+      "path": "modules/antigravity-rust/src/controller.rs",
+      "git_revision": "95b69d1d0e37487648df0161282551e2315ac18a",
+      "lines": "332-379, 403-440, 903-929, 480-538",
+      "fact": "normalized admission precedes pending prompt creation; terminal results retain a local response fingerprint; reconcile uses in-memory pending_receipts and reports NATIVE_HISTORY_UNAVAILABLE when absent"
+    },
+    {
+      "path": ".local/manager-audit/agy-s2-reconciliation-source-plan.json",
+      "fact": "reviewed source git_head matches the qualification host source commit; prior missing-task_prompt hypothesis is not supported by this run's post-dispatch terminal-success observation"
+    },
+    {
+      "path": "runs/7e96b096-09a5-4dc0-84ff-a3d99e803bca/state/module-supervisor/state/.../worker.json",
+      "facts": [
+        "artifact_id=eliot-antigravity.rust-headless.1",
+        "artifact_version=5",
+        "contract declares task_prompt, task_dispatch_context, and task_dispatch_admission schemas",
+        "build_id=null",
+        "module source commit not independently pinned"
+      ]
+    }
+  ],
+  "actions_performed": {
+    "native_calls": 0,
+    "reconcile_calls": 0,
+    "replays_or_resends": 0,
+    "restarts": 0,
+    "database_writes": 0,
+    "credential_file_contents_read": 0,
+    "only_file_written": ".local/manager-audit/agy-s2-retained-readback.json"
+  }
+}

@@ -2228,6 +2228,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "swarm-automation",
+ "swarm-antigravity-adapter",
  "swarm-bus",
  "swarm-checks",
  "swarm-client",
