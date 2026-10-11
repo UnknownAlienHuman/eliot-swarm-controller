@@ -7,8 +7,8 @@ the [worker birth-identity repair](../2026-10-10/WORKER-BIRTH-IDENTITY-REPAIR.js
 Its single host dispatch call was rejected before native admission with
 `STALE_LAUNCH_DISPATCH_SCOPE`; no native `task.dispatch` journal was written.
 The retained Store rejection corrects the historical harness classification
-`dispatch_outcome_unknown`. The binding had become disconnected/reconciling;
-its precise lifecycle cause remains under investigation. A single host epoch
+`dispatch_outcome_unknown`. The post-run binding snapshot is disconnected/reconciling;
+the transaction-time failed predicate and transition timing remain unverified. A single host epoch
 does not prove a restart. The O host exited after graceful EOF. Antigravity O
 was not started, and model consumption and Task completion remain unverified.
 

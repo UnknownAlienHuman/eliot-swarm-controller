@@ -521,7 +521,7 @@
     "guard_retained": true,
     "guard_retention_note": "validate_parent_tuple is unchanged and correct as written. It refused a dispatch whose live scope was not exact and complete. No guard relaxation, retry, or synthesized ready state is proposed or implied by this record.",
     "verdict": "Strict guard retained. The guard is correct and stays as it is. The post-run mismatch is a hypothesis, not proof: the exact failed predicate at the time of the rejection is unproved.",
-    "harness_defect_note": "Historical harness fallback required Task and Attempt linkage absent on early rejected rows. The repair in main adds client_request_id to the existing Store Operation projection only for the producing caller, and keys harness readback by exact request ID plus method. Read grants and dispatch guard unchanged. Historical receipt unchanged.",
+    "harness_defect_note": "Historical fallback required Task/Attempt linkage absent on early rejected rows. Store caller-only client_request_id projection was delivered in e75aa0498715b1592272a03167020a4f92bfd694 after the initial O record b79f7b3. The harness readback patch is not yet delivered at this checkpoint. Existing read grants and strict admission guard remain unchanged; original O receipt unchanged.",
     "source": [
       ".local/manager-audit/o-module-link-cause-review.json (sha256 e14711cd20fb45f3d3b10b554370e4013c84aefc4852c86a76b85f8061c965b0)",
       ".local/manager-audit/o-dispatch-store-scope-readback.json (sha256 2fbecc33665921b22ea8a4a13f206ad5219e4e6414d943c44cfb55a3138342a2)",
@@ -563,7 +563,7 @@
       "retry_authorized": false,
       "unknown_operation_count": 0
     },
-    "native_observation": "The final binding observation at ms 1791674547359 records connection disconnected while the module supervisor remains phase ready. The rejection at ms 1791674548100 follows that disconnect.",
+    "native_observation": "The retained ms1791674547359 timestamp belongs to the last ready supervisor observation, sequence4. The post-run binding snapshot contains connection=disconnected but no timestamp for that connection transition. Combining those fields does not establish a disconnect before rejection at ms1791674548100.",
     "rejection_order": "operation.rejected for 49fef96d-c152-4f16-9f5a-e6119be3ca6a at ms 1791674548100, before the later native MCP operations and the terminal host exit."
   },
   "binding_observation_readback": {
@@ -599,9 +599,9 @@
     "Model consumption and task completion are not proven for either adapter.",
     "R48 optional-worker supervision and the AG assigned-session MCP schema gap remain open and unchanged by edition O.",
     "No independent kilo/step5 high provenance review for edition O is on file.",
-    "13 open upstream dependency alerts remain open."
+    "At native O execution, thirteen dependency alerts were open. The later generator repair3d39a0d plus closure record5e02d43 fixed all ten pip alerts; the2026-10-10 23:55UTC readback retains four open npm alerts. This does not qualify the historical O dependency snapshot."
   ],
-  "next_step": "The dispatch outcome is resolved: the Store deterministically rejected task.dispatch before admission with STALE_LAUNCH_DISPATCH_SCOPE, and the strict guard is retained unchanged. What remains open is why binding 314cb683-fad4-431d-8244-08131ca1079b left the ready state, and the retained run cannot settle it, because the rejection did not keep its transaction-time predicate snapshot and the disconnect evidence postdates the rejection. The smallest safe next step is bounded native Rust diagnostics that record the first failed predicate from the same transaction snapshot and a privacy-safe module-link disconnect observation, while keeping the public rejection code and the guard as they are. That trace, plus an independent provenance review for edition O, should precede any new native run.",
+  "next_step": "Dispatch is deterministically rejected before admission. The rejecting transaction retained no failed-predicate label; connection transition timing is unverified. Continue the exact request-ID harness readback and bounded native Rust predicate/disconnect diagnostics. After the source patches pass their affected gates, build a new exact clean candidate and perform one bounded native pass. Historical O effects are not replayed.",
   "package_provenance_basis": {
     "schema": "eliot.native_execution_results.v1 package provenance basis",
     "basis": [
@@ -622,5 +622,20 @@
     "harness_outcome_unknown": "Not a verdict. It is the receipt's own classification, retained verbatim, and it does not propagate into this record's overall status or into any per-adapter verdict.",
     "store_rejection_outcome": "Terminal and definite. A persisted rejected state with a stable error code is a closed outcome and is reported as such.",
     "overall_final_status": "PARTIAL_PROGRESS, matching the honest historical progression of native candidates through O."
+  },
+  "source_followup_checkpoint": {
+    "store_request_identity": {
+      "status": "delivered",
+      "commit": "e75aa0498715b1592272a03167020a4f92bfd694"
+    },
+    "qualification_harness": {
+      "status": "implementation_pending",
+      "delivered_commit": null
+    },
+    "lifecycle_diagnostics": {
+      "status": "implementation_pending",
+      "delivered_commit": null
+    },
+    "qualification_candidate": "Historical exact1ad4209 only"
   }
 }

@@ -132,9 +132,10 @@ The harness's reporting of the rejection as `outcome_unknown` is a diagnostic lo
 Store defect, and it stays out of the verdict: the harness derives the operation id only from a
 successful CLI stdout parse, and its fallback filter requires the `task_id` and `attempt_id` columns
 that a pre-admission rejected row never carries. The historical classification lacked a projected
-request id. The current repair in main adds that key to the existing Store projection
-only for the producing caller, and uses it for exact harness readback. The dispatch
-guard and read grants remain unchanged. The Store rejection is terminal and definite, so the
+request id. Store commit `e75aa0498715b1592272a03167020a4f92bfd694`, delivered
+after the initial O record `b79f7b3`, adds that key to the existing projection only
+for the producing caller. The harness follow-up is still pending at this checkpoint.
+The dispatch guard and read grants remain unchanged. The Store rejection is terminal and definite, so the
 verified outcome of this run is `dispatch_rejected_before_admission`, with
 `harness_reported_status` `dispatch_outcome_unknown` retained beside it as the receipt verbatim.
 
@@ -146,6 +147,11 @@ the host startup recovery sweep at `store/mod.rs:3196-3242` and `runtime::discon
 `store/runtime.rs:3439-3481`. The run retains exactly one host lifecycle record with
 `host_epoch` 1 and final state `failed`, so no second epoch exists that would prove a restart.
 The cause is therefore recorded as `UNDETERMINED` and no restart cause is claimed here.
+
+The timestamp `1791674547359` belongs to the last ready supervisor observation,
+sequence 4. The final binding snapshot also contains `connection=disconnected`,
+but that connection mutation has no retained timestamp. Combining the snapshot's
+fields cannot establish that disconnect preceded the rejection.
 
 This section also does not settle the earlier question of whether the binding was already
 non-ready when the dispatch was rejected. The rejection kept no predicate snapshot, and both the
