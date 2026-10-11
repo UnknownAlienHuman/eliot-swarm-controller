@@ -9,7 +9,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($harness, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'R48_PARSE_FAILED' }
-$functions = @('Get-ControllerId', 'Get-StrictInt64', 'Assert-EligibleCheckRunReceipt', 'Assert-HostRemainsAlive', 'New-PrivateDirectory', 'Write-PrivateJson', 'Invoke-PublicCall', 'Stop-OwnedHost', 'Stop-OwnedPublicCliProcess', 'Start-BoundedProcess', 'Test-QualificationFaultWitness', 'Wait-ForQualificationFaultWitness')
+$functions = @('Get-ControllerId', 'Get-StrictInt64', 'Assert-EligibleCheckRunReceipt', 'Assert-HostRemainsAlive', 'New-PrivateDirectory', 'Write-PrivateJson', 'Invoke-PublicCall', 'Stop-OwnedHost', 'Stop-OwnedPublicCliProcess', 'Start-BoundedProcess', 'Test-QualificationFaultWitness', 'Wait-ForQualificationFaultWitness', 'Test-QualificationAdmitAttempts', 'Add-SubgateResult', 'Save-Receipt')
 $definitions = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in $functions })
 if ($definitions.Count -ne $functions.Count) { throw 'R48_FUNCTION_MISSING' }
@@ -130,6 +130,8 @@ param([string]$Path)
 Start-Sleep -Milliseconds 300
 $value = @{ schema='eliot.swarm.r48.qualification-fault-witness.v1'; owner_launch_pid=$PID; owner_config_sha256=('a'*64); method='automation.scheduler.admit'; replay='withheld_before_delivery'; withheld_frame_bytes=128 }
 [IO.File]::WriteAllText($Path,($value|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+$intent = @{ schema='eliot.swarm.r48.qualification-admit-attempt.v1'; owner_launch_pid=$PID; owner_config_sha256=('a'*64); method='automation.scheduler.admit'; sequence=1 }
+[IO.File]::WriteAllText((Join-Path (Split-Path $Path) 'qualification-admit-attempt-1.json'),($intent|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 [Console]::In.ReadLine() | Out-Null
 '@, [Text.UTF8Encoding]::new($false))
 $writerInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -176,6 +178,37 @@ try {
     if (-not $writer.WaitForExit(5000)) { throw 'FIXTURE_WITNESS_WRITER_STOP_UNCONFIRMED' }
     $writer.Dispose()
 }
+
+# Execute the actual completion branch after the real witness writer has exited.
+# Its result must cross Add-SubgateResult's dictionary boundary and survive JSON
+# persistence, while a second admission marker must still refuse verification.
+$completion = @($ast.FindAll({ param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+    $node.Extent.Text.StartsWith('if ($noReplay.success) {')
+}, $true))
+if ($completion.Count -ne 1) { throw 'R48_COMPLETION_BRANCH_MISSING' }
+$script:FinalScenario = $witnessScenario
+$script:SubgateResults = [System.Collections.Generic.List[object]]::new()
+$script:Report = [ordered]@{ subgates=[ordered]@{}; subgate_evidence=@() }
+$script:RunDirectory = $privatePath
+$noReplay = $observed
+& ([scriptblock]::Create($completion[0].Extent.Text))
+$persisted = Get-Content -LiteralPath (Join-Path $privatePath 'qualification-receipt.json') -Raw | ConvertFrom-Json -AsHashtable
+$recorded = $persisted.subgate_evidence[0]
+Assert-Case 'completion_persists_verified_no_replay_evidence' (
+    $persisted.subgates.uncertain_initial_admit_receipt_no_replay -ceq 'verified' -and
+    $recorded.evidence.admission_intents -eq 1 -and -not $recorded.evidence.second_intent_observed -and
+    $recorded.evidence.observation_end -ceq 'confirmed_graceful_host_stop')
+Assert-Case 'completion_preserves_validated_injection_scope' (
+    $recorded.evidence.injection.owner_launch_pid -eq $observed.owner_launch_pid -and
+    $recorded.evidence.injection.config_digest -ceq $digest -and
+    $recorded.evidence.injection.config_digest_matches_file)
+Write-PrivateJson -Path (Join-Path $servicePath 'qualification-admit-attempt-2.json') -Value @{ sequence=2 }
+& ([scriptblock]::Create($completion[0].Extent.Text))
+$persisted = Get-Content -LiteralPath (Join-Path $privatePath 'qualification-receipt.json') -Raw | ConvertFrom-Json -AsHashtable
+Assert-Case 'completion_refuses_second_admission_intent' (
+    $persisted.subgates.uncertain_initial_admit_receipt_no_replay -ceq 'not_verified' -and
+    $persisted.subgate_evidence[-1].code -ceq 'QUALIFICATION_SECOND_ADMIT_ATTEMPT_OBSERVED')
 
 # Re-load the real CLI helper after the liveness stub. Its transport accepts a
 # params document and prints the complete application value, including result.

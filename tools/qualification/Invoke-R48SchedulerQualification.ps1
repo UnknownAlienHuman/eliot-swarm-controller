@@ -1950,7 +1950,12 @@ if (-not $finalStop.stopped) {
 if ($noReplay.success) {
     $attempts = Test-QualificationAdmitAttempts -Scenario $script:FinalScenario -Injection $noReplay
     if ($attempts.success) {
-        Add-SubgateResult -Name 'uncertain_initial_admit_receipt_no_replay' -Status 'verified' -Code $null -Evidence $attempts
+        Add-SubgateResult -Name 'uncertain_initial_admit_receipt_no_replay' -Status 'verified' -Code $null -Evidence ([ordered]@{
+            admission_intents = $attempts.admission_intents
+            second_intent_observed = $attempts.second_intent_observed
+            observation_end = $attempts.observation_end
+            injection = $attempts.injection
+        })
     } else {
         Add-SubgateResult -Name 'uncertain_initial_admit_receipt_no_replay' -Status 'not_verified' -Code $attempts.code
     }

@@ -2,6 +2,12 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+The latest [installed V and completion evidence repair](R48-COMPLETION-EVIDENCE-REPAIR.md)
+retain an applied fault witness with exact owner/config binding. V's original
+exit 1 and blocked receipt remain unchanged: a dictionary/object mismatch
+prevented final no-replay evidence persistence. The current regression suite
+passes 36/36 on both platforms; all older fixture counts below are historical.
+
 The fresh [installed U observation](R48-SCHEDULER-LIFETIME.md) verified four
 of five observations but exposed demand withdrawal killing the first admit's
 caller. U's applied-fault/no-replay result remains UNKNOWN; source lifetime

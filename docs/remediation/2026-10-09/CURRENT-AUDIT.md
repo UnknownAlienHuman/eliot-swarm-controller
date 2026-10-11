@@ -1,5 +1,12 @@
 # Current-source audit and implementation ledger
 
+The [installed V observation and completion evidence repair](../2026-10-11/R48-COMPLETION-EVIDENCE-REPAIR.md)
+retain a real applied 892-byte withheld-admit witness bound to the current
+Store-owned worker and config. V recorded four verified subgates, then exited 1
+because its final consumer passed a PSCustomObject to dictionary-typed evidence.
+Its blocked receipt is preserved. The repaired consumer and actual completion
+branch regression pass 36/36 on Windows/Linux; fresh installed proof is pending.
+
 The [installed U observation and scheduler lifetime repair](../2026-10-11/R48-SCHEDULER-LIFETIME.md)
 identify a production demand-drop stop during the first admit. U verifies four
 of five observations; applied-fault/no-replay remains UNKNOWN. The source repair
