@@ -1,0 +1,271 @@
+{
+  "schema": "eliot.scheduler_owner_projection.v1",
+  "recorded_at_utc": "2026-10-11T00:17:49.8652087Z",
+  "source_base_commit": "426d6fce413acfcef0efbc199eee2fe32c3c3267",
+  "final_status": "PARTIAL_PROGRESS",
+  "source_and_affected_fixture_status": "VERIFIED",
+  "public_surface": "host.status.host_lifecycle.optional_workers.automation-scheduler.owner",
+  "behavior": [
+    "Retains launch owner scope and host epoch/controller/launch identity",
+    "Ready requires validated active current owner, current running host epoch and supervisor running marker",
+    "Legacy missing host scope degrades to explicit unavailable, ready=false",
+    "Damaged or stale owner yields bounded non-ready projection",
+    "Pure shared shape predicate reused with explicit 20-byte public start_ticks bound",
+    "No OS liveness, admission authority, secrets, token or credential projection"
+  ],
+  "source_snapshot": {
+    "raw_sha256": {
+      "crates/swarm-automation/src/lib.rs": "994f5c436f270f9edf38934a32e9b1c32ad559f949f173420f8f71d104427829",
+      "crates/swarm-kernel-host/src/store/automation_scheduler.rs": "619ddb59a0de3d32d63c54bf61d45a83336a43213d915c3c53b90c7821e6c385",
+      "crates/swarm-kernel-host/src/store/host_lifecycle.rs": "e82f8b36d1afaf4b4ba6737b5c7c3889e0d51605ce484a3c8e77a1844d0897ac",
+      "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs": "8108fd257599b3a3fa8e9ba8f350e53541d791c6bb83cf6439e2aee1c76c1483"
+    },
+    "before_gates_sha256": {
+      "crates/swarm-automation/src/lib.rs": "994f5c436f270f9edf38934a32e9b1c32ad559f949f173420f8f71d104427829",
+      "crates/swarm-kernel-host/src/store/automation_scheduler.rs": "619ddb59a0de3d32d63c54bf61d45a83336a43213d915c3c53b90c7821e6c385",
+      "crates/swarm-kernel-host/src/store/host_lifecycle.rs": "e82f8b36d1afaf4b4ba6737b5c7c3889e0d51605ce484a3c8e77a1844d0897ac",
+      "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs": "8108fd257599b3a3fa8e9ba8f350e53541d791c6bb83cf6439e2aee1c76c1483"
+    },
+    "after_gates_sha256": {
+      "crates/swarm-automation/src/lib.rs": "994f5c436f270f9edf38934a32e9b1c32ad559f949f173420f8f71d104427829",
+      "crates/swarm-kernel-host/src/store/automation_scheduler.rs": "619ddb59a0de3d32d63c54bf61d45a83336a43213d915c3c53b90c7821e6c385",
+      "crates/swarm-kernel-host/src/store/host_lifecycle.rs": "e82f8b36d1afaf4b4ba6737b5c7c3889e0d51605ce484a3c8e77a1844d0897ac",
+      "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs": "8108fd257599b3a3fa8e9ba8f350e53541d791c6bb83cf6439e2aee1c76c1483"
+    },
+    "all_four_before_after_match": true,
+    "head_at_recording": "426d6fce413acfcef0efbc199eee2fe32c3c3267",
+    "owned_paths": [
+      "crates/swarm-automation/src/lib.rs",
+      "crates/swarm-kernel-host/src/store/automation_scheduler.rs",
+      "crates/swarm-kernel-host/src/store/host_lifecycle.rs",
+      "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs"
+    ],
+    "paths_changed_in_this_slice": [
+      "crates/swarm-automation/src/lib.rs",
+      "crates/swarm-kernel-host/src/store/automation_scheduler.rs",
+      "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs"
+    ],
+    "hash_check_methods": [
+      "Get-FileHash -Algorithm SHA256 before and after gates",
+      "WSL sha256sum --check before Clippy, before tests and after tests"
+    ],
+    "diff_check": {
+      "argv": [
+        "git",
+        "diff",
+        "--check",
+        "--",
+        "crates/swarm-automation/src/lib.rs",
+        "crates/swarm-kernel-host/src/store/automation_scheduler.rs",
+        "crates/swarm-kernel-host/src/store/host_lifecycle.rs",
+        "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs"
+      ],
+      "exit_code": 0
+    }
+  },
+  "gates": {
+    "toolchain": "1.98.1",
+    "windows": {
+      "cwd": "C:/Development/Rust/projects/eliot-swarm-controller",
+      "target": "C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target",
+      "production_clippy": {
+        "executable": "rustup",
+        "argv": [
+          "run",
+          "1.98.1",
+          "cargo",
+          "clippy",
+          "--locked",
+          "--package",
+          "swarm-automation",
+          "--package",
+          "swarm-kernel-host",
+          "--lib",
+          "--bins",
+          "--no-deps",
+          "--target-dir",
+          "C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "started_at_utc": "2026-10-11T00:10:14.5504624Z",
+        "exit_code": 0,
+        "invocations": 1,
+        "log_path": ".local/manager-audit/r48-owner-projection-shared-shape-windows-clippy.log"
+      },
+      "test_build": {
+        "executable": "rustup",
+        "argv": [
+          "run",
+          "1.98.1",
+          "cargo",
+          "test",
+          "--locked",
+          "--package",
+          "swarm-kernel-host",
+          "--lib",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target"
+        ],
+        "started_at_utc": "2026-10-11T00:11:22.996099Z",
+        "exit_code": 0,
+        "invocations": 1,
+        "build_finished_success": true,
+        "log_path": ".local/manager-audit/r48-owner-projection-shared-shape-windows-test-build.jsonl",
+        "warning_count": 21,
+        "warning_paths": [
+          "crates\\swarm-kernel-host\\src\\runtime\\opencode_v2\\mcp_install.rs",
+          "crates\\swarm-kernel-host\\src\\runtime\\opencode_v2\\mcp_tools.rs"
+        ]
+      },
+      "tests": {
+        "executable": "C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\\debug\\deps\\swarm_kernel_host-aa4ff2b874bba26d.exe",
+        "argv": [
+          "--exact",
+          "store::automation_scheduler::fixture::scheduler_owner_status_launching_is_not_ready_despite_running_marker",
+          "store::automation_scheduler::fixture::scheduler_owner_status_active_exact_current_scope_is_ready_and_read_only",
+          "store::automation_scheduler::fixture::scheduler_owner_status_departed_retains_identity_without_readiness",
+          "store::automation_scheduler::fixture::scheduler_owner_status_stale_generation_or_host_scope_cannot_be_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_missing_or_damaged_owner_is_bounded_and_not_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_missing_disabled_or_damaged_registration_cannot_be_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_old_receipt_without_host_scope_cannot_be_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_requires_current_running_host_and_supervisor_marker",
+          "store::automation_scheduler::fixture::scheduler_owner_group_identity_shared_shape_is_closed_and_pure",
+          "--test-threads=4"
+        ],
+        "exit_code": 0,
+        "invocations": 1,
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 459,
+        "log_path": ".local/manager-audit/r48-owner-projection-shared-shape-windows-tests.log"
+      },
+      "order": "Production Clippy completed before compiling and executing only selected shared/pure/projection fixtures."
+    },
+    "linux": {
+      "cwd": "/mnt/c/Development/Rust/projects/eliot-swarm-controller",
+      "target": "/home/kleymor/.cache/eliot/swarm-v27-target",
+      "distribution": "Ubuntu",
+      "launcher_argv_prefix": [
+        "wsl.exe",
+        "--distribution",
+        "Ubuntu",
+        "--exec",
+        "bash",
+        "-c"
+      ],
+      "environment": {
+        "PATH": "/home/kleymor/.cargo/bin:$PATH",
+        "CC": "/usr/bin/gcc",
+        "CXX": "/usr/bin/g++",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "/usr/bin/gcc"
+      },
+      "production_clippy": {
+        "executable": "rustup",
+        "argv": [
+          "run",
+          "1.98.1",
+          "cargo",
+          "clippy",
+          "--locked",
+          "--package",
+          "swarm-automation",
+          "--package",
+          "swarm-kernel-host",
+          "--lib",
+          "--bins",
+          "--no-deps",
+          "--target-dir",
+          "/home/kleymor/.cache/eliot/swarm-v27-target",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "started_at_utc": "2026-10-11T00:10:14.5499278Z",
+        "exit_code": 0,
+        "invocations": 1,
+        "log_path": ".local/manager-audit/r48-owner-projection-shared-shape-linux-clippy.log"
+      },
+      "test_build": {
+        "executable": "rustup",
+        "argv": [
+          "run",
+          "1.98.1",
+          "cargo",
+          "test",
+          "--locked",
+          "--package",
+          "swarm-kernel-host",
+          "--lib",
+          "--no-run",
+          "--message-format=json",
+          "--target-dir",
+          "/home/kleymor/.cache/eliot/swarm-v27-target"
+        ],
+        "started_at_utc": "2026-10-11T00:11:22.9960269Z",
+        "exit_code": 0,
+        "invocations": 1,
+        "build_finished_success": true,
+        "log_path": ".local/manager-audit/r48-owner-projection-shared-shape-linux-test-build.jsonl",
+        "warning_count": 21,
+        "warning_paths": [
+          "crates/swarm-kernel-host/src/runtime/opencode_v2/mcp_install.rs",
+          "crates/swarm-kernel-host/src/runtime/opencode_v2/mcp_tools.rs"
+        ]
+      },
+      "tests": {
+        "executable": "/home/kleymor/.cache/eliot/swarm-v27-target/debug/deps/swarm_kernel_host-257b5739c6fd2424",
+        "argv": [
+          "--exact",
+          "store::automation_scheduler::fixture::scheduler_owner_status_launching_is_not_ready_despite_running_marker",
+          "store::automation_scheduler::fixture::scheduler_owner_status_active_exact_current_scope_is_ready_and_read_only",
+          "store::automation_scheduler::fixture::scheduler_owner_status_departed_retains_identity_without_readiness",
+          "store::automation_scheduler::fixture::scheduler_owner_status_stale_generation_or_host_scope_cannot_be_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_missing_or_damaged_owner_is_bounded_and_not_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_missing_disabled_or_damaged_registration_cannot_be_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_old_receipt_without_host_scope_cannot_be_ready",
+          "store::automation_scheduler::fixture::scheduler_owner_status_requires_current_running_host_and_supervisor_marker",
+          "store::automation_scheduler::fixture::scheduler_owner_group_identity_shared_shape_is_closed_and_pure",
+          "store::automation_scheduler::fixture::scheduler_owner_status_retains_stronger_start_ticks_projection_bound",
+          "--test-threads=4"
+        ],
+        "exit_code": 0,
+        "invocations": 1,
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 472,
+        "log_path": ".local/manager-audit/r48-owner-projection-shared-shape-linux-tests.log"
+      },
+      "order": "Production Clippy completed before compiling and executing only selected shared/pure/projection fixtures."
+    },
+    "gate_proof_path": ".local/manager-audit/r48-owner-projection-gates.json",
+    "gate_proof_sha256": "ba303757a3ac4d6f835bcf8da8c78756bab8f727e3927fc9d0e441bdf57c5530"
+  },
+  "independent_review": {
+    "decision": "ACCEPT",
+    "reviewer": "KiloStep5 (stepfun/step-5-preview-free, High) independent subagent",
+    "agent_id": "01a12823-e6e6-74a3-8ee5-cecfefa68eb1",
+    "reviewed_at_utc": "2026-10-11T00:16:04Z",
+    "review_path": ".local/manager-audit/r48-owner-projection-shared-shape-review.json",
+    "review_sha256": "abb9e697b6b4d0a488f70db25f2534aa2a36f72f4120dda6f027a4eee8653b6b",
+    "scope": "Supplemental four-file shared-shape change; prior three-file owner projection review retained separately",
+    "historical_review_sha256": "a43b0d50246bcdb26d76ec2dee46a1fb784a9304ae6871ece18e644da0b1be14"
+  },
+  "native_qualification": {
+    "status": "PENDING",
+    "required": [
+      "Installed active scheduler owner readiness",
+      "Target eligibility",
+      "Uncertain initial admission and no replay"
+    ],
+    "prior_installed_isolation_and_restart": "Historical R48 recovery evidence only",
+    "native_calls": 0,
+    "model_calls": 0
+  }
+}

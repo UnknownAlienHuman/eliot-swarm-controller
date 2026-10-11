@@ -368,7 +368,10 @@ pub fn service_owner_family_empty(
     }
 }
 
-fn service_owner_group_identity_shape(identity: &serde_json::Value) -> bool {
+/// Validate the closed, platform-specific automation-scheduler owner identity.
+/// This pure data check requires no owner token and performs no OS inspection;
+/// a valid shape does not establish process liveness or authorize admission.
+pub fn service_owner_group_identity_shape(identity: &serde_json::Value) -> bool {
     #[cfg(windows)]
     {
         identity.as_object().is_some_and(|fields| {

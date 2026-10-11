@@ -21,6 +21,7 @@ const GENERATION_KEY: &str = "automation_scheduler:v1:generation";
 const OWNER_KEY: &str = "automation_scheduler:v1:owner";
 const METHOD_SCOPE: [&str; 2] = ["automation.scheduler.page", "automation.scheduler.admit"];
 const MAX_SOURCE_PAGE: usize = 32;
+const MAX_PROJECTED_START_TICKS_BYTES: usize = 20;
 const MAX_CHECK_RECOVERY_ERROR_MESSAGE_CHARS: usize = 512;
 const CRON_DUE_PREFIX: &str = "automation:v1:cron:due:";
 const GOAL_DUE_PREFIX: &str = "goals:v1:due:";
@@ -67,9 +68,25 @@ struct SchedulerRegistration {
 struct SchedulerOwner {
     schema_version: u32,
     scope: DeclaredServiceScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_scope: Option<SchedulerHostScope>,
     launch_id: String,
     phase: SchedulerOwnerPhase,
     group_identity: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerHostScope {
+    controller_id: String,
+    host_epoch: i64,
+}
+
+impl SchedulerHostScope {
+    fn valid(&self) -> bool {
+        self.host_epoch > 0
+            && DeclaredServiceScope::validate_service_id(&self.controller_id).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +585,10 @@ fn owner_record(db: &Connection) -> Result<Option<SchedulerOwner>> {
                 )
             })?;
             if owner.schema_version != 1
+                || owner
+                    .host_scope
+                    .as_ref()
+                    .is_some_and(|scope| !scope.valid())
                 || owner.scope.purpose != DeclaredServicePurpose::AutomationScheduler
                 || owner.scope.service_id != SERVICE_ID
                 || owner.launch_id.is_empty()
@@ -587,6 +608,118 @@ fn owner_record(db: &Connection) -> Result<Option<SchedulerOwner>> {
             Ok(owner)
         })
         .transpose()
+}
+
+fn current_host_scope(db: &Connection) -> Result<SchedulerHostScope> {
+    let scope = SchedulerHostScope {
+        controller_id: meta(db, "controller_id")?
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        host_epoch: meta(db, "host_epoch")?
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+    };
+    if !scope.valid() {
+        return Err(Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "scheduler host scope is missing or invalid",
+        ));
+    }
+    Ok(scope)
+}
+
+fn unavailable_owner_projection(status: &str, error_code: Option<&str>) -> Value {
+    json!({"schema_version":1,"status":status,"ready":false,"error_code":error_code})
+}
+
+/// Existing host.status readback of a settled owner receipt, not an OS
+/// liveness probe or an admission grant. A retained phase stays distinct from
+/// readiness in the current host incarnation and supervisor running window.
+pub(super) fn owner_projection(
+    db: &Connection,
+    running_host_epoch: Option<i64>,
+    supervisor_running: bool,
+) -> Result<Value> {
+    let owner = match owner_record(db) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return Ok(unavailable_owner_projection("missing", None)),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "AUTOMATION_SERVICE_OWNER_CORRUPT" | "INVALID_PARAMS"
+            ) =>
+        {
+            return Ok(unavailable_owner_projection(
+                "invalid",
+                Some("AUTOMATION_SERVICE_OWNER_CORRUPT"),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if owner.group_identity.as_ref().is_some_and(|identity| {
+        !swarm_automation::service_owner_group_identity_shape(identity)
+            // The shared Linux shape allows arbitrarily long digit strings.
+            // Retain the stronger read-side bound for the public projection.
+            || identity["start_ticks"]
+                .as_str()
+                .is_some_and(|ticks| ticks.len() > MAX_PROJECTED_START_TICKS_BYTES)
+    }) {
+        return Ok(unavailable_owner_projection(
+            "invalid",
+            Some("AUTOMATION_SERVICE_OWNER_CORRUPT"),
+        ));
+    }
+    let mut projection = json!({
+        "schema_version":1,
+        "status":"current",
+        "scope":owner.scope,
+        "host_scope":owner.host_scope,
+        "launch_id":owner.launch_id,
+        "phase":owner.phase,
+        "group_identity":owner.group_identity,
+        "ready":false,
+        "readiness_source":"validated_current_owner_receipt",
+    });
+    let scope = match current_scope(db) {
+        Ok(scope) => scope,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "AUTOMATION_SERVICE_NOT_REGISTERED"
+                    | "AUTOMATION_SERVICE_REGISTRATION_CORRUPT"
+                    | "INVALID_PARAMS"
+            ) =>
+        {
+            projection["status"] = json!("scope_unavailable");
+            return Ok(projection);
+        }
+        Err(error) => return Err(error),
+    };
+    let host_scope = match current_host_scope(db) {
+        Ok(scope) => scope,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "HOST_LIFECYCLE_INVALID" | "INVALID_PARAMS"
+            ) =>
+        {
+            projection["status"] = json!("host_scope_unavailable");
+            return Ok(projection);
+        }
+        Err(error) => return Err(error),
+    };
+    if owner.host_scope.is_none() {
+        projection["status"] = json!("host_scope_unavailable");
+    } else if owner.scope != scope || owner.host_scope.as_ref() != Some(&host_scope) {
+        projection["status"] = json!("stale");
+    } else {
+        projection["ready"] = json!(
+            owner.phase == SchedulerOwnerPhase::Active
+                && running_host_epoch == Some(host_scope.host_epoch)
+                && supervisor_running
+        );
+    }
+    Ok(projection)
 }
 
 fn save_owner(tx: &Transaction<'_>, owner: &SchedulerOwner) -> Result<()> {
@@ -660,6 +793,7 @@ pub(crate) fn begin_owner(
         &SchedulerOwner {
             schema_version: 1,
             scope: scope.clone(),
+            host_scope: Some(current_host_scope(tx)?),
             launch_id: launch_id.to_owned(),
             phase: SchedulerOwnerPhase::Launching,
             group_identity: None,

@@ -937,7 +937,17 @@ pub(super) fn status(db: &Connection) -> Result<Value> {
     let current = status_value(load(db).map(|value| value.map(|record| json!(record))))?;
     let last_exit = status_value(exit_receipt(db, LAST_EXIT))?;
     let latest_failure = status_value(exit_receipt(db, LATEST_FAILURE))?;
-    let optional_workers = optional_worker_health(db)?;
+    let mut optional_workers = optional_worker_health(db)?;
+    let supervisor_running =
+        optional_workers["workers"]["automation-scheduler"]["state"] == "running";
+    let running_host_epoch = (current["state"] == "running")
+        .then(|| current["host_epoch"].as_i64())
+        .flatten();
+    let owner =
+        super::automation_scheduler::owner_projection(db, running_host_epoch, supervisor_running)?;
+    // Add only an observation when no supervisor marker exists; do not invent
+    // running/dormant state or persist the projection into the health receipt.
+    optional_workers["workers"]["automation-scheduler"]["owner"] = owner;
     Ok(json!({
         "current":current,
         "last_exit":last_exit,

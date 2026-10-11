@@ -1,5 +1,16 @@
 # Current-source audit and implementation ledger
 
+The [scheduler owner projection](../2026-10-10/SCHEDULER-OWNER-PROJECTION.json)
+adds bounded active-owner and host-scope readback to `host.status`. Its shared pure
+identity validator and affected fixtures pass strict production Clippy on Windows
+and Linux, with 9 and 10 selected tests respectively. This source evidence does
+not qualify installed scheduler readiness, target eligibility or uncertain admission/no-replay.
+
+The [dispatch request readback repair](../2026-10-10/DISPATCH-REQUEST-IDENTITY-REPAIR.json)
+delivers the caller-only Store request key at `e75aa04` and the exact-identity
+qualification harness at `426d6fc`. The integrated harness fixture passes 48 checks;
+fresh native dispatch and causal model-result evidence remain pending.
+
 Fresh [O execution](../2026-10-10/EXECUTION-RESULTS-O.json) built and installed
 eight exact clean `1ad4209` release packages, with 16 installed hashes verified.
 OpenCode passed `module_open_and_hello` with supervisor readiness, confirming
