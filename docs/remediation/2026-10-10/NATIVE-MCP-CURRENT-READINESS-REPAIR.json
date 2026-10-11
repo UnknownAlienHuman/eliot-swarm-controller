@@ -81,8 +81,15 @@
     },
     "source_review": {
       "parent": "reviewed source and unchanged admission predicate",
-      "independent": "pending",
-      "installed": "not_run_on_this_source"
+      "independent": "accepted_no_p1_no_p2 on exact 6853278 source hashes",
+      "installed": "not_run_on_this_source",
+      "independent_evidence": {
+        "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-mcp-current-readiness-independent-review.json",
+        "sha256": "0255994bb1447c50664b90746322f157853c0d222c608e7cf3d5507306bab38c",
+        "reviewed_head": "6853278240b2f414a3286f8e204a9ec1416f562d",
+        "reviewer": "Averroes",
+        "reviewed_at_local": "2026-10-10T21:30:52-04:00"
+      }
     }
   },
   "remaining": [
