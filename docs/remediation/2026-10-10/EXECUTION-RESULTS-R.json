@@ -1,0 +1,237 @@
+{
+  "schema": "eliot.native_execution_results.v1",
+  "edition": "R",
+  "date": "2026-10-10",
+  "date_basis": "America/New_York",
+  "captured_at_utc": "2026-10-11T01:49:36.7332398Z",
+  "final_status": "PARTIAL_PROGRESS",
+  "candidate_commit": "6853278240b2f414a3286f8e204a9ec1416f562d",
+  "candidate_source": {
+    "tree": "fbd3d877cfa778920ad223037101b0395c51941e",
+    "build_status": "PASS",
+    "package_count": 8,
+    "toolchain": "1.98.1",
+    "profile": "release"
+  },
+  "execution_root": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010r",
+  "evidence": {
+    "execution_binding": {
+      "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010r\\runs\\root-native-execution-binding-6853278240b2f414a3286f8e204a9ec1416f562d-04e1899a30fc4c56a68b09b14fbb3b19.json",
+      "sha256": "2626480934aaa2af863c61bb09b3f9914f7d914f68337502455159f7700fe408",
+      "bytes": 12255,
+      "stable_during_read": true
+    },
+    "qualification_receipt": {
+      "path": "C:\\Development\\Rust\\qualification-runs\\v27-native-final-20261010r\\runs\\362fa2a2-18f1-4dd5-9912-b63a718ab477\\qualification-receipt.json",
+      "sha256": "d85787518d98b4afef45b7e3200896e253e9b675d732a7d42db64bbcc390361f",
+      "bytes": 34818,
+      "stable_during_read": true
+    },
+    "build_source_gate": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-r-build-source-gate.json",
+      "sha256": "700dfee353d7e3ce9c378903c6eba0b71b43d0b8daf96450bc276808f951c6f4",
+      "bytes": 7267,
+      "stable_during_read": true
+    },
+    "execution_log": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-r-root-execution.log",
+      "sha256": "e6c93128a11bad026a0e69b98fd84ff220d6ebf0e950d510ea62342b632abbdd",
+      "bytes": 448,
+      "stable_during_read": true
+    },
+    "input_hash_preflight": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-r-input-hash-preflight.json",
+      "sha256": "0bdddacba270420f730ae4219c307f7e96cda81f7528c4a4cb94b3c077af5b57",
+      "bytes": 617,
+      "stable_during_read": true
+    },
+    "preparation": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\candidate-final-20261010r-preparation.json",
+      "sha256": "850e577fae25c9ca3638771302008dc5ff0635fd8431130adaccf7dd99a62341",
+      "bytes": 7166,
+      "stable_during_read": true
+    },
+    "retained_final_mcp_readback": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-r-mcp-preparation-final-readback.json",
+      "sha256": "25b3814996129c389eba22f681fb0d405913018570af6896b6c6a4ff436ab652",
+      "bytes": 7414,
+      "stable_during_read": true
+    },
+    "retained_field_predicates": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-r-retained-proof-field-predicates.json",
+      "sha256": "ec7a9c548bf3af4ada9bce599e0497ae65c22167f7ccc5771d5a981823717731",
+      "bytes": 1796,
+      "stable_during_read": true
+    },
+    "retained_remaining_predicates": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-r-retained-proof-remaining-predicates.json",
+      "sha256": "f5e481d6641a083bf230a9ce1b89384497f6c7bc66b36954e6cefe411b5b6c95",
+      "bytes": 2899,
+      "stable_during_read": true
+    }
+  },
+  "evidence_capture": "Exact named files hashed before and after reads; manifests and actual binary hashes rechecked. SQLite diagnostics use mode=ro and query_only=ON; raw proof, tokens and native contents are not included.",
+  "native_results": {
+    "opencode": {
+      "run_id": "362fa2a2-18f1-4dd5-9912-b63a718ab477",
+      "status": "blocked",
+      "qualification": "not_qualified",
+      "dispatch_calls": 0,
+      "parent_operation_id": "c1e188b5-143b-4e74-8701-355babb548c4",
+      "task_id": "471c3c5b-7f38-4649-8ccf-d318e3799b2a",
+      "attempt_id": "8c48bfb4-1b95-47b0-98ed-c1773cf62fc5",
+      "binding_id": "c1821acd-4744-4a58-aa71-380669f8b22d",
+      "binding_generation": 1,
+      "failure": {
+        "name": "module_open_and_hello",
+        "status": "unknown",
+        "code": "LAUNCH_READY_READBACK_TIMEOUT",
+        "facts": {
+          "parent_operation_id": "c1e188b5-143b-4e74-8701-355babb548c4",
+          "dispatch_started": false,
+          "readiness_failure": {
+            "reason": "native_mcp_connection",
+            "expected_binding_scope": {
+              "task_id": "471c3c5b-7f38-4649-8ccf-d318e3799b2a",
+              "attempt_id": "8c48bfb4-1b95-47b0-98ed-c1773cf62fc5",
+              "module_id": "eliot.opencode.v2",
+              "artifact_id": "eliot-opencode-v2.rust-http.1",
+              "artifact_version": "0.5.0",
+              "binding_id": "c1821acd-4744-4a58-aa71-380669f8b22d",
+              "generation": 1
+            },
+            "observed_binding_state": "ready",
+            "observed_supervisor_phase": "ready",
+            "observed_launch_phase": "awaiting_native_mcp",
+            "observed_native_mcp_connection_state": "unavailable",
+            "error_code": null
+          }
+        }
+      },
+      "model": "opencode/step-5-preview-free",
+      "variant": "high"
+    },
+    "antigravity": {
+      "status": "not_run",
+      "dispatch_calls": 0,
+      "qualification": "not_qualified"
+    }
+  },
+  "retained_safe_mcp_facts": {
+    "c7_state": "observed_partial",
+    "install_state": "registered",
+    "runtime_status": "connected",
+    "challenge_state": "observed",
+    "tools_readback_present": true,
+    "observed_inventory_count": 11,
+    "inspected_field_predicates": {
+      "bounded_record": true,
+      "install_registered": true,
+      "runtime_connected": true,
+      "challenge_observed": true,
+      "intent_kind": true,
+      "intent_registration": true,
+      "intent_version": true,
+      "intent_assignment": true,
+      "tools_contract": true,
+      "tools_assignment": true,
+      "tools_service": true,
+      "tools_session": true,
+      "tools_model_metadata": true,
+      "tools_challenge_id": true,
+      "tools_challenge_times": true,
+      "metadata_assignment": true,
+      "observer_plugin": true,
+      "observer_module_sha256": true,
+      "observer_module_path": true,
+      "service_directory": true,
+      "directory_digest_matches_location": true,
+      "metadata_schema": true,
+      "metadata_service": true,
+      "native_discovered_observed": true,
+      "native_inventory_nonempty_bounded": true,
+      "tools_model_unknown": true,
+      "tools_dispatch_false": true,
+      "inventory_within_challenge_time": true,
+      "scoped_inventory_nonempty": true,
+      "independent_inventory_digest": true,
+      "independent_evidence_digest": true
+    },
+    "remaining_field_predicates": {
+      "record_schema": true,
+      "record_kind": true,
+      "record_directory_digest": true,
+      "record_service_id_matches_install": true,
+      "record_dispatch_false": true,
+      "tools_model_options": true,
+      "metadata_model_options": true,
+      "install_readback_intent": true,
+      "install_runtime_entry": true,
+      "install_pid": true,
+      "install_version": true,
+      "install_dispatch_false": true,
+      "install_match_unknown": true,
+      "install_config_not_exposed": true
+    },
+    "observation_stage_shapes": {
+      "session_context": {
+        "status": "unknown",
+        "stage": null,
+        "transport": null,
+        "kind": null,
+        "observed_at_ms": null,
+        "agent": null,
+        "reason_code": null,
+        "keys": [
+          "agent",
+          "digest",
+          "observed_at_ms",
+          "reason_code",
+          "stage",
+          "status",
+          "tools"
+        ],
+        "tools_count": 0,
+        "model_matches_options": false
+      },
+      "provider_request": {
+        "status": "unknown",
+        "stage": null,
+        "transport": null,
+        "kind": null,
+        "observed_at_ms": null,
+        "agent": null,
+        "reason_code": null,
+        "keys": [
+          "agent",
+          "digest",
+          "kind",
+          "model",
+          "observed_at_ms",
+          "reason_code",
+          "stage",
+          "status",
+          "tools",
+          "transport"
+        ],
+        "tools_count": 0,
+        "model_matches_options": false
+      }
+    }
+  },
+  "source_finding": {
+    "status": "confirmed_producer_consumer_mismatch",
+    "producer": "crates/swarm-kernel-host/src/runtime/opencode_v2/mcp_tools.rs::project_readback",
+    "consumer": "crates/swarm-kernel-host/src/store/launcher_mcp_tools.rs::project_session_context/project_provider_request",
+    "detail": "Producer always emits digest in both stages; consumer allowlists omit it. Retained R unknown stages include digest=null, so this payload is deterministically rejected if the current snapshot reaches the stage consumer.",
+    "first_transaction_time_failed_predicate": "not_reconstructed",
+    "repair_status": "source_candidate_pending_checks"
+  },
+  "limitations": [
+    "Current launch snapshot and identity digest were not fully reconstructed at transaction time. Retained field predicates are not a complete validator pass.",
+    "The early remaining-predicate helper used external native_options for an owned route; that invalid comparison was preserved locally and corrected. Only corrected owned-route model predicates are included.",
+    "Transient arm outcome_unknown later settled observed; it is not treated as an arm rejection.",
+    "No native/model consumption, dispatch or Task completion is proved. R was not replayed; P and Q were not restarted.",
+    "Historical core/load passes remain retained at their exact source revisions; this edition does not requalify them."
+  ]
+}

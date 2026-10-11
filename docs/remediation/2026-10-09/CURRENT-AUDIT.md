@@ -1,5 +1,16 @@
 # Current-source audit and implementation ledger
 
+Fresh [R execution](../2026-10-10/EXECUTION-RESULTS-R.json) built and installed
+eight exact clean `6853278` release packages. OpenCode reached registered and
+connected C8 install, an observed challenge and retained inventory of 11 tools,
+but current readiness timed out with `unavailable`; no dispatch occurred.
+Antigravity was not run. Retained payload and source tracing confirm that the
+native producer always adds stage `digest` fields while the Store's closed stage
+readers reject those fields. This is a confirmed format mismatch; the first
+transaction-time refusal has not been reconstructed. Its repair is pending
+source checks. R remains retained without replay; model consumption and Task
+completion are unproven.
+
 The [current MCP readiness repair](../2026-10-10/NATIVE-MCP-CURRENT-READINESS-REPAIR.json)
 adds a closed readback through existing authorized `operation.get` launch
 diagnostics, using the unchanged dispatch connection predicate. The harness now
