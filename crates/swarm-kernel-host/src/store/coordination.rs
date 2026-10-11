@@ -3316,12 +3316,10 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             // A key cursor is only a scoped position. The authenticated
             // participant scope was reloaded above, and the exact retained
             // key must still exist beneath that scope's mailbox prefix.
-            let max_key_bytes = prefix.len() + 3 + 20 + 1 + 2 * 256;
-            if key.len() > max_key_bytes
-                || !key.starts_with(&prefix)
-                || key >= upper.as_str()
-                || !inbox_key_exists(db, key)?
-            {
+            // A damaged retained key can exceed a canonical Operation key.
+            // Apply the same exact scoped-position checks to server-issued
+            // continuations; identifier bounds must not make them unusable.
+            if !key.starts_with(&prefix) || key >= upper.as_str() || !inbox_key_exists(db, key)? {
                 return Err(Error::invalid(
                     "after_key must identify a retained inbox index in the authenticated exact scope",
                 ));
@@ -3465,6 +3463,20 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
                 "settled coordination.send body differs from its original request",
             ));
         }
+        if method == "coordination.consult"
+            && !consult_delivery_matches(
+                &result,
+                &request,
+                &envelope["body"],
+                &sender,
+                &operation_id,
+            )?
+        {
+            return Err(Error::new(
+                "INBOX_OPERATION_BODY_DAMAGED",
+                "settled coordination Operation body does not match its retained delivery",
+            ));
+        }
 
         let index_matches = index.as_ref().is_some_and(|index| {
             let position_matches = read_position.is_some_and(|(position, indexed_at_ms)| {
@@ -3497,25 +3509,6 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             stale = stale.saturating_add(1);
             last_examined = Some(cursor);
             continue;
-        }
-        let body_matches = if method == "coordination.send" {
-            true
-        } else {
-            consult_delivery_matches(
-                &result,
-                &request,
-                &envelope["body"],
-                &scope,
-                &sender,
-                &principal.client_id,
-                &operation_id,
-            )?
-        };
-        if !body_matches {
-            return Err(Error::new(
-                "INBOX_OPERATION_BODY_DAMAGED",
-                "settled coordination Operation body does not match its retained delivery",
-            ));
         }
         if messages.len() == limit as usize {
             more = true;
@@ -3697,9 +3690,7 @@ fn consult_delivery_matches(
     result: &Value,
     request: &Value,
     body: &Value,
-    scope: &ScopeData,
     sender: &str,
-    recipient: &str,
     operation_id: &str,
 ) -> Result<bool> {
     let consult = match keys::parse_consult_request(request) {
@@ -3712,11 +3703,11 @@ fn consult_delivery_matches(
         && result["ask_id"] == body["ask_id"]
         && result["ask"] == *body
         && body["schema"] == "eliot.coordination.consult.v1"
-        && body["task_id"] == scope.task["task_id"]
-        && body["task_revision"] == scope.task["revision"]
-        && body["attempt_id"] == scope.attempt["attempt_id"]
+        && body["task_id"] == result["task_id"]
+        && body["task_revision"] == result["task_revision"]
+        && body["attempt_id"] == result["attempt_id"]
         && body["sender"] == sender
-        && body["recipient"] == recipient
+        && body["recipient"] == result["recipient"]
         && body["target"] == consult_target_json(&consult)
         && body["field"] == consult.field
         && body["question_kind"] == consult.question_kind

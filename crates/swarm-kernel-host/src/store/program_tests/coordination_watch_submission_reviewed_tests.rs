@@ -1,6 +1,221 @@
 //! One real Store path for exact, passive submission-review notices.
 use super::*;
 
+async fn start_inbox_participants(
+    label: &str,
+) -> (StoreOwner, PathBuf, ReviewSubject, Principal, Principal) {
+    let (owner, directory, _bootstrap) = start_store(label).await;
+    seed_clients(&owner.store).await;
+    let subject = seed_subject(
+        &owner.store,
+        label,
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let manager = principal("review-owner-v2", Role::Manager);
+    let mut participants = Vec::new();
+    for role in ["sender", "recipient"] {
+        let client_id = format!("{label}-{role}");
+        let token = format!("{}{}", model::new_id(), model::new_id());
+        owner
+            .store
+            .call(
+                manager.clone(),
+                "coordination.participant.register".into(),
+                json!({
+                    "client_request_id":format!("register-{client_id}"),
+                    "client_id":client_id,
+                    "token_hash":model::digest(token.as_bytes()),
+                    "task_id":subject.task_id,
+                    "task_revision":1,
+                    "attempt_id":subject.attempt_id,
+                    "participation_basis":{"kind":"attempt_owner"},
+                }),
+            )
+            .await
+            .unwrap();
+        participants.push(
+            owner
+                .store
+                .authenticate(Credential { client_id, token })
+                .await
+                .unwrap(),
+        );
+    }
+    let recipient = participants.pop().unwrap();
+    let sender = participants.pop().unwrap();
+    (owner, directory, subject, sender, recipient)
+}
+
+#[tokio::test]
+async fn coordination_inbox_resumes_server_issued_overlong_retained_key() {
+    let (owner, directory, subject, sender, recipient) =
+        start_inbox_participants("inbox-overlong-cursor").await;
+    let sent = owner
+        .store
+        .call(
+            sender,
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"overlong-cursor-healthy-send",
+                "recipient":recipient.client_id,
+                "body":{"healthy":true},
+            }),
+        )
+        .await
+        .unwrap();
+    let scope_id = crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap();
+    let prefix = crate::coordination::mailbox_prefix(&scope_id, &recipient.client_id);
+    let malformed_keys = (0..36)
+        .map(|index| format!("{prefix}{index:020}:{}", "g".repeat(600)))
+        .collect::<Vec<_>>();
+    owner
+        .store
+        .run({
+            let malformed_keys = malformed_keys.clone();
+            move |db| {
+                for key in malformed_keys {
+                    db.execute(
+                        "INSERT INTO meta(key,value_json) VALUES(?1,'{\"damaged\":true}')",
+                        [&key],
+                    )?;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let gap = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gap["items"], json!([]));
+    assert_eq!(gap["coverage"], "partial");
+    assert_eq!(gap["next_after_key"], malformed_keys[35]);
+    assert!(gap["next_after_key"].as_str().unwrap().len() > prefix.len() + 536);
+    let resumed = owner
+        .store
+        .call(
+            recipient,
+            "coordination.inbox".into(),
+            json!({"limit":1,"after_key":gap["next_after_key"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed["items"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["items"][0]["operation_id"], sent["operation_id"]);
+    assert_eq!(resumed["coverage"], "complete");
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn coordination_inbox_rejects_consult_body_mismatch_before_damaged_index() {
+    let (owner, directory, subject, sender, recipient) =
+        start_inbox_participants("inbox-consult-integrity").await;
+    owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.work_card.publish".into(),
+            json!({"client_request_id":"consult-owner-card","fields":{"paths":["consult-owner.rs"]}}),
+        )
+        .await
+        .unwrap();
+    let consulted = owner
+        .store
+        .call(
+            sender,
+            "coordination.consult".into(),
+            json!({
+                "client_request_id":"consult-integrity-ask",
+                "target":{"path":"consult-owner.rs"},
+                "field":"assumptions",
+                "question_kind":"assumption_check",
+                "question":"What assumption applies?",
+                "why_needed":"Verify one retained consultation.",
+                "expected_answer":"one_fact",
+                "blocking":false,
+                "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+                "evidence_refs":[],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consulted["delivery_created"], true);
+    let operation_id = consulted["operation_id"].as_str().unwrap().to_owned();
+    let healthy = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(healthy["items"][0]["operation_id"], operation_id);
+    let scope_id = crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap();
+    let prefix = crate::coordination::mailbox_prefix(&scope_id, &recipient.client_id);
+    owner
+        .store
+        .run(move |db| {
+            let raw: String = db.query_row(
+                "SELECT result_json FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let mut result: Value = serde_json::from_str(&raw)?;
+            result["ask_id"] = json!("altered-authoritative-ask");
+            db.execute(
+                "UPDATE operations SET result_json=?2 WHERE operation_id=?1",
+                rusqlite::params![operation_id, model::canonical(&result)?],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for damaged_index in [false, true] {
+        if damaged_index {
+            owner
+                .store
+                .run({
+                    let prefix = prefix.clone();
+                    move |db| {
+                        db.execute(
+                            "UPDATE meta SET value_json='{\"damaged\":true}' WHERE key>=?1 AND key<?2",
+                            rusqlite::params![prefix, format!("{prefix}z")],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+        }
+        let error = owner
+            .store
+            .call(
+                recipient.clone(),
+                "coordination.inbox".into(),
+                json!({"limit":1}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code, "INBOX_OPERATION_BODY_DAMAGED",
+            "damaged index: {damaged_index}"
+        );
+    }
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn exact_submission_review_watch_recovers_one_inbox_notice_without_work() {
     let (mut owner, directory, bootstrap) = start_store("submission-reviewed-watch").await;

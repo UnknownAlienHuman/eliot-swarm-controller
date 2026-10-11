@@ -11,6 +11,15 @@ scans are not globally bounded. The initial lint failures are preserved; this
 OpenCode slice does not close all-adapter PR69 or installed/native/crash/load V27
 qualification.
 
+The [mailbox integrity follow-up](../2026-10-11/MAILBOX-INTEGRITY-FOLLOWUP-EVIDENCE.json)
+keeps a server-issued malformed retained-key cursor resumable even when it exceeds
+the canonical identifier length. Exact current authenticated scope and retained
+membership still constrain the cursor. Consult request/result/body consistency
+is checked before damaged derived indexes can skip the row, independently of
+current-scope relevance. Strict affected production Clippy and both real Store
+send/consult regressions pass on Windows/Linux. Transport frame limits and the
+separate legacy-ordering, installed/native/crash/load qualification gaps remain.
+
 The [mailbox recovery and response-budget repair](../2026-10-11/MAILBOX-RECOVERY-EVIDENCE.json)
 adds a bounded retained-key recovery cursor when damaged derived indexes cannot
 be resumed by Operation ID. Every read rechecks the Participant's current exact
