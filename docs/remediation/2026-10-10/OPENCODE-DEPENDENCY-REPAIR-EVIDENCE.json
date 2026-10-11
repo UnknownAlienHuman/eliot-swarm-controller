@@ -1,0 +1,126 @@
+{
+  "schema": "eliot.opencode_dependency_repair.v1",
+  "observed_at_utc": "2026-10-11T02:44:38.6926771Z",
+  "repository": "UnknownAlienHuman/eliot-swarm-controller",
+  "source_base_commit": "3d5209f41b9c59eaf648468bcbc71f5bb5512b4d",
+  "status": "SOURCE_VERIFIED_INSTALLED_CLOSURE_PENDING",
+  "change": {
+    "advisory": "GHSA-6qxp-vccf-f47h",
+    "from": "2.0.0",
+    "root_mcp_core": "2.0.0",
+    "mechanism": "one transitive npm override, preserved-lock resolution",
+    "to": "2.2.0",
+    "direct_opencode_pins": "core/server/util 2.0.7",
+    "package": "@modelcontextprotocol/client",
+    "nested_client_core": "2.2.0"
+  },
+  "source_sha256": {
+    "modules/opencode/package-lock.json": "7d51850063e021a6155f9c8a0955249a1267bde72c001f99580e3ad1880370da",
+    "modules/opencode/package.json": "03cdc8073d957e85df62ebbee6440071a903b9589e5de149f0e57d4470867b58"
+  },
+  "CodeUnderstandingProof": {
+    "graph_findings": [
+      "The only consumer of @modelcontextprotocol/client in the whole lockfile is node_modules/@opencode/core, which pins it exactly to 2.0.0.",
+      "@modelcontextprotocol/core has two consumers: node_modules/@opencode/core (exact 2.0.0) and node_modules/@modelcontextprotocol/client (exact 2.2.0 once client is upgraded).",
+      "http-cache-semantics has exactly one consumer: node_modules/make-fetch-happen with range ^4.1.1.",
+      "No override currently exists for either @modelcontextprotocol package. Existing overrides are @effect/platform-node-shared, @ai-sdk/provider-utils 4.0.57 and @opentelemetry/core 2.8.0, so the override mechanism is already in use in this manifest.",
+      "There is no nested node_modules under @opencode/core, so MCP packages resolve flat at the module root today."
+    ],
+    "exact_anchors": [
+      "modules/opencode/node_modules/@opencode/core/dist/mcp/client.js lines 104-113: runtime import block from @modelcontextprotocol/client",
+      "modules/opencode/node_modules/@opencode/core/dist/mcp/oauth.js lines 105-116: runtime import block from @modelcontextprotocol/client",
+      "modules/opencode/node_modules/@opencode/core/dist/mcp/oauth.js line 111: runtime import from @modelcontextprotocol/core",
+      "modules/opencode/node_modules/@opencode/core/dist/chunks/integration-mx4e50pb.js line 14: import of ReadBuffer and serializeMessage",
+      "modules/opencode/node_modules/@opencode/core/package.json: @modelcontextprotocol/client pinned exactly 2.0.0 and @modelcontextprotocol/core pinned exactly 2.0.0",
+      "modules/opencode/node_modules/make-fetch-happen/package.json: http-cache-semantics range ^4.1.1",
+      "modules/opencode/serve.mjs lines 198-201: dynamic imports of @opencode/server and @opencode/util layers",
+      "modules/opencode/serve.mjs lines 11-12: SERVER_VERSION 2.0.7 and BUN_VERSION 1.4.0 constants"
+    ],
+    "verifier": "isolated npm ci and npm ls, then real runtime initialize/tools/list/ping and OAuth schema compatibility",
+    "execution_path": "Store-owned OpenCode resource manifest and lock -> installer-generated npm closure -> real client runtime imports",
+    "task_goal": "Resolve open high-severity Dependabot alert 16 (@modelcontextprotocol/client 2.0.0, vulnerable >= 2.0.0, < 2.2.0) with a concrete compatible fixed resolution while preserving the direct project-pinned @opencode 2.0.7 core/server/client. Evaluate adding a http-cache-semantics override only if the advisory range, dependency availability and compatibility are confirmed.",
+    "invariants": [
+      "direct OpenCode versions retained",
+      "only client and its required nested core change",
+      "installed dependency receipt must be regenerated"
+    ],
+    "candidate_files": [
+      "modules/opencode/package.json",
+      "modules/opencode/package-lock.json",
+      "modules/opencode/node_modules/@opencode/core/package.json",
+      "modules/opencode/node_modules/@modelcontextprotocol/client/package.json",
+      "modules/opencode/node_modules/@modelcontextprotocol/core/package.json",
+      "modules/opencode/node_modules/make-fetch-happen/package.json",
+      "modules/opencode/serve.mjs",
+      "modules/opencode/native-mcp-proof.mjs",
+      "modules/opencode/UPDATE.md"
+    ],
+    "edit_allowed": true
+  },
+  "verification": {
+    "npm_ls": {
+      "resolved_tree": "client2.2.0 -> nested core2.2.0; OpenCode2.0.7 -> root core2.0.0",
+      "log_sha256": "a53f1b3b17b733b33e0b2c99504dddfa4983648656b9cff7ff46b9cc09d56b4e",
+      "exit_code": 0
+    },
+    "npm_ci": {
+      "exit_code": 0,
+      "source_repo": "C:\\Users\\kleym\\.codex\\worktrees\\swarm-mcp-offline\\eliot-swarm-controller\\modules\\opencode",
+      "package_lock_sha256": "7d51850063e021a6155f9c8a0955249a1267bde72c001f99580e3ad1880370da",
+      "completed_at_utc": "2026-10-11T02:13:41.4566272Z"
+    },
+    "runtime_fixture": {
+      "exit_code": 0,
+      "fixture_sha256": "e8ff51d88d77d84370063f322447f258cbfb148ad67d6f26e85d6debc75252f5",
+      "passed": 48,
+      "operations": [
+        "actual initialize",
+        "actual tools/list",
+        "actual ping",
+        "root/nested OAuth and OIDC schema agreement",
+        "malformed schema rejection"
+      ],
+      "source_stable": true,
+      "completed_at_utc": "2026-10-11T02:43:07.3996451Z",
+      "assertions": 48,
+      "log_sha256": "eb6cf92f092d4f2babb15d73707a281b33e2d2cce0b1ed979e930afe14485b91",
+      "native_calls": 0,
+      "provider_calls": 0
+    }
+  },
+  "prior_failure": {
+    "result_sha256": "5b66bf0218cc626984b2009b32d11185ee9ecd345047f8f4d263e7c902fbf7be",
+    "preserved": true,
+    "passed": 43,
+    "cause": "fixture ESM package metadata resolution and invalid OIDC sample",
+    "total": 48,
+    "log_sha256": "f736efcbf9ea3848e094b0e7971145cda6bcf8f5484e9c942d2627b61f5ee8cd"
+  },
+  "alert_readback_before_push": {
+    "open_numbers": [
+      12,
+      13,
+      15,
+      16
+    ],
+    "other_confirmed_patches": false,
+    "confirmed_patched_package": "@modelcontextprotocol/client 2.2.0",
+    "other_packages": [
+      "braces",
+      "sprintf-js",
+      "http-cache-semantics"
+    ]
+  },
+  "remaining": [
+    "fresh installed closure and receipts must be regenerated",
+    "GitHub alert closure must be read back after push",
+    "full native/model qualification remains pending",
+    "OAuth authorization-server and token-refresh behavior were outside this bounded probe"
+  ],
+  "CompletionProof": {
+    "final_status": "PARTIAL_PROGRESS",
+    "installed_closure": "not_verified",
+    "source_compatibility": "verified",
+    "github_fixed_at": "not_verified"
+  }
+}

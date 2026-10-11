@@ -1,5 +1,15 @@
 # Current-source audit and implementation ledger
 
+The [OpenCode dependency repair](../2026-10-10/OPENCODE-DEPENDENCY-REPAIR-EVIDENCE.json)
+updates the vulnerable transitive MCP client to 2.2.0 while retaining direct
+OpenCode 2.0.7 and root MCP core 2.0.0. The client receives its required nested
+core 2.2.0. Isolated locked installation and dependency-tree checks pass; the
+real initialize, tools/list, ping and schema compatibility fixture passes 48/48.
+The earlier 43/48 fixture failure is retained. Installed closure regeneration,
+GitHub alert closure and native/model qualification remain pending. The three
+other open dependency advisories have no confirmed patched release in the live
+GitHub readback; no resolution is claimed for them.
+
 The [Antigravity dispatch capability](../2026-10-10/ANTIGRAVITY-DISPATCH-CAPABILITY.json)
 uses its actual same-process refresh producer and a strict session/init/model/idle-turn
 consumer. Direct checks revalidate exact initial or queued Task/Attempt/binding scope,
