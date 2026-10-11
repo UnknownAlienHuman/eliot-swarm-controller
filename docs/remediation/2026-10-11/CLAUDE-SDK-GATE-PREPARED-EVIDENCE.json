@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "scope": "PR132 fixture verdict repair only; require prepared for a successful SDK admission",
+  "upstream_pr": "https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/132",
+  "source_base_commit": "bed2955918d8ff2dfc768046990e6cb761293fe0",
+  "source_path": "crates/swarm-adapter-claude/sdk-harness/sdk_gate_fixture.mjs",
+  "source_blob": "d02c36adfad7287c1bd5e0fd95fed2c1970b5583",
+  "source_sha256": "10f46dc50a13666c11862ab23506777a811151ae91cbafe85b6e56f1c52662e9",
+  "patch_matches_pr": true,
+  "windows": {
+    "node": "v25.6.1",
+    "syntax_exit_code": 0,
+    "existing_actual_bridge_fake_sdk_fixture_exit_code": 0,
+    "cases": [
+      {
+        "case": "compatible different version is admitted",
+        "expected": null,
+        "actual": null,
+        "observedVersion": "0.3.288",
+        "versionOk": true,
+        "stopped": true,
+        "exitCode": 0,
+        "frameKind": "prepared",
+        "spawnError": null,
+        "pass": true
+      },
+      {
+        "case": "missing startup export fails startup check",
+        "expected": "SDK_STARTUP_UNAVAILABLE",
+        "actual": "SDK_STARTUP_UNAVAILABLE",
+        "observedVersion": null,
+        "versionOk": true,
+        "stopped": true,
+        "exitCode": 0,
+        "frameKind": "operation_rejected",
+        "spawnError": null,
+        "pass": true
+      },
+      {
+        "case": "warm query without close fails handle check",
+        "expected": "SDK_STARTUP_UNKNOWN",
+        "actual": "SDK_STARTUP_UNKNOWN",
+        "observedVersion": null,
+        "versionOk": true,
+        "stopped": false,
+        "exitCode": 0,
+        "frameKind": "operation_unknown",
+        "spawnError": null,
+        "pass": true
+      },
+      {
+        "case": "wrong package identity fails identity check",
+        "expected": "SDK_PACKAGE_IDENTITY_MISMATCH",
+        "actual": "SDK_PACKAGE_IDENTITY_MISMATCH",
+        "observedVersion": null,
+        "versionOk": true,
+        "stopped": true,
+        "exitCode": 0,
+        "frameKind": "operation_rejected",
+        "spawnError": null,
+        "pass": true
+      }
+    ],
+    "fixture_log_sha256": "a92e25a41a3f206698c2063d3dbb5e40fd5d7b260d16e6ffe9a08df2e975fb7d"
+  },
+  "linux": {
+    "manager_run": "not_run",
+    "reason": "Node unavailable in existing Ubuntu environment (probe exit127); no environment setup performed",
+    "upstream_evidence": "PR132 author reports Linux Node22.16.0 actual fixture child/pipe/frame/verdict transcript counterexample; not independently rerun by manager"
+  },
+  "limitations": [
+    "Four manager-run fake SDK cases do not exercise the stopped-only counterexample; upstream PR records that reproduction",
+    "No real SDK/model/native service qualification",
+    "No dependency/runtime/bridge changes; no Rust change or Rust Clippy applicability"
+  ]
+}
