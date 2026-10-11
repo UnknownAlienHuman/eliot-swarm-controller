@@ -1,0 +1,29 @@
+{
+  "schema": "eliot.r48_sidecar_source_delivery.v1",
+  "date_utc": "2026-10-11T03:31:58.5158881Z",
+  "rust_candidate": "95b69d1d0e37487648df0161282551e2315ac18a",
+  "sidecar_sha256": "d31233f6cffd84f7d9776671ad161bafebb47bafb5a988e2e5ff9f6cb393f78d",
+  "changes": [
+    "One fresh disabled bootstrap config and one enabled seeded final config on one retained Store",
+    "Raw ProcessStartInfo arguments and owned stdin EOF shutdown",
+    "Create-only bounded config writes and confirmed cleanup on errors",
+    "Fault witness and direct admission-intent marker binding after confirmed stop"
+  ],
+  "verification": {
+    "production_packages": 8,
+    "source_parse_errors": 0,
+    "r48_feature_packages": 2,
+    "helper_fixture": {
+      "passed": 52,
+      "failed": 0
+    },
+    "independent_review": "ACCEPT; no remaining P1/P2",
+    "rust_clippy": "retained default+qualification feature Windows/Linux PASS; no Rust changed in this delivery"
+  },
+  "limits": {
+    "task_completion": "not claimed",
+    "native_model_consumption": "not proven",
+    "p_q_r_replayed": false,
+    "installed_r48": "pending"
+  }
+}
