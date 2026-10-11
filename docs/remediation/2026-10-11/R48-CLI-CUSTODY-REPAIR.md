@@ -29,3 +29,8 @@ to binary-source commit `9f2c789c7b1808998e8776b678a0232345b44305` and tree
 `b6870f6e32fd8bba61d6ea4532d71b4dd61645eb`; the separately bound final
 sidecar consumes them through a fresh private output root. Historical T/T2
 receipts and unknown applied-fault/no-replay outcomes remain unchanged.
+
+The fresh [installed U run](R48-SCHEDULER-LIFETIME.md) has now completed:
+four observations passed, but the production scheduler lifetime cancelled its
+first admit before terminal diagnosis. Its unchanged receipt retains UNKNOWN;
+the custody patch itself has passed CI on commit `4585f15`.

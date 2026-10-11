@@ -89,6 +89,8 @@ pub struct ScriptConfig {
 /// Explicit opt-in for the independent Store-backed scheduler process. The
 /// built-in scheduler remains the compatibility and recovery path when this
 /// is absent or disabled.
+/// An enabled independent service remains selected for the host lifetime;
+/// its shared timer bounds empty-page reads without cancelling an in-flight admit.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutomationSchedulerConfig {

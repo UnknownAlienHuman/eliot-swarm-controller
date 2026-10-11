@@ -97,9 +97,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
                AND json_extract(value_json,'$.record.enabled')=1 \
                AND json_type(value_json,'$.record.cron')='object'))",
     )?;
-    // The extracted process is opt-in and demanded only by its exact
-    // read-only due projection. The legacy predicate above remains unchanged.
-    demand.automation_scheduler = super::automation_scheduler::has_demand(db, config)?;
+    // The opt-in service owns outstanding RPCs for its configured lifetime;
+    // exhausting its due page must not cancel its caller. Legacy demand is unchanged.
+    demand.automation_scheduler = super::automation_scheduler::has_demand(config);
     demand.automation = exists(
         db,
         "SELECT EXISTS(SELECT 1 FROM meta WHERE \

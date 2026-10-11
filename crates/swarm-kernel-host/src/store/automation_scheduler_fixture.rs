@@ -261,6 +261,21 @@ fn scheduler_fixture_group_identity() -> serde_json::Value {
 }
 
 #[test]
+fn enabled_scheduler_demand_survives_exhausted_source_page() {
+    let db = scheduler_owner_fixture();
+    let mut config = crate::config::Config::default();
+    config.automation_scheduler.enabled = true;
+    let scope = super::current_scope(&db).unwrap();
+    let page = super::project_due_page(&db, &config, scope).unwrap();
+    assert!(page.next_due_at_ms.is_none());
+    assert!(!page.is_due());
+    assert!(super::has_demand(&config));
+
+    config.automation_scheduler.enabled = false;
+    assert!(!super::has_demand(&config));
+}
+
+#[test]
 fn scheduler_owner_group_identity_shared_shape_is_closed_and_pure() {
     use serde_json::{Value, json};
     use swarm_automation::service_owner_group_identity_shape;

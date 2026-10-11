@@ -1,0 +1,323 @@
+{
+  "schema": "eliot.r48.scheduler_lifetime_repair.v1",
+  "source_baseline": "4585f158277de90639f335bf0fcd75cdac6ff5cb",
+  "code_understanding_proof": {
+    "task_goal": "Keep the explicitly enabled independent scheduler alive while its first admit and shared timer belong to the configured host service.",
+    "domain_concept": "Scheduler source cursor versus owned process lifetime.",
+    "project_or_module": "eliot-swarm-controller kernel Store / optional-worker supervision",
+    "candidate_files": [
+      "crates/swarm-kernel-host/src/config.rs",
+      "crates/swarm-kernel-host/src/store/automation_scheduler.rs",
+      "crates/swarm-kernel-host/src/store/legacy_worker_demand.rs",
+      "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs"
+    ],
+    "candidate_symbols": [
+      "automation_scheduler::has_demand",
+      "legacy_worker_demand::snapshot",
+      "automation_scheduler::call",
+      "legacy_optional_workers::stop_worker"
+    ],
+    "graph_findings": "Explicit project eliot-swarm-controller search_graph has_demand identifies the Store function and its one incoming caller; exact lexical source verifies the call chain.",
+    "exact_anchors": [
+      "automation_scheduler.rs:1556",
+      "legacy_worker_demand.rs:102",
+      "automation_scheduler_fixture.rs:264",
+      "legacy_optional_workers.rs:214",
+      "legacy_optional_workers.rs:602",
+      "legacy_optional_workers.rs:468",
+      "automation_scheduler.rs:982"
+    ],
+    "execution_path": "An admit consumes the last source cursor, then awaits CheckRun reconciliation. Old has_demand becomes false; coordinator signals stop; wrapper kills caller before reply. New configured-service predicate stays selected until host shutdown.",
+    "state_reads": [
+      "Explicit automation_scheduler.enabled flag",
+      "Store due page and consumed one-shot cursor",
+      "Retained worker health and owner scope/group identity"
+    ],
+    "state_writes": [
+      "Existing Store reconcilers and cursors unchanged",
+      "Existing owned host shutdown path unchanged",
+      "No new timer, grace period, replay or admission method"
+    ],
+    "API_or_event_surface": "Existing internal Store demand predicate becomes a pure configuration predicate. Native/runtime RPC schemas and client fault seam are unchanged.",
+    "diagnostics_before": "Installed U: worker became dormant 249ms after first admit intent, before CheckRun completed; no failure or restart. Independent source audit confirms explicit demand-stop kill path.",
+    "invariants": [
+      "Disabled service remains unselected",
+      "Built-in compatibility/recovery predicate unchanged",
+      "Store owns authentication and admission",
+      "Final cursor consumption does not terminate a pending admit caller",
+      "Existing empty-page shared wake cap remains 60000ms"
+    ],
+    "blast_radius": "Independent scheduler process selection; explicitly enabled service persists for configured host lifetime.",
+    "verifier": "Strict production Clippy default/qualification modes on Windows/Linux, affected automation_scheduler tests, independent exact-source review, then fresh installed execution.",
+    "unknowns": [
+      "Fresh installed repaired-source applied-fault/no-replay evidence",
+      "Full native/model qualification and V27 scope remain incomplete"
+    ],
+    "edit_allowed": true
+  },
+  "installed_u": {
+    "binary_source_commit": "9f2c789c7b1808998e8776b678a0232345b44305",
+    "sidecar_commit": "4585f158277de90639f335bf0fcd75cdac6ff5cb",
+    "run": "r48-3559f2dba8194542954aac209b8460cb",
+    "exit_code": 0,
+    "completed_at_utc": "2026-10-11T09:34:30.7352984Z",
+    "receipt_sha256": "f02516c1dabe9350ed4869647f544a3362a7ef4636d165094087d9866d07b98e",
+    "binding_sha256": "c2feecc58352161a8ad0222b9c5a516e54cbbd57b4fd2b7e99d5f5d55a417bac",
+    "verified": [
+      "bootstrap",
+      "scheduler_current_owner_ready",
+      "enabled_one_shot_checkrun_admitted",
+      "host_remains_alive"
+    ],
+    "uncertain_initial_admit_receipt_no_replay": "UNKNOWN",
+    "historical_receipt_modified": false,
+    "replayed": false,
+    "intent_at_utc": "2026-10-11T09:31:10.1539644Z",
+    "worker_pid": 8232,
+    "dormant_at_ms": 1791711070403,
+    "check_run_observed_at_ms": 1791711070159,
+    "check_completed_at_ms": 1791711071749,
+    "last_error_code": null,
+    "consecutive_failures": 0,
+    "restart_count": 0,
+    "terminal_diagnostic_present": false,
+    "applied_witness_present": false,
+    "second_admit_marker_present": false
+  },
+  "final_source_hashes": {
+    "crates/swarm-kernel-host/src/config.rs": "55741222a8d563a4b3607027d012bbc811479cfd0a5c8ffdf0f079daa1d9a473",
+    "crates/swarm-kernel-host/src/store/automation_scheduler.rs": "6922c61d423e8d98f6d90cd94a8e6e1ea7ed94ab87d2548701f8ab6bb67f7912",
+    "crates/swarm-kernel-host/src/store/legacy_worker_demand.rs": "33b2e63a6f7b61c8d4c4c4dff0b97604ba60f282379efa04bb17cea51ff95730",
+    "crates/swarm-kernel-host/src/store/automation_scheduler_fixture.rs": "de729afe6f539fb9598593e49e2b9ffe08edf29bbe353a115dffaed15530e8cf"
+  },
+  "comment_only_correction": {
+    "old_sha256": "c2331476c985d903fd86f4e1527f165abd5c7fe6de738a47f75b01c5439730dc",
+    "new_sha256": "33b2e63a6f7b61c8d4c4c4dff0b97604ba60f282379efa04bb17cea51ff95730",
+    "only_exact_two_line_comment_replacement": true
+  },
+  "review": {
+    "agent_id": "01a12a51-1885-7ff1-97f5-d383d5004330",
+    "model": "gpt-6-luna",
+    "reasoning_effort": "max",
+    "runtime_patch_result": "NO_ADDITIONAL_ACTIONABLE_P1_P2",
+    "final_comment_hash_confirmation": "FINAL_FOUR_HASHES_VERIFIED_NO_ACTIONABLE_P1_P2"
+  },
+  "verification": [
+    {
+      "platform": "windows",
+      "mode": "default",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-windows-default-clippy.log",
+      "log_sha256": "72cbbd7133dcad231722bdf8583df1a1c25241a45c03e2d5d6b710956392473a",
+      "record_sha256": "5b113f479a4270add72f25560d518cbf429a729bb954318e9a63931a2aa7e3ad",
+      "passed": null
+    },
+    {
+      "platform": "windows",
+      "mode": "default",
+      "gate": "test",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "test",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "automation_scheduler::"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-windows-default-test.log",
+      "log_sha256": "69f87c4c7318eb5c7de1663cafddaa1ce03e17cce637222cdf924f58681b99c0",
+      "record_sha256": "04d94fc8da49fbe1be9011aea88667de43feb913fdaeb5cdfe2a243af705d9a4",
+      "passed": 16
+    },
+    {
+      "platform": "windows",
+      "mode": "qualification-faults",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--features",
+        "qualification-faults",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-windows-qualification-faults-clippy.log",
+      "log_sha256": "1b1d229a9c8664b7e1b64564f12143f369917c2e8959710841164144a655d3c8",
+      "record_sha256": "148d780605b890ba1d52e1d0471af1b315f49d2abcaf492505097b3b6fd7fc71",
+      "passed": null
+    },
+    {
+      "platform": "windows",
+      "mode": "qualification-faults",
+      "gate": "test",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "test",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--features",
+        "qualification-faults",
+        "automation_scheduler::"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-windows-qualification-faults-test.log",
+      "log_sha256": "bcb58fc8861d3b914f0ff78f1822fab425acdc8bf67586216e00d1de22946bf2",
+      "record_sha256": "1a7c82688a854b5390ecfa5985f95df1769325854c15449b893d9e14b448b673",
+      "passed": 16
+    },
+    {
+      "platform": "linux",
+      "mode": "default",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-linux-default-clippy.log",
+      "log_sha256": "b23f1cf35934d9a9fc56d9c6559eccb3c1b4655378b478367a5bfd2b16786e03",
+      "record_sha256": "65733734092e314c740b39f7a8ebd427ab7d237af0aea062e78462f5811da6f4",
+      "passed": null
+    },
+    {
+      "platform": "linux",
+      "mode": "default",
+      "gate": "test",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "test",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "automation_scheduler::"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-linux-default-test.log",
+      "log_sha256": "64ad9ad47e030abbda6fc8bd3cd78014a247b8addc5a9faac449beca93621d34",
+      "record_sha256": "6638f7ca314e18b6ee0ba08b91a10c20629f49bcd536c79dbe5cd972b6a9463b",
+      "passed": 17
+    },
+    {
+      "platform": "linux",
+      "mode": "qualification-faults",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--features",
+        "qualification-faults",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-linux-qualification-faults-clippy.log",
+      "log_sha256": "bd4ede028d853191e844c8cc60c4c2dc6b155dc7ff7364b8ba34dd1c8bddb3f9",
+      "record_sha256": "b890307f845f0f636a320598bfbd3ead588ea05465ced4d2d1be3321693f4596",
+      "passed": null
+    },
+    {
+      "platform": "linux",
+      "mode": "qualification-faults",
+      "gate": "test",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "test",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--features",
+        "qualification-faults",
+        "automation_scheduler::"
+      ],
+      "log": ".local/manager-audit/r48-scheduler-lifetime-20261011-linux-qualification-faults-test.log",
+      "log_sha256": "bd0b763e21b14d581fd3436930d602d095135b264207c5b61f8be090c5d1bb70",
+      "record_sha256": "026fc8f748262486f1e3761feec598579c3e82cb27d4b92556959929c4fce7b2",
+      "passed": 17
+    }
+  ],
+  "verification_source_note": "All runtime code passed at stable recorded hashes; the final legacy demand follow-up replaced exactly two // comment lines only, as recorded above.",
+  "completion_proof": {
+    "task_goal": "Finish V27 implementation and full installed/native/model qualification",
+    "acceptance_items": [
+      {
+        "item": "Scheduler lifetime source repair",
+        "status": "verified",
+        "evidence": "Root-cause source audit, four strict production Clippy passes, 16/16 per Windows mode and 17/17 per Linux mode",
+        "verifier": "Run-R48SchedulerLifetimeGate.ps1",
+        "residual_uncertainty": "Fresh installed repaired-source observation pending"
+      },
+      {
+        "item": "Installed R48 applied fault and no replay",
+        "status": "not_verified",
+        "evidence": "U retained UNKNOWN; root repair requires a fresh source edition",
+        "verifier": "Fresh bound installed R48 harness",
+        "residual_uncertainty": "Historical runs cannot supply repaired-source evidence"
+      }
+    ],
+    "checks_not_run_and_why": [
+      "Unchanged worker/client/PowerShell checks retained",
+      "Passed tests not repeated for final exact two-line comment-only correction",
+      "No old installed/native run replay"
+    ],
+    "remaining_uncertainty": [
+      "Installed R48 repair edition",
+      "Selected OpenCode server exact Step 5 free readiness",
+      "Antigravity causal result/Task acceptance",
+      "Remaining dependency advisories #13/#15"
+    ],
+    "final_status": "PARTIAL_PROGRESS"
+  }
+}

@@ -1,5 +1,13 @@
 # Current-source audit and implementation ledger
 
+The [installed U observation and scheduler lifetime repair](../2026-10-11/R48-SCHEDULER-LIFETIME.md)
+identify a production demand-drop stop during the first admit. U verifies four
+of five observations; applied-fault/no-replay remains UNKNOWN. The source repair
+retains the explicitly enabled independent service for the configured host
+lifetime. Strict production Clippy passes in both modes on Windows/Linux;
+affected scheduler tests pass 16/16 in each Windows mode and 17/17 in each Linux
+mode. Fresh installed qualification of this source remains pending.
+
 The [R48 CLI custody repair](../2026-10-11/R48-CLI-CUSTODY-REPAIR.md)
 retains timed-out public CLI process handles until bounded stop confirms exit.
 Its public-contract fixture passes 33/33 on Windows and Linux, including a real

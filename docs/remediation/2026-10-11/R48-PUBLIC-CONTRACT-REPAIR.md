@@ -2,6 +2,11 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+The fresh [installed U observation](R48-SCHEDULER-LIFETIME.md) verified four
+of five observations but exposed demand withdrawal killing the first admit's
+caller. U's applied-fault/no-replay result remains UNKNOWN; source lifetime
+repair and fresh installed proof are tracked separately.
+
 The [CLI custody follow-up](R48-CLI-CUSTODY-REPAIR.md) stops only the exact owned
 short-lived public CLI process and retains unconfirmed handle/PID ownership
 without replacing the original unknown outcome. Its current fixture passes

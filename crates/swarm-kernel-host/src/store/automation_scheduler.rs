@@ -1553,14 +1553,11 @@ fn damaged_schedule_registry(
     })
 }
 
-pub(super) fn has_demand(db: &Connection, config: &Config) -> Result<bool> {
-    if !config.automation_scheduler.enabled {
-        return Ok(false);
-    }
-    let scope = current_scope(db)?;
-    Ok(project_due_page(db, config, scope)?
-        .next_due_at_ms
-        .is_some())
+pub(super) fn has_demand(config: &Config) -> bool {
+    // The selected service owns its timer and outstanding RPCs for the configured
+    // lifetime. Consuming the final source cursor is not permission to kill its
+    // caller before the admission receipt reaches the worker.
+    config.automation_scheduler.enabled
 }
 
 fn due_index_snapshot(
