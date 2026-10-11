@@ -644,6 +644,33 @@ function Test-ReadinessGenerationEquals {
     return ([long]$Value -eq $Expected)
 }
 
+function Get-SafeReadinessLaunchPhase {
+    param([AllowNull()] $Value)
+    if ($Value -isnot [string]) { return $null }
+    if ($Value -cin @('pending_workspace', 'blocked', 'awaiting_binding',
+            'awaiting_participant_credential', 'awaiting_capability', 'awaiting_native_mcp',
+            'stale', 'outcome_unknown', 'unknown')) { return $Value }
+    return $null
+}
+
+function Test-ReadinessDispatchPhase {
+    param([AllowNull()] $Operation, [string] $BindingId, [long] $Generation)
+    if (-not (Test-ReadinessRecordShape $Operation) -or
+        [string]::IsNullOrWhiteSpace($BindingId) -or $Generation -le 0) { return $false }
+    $operationId = Get-OptionalField -Object $Operation -Name 'operation_id' -PreserveCollection
+    if ($operationId -isnot [string] -or [string]::IsNullOrWhiteSpace($operationId)) { return $false }
+    $result = Get-OptionalField -Object $Operation -Name 'result' -PreserveCollection
+    if (-not (Test-ReadinessRecordShape $result)) { return $false }
+    return (
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $Operation -Name 'state' -PreserveCollection) 'queued') -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $Operation -Name 'binding_id' -PreserveCollection) $BindingId) -and
+        (Test-ReadinessGenerationEquals (Get-OptionalField -Object $Operation -Name 'binding_generation' -PreserveCollection) $Generation) -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $result -Name 'operation_id' -PreserveCollection) $operationId) -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $result -Name 'state' -PreserveCollection) 'queued') -and
+        (Test-ReadinessStringEquals (Get-OptionalField -Object $result -Name 'launch_state' -PreserveCollection) 'awaiting_native_mcp')
+    )
+}
+
 function Get-SafeReadinessIdentifier {
     param([AllowNull()] $Value)
     if ($Value -isnot [string]) { return $null }
@@ -653,7 +680,7 @@ function Get-SafeReadinessIdentifier {
 
 function New-ReadinessFailureFacts {
     param(
-        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch')][string] $Reason,
+        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase')][string] $Reason,
         [AllowNull()] $TaskId,
         [AllowNull()] $AttemptId,
         [AllowNull()] $ModuleId,
@@ -662,6 +689,7 @@ function New-ReadinessFailureFacts {
         [AllowNull()] $BindingId,
         [long] $Generation,
         [AllowNull()] $Projection,
+        [AllowNull()] $LaunchPhase,
         [AllowNull()] $ErrorCode
     )
 
@@ -690,6 +718,7 @@ function New-ReadinessFailureFacts {
         }
         observed_binding_state = Get-SafeReadinessBindingState $observedBindingState
         observed_supervisor_phase = Get-SafeReadinessSupervisorPhase $observedSupervisorPhase
+        observed_launch_phase = Get-SafeReadinessLaunchPhase $LaunchPhase
         error_code = $observedErrorCode
     }
 }
@@ -2101,6 +2130,7 @@ try {
     $readinessBindingId = $null
     [long]$readinessGeneration = 0
     $lastReadinessProjection = Get-SafeReadinessProjection $null
+    $lastLaunchPhase = $null
     $lastReadinessErrorCode = Get-SafeReadinessErrorCode $launch.error_code
     while ([DateTime]::UtcNow -lt $deadline) {
         $operations = Get-Operations -TimeoutMilliseconds 30000
@@ -2234,6 +2264,17 @@ try {
             $readinessFailureReason = 'selector_mismatch'
             Start-Sleep -Milliseconds 750; continue
         }
+        # Binding readiness precedes Participant issuance. The Store publishes
+        # this launch phase only after retaining that exact scoped credential.
+        $parentResult = Get-OptionalField -Object $parentOp -Name 'result' -PreserveCollection
+        $lastLaunchPhase = if (Test-ReadinessRecordShape $parentResult) {
+            Get-SafeReadinessLaunchPhase (Get-OptionalField -Object $parentResult -Name 'launch_state' -PreserveCollection)
+        } else { $null }
+        if (-not (Test-ReadinessDispatchPhase -Operation $parentOp -BindingId $bindingId -Generation $generation)) {
+            $readinessFailureReason = 'launch_phase'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
         $readyProof = [pscustomobject]@{
             parent = $parentOp; open = $openOp; binding_id = $bindingId; generation = $generation
             state = $state; supervisor = $supervisor
@@ -2245,7 +2286,7 @@ try {
         $readinessFailureFacts = New-ReadinessFailureFacts -Reason $readinessFailureReason `
             -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id `
             -ArtifactVersion $contract.version -BindingId $readinessBindingId -Generation $readinessGeneration `
-            -Projection $lastReadinessProjection -ErrorCode $lastReadinessErrorCode
+            -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase -ErrorCode $lastReadinessErrorCode
         Add-Stage -Name 'module_open_and_hello' -Status 'unknown' -Code $code -Facts ([ordered]@{
             parent_operation_id = $parentOperationId
             dispatch_started = $false
@@ -2257,7 +2298,7 @@ try {
     $openOperationId = [string]$readyProof.open.operation_id
     $bindingId = [string]$readyProof.binding_id
     $generation = [long]$readyProof.generation
-    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
+    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; launch_phase = 'awaiting_native_mcp'; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
     Add-Stage -Name 'module_open_and_hello' -Status 'passed' -Facts $script:Report.safe_facts.launch
 
     $script:CurrentStage = 'single_task_dispatch'

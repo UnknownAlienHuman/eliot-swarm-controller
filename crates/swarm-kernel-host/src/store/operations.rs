@@ -440,6 +440,12 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
             projected.insert((*field).to_owned(), value.clone());
         }
     }
+    if method == "swarm.launch" {
+        projected.insert(
+            "launch_state".into(),
+            json!(public_launch_phase(object.get("launch_state"))),
+        );
+    }
     if method == "task.request_changes"
         && let Ok(package) = serde_json::from_value::<crate::review::ReviewFindingsPackage>(
             result["findings_package"].clone(),
@@ -481,6 +487,20 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
         projected.insert("code".into(), json!(code));
     }
     Ok(Some(Value::Object(projected)))
+}
+
+fn public_launch_phase(value: Option<&Value>) -> &'static str {
+    match value.and_then(Value::as_str) {
+        Some("blocked") => "blocked",
+        Some("pending_workspace") => "pending_workspace",
+        Some("outcome_unknown") => "outcome_unknown",
+        Some("awaiting_binding") => "awaiting_binding",
+        Some("stale") => "stale",
+        Some("awaiting_participant_credential") => "awaiting_participant_credential",
+        Some("awaiting_native_mcp") => "awaiting_native_mcp",
+        Some("awaiting_capability") => "awaiting_capability",
+        _ => "unknown",
+    }
 }
 
 fn safe_receipt_code(code: &str) -> bool {
@@ -3866,4 +3886,201 @@ fn manager_attempt_continuation_method(method: &str) -> bool {
         method,
         "task.dispatch" | "task.submit" | "task.request_changes" | "review.assign" | "swarm.launch"
     ) || (method.starts_with("agent.") && method != "agent.recover")
+}
+
+#[cfg(test)]
+mod launch_phase_public_projection_tests {
+    use super::*;
+
+    const CALLER: &str = "launch-phase-public-projection-caller";
+    const PRIVATE_MARKER: &str = "private-launch-credential-and-manifest-marker";
+
+    fn fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db
+    }
+
+    fn retain_operation(db: &Connection, operation_id: &str, method: &str, result: &Value) {
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,due_at_ms,created_at_ms,updated_at_ms) \
+             VALUES(?1,?2,?3,?4,'{}','{}','queued',?5,1,1,1)",
+            rusqlite::params![
+                operation_id,
+                CALLER,
+                format!("request-{operation_id}"),
+                method,
+                model::canonical(result).unwrap(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn operation_get(db: &Connection, operation_id: &str) -> Value {
+        let principal = Principal {
+            link_id: "launch-phase-public-projection-link".into(),
+            client_id: CALLER.into(),
+            role: Role::Observer,
+        };
+        super::super::read(
+            db,
+            &principal,
+            "operation.get",
+            &json!({"operation_id":operation_id}),
+            &Config::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn operation_get_projects_queued_launch_phases_and_excludes_private_result_data() {
+        let db = fixture();
+        retain_operation(
+            &db,
+            "launch-phase-queued",
+            "swarm.launch",
+            &json!({
+                "operation_id":"launch-phase-queued",
+                "state":"queued",
+                "launch_state":"pending_workspace",
+                "participant_credential":{"token":PRIVATE_MARKER},
+                "launch_manifest":{"private":{"owner_token":PRIVATE_MARKER}},
+                "unbounded_nested_result":{"secret":PRIVATE_MARKER},
+            }),
+        );
+        retain_operation(
+            &db,
+            "launch-phase-awaiting-native-mcp",
+            "swarm.launch",
+            &json!({
+                "operation_id":"launch-phase-awaiting-native-mcp",
+                "state":"queued",
+                "launch_state":"awaiting_native_mcp",
+                "participant":{
+                    "client_id":PRIVATE_MARKER,
+                    "credential_ref":PRIVATE_MARKER,
+                    "profile_config_ref":PRIVATE_MARKER,
+                },
+                "dispatch_permitted":false,
+            }),
+        );
+
+        let operation = operation_get(&db, "launch-phase-queued");
+        let awaiting_native_mcp = operation_get(&db, "launch-phase-awaiting-native-mcp");
+
+        assert_eq!(operation["result"]["launch_state"], "pending_workspace");
+        assert_eq!(operation["result"]["state"], "queued");
+        assert!(operation["result"].get("participant_credential").is_none());
+        assert!(operation["result"].get("launch_manifest").is_none());
+        assert!(operation["result"].get("unbounded_nested_result").is_none());
+        assert!(
+            !serde_json::to_string(&operation)
+                .unwrap()
+                .contains(PRIVATE_MARKER)
+        );
+        assert_eq!(
+            awaiting_native_mcp["result"]["launch_state"],
+            "awaiting_native_mcp"
+        );
+        assert!(awaiting_native_mcp["result"].get("participant").is_none());
+        assert!(
+            awaiting_native_mcp["result"]
+                .get("dispatch_permitted")
+                .is_none()
+        );
+        assert!(
+            !serde_json::to_string(&awaiting_native_mcp)
+                .unwrap()
+                .contains(PRIVATE_MARKER)
+        );
+    }
+
+    #[test]
+    fn operation_get_fail_closes_malformed_launch_phases_and_projects_only_launch_method() {
+        let db = fixture();
+        retain_operation(
+            &db,
+            "launch-phase-array",
+            "swarm.launch",
+            &json!({
+                "operation_id":"launch-phase-array",
+                "state":"queued",
+                "launch_state":["pending_workspace"],
+                "participant_credential":PRIVATE_MARKER,
+            }),
+        );
+        retain_operation(
+            &db,
+            "launch-phase-missing",
+            "swarm.launch",
+            &json!({"operation_id":"launch-phase-missing","state":"queued"}),
+        );
+        retain_operation(
+            &db,
+            "launch-phase-private-scalar",
+            "swarm.launch",
+            &json!({
+                "operation_id":"launch-phase-private-scalar",
+                "state":"queued",
+                "launch_state":PRIVATE_MARKER,
+            }),
+        );
+        retain_operation(
+            &db,
+            "launch-phase-boolean",
+            "swarm.launch",
+            &json!({
+                "operation_id":"launch-phase-boolean",
+                "state":"queued",
+                "launch_state":true,
+            }),
+        );
+        retain_operation(
+            &db,
+            "launch-phase-number",
+            "swarm.launch",
+            &json!({
+                "operation_id":"launch-phase-number",
+                "state":"queued",
+                "launch_state":7,
+            }),
+        );
+        retain_operation(
+            &db,
+            "launch-phase-agent",
+            "agent.open",
+            &json!({
+                "operation_id":"launch-phase-agent",
+                "state":"queued",
+                "launch_state":"pending_workspace",
+                "private_payload":PRIVATE_MARKER,
+            }),
+        );
+
+        let array = operation_get(&db, "launch-phase-array");
+        let missing = operation_get(&db, "launch-phase-missing");
+        let private_scalar = operation_get(&db, "launch-phase-private-scalar");
+        let boolean = operation_get(&db, "launch-phase-boolean");
+        let number = operation_get(&db, "launch-phase-number");
+        let agent = operation_get(&db, "launch-phase-agent");
+
+        for operation in [&array, &missing, &private_scalar, &boolean, &number] {
+            assert_eq!(operation["result"]["launch_state"], "unknown");
+        }
+        assert!(array["result"].get("participant_credential").is_none());
+        assert!(agent["result"].get("launch_state").is_none());
+        assert!(agent["result"].get("private_payload").is_none());
+        for operation in [&array, &missing, &private_scalar, &boolean, &number] {
+            assert!(
+                !serde_json::to_string(operation)
+                    .unwrap()
+                    .contains(PRIVATE_MARKER)
+            );
+        }
+        assert!(
+            !serde_json::to_string(&agent)
+                .unwrap()
+                .contains(PRIVATE_MARKER)
+        );
+    }
 }

@@ -1,5 +1,21 @@
 # Current-source audit and implementation ledger
 
+Fresh [P execution](../2026-10-10/EXECUTION-RESULTS-P.json) built and installed
+eight release packages from exact clean `f8f9cf8`. Both adapters passed open/hello
+readiness, then their sole dispatch rejected before admission at the retained
+predicate `manifest.state_awaiting_native_mcp`. Each disconnect observation records
+`host_stopping` after rejection; the post-run parent phase does not date the earlier
+dispatch phase. Model consumption and Task completion remain unproven.
+
+The [launch-phase readiness repair](../2026-10-10/LAUNCH-PHASE-READINESS-REPAIR.json)
+publishes a closed launch phase through the existing public receipt and waits for
+exact queued `awaiting_native_mcp` before the sole dispatch. Missing or damaged
+phase stays non-ready, and timeout retains a closed phase diagnostic. Strict host
+production Clippy passes on Windows and Linux; both new public projection cases
+pass on each platform and the integrated harness passes 27 assertions. Independent
+producer and consumer reviews accept the frozen source. Fresh installed execution
+and the remaining R48 acceptance contours remain pending.
+
 The [native disconnect diagnostic repair](../2026-10-10/NATIVE-DISCONNECT-DIAGNOSTICS.json)
 retains the typed disconnect origin with its exact binding transition in one Store
 transaction, and preserves the first static failed dispatch predicate in the rejected
