@@ -783,6 +783,297 @@ pub const ATTEMPT_TWO_MARKER: &str = "qualification-admit-attempt-2.json";
 #[cfg(feature = "qualification-faults")]
 const MAX_ADMIT_ATTEMPT_BYTES: usize = 512;
 
+/// Closed diagnosis of the first marked admit RPC result, never admission proof.
+#[cfg(feature = "qualification-faults")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationAdmitTerminalCategory {
+    Ok,
+    ReplyWithheld,
+    TransportUncertain,
+    OtherRejection,
+}
+
+/// Actual result of the existing applied-witness writer.
+#[cfg(feature = "qualification-faults")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationWitnessWriterOutcome {
+    Applied,
+    Rejected,
+}
+
+/// A missing parsed count cannot claim that the witness writer was attempted.
+#[cfg(feature = "qualification-faults")]
+#[derive(Serialize)]
+#[serde(tag = "frame_length_state", rename_all = "snake_case")]
+pub enum QualificationWitnessDiagnostic {
+    Absent,
+    Valid {
+        withheld_frame_bytes: usize,
+        witness_writer_outcome: QualificationWitnessWriterOutcome,
+    },
+}
+
+#[cfg(feature = "qualification-faults")]
+#[derive(Serialize)]
+struct QualificationAdmitDiagnostic<'a> {
+    schema: &'static str,
+    owner_launch_pid: u32,
+    owner_config_sha256: &'a str,
+    method: &'static str,
+    sequence: u8,
+    #[serde(flatten)]
+    details: QualificationAdmitDiagnosticDetails,
+}
+
+#[cfg(feature = "qualification-faults")]
+#[derive(Serialize)]
+#[serde(untagged)]
+enum QualificationAdmitDiagnosticDetails {
+    Terminal {
+        terminal_category: QualificationAdmitTerminalCategory,
+    },
+    Witness(QualificationWitnessDiagnostic),
+}
+
+#[cfg(feature = "qualification-faults")]
+const MAX_ADMIT_DIAGNOSTIC_BYTES: usize = 512;
+#[cfg(feature = "qualification-faults")]
+const ADMIT_TERMINAL_MARKER: &str = "qualification-admit-terminal-1.json";
+#[cfg(feature = "qualification-faults")]
+const ADMIT_WITNESS_DIAGNOSTIC_MARKER: &str = "qualification-admit-witness-diagnostic-1.json";
+
+/// Retain the terminal category before retry logging or applied-witness handling.
+/// Only the first marked request calls this producer; no result body is accepted.
+#[cfg(feature = "qualification-faults")]
+pub fn write_qualification_admit_terminal(
+    data_root: &Path,
+    pid: u32,
+    config_sha256: &str,
+    terminal_category: QualificationAdmitTerminalCategory,
+) -> swarm_contracts::error::Result<()> {
+    write_qualification_admit_diagnostic(
+        data_root,
+        ADMIT_TERMINAL_MARKER,
+        QualificationAdmitDiagnostic {
+            schema: "eliot.swarm.r48.qualification-admit-terminal.v1",
+            owner_launch_pid: pid,
+            owner_config_sha256: config_sha256,
+            method: ADMIT_METHOD,
+            sequence: 1,
+            details: QualificationAdmitDiagnosticDetails::Terminal { terminal_category },
+        },
+    )
+}
+
+/// Retain only the actual parser and writer results after witness handling.
+/// This separate immutable marker cannot replace the applied-fault witness.
+#[cfg(feature = "qualification-faults")]
+pub fn write_qualification_witness_diagnostic(
+    data_root: &Path,
+    pid: u32,
+    config_sha256: &str,
+    diagnostic: QualificationWitnessDiagnostic,
+) -> swarm_contracts::error::Result<()> {
+    if let QualificationWitnessDiagnostic::Valid {
+        withheld_frame_bytes,
+        ..
+    } = &diagnostic
+        && (*withheld_frame_bytes == 0
+            || *withheld_frame_bytes > swarm_client::IpcConfig::default().max_frame_bytes)
+    {
+        return Err(swarm_contracts::error::Error::invalid(
+            "qualification diagnosis requires a bounded parsed frame length",
+        ));
+    }
+    write_qualification_admit_diagnostic(
+        data_root,
+        ADMIT_WITNESS_DIAGNOSTIC_MARKER,
+        QualificationAdmitDiagnostic {
+            schema: "eliot.swarm.r48.qualification-admit-witness-diagnostic.v1",
+            owner_launch_pid: pid,
+            owner_config_sha256: config_sha256,
+            method: ADMIT_METHOD,
+            sequence: 1,
+            details: QualificationAdmitDiagnosticDetails::Witness(diagnostic),
+        },
+    )
+}
+
+#[cfg(feature = "qualification-faults")]
+fn write_qualification_admit_diagnostic(
+    data_root: &Path,
+    name: &'static str,
+    diagnostic: QualificationAdmitDiagnostic<'_>,
+) -> swarm_contracts::error::Result<()> {
+    use swarm_contracts::error::Error;
+    if diagnostic.owner_launch_pid == 0 || !is_sha256(diagnostic.owner_config_sha256) {
+        return Err(Error::invalid(
+            "qualification diagnosis requires the exact worker identity",
+        ));
+    }
+    let bytes = serde_json::to_vec(&diagnostic)?;
+    if bytes.len() > MAX_ADMIT_DIAGNOSTIC_BYTES {
+        return Err(Error::invalid(
+            "qualification diagnosis exceeds its bounded size",
+        ));
+    }
+    swarm_process::write_private_new(
+        &data_root.join("automation-scheduler-v1").join(name),
+        &bytes,
+    )
+    .map_err(|_| {
+        Error::new(
+            "AUTOMATION_QUALIFICATION_DIAGNOSTIC_WRITE_FAILED",
+            "qualification admission diagnosis could not be recorded",
+        )
+    })
+}
+
+#[cfg(all(test, feature = "qualification-faults"))]
+mod qualification_admit_diagnostic_tests {
+    use super::*;
+
+    fn fresh_service_root() -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "r48-terminal-diagnosis-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("automation-scheduler-v1")).unwrap();
+        root
+    }
+
+    #[test]
+    fn terminal_diagnosis_is_closed_bound_and_create_only() {
+        let root = fresh_service_root();
+        let digest = "b".repeat(64);
+        let pid = std::process::id();
+        write_qualification_admit_terminal(
+            &root,
+            pid,
+            &digest,
+            QualificationAdmitTerminalCategory::ReplyWithheld,
+        )
+        .unwrap();
+        let path = root
+            .join("automation-scheduler-v1")
+            .join(ADMIT_TERMINAL_MARKER);
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.len() <= MAX_ADMIT_DIAGNOSTIC_BYTES);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let fields = value.as_object().unwrap();
+        let mut keys = fields.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "method",
+                "owner_config_sha256",
+                "owner_launch_pid",
+                "schema",
+                "sequence",
+                "terminal_category",
+            ]
+        );
+        assert_eq!(value["owner_launch_pid"], pid);
+        assert_eq!(value["owner_config_sha256"], digest);
+        assert_eq!(
+            value["schema"],
+            "eliot.swarm.r48.qualification-admit-terminal.v1"
+        );
+        assert_eq!(value["method"], ADMIT_METHOD);
+        assert_eq!(value["sequence"], 1);
+        assert_eq!(value["terminal_category"], "reply_withheld");
+        for (category, expected) in [
+            (QualificationAdmitTerminalCategory::Ok, "ok"),
+            (
+                QualificationAdmitTerminalCategory::ReplyWithheld,
+                "reply_withheld",
+            ),
+            (
+                QualificationAdmitTerminalCategory::TransportUncertain,
+                "transport_uncertain",
+            ),
+            (
+                QualificationAdmitTerminalCategory::OtherRejection,
+                "other_rejection",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(category).unwrap(), expected);
+        }
+        assert!(
+            write_qualification_admit_terminal(
+                &root,
+                pid,
+                &digest,
+                QualificationAdmitTerminalCategory::Ok,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(
+            !root
+                .join("automation-scheduler-v1/qualification-fault-witness.json")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnosis_refuses_invalid_identity_or_count_before_create() {
+        let root = fresh_service_root();
+        let digest = "b".repeat(64);
+        let pid = std::process::id();
+        for (pid, digest) in [(0, digest.as_str()), (pid, "private-non-digest")] {
+            assert!(
+                write_qualification_admit_terminal(
+                    &root,
+                    pid,
+                    digest,
+                    QualificationAdmitTerminalCategory::Ok,
+                )
+                .is_err()
+            );
+            assert!(
+                write_qualification_witness_diagnostic(
+                    &root,
+                    pid,
+                    digest,
+                    QualificationWitnessDiagnostic::Absent,
+                )
+                .is_err()
+            );
+        }
+        for withheld_frame_bytes in [0, swarm_client::IpcConfig::default().max_frame_bytes + 1] {
+            assert!(
+                write_qualification_witness_diagnostic(
+                    &root,
+                    pid,
+                    &digest,
+                    QualificationWitnessDiagnostic::Valid {
+                        withheld_frame_bytes,
+                        witness_writer_outcome: QualificationWitnessWriterOutcome::Applied,
+                    },
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read_dir(root.join("automation-scheduler-v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod qualification_admit_attempt_tests {
     use super::*;

@@ -9,7 +9,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($harness, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'R48_PARSE_FAILED' }
-$functions = @('Get-ControllerId', 'Get-StrictInt64', 'Assert-EligibleCheckRunReceipt', 'Assert-HostRemainsAlive', 'New-PrivateDirectory', 'Write-PrivateJson', 'Invoke-PublicCall', 'Stop-OwnedHost')
+$functions = @('Get-ControllerId', 'Get-StrictInt64', 'Assert-EligibleCheckRunReceipt', 'Assert-HostRemainsAlive', 'New-PrivateDirectory', 'Write-PrivateJson', 'Invoke-PublicCall', 'Stop-OwnedHost', 'Test-QualificationFaultWitness', 'Wait-ForQualificationFaultWitness')
 $definitions = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in $functions })
 if ($definitions.Count -ne $functions.Count) { throw 'R48_FUNCTION_MISSING' }
@@ -53,12 +53,20 @@ Assert-Case 'different_check_profile_rejected' (-not (Assert-EligibleCheckRunRec
 
 # Exercise the liveness reader with a real process handle and the public UUID wire type.
 $script:fixtureStatus = @{ controller_id = $controllerId; host_lifecycle = @{ current = @{ state = 'running'; host_epoch = 1 } } }
-function Invoke-PublicCall { return [pscustomobject]@{ success = $true; value = $script:fixtureStatus } }
+function Invoke-PublicCall {
+    param($Scenario, $CredentialPath, $Method, $Params, $TimeoutMilliseconds)
+    $script:fixtureReadbackBudget = $TimeoutMilliseconds
+    if ($script:fixtureReadbackDelay -gt 0) { Start-Sleep -Milliseconds $script:fixtureReadbackDelay }
+    return [pscustomobject]@{ success = $true; value = $script:fixtureStatus }
+}
+$script:fixtureReadbackDelay = 0
 $fixtureProcess = Get-Process -Id $PID
 $scenario = [pscustomobject]@{ host = $fixtureProcess; manager_path = 'unused-fixture' }
-Assert-Case 'liveness_reads_uuid_without_pid_assignment' (Assert-HostRemainsAlive -Scenario $scenario -ExpectedPid $PID -ExpectedHostEpoch 1 -Samples 1 -IntervalSeconds 1).success
+Assert-Case 'liveness_reads_uuid_without_pid_assignment' (Assert-HostRemainsAlive -Scenario $scenario -ExpectedPid $PID -ExpectedHostEpoch 1 -ExpectedControllerId $controllerId -Samples 1 -IntervalSeconds 1).success
 $script:fixtureStatus.controller_id = 7
-Assert-Case 'unreadable_live_identity_rejected' (-not (Assert-HostRemainsAlive -Scenario $scenario -ExpectedPid $PID -ExpectedHostEpoch 1 -Samples 1 -IntervalSeconds 1).success)
+Assert-Case 'unreadable_live_identity_rejected' (-not (Assert-HostRemainsAlive -Scenario $scenario -ExpectedPid $PID -ExpectedHostEpoch 1 -ExpectedControllerId $controllerId -Samples 1 -IntervalSeconds 1).success)
+$script:fixtureStatus.controller_id = [Guid]::NewGuid().ToString('D')
+Assert-Case 'foreign_live_controller_rejected' (-not (Assert-HostRemainsAlive -Scenario $scenario -ExpectedPid $PID -ExpectedHostEpoch 1 -ExpectedControllerId $controllerId -Samples 1 -IntervalSeconds 1).success)
 
 $privatePath = Join-Path ([IO.Path]::GetTempPath()) ('r48-private-contract-' + [Guid]::NewGuid().ToString('N'))
 $null = New-PrivateDirectory $privatePath
@@ -71,6 +79,68 @@ if ($IsWindows) {
 } else {
     $mode = [IO.File]::GetUnixFileMode($privatePath)
     Assert-Case 'new_directory_private_at_creation' ($mode -eq ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute))
+}
+
+# A real child publishes a delayed witness; polling must retain the exact
+# owner/config validation rather than accepting a marker's mere existence.
+$script:MaxFrameBytes = 1MB
+$witnessRoot = Join-Path $privatePath 'witness-state'
+$servicePath = Join-Path $witnessRoot 'automation-scheduler-v1'
+$null = New-PrivateDirectory $servicePath
+$digest = 'a' * 64
+Write-PrivateJson -Path (Join-Path $servicePath 'worker.json') -Value @{ config_sha256 = $digest }
+$witnessPath = Join-Path $servicePath 'qualification-fault-witness.json'
+$writerScript = Join-Path $privatePath 'delayed-witness.ps1'
+[IO.File]::WriteAllText($writerScript, @'
+param([string]$Path)
+Start-Sleep -Milliseconds 300
+$value = @{ schema='eliot.swarm.r48.qualification-fault-witness.v1'; owner_launch_pid=$PID; owner_config_sha256=('a'*64); method='automation.scheduler.admit'; replay='withheld_before_delivery'; withheld_frame_bytes=128 }
+[IO.File]::WriteAllText($Path,($value|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+[Console]::In.ReadLine() | Out-Null
+'@, [Text.UTF8Encoding]::new($false))
+$writerInfo = [Diagnostics.ProcessStartInfo]::new()
+$writerInfo.FileName = $fixtureProcess.Path
+$writerInfo.UseShellExecute = $false
+$writerInfo.CreateNoWindow = $true
+$writerInfo.RedirectStandardInput = $true
+foreach($argument in @('-NoProfile','-File',$writerScript,'-Path',$witnessPath)) { $writerInfo.ArgumentList.Add($argument) }
+$writer = [Diagnostics.Process]::Start($writerInfo)
+try {
+    $script:fixtureStatus = @{ controller_id=$controllerId; host_lifecycle = @{ current = @{ host_epoch=1 }; optional_workers = @{ 'automation-scheduler' = @{ state='running'; owner = @{ status='current'; phase='active'; ready=$true; host_scope=@{controller_id=$controllerId;host_epoch=1}; group_identity=@{pid=$writer.Id} } } } } }
+    $witnessScenario = [pscustomobject]@{ host=$fixtureProcess; state=$witnessRoot; manager_path='unused-fixture' }
+    $waitArgs = @{Scenario=$witnessScenario;ExpectedHostPid=$PID;ExpectedHostEpoch=1;ExpectedControllerId=$controllerId;PollSeconds=5}
+    $observed = Wait-ForQualificationFaultWitness @waitArgs
+    Assert-Case 'delayed_witness_keeps_live_owner_binding' ($observed.success -and $observed.owner_launch_pid -eq $writer.Id -and $observed.config_digest_matches_file)
+    $script:fixtureStatus.host_lifecycle.optional_workers['automation-scheduler'].owner.group_identity.pid = $PID
+    Assert-Case 'foreign_delayed_witness_fails_closed' (-not (Wait-ForQualificationFaultWitness @waitArgs).success)
+    $script:fixtureStatus.host_lifecycle.optional_workers['automation-scheduler'].owner.group_identity.pid = $writer.Id
+    $script:fixtureStatus.controller_id = [Guid]::NewGuid().ToString('D')
+    Assert-Case 'foreign_witness_controller_rejected' (-not (Wait-ForQualificationFaultWitness @waitArgs).success)
+    $script:fixtureStatus.Remove('controller_id')
+    Assert-Case 'missing_witness_controller_rejected' (-not (Wait-ForQualificationFaultWitness @waitArgs).success)
+    $script:fixtureStatus.controller_id = $controllerId
+    $owner = $script:fixtureStatus.host_lifecycle.optional_workers['automation-scheduler'].owner
+    $owner.host_scope.controller_id = [Guid]::NewGuid().ToString('D')
+    Assert-Case 'foreign_witness_owner_controller_rejected' (-not (Wait-ForQualificationFaultWitness @waitArgs).success)
+    $owner.host_scope.controller_id = $controllerId
+    $owner.host_scope.host_epoch = 2
+    Assert-Case 'foreign_witness_owner_epoch_rejected' (-not (Wait-ForQualificationFaultWitness @waitArgs).success)
+    $owner.host_scope.host_epoch = 1
+    $script:fixtureStatus.host_lifecycle.optional_workers['automation-scheduler'].state = 'stopped'
+    Assert-Case 'stopped_witness_worker_rejected' (-not (Wait-ForQualificationFaultWitness @waitArgs).success)
+    $script:fixtureStatus.host_lifecycle.optional_workers['automation-scheduler'].state = 'running'
+    $script:fixtureReadbackDelay = 1100
+    $late = Wait-ForQualificationFaultWitness @waitArgs -PollSeconds 1
+    Assert-Case 'late_validation_not_accepted' (-not $late.success -and $late.code -ceq 'QUALIFICATION_WITNESS_DEADLINE_EXCEEDED')
+    Assert-Case 'witness_readback_gets_remaining_budget' ($script:fixtureReadbackBudget -gt 0 -and $script:fixtureReadbackBudget -le 1000)
+    $script:fixtureReadbackDelay = 0
+    $absentScenario = [pscustomobject]@{ host=$fixtureProcess; state=(Join-Path $privatePath 'absent-witness'); manager_path='unused-fixture' }
+    $absent = Wait-ForQualificationFaultWitness -Scenario $absentScenario -ExpectedHostPid $PID -ExpectedHostEpoch 1 -ExpectedControllerId $controllerId -PollSeconds 1
+    Assert-Case 'bounded_absence_stays_unknown' (-not $absent.success -and $absent.code -ceq 'QUALIFICATION_WITNESS_ABSENT')
+} finally {
+    $writer.StandardInput.Close()
+    if (-not $writer.WaitForExit(5000)) { throw 'FIXTURE_WITNESS_WRITER_STOP_UNCONFIRMED' }
+    $writer.Dispose()
 }
 
 # Re-load the real CLI helper after the liveness stub. Its transport accepts a
@@ -86,6 +156,7 @@ function Start-BoundedProcess {
     param($Arguments, $ExecutablePath, $TimeoutMilliseconds)
     $fileIndex = [Array]::IndexOf($Arguments, '--file')
     $script:requestDocument = Get-Content -LiteralPath $Arguments[$fileIndex + 1] -Raw | ConvertFrom-Json -AsHashtable
+    $script:transportReadbackBudget = $TimeoutMilliseconds
     return [pscustomobject]@{ started = $true; completed = $true; exit_code = 0; stdout = ($operation | ConvertTo-Json -Depth 5) }
 }
 $transportScenario = [pscustomobject]@{ state = 'unused-fixture'; requests = $privatePath }
@@ -93,6 +164,8 @@ $transportCall = Invoke-PublicCall -Scenario $transportScenario -CredentialPath 
 Assert-Case 'cli_file_contains_only_params' ($script:requestDocument.Count -eq 1 -and $script:requestDocument.operation_id -ceq 'operation-fixture')
 Assert-Case 'operation_result_keeps_outer_identity' ($transportCall.success -and $transportCall.value.method -ceq 'check.run' -and
     $transportCall.value.operation_id -ceq 'operation-fixture' -and $transportCall.value.result.check_id -ceq 'check-fixture')
+$null = Invoke-PublicCall -Scenario $transportScenario -CredentialPath 'unused-fixture' -Method 'operation.get' -Params @{ operation_id='operation-fixture' } -TimeoutMilliseconds 123
+Assert-Case 'cli_gets_supplied_readback_budget' ($script:transportReadbackBudget -eq 123)
 
 # Enter the complete public script in a separate process. An absent QRoot must be
 # rejected before any host, Store, installation or model effect can occur.

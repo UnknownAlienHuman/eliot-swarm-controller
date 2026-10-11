@@ -1,9 +1,20 @@
 # Current-source audit and implementation ledger
 
+The [qualification observation repair](../2026-10-11/QUALIFICATION-OBSERVATION-REPAIR.md)
+adds bounded R48 witness observation, feature-only first-admit diagnosis and
+immediate scoped rejected-open reporting. Strict affected Rust Clippy passes
+in both modes on Windows/Linux, followed by 9/10 package tests. The revised R48
+fixture passes 30 cases on each platform; the unchanged readiness fixture retains
+101 assertions on each platform.
+[Native T](../2026-10-11/NATIVE-T-OBSERVATIONS.md) remains partial: OpenCode has
+zero dispatches and an exact model-absent rejection; Antigravity has one applied
+dispatch and verified Gemini init, with causal result/Task acceptance missing.
+
 The [watcher ancestor repair](../2026-10-11/WATCHER-ANCESTOR-REPAIR.md) removes
 braces/micromatch from the source lock and fresh Windows/Linux closures. The
 actual core native-loader watcher checks and MCP compatibility pass on both
-systems. The sprintf-js/cache advisories remain open.
+systems. GitHub confirms alert #12 fixed at 2026-10-11T05:22:32Z. The
+sprintf-js/cache advisories remain open.
 
 The [fresh installed R48 T2 observation](../2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md)
 verifies bootstrap, real scheduler-owner readiness, linked one-shot CheckRun
@@ -12,12 +23,14 @@ admission and host liveness on source3449. The corrected public assertion passes
 the first admission-intent marker proves arming, and the missing producer
 terminal outcome still needs diagnosis. Historical receipts are unchanged.
 
-The [three remaining dependency advisories](../2026-10-11/DEPENDENCIES-REMAINING.md)
-were rechecked against live GitHub and registry metadata at 04:32UTC on 2026-10-11.
-Two have no newer leaf release outside their affected range; the cache package's
+The [two remaining dependency advisories](../2026-10-11/DEPENDENCIES-REMAINING.md)
+are confirmed open by scoped GitHub readback at 08:49UTC on 2026-10-11.
+The earlier 04:32UTC registry assessment found no newer sprintf-js leaf release
+outside its affected range; the cache package's
 4.3.0 candidate has no demonstrated fix in the named code path. Compatible
-ancestor removal remains under source/API assessment. The braces advisory is
-`<=3.0.3`, so 2.x is also affected. These gaps remain open.
+ancestor removal remains under source/API assessment. The historical braces
+range included 2.x; its ancestor chain has now been removed. The two current
+dependency gaps remain open.
 
 The [OpenCode catalog and R48 worker source repair](../2026-10-11/CATALOG-AND-R48-SOURCE-REPAIR.md)
 preserves a closed catalog subreason in public rejected-open receipts and fixes

@@ -697,7 +697,7 @@ function Get-SafeReadinessIdentifier {
 
 function New-ReadinessFailureFacts {
     param(
-        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase', 'native_dispatch_capability')][string] $Reason,
+        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase', 'native_dispatch_capability', 'terminal_open_rejection')][string] $Reason,
         [AllowNull()] $TaskId,
         [AllowNull()] $AttemptId,
         [AllowNull()] $ModuleId,
@@ -770,6 +770,32 @@ function Test-JsonSemanticEquality {
     catch {
         return $false
     }
+}
+
+function Get-TerminalOpenRejection {
+    param(
+        [AllowNull()] $Operation,
+        [string] $OperationId,
+        [string] $ParentOperationId,
+        [string] $TaskId,
+        [string] $AttemptId
+    )
+    if (-not (Test-ReadinessRecordShape $Operation)) { return $null }
+    foreach ($field in @{
+        method='agent.open'; operation_id=$OperationId; prerequisite_operation_id=$ParentOperationId;
+        task_id=$TaskId; attempt_id=$AttemptId; state='rejected'
+    }.GetEnumerator()) {
+        if (-not (Test-ReadinessStringEquals (Get-OptionalField $Operation $field.Key -PreserveCollection) $field.Value)) { return $null }
+    }
+    $result = Get-OptionalField $Operation 'result' -PreserveCollection
+    if (-not (Test-ReadinessRecordShape $result) -or
+        -not (Test-ReadinessStringEquals (Get-OptionalField $result 'outcome' -PreserveCollection) 'rejected')) { return $null }
+    $failure = Get-OptionalField $result 'failure' -PreserveCollection
+    $code = Get-SafeReadinessErrorCode (Get-OptionalField $failure 'code' -PreserveCollection)
+    $category = Get-OptionalField $failure 'catalog_failure_category' -PreserveCollection
+    if ($code -cne 'NATIVE_MODEL_UNAVAILABLE' -or $category -isnot [string] -or
+        $category -cnotin @('catalog_unavailable','model_absent','model_disabled','variant_absent')) { $category = $null }
+    return [pscustomobject]@{ error_code=$code; catalog_failure_category=$category }
 }
 
 function Get-HostReadiness {
@@ -2209,6 +2235,14 @@ try {
             Get-OptionalField -Object $openResult -Name 'outcome' -PreserveCollection
         }
         else { $null }
+        $terminalOpen = Get-TerminalOpenRejection -Operation $openOp -OperationId ([string]$openOps[0].operation_id) -ParentOperationId $parentOperationId -TaskId $taskId -AttemptId $attemptId
+        if ($null -ne $terminalOpen) {
+            $terminalCode = if ($terminalOpen.error_code) { $terminalOpen.error_code } else { 'NATIVE_OPEN_REJECTED' }
+            $failureFacts = New-ReadinessFailureFacts -Reason 'terminal_open_rejection' -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id -ArtifactVersion $contract.version -BindingId $bindingId -Generation $generation -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase -DispatchCapabilityState $lastDispatchCapabilityState -ErrorCode $terminalOpen.error_code
+            $failureFacts.catalog_failure_category = $terminalOpen.catalog_failure_category
+            Add-Stage -Name 'module_open_and_hello' -Status 'blocked' -Code $terminalCode -Facts ([ordered]@{ parent_operation_id=$parentOperationId; open_operation_id=[string]$openOp.operation_id; dispatch_started=$false; readiness_failure=$failureFacts })
+            Stop-Qualification $terminalCode
+        }
         if ([string]::IsNullOrWhiteSpace($bindingId) -or $generation -le 0 -or
             -not (Test-ReadinessStringEquals $openState 'settled') -or
             -not (Test-ReadinessStringEquals $openOutcome 'applied')) {

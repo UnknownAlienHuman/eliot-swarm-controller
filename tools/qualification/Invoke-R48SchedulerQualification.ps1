@@ -358,12 +358,14 @@ function Start-BoundedProcess {
             $result.process = $process
             return $result
         }
+        $callClock = [Diagnostics.Stopwatch]::StartNew()
         $completed = $process.WaitForExit($TimeoutMilliseconds)
         if (-not $completed) {
             $result.error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'
             return $result
         }
-        if (-not [Threading.Tasks.Task]::WaitAll(@($result.stdout_task, $result.stderr_task), 5000)) {
+        $drainMilliseconds = [int][Math]::Max(0, [Math]::Min(5000, $TimeoutMilliseconds - $callClock.Elapsed.TotalMilliseconds))
+        if (-not [Threading.Tasks.Task]::WaitAll(@($result.stdout_task, $result.stderr_task), $drainMilliseconds)) {
             $result.error_code = 'CLI_OUTPUT_DRAIN_PENDING'
             return $result
         }
@@ -433,7 +435,8 @@ function Invoke-PublicCall {
         [Parameter(Mandatory)] $Scenario,
         [Parameter(Mandatory)][string] $CredentialPath,
         [Parameter(Mandatory)][string] $Method,
-        [Parameter(Mandatory)][System.Collections.IDictionary] $Params
+        [Parameter(Mandatory)][System.Collections.IDictionary] $Params,
+        [ValidateRange(1, 60000)][int] $TimeoutMilliseconds = 60000
     )
     $requestPath = Join-Path $Scenario.requests ([Guid]::NewGuid().ToString('N') + '.json')
     Write-PrivateJson -Path $requestPath -Value $Params
@@ -444,7 +447,7 @@ function Invoke-PublicCall {
         'call', $Method,
         '--file', $requestPath
     )
-    $callTimeoutMilliseconds = [int][Math]::Min(60000, $TimeoutSeconds * 1000)
+    $callTimeoutMilliseconds = [int][Math]::Min($TimeoutMilliseconds, [Math]::Min(60000, $TimeoutSeconds * 1000))
     $result = Start-BoundedProcess -Arguments $arguments -ExecutablePath $script:PublicCliPath -TimeoutMilliseconds $callTimeoutMilliseconds
     if (-not $result.started) { return [pscustomobject]@{ success = $false; code = 'CLI_START_FAILED' } }
     if (-not $result.completed) { return [pscustomobject]@{ success = $false; code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN' } }
@@ -1037,7 +1040,9 @@ function Test-QualificationFaultWitness {
     param(
         [Parameter(Mandatory)] $Scenario,
         [Parameter(Mandatory)][int] $ExpectedHostPid,
-        [Parameter(Mandatory)][long] $ExpectedHostEpoch
+        [Parameter(Mandatory)][long] $ExpectedHostEpoch,
+        [Parameter(Mandatory)][string] $ExpectedControllerId,
+        [ValidateRange(1, 60000)][int] $ReadbackTimeoutMilliseconds = 60000
     )
     $witnessPath = Join-Path $Scenario.state 'automation-scheduler-v1' 'qualification-fault-witness.json'
     if (-not (Test-Path -LiteralPath $witnessPath)) {
@@ -1074,7 +1079,7 @@ function Test-QualificationFaultWitness {
     }
 
     # ---- Independent observation of the live Store-owned worker ----
-    $status = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'host.status' -Params ([ordered]@{})
+    $status = Invoke-PublicCall -Scenario $Scenario -CredentialPath $Scenario.manager_path -Method 'host.status' -Params ([ordered]@{}) -TimeoutMilliseconds $ReadbackTimeoutMilliseconds
     if (-not $status.success) {
         return [pscustomobject]@{ success = $false; code = 'HOST_STATUS_READBACK_FAILED' }
     }
@@ -1083,7 +1088,22 @@ function Test-QualificationFaultWitness {
     if (-not $epoch.valid -or $epoch.value -ne $ExpectedHostEpoch) {
         return [pscustomobject]@{ success = $false; code = 'HOST_EPOCH_CHANGED' }
     }
-    $owner = $status.value['host_lifecycle']['optional_workers']['automation-scheduler']['owner']
+    $controller = Get-ControllerId -Value $status.value['controller_id']
+    $worker = $status.value['host_lifecycle']['optional_workers']['automation-scheduler']
+    $owner = if ($worker -is [System.Collections.IDictionary]) { $worker['owner'] } else { $null }
+    if (-not $controller.valid -or $controller.value -cne $ExpectedControllerId) {
+        return [pscustomobject]@{ success = $false; code = 'HOST_IDENTITY_CHANGED' }
+    }
+    if ($worker -isnot [System.Collections.IDictionary] -or $worker['state'] -cne 'running' -or
+        $owner -isnot [System.Collections.IDictionary] -or $owner['host_scope'] -isnot [System.Collections.IDictionary]) {
+        return [pscustomobject]@{ success = $false; code = 'QUALIFICATION_WITNESS_OWNER_SCOPE_INVALID' }
+    }
+    $ownerController = Get-ControllerId -Value $owner['host_scope']['controller_id']
+    $ownerEpoch = Get-StrictInt64 -Value $owner['host_scope']['host_epoch']
+    if (-not $ownerController.valid -or $ownerController.value -cne $ExpectedControllerId -or
+        -not $ownerEpoch.valid -or $ownerEpoch.value -ne $ExpectedHostEpoch) {
+        return [pscustomobject]@{ success = $false; code = 'QUALIFICATION_WITNESS_OWNER_SCOPE_INVALID' }
+    }
 
     # ---- Bind the witness to the observed live worker ----
     $recordedPid = Get-StrictInt64 -Value $witness['owner_launch_pid']
@@ -1163,6 +1183,36 @@ function Test-QualificationFaultWitness {
     }
 }
 
+function Wait-ForQualificationFaultWitness {
+    param(
+        [Parameter(Mandatory)] $Scenario,
+        [Parameter(Mandatory)][int] $ExpectedHostPid,
+        [Parameter(Mandatory)][long] $ExpectedHostEpoch,
+        [Parameter(Mandatory)][string] $ExpectedControllerId,
+        [Parameter(Mandatory)][ValidateRange(1, 300)][int] $PollSeconds
+    )
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $lastAbsent = [pscustomobject]@{ success=$false; code='QUALIFICATION_WITNESS_ABSENT'; note='no applied-fault witness was observed within the bound' }
+    while ($true) {
+        $remaining = $PollSeconds * 1000 - $clock.Elapsed.TotalMilliseconds
+        if ($remaining -lt 1) { return $lastAbsent }
+        if ($null -eq $Scenario.host -or $Scenario.host.HasExited -or $Scenario.host.Id -ne $ExpectedHostPid) {
+            return [pscustomobject]@{ success = $false; code = 'HOST_PROCESS_GONE'; note = 'the owned host exited before an applied-fault witness was observed' }
+        }
+        $readbackBudget = [int][Math]::Min(60000, [Math]::Floor($remaining))
+        $result = Test-QualificationFaultWitness -Scenario $Scenario -ExpectedHostPid $ExpectedHostPid -ExpectedHostEpoch $ExpectedHostEpoch -ExpectedControllerId $ExpectedControllerId -ReadbackTimeoutMilliseconds $readbackBudget
+        if ($clock.Elapsed.TotalMilliseconds -ge $PollSeconds * 1000 -and $result.success) {
+            return [pscustomobject]@{ success=$false; code='QUALIFICATION_WITNESS_DEADLINE_EXCEEDED'; note='witness validation completed outside the observation window' }
+        }
+        # Retry only absence. A present but foreign or invalid witness fails.
+        if ($result.success -or $result.code -cne 'QUALIFICATION_WITNESS_ABSENT') { return $result }
+        $lastAbsent = $result
+        $remaining = $PollSeconds * 1000 - $clock.Elapsed.TotalMilliseconds
+        if ($remaining -lt 1) { return $lastAbsent }
+        Start-Sleep -Milliseconds ([int][Math]::Min(200, [Math]::Floor($remaining)))
+    }
+}
+
 function Test-QualificationAdmitAttempts {
     param([Parameter(Mandatory)] $Scenario, [Parameter(Mandatory)] $Injection)
     $directory = Join-Path $Scenario.state 'automation-scheduler-v1'
@@ -1198,6 +1248,7 @@ function Assert-HostRemainsAlive {
         [Parameter(Mandatory)] $Scenario,
         [Parameter(Mandatory)][int] $ExpectedPid,
         [Parameter(Mandatory)][long] $ExpectedHostEpoch,
+        [Parameter(Mandatory)][string] $ExpectedControllerId,
         [Parameter(Mandatory)][int] $Samples,
         [Parameter(Mandatory)][int] $IntervalSeconds
     )
@@ -1262,6 +1313,9 @@ function Assert-HostRemainsAlive {
         }
         if ($lifecycleState -cne 'running') {
             return [pscustomobject]@{ success = $false; code = 'HOST_LIFECYCLE_NOT_RUNNING'; observations = @($observations.ToArray()) }
+        }
+        if ($controllerId -cne $ExpectedControllerId) {
+            return [pscustomobject]@{ success = $false; code = 'CONTROLLER_ID_MISMATCH'; observations = @($observations.ToArray()) }
         }
         if ($null -ne $epoch -and $epoch -ne $ExpectedHostEpoch) {
             return [pscustomobject]@{ success = $false; code = 'HOST_EPOCH_MISMATCH'; observations = @($observations.ToArray()) }
@@ -1798,13 +1852,13 @@ Save-Receipt
 # The evidence channel is the bounded create-only witness that the live, Store-owned
 # worker writes beside its exact private config. The witness is bound to the observed
 # live owner process and to the worker config digest on disk.
-$noReplay = Test-QualificationFaultWitness -Scenario $script:FinalScenario -ExpectedHostPid $finalStart.pid -ExpectedHostEpoch $finalStart.epoch
+$noReplay = Wait-ForQualificationFaultWitness -Scenario $script:FinalScenario -ExpectedHostPid $finalStart.pid -ExpectedHostEpoch $finalStart.epoch -ExpectedControllerId $finalStart.controller_id -PollSeconds $TimeoutSeconds
 if (-not $noReplay.success) {
     # When no witness exists the subgate is recorded as an explicit gap, never as a
     # verified claim and never hidden.
     $gapStatus = if ($noReplay.code -in @('QUALIFICATION_WITNESS_ABSENT')) { 'unknown' } else { 'not_verified' }
     Add-SubgateResult -Name 'uncertain_initial_admit_receipt_no_replay' -Status $gapStatus -Code $noReplay.code -Evidence ([ordered]@{ note = $noReplay.note })
-    $script:Report.subgate_gap_note = 'This host was not launched with the qualification flag, so no admit reply was withheld and this subgate remains an explicit gap rather than a verified claim.'
+    $script:Report.subgate_gap_note = 'No valid applied-fault witness was observed within the bound. Arming, the admit RPC outcome and witness-write outcome are separate facts; this gap proves none of them absent.'
 }
 else {
     # Injection is established here. The absence of a second admission intent
@@ -1814,7 +1868,7 @@ else {
 Save-Receipt
 
 # ---- Subgate 4: host remains alive ----------------------------------------------
-$hostAlive = Assert-HostRemainsAlive -Scenario $script:FinalScenario -ExpectedPid $finalStart.pid -ExpectedHostEpoch $finalStart.epoch -Samples $HostAliveSamples -IntervalSeconds $HostAliveSampleIntervalSeconds
+$hostAlive = Assert-HostRemainsAlive -Scenario $script:FinalScenario -ExpectedPid $finalStart.pid -ExpectedHostEpoch $finalStart.epoch -ExpectedControllerId $finalStart.controller_id -Samples $HostAliveSamples -IntervalSeconds $HostAliveSampleIntervalSeconds
 if (-not $hostAlive.success) {
     Add-SubgateResult -Name 'host_remains_alive' -Status 'not_verified' -Code $hostAlive.code -Evidence ([ordered]@{ observations = $hostAlive.observations })
     Stop-Harness $hostAlive.code

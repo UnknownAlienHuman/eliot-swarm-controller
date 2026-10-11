@@ -248,33 +248,6 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
                         "swarm-automation-worker: {}; rereading Store page before retry",
                         error.code
                     );
-                    // Qualification-only applied-fault witness. This launch
-                    // sends stderr to a null sink and the host stops reading
-                    // stdout after the readiness frame, so worker logging is
-                    // unreachable. The only observable trace of the withheld
-                    // reply is a bounded create-only marker beside the exact
-                    // private worker config, bound to the live PID and the
-                    // config digest. No Store state or credential is touched.
-                    #[cfg(feature = "qualification-faults")]
-                    if error.code == swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED
-                    {
-                        // The exact withheld frame length is reported by the
-                        // transport seam inside the error message. It is parsed
-                        // strictly and a failure to parse is reported rather than
-                        // defaulting to a fabricated value.
-                        match swarm_client::qualification_faults::parse_withheld_frame_bytes(
-                            &error.message,
-                        ) {
-                            Some(withheld_frame_bytes) => {
-                                record_qualification_fault_witness(&config, withheld_frame_bytes);
-                            }
-                            None => {
-                                eprintln!(
-                                    "swarm-automation-worker: qualification witness refused; withheld frame length was absent from the transport error"
-                                );
-                            }
-                        }
-                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -322,16 +295,25 @@ async fn call_once(
     // sent, so a replay leaves a marker the harness can refute. Any marker failure
     // refuses the request rather than falling back to sending it unobserved.
     #[cfg(feature = "qualification-faults")]
-    if method == ADMIT_METHOD
+    let first_qualified_admit = if method == ADMIT_METHOD
         && QUALIFICATION_ADMIT_INTENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
     {
         swarm_automation::write_qualification_admit_attempt(
             std::path::Path::new(&config.store_root),
             std::process::id(),
             &config.config_sha256,
-        )?;
+        )? == 1
+    } else {
+        false
+    };
+    let result = client.request(method, params).await;
+    // Observe the actual completed result before the caller logs or retries it.
+    // Cancellation before completion creates no terminal diagnosis.
+    #[cfg(feature = "qualification-faults")]
+    if method == ADMIT_METHOD {
+        record_qualification_admit_result(config, first_qualified_admit, &result);
     }
-    client.request(method, params).await
+    result
 }
 
 fn valid_admit_receipt(value: &serde_json::Value, scope: &DeclaredServiceScope) -> bool {
@@ -363,6 +345,91 @@ fn retryable(code: &str) -> bool {
     )
 }
 
+/// Diagnosis borrows the actual RPC result and never replaces its error or adds
+/// a retry. It is best effort: a diagnostic write failure leaves evidence absent.
+#[cfg(feature = "qualification-faults")]
+fn record_qualification_admit_result(
+    config: &WorkerConfig,
+    first_attempt: bool,
+    result: &Result<serde_json::Value>,
+) {
+    let data_root = std::path::Path::new(&config.store_root);
+    if first_attempt {
+        use swarm_automation::QualificationAdmitTerminalCategory as Category;
+        let category = match result {
+            Ok(_) => Category::Ok,
+            Err(error)
+                if error.code
+                    == swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED =>
+            {
+                Category::ReplyWithheld
+            }
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "HOST_UNAVAILABLE"
+                        | "IO_ERROR"
+                        | "OUTCOME_UNKNOWN"
+                        | "DISCONNECTED"
+                        | "STORE_CLOSED"
+                ) =>
+            {
+                Category::TransportUncertain
+            }
+            Err(_) => Category::OtherRejection,
+        };
+        if let Err(error) = swarm_automation::write_qualification_admit_terminal(
+            data_root,
+            std::process::id(),
+            &config.config_sha256,
+            category,
+        ) {
+            eprintln!(
+                "swarm-automation-worker: qualification terminal diagnosis write failed: {}",
+                error.code
+            );
+        }
+    }
+    let Err(error) = result else {
+        return;
+    };
+    if error.code != swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED {
+        return;
+    }
+    // The unchanged parser and witness producer handle the real seam error.
+    // A parse failure does not pretend that the witness writer ran.
+    let diagnostic = match swarm_client::qualification_faults::parse_withheld_frame_bytes(
+        &error.message,
+    ) {
+        Some(withheld_frame_bytes) => swarm_automation::QualificationWitnessDiagnostic::Valid {
+            withheld_frame_bytes,
+            witness_writer_outcome: record_qualification_fault_witness(
+                config,
+                withheld_frame_bytes,
+            ),
+        },
+        None => {
+            eprintln!(
+                "swarm-automation-worker: qualification witness refused; withheld frame length was absent from the transport error"
+            );
+            swarm_automation::QualificationWitnessDiagnostic::Absent
+        }
+    };
+    if first_attempt
+        && let Err(error) = swarm_automation::write_qualification_witness_diagnostic(
+            data_root,
+            std::process::id(),
+            &config.config_sha256,
+            diagnostic,
+        )
+    {
+        eprintln!(
+            "swarm-automation-worker: qualification witness diagnosis write failed: {}",
+            error.code
+        );
+    }
+}
+
 /// Record the bounded qualification witness for one withheld admit reply.
 ///
 /// Called only from the qualification fault path, which is compiled out of any
@@ -378,7 +445,10 @@ fn retryable(code: &str) -> bool {
 /// Failure to write the witness is reported on stderr and never affects the
 /// Store, the credential, or the uncertain branch that follows.
 #[cfg(feature = "qualification-faults")]
-fn record_qualification_fault_witness(config: &WorkerConfig, withheld_frame_bytes: usize) {
+fn record_qualification_fault_witness(
+    config: &WorkerConfig,
+    withheld_frame_bytes: usize,
+) -> swarm_automation::QualificationWitnessWriterOutcome {
     let witness = swarm_automation::QualificationFaultWitness {
         owner_launch_pid: std::process::id(),
         owner_config_sha256: config.config_sha256.clone(),
@@ -394,9 +464,165 @@ fn record_qualification_fault_witness(config: &WorkerConfig, withheld_frame_byte
             "swarm-automation-worker: qualification witness write failed: {}",
             error.code
         );
-        return;
+        return swarm_automation::QualificationWitnessWriterOutcome::Rejected;
     }
     eprintln!(
         "swarm-automation-worker: QUALIFICATION_FAULT_WITNESS_RECORDED method=automation.scheduler.admit reply=withheld replay=refused"
     );
+    swarm_automation::QualificationWitnessWriterOutcome::Applied
+}
+
+#[cfg(all(test, feature = "qualification-faults"))]
+mod qualification_admit_result_tests {
+    use super::*;
+    use std::{fs, path::Path};
+
+    fn fixture_config() -> WorkerConfig {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "r48-worker-terminal-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("automation-scheduler-v1")).unwrap();
+        WorkerConfig {
+            schema_version: 1,
+            store_root: root.to_str().unwrap().to_owned(),
+            scope: DeclaredServiceScope::new(
+                swarm_contracts::DeclaredServicePurpose::AutomationScheduler,
+                "automation-scheduler-v1",
+                1,
+            )
+            .unwrap(),
+            credential: swarm_contracts::Credential {
+                client_id: "automation-scheduler-v1".to_owned(),
+                token: "private-test-credential".to_owned(),
+            },
+            service_owner_token: "private-test-owner".to_owned(),
+            config_sha256: "c".repeat(64),
+        }
+    }
+
+    fn service_file(config: &WorkerConfig, name: &str) -> PathBuf {
+        Path::new(&config.store_root)
+            .join("automation-scheduler-v1")
+            .join(name)
+    }
+
+    fn read_diagnosis(config: &WorkerConfig, name: &str) -> serde_json::Value {
+        let bytes = fs::read(service_file(config, name)).unwrap();
+        assert!(bytes.len() <= 512);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["owner_launch_pid"], std::process::id());
+        assert_eq!(value["owner_config_sha256"], config.config_sha256);
+        assert_eq!(value["method"], ADMIT_METHOD);
+        assert_eq!(value["sequence"], 1);
+        let text = String::from_utf8(bytes).unwrap();
+        for forbidden in [
+            "private-test-credential",
+            "private-test-owner",
+            "private-result-content",
+            "private-error-message",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+        value
+    }
+
+    #[test]
+    fn first_admit_diagnosis_preserves_rpc_results_and_closed_categories() {
+        for (result, category) in [
+            (Ok(serde_json::json!({"private-result-content":true})), "ok"),
+            (
+                Err(Error::new(
+                    swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED,
+                    "private-error-message",
+                )),
+                "reply_withheld",
+            ),
+            (
+                Err(Error::new("OUTCOME_UNKNOWN", "private-error-message")),
+                "transport_uncertain",
+            ),
+            (
+                Err(Error::new("STORE_CLOSED", "private-error-message")),
+                "transport_uncertain",
+            ),
+            (
+                Err(Error::new("FORBIDDEN", "private-error-message")),
+                "other_rejection",
+            ),
+        ] {
+            let config = fixture_config();
+            let before = serde_json::to_value(&result).unwrap();
+            record_qualification_admit_result(&config, true, &result);
+            assert_eq!(serde_json::to_value(&result).unwrap(), before);
+            let terminal = read_diagnosis(&config, "qualification-admit-terminal-1.json");
+            assert_eq!(terminal["terminal_category"], category);
+            assert_eq!(terminal.as_object().unwrap().len(), 6);
+            let terminal_path = service_file(&config, "qualification-admit-terminal-1.json");
+            let retained_terminal = fs::read(&terminal_path).unwrap();
+            record_qualification_admit_result(&config, false, &Ok(serde_json::json!({})));
+            assert_eq!(fs::read(terminal_path).unwrap(), retained_terminal);
+            let diagnostic_path =
+                service_file(&config, "qualification-admit-witness-diagnostic-1.json");
+            if category == "reply_withheld" {
+                let diagnostic =
+                    read_diagnosis(&config, "qualification-admit-witness-diagnostic-1.json");
+                assert_eq!(diagnostic["frame_length_state"], "absent");
+                assert_eq!(diagnostic.as_object().unwrap().len(), 6);
+                assert!(diagnostic.get("withheld_frame_bytes").is_none());
+                assert!(diagnostic.get("witness_writer_outcome").is_none());
+            } else {
+                assert!(!diagnostic_path.exists());
+            }
+            assert!(!service_file(&config, "qualification-fault-witness.json").exists());
+            fs::remove_dir_all(&config.store_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn witness_diagnosis_uses_real_writer_outcomes_without_replacing_rpc_errors() {
+        for block_witness in [false, true] {
+            let config = fixture_config();
+            let witness_path = service_file(&config, "qualification-fault-witness.json");
+            if block_witness {
+                // A directory at the file path makes create-new fail on both OSes.
+                fs::create_dir(&witness_path).unwrap();
+            }
+            let result = Err(Error::new(
+                swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED,
+                "private-error-message; withheld_frame_bytes=4096",
+            ));
+            let before = serde_json::to_value(&result).unwrap();
+            record_qualification_admit_result(&config, true, &result);
+            assert_eq!(serde_json::to_value(&result).unwrap(), before);
+            let terminal = read_diagnosis(&config, "qualification-admit-terminal-1.json");
+            assert_eq!(terminal["terminal_category"], "reply_withheld");
+            let diagnostic =
+                read_diagnosis(&config, "qualification-admit-witness-diagnostic-1.json");
+            assert_eq!(diagnostic["frame_length_state"], "valid");
+            assert_eq!(diagnostic["withheld_frame_bytes"], 4096);
+            assert_eq!(
+                diagnostic["witness_writer_outcome"],
+                if block_witness { "rejected" } else { "applied" }
+            );
+            assert_eq!(diagnostic.as_object().unwrap().len(), 8);
+            assert_eq!(witness_path.is_file(), !block_witness);
+            fs::remove_dir_all(&config.store_root).unwrap();
+        }
+        let config = fixture_config();
+        // Diagnosis failure must not mask the real transport error or create proof.
+        fs::create_dir(service_file(&config, "qualification-admit-terminal-1.json")).unwrap();
+        let result = Err(Error::new("OUTCOME_UNKNOWN", "private-error-message"));
+        let before = serde_json::to_value(&result).unwrap();
+        record_qualification_admit_result(&config, true, &result);
+        assert_eq!(serde_json::to_value(&result).unwrap(), before);
+        assert!(!service_file(&config, "qualification-admit-terminal-1.json").is_file());
+        assert!(!service_file(&config, "qualification-fault-witness.json").exists());
+        fs::remove_dir_all(&config.store_root).unwrap();
+    }
 }

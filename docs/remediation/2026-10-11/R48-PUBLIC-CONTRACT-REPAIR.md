@@ -2,6 +2,12 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+The [bounded witness and producer diagnostic repair](QUALIFICATION-OBSERVATION-REPAIR.md)
+passes the current public fixture **30/30 on both platforms**. It retains a
+bounded wait for delayed applied evidence and a separate feature-only first-RPC
+diagnosis. The 18-case and older hashes below are historical editions. T2's
+missing applied witness remains UNKNOWN until a fresh installed run proves it.
+
 The fresh T2 run `r48-91c5d1b40b3b4e568e04d5f8630bc6b6` completed at
 `2026-10-11T05:08:41Z` with exit0. Bootstrap, current-owner readiness, linked
 one-shot CheckRun admission and host liveness are verified (4/5 observations).

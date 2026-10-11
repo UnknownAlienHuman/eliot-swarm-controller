@@ -16,7 +16,7 @@ $names = @('Get-OptionalField', 'Test-ReadinessRecordShape', 'Get-SafeReadinessE
     'Get-SafeReadinessBindingState', 'Get-SafeReadinessSupervisorPhase', 'Get-SafeReadinessProjection',
     'Test-ReadinessStringEquals', 'Test-ReadinessLaunchParent', 'Test-ReadinessGenerationEquals',
     'Get-SafeReadinessLaunchPhase', 'Test-ReadinessDispatchPhase', 'Get-SafeReadinessDispatchCapabilityState', 'Get-SafeReadinessIdentifier',
-    'New-ReadinessFailureFacts', 'Test-PublicAppliedOperationReadback')
+    'New-ReadinessFailureFacts', 'Test-PublicAppliedOperationReadback', 'Get-TerminalOpenRejection')
 $functions = @($ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true) | Where-Object Name -In $names)
@@ -49,7 +49,8 @@ function New-Parent {
 }
 
 function Invoke-ReadinessCase {
-    param([object[]] $Samples, [string] $Adapter = 'OpenCode', [AllowNull()][string] $RefreshErrorCode = $null)
+    param([object[]] $Samples, [string] $Adapter = 'OpenCode', [AllowNull()][string] $RefreshErrorCode = $null,
+        [AllowNull()] $OpenFailure = $null, [string] $OpenScopeDamage = '')
     $taskId = 'task-fixture'; $attemptId = 'attempt-fixture'; $parentOperationId = 'parent-fixture'
     $TimeoutSeconds = 30
     $launch = [pscustomobject]@{ error_code = $null }
@@ -59,6 +60,10 @@ function Invoke-ReadinessCase {
         prerequisite_operation_id = $parentOperationId; task_id = $taskId; attempt_id = $attemptId
         binding_id = 'binding-fixture'; binding_generation = 7
         result = [ordered]@{ operation_id = 'open-fixture'; outcome = 'applied' }
+    }
+    if ($null -ne $OpenFailure) {
+        $open.state = 'rejected'; $open.result.outcome = 'rejected'; $open.result.failure = $OpenFailure
+        if ($OpenScopeDamage) { $open[$OpenScopeDamage] = 'foreign-scope' }
     }
     $state = [ordered]@{
         binding_id = 'binding-fixture'; generation = 7; state = 'ready'
@@ -244,4 +249,14 @@ foreach ($damage in @('missing_phase', 'array_result', 'foreign_result_id', 'for
     $result = Invoke-ReadinessCase @($sample)
     Assert-Case $damage ($result.trace.dispatches -eq 0 -and $result.stop -ceq 'LAUNCH_READY_READBACK_TIMEOUT')
 }
+foreach ($category in @('catalog_unavailable','model_absent','model_disabled','variant_absent')) {
+    $failure = @{ code='NATIVE_MODEL_UNAVAILABLE'; catalog_failure_category=$category }
+    $rejected = Invoke-ReadinessCase -Samples @((New-Parent)) -OpenFailure $failure
+    Assert-Case ('terminal rejection stops without dispatch '+$category) ($rejected.stop -ceq 'NATIVE_MODEL_UNAVAILABLE' -and $rejected.trace.dispatches -eq 0 -and $rejected.trace.polls -eq 1)
+    Assert-Case ('closed rejection category retained '+$category) ($rejected.stages[0].facts.readiness_failure.catalog_failure_category -ceq $category)
+}
+$unsafe = Invoke-ReadinessCase -Samples @((New-Parent)) -OpenFailure @{ code='NATIVE_MODEL_UNAVAILABLE'; catalog_failure_category='PRIVATE_CATALOG_MARKER' }
+Assert-Case 'unrecognized catalog category not projected' ($unsafe.stop -ceq 'NATIVE_MODEL_UNAVAILABLE' -and $null -eq $unsafe.stages[0].facts.readiness_failure.catalog_failure_category)
+$foreign = Invoke-ReadinessCase -Samples @((New-Parent)) -OpenFailure @{code='NATIVE_MODEL_UNAVAILABLE';catalog_failure_category='model_absent'} -OpenScopeDamage 'task_id'
+Assert-Case 'foreign rejected open not attributed' ($foreign.stop -ceq 'LAUNCH_READY_READBACK_TIMEOUT' -and $foreign.trace.dispatches -eq 0)
 Write-Output "PASS: $checks integrated readiness assertions; native/model calls=0"
