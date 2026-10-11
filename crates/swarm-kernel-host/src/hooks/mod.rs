@@ -5,3 +5,4 @@
 
 pub mod contract;
 pub mod git;
+pub mod setup;

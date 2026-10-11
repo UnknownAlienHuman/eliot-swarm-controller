@@ -13,6 +13,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -510,9 +511,8 @@ fn preview_post_commit_inner(
         .as_ref()
         .is_some_and(|hook| is_executable_hook(&hook_path, &hook.bytes, hook.mode));
     let exe_path = hooks_dir.join("post-commit.exe");
-    let prior_exe = read_optional_regular_file(&exe_path)?;
-    let prior_exe_digest = prior_exe.as_ref().map(|hook| model::digest(&hook.bytes));
-    let prior_exe_active = cfg!(windows) && !prior_hook_active && prior_exe.is_some();
+    let prior_exe_digest = hash_optional_regular_executable(&exe_path)?;
+    let prior_exe_active = cfg!(windows) && !prior_hook_active && prior_exe_digest.is_some();
 
     Ok(HookInstallPlan {
         repository_path,
@@ -2428,6 +2428,56 @@ fn read_optional_regular_file(path: &Path) -> Result<Option<PreviousHook>> {
     }
 }
 
+/// A chained executable is retained in place. Hash its owned handle without
+/// allocating its body or applying the script-preservation size limit.
+fn hash_optional_regular_executable(path: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(Error::new(
+                "HOOK_FILE_INVALID",
+                "chained executable must be a regular nonsymlink file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = open_regular_file(path)?;
+    if !swarm_process::opened_regular_file_matches_path(&file, path)? {
+        return Err(Error::new(
+            "HOOK_FILE_INVALID",
+            "chained executable changed before its handle was retained",
+        ));
+    }
+    let before = file.metadata()?;
+    let mut remaining = before.len();
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    while remaining != 0 {
+        let length = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let read = file.read(&mut buffer[..length])?;
+        if read == 0 {
+            return Err(Error::new(
+                "HOOK_FILE_INVALID",
+                "chained executable shrank while its digest was read",
+            ));
+        }
+        hash.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let after = file.metadata()?;
+    if before.len() != after.len()
+        || before.modified()? != after.modified()?
+        || !swarm_process::opened_regular_file_matches_path(&file, path)?
+    {
+        return Err(Error::new(
+            "HOOK_FILE_INVALID",
+            "chained executable changed while its digest was read",
+        ));
+    }
+    Ok(Some(format!("{:x}", hash.finalize())))
+}
+
 fn is_executable_hook(path: &Path, bytes: &[u8], mode: Option<u32>) -> bool {
     #[cfg(unix)]
     {
@@ -3597,6 +3647,41 @@ mod tests {
             read_bounded(&path).expect("read the boundary-sized hook"),
             exact
         );
+    }
+
+    #[test]
+    fn sibling_executable_streaming_digest_accepts_more_than_the_script_limit() {
+        let root = TestRoot::new();
+        let path = root.0.join("post-commit.exe");
+        assert!(hash_optional_regular_executable(&path).unwrap().is_none());
+        let bytes = vec![0x5a; MAX_HOOK_FILE_BYTES as usize + 64 * 1024 + 7];
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            hash_optional_regular_executable(&path).unwrap(),
+            Some(model::digest(&bytes))
+        );
+        assert_eq!(
+            read_optional_regular_file(&path).unwrap_err().code,
+            "HOOK_FILE_TOO_LARGE"
+        );
+
+        let directory = root.0.join("directory.exe");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            hash_optional_regular_executable(&directory)
+                .unwrap_err()
+                .code,
+            "HOOK_FILE_INVALID"
+        );
+        #[cfg(unix)]
+        {
+            let link = root.0.join("linked.exe");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                hash_optional_regular_executable(&link).unwrap_err().code,
+                "HOOK_FILE_INVALID"
+            );
+        }
     }
 
     const PROBE_FIXTURE_MODE_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MODE";
