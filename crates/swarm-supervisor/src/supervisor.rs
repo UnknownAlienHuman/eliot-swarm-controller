@@ -2877,7 +2877,14 @@ impl Service {
         let worker = identity_from_process_image(worker_image)?;
         match process_birth_identity(worker.pid)? {
             Some(birth) if birth == worker.birth => {
-                let current = capture_identity(worker.pid)?;
+                let current = match capture_identity(worker.pid) {
+                    Ok(current) => current,
+                    // A live birth read can precede exit during image capture.
+                    // Keep the trusted spawn receipt; family departure still
+                    // requires the independent owner-group observation.
+                    Err(error) if error.code == "PROCESS_GONE" => return Ok(Some(worker)),
+                    Err(error) => return Err(error),
+                };
                 if current.image != *worker_image {
                     return Err(Error::new(
                         "MODULE_WORKER_IDENTITY_MISMATCH",
@@ -3655,7 +3662,13 @@ fn process_identity_is_live(identity: &ProcessIdentity) -> Result<bool> {
     match process_birth_identity(identity.pid)? {
         None => Ok(false),
         Some(birth) if birth != identity.birth => Ok(false),
-        Some(_) => Ok(process_image_identity(identity.pid)? == identity.image),
+        Some(_) => match capture_identity(identity.pid) {
+            Ok(current) => Ok(current.birth == identity.birth && current.image == identity.image),
+            // Direct exit may race the bounded executable-image read. This is
+            // a liveness observation, never an owner-family departure proof.
+            Err(error) if error.code == "PROCESS_GONE" => Ok(false),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -4135,17 +4148,42 @@ mod tests {
         }
 
         fn new() -> Self {
+            Self::build(false)
+        }
+
+        #[cfg(any(windows, target_os = "linux"))]
+        fn new_with_current_executable() -> Self {
+            Self::build(true)
+        }
+
+        fn build(pin_current_executable: bool) -> Self {
             let root = std::env::temp_dir().join(format!("swarm-startup-{}", Uuid::new_v4()));
             fs::create_dir(&root).unwrap();
             let root = fs::canonicalize(root).unwrap();
             swarm_process::private_permissions(&root, true).unwrap();
+            let current_executable = pin_current_executable
+                .then(|| fs::canonicalize(std::env::current_exe().unwrap()).unwrap());
+            let executable = current_executable
+                .clone()
+                .unwrap_or_else(|| root.join("missing-adapter"));
+            let executable_sha256 = current_executable
+                .as_ref()
+                .map(|path| hash_file_sha256(path).unwrap())
+                .unwrap_or_else(|| "11".repeat(32));
+            let owner_executable = current_executable
+                .clone()
+                .unwrap_or_else(|| root.join("missing-owner"));
+            let owner_executable_sha256 = current_executable
+                .as_ref()
+                .map(|path| hash_file_sha256(path).unwrap())
+                .unwrap_or_else(|| "33".repeat(32));
             let descriptor: ModuleDescriptor = serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "module_id": "fixture",
                 "artifact": {"artifact_id": "fixture.adapter", "version": "1"},
                 "launch": {
-                    "executable": root.join("missing-adapter"),
-                    "executable_sha256": "11".repeat(32)
+                    "executable": executable,
+                    "executable_sha256": executable_sha256
                 },
                 "protocol": {
                     "minimum": {"major": 1, "minor": 0},
@@ -4177,8 +4215,8 @@ mod tests {
                 protocol: ProtocolVersion { major: 1, minor: 0 },
                 module_contract_json: "{}".to_owned(),
                 owner_executable: ModuleOwnerExecutable {
-                    path: root.join("missing-owner"),
-                    sha256: crate::Sha256Digest::new("33".repeat(32)).unwrap(),
+                    path: owner_executable,
+                    sha256: crate::Sha256Digest::new(owner_executable_sha256).unwrap(),
                 },
                 resolver: Arc::new(NoResolver),
                 admission,
@@ -4256,6 +4294,401 @@ mod tests {
         fn drop(&mut self) {
             self.stop();
         }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    struct ConnectedOwnerFixture {
+        startup: StartupFixture,
+        helper: Option<Child>,
+        helper_identity: ProcessIdentity,
+        boot_id: String,
+        owner_receipt: Value,
+        release_path: PathBuf,
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl ConnectedOwnerFixture {
+        async fn new() -> Self {
+            let startup = StartupFixture::new_with_current_executable();
+            startup.prepare_accounting();
+            let boot_id = Uuid::new_v4().to_string();
+            let state_dir = &startup.service.state_dir;
+            let release_path = state_dir.join("projection-fixture-release");
+            let mut helper = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::owner_group_fixture_waits_for_release",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE", "1")
+                .env("ELIOT_SWARM_SUPERVISOR_OWNER_STATE_DIR", state_dir)
+                .env("ELIOT_SWARM_SUPERVISOR_OWNER_BOOT_ID", &boot_id)
+                .env(
+                    "ELIOT_SWARM_SUPERVISOR_OWNER_BINDING_ID",
+                    &startup.service.scope.binding_id,
+                )
+                .env(
+                    "ELIOT_SWARM_SUPERVISOR_OWNER_GENERATION",
+                    startup.service.scope.generation.to_string(),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start OS-backed owner-family fixture");
+            let helper_pid = helper.id().expect("owner-family fixture has a PID");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let helper_identity = loop {
+                if std::time::Instant::now() >= deadline {
+                    let _ = helper.start_kill();
+                    let _ = helper.wait().await;
+                    panic!("owner-family fixture identity was not readable before deadline");
+                }
+                match capture_identity(helper_pid) {
+                    Ok(identity) => break identity,
+                    Err(error) if error.code == "PROCESS_GONE" => {
+                        if let Some(exit) = helper.try_wait().unwrap() {
+                            panic!("owner-family fixture exited before identity capture: {exit}");
+                        }
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => {
+                        let _ = helper.start_kill();
+                        let _ = helper.wait().await;
+                        panic!("owner-family fixture identity failed: {}", error.code);
+                    }
+                }
+            };
+            startup
+                .service
+                .write_launch_attempt(&boot_id, Some(&helper_identity))
+                .unwrap();
+
+            let ready_path = state_dir.join("projection-fixture-ready");
+            while !ready_path.is_file() {
+                if let Some(exit) = helper.try_wait().unwrap() {
+                    panic!("owner-family fixture exited before publishing receipts: {exit}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner-family fixture did not publish receipts before deadline"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let owner_receipt: Value =
+                serde_json::from_slice(&fs::read(state_dir.join("owner.json")).unwrap()).unwrap();
+            let worker_receipt: Value =
+                serde_json::from_slice(&fs::read(state_dir.join("worker.json")).unwrap()).unwrap();
+            let worker_identity = startup
+                .service
+                .validate_worker_receipt(&worker_receipt, &boot_id, &owner_receipt)
+                .unwrap()
+                .expect("connected worker receipt identifies the live worker");
+            assert!(
+                startup
+                    .service
+                    .observe_owned_worker(&boot_id, &helper_identity, Some(&worker_identity))
+                    .unwrap()
+            );
+
+            Self {
+                startup,
+                helper: Some(helper),
+                helper_identity,
+                boot_id,
+                owner_receipt,
+                release_path,
+            }
+        }
+
+        fn service(&self) -> &Service {
+            &self.startup.service
+        }
+
+        fn release(&self) {
+            fs::write(&self.release_path, b"release").unwrap();
+        }
+
+        async fn prove_departure(&mut self) {
+            let helper = self.helper.take().expect("owner helper is retained");
+            self.service()
+                .retain_helper_child_custody(
+                    helper,
+                    Some(self.helper_identity.clone()),
+                    Some(self.boot_id.clone()),
+                    "MODULE_WORKER_EXITED",
+                )
+                .await;
+            self.release();
+            self.service()
+                .reconcile_retained_helper_child()
+                .await
+                .unwrap();
+            assert!(matches!(
+                self.service().current_status().lifecycle,
+                LifecycleState::ProcessExited {
+                    exit_proven: true,
+                    ..
+                }
+            ));
+        }
+
+        async fn finish_without_proving_departure(&mut self) {
+            self.release();
+            if let Some(mut helper) = self.helper.take() {
+                let _ = helper.wait().await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl Drop for ConnectedOwnerFixture {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release_path, b"release");
+            if let Some(helper) = self.helper.as_mut() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    match helper.try_wait() {
+                        Ok(Some(_)) => break,
+                        _ if std::time::Instant::now() >= deadline => {
+                            let _ = helper.start_kill();
+                            break;
+                        }
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn empty_operation_readback(scope: &ServiceScope) -> OperationReadback {
+        OperationReadback {
+            scope: scope.clone(),
+            complete: true,
+            operations: Vec::new(),
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn aggregate_has_obligations(service: &Service) -> bool {
+        crate::standalone::StandaloneSupervisor::registry_statuses_have_obligations_for_test([
+            service.current_status(),
+        ])
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "spawned by the supervisor connected registry projection regressions"]
+    fn owner_group_fixture_waits_for_release() {
+        if std::env::var_os("ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE").is_none() {
+            return;
+        }
+        let state_dir = PathBuf::from(
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_OWNER_STATE_DIR")
+                .expect("owner fixture state directory"),
+        );
+        let boot_id =
+            std::env::var("ELIOT_SWARM_SUPERVISOR_OWNER_BOOT_ID").expect("owner fixture boot ID");
+        let binding_id = std::env::var("ELIOT_SWARM_SUPERVISOR_OWNER_BINDING_ID")
+            .expect("owner fixture binding ID");
+        let generation = std::env::var("ELIOT_SWARM_SUPERVISOR_OWNER_GENERATION")
+            .expect("owner fixture generation");
+        let token = Uuid::new_v4().to_string();
+        let group = swarm_process::Group::enter_module(&token).unwrap();
+        let owner_receipt = serde_json::json!({
+            "version": 1,
+            "token": token,
+            "process": group.identity.clone(),
+        });
+        fs::write(
+            state_dir.join("owner.json"),
+            serde_json::to_vec(&owner_receipt).unwrap(),
+        )
+        .unwrap();
+
+        let mut worker = WorkerProcessFixture::new();
+        let worker_receipt = serde_json::json!({
+            "version": 1,
+            "boot_id": boot_id,
+            "module": "fixture",
+            "binding": binding_id,
+            "generation": generation,
+            "artifact_id": "fixture.adapter",
+            "artifact_version": "1",
+            "build_id": null,
+            "protocol": "1.0",
+            "module_contract": "{}",
+            "process": worker.identity.image.clone(),
+        });
+        fs::write(
+            state_dir.join("worker.json"),
+            serde_json::to_vec(&worker_receipt).unwrap(),
+        )
+        .unwrap();
+        fs::write(state_dir.join("projection-fixture-ready"), b"ready").unwrap();
+
+        let release_path = state_dir.join("projection-fixture-release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !release_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                worker.stop();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        worker.stop();
+        std::process::exit(23);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn registry_obligation_projection_releases_departed_worker_after_complete_empty_readback()
+    {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let scope = fixture.service().scope.clone();
+        fixture
+            .service()
+            .apply_readback(OperationReadback {
+                scope: scope.clone(),
+                complete: true,
+                operations: vec![OperationSnapshot {
+                    operation_id: "departed-worker-operation".to_owned(),
+                    binding_id: scope.binding_id,
+                    generation: scope.generation,
+                    state: "outcome_unknown".to_owned(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            fixture.service().current_status().unknown_operation_count,
+            1
+        );
+        fixture.prove_departure().await;
+
+        let before_readback = fixture.service().current_status();
+        assert!(before_readback.readback_required);
+        assert_eq!(
+            before_readback.effect_certainty,
+            ModuleEffectCertainty::Unknown
+        );
+        assert_eq!(before_readback.unknown_operation_count, 1);
+        assert_eq!(
+            before_readback.unknown_operation_ids,
+            vec!["departed-worker-operation".to_owned()]
+        );
+        assert!(aggregate_has_obligations(fixture.service()));
+
+        fixture
+            .service()
+            .apply_readback(empty_operation_readback(&before_readback.scope))
+            .unwrap();
+        let after_readback = fixture.service().current_status();
+        assert!(matches!(
+            after_readback.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ));
+        assert!(!after_readback.readback_required);
+        assert!(after_readback.unknown_operation_ids.is_empty());
+        assert_eq!(after_readback.unknown_operation_count, 0);
+        assert_eq!(
+            after_readback.effect_certainty,
+            ModuleEffectCertainty::Unknown
+        );
+        assert!(!aggregate_has_obligations(fixture.service()));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn registry_obligation_projection_keeps_incomplete_readback_blocked() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        fixture.prove_departure().await;
+        let status = fixture.service().current_status();
+        let mut readback = empty_operation_readback(&status.scope);
+        readback.complete = false;
+
+        assert_eq!(
+            fixture.service().apply_readback(readback).unwrap_err().code,
+            "MODULE_READBACK_INCOMPLETE"
+        );
+        assert!(fixture.service().current_status().readback_required);
+        assert!(aggregate_has_obligations(fixture.service()));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn registry_obligation_projection_keeps_mismatched_readback_blocked() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        fixture.prove_departure().await;
+        let status = fixture.service().current_status();
+        let mut readback = empty_operation_readback(&status.scope);
+        readback.scope.binding_id = "other-binding".to_owned();
+
+        assert_eq!(
+            fixture.service().apply_readback(readback).unwrap_err().code,
+            "MODULE_READBACK_INCOMPLETE"
+        );
+        assert!(fixture.service().current_status().readback_required);
+        assert!(aggregate_has_obligations(fixture.service()));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn registry_obligation_projection_keeps_unresolved_operations_blocked() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        fixture.prove_departure().await;
+        let status = fixture.service().current_status();
+        fixture
+            .service()
+            .apply_readback(OperationReadback {
+                scope: status.scope.clone(),
+                complete: true,
+                operations: vec![OperationSnapshot {
+                    operation_id: "fixture-operation".to_owned(),
+                    binding_id: status.scope.binding_id,
+                    generation: status.scope.generation,
+                    state: "outcome_unknown".to_owned(),
+                }],
+            })
+            .unwrap();
+
+        let status = fixture.service().current_status();
+        assert!(!status.readback_required);
+        assert_eq!(status.unknown_operation_count, 1);
+        assert_eq!(
+            status.unknown_operation_ids,
+            vec!["fixture-operation".to_owned()]
+        );
+        assert_eq!(status.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert!(aggregate_has_obligations(fixture.service()));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn registry_obligation_projection_keeps_unproved_departure_blocked() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let token = fixture.owner_receipt["token"].as_str().unwrap();
+        assert!(matches!(
+            observe_process_family(&fixture.owner_receipt["process"], token),
+            ProcessFamilyObservation::Retained
+        ));
+
+        let scope = fixture.service().scope.clone();
+        fixture
+            .service()
+            .apply_readback(empty_operation_readback(&scope))
+            .unwrap();
+        assert!(matches!(
+            fixture.service().current_status().lifecycle,
+            LifecycleState::Starting { .. }
+        ));
+        assert!(aggregate_has_obligations(fixture.service()));
+        fixture.finish_without_proving_departure().await;
     }
 
     #[cfg(any(windows, target_os = "linux"))]

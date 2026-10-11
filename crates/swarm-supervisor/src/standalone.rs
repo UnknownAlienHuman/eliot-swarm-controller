@@ -1381,19 +1381,52 @@ impl StandaloneSupervisor {
     }
 
     async fn registry_has_obligations(&self) -> bool {
-        self.registry.statuses().await.into_iter().any(|status| {
-            Self::has_unsettled_process_custody(
-                &status.lifecycle,
-                status.owner.is_some(),
-                status.worker.is_some(),
-            ) || status.readback_required
-                || status.unknown_operation_count != 0
-                || !status.unknown_operation_ids.is_empty()
-                || matches!(
-                    status.effect_certainty,
-                    crate::ModuleEffectCertainty::Unknown
-                )
-        })
+        Self::registry_statuses_have_obligations(self.registry.statuses().await)
+    }
+
+    fn registry_statuses_have_obligations(
+        statuses: impl IntoIterator<Item = SupervisorStatus>,
+    ) -> bool {
+        statuses
+            .into_iter()
+            .any(|status| Self::registry_status_has_obligations(&status))
+    }
+
+    fn registry_status_has_obligations(status: &SupervisorStatus) -> bool {
+        Self::has_unsettled_process_custody(
+            &status.lifecycle,
+            status.owner.is_some(),
+            status.worker.is_some(),
+        ) || status.readback_required
+            || status.unknown_operation_count != 0
+            || !status.unknown_operation_ids.is_empty()
+            || (matches!(
+                status.effect_certainty,
+                crate::ModuleEffectCertainty::Unknown
+            ) && !Self::has_exact_departed_worker(status))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_statuses_have_obligations_for_test(
+        statuses: impl IntoIterator<Item = SupervisorStatus>,
+    ) -> bool {
+        Self::registry_statuses_have_obligations(statuses)
+    }
+
+    fn has_exact_departed_worker(status: &SupervisorStatus) -> bool {
+        matches!(
+            &status.lifecycle,
+            crate::LifecycleState::Completed { .. }
+                | crate::LifecycleState::ProcessExited {
+                    exit_proven: true,
+                    ..
+                }
+        ) && status.owner.is_some()
+            && status.worker.is_some()
+            && status
+                .worker_boot_id
+                .as_deref()
+                .is_some_and(|boot_id| Uuid::parse_str(boot_id).is_ok())
     }
 
     fn has_unsettled_process_custody(

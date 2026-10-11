@@ -1,5 +1,14 @@
 # Current-source audit and implementation ledger
 
+The [Issue #115 aggregate quiescence repair](../2026-10-11/ISSUE-115-QUIESCENCE-EVIDENCE.json)
+releases the historical Unknown hold only after exact worker departure and
+complete exact-scope zero-unresolved readback. A process exit during birth/image
+capture no longer aborts the independent family-departure observation. Query
+errors, live custody, incomplete/mismatched readback and unresolved Operations
+still block. Strict production Clippy and all five connected real-process cases
+pass on Windows and Linux with Rust 1.98.1. The initial 1-pass/4-failure receipts
+remain historical. Full installed/public/crash/native/load qualification is pending.
+
 The [OpenCodex integration verification repair](../2026-10-11/OPENCODEX-INTEGRATION-VERIFICATION.json)
 requires positive exact-target receipt evidence and independent fresh state
 readback before a responded integration is applied. Restore remains Unknown
