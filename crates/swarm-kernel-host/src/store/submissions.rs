@@ -1485,8 +1485,9 @@ pub(super) fn request_changes_package_on_behalf(
             "findings package differs from its typed review cause",
         ));
     }
+    let content_digest = package.correction_content_digest()?;
     let client_request_id =
-        context.semantic_request_id(&package.identity.submission_ref, &package.findings_digest)?;
+        context.semantic_request_id(&package.identity.submission_ref, &content_digest)?;
     let value = json!({
         "client_request_id":client_request_id,
         "package":package
@@ -1514,8 +1515,7 @@ pub(super) fn request_changes_package_on_behalf(
     if caller_id != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
         || method != "task.request_changes"
         || client_request_id
-            != context
-                .semantic_request_id(&package.identity.submission_ref, &package.findings_digest)?
+            != context.semantic_request_id(&package.identity.submission_ref, &content_digest)?
         || model::canonical(&serde_json::from_str::<Value>(&original_request)?)?
             != model::canonical(&value)?
         || !matches!(state.as_str(), "queued" | "settled")
@@ -1627,6 +1627,154 @@ impl<'a> FeedbackActor<'a> {
     }
 }
 
+/// Reuse a delivered correction while recording the exact current review's
+/// disposition. Current authority comes from the typed context and retained
+/// current review, never from the historical delivery's Operation linkage.
+pub(super) fn coalesce_review_disposition(
+    tx: &Transaction<'_>,
+    context: &ReviewDispositionContext,
+    package: &ReviewFindingsPackage,
+    feedback_operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let prior = retained_feedback_for_package(tx, context.effective_manager_id(), package)?
+        .ok_or_else(|| {
+            Error::new(
+                "FEEDBACK_DELIVERY_DAMAGED",
+                "no matching retained correction delivery",
+            )
+        })?;
+    if prior["operation_id"] != feedback_operation_id
+        || prior["message_id"] != feedback_operation_id
+        || prior["applied"] != true
+    {
+        return Err(Error::new(
+            "FEEDBACK_DELIVERY_DAMAGED",
+            "retained correction has no exact applied delivery",
+        ));
+    }
+    let (method, state, task_id, attempt_id, result_json): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = tx.query_row(
+        "SELECT method,state,task_id,attempt_id,result_json FROM operations WHERE operation_id=?1",
+        [feedback_operation_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let retained_result: Value = serde_json::from_str(&result_json.ok_or_else(|| {
+        Error::new(
+            "FEEDBACK_DELIVERY_DAMAGED",
+            "settled correction delivery has no retained result",
+        )
+    })?)?;
+    if method != "task.request_changes"
+        || state != "settled"
+        || task_id.as_deref() != Some(&package.identity.task_id)
+        || attempt_id.as_deref() != Some(&package.identity.attempt_id)
+        || [
+            "applied",
+            "operation_id",
+            "message_id",
+            "findings_package",
+            "findings_digest",
+            "sender",
+            "recipient",
+        ]
+        .iter()
+        .any(|field| retained_result[*field] != prior[*field])
+    {
+        return Err(Error::new(
+            "FEEDBACK_DELIVERY_DAMAGED",
+            "correction delivery Operation differs from its exact subject",
+        ));
+    }
+    let subject = FeedbackSubject::from(&package.identity);
+    let mut value = request_changes_core(
+        tx,
+        FeedbackActor::Automation(context),
+        &subject,
+        package,
+        feedback_operation_id,
+        now,
+    )?;
+    value["resend_suppressed"] = json!(true);
+    value["current_disposition_recorded"] = json!(true);
+    Ok(value)
+}
+
+/// Content keys are independent of review provenance. The indexed exact lookup
+/// handles current producers; the Store query also finds immutable v1 feedback
+/// written before content keys existed, without rewriting its package or link.
+pub(super) fn retained_feedback_for_package(
+    tx: &Transaction<'_>,
+    decision_actor_id: &str,
+    package: &ReviewFindingsPackage,
+) -> Result<Option<Value>> {
+    let key = feedback_content_key(decision_actor_id, package)?;
+    let mut raw: Option<String> = tx.query_row(
+        "SELECT payload_json FROM observations WHERE source_stream_id='controller:review' AND source_event_key=?1",
+        [&key], |row| row.get(0),
+    ).optional()?;
+    if raw.is_none() {
+        raw = tx.query_row(
+            "SELECT o.payload_json FROM observations o JOIN operations p ON p.operation_id=o.operation_id \
+             WHERE o.source_stream_id='controller:review' AND o.kind='task.feedback' \
+             AND p.task_id=?1 AND p.attempt_id=?2 AND json_extract(o.payload_json,'$.sender')=?3 \
+             AND json_extract(o.payload_json,'$.findings_package.identity')=?4 \
+             AND json_extract(o.payload_json,'$.findings_package.findings')=?5 \
+             ORDER BY o.observation_id LIMIT 1",
+            params![package.identity.task_id,package.identity.attempt_id,decision_actor_id,
+                model::canonical(&json!(package.identity))?, model::canonical(&json!(package.findings))?],
+            |row| row.get(0),
+        ).optional()?;
+    }
+    raw.map(|raw| {
+        let value: Value = serde_json::from_str(&raw)?;
+        let retained: ReviewFindingsPackage =
+            serde_json::from_value(value["findings_package"].clone())?;
+        retained.validate()?;
+        if value["sender"] != decision_actor_id
+            || retained.correction_content_digest()? != package.correction_content_digest()?
+        {
+            return Err(Error::new(
+                "REVIEW_FINDINGS_PACKAGE_CONFLICT",
+                "retained feedback differs from the exact correction content",
+            ));
+        }
+        Ok(value)
+    })
+    .transpose()
+}
+
+fn feedback_content_key(
+    decision_actor_id: &str,
+    package: &ReviewFindingsPackage,
+) -> Result<String> {
+    Ok(format!(
+        "findings-package:{}",
+        model::digest(
+            model::canonical(&json!([
+                decision_actor_id,
+                package.identity.submission_ref,
+                package.identity.candidate_ref,
+                package.correction_content_digest()?
+            ]))?
+            .as_bytes()
+        )
+    ))
+}
+
 fn request_changes_core(
     tx: &Transaction<'_>,
     actor: FeedbackActor<'_>,
@@ -1704,18 +1852,7 @@ fn request_changes_core(
     };
     let finding = Value::Null;
     let package_value = serde_json::to_value(package)?;
-    let key = format!(
-        "findings-package:{}",
-        model::digest(
-            model::canonical(&json!([
-                decision_actor_id,
-                identity.submission_ref,
-                identity.candidate_ref,
-                package.findings_digest
-            ]))?
-            .as_bytes()
-        )
-    );
+    let key = feedback_content_key(decision_actor_id, package)?;
     let t = match automation_task {
         Some(task) => task,
         None => tasks::get_task(tx, &identity.task_id)?,
@@ -1745,15 +1882,7 @@ fn request_changes_core(
         "Applied exact ordered reviewer findings package {}.",
         package.findings_digest
     );
-    let old: Option<String> = tx.query_row("SELECT payload_json FROM observations WHERE source_stream_id='controller:review' AND source_event_key=?1", [&key], |r| r.get(0)).optional()?;
-    if let Some(raw) = old {
-        let mut prior: Value = serde_json::from_str(&raw)?;
-        if prior.get("findings_package") != Some(&package_value) {
-            return Err(Error::new(
-                "REVIEW_FINDINGS_PACKAGE_CONFLICT",
-                "feedback identity already names a different exact subject",
-            ));
-        }
+    if let Some(mut prior) = retained_feedback_for_package(tx, decision_actor_id, package)? {
         let original_feedback_operation_id = model::text(&prior, "operation_id")?.to_owned();
         let mut feedback_operation_id = original_feedback_operation_id.clone();
         if applies && prior["message_id"].is_null() {
@@ -1834,6 +1963,8 @@ fn request_changes_core(
             "historical_evidence_only"
         });
         prior["review_provenance"] = json!(review_provenance);
+        prior["findings_package"] = package_value;
+        prior["findings_digest"] = json!(package.findings_digest);
         if !applies {
             prior["message_id"] = Value::Null;
         }

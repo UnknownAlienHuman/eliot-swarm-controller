@@ -4263,11 +4263,22 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
         package.validate().map_err(|_| corrupt())?;
         let package_identity: ReviewSlotIdentity =
             serde_json::from_value(identity.clone()).map_err(|_| corrupt())?;
-        let expected_request_id = model::digest(
+        let expected_provenance_request_id = model::digest(
             model::canonical(&json!([
                 link.effective_manager_id.as_str(),
                 package.identity.submission_ref.as_str(),
                 package.findings_digest.as_str()
+            ]))
+            .map_err(|_| corrupt())?
+            .as_bytes(),
+        );
+        let correction_content_digest =
+            package.correction_content_digest().map_err(|_| corrupt())?;
+        let expected_content_request_id = model::digest(
+            model::canonical(&json!([
+                link.effective_manager_id.as_str(),
+                package.identity.submission_ref.as_str(),
+                correction_content_digest
             ]))
             .map_err(|_| corrupt())?
             .as_bytes(),
@@ -4277,7 +4288,8 @@ fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLin
             || package.review_assignment_id != assignment_id
             || package.review_result_operation_id != result_operation_id
             || package_findings != result["findings"]
-            || request_client_request_id != expected_request_id.as_str()
+            || (request_client_request_id != expected_provenance_request_id.as_str()
+                && request_client_request_id != expected_content_request_id.as_str())
         {
             return Err(corrupt());
         }

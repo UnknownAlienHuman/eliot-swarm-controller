@@ -10,7 +10,7 @@ use super::{actions::AutomationStep, authorization, config};
 use crate::{
     error::{Error, Result},
     model,
-    review::{ReviewFindingsPackage, ReviewSlotIdentity},
+    review::{ReviewFinding, ReviewFindingsPackage, ReviewSlotIdentity},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -87,6 +87,7 @@ pub(crate) struct RepairDispatchContext {
     feedback_observation_id: i64,
     identity: ReviewSlotIdentity,
     findings_package: ReviewFindingsPackage,
+    feedback_findings_package: ReviewFindingsPackage,
     binding_id: String,
     binding_generation: i64,
     semantic_slot_id: String,
@@ -101,6 +102,7 @@ pub(crate) struct RepairCommittedLineage {
     pub(crate) project_id: String,
     pub(crate) binding_id: String,
     pub(crate) binding_generation: i64,
+    pub(crate) feedback_findings_package: ReviewFindingsPackage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +251,7 @@ impl RepairDispatchContext {
             feedback_observation_id,
             identity,
             findings_package,
+            feedback_findings_package: lineage.feedback_findings_package.clone(),
             binding_id,
             binding_generation,
             semantic_slot_id: String::new(),
@@ -361,6 +364,7 @@ impl RepairDispatchContext {
         if expected_binding_generation <= 0 {
             return Err(source_damaged());
         }
+        let feedback_findings_package = findings_package.clone();
         let mut context = Self {
             technical_requester_id: authorization::AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: owner_manager_id.to_owned(),
@@ -381,6 +385,7 @@ impl RepairDispatchContext {
             feedback_observation_id,
             identity,
             findings_package,
+            feedback_findings_package,
             binding_id: expected_binding_id.to_owned(),
             binding_generation: expected_binding_generation,
             semantic_slot_id: String::new(),
@@ -405,6 +410,7 @@ impl RepairDispatchContext {
         context.source_attempt_owner_id = lineage.source_attempt_owner_id;
         context.review_assignment_sponsor_id = lineage.review_assignment_sponsor_id;
         context.decision_manager_id = lineage.decision_manager_id;
+        context.feedback_findings_package = lineage.feedback_findings_package;
         let (transfer_operation_ids, owner_lineage) = transfer_path_through_owner(
             db,
             &context.source_attempt_owner_id,
@@ -587,6 +593,7 @@ impl RepairDispatchContext {
             project_id: self.project_id.clone(),
             binding_id: self.binding_id.clone(),
             binding_generation: self.binding_generation,
+            feedback_findings_package: self.feedback_findings_package.clone(),
         };
         let ids = validate_repair_transfer_authority(
             &lineage,
@@ -652,6 +659,7 @@ impl RepairDispatchContext {
             || lineage.project_id != self.project_id
             || lineage.binding_id != self.binding_id
             || lineage.binding_generation != self.binding_generation
+            || lineage.feedback_findings_package != self.feedback_findings_package
         {
             return Err(source_damaged());
         }
@@ -820,6 +828,10 @@ impl RepairDispatchContext {
 
     pub(crate) fn findings_package(&self) -> &ReviewFindingsPackage {
         &self.findings_package
+    }
+
+    pub(crate) fn feedback_findings_package(&self) -> &ReviewFindingsPackage {
+        &self.feedback_findings_package
     }
 
     pub(crate) fn binding_id(&self) -> &str {
@@ -1439,14 +1451,6 @@ pub(crate) fn validate_committed_review_and_feedback(
     {
         return Err(damaged());
     }
-    validate_manager_disposition_operation(
-        db,
-        decision_manager_id,
-        disposition_operation_id,
-        assignment_id,
-        identity,
-    )?;
-
     let feedback_operation: Option<RepairFeedbackOperationRow> = db
         .query_row(
             "SELECT caller_id,method,state,result_json,task_id,attempt_id,original_request_json,client_request_id \
@@ -1483,60 +1487,137 @@ pub(crate) fn validate_committed_review_and_feedback(
         serde_json::from_str(&feedback_result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
     let feedback_request_value: Value =
         serde_json::from_str(&feedback_request_json).map_err(|_| damaged())?;
-    let package_value = serde_json::to_value(findings_package).map_err(|_| damaged())?;
+    let feedback_package_value = feedback_result
+        .get("findings_package")
+        .filter(|value| value.is_object())
+        .cloned();
+    let feedback_findings_package = if let Some(value) = feedback_package_value.as_ref() {
+        let package: ReviewFindingsPackage =
+            serde_json::from_value(value.clone()).map_err(|_| damaged())?;
+        package.validate().map_err(|_| damaged())?;
+        if package.identity != *identity
+            || package.correction_content_digest().map_err(|_| damaged())?
+                != findings_package
+                    .correction_content_digest()
+                    .map_err(|_| damaged())?
+            || feedback_request_value
+                .get("package")
+                .is_some_and(|request_package| request_package != value)
+        {
+            return Err(damaged());
+        }
+        package
+    } else {
+        if feedback_result
+            .get("findings_package")
+            .is_some_and(|value| !value.is_null())
+            || feedback_request_value.get("package").is_some()
+        {
+            return Err(damaged());
+        }
+        findings_package.clone()
+    };
+    let has_feedback_package = feedback_package_value.is_some();
+    let feedback_package_value =
+        serde_json::to_value(&feedback_findings_package).map_err(|_| damaged())?;
+    let feedback_assignment_id = feedback_findings_package.review_assignment_id.as_str();
+    let feedback_result_operation_id = feedback_findings_package
+        .review_result_operation_id
+        .as_str();
+    let feedback_sender = feedback_result["sender"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(damaged)?;
+    validate_identity_text(feedback_sender, "feedback_sender").map_err(|_| damaged())?;
+    let feedback_is_current_review = feedback_assignment_id == assignment_id
+        && feedback_result_operation_id == result_operation_id;
+    if feedback_is_current_review {
+        if feedback_sender != decision_manager_id {
+            return Err(damaged());
+        }
+    } else if !has_feedback_package {
+        return Err(damaged());
+    } else {
+        validate_retained_feedback_origin(
+            db,
+            identity,
+            &feedback_findings_package,
+            feedback_operation_id,
+            feedback_sender,
+        )?;
+    }
     let request_client_request_id = feedback_request_value["client_request_id"]
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(damaged)?;
-    let expected_feedback_client_request_id = model::digest(
+    let expected_provenance_feedback_client_request_id = model::digest(
         model::canonical(&json!([
-            decision_manager_id,
+            feedback_sender,
             identity.submission_ref,
-            findings_package.findings_digest
+            feedback_findings_package.findings_digest
         ]))?
         .as_bytes(),
     );
+    let feedback_content_digest = feedback_findings_package
+        .correction_content_digest()
+        .map_err(|_| damaged())?;
+    let expected_content_feedback_client_request_id = model::digest(
+        model::canonical(&json!([
+            feedback_sender,
+            identity.submission_ref,
+            feedback_content_digest
+        ]))?
+        .as_bytes(),
+    );
+    // Retained Operations keep their provenance-keyed ID; current automatic
+    // feedback uses the correction-content key. Accept either exact form.
+    let feedback_client_request_id_matches = feedback_client_request_id
+        == expected_provenance_feedback_client_request_id
+        || feedback_client_request_id == expected_content_feedback_client_request_id;
     let preserves_review_scope = feedback_request_value
         == json!({
             "client_request_id":request_client_request_id,
-            "package":package_value
+            "package":feedback_package_value
         });
     let preserves_package_result = feedback_result["finding"].is_null()
-        && feedback_result["findings_package"] == package_value
-        && feedback_result["findings_digest"] == findings_package.findings_digest
+        && feedback_result["findings_package"] == feedback_package_value
+        && feedback_result["findings_digest"] == feedback_findings_package.findings_digest
         && feedback_result["text"]
             == format!(
                 "Applied exact ordered reviewer findings package {}.",
-                findings_package.findings_digest
+                feedback_findings_package.findings_digest
             )
-        && feedback_result["review_provenance"]["findings_package"] == package_value;
-    let matches_package_feedback = feedback_client_request_id
-        == expected_feedback_client_request_id
+        && feedback_result["review_provenance"]["findings_package"] == feedback_package_value;
+    let matches_package_feedback = has_feedback_package
+        && feedback_client_request_id_matches
         && preserves_review_scope
         && preserves_package_result;
-    let matches_manual_package_feedback = if feedback_request_value.get("schema_version").is_some()
-    {
-        let input = crate::submission::ChangeRequestV2::parse(&feedback_request_value)
-            .map_err(|_| damaged())?;
-        feedback_caller == decision_manager_id
-            && input.attempt_id == identity.attempt_id
-            && input.expected_revision == identity.task_revision
-            && input.submission_ref == identity.submission_ref
-            && input.candidate_ref == identity.candidate_ref
-            && input.review_assignment_id == assignment_id
-            && input.review_result_operation_id == result_operation_id
-            && input.finding_ids.len() == selected_ids.len()
-            && input
-                .finding_ids
-                .iter()
-                .all(|id| selected_ids.contains(id.as_str()))
-            && preserves_package_result
-    } else {
-        false
-    };
+    let matches_manual_package_feedback =
+        if has_feedback_package && feedback_request_value.get("schema_version").is_some() {
+            let input = crate::submission::ChangeRequestV2::parse(&feedback_request_value)
+                .map_err(|_| damaged())?;
+            feedback_caller == feedback_sender
+                && input.attempt_id == identity.attempt_id
+                && input.expected_revision == identity.task_revision
+                && input.submission_ref == identity.submission_ref
+                && input.candidate_ref == identity.candidate_ref
+                && input.review_assignment_id == feedback_assignment_id
+                && input.review_result_operation_id == feedback_result_operation_id
+                && input.finding_ids.len() == feedback_findings_package.findings.len()
+                && input.finding_ids.iter().all(|id| {
+                    feedback_findings_package
+                        .findings
+                        .iter()
+                        .any(|finding| finding.finding_id == *id)
+                })
+                && preserves_package_result
+        } else {
+            false
+        };
     // Retained unversioned feedback predates immutable package requests. A
     // versioned or malformed package request cannot use that historical shape.
-    let matches_single_finding_feedback = if feedback_request_value.get("package").is_none()
+    let matches_single_finding_feedback = if !has_feedback_package
+        && feedback_request_value.get("package").is_none()
         && feedback_request_value.get("schema_version").is_none()
         && findings_package.findings.len() == 1
     {
@@ -1572,23 +1653,24 @@ pub(crate) fn validate_committed_review_and_feedback(
         || feedback_result["applied"] != true
         || feedback_result["status"] != "needs_correction"
         || feedback_result["delivery"] != "durable_mailbox_only"
-        || feedback_result["sender"] != decision_manager_id
+        || feedback_result["sender"] != feedback_sender
         || feedback_result["recipient"] != source_attempt_owner_id
         || feedback_result["task_id"] != identity.task_id
-        || feedback_result["review_provenance"]["review_assignment_id"] != assignment_id
-        || feedback_result["review_provenance"]["review_operation_id"] != result_operation_id
+        || feedback_result["review_provenance"]["review_assignment_id"] != feedback_assignment_id
+        || feedback_result["review_provenance"]["review_operation_id"]
+            != feedback_result_operation_id
         || feedback_result["review_provenance"]["identity"] != json!(identity)
         || feedback_result["native_input_sent"] != false
         || feedback_result["repair_started"] != false
     {
         return Err(damaged());
     }
-    if feedback_caller != decision_manager_id {
+    if feedback_caller != feedback_sender {
         let link = authorization::operation_link(db, feedback_operation_id)?.ok_or_else(damaged)?;
         if link.action != "task.request_changes"
-            || link.effective_manager_id != decision_manager_id
+            || link.effective_manager_id != feedback_sender
             || link.cause["identity"] != json!(identity)
-            || link.cause["review_assignment_id"] != assignment_id
+            || link.cause["review_assignment_id"] != feedback_assignment_id
         {
             return Err(damaged());
         }
@@ -1608,6 +1690,21 @@ pub(crate) fn validate_committed_review_and_feedback(
     if stream != REVIEW_STREAM || kind != "task.feedback" || feedback_payload != feedback_result {
         return Err(damaged());
     }
+    // A coalesced current disposition reuses the immutable feedback Operation.
+    // Its link cause remains bound to the retained package; the current review
+    // assignment and result were validated from the current disposition above.
+    let disposition_cause_assignment_id = if disposition_operation_id == feedback_operation_id {
+        feedback_assignment_id
+    } else {
+        assignment_id
+    };
+    validate_manager_disposition_operation(
+        db,
+        decision_manager_id,
+        disposition_operation_id,
+        disposition_cause_assignment_id,
+        identity,
+    )?;
     Ok(RepairCommittedLineage {
         source_attempt_owner_id,
         review_assignment_sponsor_id: review_assignment_sponsor_id.to_owned(),
@@ -1615,7 +1712,163 @@ pub(crate) fn validate_committed_review_and_feedback(
         project_id,
         binding_id: binding_id.ok_or_else(damaged)?,
         binding_generation: binding_generation.ok_or_else(damaged)?,
+        feedback_findings_package,
     })
+}
+
+fn validate_retained_feedback_origin(
+    db: &Connection,
+    identity: &ReviewSlotIdentity,
+    package: &ReviewFindingsPackage,
+    feedback_operation_id: &str,
+    decision_manager_id: &str,
+) -> Result<()> {
+    let damaged = source_damaged;
+    package.validate().map_err(|_| damaged())?;
+    if package.identity != *identity {
+        return Err(damaged());
+    }
+
+    let assignment_key = format!("assignment:{}", package.review_assignment_id);
+    let assignment_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind='review.assignment'",
+            params![REVIEW_STREAM, assignment_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((assignment_json, assignment_operation_id)) = assignment_row else {
+        return Err(damaged());
+    };
+    let assignment: Value = serde_json::from_str(&assignment_json).map_err(|_| damaged())?;
+    let sponsor_id = assignment["sponsor_client_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(damaged)?;
+    if assignment["review_assignment_id"] != package.review_assignment_id
+        || assignment["operation_id"] != assignment_operation_id
+        || assignment["identity"] != json!(identity)
+    {
+        return Err(damaged());
+    }
+    let assignment_operation: Option<(String, String, Option<String>)> = db
+        .query_row(
+            "SELECT method,state,result_json FROM operations WHERE operation_id=?1",
+            [&assignment_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((assignment_method, assignment_state, assignment_result_json)) = assignment_operation
+    else {
+        return Err(damaged());
+    };
+    let assignment_result: Value =
+        serde_json::from_str(&assignment_result_json.ok_or_else(damaged)?)
+            .map_err(|_| damaged())?;
+    if assignment_method != "review.assign"
+        || assignment_state != "settled"
+        || assignment_result["review_assignment_id"] != package.review_assignment_id
+        || assignment_result["identity"] != json!(identity)
+        || assignment_result["sponsor_client_id"] != sponsor_id
+    {
+        return Err(damaged());
+    }
+
+    let result_key = format!("result:{}", package.review_assignment_id);
+    let result_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind='review.result'",
+            params![REVIEW_STREAM, result_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((result_json, observed_operation_id)) = result_row else {
+        return Err(damaged());
+    };
+    let review_result: Value = serde_json::from_str(&result_json).map_err(|_| damaged())?;
+    if observed_operation_id != package.review_result_operation_id
+        || review_result["operation_id"] != package.review_result_operation_id
+        || review_result["review_assignment_id"] != package.review_assignment_id
+        || review_result["identity"] != json!(identity)
+    {
+        return Err(damaged());
+    }
+    let result_operation: Option<(String, String, String, Option<String>)> = db
+        .query_row(
+            "SELECT caller_id,method,state,result_json FROM operations WHERE operation_id=?1",
+            [&package.review_result_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((reviewer_id, result_method, result_state, result_json)) = result_operation else {
+        return Err(damaged());
+    };
+    let result_value: Value =
+        serde_json::from_str(&result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
+    let retained_findings: Vec<ReviewFinding> =
+        serde_json::from_value(result_value["findings"].clone()).map_err(|_| damaged())?;
+    let selected_ids = package
+        .findings
+        .iter()
+        .map(|finding| finding.finding_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_findings = retained_findings
+        .into_iter()
+        .filter(|finding| selected_ids.contains(finding.finding_id.as_str()))
+        .collect::<Vec<_>>();
+    if result_method != "review.submit"
+        || result_state != "settled"
+        || reviewer_id
+            != assignment["reviewer_client_id"]
+                .as_str()
+                .unwrap_or_default()
+        || result_value != review_result["result"]
+        || result_value["review_assignment_id"] != package.review_assignment_id
+        || result_value["sponsor_client_id"] != sponsor_id
+        || result_value["task_id"] != identity.task_id
+        || result_value["task_revision"] != identity.task_revision
+        || result_value["attempt_id"] != identity.attempt_id
+        || result_value["submission_ref"] != identity.submission_ref
+        || result_value["candidate_ref"] != identity.candidate_ref
+        || result_value["verdict"] != "changes_requested"
+        || result_value["applicability"] != "current_candidate"
+        || selected_findings != package.findings
+    {
+        return Err(damaged());
+    }
+
+    let disposition_key = format!("disposition:{}", package.review_assignment_id);
+    let disposition_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind='review.disposition'",
+            params![REVIEW_STREAM, disposition_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((disposition_json, disposition_observation_operation_id)) = disposition_row else {
+        return Err(damaged());
+    };
+    let disposition: Value = serde_json::from_str(&disposition_json).map_err(|_| damaged())?;
+    if disposition["schema_version"] != 1
+        || disposition["kind"] != "review.disposition"
+        || disposition["review_assignment_id"] != package.review_assignment_id
+        || disposition["operation_id"] != disposition_observation_operation_id
+        || disposition["review_result_operation_id"] != package.review_result_operation_id
+        || disposition["identity"] != json!(identity)
+        || disposition["disposition"] != "return_for_correction"
+        || disposition["finding_ids"] != json!(package.finding_ids())
+        || disposition["task_feedback_operation_id"] != feedback_operation_id
+        || disposition["decided_by"] != decision_manager_id
+    {
+        return Err(damaged());
+    }
+    validate_manager_disposition_operation(
+        db,
+        decision_manager_id,
+        &disposition_observation_operation_id,
+        &package.review_assignment_id,
+        identity,
+    )
 }
 
 fn validate_manager_disposition_operation(

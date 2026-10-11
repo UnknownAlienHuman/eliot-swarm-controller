@@ -213,6 +213,16 @@ impl ReviewFindingsPackage {
             .collect()
     }
 
+    /// Stable dedupe identity for this exact correction content, independent
+    /// of which review assignment and result operation supplied it.
+    pub(crate) fn correction_content_digest(&self) -> Result<String> {
+        let value = json!({
+            "identity":self.identity,
+            "findings":self.findings
+        });
+        Ok(model::digest(model::canonical(&value)?.as_bytes()))
+    }
+
     /// New RepairDispatch identities always bind the complete retained package,
     /// including when it contains one finding.
     pub(crate) fn semantic_subject_key(&self) -> &str {
@@ -410,4 +420,74 @@ pub(crate) fn review_policy_generation(spec: &crate::model::TaskSpec) -> Result<
         "source_index": spec.source_index,
     });
     Ok(model::digest(model::canonical(&policy)?.as_bytes()))
+}
+
+#[cfg(test)]
+mod findings_package_compatibility_tests {
+    use super::*;
+
+    const RETAINED_V1_PACKAGE: &str = r#"{"schema_version":1,"identity":{"task_id":"task-1","attempt_id":"attempt-1","task_revision":1,"submission_ref":"submission-1","candidate_ref":"candidate-1","review_policy_generation":"policy-1","review_slot":"primary"},"review_assignment_id":"assignment-1","review_result_operation_id":"operation-1","findings":[{"finding_id":"finding-1","requirement_ids":["req-1"],"reason":"fails","evidence_refs":["src/lib.rs:1"],"requested_change":"fix it"}],"findings_digest":"7c34cfbb3d5844159d4bb9fc0e6389999c7b055750a485fdffa9cac0d722509e"}"#;
+
+    fn identity() -> ReviewSlotIdentity {
+        ReviewSlotIdentity {
+            task_id: "task-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            task_revision: 1,
+            submission_ref: "submission-1".to_owned(),
+            candidate_ref: "candidate-1".to_owned(),
+            review_policy_generation: "policy-1".to_owned(),
+            review_slot: PRIMARY_REVIEW_SLOT.to_owned(),
+        }
+    }
+
+    fn finding(requested_change: &str) -> ReviewFinding {
+        ReviewFinding {
+            finding_id: "finding-1".to_owned(),
+            requirement_ids: vec!["req-1".to_owned()],
+            reason: "fails".to_owned(),
+            evidence_refs: vec!["src/lib.rs:1".to_owned()],
+            requested_change: requested_change.to_owned(),
+        }
+    }
+
+    #[test]
+    fn retained_v1_digest_and_correction_content_digest_are_compatible() {
+        let retained: ReviewFindingsPackage =
+            serde_json::from_str(RETAINED_V1_PACKAGE).expect("retained v1 package parses");
+        retained
+            .validate()
+            .expect("retained v1 provenance-bound digest remains valid");
+
+        let same_content_other_review = ReviewFindingsPackage::new(
+            identity(),
+            "assignment-2".to_owned(),
+            "operation-2".to_owned(),
+            vec![finding("fix it")],
+        )
+        .expect("second review package is valid");
+        assert_ne!(
+            retained.findings_digest,
+            same_content_other_review.findings_digest
+        );
+        assert_eq!(
+            retained.correction_content_digest().unwrap(),
+            same_content_other_review
+                .correction_content_digest()
+                .unwrap()
+        );
+
+        let changed_content = ReviewFindingsPackage::new(
+            identity(),
+            "assignment-2".to_owned(),
+            "operation-2".to_owned(),
+            vec![finding("replace it")],
+        )
+        .expect("changed review package is valid");
+        assert_ne!(
+            same_content_other_review
+                .correction_content_digest()
+                .unwrap(),
+            changed_content.correction_content_digest().unwrap()
+        );
+    }
 }

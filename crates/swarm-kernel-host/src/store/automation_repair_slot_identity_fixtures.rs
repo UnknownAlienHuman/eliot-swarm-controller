@@ -22,9 +22,21 @@ fn package(reason: &str) -> ReviewFindingsPackage {
 }
 
 fn package_with_result(reason: &str, review_result_operation_id: &str) -> ReviewFindingsPackage {
+    package_with_provenance(
+        reason,
+        "assignment-slot-fixture",
+        review_result_operation_id,
+    )
+}
+
+fn package_with_provenance(
+    reason: &str,
+    review_assignment_id: &str,
+    review_result_operation_id: &str,
+) -> ReviewFindingsPackage {
     ReviewFindingsPackage::new(
         review_identity(),
-        "assignment-slot-fixture".to_owned(),
+        review_assignment_id.to_owned(),
         review_result_operation_id.to_owned(),
         vec![ReviewFinding {
             finding_id: "finding-stable-id".to_owned(),
@@ -62,6 +74,7 @@ fn fixture_db() -> Connection {
              method TEXT NOT NULL,
              state TEXT NOT NULL,
              original_request_json TEXT NOT NULL,
+             result_json TEXT,
              task_id TEXT,
              attempt_id TEXT,
              binding_id TEXT,
@@ -131,15 +144,25 @@ fn seed_direct_slot(
 }
 
 fn direct_slot(package: ReviewFindingsPackage) -> DirectRepairSlot {
+    direct_slot_with_feedback(package.clone(), package)
+}
+
+fn direct_slot_with_feedback(
+    package: ReviewFindingsPackage,
+    feedback_findings_package: ReviewFindingsPackage,
+) -> DirectRepairSlot {
     let semantic_slot_id = slot_id(&package, SLOT_SCHEMA_VERSION);
     let request = request(&package, &semantic_slot_id);
     let request_digest = repair_request_digest(&request).expect("current request digest");
+    let assignment_id = package.review_assignment_id.clone();
+    let result_operation_id = package.review_result_operation_id.clone();
     DirectRepairSlot {
         manager_id: MANAGER_ID.to_owned(),
         identity: package.identity.clone(),
         findings_package: package,
-        assignment_id: "assignment-slot-fixture".to_owned(),
-        result_operation_id: "review-result-slot-fixture".to_owned(),
+        feedback_findings_package,
+        assignment_id,
+        result_operation_id,
         disposition_operation_id: "disposition-slot-fixture".to_owned(),
         feedback_operation_id: "feedback-slot-fixture".to_owned(),
         feedback_observation_id: 9,
@@ -149,6 +172,101 @@ fn direct_slot(package: ReviewFindingsPackage) -> DirectRepairSlot {
         request,
         request_digest,
     }
+}
+
+#[test]
+fn same_correction_across_reviews_reads_back_the_original_legacy_slot_and_native_effect() {
+    let retained = package_with_provenance(
+        "same exact retained correction",
+        "assignment-original",
+        "review-result-original",
+    );
+    let current = package_with_provenance(
+        "same exact retained correction",
+        "assignment-current",
+        "review-result-current",
+    );
+    assert_ne!(retained.findings_digest, current.findings_digest);
+    assert_eq!(
+        retained.correction_content_digest().unwrap(),
+        current.correction_content_digest().unwrap()
+    );
+    let changed = package_with_provenance(
+        "changed retained correction",
+        "assignment-current",
+        "review-result-current",
+    );
+    assert_ne!(
+        current.correction_content_digest().unwrap(),
+        changed.correction_content_digest().unwrap()
+    );
+
+    let db = fixture_db();
+    let retained_slot_id = slot_id(&retained, LEGACY_REPAIR_SCHEMA_VERSION);
+    let operation_id = "operation-original-correction-delivery";
+    seed_direct_slot(
+        &db,
+        &retained,
+        LEGACY_REPAIR_SCHEMA_VERSION,
+        &retained_slot_id,
+        Some(retained.findings_digest.clone()),
+        None,
+        operation_id,
+        &retained_slot_id,
+    );
+    let native_result = json!({
+        "outcome":"applied",
+        "native_input_id":"native-input-original",
+        "details":{"completion_condition":"native_input_admitted"}
+    });
+    let native_result_json = native_result.to_string();
+    db.execute(
+        "UPDATE operations SET result_json=?2 WHERE operation_id=?1",
+        params![operation_id, native_result_json.as_str()],
+    )
+    .expect("retain original native effect receipt");
+    let original_operation: (String, String, String) = db
+        .query_row(
+            "SELECT original_request_json,client_request_id,result_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read original Operation bytes and native effect");
+    let original_slot = config::read_record(&db, &slot_key(&retained_slot_id), "fixture slot")
+        .expect("read original slot")
+        .expect("original slot exists");
+
+    let current_slot = direct_slot_with_feedback(current.clone(), retained.clone());
+    assert!(matches!(
+        resolve_direct_slot(&db, &current_slot).expect("resolve retained correction"),
+        RepairSlotResolution::Existing { operation_id: retained, .. }
+            if retained == operation_id
+    ));
+    let readback = historical_direct_repair_readback(
+        &db,
+        operation_id,
+        &current.review_assignment_id,
+        &current.review_result_operation_id,
+        &retained_slot_id,
+    )
+    .expect("read back original native effect");
+    assert_eq!(readback["status"], "delivered");
+    assert_eq!(readback["operation_id"], operation_id);
+    assert_eq!(readback["semantic_slot_id"], retained_slot_id);
+
+    let retained_operation: (String, String, String) = db
+        .query_row(
+            "SELECT original_request_json,client_request_id,result_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("re-read original Operation bytes and native effect");
+    let retained_slot = config::read_record(&db, &slot_key(&retained_slot_id), "fixture slot")
+        .expect("re-read original slot")
+        .expect("original slot remains");
+    assert_eq!(retained_operation, original_operation);
+    assert_eq!(retained_operation.2, native_result_json);
+    assert_eq!(retained_slot, original_slot);
 }
 
 #[test]

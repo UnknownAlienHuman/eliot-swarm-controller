@@ -25,7 +25,7 @@ const REVIEW_LIST_SCAN_MAX: i64 = 512;
 const REVIEW_LIST_RESPONSE_MAX_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy)]
-enum ReviewReplacementClass {
+pub(super) enum ReviewReplacementClass {
     Unanswered,
     Inconclusive,
     ReturnedForCorrection,
@@ -746,6 +746,7 @@ pub(crate) fn reserve_assign(
             request.review_profile.as_deref(),
             Some(existing_id),
             Some(replacement_context),
+            Some(replacement_class),
             &slot_key,
             &slot_record_key,
             current_pointer.as_ref().map(|(raw, _)| raw.as_str()),
@@ -775,6 +776,7 @@ pub(crate) fn reserve_assign(
         &on_behalf,
         &reviewer_id,
         request.review_profile.as_deref(),
+        None,
         None,
         None,
         &slot_key,
@@ -849,6 +851,7 @@ fn create_assignment(
     review_profile: Option<&str>,
     supersedes: Option<&str>,
     replacement_context: Option<Value>,
+    replacement_class: Option<ReviewReplacementClass>,
     slot_key: &str,
     slot_record_key: &str,
     expected_pointer: Option<&str>,
@@ -880,7 +883,14 @@ fn create_assignment(
         "assignment_state":"assigned",
         "on_behalf":on_behalf,
     });
-    coordination::bind_review_assignment(tx, reviewer_id, &assignment_id, sponsor_id, &scope)?;
+    coordination::bind_review_assignment(
+        tx,
+        reviewer_id,
+        &assignment_id,
+        sponsor_id,
+        &scope,
+        replacement_class,
+    )?;
     let result = assignment_receipt(&assignment, operation_id, false)?;
     assignment["result"] = result.clone();
     let event_key = format!("assignment:{assignment_id}");

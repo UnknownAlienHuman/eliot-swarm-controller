@@ -6547,6 +6547,8 @@ fn apply(
 }
 
 #[cfg(test)]
+mod automation_review_disposition_dedupe_fixture;
+#[cfg(test)]
 mod automation_transfer_tests;
 #[cfg(test)]
 mod capacity_tests;

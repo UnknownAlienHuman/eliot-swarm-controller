@@ -503,12 +503,13 @@ pub(crate) fn find_review_profile_participants(
 /// Bind a pre-registered sponsored reviewer to the server-generated slot ID.
 /// Review assignment creation and this update must share one SQLite
 /// transaction. The pending credential cannot perform any participant call.
-pub(crate) fn bind_review_assignment(
+pub(super) fn bind_review_assignment(
     tx: &Transaction<'_>,
     reviewer_client_id: &str,
     review_assignment_id: &str,
     sponsor_client_id: &str,
     exact_scope: &Value,
+    replacement_class: Option<super::reviews::ReviewReplacementClass>,
 ) -> Result<()> {
     let mut scope = normalized_review_scope(exact_scope, true)?;
     if review_assignment_id.trim().is_empty()
@@ -540,7 +541,7 @@ pub(crate) fn bind_review_assignment(
             "participant registration does not match this review sponsor and slot",
         ));
     }
-    validate_pending_review_tuple(tx, &scope)?;
+    validate_pending_review_tuple_with_replacement(tx, &scope, replacement_class)?;
     if let Some(profile) = registration["review_profile"].as_str() {
         tx.execute(
             "DELETE FROM meta WHERE key=?1",
@@ -1919,6 +1920,14 @@ fn require_sponsored_scope(scope: &ScopeData, exact_scope: &Value) -> Result<()>
 }
 
 fn validate_pending_review_tuple(db: &Connection, scope: &Value) -> Result<()> {
+    validate_pending_review_tuple_with_replacement(db, scope, None)
+}
+
+fn validate_pending_review_tuple_with_replacement(
+    db: &Connection,
+    scope: &Value,
+    replacement_class: Option<super::reviews::ReviewReplacementClass>,
+) -> Result<()> {
     if !scope["review_assignment_id"].is_null() {
         return Err(Error::invalid(
             "pre-registration review scope must have a null review_assignment_id",
@@ -1939,7 +1948,11 @@ fn validate_pending_review_tuple(db: &Connection, scope: &Value) -> Result<()> {
     }
     let attempt = tasks::get_attempt(db, attempt_id)?;
     validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
-    if attempt["state"] != "submitted"
+    let current_returned_candidate = matches!(
+        replacement_class,
+        Some(super::reviews::ReviewReplacementClass::ReturnedForCorrection)
+    ) && attempt["state"] == "needs_correction";
+    if (attempt["state"] != "submitted" && !current_returned_candidate)
         || attempt["submission_ref"] != scope["submission_ref"]
         || attempt["candidate_ref"] != scope["candidate_ref"]
     {

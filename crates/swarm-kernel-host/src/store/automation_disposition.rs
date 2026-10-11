@@ -460,8 +460,9 @@ fn consume_selected_disposition(
         review_result_operation_id.to_owned(),
         ordered_findings,
     )?;
+    let content_digest = package.correction_content_digest()?;
     let client_request_id =
-        context.semantic_request_id(&review.identity.submission_ref, &package.findings_digest)?;
+        context.semantic_request_id(&review.identity.submission_ref, &content_digest)?;
     let request_value = json!({
         "client_request_id":client_request_id,
         "package":package
@@ -476,19 +477,34 @@ fn consume_selected_disposition(
         now_ms,
     )?;
     Ok(json!({
-        "status":if value["code"] == "semantic_duplicate_requires_current_disposition" {"semantic_duplicate_requires_current_disposition"} else if coalesced {"coalesced"} else if value["applied"] == true {"applied"} else {"settled_without_application"},
+        "status":value
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| *status != "conflict")
+            .unwrap_or(if coalesced {
+                "coalesced"
+            } else if value["applied"] == true {
+                "applied"
+            } else {
+                "settled_without_application"
+            })
+            .to_owned(),
         "code":value.get("code").cloned().unwrap_or(Value::Null),
         "action":"task.request_changes",
         "operation_id":operation_id,
         "coalesced":coalesced,
         "applied":value["applied"] == true,
+        "resend_suppressed":value.get("resend_suppressed").and_then(Value::as_bool).unwrap_or(false),
+        "current_disposition_recorded":value
+            .get("current_disposition_recorded")
+            .and_then(Value::as_bool)
+            .unwrap_or(value["applied"] == true),
         "review_assignment_id":review_assignment_id,
         "review_result_operation_id":review_result_operation_id,
         "findings_digest":package.findings_digest,
         "finding_count":package.findings.len(),
         "feedback":value,
-        "disposition_applied":value["applied"] == true,
-        "current_disposition_recorded":value.get("current_disposition_recorded").and_then(Value::as_bool).unwrap_or(value["applied"] == true)
+        "disposition_applied":value["applied"] == true
     }))
 }
 
@@ -652,83 +668,66 @@ fn reserve_feedback_operation(
         )
         .optional()?;
     if let Some((operation_id, method, original, state, result)) = existing {
-        if method != "task.request_changes" || original != original_json {
+        let retained_request: Value = serde_json::from_str(&original)?;
+        let retained_package: ReviewFindingsPackage =
+            serde_json::from_value(retained_request["package"].clone())?;
+        retained_package.validate()?;
+        if method != "task.request_changes"
+            || retained_package.correction_content_digest()?
+                != package.correction_content_digest()?
+        {
             return Err(Error::new(
                 "REVIEW_DISPOSITION_CONFLICT",
-                "the manager/submission/findings-package request ID is already used for another action",
+                "the semantic correction request ID is already used for another action",
             ));
         }
         if state != "settled" {
             return Ok((
                 operation_id.clone(),
                 json!({
-                    "status":"pending",
-                    "operation_id":operation_id,
-                    "applied":false,
+                    "status":"pending", "operation_id":operation_id, "applied":false,
                     "reason":"an identical retained disposition Operation is unresolved"
                 }),
                 true,
             ));
         }
-        let link = authorization::operation_link(tx, &operation_id)?.ok_or_else(|| {
-            Error::new(
-                "AUTOMATION_LINK_CORRUPT",
-                "settled automatic feedback Operation has no manager linkage",
-            )
-        })?;
-        if link.action != "task.request_changes"
-            || link.effective_manager_id != context.effective_manager_id()
-            || link.project_id != context.project_id()
-            || link.cause["identity"]["task_id"] != context.identity().task_id
-            || link.cause["identity"]["task_revision"] != context.identity().task_revision
-            || link.cause["identity"]["attempt_id"] != context.identity().attempt_id
-            || link.cause["identity"]["submission_ref"] != context.identity().submission_ref
-            || link.cause["identity"]["candidate_ref"] != context.identity().candidate_ref
-        {
-            return Err(Error::new(
-                "AUTOMATION_LINK_CORRUPT",
-                "settled feedback Operation belongs to another manager or semantic subject",
-            ));
-        }
-        let same_review_cause = link.cause["kind"] == "review_result"
-            && link.cause["id"] == context.review_assignment_id()
-            && link.cause["review_assignment_id"] == context.review_assignment_id()
-            && link.cause["operation_id"] == context.review_result_operation_id()
-            && link.cause["identity"] == json!(context.identity())
-            && link
-                .cause
-                .get("review_assignment_sponsor_id")
-                .is_none_or(|sponsor| sponsor == context.review_assignment_sponsor_id());
-        if !same_review_cause {
-            return Ok((
-                operation_id.clone(),
-                json!({
-                    "status":"semantic_duplicate_requires_current_disposition",
-                    "code":"semantic_duplicate_requires_current_disposition",
-                    "operation_id":operation_id,
-                    "semantic_duplicate_operation_id":operation_id,
-                    "coalesced":true,
-                    "applied":false,
-                    "current_disposition_recorded":false,
-                    "prior_review_cause":{
-                        "review_assignment_id":link.cause["review_assignment_id"],
-                        "review_result_operation_id":link.cause["operation_id"]
-                    },
-                    "reason":"the manager/submission/finding semantic decision already has a settled Operation for another assigned review result; that Operation does not record a disposition for this exact assignment"
-                }),
-                true,
-            ));
-        }
-        let mut result: Value = serde_json::from_str(&result.ok_or_else(|| {
+        let mut retained: Value = serde_json::from_str(&result.ok_or_else(|| {
             Error::new(
                 "AUTOMATION_OPERATION_CORRUPT",
                 "settled feedback Operation has no result",
             )
         })?)?;
-        result["coalesced"] = json!(true);
-        return Ok((operation_id, result, true));
+        if !retained.is_object() {
+            return Err(Error::new(
+                "AUTOMATION_OPERATION_CORRUPT",
+                "settled feedback result is not an object",
+            ));
+        }
+        if retained["applied"] == true {
+            let value = submissions::coalesce_review_disposition(
+                tx,
+                context,
+                package,
+                &operation_id,
+                now_ms,
+            )?;
+            return Ok((operation_id, value, true));
+        }
+        retained["coalesced"] = json!(true);
+        return Ok((operation_id, retained, true));
     }
-
+    // Older provenance-keyed automatic and manual deliveries remain immutable.
+    // A current typed review may adopt their exact content without a new send.
+    if let Some(prior) =
+        submissions::retained_feedback_for_package(tx, context.effective_manager_id(), package)?
+        && prior["applied"] == true
+        && !prior["message_id"].is_null()
+    {
+        let operation_id = model::text(&prior, "operation_id")?.to_owned();
+        let value =
+            submissions::coalesce_review_disposition(tx, context, package, &operation_id, now_ms)?;
+        return Ok((operation_id, value, true));
+    }
     let operation_id = model::new_id();
     let effective = json!({
         "request":request_value,
