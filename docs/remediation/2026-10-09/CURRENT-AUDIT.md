@@ -1,5 +1,16 @@
 # Current-source audit and implementation ledger
 
+Fresh [Q execution](../2026-10-10/EXECUTION-RESULTS-Q.json) built and installed
+eight release packages from exact clean `0e70267`. The phase-readiness repair
+worked on both adapters: each sole dispatch followed the retained
+`awaiting_native_mcp` phase. OpenCode rejected with
+`NATIVE_MCP_CAPABILITY_UNAVAILABLE`, Antigravity with `NATIVE_MCP_SCOPE_MISMATCH`,
+both before admission. Q exited successfully; native/model consumption and Task
+completion remain unproven. Read-only retained diagnostics show OpenCode's owned
+service was observed while its C7 child was still being consumed and no C8 record
+existed; Antigravity failed C7 launch-snapshot validation. These are separate
+remaining causes; Q is retained without replay.
+
 Fresh [P execution](../2026-10-10/EXECUTION-RESULTS-P.json) built and installed
 eight release packages from exact clean `f8f9cf8`. Both adapters passed open/hello
 readiness, then their sole dispatch rejected before admission at the retained
@@ -13,8 +24,9 @@ exact queued `awaiting_native_mcp` before the sole dispatch. Missing or damaged
 phase stays non-ready, and timeout retains a closed phase diagnostic. Strict host
 production Clippy passes on Windows and Linux; both new public projection cases
 pass on each platform and the integrated harness passes 27 assertions. Independent
-producer and consumer reviews accept the frozen source. Fresh installed execution
-and the remaining R48 acceptance contours remain pending.
+producer and consumer reviews accept the frozen source. Q verifies the phase
+wait; exact current native MCP readiness and the remaining R48 acceptance
+contours remain pending.
 
 The [native disconnect diagnostic repair](../2026-10-10/NATIVE-DISCONNECT-DIAGNOSTICS.json)
 retains the typed disconnect origin with its exact binding transition in one Store
