@@ -101,7 +101,8 @@ function Get-Classification([string[]] $Paths) {
         $_ -match '^modules/[^/]+/(package\.json|package-lock\.json|npm-shrinkwrap\.json)$'
     }).Count -gt 0
     $moduleJs = @($Paths | Where-Object {
-        $_ -match '^modules/.+\.(mjs|cjs|js)$'
+        $_ -match '^modules/.+\.(mjs|cjs|js)$' -or
+        $_ -match '^crates/swarm-adapter-claude/sdk-harness/[^/]+\.(mjs|cjs|js)$'
     } | Where-Object {
         Test-Path -LiteralPath (Get-FullPath $_) -PathType Leaf
     })
