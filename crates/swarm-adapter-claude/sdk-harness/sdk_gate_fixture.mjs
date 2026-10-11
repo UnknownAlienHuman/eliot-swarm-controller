@@ -145,6 +145,8 @@ export async function runGateFixture() {
       const versionOk = frame?.kind === 'prepared'
         ? frame.sdk_version === testCase.package.version
         : true;
+      // A clean stop without an admission frame is not successful SDK prepare.
+      const admissionObserved = testCase.expectDiagnostic !== null || frame?.kind === 'prepared';
       results.push({
         case: testCase.name,
         expected: testCase.expectDiagnostic,
@@ -156,7 +158,7 @@ export async function runGateFixture() {
         frameKind: frame?.kind,
         stderr: stderr || null,
         spawnError,
-        pass: actual === testCase.expectDiagnostic && versionOk && exitCode === 0 && !spawnError && !timedOut && closed && (frame?.kind === 'operation_unknown' || stopped),
+        pass: admissionObserved && actual === testCase.expectDiagnostic && versionOk && exitCode === 0 && !spawnError && !timedOut && closed && (frame?.kind === 'operation_unknown' || stopped),
       });
     } finally {
       await cleanup(runtimeRoot);
