@@ -440,7 +440,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
     read(
         "coordination.inbox",
         "Read bounded durable deliveries addressed to the authenticated Participant in its exact current scope.",
-        &[f("limit", I), f("after_operation_id", S)],
+        &[f("limit", I), f("after_operation_id", S), f("after_key", S)],
         &[],
     ),
     read(
@@ -5877,9 +5877,11 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         PARTICIPANT_ONLY_AUDIENCES,
         Core,
         "Read durable messages addressed to the authenticated Participant in its exact current scope.",
-        "Use to receive scoped peer deliveries; inbound hold policy returns no items with an explicit state.",
+        "Use after_operation_id for normal paging; when a damaged partial window returns next_after_key, resume with that exact retained key. The cursor forms are mutually exclusive and Store rechecks the authenticated current scope.",
         &["inbox", "messages", "peer", "delivery", "coordination"],
-        &["authenticated participant; optional after_operation_id/limit"],
+        &[
+            "authenticated participant; optional limit; choose one of after_operation_id or retained same-scope after_key"
+        ],
         "Bounded addressed-delivery page; reading is non-destructive."
     ),
     entry!(

@@ -86,11 +86,19 @@ async fn start_stack() -> Stack {
 
 impl Stack {
     fn facade(&self) -> swarm_mcp::ProfiledFacade {
+        self.profiled_facade(self.credential.clone(), McpToolProfile::Full)
+    }
+
+    fn profiled_facade(
+        &self,
+        credential: Credential,
+        profile: McpToolProfile,
+    ) -> swarm_mcp::ProfiledFacade {
         public_facade(
             self.dir.clone(),
-            self.credential.clone(),
+            credential,
             self.config.ipc.clone(),
-            McpToolProfile::Full,
+            profile,
         )
     }
 
@@ -636,5 +644,223 @@ async fn reconnect_resubscribes_from_cursor_without_replay_continuity() {
     );
 
     client.close().await;
+    stack.close().await;
+}
+
+#[tokio::test]
+async fn participant_mcp_inbox_resumes_damaged_window_with_after_key() {
+    const MESSAGE_COUNT: usize = 45;
+    const DAMAGED_WINDOW: usize = 36;
+
+    let stack = start_stack().await;
+    let task = stack
+        .write(
+            "task.create",
+            json!({
+                "project_id":"p",
+                "spec":{
+                    "objective":"mailbox inbox recovery",
+                    "phase":"p",
+                    "requirements":[{"id":"r1","statement":"s"}],
+                    "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
+                },
+            }),
+        )
+        .await;
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let attempt = stack
+        .write(
+            "task.claim",
+            json!({"task_id":task_id,"expected_revision":1}),
+        )
+        .await;
+    let attempt_id = attempt["attempt_id"].as_str().unwrap().to_owned();
+    let sender_id = "mcp-inbox-sender";
+    let recipient_id = "mcp-inbox-recipient";
+    let sender_token = format!("{}{}", model::new_id(), model::new_id());
+    let recipient_token = format!("{}{}", model::new_id(), model::new_id());
+
+    for (client_id, token) in [
+        (sender_id, sender_token.as_str()),
+        (recipient_id, recipient_token.as_str()),
+    ] {
+        stack
+            .write(
+                "coordination.participant.register",
+                json!({
+                    "client_id":client_id,
+                    "token_hash":model::digest(token.as_bytes()),
+                    "task_id":task_id,
+                    "task_revision":1,
+                    "attempt_id":attempt_id,
+                    "participation_basis":{"kind":"attempt_owner"},
+                }),
+            )
+            .await;
+    }
+
+    let sender = stack
+        .owner
+        .store
+        .authenticate(Credential {
+            client_id: sender_id.to_owned(),
+            token: sender_token,
+        })
+        .await
+        .unwrap();
+    let recipient_credential = Credential {
+        client_id: recipient_id.to_owned(),
+        token: recipient_token,
+    };
+    let mut operation_ids = Vec::with_capacity(MESSAGE_COUNT);
+    for index in 0..MESSAGE_COUNT {
+        let sent = stack
+            .owner
+            .store
+            .call(
+                sender.clone(),
+                "coordination.send".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "recipient":recipient_id,
+                    "body":{"sequence":index},
+                }),
+            )
+            .await
+            .unwrap();
+        operation_ids.push(sent["operation_id"].as_str().unwrap().to_owned());
+    }
+
+    let scope_id = crate::coordination::scope_id(&task_id, 1, &attempt_id).unwrap();
+    let prefix = crate::coordination::mailbox_prefix(&scope_id, recipient_id);
+    let upper = format!("{prefix}z");
+    let query_prefix = prefix.clone();
+    let index_rows = stack
+        .owner
+        .store
+        .run_fixture(move |db| {
+            let mut statement = db
+                .prepare("SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key")?;
+            let rows = statement
+                .query_map(rusqlite::params![query_prefix, upper], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    assert_eq!(index_rows.len(), MESSAGE_COUNT);
+
+    let boundary_operation_id = serde_json::from_str::<Value>(&index_rows[DAMAGED_WINDOW - 1].1)
+        .unwrap()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let damaged_rows = index_rows[..DAMAGED_WINDOW].to_vec();
+    stack
+        .owner
+        .store
+        .run_fixture(move |db| {
+            let damaged_json = model::canonical(&json!({"damaged":true}))?;
+            for (key, _) in damaged_rows {
+                let updated = db.execute(
+                    "UPDATE meta SET value_json=?2 WHERE key=?1",
+                    rusqlite::params![key, damaged_json],
+                )?;
+                assert_eq!(updated, 1);
+            }
+            let deleted = db.execute(
+                "DELETE FROM observations WHERE source_stream_id='controller:read-position:operation' \
+                   AND source_event_key=?1",
+                [&boundary_operation_id],
+            )?;
+            assert_eq!(deleted, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let mut participant = SubClient::connect(
+        stack.profiled_facade(recipient_credential, McpToolProfile::Participant),
+    )
+    .await;
+    let mut cursor: Option<String> = None;
+    let mut inbox_schema = None;
+    loop {
+        let mut params = json!({});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = participant.request("tools/list", params).await.unwrap();
+        if let Some(tool) = page["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == json!("coordination_inbox"))
+        {
+            inbox_schema = Some(tool.clone());
+            break;
+        }
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let inbox_schema = inbox_schema.expect("Participant tools/list exposes coordination.inbox");
+    assert_eq!(
+        inbox_schema["inputSchema"]["properties"]["after_key"]["type"],
+        json!("string")
+    );
+
+    let mut manager = SubClient::connect(
+        stack.profiled_facade(stack.credential.clone(), McpToolProfile::Manager),
+    )
+    .await;
+    let manager_call = manager
+        .call_tool(
+            "coordination_inbox",
+            json!({"limit":1,"after_key":index_rows[DAMAGED_WINDOW - 1].0}),
+        )
+        .await
+        .expect_err("Manager profile must reject the Participant-only inbox tool");
+    assert_eq!(manager_call["code"], json!(-32601));
+    manager.close().await;
+
+    let first_response = participant
+        .call_tool("coordination_inbox", json!({"limit":1}))
+        .await
+        .unwrap();
+    assert_ne!(first_response["isError"], json!(true), "{first_response}");
+    let first = first_response["structuredContent"].clone();
+    assert_eq!(first["items"], json!([]));
+    assert_eq!(first["coverage"], json!("partial"));
+    assert_eq!(first["next_after"], Value::Null);
+    assert_eq!(
+        first["next_after_key"],
+        json!(index_rows[DAMAGED_WINDOW - 1].0)
+    );
+    assert!(first["gaps"].as_array().unwrap().iter().any(|gap| {
+        gap["kind"] == json!("damaged_mailbox_indexes") && gap["count"] == json!(DAMAGED_WINDOW)
+    }));
+
+    let resumed_response = participant
+        .call_tool(
+            "coordination_inbox",
+            json!({"limit":1,"after_key":first["next_after_key"]}),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resumed_response["isError"],
+        json!(true),
+        "{resumed_response}"
+    );
+    assert_eq!(
+        resumed_response["structuredContent"]["items"][0]["operation_id"],
+        json!(operation_ids[DAMAGED_WINDOW])
+    );
+
+    participant.close().await;
     stack.close().await;
 }

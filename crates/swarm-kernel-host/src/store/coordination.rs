@@ -3242,11 +3242,27 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
     }))
 }
 
+#[derive(Clone)]
+enum InboxCursor {
+    Operation(String),
+    ScopedKey(String),
+}
+
 fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
     principal.require_participant()?;
-    model::fields(value, &["limit", "after_operation_id"])?;
+    model::fields(value, &["limit", "after_operation_id", "after_key"])?;
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_operation_id")?;
+    let after_key = match value.get("after_key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(key)) => Some(key.as_str()),
+        Some(_) => return Err(Error::invalid("after_key must be a string or null")),
+    };
+    if after.is_some() && after_key.is_some() {
+        return Err(Error::invalid(
+            "after_operation_id and after_key cannot be supplied together",
+        ));
+    }
     let scope = match load_current_scope(db, principal) {
         Ok(scope) => scope,
         Err(error) if is_stale_watch_authority(&error) => {
@@ -3260,6 +3276,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             return Ok(
                 json!({"items":[],"task_id":null,"task_revision":null,"attempt_id":null,
                 "inbound_policy":null,"availability":"current_scope_unavailable","next_after":null,
+                 "next_after_key":null,
                 "watch_notifications":watch_notifications,"coverage":"partial",
                 "gaps":[{"kind":"current_scope_unavailable","code":error.code}]}),
             );
@@ -3276,25 +3293,47 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             "inbound_policy":"hold",
             "availability":"held_by_inbound_policy",
             "next_after":null,
+            "next_after_key":null,
             "watch_notifications":watch_notifications,
             "coverage":"complete",
             "gaps":[],
         }));
     }
-    // Cursors stay Operation IDs. Resolve them through the immutable position
-    // marker and exact scoped index keys; never scan the mailbox to reconstruct
-    // a cursor left by a stale-filtered page.
-    let after_key = after
-        .as_deref()
-        .map(|operation_id| inbox_cursor_key(db, &scope, &principal.client_id, operation_id))
-        .transpose()?;
+    // Operation IDs remain the normal cursor. A scoped key is the bounded
+    // recovery cursor when damaged indexes cannot be represented by one.
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
     let prefix = keys::mailbox_prefix(&scope.scope_id, &principal.client_id);
     // Legacy timestamp keys and v2 read-position keys both sort below `z`.
     let upper = format!("{prefix}z");
-    let (lower, comparison) = match after_key {
+    let after_key = match (after.as_deref(), after_key) {
+        (Some(operation_id), None) => Some(inbox_cursor_key(
+            db,
+            &scope,
+            &principal.client_id,
+            operation_id,
+        )?),
+        (None, Some(key)) => {
+            // A key cursor is only a scoped position. The authenticated
+            // participant scope was reloaded above, and the exact retained
+            // key must still exist beneath that scope's mailbox prefix.
+            let max_key_bytes = prefix.len() + 3 + 20 + 1 + 2 * 256;
+            if key.len() > max_key_bytes
+                || !key.starts_with(&prefix)
+                || key >= upper.as_str()
+                || !inbox_key_exists(db, key)?
+            {
+                return Err(Error::invalid(
+                    "after_key must identify a retained inbox index in the authenticated exact scope",
+                ));
+            }
+            Some(key.to_owned())
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("cursor forms were checked above"),
+    };
+    let (lower, comparison) = match after_key.as_deref() {
         Some(key) => (key, ">"),
-        None => (prefix, ">="),
+        None => (prefix.as_str(), ">="),
     };
     let sql = format!(
         "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
@@ -3308,64 +3347,67 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
     let scan_more = rows.len() as i64 > scan_limit;
     let mut messages = Vec::new();
     let mut stale = 0usize;
+    let mut damaged = 0usize;
     // Advance only through rows actually examined. In particular, a valid
-    // item excluded by the item budget remains the first row on the next page.
-    let mut last_examined_operation: Option<String> = None;
+    // item excluded by either response budget remains the first row on the
+    // next page. Damaged rows use their exact retained key when an Operation
+    // ID cannot identify one unambiguous ordering position.
+    let mut last_examined: Option<InboxCursor> = None;
+    let mut serialized_items_bytes = 2usize; // canonical "[]"
     let mut more = false;
+    let mut item_limited = false;
+    let mut byte_limited = false;
     for (key, raw_index) in rows.iter().take(scan_limit as usize) {
-        let index: Value = serde_json::from_str(raw_index)?;
-        let Some(operation_id) = index.get("operation_id").and_then(Value::as_str) else {
-            return Err(Error::new(
-                "INBOX_INDEX_DAMAGED",
-                "scoped inbox index has no Operation ID",
-            ));
+        let index = serde_json::from_str::<Value>(raw_index).ok();
+        let Some(operation_id) = inbox_operation_id_from_key(&prefix, key) else {
+            damaged = damaged.saturating_add(1);
+            last_examined = Some(InboxCursor::ScopedKey(key.clone()));
+            continue;
         };
-        let Some((position, indexed_at_ms)) = operation_read_position(db, operation_id)? else {
-            return Err(Error::new(
-                "INBOX_INDEX_DAMAGED",
-                "scoped inbox index has no Operation read-position marker",
-            ));
-        };
-        let position_key = mailbox_position_key(
-            &scope.scope_id,
-            &principal.client_id,
-            position,
-            operation_id,
-        );
-        let legacy_key = keys::mailbox_key(
-            &scope.scope_id,
-            &principal.client_id,
-            indexed_at_ms,
-            operation_id,
-        );
-        if position <= 0
-            || (key != &position_key && key != &legacy_key)
-            || index["created_at_ms"].as_i64() != Some(indexed_at_ms)
-            || (key == &position_key && index["read_position"].as_i64() != Some(position))
+        let read_position = operation_read_position(db, &operation_id)?;
+        let mut cursor = InboxCursor::ScopedKey(key.clone());
+        let mut position_key: Option<String> = None;
+        let mut legacy_key: Option<String> = None;
+        let mut duplicate_indexes = false;
+        if let Some((position, indexed_at_ms)) = read_position
+            && position > 0
         {
-            return Err(Error::new(
-                "INBOX_INDEX_DAMAGED",
-                "scoped inbox index key differs from its Operation position",
-            ));
+            let expected_position_key = mailbox_position_key(
+                &scope.scope_id,
+                &principal.client_id,
+                position,
+                &operation_id,
+            );
+            let expected_legacy_key = keys::mailbox_key(
+                &scope.scope_id,
+                &principal.client_id,
+                indexed_at_ms,
+                &operation_id,
+            );
+            if key == &expected_position_key || key == &expected_legacy_key {
+                let alternate_key = if key == &expected_position_key {
+                    &expected_legacy_key
+                } else {
+                    &expected_position_key
+                };
+                duplicate_indexes = inbox_key_exists(db, alternate_key)?;
+                if !duplicate_indexes {
+                    cursor = InboxCursor::Operation(operation_id.clone());
+                }
+            }
+            position_key = Some(expected_position_key);
+            legacy_key = Some(expected_legacy_key);
         }
-        let alternate_key = if key == &position_key {
-            &legacy_key
-        } else {
-            &position_key
-        };
-        if meta(db, alternate_key)?.is_some() {
-            return Err(Error::new(
-                "INBOX_INDEX_DAMAGED",
-                "Operation has duplicate legacy and read-position inbox indexes",
-            ));
-        }
+
+        // The retained Operation is authoritative. Index damage must not turn
+        // missing/invalid Operation receipts or body data into an empty page.
         let operation: Option<(String, String, i64, String, String)> = db
             .query_row(
                 "SELECT method,caller_id,created_at_ms,original_request_json,result_json \
                  FROM operations WHERE operation_id=?1 \
                    AND method IN ('coordination.send','coordination.consult') \
                    AND state='settled'",
-                [operation_id],
+                [&operation_id],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -3378,29 +3420,86 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             )
             .optional()?;
         let Some((method, sender, created_at, request_json, result_json)) = operation else {
-            stale = stale.saturating_add(1);
-            last_examined_operation = Some(operation_id.to_owned());
-            continue;
+            return Err(Error::new(
+                "INBOX_OPERATION_MISSING",
+                "scoped inbox index does not identify a settled coordination Operation",
+            ));
         };
         let result: Value = serde_json::from_str(&result_json)?;
         let request: Value = serde_json::from_str(&request_json)?;
-        if !delivery_matches_scope(&result, &scope, &principal.client_id)?
+        if method == "coordination.consult" && result["delivery_created"] == false {
+            // Coalesced/answered consultations have no mailbox body. A stale
+            // copied index to one is derived-index damage.
+            damaged = damaged.saturating_add(1);
+            last_examined = Some(cursor);
+            continue;
+        }
+        let raw_envelope = model::text(&result, "text")?;
+        if raw_envelope.len() > keys::MAX_MESSAGE_BYTES {
+            return Err(Error::new(
+                "INBOX_OPERATION_BODY_DAMAGED",
+                "settled coordination Operation exceeds the retained message byte limit",
+            ));
+        }
+        let envelope: Value = serde_json::from_str(raw_envelope)?;
+        if envelope["schema"] != "eliot.coordination.message.v1"
+            || envelope["body"].is_null()
             || result["sender"] != sender
-            || index["sender"] != sender
-            || index["recipient"] != principal.client_id
-            || index["task_id"] != scope.task["task_id"]
-            || index["task_revision"] != scope.task["revision"]
-            || index["attempt_id"] != scope.attempt["attempt_id"]
-            || index["created_at_ms"] != created_at
+            || envelope["sender"] != sender
+            || envelope["recipient"] != result["recipient"]
+            || envelope["task_id"] != result["task_id"]
+            || envelope["task_revision"] != result["task_revision"]
+            || envelope["attempt_id"] != result["attempt_id"]
+        {
+            return Err(Error::new(
+                "INBOX_OPERATION_BODY_DAMAGED",
+                "settled coordination Operation body differs from its authoritative receipt",
+            ));
+        }
+        if method == "coordination.send"
+            && (request["recipient"] != envelope["recipient"]
+                || envelope["body"] != request["body"])
+        {
+            return Err(Error::new(
+                "INBOX_OPERATION_BODY_DAMAGED",
+                "settled coordination.send body differs from its original request",
+            ));
+        }
+
+        let index_matches = index.as_ref().is_some_and(|index| {
+            let position_matches = read_position.is_some_and(|(position, indexed_at_ms)| {
+                position > 0
+                    && (position_key.as_deref() == Some(key.as_str())
+                        || legacy_key.as_deref() == Some(key.as_str()))
+                    && indexed_at_ms == created_at
+                    && (position_key.as_deref() != Some(key.as_str())
+                        || index["read_position"].as_i64() == Some(position))
+            });
+            index["operation_id"].as_str() == Some(operation_id.as_str())
+                && index["created_at_ms"].as_i64() == Some(created_at)
+                && index["sender"].as_str() == Some(sender.as_str())
+                && index["recipient"].as_str() == Some(principal.client_id.as_str())
+                && index["task_id"] == scope.task["task_id"]
+                && index["task_revision"] == scope.task["revision"]
+                && index["attempt_id"] == scope.attempt["attempt_id"]
+                && position_matches
+                && !duplicate_indexes
+        });
+        if !index_matches {
+            damaged = damaged.saturating_add(1);
+            last_examined = Some(cursor);
+            continue;
+        }
+
+        if !delivery_matches_scope(&result, &scope, &principal.client_id)?
             || (method == "coordination.send" && request["recipient"] != principal.client_id)
         {
             stale = stale.saturating_add(1);
-            last_examined_operation = Some(operation_id.to_owned());
+            last_examined = Some(cursor);
             continue;
         }
-        let envelope: Value = serde_json::from_str(model::text(&result, "text")?)?;
         let body_matches = if method == "coordination.send" {
-            envelope["body"] == request["body"]
+            true
         } else {
             consult_delivery_matches(
                 &result,
@@ -3409,45 +3508,73 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
                 &scope,
                 &sender,
                 &principal.client_id,
-                operation_id,
+                &operation_id,
             )?
         };
         if !body_matches {
-            stale = stale.saturating_add(1);
-            last_examined_operation = Some(operation_id.to_owned());
-            continue;
+            return Err(Error::new(
+                "INBOX_OPERATION_BODY_DAMAGED",
+                "settled coordination Operation body does not match its retained delivery",
+            ));
         }
         if messages.len() == limit as usize {
             more = true;
+            item_limited = true;
             break;
         }
-        messages.push(json!({
+        let message = json!({
             "operation_id":operation_id,
             "delivery_id":result["delivery_id"],
-                "sender":sender,
+            "sender":sender,
             "recipient":principal.client_id,
             "sent_at_ms":created_at,
             "payload_digest":result["payload_digest"],
             "kind":if method == "coordination.consult" { "consult" } else { "message" },
             "body":envelope["body"],
-        }));
-        last_examined_operation = Some(operation_id.to_owned());
+        });
+        let item_bytes = model::canonical(&message)?.len();
+        let candidate_bytes = serialized_items_bytes
+            .saturating_add(item_bytes)
+            .saturating_add(usize::from(!messages.is_empty()));
+        if candidate_bytes > super::projection::MAX_SERIALIZED_BYTES {
+            more = true;
+            byte_limited = true;
+            break;
+        }
+        serialized_items_bytes = candidate_bytes;
+        messages.push(message);
+        last_examined = Some(cursor);
     }
-    let partial = scan_more || stale > 0 || more;
+    let partial = scan_more || stale > 0 || damaged > 0 || more;
     let mut gaps = Vec::new();
+    if damaged > 0 {
+        gaps.push(json!({"kind":"damaged_mailbox_indexes","count":damaged}));
+    }
     if stale > 0 {
         gaps.push(json!({"kind":"stale_mailbox_records","count":stale}));
     }
     if scan_more {
         gaps.push(json!({"kind":"inbox_scan_bound","count":null}));
     }
+    if item_limited {
+        gaps.push(json!({"kind":"inbox_item_budget","count":null}));
+    }
+    if byte_limited {
+        gaps.push(json!({"kind":"inbox_byte_budget","count":null}));
+    }
+    let (next_after, next_after_key) = match last_examined {
+        Some(InboxCursor::Operation(operation_id)) => (json!(operation_id), Value::Null),
+        Some(InboxCursor::ScopedKey(key)) => (Value::Null, json!(key)),
+        None => (Value::Null, Value::Null),
+    };
     Ok(json!({
         "items":messages,
         "task_id":scope.task["task_id"],
         "task_revision":scope.task["revision"],
         "attempt_id":scope.attempt["attempt_id"],
         "inbound_policy":scope.registration["inbound_policy"],
-        "next_after":last_examined_operation,
+        "next_after":next_after,
+        "next_after_key":next_after_key,
         "watch_notifications":watch_notifications,
         "coverage":if partial { "partial" } else { "complete" },
         "gaps":gaps,
@@ -3473,35 +3600,58 @@ fn inbox_cursor_key(
     }
     let position_key = mailbox_position_key(&scope.scope_id, client_id, position, operation_id);
     let legacy_key = keys::mailbox_key(&scope.scope_id, client_id, created_at_ms, operation_id);
-    let position_index = meta(db, &position_key)?;
-    let legacy_index = meta(db, &legacy_key)?;
-    let (key, index, position_keyed) = match (position_index, legacy_index) {
-        (Some(_), Some(_)) => {
-            return Err(Error::new(
-                "INBOX_INDEX_DAMAGED",
-                "Operation has duplicate legacy and read-position inbox indexes",
-            ));
-        }
-        (Some(index), None) => (position_key, index, true),
-        (None, Some(index)) => (legacy_key, index, false),
-        (None, None) => {
-            return Err(Error::invalid(
-                "after_operation_id has no retained scoped inbox index",
-            ));
-        }
-    };
-    // The key prefix is already bound to this authenticated scope. Keep stale
-    // rows cursorable even when their copied scope fields are what made them
-    // stale; only the row identity and key position must still agree.
-    if index["operation_id"] != operation_id
-        || index["created_at_ms"].as_i64() != Some(created_at_ms)
-        || (position_keyed && index["read_position"].as_i64() != Some(position))
-    {
-        return Err(Error::invalid(
-            "after_operation_id is not an index row in the authenticated exact scope",
-        ));
+    let position_index = inbox_key_exists(db, &position_key)?;
+    let legacy_index = inbox_key_exists(db, &legacy_key)?;
+    match (position_index, legacy_index) {
+        (true, true) => Err(Error::invalid(
+            "after_operation_id has duplicate scoped inbox indexes; resume with after_key",
+        )),
+        (true, false) => Ok(position_key),
+        (false, true) => Ok(legacy_key),
+        (false, false) => Err(Error::invalid(
+            "after_operation_id has no retained scoped inbox index",
+        )),
     }
-    Ok(key)
+}
+
+fn inbox_key_exists(db: &Connection, key: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [key],
+        |row| row.get(0),
+    )?)
+}
+
+fn inbox_operation_id_from_key(prefix: &str, key: &str) -> Option<String> {
+    let suffix = key.strip_prefix(prefix)?;
+    let (order, encoded_operation_id) = suffix.rsplit_once(':')?;
+    if let Some(position) = order.strip_prefix("v2:") {
+        let value = position.parse::<i64>().ok()?;
+        if value <= 0 || position.len() != 20 || format!("{value:020}") != position {
+            return None;
+        }
+    } else {
+        let timestamp = order.parse::<i64>().ok()?;
+        if timestamp <= 0 || order.len() != 20 || format!("{timestamp:020}") != order {
+            return None;
+        }
+    }
+    if encoded_operation_id.is_empty() || encoded_operation_id.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(encoded_operation_id.len() / 2);
+    for pair in encoded_operation_id.as_bytes().as_chunks::<2>().0 {
+        let byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        decoded.push(byte);
+    }
+    let operation_id = String::from_utf8(decoded).ok()?;
+    if operation_id.is_empty()
+        || operation_id.len() > 256
+        || keys::key_component(&operation_id) != encoded_operation_id
+    {
+        return None;
+    }
+    Some(operation_id)
 }
 
 fn operation_read_position(db: &Connection, operation_id: &str) -> Result<Option<(i64, i64)>> {

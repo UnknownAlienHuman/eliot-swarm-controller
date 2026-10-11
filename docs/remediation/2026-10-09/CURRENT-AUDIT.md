@@ -1,4 +1,18 @@
 # Current-source audit and implementation ledger
+The [mailbox recovery and response-budget repair](../2026-10-11/MAILBOX-RECOVERY-EVIDENCE.json)
+adds a bounded retained-key recovery cursor when damaged derived indexes cannot
+be resumed by Operation ID. Every read rechecks the Participant's current exact
+scope; missing or damaged authoritative Operation/body data remains a hard error.
+The first valid delivery excluded by the serialized-items budget remains on the
+next page. An isolated main-based five-file candidate, without the unrelated
+feedback/RepairDispatch or custody changes, passes strict host/contracts production
+Clippy and both real MCP/IPC and Store regressions on Windows/Linux.
+The budget covers the items array, not the entire RPC envelope. The MCP fixture
+creates/claims its Task and registers/sends through real calls; the Store fixture
+seeds its initial subject. Legacy timestamp-key commit ordering remains owned by
+R08/#34 and requires a separate fix. Full PR34/native/installed/crash/load and V27
+qualification remain open; initial failed and stale-build receipts are preserved.
+
 The [Claude SDK capability gate](../2026-10-11/CLAUDE-SDK-CAPABILITY-GATE-EVIDENCE.json)
 removes the hard runtime equality to SDK 0.3.287 while preserving the exact
 package identity, bounded observed version, safe export entry, startup export

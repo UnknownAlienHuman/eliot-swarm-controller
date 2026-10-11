@@ -1685,6 +1685,15 @@ impl Store {
         .await
     }
 
+    /// Serialize test-only state injection through the real database owner.
+    #[cfg(test)]
+    pub(crate) async fn run_fixture<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run(f).await
+    }
+
     async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
