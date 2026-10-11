@@ -1588,3 +1588,108 @@ fn successor_manager_gets_readback_action_for_unknown_start_after_host_interrupt
     assert!(former_exceptions.get("host_lifecycle").is_none());
     assert_eq!(stored_admission_result(&fixture.db), original_result);
 }
+
+#[tokio::test]
+async fn disconnected_line_observer_failure_does_not_block_store_work_or_shutdown() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::sync_channel,
+    };
+    use std::time::Duration;
+
+    let state_dir =
+        std::env::temp_dir().join(format!("store-observer-disconnect-{}", model::new_id()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let root = DataRoot::acquire(&state_dir).unwrap();
+    let credential = crate::platform::bootstrap_credential(&root.path).unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = root.path.clone();
+
+    let (observer_tx, observer_rx) = sync_channel::<usize>(1);
+    drop(observer_rx);
+    let callback_attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = Arc::clone(&callback_attempts);
+    let observer: swarm_telemetry::LineObserver = Arc::new(move |line, _policy| {
+        observed_attempts.fetch_add(1, Ordering::SeqCst);
+        if observer_tx.try_send(line.len()).is_err() {
+            panic!("line observer receiver disconnected");
+        }
+    });
+
+    let owner = StoreOwner::start_with_line_observer(
+        root,
+        Arc::new(config),
+        credential.clone(),
+        Some(observer),
+    )
+    .await
+    .unwrap();
+    let components = owner.store.telemetry.text_capture_components();
+    assert!(components.producer_enabled);
+    assert!(components.observer_attached);
+
+    assert_eq!(
+        owner.store.telemetry.emit(swarm_telemetry::Record::new(
+            swarm_telemetry::Severity::Error,
+            swarm_telemetry::Kind::StoreOperationFailed,
+            swarm_telemetry::Phase::StoreDisconnect,
+        )),
+        swarm_telemetry::EmitResult::Queued
+    );
+    let drained = tokio::time::timeout(
+        Duration::from_secs(2),
+        owner.store.drain_diagnostics(Duration::from_secs(1)),
+    )
+    .await
+    .expect("diagnostic drain exceeded its bound");
+    assert!(drained, "the admitted diagnostic callback did not drain");
+    assert_eq!(callback_attempts.load(Ordering::SeqCst), 1);
+
+    let stats = owner.store.diagnostic_stats();
+    assert_eq!(stats.observer_panics, 1);
+    assert_eq!(stats.enqueued_records, 1);
+    assert_eq!(stats.written_records, 1);
+    assert_eq!(stats.dropped_records, 0);
+    assert_eq!(stats.pending_records, 0);
+    assert_eq!(stats.sink_state, swarm_telemetry::SinkState::Ready);
+
+    let operator = owner.store.authenticate(credential).await.unwrap();
+    let mutation = owner
+        .store
+        .call(
+            operator.clone(),
+            "host.mode".into(),
+            json!({
+                "client_request_id": model::new_id(),
+                "new_work": "disabled",
+            }),
+        )
+        .await
+        .unwrap();
+    let operation_id = mutation["operation_id"].as_str().unwrap();
+    let operation = owner
+        .store
+        .call(
+            operator.clone(),
+            "operation.get".into(),
+            json!({"operation_id":operation_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(operation["operation_id"], operation_id);
+    assert_eq!(operation["method"], "host.mode");
+    assert_eq!(operation["state"], "settled");
+
+    let status = owner
+        .store
+        .call(operator, "host.status".into(), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(status["execution_mode"]["new_work"], "disabled");
+
+    tokio::time::timeout(Duration::from_secs(5), owner.close())
+        .await
+        .expect("StoreOwner shutdown exceeded its bound")
+        .expect("StoreOwner shutdown failed after the observer disconnect");
+    std::fs::remove_dir_all(state_dir).unwrap();
+}

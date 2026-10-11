@@ -200,6 +200,42 @@ soaked = false
 role_qualified = false
 
 [[donors]]
+id = "agent-client-protocol"
+name = "Agent Client Protocol Rust SDK crate"
+selection = "command_acp_protocol_types_and_connection"
+adoption_class = "adopt"
+program_decision = "ADOPT CRATE (already used by the main Command ACP adapter)"
+module = "runtime.command-acp"
+repository = "https://github.com/agentclientprotocol/rust-sdk"
+package = "agent-client-protocol"
+source_manifest = "crates/swarm-adapter-command/Cargo.toml:10"
+source_units = ["crates/swarm-adapter-command/src/adapter/acp.rs", "agent-client-protocol-3.3.0/src/role/acp.rs", "agent-client-protocol-3.3.0/src/jsonrpc.rs", "agent-client-protocol-schema-1.11.0/src/v1/agent.rs", "agent-client-protocol-schema-1.11.0/src/v1/client.rs"]
+manifest_version = "3.3.0"
+published_artifact_version_verified = true
+reviewed_pin = "crates.io agent-client-protocol 3.3.0; cached archive SHA-256 02898d848a20eb09b8a392e85bb3a4c79dba01d369758185d102b001362a60da"
+installed_pin = "Cargo.lock registry package agent-client-protocol 3.3.0; checksum 02898d848a20eb09b8a392e85bb3a4c79dba01d369758185d102b001362a60da (cached archive hash matches)"
+license_declaration = "Apache-2.0; exact cached crate Cargo.toml declares license = Apache-2.0 and license-file = LICENSE; LICENSE text verified against the cached 3.3.0 archive on 2026-10-11. This statement covers this crate, not every transitive dependency."
+dependency_license_review = "Transitive dependency licenses were not independently reviewed; none are inferred from the lock graph."
+api_surface = ["agent_client_protocol::{Client, Agent, ConnectionTo, Lines}", "Client::builder with typed notification/request handlers", "schema::v1::{InitializeRequest, RequestPermissionRequest, RequestPermissionResponse, PermissionOptionKind::{AllowOnce, RejectOnce}, SessionUpdate}", "Responder<RequestPermissionResponse>"]
+source_dependencies = ["agent-client-protocol-derive 3.3.0", "agent-client-protocol-schema 1.11.0", "futures 0.3.34", "futures-concurrency 7.7.1", "rustc-hash 2.1.3", "serde 1.0.229", "serde_json 1.0.151", "tracing 0.1.44", "uuid 1.26.1"]
+dependency_closure = "Cargo.lock dependency-edge reachability from this package contains 123 locked package nodes including the crate (122 dependencies); this is the workspace-resolved lock graph, not a claim that every optional upstream feature is enabled by Command."
+execution = "Command's interactive ACP v1 connection uses the crate's typed Client/Agent, ConnectionTo and Lines API; local bounded framing, child custody, journaling and policy remain ELIOT-owned. This is separate from Command batch execution and from ACPX."
+authority_invariant = "ELIOT Store/Operations retain Task, admission, result-artifact and acceptance authority. ACP supplies protocol types and session transport only: dispatch requires the exact admitted TaskPrompt; uncertain prompts are not replayed; permission replies bind the exact live session/request/fingerprint and one advertised one-time option; persistent choices require a separate policy mutation and readback."
+negative_fixture = "No executable persistent-permission negative fixture exists in the current Command ACP test module. Source-only counterexample: selecting a non-AllowOnce/RejectOnce option returns NATIVE_PERMISSION_PERSISTENT_UNSUPPORTED at crates/swarm-adapter-command/src/adapter/acp.rs:2941-2945; not fixture-checked."
+deletion_target = "None identified: the production adapter already uses this crate; no parallel legacy ACP schema/JSON-RPC implementation was found. Keep the ELIOT-owned bounded framing, child custody, journal and policy. ACPX is a distinct optional backend and remains not installed."
+qualification = "source_reviewed and locked as a production Command dependency; no executable negative fixture checked, no live/native ACP qualification, and no 200-agent load or role qualification."
+retain = ["Typed ACP schema and connection API", "Exact upstream license and applicable notices", "ELIOT Store admission, journal, permission policy and process ownership"]
+do_not_copy = ["A second Task/Operation/result authority", "ACPX as a mandatory wrapper or as interchangeable with this protocol crate", "Child ownership as proof of process-family departure", "Blanket PTY behavior"]
+qualification_points = ["Executable persistent-permission rejection fixture", "Native Windows ACP session and permission/readback", "Exact installed runtime qualification", "200-agent load and role qualification"]
+source_reviewed = true
+installed = true
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
+
+[[donors]]
 id = "existing-control-bundle"
 selection = "migration_source"
 adoption_class = "adopt"
