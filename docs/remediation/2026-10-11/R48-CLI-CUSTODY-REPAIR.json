@@ -1,0 +1,55 @@
+{
+  "schema": "eliot.r48.cli_custody_repair.v1",
+  "source_baseline": "a6c1d8aa31d14e34abefe3ec12e2e16d1fc59896",
+  "code_understanding_proof": {
+    "task_goal": "Retain exact short-lived public CLI child custody after an unknown timeout outcome.",
+    "domain_concept": "Bounded public CLI process cleanup and ownership.",
+    "project_or_module": "eliot-swarm-controller qualification sidecar",
+    "candidate_files": ["tools/qualification/Invoke-R48SchedulerQualification.ps1", "tools/qualification/Test-R48PublicContract.ps1"],
+    "candidate_symbols": ["Start-BoundedProcess", "Stop-OwnedPublicCliProcess", "Invoke-PublicCall", "New-R48Manager"],
+    "graph_findings": "Explicit search_graph project eliot-swarm-controller, name-pattern Start-BoundedProcess: total=0. Exact lexical source and PowerShell AST are authoritative.",
+    "exact_anchors": ["Invoke-R48SchedulerQualification.ps1:311", "Invoke-R48SchedulerQualification.ps1:407", "Invoke-R48SchedulerQualification.ps1:492", "Invoke-R48SchedulerQualification.ps1:629", "Invoke-R48SchedulerQualification.ps1:1999", "Test-R48PublicContract.ps1:64"],
+    "execution_path": "Invoke-PublicCall or New-R48Manager -> Start-BoundedProcess -> exact Process timeout/error -> Stop-OwnedPublicCliProcess -> caller scenario pending collection -> final cleanup.",
+    "state_reads": ["Exact owned Process ID/exit state", "CLI error and completion result", "Pending process collection"],
+    "state_writes": ["CLI request file", "Bounded stop of the exact short-lived owned Process", "Pending Process/PID ownership", "Qualification cleanup receipt"],
+    "API_or_event_surface": "System.Diagnostics.Process.Kill() without a process-tree argument; bounded WaitForExit; Dispose only on confirmed exit. Real timeout-child fixture verifies this boundary.",
+    "diagnostics_before": "Prior v2 source review identified dropped timeout-child ownership; historical review report preserved.",
+    "invariants": ["No process-tree or unrelated-process stop", "LongLived host path excluded", "No unknown CLI outcome promoted to success", "No public RPC replay", "Unconfirmed Process handle retained"],
+    "blast_radius": "PowerShell public CLI helper and scenario cleanup only; no Rust/native adapter change.",
+    "verifier": "Test-R48PublicContract.ps1 on Windows and Ubuntu PowerShell, AST parse, git diff --check, exact-hash independent review.",
+    "unknowns": ["Fresh installed R48 applied witness and no-replay qualification pending"],
+    "edit_allowed": true
+  },
+  "review": {
+    "model": "gpt-6-luna",
+    "reasoning_effort": "max",
+    "agent_id": "01a12a45-e685-73a3-b79a-2b57a730915a",
+    "result": "NO_ACTIONABLE_P1_P2",
+    "verified_hashes": true,
+    "runtime_checks": false
+  },
+  "files_sha256": {
+    "tools/qualification/Invoke-R48SchedulerQualification.ps1": "d6c78aee84bc309ceb6fa3ac9d28ccd00fe466ee9607c23524341dac66cfe411",
+    "tools/qualification/Test-R48PublicContract.ps1": "733bcd099dd3641654945def410739736200b89c96eaf3ef0d61341cb98b20dd"
+  },
+  "verification": {
+    "windows": {"passed": 33, "failed": 0, "log": ".local/manager-audit/r48-public-contract-cli-custody-20261011-windows.log", "log_sha256": "f02ceaad20fb4082b8ba4351937cd949328348a91ff7f33ee58857735e57d26b"},
+    "linux": {"passed": 33, "failed": 0, "log": ".local/manager-audit/r48-public-contract-cli-custody-20261011-linux.log", "log_sha256": "f02ceaad20fb4082b8ba4351937cd949328348a91ff7f33ee58857735e57d26b"},
+    "ast_parse_errors": 0,
+    "git_diff_check": "PASS",
+    "rust_gates": "Retained passed default/qualification strict production Clippy and affected tests; unchanged Rust source was not retested.",
+    "model_calls": 0
+  },
+  "completion_proof": {
+    "task_goal": "Complete controller qualification and implementation per V27.",
+    "acceptance_items": [
+      {"item": "R48 public CLI custody source repair", "status": "verified", "evidence": "Exact hashes, independent source review and 33/33 affected assertions on each platform", "verifier": "Test-R48PublicContract.ps1", "residual_uncertainty": "Installed scenario has not run on this edition"},
+      {"item": "Fresh R48 installed applied-fault and no-replay evidence", "status": "not_verified", "evidence": "Five pinned U packages verified and four frontends publicly installed; preparation is not qualification", "verifier": "Fresh bound Invoke-R48SchedulerQualification.ps1", "residual_uncertainty": "Applied witness and bounded no-replay observation pending"}
+    ],
+    "changed_files": ["tools/qualification/Invoke-R48SchedulerQualification.ps1", "tools/qualification/Test-R48PublicContract.ps1"],
+    "checks_run": ["33 Windows fixture assertions", "33 Linux fixture assertions", "AST parsing", "git diff --check", "Independent exact-hash source review"],
+    "checks_not_run_and_why": ["Unchanged Rust checks were not repeated", "Native/model qualification follows installed R48"],
+    "remaining_uncertainty": ["Full V27 scope remains active", "OpenCode selected-server exact model readiness", "Antigravity causal result and Task acceptance", "Two remaining dependency advisories"],
+    "final_status": "PARTIAL_PROGRESS"
+  }
+}

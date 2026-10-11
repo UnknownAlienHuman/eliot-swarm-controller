@@ -9,7 +9,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($harness, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'R48_PARSE_FAILED' }
-$functions = @('Get-ControllerId', 'Get-StrictInt64', 'Assert-EligibleCheckRunReceipt', 'Assert-HostRemainsAlive', 'New-PrivateDirectory', 'Write-PrivateJson', 'Invoke-PublicCall', 'Stop-OwnedHost', 'Test-QualificationFaultWitness', 'Wait-ForQualificationFaultWitness')
+$functions = @('Get-ControllerId', 'Get-StrictInt64', 'Assert-EligibleCheckRunReceipt', 'Assert-HostRemainsAlive', 'New-PrivateDirectory', 'Write-PrivateJson', 'Invoke-PublicCall', 'Stop-OwnedHost', 'Stop-OwnedPublicCliProcess', 'Start-BoundedProcess', 'Test-QualificationFaultWitness', 'Wait-ForQualificationFaultWitness')
 $definitions = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in $functions })
 if ($definitions.Count -ne $functions.Count) { throw 'R48_FUNCTION_MISSING' }
@@ -61,6 +61,40 @@ function Invoke-PublicCall {
 }
 $script:fixtureReadbackDelay = 0
 $fixtureProcess = Get-Process -Id $PID
+$timedChild = $null
+try {
+    $timedChild = Start-BoundedProcess -Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 30') -ExecutablePath $fixtureProcess.Path -TimeoutMilliseconds 250
+    Assert-Case 'timed_out_cli_child_is_stopped_and_exit_confirmed' (
+        $timedChild.started -and -not $timedChild.completed -and
+        $timedChild.error_code -ceq 'CLI_TIMEOUT_OUTCOME_UNKNOWN' -and
+        $timedChild.cleanup_confirmed -and -not $timedChild.cleanup_pending -and
+        $null -eq $timedChild.process)
+} finally {
+    if ($null -ne $timedChild -and $null -ne $timedChild.process) {
+        $childCleanup = Stop-OwnedPublicCliProcess -Process $timedChild.process -WaitMilliseconds 5000
+        if (-not $childCleanup.stopped) { throw 'FIXTURE_PUBLIC_CLI_CHILD_STOP_UNCONFIRMED' }
+    }
+}
+
+$refusedProcess = [pscustomobject]@{
+    Id = 424242
+    waits = [System.Collections.Generic.List[int]]::new()
+    kill_called = $false
+    dispose_called = $false
+}
+$refusedProcess | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+    param([int] $Milliseconds)
+    $this.waits.Add($Milliseconds)
+    return $false
+}
+$refusedProcess | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.kill_called = $true }
+$refusedProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.dispose_called = $true }
+$refusedStop = Stop-OwnedPublicCliProcess -Process $refusedProcess -WaitMilliseconds 1
+Assert-Case 'unconfirmed_cli_stop_retains_handle_without_dispose' (
+    -not $refusedStop.stopped -and $refusedStop.pending_pid -eq 424242 -and
+    [object]::ReferenceEquals($refusedStop.process, $refusedProcess) -and
+    $refusedProcess.kill_called -and -not $refusedProcess.dispose_called -and
+    $refusedProcess.waits.Count -eq 2 -and $refusedProcess.waits[1] -eq 1)
 $scenario = [pscustomobject]@{ host = $fixtureProcess; manager_path = 'unused-fixture' }
 Assert-Case 'liveness_reads_uuid_without_pid_assignment' (Assert-HostRemainsAlive -Scenario $scenario -ExpectedPid $PID -ExpectedHostEpoch 1 -ExpectedControllerId $controllerId -Samples 1 -IntervalSeconds 1).success
 $script:fixtureStatus.controller_id = 7
@@ -157,15 +191,31 @@ function Start-BoundedProcess {
     $fileIndex = [Array]::IndexOf($Arguments, '--file')
     $script:requestDocument = Get-Content -LiteralPath $Arguments[$fileIndex + 1] -Raw | ConvertFrom-Json -AsHashtable
     $script:transportReadbackBudget = $TimeoutMilliseconds
-    return [pscustomobject]@{ started = $true; completed = $true; exit_code = 0; stdout = ($operation | ConvertTo-Json -Depth 5) }
+    return [pscustomobject]@{ started = $true; completed = $true; exit_code = 0; stdout = ($operation | ConvertTo-Json -Depth 5); error_code = $null; cleanup_pending = $false; cleanup_confirmed = $true; process_id = 1; process = $null }
 }
-$transportScenario = [pscustomobject]@{ state = 'unused-fixture'; requests = $privatePath }
+$transportScenario = [pscustomobject]@{ state = 'unused-fixture'; requests = $privatePath; pending_public_cli_processes = [System.Collections.Generic.List[object]]::new() }
 $transportCall = Invoke-PublicCall -Scenario $transportScenario -CredentialPath 'unused-fixture' -Method 'operation.get' -Params @{ operation_id = 'operation-fixture' }
 Assert-Case 'cli_file_contains_only_params' ($script:requestDocument.Count -eq 1 -and $script:requestDocument.operation_id -ceq 'operation-fixture')
 Assert-Case 'operation_result_keeps_outer_identity' ($transportCall.success -and $transportCall.value.method -ceq 'check.run' -and
     $transportCall.value.operation_id -ceq 'operation-fixture' -and $transportCall.value.result.check_id -ceq 'check-fixture')
 $null = Invoke-PublicCall -Scenario $transportScenario -CredentialPath 'unused-fixture' -Method 'operation.get' -Params @{ operation_id='operation-fixture' } -TimeoutMilliseconds 123
 Assert-Case 'cli_gets_supplied_readback_budget' ($script:transportReadbackBudget -eq 123)
+$script:pendingStartResult = [pscustomobject]@{
+    started = $true; completed = $false; exit_code = $null; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'
+    stdout = ''; stderr = ''; process = $refusedProcess; process_id = 424242
+    cleanup_confirmed = $false; cleanup_pending = $true
+}
+function Start-BoundedProcess {
+    param($Arguments, $ExecutablePath, $TimeoutMilliseconds)
+    return $script:pendingStartResult
+}
+$pendingScenario = [pscustomobject]@{ state = 'unused-fixture'; requests = $privatePath; pending_public_cli_processes = [System.Collections.Generic.List[object]]::new() }
+$pendingCall = Invoke-PublicCall -Scenario $pendingScenario -CredentialPath 'unused-fixture' -Method 'operation.get' -Params @{ operation_id = 'operation-fixture' }
+Assert-Case 'public_cli_timeout_keeps_original_error_and_pending_handle' (
+    -not $pendingCall.success -and $pendingCall.code -ceq 'CLI_TIMEOUT_OUTCOME_UNKNOWN' -and
+    $pendingCall.cleanup_pending -and $pendingCall.pending_pid -eq 424242 -and
+    $pendingScenario.pending_public_cli_processes.Count -eq 1 -and
+    [object]::ReferenceEquals($pendingScenario.pending_public_cli_processes[0].process, $refusedProcess))
 
 # Enter the complete public script in a separate process. An absent QRoot must be
 # rejected before any host, Store, installation or model effect can occur.

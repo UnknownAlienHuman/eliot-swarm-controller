@@ -1,5 +1,10 @@
 # Current-source audit and implementation ledger
 
+The [R48 CLI custody repair](../2026-10-11/R48-CLI-CUSTODY-REPAIR.md)
+retains timed-out public CLI process handles until bounded stop confirms exit.
+Its public-contract fixture passes 33/33 on Windows and Linux, including a real
+timeout child and pending ownership. Fresh installed U evidence remains pending.
+
 The [OpenCode native coordinate repair](../2026-10-11/OPENCODE-NATIVE-MODEL-COORDINATE.md)
 preserves the model id `stepfun/step-5-preview-free` after the provider boundary.
 Its actual-parameter/contract fixture passes 21/21 on both platforms without

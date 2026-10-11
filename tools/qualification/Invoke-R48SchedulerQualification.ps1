@@ -308,6 +308,27 @@ function Save-Receipt {
  Bounded process management. A started process is either owned and tracked here, or
  explicitly reported as pending ownership. Nothing is silently leaked.
 ========================================================================================== #>
+function Stop-OwnedPublicCliProcess {
+    param(
+        [Parameter(Mandatory)] $Process,
+        [ValidateRange(0, 5000)][int] $WaitMilliseconds = 5000
+    )
+    $processId = $null
+    try { $processId = [int]$Process.Id } catch { }
+    $stopped = $false
+    try { $stopped = $Process.WaitForExit(0) } catch { }
+    if (-not $stopped) {
+        # Kill() without the process-tree overload is restricted to this owned CLI.
+        try { $Process.Kill() } catch { }
+        try { $stopped = $Process.WaitForExit($WaitMilliseconds) } catch { $stopped = $false }
+    }
+    if ($stopped) {
+        try { $Process.Dispose() } catch { }
+        return [pscustomobject]@{ stopped = $true; process_id = $processId; pending_pid = $null; process = $null }
+    }
+    return [pscustomobject]@{ stopped = $false; process_id = $processId; pending_pid = $processId; process = $Process }
+}
+
 function Start-BoundedProcess {
     param(
         [Parameter(Mandatory)][object[]] $Arguments,
@@ -319,6 +340,7 @@ function Start-BoundedProcess {
         started = $false; completed = $false; exit_code = $null; error_code = $null
         stdout = ''; stderr = ''; process = $null; process_id = $null
         stdout_task = $null; stderr_task = $null
+        cleanup_confirmed = $false; cleanup_pending = $false
     }
     $psi = [Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $ExecutablePath
@@ -347,11 +369,12 @@ function Start-BoundedProcess {
     try { $null = $process.Start() }
     catch {
         $result.error_code = 'PROCESS_START_FAILED'
+        try { $process.Dispose() } catch { }
         return $result
     }
-    $result.started = $true
-    $result.process_id = $process.Id
     try {
+        $result.started = $true
+        $result.process_id = [int]$process.Id
         $result.stdout_task = $process.StandardOutput.ReadToEndAsync()
         $result.stderr_task = $process.StandardError.ReadToEndAsync()
         if ($LongLived) {
@@ -381,7 +404,24 @@ function Start-BoundedProcess {
         return $result
     }
     finally {
-        if (-not $LongLived) { $process.Dispose() }
+        if (-not $LongLived) {
+            $stop = $null
+            try { $stop = Stop-OwnedPublicCliProcess -Process $process -WaitMilliseconds 5000 }
+            catch {
+                $pendingPid = $null
+                try { $pendingPid = [int]$process.Id } catch { }
+                $stop = [pscustomobject]@{ stopped = $false; process_id = $pendingPid; pending_pid = $pendingPid; process = $process }
+            }
+            $result.cleanup_confirmed = $stop.stopped
+            if ($stop.stopped) {
+                $result.process = $null
+            }
+            else {
+                $result.cleanup_pending = $true
+                $result.process = $stop.process
+                if ($null -ne $stop.process_id) { $result.process_id = $stop.process_id }
+            }
+        }
     }
 }
 
@@ -449,8 +489,19 @@ function Invoke-PublicCall {
     )
     $callTimeoutMilliseconds = [int][Math]::Min($TimeoutMilliseconds, [Math]::Min(60000, $TimeoutSeconds * 1000))
     $result = Start-BoundedProcess -Arguments $arguments -ExecutablePath $script:PublicCliPath -TimeoutMilliseconds $callTimeoutMilliseconds
-    if (-not $result.started) { return [pscustomobject]@{ success = $false; code = 'CLI_START_FAILED' } }
-    if (-not $result.completed) { return [pscustomobject]@{ success = $false; code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN' } }
+    if ($result.cleanup_pending) { $Scenario.pending_public_cli_processes.Add($result) }
+    if (-not $result.started) {
+        return [pscustomobject]@{ success = $false; code = $(if ($result.error_code) { $result.error_code } else { 'CLI_START_FAILED' }) }
+    }
+    if (-not $result.completed) {
+        $code = if ($result.error_code) { $result.error_code } else { 'CLI_TIMEOUT_OUTCOME_UNKNOWN' }
+        return [pscustomobject]@{
+            success = $false
+            code = $code
+            cleanup_pending = [bool]$result.cleanup_pending
+            pending_pid = $(if ($result.cleanup_pending) { $result.process_id } else { $null })
+        }
+    }
     if ($result.exit_code -ne 0) {
         return [pscustomobject]@{ success = $false; code = 'CLI_NONZERO_EXIT'; stderr = $result.stderr }
     }
@@ -497,6 +548,7 @@ function New-R48ScenarioDirectory {
         host = $null
         stdout_task = $null
         stderr_task = $null
+        pending_public_cli_processes = [System.Collections.Generic.List[object]]::new()
         pipe_name = $null
         operator_path = (Join-Path $state 'operator.json')
         manager_path = (Join-Path $path 'manager.json')
@@ -574,8 +626,15 @@ function New-R48Manager {
         'client-create', $managerId, '--role', 'manager', '--out', $Scenario.manager_path
     )
     $create = Start-BoundedProcess -Arguments $arguments -ExecutablePath $script:PublicCliPath -TimeoutMilliseconds 30000
+    if ($create.cleanup_pending) { $Scenario.pending_public_cli_processes.Add($create) }
     if (-not $create.completed -or $create.exit_code -ne 0 -or -not (Test-Path -LiteralPath $Scenario.manager_path)) {
-        return [pscustomobject]@{ success = $false; code = 'MANAGER_CREATE_FAILED'; detail = $create.error_code }
+        return [pscustomobject]@{
+            success = $false
+            code = $(if ($create.error_code) { $create.error_code } else { 'MANAGER_CREATE_FAILED' })
+            detail = $create.error_code
+            cleanup_pending = [bool]$create.cleanup_pending
+            pending_pid = $(if ($create.cleanup_pending) { $create.process_id } else { $null })
+        }
     }
     $credential = Read-JsonFile -Path $Scenario.manager_path
     if ($credential['client_id'] -cne $managerId) { return [pscustomobject]@{ success = $false; code = 'MANAGER_CREDENTIAL_INVALID' } }
@@ -1925,15 +1984,51 @@ Write-Output $script:ReceiptPath
     throw
 } finally {
     $cleanup = [System.Collections.Generic.List[object]]::new()
+    $pendingPublicCli = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in @(@{ name='bootstrap'; scenario=$script:BootstrapScenario }, @{ name='final'; scenario=$script:FinalScenario })) {
-        if ($null -eq $entry.scenario -or $null -eq $entry.scenario.host) { continue }
-        $stopped = Stop-OwnedHost -Scenario $entry.scenario
-        $cleanup.Add(@{phase=$entry.name;stopped=$stopped.stopped})
-        if (-not $stopped.stopped) {
-            $script:Report.limits['pending_'+$entry.name+'_host_pid'] = $stopped.pending_pid
-            $script:Report.status = 'blocked'
-            $script:Report.blocked_code = 'OWNED_HOST_STOP_UNCONFIRMED'
+        if ($null -eq $entry.scenario) { continue }
+        if ($null -ne $entry.scenario.host) {
+            $stopped = Stop-OwnedHost -Scenario $entry.scenario
+            $cleanup.Add(@{phase=$entry.name;kind='host';stopped=$stopped.stopped})
+            if (-not $stopped.stopped) {
+                $script:Report.limits['pending_'+$entry.name+'_host_pid'] = $stopped.pending_pid
+                $script:Report.status = 'blocked'
+                if (-not $script:Report.Contains('blocked_code')) { $script:Report.blocked_code = 'OWNED_HOST_STOP_UNCONFIRMED' }
+            }
         }
+        foreach ($pendingCall in @($entry.scenario.pending_public_cli_processes.ToArray())) {
+            $stopped = Stop-OwnedPublicCliProcess -Process $pendingCall.process -WaitMilliseconds 5000
+            $cleanup.Add([ordered]@{
+                phase = $entry.name
+                kind = 'public_cli_process'
+                process_id = $pendingCall.process_id
+                initial_cleanup_pending = [bool]$pendingCall.cleanup_pending
+                stopped = $stopped.stopped
+                cli_error_code = $pendingCall.error_code
+                pending_pid = $stopped.pending_pid
+            })
+            if ($stopped.stopped) {
+                $pendingCall.cleanup_pending = $false
+                $pendingCall.cleanup_confirmed = $true
+                $pendingCall.process = $null
+                $null = $entry.scenario.pending_public_cli_processes.Remove($pendingCall)
+            }
+            else {
+                $pendingCall.cleanup_pending = $true
+                $pendingCall.process = $stopped.process
+                if ($null -ne $stopped.process_id) { $pendingCall.process_id = $stopped.process_id }
+                $pendingPublicCli.Add([ordered]@{
+                    phase = $entry.name
+                    process_id = $pendingCall.process_id
+                    cli_error_code = $pendingCall.error_code
+                })
+            }
+        }
+    }
+    if ($pendingPublicCli.Count -gt 0) {
+        $script:Report.limits['pending_public_cli_processes'] = @($pendingPublicCli.ToArray())
+        $script:Report.status = 'blocked'
+        if (-not $script:Report.Contains('blocked_code')) { $script:Report.blocked_code = 'PUBLIC_CLI_CLEANUP_PENDING' }
     }
     $script:Report.cleanup = @($cleanup.ToArray())
     if ($null -ne $script:RunDirectory) { Save-Receipt }

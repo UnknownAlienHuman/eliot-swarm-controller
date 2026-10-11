@@ -2,6 +2,11 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+The [CLI custody follow-up](R48-CLI-CUSTODY-REPAIR.md) stops only the exact owned
+short-lived public CLI process and retains unconfirmed handle/PID ownership
+without replacing the original unknown outcome. Its current fixture passes
+33/33 on Windows and Linux. The 30-case edition below is retained history.
+
 The [bounded witness and producer diagnostic repair](QUALIFICATION-OBSERVATION-REPAIR.md)
 passes the current public fixture **30/30 on both platforms**. It retains a
 bounded wait for delayed applied evidence and a separate feature-only first-RPC
