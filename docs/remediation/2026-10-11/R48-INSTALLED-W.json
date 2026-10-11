@@ -1,0 +1,268 @@
+{
+  "schema": "eliot.r48.installed_w_observations.v1",
+  "run": "r48-c0e4642174d842b5b11f59edbb74f39e",
+  "run_directory": "C:\\Development\\Rust\\qualification-runs\\r48-execution-20261011w\\r48-c0e4642174d842b5b11f59edbb74f39e",
+  "binary_source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+  "binary_source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+  "sidecar_commit": "b342f9993ee6b16d0f3ba92298bef1551aaa850e",
+  "runtime_inputs_unchanged_between_commits": true,
+  "source_sha256": {
+    "sidecar": "91848bc9e6e39e0544c3f564865a4993cee1cf49856506a0f3909dea28cc2a35",
+    "fixture": "008b9eb9bed99db899144f18a91197d445c03630389955e97e82b0523f228424"
+  },
+  "exit_code": 0,
+  "started_at_utc": "2026-10-11T10:18:19.3443908Z",
+  "completed_at_utc": "2026-10-11T10:20:43.8764460Z",
+  "subgates": {
+    "scheduler_current_owner_ready": "verified",
+    "enabled_one_shot_checkrun_admitted": "verified",
+    "uncertain_initial_admit_receipt_no_replay": "verified",
+    "host_remains_alive": "verified",
+    "bootstrap_seed": "verified"
+  },
+  "subgate_evidence": [
+    {
+      "name": "bootstrap_seed",
+      "status": "verified",
+      "code": "",
+      "evidence": {
+        "task_id": "06793470-812a-4a43-ad23-935243e4f01a",
+        "attempt_id": "70d54299-1952-4b6f-9c29-5638dc52c36f",
+        "candidate_ref": "source-fff7fe7e73006b596b19277982aebdf8fc6235852091a9e31e75d5f598e686ef",
+        "capture_operation_id": "ab21cd51-bda8-495a-82d2-3eb82e39b76c"
+      },
+      "recorded_at_utc": "2026-10-11T10:18:22.4856836Z"
+    },
+    {
+      "name": "scheduler_current_owner_ready",
+      "status": "verified",
+      "code": "",
+      "evidence": {
+        "observations": [
+          {
+            "observed_at_utc": "2026-10-11T10:18:22.6681744Z",
+            "worker_state": "running",
+            "owner_status": "current",
+            "owner_phase": "active",
+            "owner_ready": true,
+            "readiness_source": "validated_current_owner_receipt",
+            "group_identity_present": true,
+            "owner_host_scope": {
+              "controller_id": "d06431cc-5f93-43b7-86a0-2ac0f2b5e38b",
+              "host_epoch": 2
+            },
+            "current_controller_id": "d06431cc-5f93-43b7-86a0-2ac0f2b5e38b",
+            "current_host_epoch": 2
+          }
+        ],
+        "ready_at_utc": "2026-10-11T10:18:22.6699870Z"
+      },
+      "recorded_at_utc": "2026-10-11T10:18:22.6711808Z"
+    },
+    {
+      "name": "enabled_one_shot_checkrun_admitted",
+      "status": "verified",
+      "code": "",
+      "evidence": {
+        "schedule_id": "r48-once-135b9dbf125447869dabe9618c0724a0",
+        "anchor_ms": 1791714022511,
+        "work_operation_id": "a1c1d637-fa47-44c7-99c5-f33670990103",
+        "operation_state": "native_accepted",
+        "attempt_id": "70d54299-1952-4b6f-9c29-5638dc52c36f",
+        "candidate_ref": "source-fff7fe7e73006b596b19277982aebdf8fc6235852091a9e31e75d5f598e686ef",
+        "samples": [
+          {
+            "observed_at_utc": "2026-10-11T10:20:23.6257037Z",
+            "schedule_last_operation": {
+              "outcome": "admitted",
+              "receipt_operation_id": "a1c1d637-fa47-44c7-99c5-f33670990103",
+              "request_id": "5235a535f501c6ef5147b2d35308bcd197e939c95f95b0f80f5b8d9196a3d06d",
+              "slot": 0,
+              "state": "native_accepted",
+              "work_operation_id": "a1c1d637-fa47-44c7-99c5-f33670990103"
+            },
+            "operation": {
+              "attempt_id": "70d54299-1952-4b6f-9c29-5638dc52c36f",
+              "binding_generation": null,
+              "binding_id": null,
+              "created_at_ms": 1791714022528,
+              "method": "check.run",
+              "operation_id": "a1c1d637-fa47-44c7-99c5-f33670990103",
+              "prerequisite_operation_id": null,
+              "result": {
+                "check_id": "5fa62345-85a1-41e9-b582-1d23b7d5c2d8",
+                "operation_id": "a1c1d637-fa47-44c7-99c5-f33670990103",
+                "state": "queued"
+              },
+              "state": "native_accepted",
+              "task_id": "06793470-812a-4a43-ad23-935243e4f01a",
+              "updated_at_ms": 1791714023074
+            },
+            "check_receipt": {
+              "attempt_id": "70d54299-1952-4b6f-9c29-5638dc52c36f",
+              "cached_from": null,
+              "cancel_request": null,
+              "cancellation": null,
+              "candidate_ref": "source-fff7fe7e73006b596b19277982aebdf8fc6235852091a9e31e75d5f598e686ef",
+              "check_id": "5fa62345-85a1-41e9-b582-1d23b7d5c2d8",
+              "cleanup_pending": false,
+              "coverage": {},
+              "exit_code": null,
+              "operation_id": "a1c1d637-fa47-44c7-99c5-f33670990103",
+              "process_diagnostic": null,
+              "process_facts": null,
+              "profile_id": "r48-readme-135b9dbf125447869dabe9618c0724a0",
+              "profile_revision": "1",
+              "release_evidence": null,
+              "resource_claimed_at_ms": 1791714022824,
+              "resource_key": "check-target:r48-readme-135b9dbf125447869dabe9618c0724a0",
+              "resource_released": null,
+              "resource_released_at_ms": null,
+              "result_ref": null,
+              "state": "running"
+            }
+          }
+        ]
+      },
+      "recorded_at_utc": "2026-10-11T10:20:23.6323655Z"
+    },
+    {
+      "name": "host_remains_alive",
+      "status": "verified",
+      "code": "",
+      "evidence": {
+        "observations": [
+          {
+            "sample_index": 0,
+            "observed_at_utc": "2026-10-11T10:20:23.6926261Z",
+            "pid": 13360,
+            "process_start_time_utc": "2026-10-11T10:18:22.5302442Z",
+            "host_lifecycle_state": "running",
+            "controller_id": "d06431cc-5f93-43b7-86a0-2ac0f2b5e38b",
+            "host_epoch": 2
+          },
+          {
+            "sample_index": 1,
+            "observed_at_utc": "2026-10-11T10:20:33.7254740Z",
+            "pid": 13360,
+            "process_start_time_utc": "2026-10-11T10:18:22.5302442Z",
+            "host_lifecycle_state": "running",
+            "controller_id": "d06431cc-5f93-43b7-86a0-2ac0f2b5e38b",
+            "host_epoch": 2
+          },
+          {
+            "sample_index": 2,
+            "observed_at_utc": "2026-10-11T10:20:43.7448102Z",
+            "pid": 13360,
+            "process_start_time_utc": "2026-10-11T10:18:22.5302442Z",
+            "host_lifecycle_state": "running",
+            "controller_id": "d06431cc-5f93-43b7-86a0-2ac0f2b5e38b",
+            "host_epoch": 2
+          }
+        ],
+        "pid": 13360,
+        "host_epoch": 2
+      },
+      "recorded_at_utc": "2026-10-11T10:20:43.7451499Z"
+    },
+    {
+      "name": "uncertain_initial_admit_receipt_no_replay",
+      "status": "verified",
+      "code": "",
+      "evidence": {
+        "admission_intents": 1,
+        "second_intent_observed": false,
+        "observation_end": "confirmed_graceful_host_stop",
+        "injection": {
+          "success": true,
+          "code": null,
+          "witness_schema": "eliot.swarm.r48.qualification-fault-witness.v1",
+          "withheld_method": "automation.scheduler.admit",
+          "withheld_replay": "withheld_before_delivery",
+          "withheld_frame_bytes": 892,
+          "owner_launch_pid": 40276,
+          "pid_equals_current_owner_worker": true,
+          "current_owner_worker_pid": 40276,
+          "config_digest": "85ef92e9fe3ed439bbd793f2e1d169f710fec7235428980235a6b06b2154081e",
+          "config_digest_matches_file": true,
+          "owner_status": "current",
+          "owner_phase": "active",
+          "owner_ready": true,
+          "epoch_unchanged": true,
+          "credential_or_payload_recorded": false
+        }
+      },
+      "recorded_at_utc": "2026-10-11T10:20:43.7776073Z"
+    }
+  ],
+  "fault_injection": {
+    "success": true,
+    "code": null,
+    "witness_schema": "eliot.swarm.r48.qualification-fault-witness.v1",
+    "withheld_method": "automation.scheduler.admit",
+    "withheld_replay": "withheld_before_delivery",
+    "withheld_frame_bytes": 892,
+    "owner_launch_pid": 40276,
+    "pid_equals_current_owner_worker": true,
+    "current_owner_worker_pid": 40276,
+    "config_digest": "85ef92e9fe3ed439bbd793f2e1d169f710fec7235428980235a6b06b2154081e",
+    "config_digest_matches_file": true,
+    "owner_status": "current",
+    "owner_phase": "active",
+    "owner_ready": true,
+    "epoch_unchanged": true,
+    "credential_or_payload_recorded": false
+  },
+  "retained_summary": {
+    "subgates_verified": 5,
+    "subgates_with_gaps": 0,
+    "r48_qualification": "not_qualified",
+    "reason": "this sidecar harness reports bounded subgates only and never an overall R48 result"
+  },
+  "qualification_receipt_sha256": "5402c3f90d117d771a3be4a765e5043adaa3960476f4fa928a50c1581ed62fa5",
+  "execution_log_sha256": "75f5498ff69df99f0139d3ee087291507afb067306087bc96ff2036efa18b09e",
+  "execution_exit_sha256": "d76f9bc5668c70f59eeaeceec769fc5741e2228df233d46a1b1a55e14253f021",
+  "binding_sha256": "4ab618e878557430e229070fd0890fce974aad04e3ccf082bd92564b0471022e",
+  "prepared_args_sha256": "751b414c420b18325b6cafa41e9b2b1983bc02ba298b4d33140daa72a9b6fb9c",
+  "preparation_receipt_sha256": "1f3b59fcfcd2e54bc06c7cadc1fbe80c78d68b2404654798e0839532ecf90f66",
+  "post_run_pid_readback": {
+    "observed_at_utc": "2026-10-11T10:20:53.7032630Z",
+    "pids": [
+      53840,
+      13360,
+      40276
+    ],
+    "present": []
+  },
+  "second_intent_present": false,
+  "historical_run_replayed": false,
+  "historical_receipts_modified": false,
+  "rust_rebuilds": 0,
+  "model_calls": 0,
+  "completion_proof": {
+    "final_status": "PARTIAL_PROGRESS",
+    "remaining_uncertainty": [
+      "Scope beyond the five named observations",
+      "Native Step5/Gemini causal result and Task acceptance",
+      "Broader platform/crash/load qualification",
+      "Two dependency advisories"
+    ],
+    "acceptance_items": [
+      {
+        "verifier": "Bounded installed W run and exact receipt/witness/scope readback",
+        "status": "verified",
+        "item": "Five named installed sidecar observations"
+      },
+      {
+        "status": "not_verified",
+        "item": "Full R48 optional-worker lifecycle",
+        "evidence": "Sidecar summary explicitly refuses overall qualification"
+      },
+      {
+        "status": "not_verified",
+        "item": "Full native/model and V27",
+        "evidence": "Current audit retains causal acceptance, platform/crash/load and dependency gaps"
+      }
+    ]
+  }
+}

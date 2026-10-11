@@ -1,5 +1,9 @@
 # R48 applied witness and completion evidence repair
 
+The subsequent [fresh installed W result](R48-INSTALLED-W.md) verifies the
+repaired consumer in the installed contour with five bounded observations and
+exit 0. V's failed receipt below remains unchanged.
+
 Installed V used five verified packages built from commit
 `ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480`, tree
 `e2fa1c5b7cf3a94b1c6e0158882972020973d740`, and ran once as
@@ -40,6 +44,6 @@ Independent Luna Max review of both exact final source hashes found no
 actionable P1/P2.
 
 Only PowerShell changed. The existing strict Rust Clippy and scheduler gates
-remain applicable; no Rust rebuild or repeated Rust gate is required. A fresh
-installed sidecar run with this repaired consumer remains pending. Full R48,
+remain applicable; no Rust rebuild or repeated Rust gate is required. W now
+verifies the fresh installed sidecar contour separately. Full R48,
 native/model qualification and the full V27 release remain unproven.

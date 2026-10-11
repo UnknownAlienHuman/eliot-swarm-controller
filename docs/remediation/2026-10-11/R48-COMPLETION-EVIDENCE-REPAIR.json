@@ -137,8 +137,8 @@
         "item": "Dictionary evidence consumer and serialized no-replay scope"
       },
       {
-        "status": "not_verified",
-        "evidence": "W preparation pending execution",
+        "status": "verified",
+        "evidence": "Fresh installed W: five bounded observations, retained original receipt, exit0",
         "item": "Fresh installed repaired sidecar"
       },
       {
@@ -151,8 +151,14 @@
       "Rust Clippy/build/test repeats omitted because no Rust or Cargo input changed."
     ],
     "remaining_uncertainty": [
-      "Fresh installed consumer execution",
-      "Full native/model and V27 qualification"
+      "Full R48 and native/model and V27 qualification"
     ]
+  },
+  "installed_w": {
+    "record": "R48-INSTALLED-W.json",
+    "verified_observations": 5,
+    "full_r48_qualified": false,
+    "record_sha256": "343861d40e42a00055e85d6d7ff0c5b549cf92066e8f537eea23b22d9601bf42",
+    "exit_code": 0
   }
 }

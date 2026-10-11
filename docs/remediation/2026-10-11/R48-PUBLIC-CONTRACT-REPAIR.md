@@ -2,6 +2,10 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+The [fresh installed W contour](R48-INSTALLED-W.md) passes five bounded
+observations with exit 0, including applied uncertain-admit/no-replay evidence.
+It does not qualify the entire R48 scope. All historical receipts stay unchanged.
+
 The latest [installed V and completion evidence repair](R48-COMPLETION-EVIDENCE-REPAIR.md)
 retain an applied fault witness with exact owner/config binding. V's original
 exit 1 and blocked receipt remain unchanged: a dictionary/object mismatch

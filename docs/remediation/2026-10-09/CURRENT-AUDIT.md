@@ -1,5 +1,11 @@
 # Current-source audit and implementation ledger
 
+The [fresh installed W result](../2026-10-11/R48-INSTALLED-W.md) verifies all
+five bounded observations with exit 0, an applied withheld reply bound to the
+live owner/config, exactly one admit intent after confirmed graceful stop, and
+unchanged host identity. No build or historical-run replay occurred. This closes
+that installed contour only; full R48, native/model and V27 remain unqualified.
+
 The [installed V observation and completion evidence repair](../2026-10-11/R48-COMPLETION-EVIDENCE-REPAIR.md)
 retain a real applied 892-byte withheld-admit witness bound to the current
 Store-owned worker and config. V recorded four verified subgates, then exited 1
