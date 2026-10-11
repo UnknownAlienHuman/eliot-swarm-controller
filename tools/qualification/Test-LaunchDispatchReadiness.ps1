@@ -1,8 +1,8 @@
 #requires -Version 7.0
 <#
 Runs the production launch readiness loop and sole task.dispatch call against
-public transport fixtures. Binding/hello is already ready in every case; only
-the retained launch phase and exact parent tuple change. No native effects.
+public transport fixtures. Binding/hello is already ready in every case; the
+launch phase, native MCP connection card and exact parent tuple vary. No native effects.
 #>
 [CmdletBinding()]
 param()
@@ -15,7 +15,7 @@ if ($errors.Count) { throw 'Harness parse failed.' }
 $names = @('Get-OptionalField', 'Test-ReadinessRecordShape', 'Get-SafeReadinessErrorCode',
     'Get-SafeReadinessBindingState', 'Get-SafeReadinessSupervisorPhase', 'Get-SafeReadinessProjection',
     'Test-ReadinessStringEquals', 'Test-ReadinessLaunchParent', 'Test-ReadinessGenerationEquals',
-    'Get-SafeReadinessLaunchPhase', 'Test-ReadinessDispatchPhase', 'Get-SafeReadinessIdentifier',
+    'Get-SafeReadinessLaunchPhase', 'Test-ReadinessDispatchPhase', 'Get-SafeReadinessNativeMcpConnectionState', 'Get-SafeReadinessIdentifier',
     'New-ReadinessFailureFacts', 'Test-PublicAppliedOperationReadback')
 $functions = @($ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
@@ -42,6 +42,9 @@ function New-Parent {
         task_id = 'task-fixture'; attempt_id = 'attempt-fixture'
         binding_id = 'binding-fixture'; binding_generation = 7
         result = [ordered]@{ operation_id = 'parent-fixture'; state = 'queued'; launch_state = $Phase }
+        native_mcp_connection_readback = [ordered]@{
+            schema_version = 1; state = 'ready'; dispatch_permitted = $false; model_consumed = 'unknown'
+        }
     }
 }
 
@@ -122,6 +125,70 @@ $progression = Invoke-ReadinessCase @((New-Parent 'awaiting_binding'), (New-Pare
 Assert-Case 'ready hello waits for participant issuance' ($progression.trace.polls -eq 3 -and $progression.trace.dispatched_poll -eq 3)
 Assert-Case 'one dispatch on the exact phase' ($progression.trace.dispatches -eq 1 -and $null -eq $progression.stop)
 Assert-Case 'safe success phase retained' ($progression.facts.launch.launch_phase -ceq 'awaiting_native_mcp')
+Assert-Case 'safe success connection state retained' ($progression.facts.launch.native_mcp_connection_state -ceq 'ready')
+
+# Reproduce Q: binding and launch phase are ready while the MCP link is missing.
+$missingMcp = New-Parent
+$missingMcp.Remove('native_mcp_connection_readback')
+$unavailableMcp = New-Parent
+$unavailableMcp.native_mcp_connection_readback.state = 'unavailable'
+$connectionProgression = Invoke-ReadinessCase @($missingMcp, $unavailableMcp, (New-Parent))
+Assert-Case 'ready phase waits for missing then unavailable MCP' ($connectionProgression.trace.polls -eq 3 -and
+    $connectionProgression.trace.dispatched_poll -eq 3)
+Assert-Case 'connection becoming ready permits only one dispatch' ($connectionProgression.trace.dispatches -eq 1 -and
+    $null -eq $connectionProgression.stop)
+Assert-Case 'connection success saves only closed state' ($connectionProgression.facts.launch.native_mcp_connection_state -ceq 'ready' -and
+    -not $connectionProgression.facts.launch.Contains('native_mcp_connection_readback') -and
+    -not $connectionProgression.facts.launch.Contains('schema_version'))
+
+$unavailable = Invoke-ReadinessCase @($unavailableMcp, $unavailableMcp)
+Assert-Case 'unavailable connection never dispatches' ($unavailable.trace.dispatches -eq 0 -and
+    $unavailable.stop -ceq 'LAUNCH_READY_READBACK_TIMEOUT')
+Assert-Case 'unavailable timeout retains closed reason and state' ($unavailable.stages[0].facts.readiness_failure.reason -ceq 'native_mcp_connection' -and
+    $unavailable.stages[0].facts.readiness_failure.observed_native_mcp_connection_state -ceq 'unavailable' -and
+    $unavailable.stages[0].facts.dispatch_started -eq $false)
+
+foreach ($damage in @('missing_card', 'null_card', 'array_card', 'scalar_card', 'private_state', 'pending_state', 'upper_state', 'array_state',
+        'missing_schema', 'future_schema', 'string_schema', 'boolean_schema', 'array_schema', 'floating_schema',
+        'missing_permission', 'permission_true', 'permission_string', 'permission_number', 'permission_null', 'permission_array',
+        'missing_consumption', 'consumed_model', 'array_consumption', 'null_consumption', 'extra_private_field', 'wrong_key_case')) {
+    $sample = New-Parent
+    $card = $sample.native_mcp_connection_readback
+    switch ($damage) {
+        'missing_card' { $sample.Remove('native_mcp_connection_readback') }
+        'null_card' { $sample.native_mcp_connection_readback = $null }
+        'array_card' { $sample.native_mcp_connection_readback = @($card) }
+        'scalar_card' { $sample.native_mcp_connection_readback = 'PRIVATE_MCP_CARD_MARKER' }
+        'private_state' { $card.state = 'PRIVATE_MCP_CARD_MARKER' }
+        'pending_state' { $card.state = 'pending' }
+        'upper_state' { $card.state = 'READY' }
+        'array_state' { $card.state = @('ready') }
+        'missing_schema' { $card.Remove('schema_version') }
+        'future_schema' { $card.schema_version = 2 }
+        'string_schema' { $card.schema_version = '1' }
+        'boolean_schema' { $card.schema_version = $true }
+        'array_schema' { $card.schema_version = @(1) }
+        'floating_schema' { $card.schema_version = 1.0 }
+        'missing_permission' { $card.Remove('dispatch_permitted') }
+        'permission_true' { $card.dispatch_permitted = $true }
+        'permission_string' { $card.dispatch_permitted = 'false' }
+        'permission_number' { $card.dispatch_permitted = 0 }
+        'permission_null' { $card.dispatch_permitted = $null }
+        'permission_array' { $card.dispatch_permitted = @($false) }
+        'missing_consumption' { $card.Remove('model_consumed') }
+        'consumed_model' { $card.model_consumed = 'true' }
+        'array_consumption' { $card.model_consumed = @('unknown') }
+        'null_consumption' { $card.model_consumed = $null }
+        'extra_private_field' { $card.private_detail = 'PRIVATE_MCP_CARD_MARKER' }
+        'wrong_key_case' { $card.Remove('schema_version'); $card['Schema_Version'] = 1 }
+    }
+    $result = Invoke-ReadinessCase @($sample)
+    Assert-Case ('connection ' + $damage + ' cannot dispatch') ($result.trace.dispatches -eq 0 -and
+        $result.stop -ceq 'LAUNCH_READY_READBACK_TIMEOUT')
+    Assert-Case ('connection ' + $damage + ' has closed diagnostics') ($result.stages[0].facts.readiness_failure.reason -ceq 'native_mcp_connection' -and
+        $result.stages[0].facts.readiness_failure.observed_native_mcp_connection_state -ceq 'unknown' -and
+        -not (($result.stages | ConvertTo-Json -Depth 12) -match 'PRIVATE_MCP_CARD_MARKER|schema_version|dispatch_permitted|model_consumed'))
+}
 
 $pending = Invoke-ReadinessCase @((New-Parent 'awaiting_participant_credential'))
 Assert-Case 'pending launch expires without dispatch' ($pending.stop -ceq 'LAUNCH_READY_READBACK_TIMEOUT' -and $pending.trace.dispatches -eq 0)

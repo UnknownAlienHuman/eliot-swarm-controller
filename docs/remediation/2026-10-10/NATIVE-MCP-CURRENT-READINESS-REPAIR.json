@@ -1,0 +1,94 @@
+{
+  "schema": "eliot.native_mcp_current_readiness_repair.v1",
+  "date": "2026-10-10",
+  "captured_at_utc": "2026-10-11T01:28:59.2145975Z",
+  "base_commit": "313e869f5fab0c3818a7413306dc7f542cd68f87",
+  "status": "source_and_affected_verifiers_pass_installed_pending",
+  "cause": {
+    "edition": "Q",
+    "opencode": "Exact owned service observed; C7 retained reading with settled native.mcp.observe child, no C8 metadata. The phase-only harness sent before current acknowledged MCP proof existed.",
+    "runtime_limit": "Retained after-run state does not date every C7 transition. Actual dispatch rejection and missing C8 record are proven; no native model consumption claimed.",
+    "evidence": {
+      "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\native-q-mcp-preparation-safe-readback.json",
+      "sha256": "96632274f9b05233328d83d3f7a6a499d3228206d918a58444bfffb58236447f"
+    }
+  },
+  "change": [
+    "Existing operation.get adds a closed current connection card only after existing launch diagnostic visibility. Historical and list receipts retain their existing projection.",
+    "Ready requires a bounded private record and the unchanged require_current_connection predicate, including exact current assignment, owned process, acknowledged install, challenge and inventory proof.",
+    "Harness requires the exact four-field ready card as well as previous exact parent/binding/generation/phase checks before its sole task.dispatch. Timeout retains a closed state only."
+  ],
+  "invariants": [
+    "Store dispatch revalidates its authority in its own transaction",
+    "dispatch_permitted remains false in readback",
+    "model_consumed remains unknown",
+    "no private proof bytes or raw error messages exposed",
+    "P and Q are preserved without replay"
+  ],
+  "source_sha256": {
+    "crates/swarm-kernel-host/src/store/object_reads.rs": "6c6c73c6bac74e60d3d18258b4279af34cb6da559007c536750c03f4feb16dc7",
+    "crates/swarm-kernel-host/src/store/mod.rs": "f6924a6252653405ba404d9c2ed3fd87a5b737aa0a080db837e0d3f30ba4d5be",
+    "crates/swarm-kernel-host/src/store/launcher_mcp_tools.rs": "dd9c019e598b1071c36bf322fe3e4ca0d23ffbf516d35ba2a98594fa30d60f96",
+    "crates/swarm-kernel-host/src/store/core_failure_tests.rs": "fc343f28120fea180f6ee1ea2fad48105d3d35d04bbe0840fe3e988109449956",
+    "tools/qualification/New-NativeQualification.ps1": "d349f252d4a57a68e635be2f0200f2182cbdad0648eb3304710fc8bc1a24ec51",
+    "tools/qualification/Test-LaunchDispatchReadiness.ps1": "671b920d429741ae02700892bc6753a16b58cdb3bd6ee86b9c411a477c6a4534"
+  },
+  "verification": {
+    "rust": "1.98.1",
+    "strict_production_clippy": {
+      "windows": {
+        "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\windows-current-mcp-readiness-clippy-result.json",
+        "sha256": "99c2d8bc274d3d2b47515185d4a8981f338c31d470c76829fd46e77f67e10ca2"
+      },
+      "linux": {
+        "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\linux-current-mcp-readiness-clippy-result.json",
+        "sha256": "ccb99446c8e9702348e194428d34336ccf4dec6299d1133e2aefb27445c1f447"
+      },
+      "status": "PASS"
+    },
+    "affected_public_rust": {
+      "windows": {
+        "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\windows-current-mcp-readiness-tests-result.json",
+        "sha256": "2c167b5e6b3b7ba0aa2f46aa5c39822baa80a945d6356104ae4e324f09f54222"
+      },
+      "linux": {
+        "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\linux-current-mcp-readiness-tests-result.json",
+        "sha256": "6f6f79bc70ac389c44ac632ee03a853582e49f2360f6619c8ff2c44427e84664"
+      },
+      "count_per_platform": 8,
+      "new_refusal_case_pass_retained_in_initial_logs": [
+        {
+          "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\windows-current-mcp-readiness-tests-before-phase-expectation.log",
+          "sha256": "bdcc89b488861636f05d3846d1945edf59aed1031cd7eedbc7c7913cc55ec282"
+        },
+        {
+          "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\linux-current-mcp-readiness-tests-before-phase-expectation.log",
+          "sha256": "64d686c65455621e3d41176ad36980793095357f1ede7c485253a5d10515d19d"
+        }
+      ],
+      "fixture_correction": "Two existing cases initially failed because their shared expected public receipt omitted launch_state from prior 0e70267. Updated expected awaiting_capability to match exact retained result. Seven affected shared-fixture cases then passed on each platform; new refusal PASS was retained without rerun.",
+      "status": "PASS"
+    },
+    "integrated_harness": {
+      "evidence": {
+        "path": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\current-mcp-readiness-harness-tests-result.json",
+        "sha256": "dabdf3c870b689c043b653ececc851acbe30b1ecfad004aa8514436078793ec2"
+      },
+      "assertions": 85,
+      "status": "PASS",
+      "native_calls": 0,
+      "model_calls": 0
+    },
+    "source_review": {
+      "parent": "reviewed source and unchanged admission predicate",
+      "independent": "pending",
+      "installed": "not_run_on_this_source"
+    }
+  },
+  "remaining": [
+    "Fresh installed OpenCode current MCP admission and model consumption",
+    "Antigravity requires its supported native producer contract; OpenCode proof is not fabricated",
+    "R48 installed readiness/eligibility/uncertain receipt/no replay",
+    "Current dependency alerts disposition"
+  ]
+}

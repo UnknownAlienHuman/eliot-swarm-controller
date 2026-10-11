@@ -2051,10 +2051,11 @@ impl Store {
                         }
                         if method == "operation.get" {
                             model::fields(&params, &["operation_id"])?;
-                            return object_reads::operation(
+                            return object_reads::current_operation(
                                 db,
                                 &principal,
                                 model::text(&params, "operation_id")?,
+                                &config,
                             );
                         }
                         return coordination::read(db, &principal, &method, &params);
@@ -4671,7 +4672,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "operation.get" => {
             model::fields(v, &["operation_id"])?;
             let id = model::text(v, "operation_id")?;
-            object_reads::operation(db, p, id)
+            object_reads::current_operation(db, p, id, config)
         }
         "agent.usage" => native_usage::read(db, p, v),
         "agent.state" => {

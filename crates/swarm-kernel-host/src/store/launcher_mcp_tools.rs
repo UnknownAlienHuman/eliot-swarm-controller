@@ -2142,6 +2142,35 @@ fn validate_current_scope(
     Ok(())
 }
 
+/// Closed readback of the same current predicate used at dispatch admission.
+/// This read neither installs MCP nor authorizes a later dispatch: admission
+/// rechecks the retained tuple and proofs in its own transaction.
+pub(super) fn current_connection_readback(
+    db: &Connection,
+    config: &Config,
+    launch_operation_id: &str,
+) -> Value {
+    let bounded_record = matches!(
+        read_diagnostic_meta(
+            db,
+            &record_key(launch_operation_id),
+            MAX_PUBLIC_C8_RECORD_BYTES
+        ),
+        Ok(DiagnosticMeta::Value(_))
+    );
+    json!({
+        "schema_version":1,
+        "state":if bounded_record
+            && require_current_connection(db, config, launch_operation_id, None).is_ok() {
+            "ready"
+        } else {
+            "unavailable"
+        },
+        "dispatch_permitted":false,
+        "model_consumed":"unknown",
+    })
+}
+
 /// Return the exact acknowledged C8 native tool proof for a current launch
 /// dispatch stage. This path is read-only: it never contacts OpenCode,
 /// upgrades a receipt, or claims that a model consumed the schemas.

@@ -671,6 +671,23 @@ function Test-ReadinessDispatchPhase {
     )
 }
 
+function Get-SafeReadinessNativeMcpConnectionState {
+    param([AllowNull()] $Card)
+    if (-not (Test-ReadinessRecordShape $Card)) { return 'unknown' }
+    $keys = if ($Card -is [System.Collections.IDictionary]) { @($Card.Keys) } else { @($Card.PSObject.Properties.Name) }
+    if ($keys.Count -ne 4 -or
+        (($keys | Sort-Object -CaseSensitive) -join ',') -cne 'dispatch_permitted,model_consumed,schema_version,state') { return 'unknown' }
+    $schema = Get-OptionalField -Object $Card -Name 'schema_version' -PreserveCollection
+    $state = Get-OptionalField -Object $Card -Name 'state' -PreserveCollection
+    $dispatchPermitted = Get-OptionalField -Object $Card -Name 'dispatch_permitted' -PreserveCollection
+    $modelConsumed = Get-OptionalField -Object $Card -Name 'model_consumed' -PreserveCollection
+    if (($schema -isnot [int] -and $schema -isnot [long]) -or $schema -ne 1 -or
+        $state -isnot [string] -or $state -cnotin @('ready', 'unavailable') -or
+        $dispatchPermitted -isnot [bool] -or $dispatchPermitted -ne $false -or
+        -not (Test-ReadinessStringEquals $modelConsumed 'unknown')) { return 'unknown' }
+    return $state
+}
+
 function Get-SafeReadinessIdentifier {
     param([AllowNull()] $Value)
     if ($Value -isnot [string]) { return $null }
@@ -680,7 +697,7 @@ function Get-SafeReadinessIdentifier {
 
 function New-ReadinessFailureFacts {
     param(
-        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase')][string] $Reason,
+        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase', 'native_mcp_connection')][string] $Reason,
         [AllowNull()] $TaskId,
         [AllowNull()] $AttemptId,
         [AllowNull()] $ModuleId,
@@ -690,6 +707,7 @@ function New-ReadinessFailureFacts {
         [long] $Generation,
         [AllowNull()] $Projection,
         [AllowNull()] $LaunchPhase,
+        [AllowNull()] $NativeMcpConnectionState,
         [AllowNull()] $ErrorCode
     )
 
@@ -719,6 +737,8 @@ function New-ReadinessFailureFacts {
         observed_binding_state = Get-SafeReadinessBindingState $observedBindingState
         observed_supervisor_phase = Get-SafeReadinessSupervisorPhase $observedSupervisorPhase
         observed_launch_phase = Get-SafeReadinessLaunchPhase $LaunchPhase
+        observed_native_mcp_connection_state = if ($NativeMcpConnectionState -is [string] -and
+            $NativeMcpConnectionState -cin @('ready', 'unavailable')) { $NativeMcpConnectionState } else { 'unknown' }
         error_code = $observedErrorCode
     }
 }
@@ -2131,8 +2151,10 @@ try {
     [long]$readinessGeneration = 0
     $lastReadinessProjection = Get-SafeReadinessProjection $null
     $lastLaunchPhase = $null
+    $lastNativeMcpConnectionState = 'unknown'
     $lastReadinessErrorCode = Get-SafeReadinessErrorCode $launch.error_code
     while ([DateTime]::UtcNow -lt $deadline) {
+        $lastNativeMcpConnectionState = 'unknown'
         $operations = Get-Operations -TimeoutMilliseconds 30000
         if (-not $operations.success) {
             $readinessFailureReason = 'operation_count_scope'
@@ -2275,6 +2297,15 @@ try {
             Start-Sleep -Milliseconds 750
             continue
         }
+        # A retained launch phase does not prove the current native MCP link.
+        # This diagnostic is readiness evidence, not permission or consumption.
+        $lastNativeMcpConnectionState = Get-SafeReadinessNativeMcpConnectionState (
+            Get-OptionalField -Object $parentOp -Name 'native_mcp_connection_readback' -PreserveCollection)
+        if ($lastNativeMcpConnectionState -cne 'ready') {
+            $readinessFailureReason = 'native_mcp_connection'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
         $readyProof = [pscustomobject]@{
             parent = $parentOp; open = $openOp; binding_id = $bindingId; generation = $generation
             state = $state; supervisor = $supervisor
@@ -2286,7 +2317,8 @@ try {
         $readinessFailureFacts = New-ReadinessFailureFacts -Reason $readinessFailureReason `
             -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id `
             -ArtifactVersion $contract.version -BindingId $readinessBindingId -Generation $readinessGeneration `
-            -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase -ErrorCode $lastReadinessErrorCode
+            -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase `
+            -NativeMcpConnectionState $lastNativeMcpConnectionState -ErrorCode $lastReadinessErrorCode
         Add-Stage -Name 'module_open_and_hello' -Status 'unknown' -Code $code -Facts ([ordered]@{
             parent_operation_id = $parentOperationId
             dispatch_started = $false
@@ -2298,7 +2330,7 @@ try {
     $openOperationId = [string]$readyProof.open.operation_id
     $bindingId = [string]$readyProof.binding_id
     $generation = [long]$readyProof.generation
-    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; launch_phase = 'awaiting_native_mcp'; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
+    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; launch_phase = 'awaiting_native_mcp'; native_mcp_connection_state = 'ready'; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
     Add-Stage -Name 'module_open_and_hello' -Status 'passed' -Facts $script:Report.safe_facts.launch
 
     $script:CurrentStage = 'single_task_dispatch'

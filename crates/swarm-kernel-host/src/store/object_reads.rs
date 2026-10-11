@@ -97,6 +97,25 @@ pub(super) fn operation(db: &Connection, p: &Principal, id: &str) -> Result<Valu
     operations::project_operation(db, p, id, grant)
 }
 
+pub(super) fn current_operation(
+    db: &Connection,
+    p: &Principal,
+    id: &str,
+    config: &crate::config::Config,
+) -> Result<Value> {
+    let mut operation = operation(db, p, id)?;
+    // These cards are added only after the existing narrow launch diagnostic
+    // grant. A receipt-only reader cannot discover current connection state.
+    if operation["method"] == "swarm.launch"
+        && (operation.get("native_mcp_readback").is_some()
+            || operation.get("native_mcp_tools_readback").is_some())
+    {
+        operation["native_mcp_connection_readback"] =
+            super::launcher_mcp_tools::current_connection_readback(db, config, id);
+    }
+    Ok(operation)
+}
+
 fn require_evidence(
     db: &Connection,
     p: &Principal,

@@ -1,5 +1,15 @@
 # Current-source audit and implementation ledger
 
+The [current MCP readiness repair](../2026-10-10/NATIVE-MCP-CURRENT-READINESS-REPAIR.json)
+adds a closed readback through existing authorized `operation.get` launch
+diagnostics, using the unchanged dispatch connection predicate. The harness now
+waits for this exact proof before its sole dispatch. Strict host production Clippy
+passes on Windows and Linux; eight affected public Rust cases pass on each
+platform, and the integrated readiness fixture passes 85 assertions with no
+native/model calls. Missing, damaged and historical ready labels stay non-ready.
+Fresh installed OpenCode execution, Antigravity's supported producer contract and
+R48 acceptance remain open.
+
 Fresh [Q execution](../2026-10-10/EXECUTION-RESULTS-Q.json) built and installed
 eight release packages from exact clean `0e70267`. The phase-readiness repair
 worked on both adapters: each sole dispatch followed the retained

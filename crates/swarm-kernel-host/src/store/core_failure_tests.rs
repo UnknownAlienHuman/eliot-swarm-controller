@@ -202,6 +202,7 @@ fn fixture() -> Fixture {
         public_launch_receipt: json!({
             "operation_id":LAUNCH_OPERATION_ID,
             "state":"queued",
+            "launch_state":"awaiting_capability",
         }),
         admission_result_json,
         observation_id,
@@ -1002,6 +1003,53 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
 }
 
 #[test]
+fn native_mcp_connection_readiness_does_not_trust_a_retained_ready_label() {
+    let fixture = fixture();
+    let caller = principal(ORIGINAL_GM, Role::Manager);
+    let read = || {
+        store_read(
+            &fixture.db,
+            caller.clone(),
+            "operation.get",
+            json!({"operation_id":LAUNCH_OPERATION_ID}),
+        )
+    };
+    assert!(read().get("native_mcp_connection_readback").is_none());
+    set_native_mcp_manifest(
+        &fixture,
+        json!({"state":"reading","attempts":1,"dispatch_permitted":false}),
+        Value::Null,
+    );
+    let expected = json!({
+        "schema_version":1,"state":"unavailable",
+        "dispatch_permitted":false,"model_consumed":"unknown",
+    });
+    assert_eq!(read()["native_mcp_connection_readback"], expected);
+    let record_key =
+        native_mcp_tools_meta_key("launcher:native_mcp_tools:v1:", LAUNCH_OPERATION_ID);
+    set_meta(
+        &fixture.db,
+        &record_key,
+        &json!({
+            "schema_version":1,"kind":"launcher_native_mcp_tools",
+            "operation_id":LAUNCH_OPERATION_ID,"state":"ready",
+            "install":{"state":"registered","readback":{"runtime_status":"connected"}},
+            "challenge":{"state":"observed"},"tools_readback":{},
+        }),
+    )
+    .unwrap();
+    assert_eq!(read()["native_mcp_connection_readback"], expected);
+    // A historical/list receipt never substitutes for the current readback.
+    let receipt =
+        super::object_reads::operation(&fixture.db, &caller, LAUNCH_OPERATION_ID).unwrap();
+    assert!(receipt.get("native_mcp_connection_readback").is_none());
+    assert_eq!(
+        stored_admission_result(&fixture.db),
+        fixture.admission_result_json
+    );
+}
+
+#[test]
 fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
     const RAW_MESSAGE: &str = "RAW_C8_ERROR_MESSAGE_private_6312";
     const RAW_AUTH: &str = "RAW_C8_AUTH_private_9124";
@@ -1083,6 +1131,16 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
     });
     assert_eq!(original_operation["result"], fixture.public_launch_receipt);
     assert_eq!(original_operation["native_mcp_tools_readback"], expected);
+    let unavailable_connection = json!({
+        "schema_version":1,
+        "state":"unavailable",
+        "dispatch_permitted":false,
+        "model_consumed":"unknown",
+    });
+    assert_eq!(
+        original_operation["native_mcp_connection_readback"], unavailable_connection,
+        "retained historical C8 state does not establish a current connection"
+    );
     let original_json = serde_json::to_string(&original_operation).unwrap();
     for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
         assert!(!original_json.contains(marker));
@@ -1097,6 +1155,10 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
     );
     assert_eq!(successor_operation["result"], fixture.public_launch_receipt);
     assert_eq!(successor_operation["native_mcp_tools_readback"], expected);
+    assert_eq!(
+        successor_operation["native_mcp_connection_readback"],
+        unavailable_connection
+    );
     let former_operation = store_read(
         &fixture.db,
         principal(ORIGINAL_GM, Role::Manager),
@@ -1105,6 +1167,10 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
     );
     assert_eq!(former_operation["result"], fixture.public_launch_receipt);
     assert_eq!(former_operation["native_mcp_tools_readback"], expected);
+    assert_eq!(
+        former_operation["native_mcp_connection_readback"],
+        unavailable_connection
+    );
     assert!(former_operation.get("manager_action_required").is_none());
     assert!(
         former_operation
