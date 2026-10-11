@@ -63,6 +63,18 @@ pub(crate) struct OwnedServiceExpectation {
 }
 
 impl OwnedServiceExpectation {
+    #[cfg(test)]
+    pub(crate) fn offline_proof_fixture(process_id: u32) -> Self {
+        Self {
+            process_id,
+            process_birth_token: "offline-fixture".into(),
+            executable_sha256: model::digest(b"offline-fixture-image"),
+            identity_digest: format!("sha256:{}", model::digest(b"offline-fixture-owner")),
+            proof_digest: model::digest(b"offline-fixture-proof"),
+            provider_auth_required: false,
+        }
+    }
+
     pub(crate) fn process_id(&self) -> u32 {
         self.process_id
     }

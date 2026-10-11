@@ -1,0 +1,132 @@
+{
+  "schema": "eliot.native_mcp_offline_roundtrip.v1",
+  "recorded_at_utc": "2026-10-11T02:16:55.4603058Z",
+  "base_commit": "61762d28f617e5884e35fc4b39d240edd3c39fb9",
+  "scope": "One offline producer-to-Store-consumer-to-dispatch-admission integration fixture",
+  "execution_path": [
+    "Typed PluginReadback using actual Participant core contracts and new_challenge",
+    "Actual project_readback serializer",
+    "serde_json byte serialization and parse",
+    "Complete private validate_connection_record used by current Store admission",
+    "Actual production build_packet"
+  ],
+  "production_change": "Extract retained payload validation into one private consumer; current Store snapshot and lazy provider-auth reads preserve their existing guard order",
+  "synthetic_context": "Launch/install and owned-service context only; no live authority is established",
+  "source_sha256": {
+    "crates/swarm-kernel-host/src/store/launcher_mcp_tools.rs": "f2619649a3549d4fa4ad2c623b73acd83513ec17b6b763dbaa478c40ea3e1ccb",
+    "crates/swarm-kernel-host/src/store/launcher_mcp_projection_tests.rs": "39d1a23d3e8a66b7f5d2bd56cc171567d0a8392c0085dade8ca9f0b934254352",
+    "crates/swarm-kernel-host/src/store/launcher_native_mcp.rs": "bf6e4b88b36b7308e402b347a0bb8e0c82fba28a7958be6d52068bd324ec7e43",
+    "crates/swarm-kernel-host/src/runtime/opencode_v2/mcp_tools.rs": "b9da0eb4d8fbd683a7f28ab423f01644709bdb02a40c93d313e3454a6b22300f",
+    "crates/swarm-kernel-host/src/runtime/opencode_v2/http.rs": "75aa1df72eee55891ab4f4d64584bb94330e6dc22aeb9f0e809517630525090f",
+    "crates/swarm-kernel-host/src/store/launcher_dispatch/preinput_contract_tests.rs": "250e0a834eac49dc3934950b0f447fdffb5399025d256f1e0f128c2f6dcdd9f6",
+    "crates/swarm-kernel-host/src/store/launcher_dispatch.rs": "71cf6fb8c35be2d626dca050ebc2423b577de477c49f7f264bee6d772cc6b16f"
+  },
+  "checks": [
+    {
+      "platform": "windows",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log_sha256": "908b54370661f1fae443d328aeffc5d4f996a979448aba0637d0aa2ea7ceb613",
+      "completed_at_utc": "2026-10-11T02:15:06.9744652Z",
+      "selected_tests": null
+    },
+    {
+      "platform": "windows",
+      "gate": "tests",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(actual_mcp_producer_roundtrips_through_store_consumer_and_admission)"
+      ],
+      "log_sha256": "9bcc0a0282b44aa82e2316d9e98946f53bb3c3759b8e14eb32a46a92e27ccf7e",
+      "completed_at_utc": "2026-10-11T02:15:44.070797Z",
+      "selected_tests": 1
+    },
+    {
+      "platform": "linux",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log_sha256": "82913dd282c1022f5b84e9d9f1e3e4885fa5cf97be749279f8ab4256a7c37ec4",
+      "completed_at_utc": "2026-10-11T02:15:14.7243034Z",
+      "selected_tests": null
+    },
+    {
+      "platform": "linux",
+      "gate": "tests",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(actual_mcp_producer_roundtrips_through_store_consumer_and_admission)"
+      ],
+      "log_sha256": "e078b3047fffc2731711220b2efeb03c191897d1b88d8b93cc8ad96a298dac0a",
+      "completed_at_utc": "2026-10-11T02:15:55.4645632Z",
+      "selected_tests": 1
+    }
+  ],
+  "assertions": [
+    "Producer emits explicit null digests for both unknown pre-input hooks",
+    "Complete consumer accepts actual versioned serialized proof and canonical digests",
+    "Admission accepts the exact consumer result and selected model",
+    "Removing emitted session digest is refused even after recomputing enclosing digest"
+  ],
+  "resource_setup": {
+    "mode": "Existing explicit debug source-resource opt-in",
+    "source_resources": "Actual repository plugin source and real npm ci from frozen lock",
+    "npm_lock_sha256": "7d51850063e021a6155f9c8a0955249a1267bde72c001f99580e3ad1880370da",
+    "no_vendor_process": true,
+    "no_provider_calls": true
+  },
+  "independent_review": {
+    "status": "PENDING",
+    "scope": "Independent seven-file read-only source review; parent source review and mechanical gates complete"
+  },
+  "limitations": [
+    "Current Store snapshot, OS/process custody, and provider-auth authority are not qualified by the offline fixture",
+    "Native installation, model consumption, causal model result, Antigravity, and R48 qualification remain pending"
+  ],
+  "status": "OFFLINE_ROUNDTRIP_VERIFIED"
+}

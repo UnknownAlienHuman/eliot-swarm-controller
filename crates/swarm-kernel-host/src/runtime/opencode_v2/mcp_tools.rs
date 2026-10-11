@@ -1359,6 +1359,77 @@ fn schema_error(message: &str) -> Error {
     Error::new("NATIVE_MCP_PROOF_SCHEMA", message)
 }
 
+/// Exercise the actual typed producer and serializer without a vendor process
+/// or HTTP call. Only fixture data is synthetic; no output shape is duplicated.
+#[cfg(test)]
+pub(crate) fn offline_preinput_proof_fixture(
+    assignment: AssignmentContext,
+    options: &Options,
+    service_pid: u32,
+    server_name: &str,
+) -> Result<(Value, Value)> {
+    let service = Service::offline_proof_fixture(service_pid, PINNED_VERSION);
+    let challenge = new_challenge(assignment, &service, options)?;
+    let tools = crate::mcp::participant_core_tool_contracts()?
+        .into_iter()
+        .map(|tool| NativeTool {
+            server: server_name.to_owned(),
+            name: tool["name"].as_str().unwrap().to_owned(),
+            description: "Participant core tool".to_owned(),
+            input_schema: tool["input_schema"].clone(),
+            codemode: None,
+        })
+        .collect();
+    let raw = PluginReadback {
+        plugin_id: PLUGIN_ID.into(),
+        module_path: challenge.module_path.to_str().unwrap().to_owned(),
+        module_sha256: challenge.module_sha256.clone(),
+        service_id: challenge.service_id.clone(),
+        service_pid,
+        service_version: PINNED_VERSION.into(),
+        directory: challenge.directory.clone(),
+        challenge_id: challenge.challenge_id.clone(),
+        nonce: challenge.nonce.clone(),
+        issued_at_ms: challenge.issued_at_ms,
+        expires_at_ms: challenge.expires_at_ms,
+        assignment: challenge.assignment.as_value(),
+        expected_model: options.model.clone(),
+        session_id: challenge.assignment.native_session_id().into(),
+        receipt_observed_at_ms: challenge.issued_at_ms,
+        observation_sequence: 0,
+        native_discovered: NativeDiscovery {
+            status: "observed".into(),
+            observed_at_ms: challenge.issued_at_ms,
+            tools,
+        },
+        session_context: SessionContextEvidence {
+            status: "unknown".into(),
+            stage: None,
+            observed_at_ms: None,
+            agent: None,
+            tools: Vec::new(),
+            reason_code: None,
+        },
+        provider_request: ProviderRequestEvidence {
+            status: "unknown".into(),
+            transport: None,
+            stage: None,
+            kind: None,
+            observed_at_ms: None,
+            agent: None,
+            model: None,
+            tools: Vec::new(),
+            reason_code: None,
+        },
+        model_consumed: "unknown".into(),
+    };
+    validate_readback(&raw, &challenge, &service, options)?;
+    Ok((
+        project_readback(raw, &challenge, &service)?,
+        challenge_metadata(&challenge),
+    ))
+}
+
 #[cfg(test)]
 mod plugin_package_path_tests {
     use super::{

@@ -1716,4 +1716,4 @@ fn stale_capability(message: &str) -> Error {
 }
 
 #[cfg(test)]
-mod preinput_contract_tests;
+pub(in crate::store) mod preinput_contract_tests;

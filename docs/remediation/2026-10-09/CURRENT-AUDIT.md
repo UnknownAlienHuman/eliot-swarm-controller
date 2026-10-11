@@ -1,5 +1,14 @@
 # Current-source audit and implementation ledger
 
+The [offline MCP round-trip](../2026-10-10/NATIVE-MCP-OFFLINE-ROUNDTRIP.json)
+now verifies the actual typed producer and versioned JSON serializer through the
+complete retained Store payload consumer into production dispatch admission.
+Both unknown pre-input hooks retain explicit null digests. Removing a producer
+stage digest is rejected even with a valid recomputed enclosing digest. Strict
+host production Clippy and the one integration fixture pass on Windows and Linux.
+Current Store authority, live process custody, provider auth, native execution
+and model consumption remain outside this offline proof.
+
 The [C8 stage digest repair](../2026-10-10/NATIVE-MCP-PROJECTION-DIGEST-REPAIR.json)
 consumes the exact producer format and validates each retained stage digest.
 Unknown hooks keep explicit null digests and stay unknown. Observed and

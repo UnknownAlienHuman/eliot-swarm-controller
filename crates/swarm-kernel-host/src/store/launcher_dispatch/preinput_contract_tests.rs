@@ -8,7 +8,7 @@ const ATTEMPT_ID: &str = "attempt-preinput-packet-fixture";
 const BINDING_ID: &str = "binding-preinput-packet-fixture";
 const ROUTE_ALIAS: &str = "preinput-packet-route";
 const PARTICIPANT_ID: &str = "participant-preinput-packet-fixture";
-const NATIVE_ROOT_ID: &str = "native-root-preinput-packet-fixture";
+const NATIVE_ROOT_ID: &str = "ses_preinput_packet_fixture";
 const SERVER_NAME: &str = "fixture-native-mcp-server";
 const SERVICE_ID: &str = "fixture-native-mcp-service";
 const PROVIDER_ID: &str = "fixture-provider";
@@ -230,6 +230,19 @@ fn packet_fixture() -> PacketFixture {
         attempt,
         binding,
         proof,
+    }
+}
+
+/// Offline bridge from the real MCP readback producer fixture into the
+/// production dispatch-packet consumer. `None` exposes only the pre-input
+/// context fixture; a supplied proof is validated by the real `build_packet`.
+pub(in crate::store) fn offline_mcp_packet_fixture(
+    proof: Option<Value>,
+) -> crate::error::Result<Value> {
+    let fixture = packet_fixture();
+    match proof {
+        Some(proof) => build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        None => Ok(fixture.proof),
     }
 }
 

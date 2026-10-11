@@ -252,6 +252,17 @@ fn authenticated_service(record: ConnectionRecord, expected_version: String) -> 
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn offline_proof_fixture(pid: u32, version: &str) -> Self {
+        Self {
+            client: Client::new(),
+            endpoint: Url::parse("http://127.0.0.1:1").unwrap(),
+            pid,
+            version: version.to_owned(),
+            owned_process: None,
+        }
+    }
+
     pub(crate) async fn connect(options: &Options) -> Result<Self> {
         let path = options.connection_file.clone();
         let record = tokio::task::spawn_blocking(move || record(&path))

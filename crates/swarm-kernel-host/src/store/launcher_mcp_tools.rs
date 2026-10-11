@@ -2211,7 +2211,29 @@ pub(crate) fn require_current_connection(
             "exact acknowledged native MCP proof is not retained",
         )
     })?;
-    validate_record(&record, &facts, &assignment)?;
+    validate_connection_record(&record, &facts, dispatch_operation_id, || {
+        validated_provider_auth_projection(db, &snapshot, owned_service)
+    })
+}
+
+// Keep the current Store snapshot and provider-auth reads in the caller.
+// This is the same complete payload consumer for live admission and the
+// offline producer/consumer/admission fixture; it has no public entrypoint.
+fn validate_connection_record(
+    record: &Value,
+    facts: &LaunchFacts,
+    dispatch_operation_id: Option<&str>,
+    provider_auth: impl FnOnce() -> Result<Option<Value>>,
+) -> Result<Value> {
+    let identity_digest = &facts.identity_digest;
+    let assignment = &facts.assignment;
+    let owned_service = facts.owned_service.as_ref().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "dispatch requires the retained owned-service process identity",
+        )
+    })?;
+    validate_record(record, facts, assignment)?;
     if record["install"]["state"] != "registered"
         || record["install"]["readback"]["runtime_status"] != "connected"
         || record["challenge"]["state"] != "observed"
@@ -2436,7 +2458,7 @@ pub(crate) fn require_current_connection(
             "native MCP proof does not match the current owned-service process",
         ));
     }
-    let provider_auth = validated_provider_auth_projection(db, &snapshot, owned_service)?;
+    let provider_auth = provider_auth()?;
     let service_process_identity_digest = digest_json(&json!({
         "process_id":owned_service.process_id(),
         "process_birth_token":owned_service.process_birth_token(),
