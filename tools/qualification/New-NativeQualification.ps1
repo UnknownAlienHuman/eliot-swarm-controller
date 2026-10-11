@@ -32,8 +32,8 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedModuleOwnerHelperSha256,
     [ValidateSet('OpenCode', 'Command', 'Codex', 'Antigravity', 'Claude')][string] $Adapter = 'OpenCode',
     [Guid] $RunId,
-    [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
-    [string] $OpenCodeCommandTestModelRef = 'kilo/stepfun-step-5-preview-free',
+    [ValidatePattern('\A[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+(?:/[A-Za-z0-9._:-]+)*\z')]
+    [string] $OpenCodeCommandTestModelRef = 'kilo/stepfun/step-5-preview-free',
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
     [string] $CommandTestModelId = 'kilo/stepfun-step-5-preview-free',
     [ValidateRange(30, 300)][int] $TimeoutSeconds = 180,
@@ -1257,7 +1257,7 @@ function Get-AdapterContract {
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.opencode_interaction_observation@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = 'opencode-v2-native-options'; expected_config_schema_version = '3'; expected_config_schema_sha256 = '070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e';
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
-                expected_provider = ($OpenCodeCommandTestModelRef.Split('/')[0]); expected_model = ($OpenCodeCommandTestModelRef.Split('/')[1]); expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
+                expected_provider = ($OpenCodeCommandTestModelRef -split '/', 2)[0]; expected_model = ($OpenCodeCommandTestModelRef -split '/', 2)[1]; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
             }
         }
         'Command' {

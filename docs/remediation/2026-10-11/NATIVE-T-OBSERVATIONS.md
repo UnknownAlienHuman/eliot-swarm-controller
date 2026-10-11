@@ -34,8 +34,9 @@ The installed core 2.0.7 source names the unauthenticated public catalog
 `2026-10-11T08:56:33Z` lists `providerID=kilo`, native
 `id=stepfun/step-5-preview-free` and `high` reasoning effort. The shipped
 snapshot lacks Step 5 free. The failed run requested the flattened id
-`stepfun-step-5-preview-free`, and the current qualification parameter/parser
-cannot express the native slash-containing id. Correcting that coordinate
+`stepfun-step-5-preview-free`, and its qualification parameter/parser
+could not express the native slash-containing id. The [coordinate repair](OPENCODE-NATIVE-MODEL-COORDINATE.md)
+now preserves it in the current harness. Correcting that coordinate
 preserves the requested Step 5 free model; it is not a substitute model.
 The failed run's specific server catalog was not recovered, and public catalog
 visibility alone does not establish that server's readiness or authorization.

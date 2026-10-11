@@ -1,5 +1,11 @@
 # Current-source audit and implementation ledger
 
+The [OpenCode native coordinate repair](../2026-10-11/OPENCODE-NATIVE-MODEL-COORDINATE.md)
+preserves the model id `stepfun/step-5-preview-free` after the provider boundary.
+Its actual-parameter/contract fixture passes 21/21 on both platforms without
+model calls. The requested Step 5 free model and high variant are unchanged;
+selected-server catalog qualification remains pending.
+
 The [qualification observation repair](../2026-10-11/QUALIFICATION-OBSERVATION-REPAIR.md)
 adds bounded R48 witness observation, feature-only first-admit diagnosis and
 immediate scoped rejected-open reporting. Strict affected Rust Clippy passes
