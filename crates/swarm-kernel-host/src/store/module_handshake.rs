@@ -591,32 +591,52 @@ pub(super) fn read_catalog(
             .ok_or_else(|| Error::invalid("limit must be 1..8"))? as usize,
     };
     let registry = load_registry(db)?;
-    let end = after.saturating_add(limit).min(registry.descriptors.len());
-    let descriptors = if after < end {
-        registry.descriptors[after..end]
-            .iter()
-            .map(public_descriptor)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let descriptor_count = registry.descriptors.len();
+    let mut page_end = after.saturating_add(limit).min(descriptor_count);
     let selections = registry
         .selections
         .get(&principal.client_id)
         .cloned()
         .unwrap_or_default();
-    let result = json!({
-        "schema_version":registry.schema_version,
-        "catalog_revision":registry.revision,
-        "host_protocol":{"major":HOST_PROTOCOL.major,"minor":HOST_PROTOCOL.minor},
-        "descriptor_count":registry.descriptors.len(),
-        "after":after,
-        "descriptors":descriptors,
-        "next_after":if end < registry.descriptors.len() { json!(end) } else { Value::Null },
-        "route_selections":selections,
-        "launch_details":"redacted",
-    });
-    bounded_json(&result, MAX_PAGE_BYTES, "module catalog page")?;
+    let result = loop {
+        let descriptors = if after < page_end {
+            registry.descriptors[after..page_end]
+                .iter()
+                .map(public_descriptor)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let result = json!({
+            "schema_version":registry.schema_version,
+            "catalog_revision":registry.revision,
+            "host_protocol":{"major":HOST_PROTOCOL.major,"minor":HOST_PROTOCOL.minor},
+            "descriptor_count":descriptor_count,
+            "after":after,
+            "descriptors":descriptors,
+            "next_after":if page_end < descriptor_count { json!(page_end) } else { Value::Null },
+            "route_selections":selections,
+            "launch_details":"redacted",
+        });
+        let page_bytes = model::canonical(&result)?.len();
+        if page_bytes <= MAX_PAGE_BYTES {
+            if page_end == after && after < descriptor_count {
+                return Err(Error::new(
+                    "MODULE_CATALOG_TOO_LARGE",
+                    "module catalog page cannot fit its next descriptor",
+                ));
+            }
+            break result;
+        }
+        if page_end > after {
+            page_end -= 1;
+            continue;
+        }
+        return Err(Error::new(
+            "MODULE_CATALOG_TOO_LARGE",
+            "module catalog page exceeds its size limit",
+        ));
+    };
     Ok(result)
 }
 
@@ -1251,6 +1271,75 @@ mod tests {
                 ["version"],
             "2.1.0"
         );
+    }
+
+    #[test]
+    fn read_catalog_shrinks_large_descriptor_pages_without_gaps() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let expected = (0..8)
+            .map(|index| format!("example.adapter.{index}"))
+            .collect::<Vec<_>>();
+
+        for index in 0..8 {
+            let mut candidate = descriptor();
+            candidate.module_id = ModuleId::new(format!("example.adapter.{index}")).unwrap();
+            candidate.artifact.artifact_id =
+                ArtifactId::new(format!("example-artifact-{index}")).unwrap();
+            candidate.command_schemas = (0..300)
+                .map(|schema_index| SchemaDescriptor {
+                    schema_id: format!("schema.{}.{}", "x".repeat(110), schema_index),
+                    version: format!("1.{}", "0".repeat(126)),
+                    sha256: None,
+                })
+                .collect();
+            candidate.validate().unwrap();
+            let encoded = serde_json::to_value(&candidate).unwrap();
+            assert!(model::canonical(&encoded).unwrap().len() <= MAX_DESCRIPTOR_BYTES);
+            register_trusted_descriptor(&tx, candidate).unwrap();
+        }
+
+        let registry = load_registry(&tx).unwrap();
+        let projected_descriptor_bytes = registry
+            .descriptors
+            .iter()
+            .map(|entry| model::canonical(&public_descriptor(entry)).unwrap().len())
+            .sum::<usize>();
+        assert!(projected_descriptor_bytes > MAX_PAGE_BYTES);
+
+        let manager = Principal {
+            link_id: "catalog-link".to_owned(),
+            client_id: "catalog-manager".to_owned(),
+            role: Role::Manager,
+        };
+        let mut after = 0usize;
+        let mut observed = Vec::new();
+        loop {
+            let page = read_catalog(&manager, &json!({"after":after}), &tx).unwrap();
+            assert!(model::canonical(&page).unwrap().len() <= MAX_PAGE_BYTES);
+            assert_eq!(page["after"].as_u64(), Some(u64::try_from(after).unwrap()));
+            let descriptors = page["descriptors"].as_array().unwrap();
+            if after == 0 {
+                assert!(descriptors.len() < MAX_PAGE_ITEMS);
+            }
+            observed.extend(
+                descriptors
+                    .iter()
+                    .map(|descriptor| descriptor["module_id"].as_str().unwrap().to_owned()),
+            );
+            match page["next_after"].as_u64() {
+                Some(next_after) => {
+                    let next_after = usize::try_from(next_after).unwrap();
+                    assert_eq!(next_after, after + descriptors.len());
+                    assert!(next_after > after);
+                    after = next_after;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(observed, expected);
     }
 
     #[test]
