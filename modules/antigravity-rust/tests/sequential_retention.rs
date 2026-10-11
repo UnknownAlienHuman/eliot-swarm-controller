@@ -203,14 +203,57 @@ fn oversized_body_is_not_published_as_truncated_text() {
     );
 }
 #[test]
-fn failed_stream_invalidates_retained_body() {
-    let mut state = state();
-    state.consume_line(&result(ROOT, "answer"));
-    assert!(state.retained_response_for(1, ROOT, 0).is_ok());
-    state.note_stream_failure();
-    assert_eq!(
-        state.retained_response_for(1, ROOT, 0).unwrap_err(),
-        RetainedResponseMiss::Absent
+fn completed_ack_body_survives_stream_departure_while_inflight_turn_stays_unknown() {
+    with_contract(
+        "completed_ack_body_survives_stream_departure_while_inflight_turn_stays_unknown",
+        || {
+            for departure in ["failure", "child_exit", "stream_end"] {
+                let mut controller = controller();
+                let completed = dispatch("op-completed");
+                settle(&mut controller, &completed, "sealed answer");
+                let inflight = dispatch("op-inflight");
+                controller.begin_prompt(&inflight).unwrap();
+                let unknown = match departure {
+                    "failure" => controller.stdout_failed(),
+                    "child_exit" => controller.child_exited(Some(0)),
+                    _ => controller.stream_ended(),
+                }
+                .expect("in-flight prompt retains an unknown outcome");
+                assert_eq!(unknown.operation_id, inflight.operation_id);
+                assert_eq!(
+                    unknown.outcome,
+                    swarm_contracts::runtime::EffectOutcome::Unknown
+                );
+                controller.acknowledge_outcome(&inflight.operation_id);
+                controller.consume_line(&result(ROOT, "late unsealed answer"));
+                assert!(controller.settle_terminal().is_none());
+                let page =
+                    result_page::build_normalized(&page_command(&completed, 0, 100), &controller)
+                        .unwrap();
+                assert_eq!(
+                    page["page"]["source"]["payload_sha256"],
+                    hash(b"sealed answer")
+                );
+                assert_eq!(page["page"]["byte_length"], b"sealed answer".len());
+                assert_eq!(page["page"]["eof"], true);
+                assert_eq!(
+                    controller
+                        .retained_response_for_operation(
+                            &completed.operation_id,
+                            &origin(&completed)
+                        )
+                        .unwrap()
+                        .body,
+                    "sealed answer"
+                );
+                assert_eq!(
+                    result_page::build_normalized(&page_command(&inflight, 0, 100), &controller)
+                        .unwrap_err()
+                        .code,
+                    "RESULT_BODY_UNAVAILABLE"
+                );
+            }
+        },
     );
 }
 #[test]

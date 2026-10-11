@@ -329,9 +329,8 @@ impl StreamState {
 
     pub fn note_stream_failure(&mut self) {
         // A broken stream can no longer prove that the next result belongs to
-        // the prompt still in flight. Invalidate retained bodies so a later
-        // normalized result page cannot attribute a stale body to a new turn.
-        self.retained_responses.clear();
+        // the prompt still in flight. The Controller makes that prompt unknown;
+        // already sealed turns keep their exact bodies under bounded eviction.
         self.phase = Phase::StreamFailed;
         self.execution = "stream_failed";
         self.stream_error_code = Some("NATIVE_STREAM_FAILED");
@@ -343,7 +342,8 @@ impl StreamState {
     }
 
     pub fn note_stream_end(&mut self, exit_code: Option<i32>) {
-        self.retained_responses.clear();
+        // Departure does not invalidate bodies observed and sealed before it.
+        // Exact Operation and generation checks still fence every later page.
         self.phase = Phase::StreamEnded;
         self.execution = "stream_ended";
         self.exit_code = exit_code;
