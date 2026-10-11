@@ -1,12 +1,19 @@
+mod retention;
+#[cfg(test)]
+mod retention_tests;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use swarm_contracts::{
     error::{Error, Result},
@@ -20,7 +27,6 @@ use swarm_process::{
 const RECORD_LIMIT: usize = 1_048_576;
 const HISTORY_LIMIT: usize = 8 * RECORD_LIMIT;
 const OUTBOX_BATCH: usize = 32;
-const RETENTION_DELETE_BATCH: usize = 32;
 const RETENTION_ACK_INTERVAL: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,9 +162,11 @@ pub struct OperationRecoveryState {
 #[derive(Debug, Default)]
 pub struct RetentionSummary {
     pub reclaimed: usize,
+    pub examined: usize,
     pub complete: bool,
 }
 
+#[derive(Clone)]
 struct RetainedOperation {
     operation_id: String,
     path: PathBuf,
@@ -175,10 +183,31 @@ fn inspect_retained_operation(
     binding_id: &str,
     generation: i64,
     scope: &str,
+    pending_delivery: bool,
 ) -> Result<RetainedOperation> {
     ensure_regular(&path, "operation journal")?;
     let observed_bytes = read_limited(&path, HISTORY_LIMIT)?;
     let history = read_operation_history_bytes(&observed_bytes, None)?;
+    summarize_retained_operation(
+        path,
+        &observed_bytes,
+        &history,
+        binding_id,
+        generation,
+        scope,
+        pending_delivery,
+    )
+}
+
+fn summarize_retained_operation(
+    path: PathBuf,
+    observed_bytes: &[u8],
+    history: &OperationHistory,
+    binding_id: &str,
+    generation: i64,
+    scope: &str,
+    pending_delivery: bool,
+) -> Result<RetainedOperation> {
     let name = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -253,7 +282,7 @@ fn inspect_retained_operation(
     }
 
     let mut references = Vec::new();
-    if history_is_unresolved(&history)
+    if (history_is_unresolved(history) || pending_delivery)
         && let Some(intent) = history.intent.as_ref()
     {
         if let Some(target) = intent.reconcile_target_operation_id.as_ref() {
@@ -300,8 +329,8 @@ fn inspect_retained_operation(
     Ok(RetainedOperation {
         operation_id,
         path,
-        observed_sha256: format!("{:x}", Sha256::digest(&observed_bytes)),
-        releasable: history_is_releasable(&history),
+        observed_sha256: format!("{:x}", Sha256::digest(observed_bytes)),
+        releasable: history_is_releasable(history),
         result_source,
         references,
         native_root_id: outcome_root.or(intent_root).map(ToOwned::to_owned),
@@ -343,7 +372,7 @@ struct RootCheckpoint {
     native_root_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct StateIdentity {
     version: u32,
@@ -354,9 +383,11 @@ struct StateIdentity {
 }
 
 pub struct Journal {
+    identity: StateIdentity,
     operations: PathBuf,
     outbox: PathBuf,
     checkpoints: PathBuf,
+    retention: Mutex<retention::RetentionIndex>,
     acknowledgements_since_retention: AtomicUsize,
 }
 
@@ -398,7 +429,12 @@ impl Journal {
                 ));
             }
         } else {
-            for existing in ["operations", "outbox", "native-checkpoints.jsonl"] {
+            for existing in [
+                "operations",
+                "outbox",
+                "native-checkpoints.jsonl",
+                "retention-cursor.json",
+            ] {
                 if root.join(existing).exists() {
                     return Err(Error::new(
                         "ADAPTER_STATE_IDENTITY_MISSING",
@@ -429,10 +465,13 @@ impl Journal {
         } else {
             ensure_regular(&checkpoints, "native checkpoint")?;
         }
+        let retention = retention::RetentionIndex::open(root, &identity);
         Ok(Self {
+            identity,
             operations,
             outbox,
             checkpoints,
+            retention: Mutex::new(retention),
             acknowledgements_since_retention: AtomicUsize::new(0),
         })
     }
@@ -636,6 +675,7 @@ impl Journal {
     }
 
     pub fn recover_outbox(&self) -> Result<Vec<OperationRecoveryState>> {
+        retention::begin_recovery(self)?;
         let mut recovery_states = Vec::new();
         let entries = fs::read_dir(&self.operations)
             .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be read"))?;
@@ -645,13 +685,61 @@ impl Journal {
             let path = entry.path();
             ensure_regular(&path, "operation journal")?;
             let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
+                retention::mark_damaged(self)?;
                 continue;
             };
-            let history = match self.load_by_path(&path) {
+            let observed_bytes = read_limited(&path, HISTORY_LIMIT)?;
+            let history = match read_operation_history_bytes(&observed_bytes, None) {
                 Ok(history) => history,
-                Err(error) if error.code == "ADAPTER_JOURNAL" => continue,
+                Err(error) if error.code == "ADAPTER_JOURNAL" => {
+                    retention::mark_damaged(self)?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
+            let known_operation_id = history
+                .intent
+                .as_ref()
+                .map(|intent| intent.operation_id.as_str())
+                .or_else(|| {
+                    history
+                        .outcome
+                        .as_ref()
+                        .and_then(|outcome| outcome["operation_id"].as_str())
+                })
+                .or_else(|| {
+                    history
+                        .result_params
+                        .as_ref()
+                        .and_then(|params| params["operation_id"].as_str())
+                });
+            let pending_delivery = match known_operation_id {
+                Some(operation_id) => match self.operation_has_pending_delivery(operation_id) {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        retention::mark_damaged(self)?;
+                        true
+                    }
+                },
+                None => {
+                    retention::mark_damaged(self)?;
+                    true
+                }
+            };
+            match summarize_retained_operation(
+                path.clone(),
+                &observed_bytes,
+                &history,
+                &self.identity.binding_id,
+                self.identity.generation,
+                &self.identity.native_scope_key,
+                pending_delivery,
+            ) {
+                Ok(operation) => {
+                    retention::register_operation(self, operation)?;
+                }
+                Err(_) => retention::mark_damaged(self)?,
+            }
             if let (Some(outcome), Some(digest)) =
                 (history.outcome.as_ref(), history.outcome_sha256.as_ref())
                 && history.acknowledged_sha256.as_deref() != Some(digest.as_str())
@@ -718,6 +806,7 @@ impl Journal {
                 });
             }
         }
+        retention::finish_recovery(self)?;
         Ok(recovery_states)
     }
 
@@ -738,81 +827,7 @@ impl Journal {
         generation: i64,
         scope: &str,
     ) -> Result<RetentionSummary> {
-        // References are derived from the exact unresolved journal intents.
-        // Stream both passes instead of requiring the complete operation set
-        // to fit a scan cap or retaining an inventory-sized path vector.
-        let mut unresolved_references = BTreeSet::new();
-        let entries = fs::read_dir(&self.operations)
-            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be read"))?;
-        for entry in entries {
-            let entry = entry
-                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
-            let operation =
-                inspect_retained_operation(entry.path(), binding_id, generation, scope)?;
-            unresolved_references.extend(operation.references);
-        }
-
-        let mut summary = RetentionSummary::default();
-        let mut batch_deferred = false;
-        let entries = fs::read_dir(&self.operations)
-            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be read"))?;
-        for entry in entries {
-            let entry = entry
-                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
-            let operation =
-                inspect_retained_operation(entry.path(), binding_id, generation, scope)?;
-            if !operation.releasable
-                || unresolved_references.contains(&operation.operation_id)
-                || operation.result_source
-                || self.operation_has_pending_delivery(&operation.operation_id)?
-            {
-                continue;
-            }
-            if summary.reclaimed == RETENTION_DELETE_BATCH {
-                batch_deferred = true;
-                continue;
-            }
-
-            self.checkpoint_operation_root(
-                operation.native_root_id.as_deref(),
-                operation.native_scope_key.as_deref(),
-                binding_id,
-                generation,
-                scope,
-            )?;
-            let current_bytes = read_limited(&operation.path, HISTORY_LIMIT)?;
-            if format!("{:x}", Sha256::digest(&current_bytes)) != operation.observed_sha256 {
-                return Err(Error::new(
-                    "ADAPTER_JOURNAL",
-                    "operation journal changed during retention classification",
-                ));
-            }
-            match remove_private_durable(&operation.path) {
-                Ok(true) => summary.reclaimed += 1,
-                Ok(false) => {
-                    return Err(Error::new(
-                        "ADAPTER_JOURNAL",
-                        "acknowledged operation journal disappeared during retention",
-                    ));
-                }
-                Err(remove_error) => {
-                    if let Err(restore_error) =
-                        replace_private_durable(&operation.path, &current_bytes)
-                    {
-                        return Err(Error::new(
-                            "ADAPTER_JOURNAL_RESTORE",
-                            format!(
-                                "journal removal failed ({}) and exact restoration failed ({})",
-                                remove_error.code, restore_error.code
-                            ),
-                        ));
-                    }
-                    return Err(remove_error);
-                }
-            }
-        }
-        summary.complete = !batch_deferred;
-        Ok(summary)
+        retention::reclaim_acknowledged(self, binding_id, generation, scope)
     }
 
     fn operation_has_pending_delivery(&self, operation_id: &str) -> Result<bool> {
@@ -972,6 +987,7 @@ impl Journal {
         {
             return Err(torn_ack_recovery_unknown());
         }
+        retention::refresh_operation(self, operation_id);
         Ok(true)
     }
 
@@ -1175,8 +1191,18 @@ impl Journal {
         } else {
             None
         };
+        let retention_operation_id = retained_bytes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<PendingItem>(bytes).ok())
+            .filter(|item| matches!(item.kind.as_str(), "outcome" | "result"))
+            .map(|item| item.key);
         match remove_private_durable(path) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(operation_id) = retention_operation_id {
+                    retention::refresh_operation(self, &operation_id);
+                }
+                Ok(())
+            }
             Err(_) => {
                 if let Some(bytes) = retained_bytes {
                     // A parent-directory sync failure may follow a successful
@@ -1228,10 +1254,14 @@ impl Journal {
                 "operation history exceeds its total byte boundary",
             ));
         }
-        append_bytes(&path, &bytes)
+        append_bytes(&path, &bytes)?;
+        retention::refresh_operation(self, operation_id);
+        Ok(())
     }
 
     fn write_pending(&self, item: PendingItem) -> Result<()> {
+        let retention_operation_id =
+            matches!(item.kind.as_str(), "outcome" | "result").then(|| item.key.clone());
         let prefix = match item.kind.as_str() {
             "outcome" => "outcome",
             "observation" => "observation",
@@ -1260,14 +1290,22 @@ impl Journal {
                     "pending item identity conflicts with saved result",
                 ));
             }
-            return replace_private_durable(&path, &previous).map_err(|_| {
+            replace_private_durable(&path, &previous).map_err(|_| {
                 Error::new(
                     "ADAPTER_OUTBOX",
                     "pending item could not be durably published",
                 )
-            });
+            })?;
+            if let Some(operation_id) = retention_operation_id {
+                retention::refresh_operation(self, &operation_id);
+            }
+            return Ok(());
         }
-        write_private_new(&path, &bytes)
+        write_private_new(&path, &bytes)?;
+        if let Some(operation_id) = retention_operation_id {
+            retention::refresh_operation(self, &operation_id);
+        }
+        Ok(())
     }
 
     fn load_by_path(&self, path: &Path) -> Result<OperationHistory> {
@@ -1530,11 +1568,16 @@ fn history_is_releasable(history: &OperationHistory) -> bool {
             let Some(digest) = history.outcome_sha256.as_deref() else {
                 return false;
             };
+            let terminal_receipt =
+                matches!(outcome["outcome"].as_str(), Some("applied" | "rejected"));
+            let reconcile_resolved = history.intent.as_ref().is_none_or(|intent| {
+                intent.method != "agent.reconcile"
+                    || outcome["outcome"] == "rejected"
+                    || outcome["details"]["resolved"].as_bool() == Some(true)
+            });
             history.acknowledged_sha256.as_deref() == Some(digest)
-                && matches!(
-                    outcome["outcome"].as_str(),
-                    Some("applied" | "accepted" | "rejected")
-                )
+                && terminal_receipt
+                && reconcile_resolved
                 && (history.result_params.is_none() || result_page_acknowledged)
         }
         // Store's exact module.result acknowledgement settles the read

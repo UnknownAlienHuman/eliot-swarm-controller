@@ -1,4 +1,16 @@
 # Current-source audit and implementation ledger
+The [OpenCode retention slice](../2026-10-11/OPENCODE-RETENTION-EVIDENCE.json)
+derives a volatile candidate queue and reverse references during existing journal
+recovery and persists only an identity-bound traversal cursor. Each retention pass
+examines at most 32 candidates, including deferred entries. Accepted inputs and
+unresolved Applied reconciliation targets remain retained; deletion still requires
+ACK, no live references, exact journal-byte rechecks and root checkpoint/recovery.
+Strict production Clippy and the retention/reopen plus both actual outbox-drain
+regressions pass on Windows/Linux with stable source hashes. Existing startup
+scans are not globally bounded. The initial lint failures are preserved; this
+OpenCode slice does not close all-adapter PR69 or installed/native/crash/load V27
+qualification.
+
 The [mailbox recovery and response-budget repair](../2026-10-11/MAILBOX-RECOVERY-EVIDENCE.json)
 adds a bounded retained-key recovery cursor when damaged derived indexes cannot
 be resumed by Operation ID. Every read rechecks the Participant's current exact
