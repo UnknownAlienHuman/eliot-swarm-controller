@@ -137,6 +137,20 @@ so they are never sent unbound:
    integration routes serve (`configPath`, `snapshotPath`,
    `conflictPaths`), is never copied into a record or snapshot.
 
+For apply/disable, `applied` requires a positive receipt for the exact
+target and confirmed operation, plus a fresh GET matching the state
+specified by that request. A missing, false, contradictory or residual
+receipt keeps the outcome `unknown`, even when the GET matches. A lost
+response is reconciled by the existing readback path without another
+mutation.
+
+Restore previews and journal entries expose current state and snapshot
+existence, but no independent expected post-restore state. Restore
+therefore remains `unknown` with `observed` verification; matching
+receipt and GET values do not establish that expectation. The bridge
+retains both as evidence and never derives restore authority from an
+in-memory cache.
+
 The Aside **bulk** PUT (`PUT /api/client-integrations/aside/profiles`)
 is never sent: upstream refuses plan bindings for it ("a confirmed plan
 applies to one profile"), so it cannot meet the issue's confirmation
@@ -275,7 +289,7 @@ intervening change, preview-unavailable, a lost mutation response, a
 failed catalog refresh, and the Aside 200/207 partial envelope.
 
 ```sh
-node selftest.mjs   # fake Management server, 28 fixture tests, no network
+node selftest.mjs   # local fake Management server; no upstream or model calls
 ```
 
 The load-bearing tests: a full attach+snapshot cycle issues **GET

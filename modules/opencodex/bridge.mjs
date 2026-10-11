@@ -1527,6 +1527,69 @@ export function createAdapter(config, env = process.env) {
     };
   }
 
+  function integrationTarget(request) {
+    return request.kind.startsWith('aside')
+      ? { clientId: 'aside', profileId: request.profileId }
+      : { clientId: request.clientId, profileId: null };
+  }
+
+  function integrationReadbackMatchesTarget(state, request) {
+    const target = integrationTarget(request);
+    return target.profileId === null
+      ? Boolean(state) && state.clientId === target.clientId
+      : Boolean(state) && state.profileId === target.profileId;
+  }
+
+  function integrationStateVerification(after, request, expectedState) {
+    if (!after) return 'not_checked';
+    if (!integrationReadbackMatchesTarget(after, request)) return 'mismatch';
+    if (expectedState === null) return 'not_checked';
+    return after.state === expectedState ? 'verified' : 'mismatch';
+  }
+
+  function integrationReceiptProvesRequest(body, receipt, elements, request, paths, expectedState, status) {
+    const target = integrationTarget(request);
+    const requestOperation = request.operation;
+    const operationBound = request.binding?.operation === requestOperation
+      && paths.applyBody.operation === requestOperation;
+    if (!operationBound || receipt?.ok !== true || receipt.residual === true
+      || receipt.clientId !== target.clientId
+      || receipt.profileId !== target.profileId
+      || expectedState === null
+      || receipt.state !== expectedState) return false;
+
+    // The upstream receipt does not currently echo operation. If it or
+    // any per-item result does echo one, reject a contradiction; otherwise
+    // the exact operation is established by the validated fingerprint
+    // binding and the body sent above.
+    if (isObject(body) && body.operation !== undefined && body.operation !== requestOperation) {
+      return false;
+    }
+    const hasResults = isObject(body) && Object.hasOwn(body, 'results');
+    const hasClientIntegrations = isObject(body) && Object.hasOwn(body, 'clientIntegrations');
+    if ((hasResults && !Array.isArray(body.results))
+      || (hasClientIntegrations && !Array.isArray(body.clientIntegrations))
+      || (hasResults && hasClientIntegrations)) return false;
+    const rawElements = isObject(body)
+      ? (Array.isArray(body.results) ? body.results
+        : Array.isArray(body.clientIntegrations) ? body.clientIntegrations : null)
+      : null;
+    const hasElementField = hasResults || hasClientIntegrations;
+    if (status === 207 || hasElementField) {
+      if (!Array.isArray(rawElements) || rawElements.length !== 1
+        || !Array.isArray(elements) || elements.length !== 1) return false;
+      const entry = elements[0];
+      if (entry.ok !== true || entry.residual === true
+        || entry.client !== target.clientId || entry.profileId !== target.profileId
+        || (entry.state !== null && entry.state !== expectedState)) {
+        return false;
+      }
+      if (rawElements.some((row) => isObject(row)
+        && row.operation !== undefined && row.operation !== requestOperation)) return false;
+    }
+    return true;
+  }
+
   async function integrationStateRead(record, request, paths) {
     const result = await readFor(record, paths.statePath);
     if (!result.ok) return null;
@@ -1594,6 +1657,10 @@ export function createAdapter(config, env = process.env) {
     }
     // configure: the binding was validated locally (both-or-neither,
     // operation agreement) before this point.
+    // Restore's preview and journal expose the current state and snapshot
+    // existence, not the requested post-restore state. Keep that effect
+    // unverified until its upstream contract supplies an independent target.
+    const expectedState = paths.expectedState;
     const result = await mutateFor(record, paths.applyMethod, paths.applyPath, paths.applyBody);
     if (!result.responded) {
       record.outcome = 'unknown';
@@ -1601,8 +1668,7 @@ export function createAdapter(config, env = process.env) {
       const after = await integrationStateRead(record, request, paths);
       record.readback = { after };
       record.verification = verifyFields({
-        state: after && paths.expectedState !== null ?
-          (after.state === paths.expectedState ? 'verified' : 'mismatch') : 'not_checked',
+        state: integrationStateVerification(after, request, expectedState),
       });
       record.verification.reconciledByRead = true;
       outcomeFromReadback(record);
@@ -1627,17 +1693,14 @@ export function createAdapter(config, env = process.env) {
     record.elements = normalizeIntegrationOutcomes(result.body);
     const after = await integrationStateRead(record, request, paths);
     record.readback = { after };
-    const expectedState = paths.expectedState ?? record.receipt?.state ?? null;
     record.verification = verifyFields({
-      state: after && expectedState !== null
-        ? (after.state === expectedState ? 'verified' : 'mismatch')
-        : 'not_checked',
+      state: integrationStateVerification(after, request, expectedState),
     });
     outcomeFromReadback(record);
-    const elementResults = record.elements ?? [];
-    const elementFailures = elementResults.some((entry) => entry.ok !== true)
-      || (result.status === 207 && elementResults.length === 0);
-    if (elementFailures) {
+    const receiptProven = integrationReceiptProvesRequest(
+      result.body, record.receipt, record.elements, request, paths, expectedState, result.status,
+    );
+    if (!receiptProven) {
       record.outcome = 'unknown';
       if (!record.reason) record.reason = 'integration_elements_incomplete';
     }

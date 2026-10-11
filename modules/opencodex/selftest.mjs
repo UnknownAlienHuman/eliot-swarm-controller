@@ -502,9 +502,114 @@ await withServer('happy', async (fake, adapter) => {
     kind: 'client_integration_restore', clientId: 'cline', opId: record.receipt.opId,
     operation: 'restore', planFingerprint: restorePreview.plan.fingerprint,
   });
-  assert.equal(restored.outcome, 'applied');
+  assert.equal(restored.outcome, 'unknown');
   assert.equal(restored.readback.after.state, 'absent', 'rollback returns the client to absent');
+  assert.equal(restored.receipt.state, 'absent');
+  assert.equal(restored.verification.state, 'observed', 'restore has no independently specified expected state');
   console.log('PASS client-integration: preview/binding/apply/readback + journal rollback');
+});
+
+// A matching fresh GET cannot turn an absent, false or contradictory
+// integration receipt into proof that the confirmed Operation applied.
+for (const scenario of ['integration_receipt_false', 'integration_receipt_missing_ok']) {
+  await withServer(scenario, async (fake, adapter) => {
+    const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+    const record = await adapter.configure({
+      kind: 'client_integration', clientId: 'cline', enabled: true,
+      operation: 'apply', planFingerprint: preview.plan.fingerprint,
+    });
+    assert.equal(record.outcome, 'unknown');
+    assert.equal(record.verification.state, 'verified', 'GET observes the desired state but cannot replace receipt proof');
+    assert.equal(record.readback.after.state, 'current');
+    assert.equal(record.elements, null, 'the single-target receipt has no per-item entries');
+    assert.equal(record.receipt.ok, scenario === 'integration_receipt_false' ? false : null);
+    assert.equal(mutations(fake, 'PUT', '/api/client-integrations/cline').length, 1);
+    console.log(`PASS ${scenario}: matching readback does not replace a positive receipt`);
+  });
+}
+
+for (const scenario of ['integration_receipt_wrong_target', 'integration_receipt_wrong_operation',
+  'integration_receipt_residual', 'integration_receipt_wrong_element_state']) {
+  await withServer(scenario, async (fake, adapter) => {
+    const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+    const record = await adapter.configure({
+      kind: 'client_integration', clientId: 'cline', enabled: true,
+      operation: 'apply', planFingerprint: preview.plan.fingerprint,
+    });
+    assert.equal(record.outcome, 'unknown');
+    assert.equal(record.verification.state, 'verified', 'target state alone is insufficient');
+    assert.equal(record.readback.after.clientId, 'cline');
+    console.log(`PASS ${scenario}: receipt target/operation must match the confirmed request`);
+  });
+}
+
+// Restore does not expose a request-derived post-restore state. Matching
+// receipt and GET must therefore remain Unknown, including after a prior
+// apply in the same adapter instance.
+await withServer('restore_receipt_state_fallback', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  const applied = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(applied.outcome, 'applied');
+  const restorePreview = await adapter.preview({
+    kind: 'client_integration_restore', clientId: 'cline', opId: applied.receipt.opId,
+  });
+  const restored = await adapter.configure({
+    kind: 'client_integration_restore', clientId: 'cline', opId: applied.receipt.opId,
+    operation: 'restore', planFingerprint: restorePreview.plan.fingerprint,
+  });
+  assert.equal(restored.receipt.ok, true);
+  assert.equal(restored.receipt.state, 'current');
+  assert.equal(restored.readback.after.state, 'current');
+  assert.equal(restored.verification.state, 'observed', 'no post-restore state is specified');
+  assert.equal(restored.outcome, 'unknown', 'receipt.state is not the restore expectation');
+  assert.equal(mutations(fake, 'POST', '/api/client-integrations/restore').length, 1);
+  console.log('PASS restore_receipt_state_fallback: receipt cannot authorize its own expected state');
+});
+
+// Restarting the adapter cannot turn matching receipt and GET into an
+// independently specified expected restore state.
+await withServer('happy', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  const applied = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(applied.outcome, 'applied');
+
+  const separateAdapter = createAdapter(await configFor(fake.endpoint));
+  const restorePreview = await separateAdapter.preview({
+    kind: 'client_integration_restore', clientId: 'cline', opId: applied.receipt.opId,
+  });
+  const restored = await separateAdapter.configure({
+    kind: 'client_integration_restore', clientId: 'cline', opId: applied.receipt.opId,
+    operation: 'restore', planFingerprint: restorePreview.plan.fingerprint,
+  });
+  assert.equal(restored.receipt.ok, true);
+  assert.equal(restored.receipt.state, 'absent');
+  assert.equal(restored.readback.after.state, 'absent');
+  assert.equal(restored.verification.state, 'observed');
+  assert.equal(restored.outcome, 'unknown', 'no retained restore expectation is available');
+  console.log('PASS restore_receipt_state_unretained: matching self-reported state remains Unknown');
+});
+
+// A lost integration response is reconciled by its request-derived state
+// and exact GET target; the mutation is not replayed.
+await withServer('integration_lost_response', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  const record = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.mutation.reason, 'mutation_response_lost');
+  assert.equal(record.verification.reconciledByRead, true);
+  assert.equal(record.verification.state, 'verified');
+  assert.equal(record.readback.after.clientId, 'cline');
+  assert.equal(mutations(fake, 'PUT', '/api/client-integrations/cline').length, 1, 'mutation is sent once');
+  console.log('PASS integration_lost_response: exact readback applied without mutation replay');
 });
 
 // 23. Stale plan: the world moved between preview and confirm. The

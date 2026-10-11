@@ -1,5 +1,13 @@
 # Current-source audit and implementation ledger
 
+The [OpenCodex integration verification repair](../2026-10-11/OPENCODEX-INTEGRATION-VERIFICATION.json)
+requires positive exact-target receipt evidence and independent fresh state
+readback before a responded integration is applied. Restore remains Unknown
+because the upstream contract supplies no independent post-restore expectation.
+The unchanged final Windows selftest passes all 37 recorded cases. Linux was
+not run: the attempted runner lacked Node. Live/native and full V27
+qualification remain pending; no mutation or historical native run was replayed.
+
 The [fresh installed W result](../2026-10-11/R48-INSTALLED-W.md) verifies all
 five bounded observations with exit 0, an applied withheld reply bound to the
 live owner/config, exactly one admit intent after confirmed graceful stop, and

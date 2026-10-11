@@ -60,6 +60,7 @@ export async function createFakeManagementServer({ scenario = 'happy', token = '
     },
   ];
   let lostResponseConsumed = false;
+  let integrationLostResponseConsumed = false;
   let staleInjected = false;
 
   const fingerprint = (scope, operation) => `fixture-fp-${scope}-${operation}-v${stateVersion}`;
@@ -494,6 +495,11 @@ export async function createFakeManagementServer({ scenario = 'happy', token = '
         entry.snapshotCount += 1;
         const opId = recordApply(op.clientId, 'restore');
         entry.lastOpId = opId;
+        if (scenario === 'restore_receipt_state_fallback') {
+          // Leave the post-apply state in place and report it truthfully;
+          // it must not become the bridge's expected restore state.
+          entry.state = 'current';
+        }
         return send({
           status: 200,
           body: { ok: true, clientId: op.clientId, changed: true, state: entry.state, opId, message: 'fixture restored' },
@@ -630,6 +636,48 @@ export async function createFakeManagementServer({ scenario = 'happy', token = '
           entry.snapshotCount += 1;
           const opId = recordApply(clientId, expected);
           entry.lastOpId = opId;
+          if (scenario === 'integration_lost_response' && !integrationLostResponseConsumed) {
+            integrationLostResponseConsumed = true;
+            res.socket.destroy();
+            return undefined;
+          }
+          if (scenario === 'integration_receipt_false') {
+            return send({
+              status: 200,
+              body: { ok: false, clientId, state: entry.state, opId, reason: 'fixture_receipt_false' },
+            });
+          }
+          if (scenario === 'integration_receipt_missing_ok') {
+            return send({
+              status: 200,
+              body: { clientId, state: entry.state, opId },
+            });
+          }
+          if (scenario === 'integration_receipt_wrong_target') {
+            return send({
+              status: 200,
+              body: { ok: true, clientId: 'codex', state: entry.state, opId },
+            });
+          }
+          if (scenario === 'integration_receipt_wrong_operation') {
+            return send({
+              status: 200,
+              body: { ok: true, clientId, operation: 'disable', state: entry.state, opId },
+            });
+          }
+          if (scenario === 'integration_receipt_residual') {
+            return send({
+              status: 200,
+              body: { ok: true, clientId, state: entry.state, opId, residual: true },
+            });
+          }
+          if (scenario === 'integration_receipt_wrong_element_state') {
+            return send({
+              status: 200,
+              body: { ok: true, clientId, state: entry.state, opId,
+                results: [{ ok: true, clientId, state: 'absent' }] },
+            });
+          }
           return send({
             status: 200,
             body: { ok: true, clientId, changed: true, state: entry.state, opId, message: 'fixture applied' },
