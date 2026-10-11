@@ -1,4 +1,16 @@
 # Current-source audit and implementation ledger
+The [Claude SDK capability gate](../2026-10-11/CLAUDE-SDK-CAPABILITY-GATE-EVIDENCE.json)
+removes the hard runtime equality to SDK 0.3.287 while preserving the exact
+package identity, bounded observed version, safe export entry, startup export
+and returned WarmQuery interface checks. Strict embedded-adapter production
+Clippy passes on Windows/Linux. Four connected Windows fake-SDK cases cross
+the real Node bridge and dynamic import: compatible different version admitted,
+missing startup rejected, incomplete WarmQuery retained as startup Unknown,
+and wrong package identity rejected. All four close the actual bridge process.
+No dependency upgrade or model query occurred. Linux Node was unavailable,
+so the JavaScript fixture did not run there. This supersedes the exact SDK gate
+review gap noted in the historical journal/lifecycle entry below; full installed,
+native and V27 qualification remain pending.
 
 The [OpenCode result-page ACK repair](../2026-10-11/OPENCODE-RESULT-ACK-RECOVERY.json)
 extends the same stable-prefix repair to independently saved result pages.

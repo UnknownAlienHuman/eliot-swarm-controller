@@ -273,9 +273,12 @@ async function prepare(command) {
   const packageFile = path.join(packageDirectory, 'package.json');
   const packageInfo = JSON.parse(await readFile(packageFile, 'utf8'));
   const sdkVersion = boundedSdkText(packageInfo.version, 64);
-  if (packageInfo.name !== '@anthropic-ai/claude-agent-sdk'
-      || packageInfo.version !== '0.3.287' || sdkVersion === null) {
-    throw Object.assign(new Error(), { diagnosticCode: 'SDK_VERSION_MISMATCH' });
+  // Admission is interface-based, not release-pinned: the external SDK is
+  // admitted by package identity and by the startup/WarmQuery contract
+  // verified below, so a compatible differently-versioned package passes.
+  // sdkVersion stays a bounded observed value reported in the prepared frame.
+  if (packageInfo.name !== '@anthropic-ai/claude-agent-sdk' || sdkVersion === null) {
+    throw Object.assign(new Error(), { diagnosticCode: 'SDK_PACKAGE_IDENTITY_MISMATCH' });
   }
   const sdkEntry = sdkImportEntry(packageInfo, packageDirectory);
   if (!sdkEntry) throw Object.assign(new Error(), { diagnosticCode: 'SDK_IMPORT_ENTRY_UNAVAILABLE' });
