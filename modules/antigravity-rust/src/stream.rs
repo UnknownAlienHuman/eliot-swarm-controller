@@ -16,6 +16,16 @@ pub const MAX_INIT_TOOLS: usize = 64;
 pub const MAX_CHILD_STRINGS: usize = 8;
 pub const MAX_CHILD_URI_CHARS: usize = 256;
 pub const MAX_TEXT_CHARS_PER_STEP: u64 = 1_000_000;
+/// Bounded retained native response body. Headless emits one terminal result
+/// per prompt, so a sequentially admitted prompt owns exactly one result and
+/// this adapter may retain that result's own response text. The bound keeps a
+/// single hostile or enormous answer from growing this process without limit.
+pub const MAX_RESPONSE_CHARS: usize = 262_144;
+/// Bounded retained responses. Antigravity exposes no history readback, so only
+/// responses observed by this process exist; retaining a small window lets a
+/// normalized result page read the exact turn a prior result Operation named
+/// without letting an unbounded stream accumulate transcripts in memory.
+pub const MAX_RETAINED_RESPONSES: usize = MAX_TURNS;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct UsageSnapshot {
@@ -116,6 +126,18 @@ struct UsageBaseline {
     gaps: u64,
 }
 
+/// Exact response body retained for one observed result ordinal, together with
+/// the generation that produced it. Headless sequencing means one prompt owns
+/// exactly one result, so the ordinal plus generation is the causal key.
+#[derive(Debug, Clone)]
+struct RetainedResponse {
+    conversation_id: String,
+    stream_generation: u64,
+    status: String,
+    response_sha256: String,
+    body: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -171,6 +193,40 @@ pub struct Turn {
     pub usage: TurnUsageEvidence,
 }
 
+/// Why an exact retained response could not be published. Every arm maps to a
+/// closed diagnostic so a caller can never silently substitute another body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedResponseMiss {
+    /// No response body is retained for the requested ordinal in this process.
+    Absent,
+    /// A body is retained but its conversation differs from the target root.
+    ConversationMismatch,
+    /// A body is retained but belongs to an earlier stream generation, so it
+    /// cannot prove causality for the prompt being settled now.
+    StaleOwner,
+}
+
+impl RetainedResponseMiss {
+    pub fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Absent => "NATIVE_RESULT_BODY_UNAVAILABLE",
+            Self::ConversationMismatch => "NATIVE_RESULT_BODY_ORIGIN_MISMATCH",
+            Self::StaleOwner => "NATIVE_RESULT_BODY_STALE_OWNER",
+        }
+    }
+}
+
+/// Bounded response body a normalized result page may publish. Carrying the
+/// status and the digest the native event declared lets the page prove that
+/// the bytes it publishes are exactly the bytes the stream observed, without
+/// exposing the adapter's internal retention key.
+#[derive(Debug, Clone)]
+pub struct RetainedResponseBody {
+    pub status: String,
+    pub response_sha256: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalDisposition {
     Applied,
@@ -194,6 +250,14 @@ pub struct StreamState {
     pub children: BTreeMap<String, Child>,
     pub turns: VecDeque<Turn>,
     pub result_ordinal: u64,
+    pub stream_generation: u64,
+    retained_responses: BTreeMap<u64, RetainedResponse>,
+    // The raw native response text never enters a serialized Turn. Turn is
+    // Serialize and its values reach the runtime observation snapshot, so a
+    // body stored there would leave through generic status and report paths.
+    // This private map is the only place the body lives, and it is reachable
+    // solely through retained_response_for for an authorized normalized
+    // agent.result page.
     pub tool_errors: VecDeque<ToolError>,
     pub native_events_seen: u64,
     pub malformed_lines: u64,
@@ -216,6 +280,8 @@ impl StreamState {
             children: BTreeMap::new(),
             turns: VecDeque::new(),
             result_ordinal: initial_result_ordinal,
+            stream_generation: 0,
+            retained_responses: BTreeMap::new(),
             tool_errors: VecDeque::new(),
             native_events_seen: 0,
             malformed_lines: 0,
@@ -262,6 +328,10 @@ impl StreamState {
     }
 
     pub fn note_stream_failure(&mut self) {
+        // A broken stream can no longer prove that the next result belongs to
+        // the prompt still in flight. Invalidate retained bodies so a later
+        // normalized result page cannot attribute a stale body to a new turn.
+        self.retained_responses.clear();
         self.phase = Phase::StreamFailed;
         self.execution = "stream_failed";
         self.stream_error_code = Some("NATIVE_STREAM_FAILED");
@@ -273,6 +343,7 @@ impl StreamState {
     }
 
     pub fn note_stream_end(&mut self, exit_code: Option<i32>) {
+        self.retained_responses.clear();
         self.phase = Phase::StreamEnded;
         self.execution = "stream_ended";
         self.exit_code = exit_code;
@@ -296,6 +367,74 @@ impl StreamState {
             _ => return None,
         };
         Some((turn, disposition))
+    }
+
+    /// Retain one observed response body under its exact result ordinal. Only
+    /// the body carried by that ordinal's own result event is accepted, and
+    /// only when its recorded digest matches, so a retained body can never be
+    /// substituted for another turn's answer.
+    fn retain_response(
+        &mut self,
+        result_ordinal: u64,
+        conversation_id: &str,
+        status: &str,
+        response: &str,
+        response_sha256: &str,
+    ) {
+        let body = bounded_string(response, MAX_RESPONSE_CHARS);
+        if sha256_hex(&body) != response_sha256 || body.chars().count() < response.chars().count() {
+            // A body that had to be truncated cannot be represented by the
+            // digest the native event declared. Drop it and fail closed rather
+            // than publish a page whose payload digest is a lie.
+            self.retained_responses.remove(&result_ordinal);
+            self.gaps = self.gaps.saturating_add(1);
+            return;
+        }
+        self.retained_responses.insert(
+            result_ordinal,
+            RetainedResponse {
+                conversation_id: conversation_id.to_owned(),
+                stream_generation: self.stream_generation,
+                status: status.to_owned(),
+                response_sha256: response_sha256.to_owned(),
+                body,
+            },
+        );
+        while self.retained_responses.len() > MAX_RETAINED_RESPONSES {
+            let Some(oldest) = self.retained_responses.keys().next().copied() else {
+                break;
+            };
+            self.retained_responses.remove(&oldest);
+        }
+    }
+
+    /// Read the retained response body for one exact target, or fail closed.
+    /// Every field the caller expects must match: the exact next ordinal, the
+    /// same conversation, and the same owned boot and stream generation. A
+    /// missing, mismatched, or stale entry is reported as a typed cause rather
+    /// than substituted with any other retained body.
+    pub fn retained_response_for(
+        &self,
+        result_ordinal: u64,
+        expected_conversation: &str,
+        expected_stream_generation: u64,
+    ) -> Result<RetainedResponseBody, RetainedResponseMiss> {
+        let Some(retained) = self.retained_responses.get(&result_ordinal) else {
+            return Err(RetainedResponseMiss::Absent);
+        };
+        if retained.conversation_id != expected_conversation {
+            return Err(RetainedResponseMiss::ConversationMismatch);
+        }
+        if retained.stream_generation != expected_stream_generation
+            || retained.stream_generation != self.stream_generation
+        {
+            return Err(RetainedResponseMiss::StaleOwner);
+        }
+        Ok(RetainedResponseBody {
+            status: retained.status.clone(),
+            response_sha256: retained.response_sha256.clone(),
+            body: retained.body.clone(),
+        })
     }
 
     pub fn snapshot(&self) -> Value {
@@ -665,6 +804,23 @@ impl StreamState {
             self.gaps = self.gaps.saturating_add(1);
         }
         self.turns.push_back(turn.clone());
+        if let Some(response) = response
+            && let Some(response_sha256) = turn.response_sha256.as_deref()
+        {
+            if let Some(conversation_id) = turn.conversation_id.as_deref() {
+                self.retain_response(
+                    self.result_ordinal,
+                    conversation_id,
+                    &turn.status,
+                    response,
+                    response_sha256,
+                );
+            } else {
+                // A response with no conversation identity cannot be attributed
+                // to any root. Drop it instead of retaining an unownable body.
+                self.gaps = self.gaps.saturating_add(1);
+            }
+        }
         if self.phase == Phase::AwaitingInit {
             if matches!(turn.status.as_str(), "ERROR" | "CANCELED" | "INTERRUPTED") {
                 self.phase = Phase::InitFailed;

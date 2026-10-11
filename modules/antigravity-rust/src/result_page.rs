@@ -1,14 +1,18 @@
 //! Bounded Antigravity Operation status pages.
 //!
-//! Antigravity's public result event has no native request/assistant-message
-//! identity and this adapter does not retain its response text. This module
-//! publishes only the exact terminal Operation receipt supplied by Store.
+//! Antigravity's public result event carries no native request, item, or
+//! assistant-message parent, so this adapter never invents one. Headless does
+//! emit exactly one terminal result per prompt and the caller must await it
+//! before writing the next prompt, so a sequentially admitted prompt owns
+//! exactly one result. This module publishes that owned result's exact
+//! response body under the pending prompt's Operation, conversation, exact
+//! next ordinal, and owned stream generation, and fails closed on mismatch.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use swarm_contracts::{
     error::{Error, Result},
-    runtime::{NormalizedResultOriginContext, RuntimeCommand},
+    runtime::{NormalizedResultOriginContext, NormalizedResultPageSource, RuntimeCommand},
 };
 
 use crate::{module_receipt, wire::OperationIdentity};
@@ -181,7 +185,18 @@ pub fn build(command: &RuntimeCommand) -> Result<Value> {
 /// native protocol's bounded body capability. Antigravity's stream result
 /// has no request, item, or turn parent; conversation plus this adapter's
 /// local ordinal cannot prove that response text belongs to this input.
-pub fn build_normalized(command: &RuntimeCommand) -> Result<Value> {
+/// Publish the exact response body this process retained for one Store-sealed
+/// normalized prompt. The native protocol carries no request, item, or turn
+/// parent, so nothing here invents a native parent identity. Causality rests
+/// on headless sequencing: the caller admits exactly one prompt, awaits its
+/// single terminal result, and only then admits the next prompt. The sealed
+/// ordinal and stream generation make that ownership checkable, and every
+/// mismatch or absence fails closed. A published body never asserts
+/// execution or Task completion; both stay false and unknown.
+pub fn build_normalized(
+    command: &RuntimeCommand,
+    retained: &crate::controller::Controller,
+) -> Result<Value> {
     if command.method != "agent.result"
         || command.route["runtime"].as_str() != Some("antigravity")
         || !command.input["normalized_result_origin"].is_object()
@@ -231,6 +246,7 @@ pub fn build_normalized(command: &RuntimeCommand) -> Result<Value> {
             )
         })?;
     if command.native_root_id.as_deref() != Some(session_id)
+        || retained.native_root_id() != Some(session_id)
         || identity.target_operation_id.as_deref() != Some(target_id)
         || identity.target_input_sha256.as_deref() != Some(origin.target_input_sha256.as_str())
         || origin.binding_id != command.binding_id
@@ -241,10 +257,111 @@ pub fn build_normalized(command: &RuntimeCommand) -> Result<Value> {
             "normalized result origin differs from the admitted binding or input",
         ));
     }
-    Err(Error::new(
-        "RESULT_BODY_UNAVAILABLE",
-        "Antigravity exposes response text without a native request, item, or turn parent; conversation and local ordinal do not prove input causality",
-    ))
+    // The origin is admitted and bound to this exact binding, target, and
+    // input digest. The remaining question is whether this process actually
+    // observed the response for that exact prompt. The sealed origin names the
+    // target dispatch Operation, and this adapter's own recorded outcome for
+    // that exact Operation carries the ordinal, boot, and conversation it
+    // settled. The retained body must match all of them.
+    let body = retained
+        .retained_response_for_operation(target_id, &origin)
+        .map_err(|code| {
+            if code == "NATIVE_RESULT_BODY_UNAVAILABLE" {
+                Error::new(
+                    "RESULT_BODY_UNAVAILABLE",
+                    "this process retained no response body for the exact target prompt",
+                )
+            } else {
+                Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "the retained response body does not match the exact target prompt",
+                )
+            }
+        })?;
+    build_normalized_page(command, &identity, origin, &body)
+}
+
+/// Assemble the bounded normalized page for one exact retained response body.
+/// The payload digest and length describe exactly the retained bytes, the
+/// receipt is derived from the live result command, and no native parent
+/// identity is invented. The body digest the native event declared is checked
+/// against the bytes actually published so the page can never carry text the
+/// stream did not observe.
+fn build_normalized_page(
+    command: &RuntimeCommand,
+    identity: &OperationIdentity,
+    origin: NormalizedResultOriginContext,
+    body: &crate::stream::RetainedResponseBody,
+) -> Result<Value> {
+    let bytes = body.body.as_bytes();
+    if sha256_hex(bytes) != body.response_sha256 {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "retained response body differs from the digest the native result declared",
+        ));
+    }
+    let payload_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "retained response body is too large",
+        )
+    })?;
+    let result_receipt = module_receipt::for_command(command)?;
+    let source = NormalizedResultPageSource {
+        schema_id: swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
+        schema_version: 1,
+        origin,
+        result_operation_id: identity.operation_id.clone(),
+        result_input_sha256: result_receipt.input_sha256.clone(),
+        result_module_receipt: result_receipt.clone(),
+        payload_sha256: body.response_sha256.clone(),
+        payload_bytes,
+        // Antigravity's result event carries no native request, item, or
+        // assistant-message parent. This adapter's own Operation id is not a
+        // native identity, so the field stays empty rather than carrying a
+        // synthesized label. Causality rests on the completed-turn mapping,
+        // not on a native parent id.
+        native_response_identity: None,
+        execution_complete: false,
+        task_completion: "unknown".to_owned(),
+        native_replay: false,
+    };
+    source.validate().map_err(|_| {
+        Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "normalized result source is invalid",
+        )
+    })?;
+    let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
+    let requested_length = command.input["length_bytes"]
+        .as_u64()
+        .unwrap_or(MAX_PAGE_BYTES as u64)
+        .min(MAX_PAGE_BYTES as u64);
+    if offset > payload_bytes || (requested_length == 0 && offset < payload_bytes) {
+        return Err(Error::new(
+            "RESULT_RANGE_INVALID",
+            "requested normalized result page range is outside the retained body",
+        ));
+    }
+    let end = offset.saturating_add(requested_length).min(payload_bytes);
+    let start = usize::try_from(offset)
+        .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
+    let end_index = usize::try_from(end)
+        .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page end is too large"))?;
+    let selected = &bytes[start..end_index];
+    Ok(json!({
+        "operation_id":identity.operation_id,
+        "page":{
+            "source":source,
+            "offset_bytes":offset,
+            "byte_length":selected.len(),
+            "total_bytes":payload_bytes,
+            "eof":end == payload_bytes,
+            "media_type":"text/plain; charset=utf-8",
+            "content_base64":encode_base64(selected),
+            "page_sha256":sha256_hex(selected),
+        }
+    }))
 }
 
 fn status_body(source: &Value) -> Value {

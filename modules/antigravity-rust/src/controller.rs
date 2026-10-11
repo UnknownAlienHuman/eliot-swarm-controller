@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -42,7 +42,24 @@ struct PendingPrompt {
     identity: OperationIdentity,
     conversation_id: String,
     result_ordinal_before: u64,
+    stream_generation: u64,
     dispatch_admission: Option<TaskDispatchAdmissionReceipt>,
+}
+
+/// Immutable record of one completed native turn, keyed by the exact prompt
+/// Operation that settled it. Store ACKs and prunes the adapter's retry
+/// outbox, so a body lookup cannot depend on pending_receipts surviving. This
+/// mapping is a separate bounded same-process cache that keeps only what a
+/// later normalized result page needs: the exact receipt, conversation,
+/// ordinal, boot, and stream generation that prove which prompt owned which
+/// response. It is never sufficient to recover after this process exits.
+#[derive(Debug, Clone)]
+struct CompletedTurn {
+    receipt: swarm_contracts::runtime::ModuleReceiptIdentity,
+    conversation_id: String,
+    result_ordinal: u64,
+    boot_id: String,
+    stream_generation: u64,
 }
 
 /// Stateful native turn reducer. The manager remains the sole durable
@@ -62,6 +79,7 @@ pub struct Controller {
     pending_open: Option<OperationIdentity>,
     pending: Option<PendingPrompt>,
     stream: StreamState,
+    completed_turns: BTreeMap<String, CompletedTurn>,
     pending_receipts: VecDeque<serde_json::Value>,
     journal: VecDeque<serde_json::Value>,
     local_execution_results: VecDeque<serde_json::Value>,
@@ -91,6 +109,7 @@ impl Controller {
             pending_open: None,
             pending: None,
             stream: StreamState::new(0),
+            completed_turns: BTreeMap::new(),
             pending_receipts: VecDeque::new(),
             journal: VecDeque::new(),
             local_execution_results: VecDeque::new(),
@@ -374,6 +393,7 @@ impl Controller {
             identity,
             conversation_id: conversation_id.to_owned(),
             result_ordinal_before: self.stream.result_ordinal,
+            stream_generation: self.stream.stream_generation,
             dispatch_admission,
         });
         Ok(line)
@@ -414,7 +434,19 @@ impl Controller {
         };
         let (turn, disposition) = self.stream.terminal_for(&conversation_id)?;
         let turn = turn.clone();
-        if turn.result_ordinal <= result_ordinal_before {
+        // Headless emits one terminal result per prompt and the caller must
+        // await it before the next prompt, so the settled turn must be the
+        // exact next ordinal for this prompt. Accepting any greater ordinal
+        // would let a later turn's result settle this Operation and publish
+        // that turn's response text as this prompt's answer. A stale or absent
+        // ordinal simply is not the terminal readback this prompt is waiting
+        // for, so it stays pending rather than becoming an Unknown outcome.
+        let expected_ordinal = result_ordinal_before.checked_add(1)?;
+        if turn.result_ordinal != expected_ordinal {
+            return None;
+        }
+        let stream_generation = self.pending.as_ref()?.stream_generation;
+        if stream_generation != self.stream.stream_generation {
             return None;
         }
         if turn.response_sha256.is_none() {
@@ -438,12 +470,112 @@ impl Controller {
         self.pending = None;
         self.pending_observation = None;
         let _ = self.record_outcome(&outcome, &identity.method, &identity.module_receipt);
+        self.remember_completed_turn(&identity, &conversation_id, &turn);
         Some(outcome)
     }
 
     pub fn stream_ended(&mut self) -> Option<RuntimeOutcome> {
         self.stream.note_stream_end(None);
         self.pending_unknown("NATIVE_STREAM_ENDED_BEFORE_TERMINAL_RESULT")
+    }
+
+    /// Read the exact response body this process retained for one sequential
+    /// turn. The caller names the prompt's conversation, the exact next
+    /// ordinal, and the stream generation that owned the write. This only
+    /// reports what this boot actually observed; it never reconstructs a body
+    /// from a digest and never attributes another turn's text to this prompt.
+    /// A miss is reported as a closed diagnostic so the caller fails closed.
+    pub fn retained_response_body(
+        &self,
+        conversation_id: &str,
+        result_ordinal: u64,
+        stream_generation: u64,
+    ) -> std::result::Result<crate::stream::RetainedResponseBody, &'static str> {
+        if self.native_root_id.as_deref() != Some(conversation_id) {
+            return Err("NATIVE_RESULT_BODY_ORIGIN_MISMATCH");
+        }
+        if stream_generation != self.stream.stream_generation {
+            return Err("NATIVE_RESULT_BODY_STALE_OWNER");
+        }
+        self.stream
+            .retained_response_for(result_ordinal, conversation_id, stream_generation)
+            .map_err(|miss| miss.diagnostic_code())
+    }
+
+    /// Read the response body this process retained for one exact sealed
+    /// dispatch Operation. The completed-turn mapping is separate from the
+    /// retry outbox, so a prior Store ACK that prunes pending_receipts cannot
+    /// erase the causal lookup. Store's sealed origin names the Operation, and
+    /// the caller supplies no ordinal: the sealed producer receipt, target
+    /// digest, and this adapter's own recorded mapping must all agree before
+    /// any body is read. Any disagreement, or a prompt this process never
+    /// settled or settled under another boot, fails closed.
+    pub fn retained_response_for_operation(
+        &self,
+        operation_id: &str,
+        origin: &swarm_contracts::runtime::NormalizedResultOriginContext,
+    ) -> std::result::Result<crate::stream::RetainedResponseBody, &'static str> {
+        let completed = self
+            .completed_turns
+            .get(operation_id)
+            .ok_or("NATIVE_RESULT_BODY_UNAVAILABLE")?;
+        // The sealed origin must name this exact Operation, not merely an
+        // Operation whose request hashes the same. Two different Operations can
+        // carry an identical input digest, so digest equality alone would let a
+        // prompt's body be published under another Operation's result. Require
+        // the exact Operation id and the full typed receipt equality Store sealed.
+        if operation_id != origin.target_operation_id
+            || completed.receipt != origin.producer.module_receipt
+        {
+            return Err("NATIVE_RESULT_BODY_ORIGIN_MISMATCH");
+        }
+        if completed.boot_id != self.boot_id
+            || completed.stream_generation != self.stream.stream_generation
+        {
+            return Err("NATIVE_RESULT_BODY_STALE_OWNER");
+        }
+        self.retained_response_body(
+            &completed.conversation_id,
+            completed.result_ordinal,
+            completed.stream_generation,
+        )
+    }
+
+    /// Record the immutable causal mapping for one settled turn. This runs
+    /// after the outcome is recorded and never touches the retry outbox, so a
+    /// later Store ACK that prunes pending_receipts still leaves this entry
+    /// intact. It is bounded and evicted together with its retained body.
+    fn remember_completed_turn(
+        &mut self,
+        identity: &OperationIdentity,
+        conversation_id: &str,
+        turn: &Turn,
+    ) {
+        self.completed_turns.insert(
+            identity.operation_id.clone(),
+            CompletedTurn {
+                receipt: identity.module_receipt.clone(),
+                conversation_id: conversation_id.to_owned(),
+                result_ordinal: turn.result_ordinal,
+                boot_id: self.boot_id.clone(),
+                stream_generation: self.stream.stream_generation,
+            },
+        );
+        while self.completed_turns.len() > crate::stream::MAX_RETAINED_RESPONSES {
+            // Evict the lowest result ordinal, not the lexically first key.
+            // Operation ids are opaque UUIDs whose ordering carries no time
+            // meaning, so a lexical eviction could discard the newest
+            // completed prompt and leave an older one unreadable.
+            let Some(oldest) = self
+                .completed_turns
+                .iter()
+                .min_by_key(|(_, turn)| turn.result_ordinal)
+                .map(|(operation_id, _)| operation_id.clone())
+            else {
+                break;
+            };
+            self.completed_turns.remove(&oldest);
+        }
     }
 
     /// Reads only facts observed by this process. Antigravity exposes no

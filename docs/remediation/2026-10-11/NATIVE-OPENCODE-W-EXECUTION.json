@@ -1,0 +1,350 @@
+{
+  "schema": "eliot.native_oc_w_execution.v1",
+  "source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+  "source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+  "harness_sha256": "c1fdf2ebcc5de7af41532f64741fb64ff3d18ad451dee6c39299e13bd0b4a1c2",
+  "run_id": "4c7195cc-0e82-4314-bf42-196a5dd26bf7",
+  "status": "blocked",
+  "qualification": "not_qualified",
+  "receipt_sha256": "22d47c5ed42d01f30b809910e42d387e07b055337cf2af47ac4f350a60018fe0",
+  "stages": [
+    {
+      "name": "preflight",
+      "status": "passed",
+      "facts": {
+        "kernel_host_binary_sha256": "3c3b2ae1c7453cb809d55b28dbbdea9602f4ac768eb01226df7924f2cda20442",
+        "host_launcher_binary_sha256": "ab3193017bc2126dc7697ed3924063904e4889d798e00da4509eef60ab277773",
+        "host_supervisor_binary_sha256": "21b1216488237a5861768725e70786ae76e397d48a794385c0688116eb6ea478",
+        "public_cli_sha256": "efd1150cdba028bb55bee2bc8b019ba2403f7161ea1311d9db5edea22376d68e",
+        "kernel_host_build": {
+          "manifest_sha256": "d2a97a0d3d843ba876ffdb76aada5f2895e49a8d98934346d0171d72f90161d4",
+          "source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+          "source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+          "package_name": "swarm-kernel-host",
+          "package_manifest": "crates/swarm-kernel-host/Cargo.toml",
+          "profile": "release",
+          "target_dir_sha256": "2c3d57d83e4bc2c3ef339a10cc0413b513e299b6b2f2b629e48d3ee416bc7509",
+          "binary_target": "swarm-kernel-host",
+          "binary_sha256": "3c3b2ae1c7453cb809d55b28dbbdea9602f4ac768eb01226df7924f2cda20442",
+          "binary_bytes": 54027776,
+          "cargo_toml_sha256": "50455f306fa740bb41f3845d1684879f451468d0f7f480b40d606786a73b8456",
+          "cargo_lock_sha256": "0aad2507a3199b51c59dabfd775436336368e044e0f7b1f214b39ac318e3e91d",
+          "rust_toolchain_toml_sha256": "887f9be066a15585a2c583578e84b0fcb541126d81546276bad3d2ff00d61167",
+          "active_toolchain": "1.98.1-x86_64-pc-windows-msvc (overridden by environment variable RUSTUP_TOOLCHAIN)",
+          "pinned_channel": "1.98.1",
+          "rustc_version_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\r\nbinary: rustc\r\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\r\ncommit-date: 2026-09-01\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.98.1\r\nLLVM version: 22.1.8",
+          "cargo_version_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\r\nrelease: 1.98.1\r\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\r\ncommit-date: 2026-08-05\r\nhost: x86_64-pc-windows-msvc\r\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\r\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:Schannel)\r\nos: Windows 10.0.26300 (Windows 11 Core) [64-bit]",
+          "rustc_host_triple": "x86_64-pc-windows-msvc",
+          "host_ipc_protocol_version": 1,
+          "host_runtime_package_name": "swarm-kernel-host",
+          "host_runtime_binary_target": "swarm-kernel-host",
+          "host_supervisor_package_name": "swarm-supervisor",
+          "host_supervisor_binary_target": "swarm-supervisor",
+          "provenance": "manifest_sha256_and_image_hash_verified; manifest_is_not_signed"
+        },
+        "host_launcher_build": {
+          "manifest_sha256": "ae98d749ac8fb59b64041f70279a09767c5d76946f281e033fe6263bbc17ffc9",
+          "source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+          "source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+          "package_name": "eliot-swarm-controller",
+          "package_manifest": "Cargo.toml",
+          "profile": "release",
+          "target_dir_sha256": "2c3d57d83e4bc2c3ef339a10cc0413b513e299b6b2f2b629e48d3ee416bc7509",
+          "binary_target": "swarm-host",
+          "binary_sha256": "ab3193017bc2126dc7697ed3924063904e4889d798e00da4509eef60ab277773",
+          "binary_bytes": 459264,
+          "cargo_toml_sha256": "50455f306fa740bb41f3845d1684879f451468d0f7f480b40d606786a73b8456",
+          "cargo_lock_sha256": "0aad2507a3199b51c59dabfd775436336368e044e0f7b1f214b39ac318e3e91d",
+          "rust_toolchain_toml_sha256": "887f9be066a15585a2c583578e84b0fcb541126d81546276bad3d2ff00d61167",
+          "active_toolchain": "1.98.1-x86_64-pc-windows-msvc (overridden by environment variable RUSTUP_TOOLCHAIN)",
+          "pinned_channel": "1.98.1",
+          "rustc_version_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\r\nbinary: rustc\r\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\r\ncommit-date: 2026-09-01\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.98.1\r\nLLVM version: 22.1.8",
+          "cargo_version_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\r\nrelease: 1.98.1\r\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\r\ncommit-date: 2026-08-05\r\nhost: x86_64-pc-windows-msvc\r\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\r\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:Schannel)\r\nos: Windows 10.0.26300 (Windows 11 Core) [64-bit]",
+          "rustc_host_triple": "x86_64-pc-windows-msvc",
+          "host_ipc_protocol_version": 1,
+          "host_runtime_package_name": "swarm-kernel-host",
+          "host_runtime_binary_target": "swarm-kernel-host",
+          "host_supervisor_package_name": "swarm-supervisor",
+          "host_supervisor_binary_target": "swarm-supervisor",
+          "provenance": "manifest_sha256_and_image_hash_verified; manifest_is_not_signed"
+        },
+        "host_supervisor_build": {
+          "manifest_sha256": "e6655b5e78ec0e357e138eb11aa3fbf3402612bd83071e1806f0845ea4a3b3f5",
+          "source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+          "source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+          "package_name": "swarm-supervisor",
+          "package_manifest": "crates/swarm-supervisor/Cargo.toml",
+          "profile": "release",
+          "target_dir_sha256": "2c3d57d83e4bc2c3ef339a10cc0413b513e299b6b2f2b629e48d3ee416bc7509",
+          "binary_target": "swarm-supervisor",
+          "binary_sha256": "21b1216488237a5861768725e70786ae76e397d48a794385c0688116eb6ea478",
+          "binary_bytes": 2895360,
+          "cargo_toml_sha256": "50455f306fa740bb41f3845d1684879f451468d0f7f480b40d606786a73b8456",
+          "cargo_lock_sha256": "0aad2507a3199b51c59dabfd775436336368e044e0f7b1f214b39ac318e3e91d",
+          "rust_toolchain_toml_sha256": "887f9be066a15585a2c583578e84b0fcb541126d81546276bad3d2ff00d61167",
+          "active_toolchain": "1.98.1-x86_64-pc-windows-msvc (overridden by environment variable RUSTUP_TOOLCHAIN)",
+          "pinned_channel": "1.98.1",
+          "rustc_version_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\r\nbinary: rustc\r\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\r\ncommit-date: 2026-09-01\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.98.1\r\nLLVM version: 22.1.8",
+          "cargo_version_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\r\nrelease: 1.98.1\r\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\r\ncommit-date: 2026-08-05\r\nhost: x86_64-pc-windows-msvc\r\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\r\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:Schannel)\r\nos: Windows 10.0.26300 (Windows 11 Core) [64-bit]",
+          "rustc_host_triple": "x86_64-pc-windows-msvc",
+          "host_ipc_protocol_version": 1,
+          "host_runtime_package_name": "swarm-kernel-host",
+          "host_runtime_binary_target": "swarm-kernel-host",
+          "host_supervisor_package_name": "swarm-supervisor",
+          "host_supervisor_binary_target": "swarm-supervisor",
+          "provenance": "manifest_sha256_and_image_hash_verified; manifest_is_not_signed"
+        },
+        "public_cli_build": {
+          "manifest_sha256": "c007a1fe56f5f1f0c24e08076e859092a19fce983bf4e477f252e03dde2d15c8",
+          "source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+          "source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+          "package_name": "swarm-cli",
+          "package_manifest": "crates/swarm-cli/Cargo.toml",
+          "profile": "release",
+          "target_dir_sha256": "2c3d57d83e4bc2c3ef339a10cc0413b513e299b6b2f2b629e48d3ee416bc7509",
+          "binary_target": "swarm",
+          "binary_sha256": "efd1150cdba028bb55bee2bc8b019ba2403f7161ea1311d9db5edea22376d68e",
+          "binary_bytes": 2724352,
+          "cargo_toml_sha256": "50455f306fa740bb41f3845d1684879f451468d0f7f480b40d606786a73b8456",
+          "cargo_lock_sha256": "0aad2507a3199b51c59dabfd775436336368e044e0f7b1f214b39ac318e3e91d",
+          "rust_toolchain_toml_sha256": "887f9be066a15585a2c583578e84b0fcb541126d81546276bad3d2ff00d61167",
+          "active_toolchain": "1.98.1-x86_64-pc-windows-msvc (overridden by environment variable RUSTUP_TOOLCHAIN)",
+          "pinned_channel": "1.98.1",
+          "rustc_version_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\r\nbinary: rustc\r\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\r\ncommit-date: 2026-09-01\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.98.1\r\nLLVM version: 22.1.8",
+          "cargo_version_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\r\nrelease: 1.98.1\r\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\r\ncommit-date: 2026-08-05\r\nhost: x86_64-pc-windows-msvc\r\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\r\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:Schannel)\r\nos: Windows 10.0.26300 (Windows 11 Core) [64-bit]",
+          "host_launcher_package_name": "eliot-swarm-controller",
+          "host_launcher_binary_target": "swarm-host",
+          "host_runtime_package_name": "swarm-kernel-host",
+          "host_runtime_binary_target": "swarm-kernel-host",
+          "host_supervisor_package_name": "swarm-supervisor",
+          "host_supervisor_binary_target": "swarm-supervisor",
+          "host_supervisor_role": "host_supervisor",
+          "host_ipc_protocol_version": 1,
+          "rustc_host_triple": "x86_64-pc-windows-msvc",
+          "provenance": "frontend_manifest_sha256_and_image_hash_verified; manifest_is_not_signed"
+        },
+        "cli_host_siblings_verified": true,
+        "cli_host_ipc_protocol_version": 1,
+        "module_executable_sha256": "85f3ef004af2b906e3ae137bd4ba0a6bc3449b5d713bf59f6c14a407a6a3cd15",
+        "descriptor_sha256": "51b25ff2b9321e507a37a71feef7ab7aea747e9f8f9826eba88564f5cc1afbd8",
+        "install_receipt_sha256": "e905a641266a1be00836e080e188adccbe4b975d001ab2fbecefa1baff730e3d",
+        "module_identity": {
+          "module_id": "eliot.opencode.v2",
+          "artifact_id": "eliot-opencode-v2.rust-http.1",
+          "version": "0.5.0",
+          "build_id": null,
+          "executable_sha256": "85f3ef004af2b906e3ae137bd4ba0a6bc3449b5d713bf59f6c14a407a6a3cd15",
+          "descriptor_sha256": "51b25ff2b9321e507a37a71feef7ab7aea747e9f8f9826eba88564f5cc1afbd8"
+        },
+        "module_build": {
+          "manifest_sha256": "397a598d584c5a8444c0822ed8dcc7a729283ce77efdc9166707371a8dd12d1f",
+          "source_commit": "ef3a4b3e64fb2d4aae87dda7f71fd5b87c57a480",
+          "source_tree": "e2fa1c5b7cf3a94b1c6e0158882972020973d740",
+          "package_name": "swarm-adapter-opencode",
+          "package_manifest": "crates/swarm-adapter-opencode/Cargo.toml",
+          "profile": "release",
+          "target_dir_sha256": "2c3d57d83e4bc2c3ef339a10cc0413b513e299b6b2f2b629e48d3ee416bc7509",
+          "binary_target": "swarm-adapter-opencode",
+          "binary_sha256": "85f3ef004af2b906e3ae137bd4ba0a6bc3449b5d713bf59f6c14a407a6a3cd15",
+          "binary_bytes": 5086720,
+          "cargo_toml_sha256": "50455f306fa740bb41f3845d1684879f451468d0f7f480b40d606786a73b8456",
+          "cargo_lock_sha256": "0aad2507a3199b51c59dabfd775436336368e044e0f7b1f214b39ac318e3e91d",
+          "rust_toolchain_toml_sha256": "887f9be066a15585a2c583578e84b0fcb541126d81546276bad3d2ff00d61167",
+          "active_toolchain": "1.98.1-x86_64-pc-windows-msvc (overridden by environment variable RUSTUP_TOOLCHAIN)",
+          "pinned_channel": "1.98.1",
+          "rustc_version_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\r\nbinary: rustc\r\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\r\ncommit-date: 2026-09-01\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.98.1\r\nLLVM version: 22.1.8",
+          "cargo_version_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\r\nrelease: 1.98.1\r\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\r\ncommit-date: 2026-08-05\r\nhost: x86_64-pc-windows-msvc\r\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\r\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:Schannel)\r\nos: Windows 10.0.26300 (Windows 11 Core) [64-bit]",
+          "rustc_host_triple": "x86_64-pc-windows-msvc",
+          "host_ipc_protocol_version": null,
+          "host_runtime_package_name": null,
+          "host_runtime_binary_target": null,
+          "host_supervisor_package_name": null,
+          "host_supervisor_binary_target": null,
+          "provenance": "manifest_sha256_and_image_hash_verified; manifest_is_not_signed"
+        }
+      }
+    },
+    {
+      "name": "isolated_host",
+      "status": "passed",
+      "facts": {
+        "isolated_data_root": true,
+        "kernel_process_id": 10824,
+        "kernel_image_sha256": "3c3b2ae1c7453cb809d55b28dbbdea9602f4ac768eb01226df7924f2cda20442",
+        "host_launcher_image_sha256": "ab3193017bc2126dc7697ed3924063904e4889d798e00da4509eef60ab277773",
+        "host_supervisor_image_sha256": "21b1216488237a5861768725e70786ae76e397d48a794385c0688116eb6ea478",
+        "public_cli_image_sha256": "efd1150cdba028bb55bee2bc8b019ba2403f7161ea1311d9db5edea22376d68e",
+        "host_readiness": {
+          "host_epoch": 1,
+          "kernel_lifecycle_state": "running",
+          "module_supervisor_state": "dormant",
+          "child_exit_category": "exited",
+          "child_exit_code": 0,
+          "module_supervisor_image_sha256": "sha256:21b1216488237a5861768725e70786ae76e397d48a794385c0688116eb6ea478"
+        },
+        "operator_credential_created": true
+      }
+    },
+    {
+      "name": "manager_admission",
+      "status": "passed",
+      "facts": {
+        "role": "manager",
+        "client_id": "native-qualification-b54b01a18d0b47febde5158ac1b3c4d4",
+        "credential_created_for_private_run": true,
+        "credential_material_in_receipt": false,
+        "gm_handover": true,
+        "gm_epoch": 1
+      }
+    },
+    {
+      "name": "trusted_descriptor",
+      "status": "passed",
+      "facts": {
+        "module_id": "eliot.opencode.v2",
+        "artifact_id": "eliot-opencode-v2.rust-http.1",
+        "version": "0.5.0",
+        "registered_revision": 1,
+        "catalog_revision": 1,
+        "protocol": "1.0",
+        "capability_count": 13
+      }
+    },
+    {
+      "name": "route_configuration",
+      "status": "passed",
+      "facts": {
+        "route_alias": "native-w-opencode",
+        "runtime": "module",
+        "artifact_id": "eliot-opencode-v2.rust-http.1",
+        "model_id": "stepfun/step-5-preview-free",
+        "provider_id": "kilo",
+        "variant": "high",
+        "requested_model_ref": "kilo/stepfun/step-5-preview-free"
+      }
+    },
+    {
+      "name": "manager_route_selection",
+      "status": "passed",
+      "facts": {
+        "route_alias": "native-w-opencode",
+        "module_id": "eliot.opencode.v2",
+        "artifact_id": "eliot-opencode-v2.rust-http.1",
+        "selected_revision": 2,
+        "scope": "manager_future_bindings_only"
+      }
+    },
+    {
+      "name": "task_create",
+      "status": "passed",
+      "facts": {
+        "task_id": "061ab2ea-b3fe-4d15-a962-fb8b46d3483d",
+        "revision": 1,
+        "project_id": "native-w-a6daa170ce884f8386b68a04e118f1d7",
+        "source": "caller_supplied_task_spec"
+      }
+    },
+    {
+      "name": "task_claim",
+      "status": "passed",
+      "facts": {
+        "task_id": "061ab2ea-b3fe-4d15-a962-fb8b46d3483d",
+        "attempt_id": "a15aa869-22aa-4094-b9e0-de7da3401e8d",
+        "owner_id": "native-qualification-b54b01a18d0b47febde5158ac1b3c4d4",
+        "start_owner": "controller"
+      }
+    },
+    {
+      "name": "launcher_preview",
+      "status": "passed",
+      "facts": {
+        "plan_digest": "sha256:52dcdc4b14728ae69949e57fd9e781464dccca7da618c6d89c2375d93fc82b46",
+        "hard_blocks": [],
+        "attempt_id": "a15aa869-22aa-4094-b9e0-de7da3401e8d",
+        "workspace_policy": "manager_owned_worktree"
+      }
+    },
+    {
+      "name": "module_open_and_hello",
+      "status": "blocked",
+      "code": "NATIVE_MODEL_UNAVAILABLE",
+      "facts": {
+        "parent_operation_id": "26267648-8662-4293-9f16-0168366c188d",
+        "open_operation_id": "f620c4fd-2559-411f-b056-7a2473e25f91",
+        "dispatch_started": false,
+        "readiness_failure": {
+          "reason": "terminal_open_rejection",
+          "expected_binding_scope": {
+            "task_id": "061ab2ea-b3fe-4d15-a962-fb8b46d3483d",
+            "attempt_id": "a15aa869-22aa-4094-b9e0-de7da3401e8d",
+            "module_id": "eliot.opencode.v2",
+            "artifact_id": "eliot-opencode-v2.rust-http.1",
+            "artifact_version": "0.5.0",
+            "binding_id": "846a9feb-e683-4577-aea0-8e09ae2df670",
+            "generation": 1
+          },
+          "observed_binding_state": null,
+          "observed_supervisor_phase": null,
+          "observed_launch_phase": null,
+          "observed_native_dispatch_capability_state": "unknown",
+          "error_code": "NATIVE_MODEL_UNAVAILABLE",
+          "catalog_failure_category": "model_absent",
+          "selected_catalog_diagnostic_status": "unknown",
+          "selected_catalog_diagnostic_reason": "OPENCODE_SELECTED_CATALOG_IDENTITY_UNKNOWN"
+        }
+      }
+    }
+  ],
+  "diagnostic": {
+    "schema_version": 1,
+    "captured_at_utc": "2026-10-11T11:01:52.1238476Z",
+    "capture_status": "unknown",
+    "reason_code": "OPENCODE_SELECTED_CATALOG_IDENTITY_UNKNOWN",
+    "scope": {
+      "mode": "rejected_open_diagnostic",
+      "task_id": "061ab2ea-b3fe-4d15-a962-fb8b46d3483d",
+      "attempt_id": "a15aa869-22aa-4094-b9e0-de7da3401e8d",
+      "parent_operation_id": "26267648-8662-4293-9f16-0168366c188d",
+      "open_operation_id": "f620c4fd-2559-411f-b056-7a2473e25f91",
+      "binding_id": "846a9feb-e683-4577-aea0-8e09ae2df670",
+      "generation": 1,
+      "route_alias": "native-w-opencode",
+      "module_id": "eliot.opencode.v2",
+      "artifact_id": "eliot-opencode-v2.rust-http.1",
+      "requested_model": {
+        "provider_id": "kilo",
+        "model_id": "stepfun/step-5-preview-free",
+        "variant": "high"
+      },
+      "identity_source": "fresh_owned_service_route",
+      "identity_limitation": "No supported public post-launch projection exposes this binding service_id, connection_file, and workspace; selected catalog was not captured."
+    },
+    "endpoint_identity": null,
+    "selected_pid": null,
+    "responses": {
+      "info": null,
+      "location": null,
+      "model_catalog": null
+    },
+    "predicates": {
+      "connection_record_schema_valid": false,
+      "server_info_schema_valid": false,
+      "server_pid_matches_selected_record": false,
+      "location_http_ok": false,
+      "location_project_identity_present": false,
+      "location_workspace_matches_route": false,
+      "catalog_http_ok": false,
+      "catalog_location_matches_route": false,
+      "catalog_shape_valid": false,
+      "matching_model_count": 0,
+      "selected_model_enabled_is_true": false,
+      "matching_variant_count": 0
+    }
+  },
+  "dispatch_calls": 0,
+  "terminal_code": "NATIVE_MODEL_UNAVAILABLE",
+  "catalog_failure_category": "model_absent",
+  "model_execution": "not_observed",
+  "historical_runs_replayed": false,
+  "replay_allowed": false
+}

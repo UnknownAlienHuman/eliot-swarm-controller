@@ -322,7 +322,10 @@ async fn run() -> Result<()> {
             }
             "agent.result" => {
                 let params = if command.input["normalized_result_origin"].is_object() {
-                    result_page::build_normalized(&command)
+                    // The normalized path publishes only the response body this
+                    // process retained for the exact sealed prompt, so it reads
+                    // the controller's bounded retention rather than the wire.
+                    result_page::build_normalized(&command, &controller)
                 } else {
                     result_page::build(&command)
                 };
