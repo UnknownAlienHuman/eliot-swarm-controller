@@ -1,5 +1,15 @@
 # Current-source audit and implementation ledger
 
+The [OpenCode torn-ACK recovery repair](../2026-10-11/OPENCODE-TORN-ACK-RECOVERY.json)
+removes only a bounded, stable unterminated suffix after validating the exact
+saved-outcome prefix. It never fabricates an ACK or replays native input. The
+actual outbox drain delivers the recovered outcome and 33 independent outcomes
+past the batch limit while preserving complete corrupt bytes. Shared opened-file
+identity uses stable platform APIs; validated readers close before Windows
+write-through replacement. Strict production Clippy and the connected drain and
+file-identity cases pass on Windows/Linux. Initial failed receipts are retained.
+Claude follow-up and full installed/native/crash/load qualification remain pending.
+
 The [Issue #115 aggregate quiescence repair](../2026-10-11/ISSUE-115-QUIESCENCE-EVIDENCE.json)
 releases the historical Unknown hold only after exact worker departure and
 complete exact-scope zero-unresolved readback. A process exit during birth/image

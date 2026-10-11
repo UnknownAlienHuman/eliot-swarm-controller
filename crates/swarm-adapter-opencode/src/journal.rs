@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -571,18 +571,29 @@ impl Journal {
         )
     }
 
+    #[cfg(test)]
     pub fn pending_items(&self) -> Result<Vec<(PathBuf, PendingItem)>> {
+        self.pending_items_excluding(&HashSet::new())
+    }
+
+    pub fn pending_items_excluding(
+        &self,
+        deferred_paths: &HashSet<PathBuf>,
+    ) -> Result<Vec<(PathBuf, PendingItem)>> {
         let mut items = Vec::with_capacity(OUTBOX_BATCH);
         let entries = fs::read_dir(&self.outbox)
             .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox cannot be read"))?;
         for entry in entries {
             let entry =
                 entry.map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox entry cannot be read"))?;
+            let path = entry.path();
+            ensure_regular(&path, "outbox item")?;
+            if deferred_paths.contains(&path) {
+                continue;
+            }
             if items.len() >= OUTBOX_BATCH {
                 break;
             }
-            let path = entry.path();
-            ensure_regular(&path, "outbox item")?;
             let bytes = read_limited(&path, RECORD_LIMIT)?;
             let item: PendingItem = serde_json::from_slice(&bytes)
                 .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
@@ -601,25 +612,23 @@ impl Journal {
             let path = entry.path();
             ensure_regular(&path, "operation journal")?;
             let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
-                return Err(Error::new(
-                    "ADAPTER_JOURNAL",
-                    "operation filename is invalid",
-                ));
+                continue;
             };
-            let history = self.load_by_path(&path)?;
+            let history = match self.load_by_path(&path) {
+                Ok(history) => history,
+                Err(error) if error.code == "ADAPTER_JOURNAL" => continue,
+                Err(error) => return Err(error),
+            };
             if let (Some(outcome), Some(digest)) =
                 (history.outcome.as_ref(), history.outcome_sha256.as_ref())
                 && history.acknowledged_sha256.as_deref() != Some(digest.as_str())
             {
-                let operation_id = outcome["operation_id"].as_str().ok_or_else(|| {
-                    Error::new("ADAPTER_JOURNAL", "outcome operation ID is missing")
-                })?;
+                let Some(operation_id) = outcome["operation_id"].as_str() else {
+                    continue;
+                };
                 let expected = operation_key(operation_id);
                 if name != expected {
-                    return Err(Error::new(
-                        "ADAPTER_JOURNAL",
-                        "operation filename does not match its identity",
-                    ));
+                    continue;
                 }
                 self.write_pending(PendingItem {
                     kind: "outcome".into(),
@@ -632,14 +641,11 @@ impl Journal {
                 history.result_sha256.as_ref(),
             ) && history.result_acknowledged_sha256.as_deref() != Some(digest.as_str())
             {
-                let operation_id = params["operation_id"].as_str().ok_or_else(|| {
-                    Error::new("ADAPTER_JOURNAL", "result page operation ID is missing")
-                })?;
+                let Some(operation_id) = params["operation_id"].as_str() else {
+                    continue;
+                };
                 if name != operation_key(operation_id) {
-                    return Err(Error::new(
-                        "ADAPTER_JOURNAL",
-                        "result page filename does not match its identity",
-                    ));
+                    continue;
                 }
                 self.write_pending(PendingItem {
                     kind: "result".into(),
@@ -670,10 +676,7 @@ impl Journal {
                     .as_deref()
                     .is_some_and(|operation_id| name != operation_key(operation_id))
                 {
-                    return Err(Error::new(
-                        "ADAPTER_JOURNAL",
-                        "operation filename does not match its identity",
-                    ));
+                    continue;
                 }
                 recovery_states.push(OperationRecoveryState {
                     operation_key: name.to_owned(),
@@ -843,19 +846,89 @@ impl Journal {
                 "outcome acknowledgement does not match the saved result",
             ));
         }
+        if history.torn_tail_evidence.is_some() && !self.repair_torn_outcome_ack(outcome)? {
+            return Err(torn_ack_recovery_unknown());
+        }
+        let history = self.load(operation_id)?;
+        if history.acknowledged_sha256.as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
+        if history.acknowledged_sha256.is_some() {
+            return Err(torn_ack_recovery_unknown());
+        }
         self.append(
             operation_id,
-            &JournalRecord {
-                version: 2,
-                operation_id: operation_id.into(),
-                kind: "acknowledged".into(),
-                intent: None,
-                outcome: None,
-                outcome_sha256: Some(digest),
-                result_params: None,
-                result_sha256: None,
-            },
+            &acknowledged_outcome_record(operation_id, &digest),
         )
+    }
+
+    /// Remove only a bounded torn suffix after rescanning the exact saved
+    /// outcome prefix. The suffix never proves that the host acknowledged it.
+    pub fn repair_torn_outcome_ack(&self, outcome: &Value) -> Result<bool> {
+        let operation_id = outcome["operation_id"].as_str().ok_or_else(|| {
+            Error::new("ADAPTER_OUTBOX", "acknowledged outcome has no operation ID")
+        })?;
+        let digest = digest_json(outcome)?;
+        let path = self.operation_path(operation_id);
+        ensure_regular(&path, "operation journal").map_err(|_| torn_ack_recovery_unknown())?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        let bytes = read_opened_file_for_repair(&path, &mut file)?;
+        let opened_history = read_operation_history_bytes(&bytes, Some(operation_id))
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        let Some(evidence) = opened_history.torn_tail_evidence.as_ref() else {
+            return Ok(false);
+        };
+        let acknowledged_sha256 = opened_history.acknowledged_sha256.clone();
+        if opened_history.outcome.as_ref() != Some(outcome)
+            || opened_history.outcome_sha256.as_deref() != Some(digest.as_str())
+            || acknowledged_sha256
+                .as_deref()
+                .is_some_and(|saved| saved != digest)
+        {
+            return Err(torn_ack_recovery_unknown());
+        }
+
+        let prefix_bytes = evidence.valid_prefix_bytes;
+        let Some(tail_end) = prefix_bytes.checked_add(evidence.tail_bytes) else {
+            return Err(torn_ack_recovery_unknown());
+        };
+        if evidence.tail_bytes == 0 || tail_end != bytes.len() || prefix_bytes >= bytes.len() {
+            return Err(torn_ack_recovery_unknown());
+        }
+        let repaired_bytes = bytes[..prefix_bytes].to_vec();
+        let opened_metadata = file.metadata().map_err(|_| torn_ack_recovery_unknown())?;
+        if repaired_bytes.len() > HISTORY_LIMIT
+            || opened_metadata.len() != bytes.len() as u64
+            || !opened_file_matches_path(&file, &path)
+        {
+            return Err(torn_ack_recovery_unknown());
+        }
+        // The adapter retains its single-owner scope. Close the validated
+        // reader before the write-through replacement, which Windows refuses
+        // while the destination reader is open.
+        drop(file);
+        replace_private_durable(&path, &repaired_bytes).map_err(|_| torn_ack_recovery_unknown())?;
+
+        ensure_regular(&path, "operation journal").map_err(|_| torn_ack_recovery_unknown())?;
+        let mut repaired_file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        let verified_bytes = read_opened_file_for_repair(&path, &mut repaired_file)?;
+        let verified_history = read_operation_history_bytes(&verified_bytes, Some(operation_id))
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        if verified_bytes != repaired_bytes
+            || verified_history.torn_tail_evidence.is_some()
+            || verified_history.outcome.as_ref() != Some(outcome)
+            || verified_history.outcome_sha256.as_deref() != Some(digest.as_str())
+            || verified_history.acknowledged_sha256 != acknowledged_sha256
+        {
+            return Err(torn_ack_recovery_unknown());
+        }
+        Ok(true)
     }
 
     pub fn remember_native_root(
@@ -913,13 +986,20 @@ impl Journal {
                 .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
             if item.kind == "outcome"
                 && item.payload["native_scope_key"] == scope
-                && let Some(intent) = self.load(&item.key)?.intent
-                && intent.binding_id == binding_id
-                && intent.generation == generation
-                && intent.native_scope_key == scope
                 && let Some(root) = item.payload["native_root_id"].as_str()
             {
-                remember_one_root(&mut root_checkpoint, root.into())?;
+                let history = match self.load(&item.key) {
+                    Ok(history) => history,
+                    Err(error) if error.code == "ADAPTER_JOURNAL" => continue,
+                    Err(error) => return Err(error),
+                };
+                if let Some(intent) = history.intent
+                    && intent.binding_id == binding_id
+                    && intent.generation == generation
+                    && intent.native_scope_key == scope
+                {
+                    remember_one_root(&mut root_checkpoint, root.into())?;
+                }
             }
         }
         let entries = fs::read_dir(&self.operations)
@@ -930,12 +1010,13 @@ impl Journal {
             let path = entry.path();
             ensure_regular(&path, "operation journal")?;
             let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
-                return Err(Error::new(
-                    "ADAPTER_JOURNAL",
-                    "operation filename is invalid",
-                ));
+                continue;
             };
-            let history = self.load_by_path(&path)?;
+            let history = match self.load_by_path(&path) {
+                Ok(history) => history,
+                Err(error) if error.code == "ADAPTER_JOURNAL" => continue,
+                Err(error) => return Err(error),
+            };
             if let Some(intent) = history.intent
                 && name == operation_key(&intent.operation_id)
                 && intent.binding_id == binding_id
@@ -1203,6 +1284,72 @@ fn read_operation_history_bytes(
         }
     }
     Ok(history)
+}
+
+fn acknowledged_outcome_record(operation_id: &str, digest: &str) -> JournalRecord {
+    JournalRecord {
+        version: 2,
+        operation_id: operation_id.into(),
+        kind: "acknowledged".into(),
+        intent: None,
+        outcome: None,
+        outcome_sha256: Some(digest.into()),
+        result_params: None,
+        result_sha256: None,
+    }
+}
+
+fn torn_ack_recovery_unknown() -> Error {
+    Error::new(
+        "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+        "torn journal suffix could not be safely removed from the exact saved outcome prefix",
+    )
+}
+
+fn read_opened_file_for_repair(path: &Path, file: &mut File) -> Result<Vec<u8>> {
+    if !opened_file_matches_path(file, path) {
+        return Err(torn_ack_recovery_unknown());
+    }
+    let initial_metadata = file.metadata().map_err(|_| torn_ack_recovery_unknown())?;
+    if initial_metadata.len() > HISTORY_LIMIT as u64 {
+        return Err(torn_ack_recovery_unknown());
+    }
+
+    let mut bytes = Vec::new();
+    Read::by_ref(file)
+        .take((HISTORY_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| torn_ack_recovery_unknown())?;
+    if bytes.len() > HISTORY_LIMIT || initial_metadata.len() != bytes.len() as u64 {
+        return Err(torn_ack_recovery_unknown());
+    }
+    if !opened_file_matches_path(file, path) {
+        return Err(torn_ack_recovery_unknown());
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| torn_ack_recovery_unknown())?;
+    let mut confirmed_bytes = Vec::new();
+    Read::by_ref(file)
+        .take((HISTORY_LIMIT + 1) as u64)
+        .read_to_end(&mut confirmed_bytes)
+        .map_err(|_| torn_ack_recovery_unknown())?;
+    let final_metadata = file.metadata().map_err(|_| torn_ack_recovery_unknown())?;
+    if confirmed_bytes != bytes
+        || confirmed_bytes.len() > HISTORY_LIMIT
+        || final_metadata.len() != bytes.len() as u64
+        || !opened_file_matches_path(file, path)
+    {
+        return Err(torn_ack_recovery_unknown());
+    }
+    Ok(bytes)
+}
+
+fn opened_file_matches_path(file: &File, path: &Path) -> bool {
+    if ensure_regular(path, "operation journal").is_err() {
+        return false;
+    }
+    swarm_process::opened_regular_file_matches_path(file, path).unwrap_or(false)
 }
 
 fn apply_operation_record(

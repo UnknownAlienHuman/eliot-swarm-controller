@@ -18,8 +18,11 @@ pub use config::{
 pub use module_runtime::OwnedBootstrap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(test)]
+use journal::operation_key;
 use journal::{
-    Journal, OperationIntent, ResultAssistantIntent, ResultInputStatusIntent, digest_json,
+    Journal, OperationIntent, PendingItem, ResultAssistantIntent, ResultInputStatusIntent,
+    digest_json,
 };
 use native::{
     AssistantResultEvidence, InputEvidence, NativeClient, canonical_json, input_id, intent_for,
@@ -28,6 +31,8 @@ use native::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
+    path::PathBuf,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -2386,62 +2391,138 @@ impl<'a> HostSession<'a> {
     }
 }
 
+struct PreparedOutboxItem {
+    path: PathBuf,
+    item: PendingItem,
+}
+
+fn prepare_outbox_batch(
+    journal: &Journal,
+    items: Vec<(PathBuf, PendingItem)>,
+) -> Result<(Vec<PreparedOutboxItem>, Vec<PathBuf>)> {
+    let mut prepared = Vec::with_capacity(items.len());
+    let mut deferred_paths = Vec::new();
+    for (path, item) in items {
+        if item.kind == "outcome" {
+            match journal.repair_torn_outcome_ack(&item.payload) {
+                Ok(_) => {}
+                Err(error) if error.code == "ADAPTER_JOURNAL_RECOVERY_UNKNOWN" => {
+                    deferred_paths.push(path);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        prepared.push(PreparedOutboxItem { path, item });
+    }
+    Ok((prepared, deferred_paths))
+}
+
 async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
     let journal = host.journal;
-    loop {
-        let items = journal.pending_items()?;
-        if items.is_empty() {
-            return Ok(());
-        }
-        for (path, item) in items {
+    flush_outbox_with_sender(
+        journal,
+        |method, params| host.call_recorded_retry(method, params),
+        |item| {
             match item.kind.as_str() {
                 "outcome" => {
-                    let mut acknowledged_now = false;
-                    let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
-                        Error::new("ADAPTER_OUTBOX", "saved outcome has no operation ID")
-                    })?;
-                    let digest = digest_json(&item.payload)?;
-                    let history = journal.load(operation_id)?;
-                    if history.acknowledged_sha256.as_deref() != Some(digest.as_str()) {
-                        host.call_recorded_retry("module.outcome", item.payload.clone())
-                            .await?;
-                        journal.acknowledge_outcome(&item.payload)?;
-                        acknowledged_now = true;
-                    }
                     remember_root_from_outcome(host.config, journal, &item.payload)?;
                     if let Some(root) = item.payload["native_root_id"].as_str() {
                         host.set_root_hint(root)?;
                     }
+                }
+                "result" => {
+                    if let Some(root) = item.payload["page"]["source"]["native_session_id"].as_str()
+                    {
+                        host.set_root_hint(root)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+        || {
+            if journal.retention_pass_due_after_ack() {
+                attempt_journal_retention(host);
+            }
+        },
+    )
+    .await
+}
+
+async fn flush_outbox_with_sender<F, Fut, D, R>(
+    journal: &Journal,
+    mut send_recorded: F,
+    mut after_delivery: D,
+    mut after_acknowledged: R,
+) -> Result<()>
+where
+    F: FnMut(&'static str, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+    D: FnMut(&PendingItem) -> Result<()>,
+    R: FnMut(),
+{
+    let mut deferred_paths = HashSet::new();
+    loop {
+        let items = journal.pending_items_excluding(&deferred_paths)?;
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (items, newly_deferred_paths) = prepare_outbox_batch(journal, items)?;
+        deferred_paths.extend(newly_deferred_paths);
+        for PreparedOutboxItem { path, item } in items {
+            match item.kind.as_str() {
+                "outcome" => {
+                    let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
+                        Error::new("ADAPTER_OUTBOX", "saved outcome has no operation ID")
+                    })?;
+                    let digest = digest_json(&item.payload)?;
+                    let history = match journal.load(operation_id) {
+                        Ok(history) => history,
+                        Err(error)
+                            if matches!(
+                                error.code.as_str(),
+                                "ADAPTER_JOURNAL" | "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+                            ) =>
+                        {
+                            deferred_paths.insert(path);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut acknowledged_now = false;
+                    if history.acknowledged_sha256.as_deref() != Some(digest.as_str()) {
+                        send_recorded("module.outcome", item.payload.clone()).await?;
+                        journal.acknowledge_outcome(&item.payload)?;
+                        acknowledged_now = true;
+                    }
+                    after_delivery(&item)?;
                     journal.remove_pending(&path)?;
-                    if acknowledged_now && journal.retention_pass_due_after_ack() {
-                        attempt_journal_retention(host);
+                    if acknowledged_now {
+                        after_acknowledged();
                     }
                 }
                 "observation" => {
-                    host.call_recorded_retry("module.observe", item.payload.clone())
-                        .await?;
+                    send_recorded("module.observe", item.payload.clone()).await?;
+                    after_delivery(&item)?;
                     journal.remove_pending(&path)?;
                 }
                 "result" => {
-                    let mut acknowledged_now = false;
                     let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
                         Error::new("ADAPTER_OUTBOX", "saved result page has no operation ID")
                     })?;
                     let digest = digest_json(&item.payload)?;
                     let history = journal.load(operation_id)?;
+                    let mut acknowledged_now = false;
                     if history.result_acknowledged_sha256.as_deref() != Some(digest.as_str()) {
-                        host.call_recorded_retry("module.result", item.payload.clone())
-                            .await?;
+                        send_recorded("module.result", item.payload.clone()).await?;
                         journal.acknowledge_result(&item.payload)?;
                         acknowledged_now = true;
                     }
-                    if let Some(root) = item.payload["page"]["source"]["native_session_id"].as_str()
-                    {
-                        host.set_root_hint(root)?;
-                    }
+                    after_delivery(&item)?;
                     journal.remove_pending(&path)?;
-                    if acknowledged_now && journal.retention_pass_due_after_ack() {
-                        attempt_journal_retention(host);
+                    if acknowledged_now {
+                        after_acknowledged();
                     }
                 }
                 _ => {
@@ -2631,5 +2712,223 @@ fn optional_identity_field<'a>(value: &'a Value, field: &str) -> Result<Option<&
             "NATIVE_IDENTITY_MISMATCH",
             "host native identity field must be a nonempty string or null",
         )),
+    }
+}
+
+#[cfg(test)]
+mod outbox_recovery_tests {
+    use super::*;
+    use serde_json::json;
+    use std::{collections::HashMap, io::Write};
+
+    fn fixture_effect_intent(operation_id: &str) -> OperationIntent {
+        let module_receipt: swarm_contracts::runtime::ModuleReceiptIdentity =
+            serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":"eliot.opencode",
+            "artifact":{"artifact_id":ARTIFACT_ID,"version":ARTIFACT_VERSION},
+            "protocol":{"major":1,"minor":0},
+            "binding_id":"fixture-binding",
+            "binding_generation":1,
+            "operation_id":operation_id,
+            "input_sha256":"c".repeat(64)
+            }))
+            .unwrap();
+        OperationIntent {
+            version: 2,
+            operation_id: operation_id.to_owned(),
+            module_receipt,
+            method: "agent.send".to_owned(),
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_scope_key: "fixture-scope".to_owned(),
+            native_root_id: None,
+            native_input_id: Some("native-input".to_owned()),
+            prompt_sha256: Some(format!("sha256:{}", "d".repeat(64))),
+            prompt_bytes: Some(12),
+            reconcile_target_operation_id: None,
+            result_input_status: None,
+            result_assistant: None,
+            dispatch_admission: None,
+            route_sha256: format!("sha256:{}", "a".repeat(64)),
+            model: json!({"id":"fixture-model"}),
+            marker: json!({"fixture_native_effect_was_already_attempted":true}),
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_resends_recovered_outcome_without_native_replay_and_drains_past_corruption() {
+        let root =
+            std::env::temp_dir().join(format!("swarm-opencode-torn-ack-{}", uuid::Uuid::new_v4()));
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let recovered = json!({"operation_id":"recovered-operation","outcome":"unknown"});
+        let corrupt = json!({"operation_id":"corrupt-operation","outcome":"unknown"});
+        let mut expected_outcomes = HashMap::new();
+        let recovered_id = "recovered-operation";
+        journal
+            .write_intent(&fixture_effect_intent(recovered_id))
+            .unwrap();
+        journal.queue_outcome_value(&recovered).unwrap();
+        expected_outcomes.insert(recovered_id.to_owned(), recovered.clone());
+        for index in 0..33 {
+            let operation_id = format!("independent-{index:02}");
+            let outcome = json!({"operation_id":operation_id.clone(),"outcome":"unknown"});
+            journal.queue_outcome_value(&outcome).unwrap();
+            expected_outcomes.insert(operation_id, outcome);
+        }
+        journal.queue_outcome_value(&corrupt).unwrap();
+        expected_outcomes.insert("corrupt-operation".to_owned(), corrupt.clone());
+
+        let recovered_path = root
+            .join("operations")
+            .join(format!("{}.jsonl", operation_key(recovered_id)));
+        let recovered_prefix = std::fs::read(&recovered_path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&recovered_path)
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+
+        let corrupt_path = root
+            .join("operations")
+            .join(format!("{}.jsonl", operation_key("corrupt-operation")));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&corrupt_path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+        drop(journal);
+
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        journal.recover_outbox().unwrap();
+        assert_eq!(
+            journal
+                .native_root_for_hello("fixture-binding", 1, "fixture-scope")
+                .unwrap(),
+            None
+        );
+
+        let mut host_deliveries = Vec::new();
+        let mut native_effect_calls = 0;
+        flush_outbox_with_sender(
+            &journal,
+            |method, payload| {
+                if method.starts_with("native.") {
+                    native_effect_calls += 1;
+                }
+                if payload["operation_id"] == recovered_id {
+                    let history = journal.load(recovered_id).unwrap();
+                    assert!(history.torn_tail_evidence.is_none());
+                    assert!(history.acknowledged_sha256.is_none());
+                    assert!(!history.native_replay_permitted());
+                    assert_eq!(std::fs::read(&recovered_path).unwrap(), recovered_prefix);
+                }
+                let exact_saved_outcome = method == "module.outcome"
+                    && payload["operation_id"]
+                        .as_str()
+                        .and_then(|operation_id| expected_outcomes.get(operation_id))
+                        == Some(&payload);
+                let host_response = json!({"recorded":exact_saved_outcome});
+                host_deliveries.push((
+                    method.to_owned(),
+                    payload.clone(),
+                    host_response["recorded"] == true,
+                ));
+                let recorded = host_response["recorded"] == true;
+                async move {
+                    if recorded {
+                        Ok(())
+                    } else {
+                        Err(Error::new(
+                            "HOST_ACK_SCHEMA",
+                            "fixture host did not record the exact saved outcome",
+                        ))
+                    }
+                }
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(host_deliveries.len(), 34);
+        assert!(
+            host_deliveries
+                .iter()
+                .all(|(method, _, recorded)| { method == "module.outcome" && *recorded })
+        );
+        assert_eq!(native_effect_calls, 0);
+        assert_eq!(
+            host_deliveries
+                .iter()
+                .filter(|(_, payload, _)| payload["operation_id"] == recovered_id)
+                .count(),
+            1
+        );
+        assert!(
+            !host_deliveries
+                .iter()
+                .any(|(_, payload, _)| payload["operation_id"] == "corrupt-operation")
+        );
+
+        let recovered_history = journal.load(recovered_id).unwrap();
+        let recovered_digest = digest_json(&recovered).unwrap();
+        assert!(recovered_history.torn_tail_evidence.is_none());
+        assert_eq!(
+            recovered_history.acknowledged_sha256.as_deref(),
+            Some(recovered_digest.as_str())
+        );
+        let repaired_bytes = std::fs::read(&recovered_path).unwrap();
+        let ack_suffix = repaired_bytes
+            .strip_prefix(recovered_prefix.as_slice())
+            .unwrap();
+        assert_eq!(ack_suffix.last(), Some(&b'\n'));
+        let ack_frame: Value = serde_json::from_slice(&ack_suffix[..ack_suffix.len() - 1]).unwrap();
+        assert_eq!(ack_frame["kind"], "acknowledged");
+        assert_eq!(ack_frame["operation_id"], recovered_id);
+        assert_eq!(ack_frame["outcome_sha256"], recovered_digest);
+
+        for operation_id in expected_outcomes.keys() {
+            if operation_id.as_str() == "corrupt-operation" {
+                continue;
+            }
+            let history = journal.load(operation_id).unwrap();
+            assert_eq!(
+                history.acknowledged_sha256.as_deref(),
+                Some(
+                    digest_json(&expected_outcomes[operation_id])
+                        .unwrap()
+                        .as_str()
+                )
+            );
+        }
+        assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
+        assert_eq!(
+            journal.load("corrupt-operation").unwrap_err().code,
+            "ADAPTER_JOURNAL"
+        );
+        let pending = journal.pending_items().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.key, "corrupt-operation");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

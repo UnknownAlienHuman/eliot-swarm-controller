@@ -6,6 +6,71 @@ use std::{
 };
 use swarm_contracts::error::{Error, Result};
 
+/// Compare a retained regular-file handle with the current named file. Bytes,
+/// timestamps and length do not establish identity across atomic replacement.
+pub fn opened_regular_file_matches_path(file: &fs::File, path: &Path) -> Result<bool> {
+    if !target_is_regular_file(path)? || !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let named = options.open(path)?;
+    if !named.metadata()?.is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let current = named.metadata()?;
+        Ok(opened.dev() == current.dev() && opened.ino() == current.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+        };
+        fn identity(file: &fs::File) -> Result<Option<(u32, u32, u32)>> {
+            // SAFETY: the integer-only output is initialized, and File retains
+            // the valid handle throughout this read-only platform query.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Ok(None);
+            }
+            Ok(Some((
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )))
+        }
+        Ok(
+            matches!((identity(file)?, identity(&named)?), (Some(opened), Some(current)) if opened == current),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(Error::new(
+            "PRIVATE_FILE_IDENTITY_UNSUPPORTED",
+            "opened-file identity is unavailable on this platform",
+        ))
+    }
+}
+
 /// Restrict only the explicitly selected path to the current user's access.
 pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
     #[cfg(unix)]
@@ -476,6 +541,35 @@ mod publication_tests {
         assert_eq!(fs::read(&temp).unwrap(), b"racing");
         assert!(write_private_new(&root, b"not-a-regular-file").is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn opened_file_identity_rejects_replacement_with_identical_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("swarm-file-identity-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        private_permissions(&root, true).unwrap();
+        let path = root.join("journal.jsonl");
+        write_private_new(&path, b"immutable prefix\n").unwrap();
+        let opened = fs::File::open(&path).unwrap();
+        assert!(opened_regular_file_matches_path(&opened, &path).unwrap());
+
+        let prior_path = root.join("prior-journal.jsonl");
+        fs::rename(&path, &prior_path).unwrap();
+        write_private_new(&path, b"immutable prefix\n").unwrap();
+        assert!(!opened_regular_file_matches_path(&opened, &path).unwrap());
+        let current = fs::File::open(&path).unwrap();
+        assert!(opened_regular_file_matches_path(&current, &path).unwrap());
+        drop(current);
+        drop(opened);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&prior_path).unwrap();
+        fs::remove_dir(&root).unwrap();
     }
 }
 
