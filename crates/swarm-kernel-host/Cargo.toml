@@ -57,3 +57,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globali
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.189"
 
+# Qualification-only transport fault propagation into the Store-owned
+# scheduler worker. Not a default feature: a build that does not request it
+# contains no qualification activation path at all.
+[features]
+qualification-faults = ["swarm-client/qualification-faults", "swarm-automation/qualification-faults"]

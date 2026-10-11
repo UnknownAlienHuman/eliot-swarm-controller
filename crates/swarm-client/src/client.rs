@@ -152,6 +152,22 @@ impl Client {
         if response["id"] != id || response["jsonrpc"] != "2.0" {
             return Err(unknown_response());
         }
+        // Qualification-only seam. A complete, matched response has just been
+        // received and the request was written exactly once and unaltered, so
+        // every Store decision it produced is already durable.
+        #[cfg(feature = "qualification-faults")]
+        if crate::qualification_faults::take_single_reply_drop_if_armed(method) {
+            // Poison the connection exactly as an uncertain reply does:
+            // usable stays false, so the caller must reconnect before any
+            // further request and cannot replay this frame.
+            return Err(Error::new(
+                crate::qualification_faults::QUALIFICATION_REPLY_DROPPED,
+                format!(
+                    "qualified reply withheld at the transport seam; the request was sent once and is not reusable; withheld_frame_bytes={}",
+                    frame.len()
+                ),
+            ));
+        }
         if let Some(error) = response.get("error") {
             if response.get("result").is_some()
                 || !error.is_object()
@@ -289,5 +305,63 @@ mod tests {
         })
         .await;
         assert_eq!(first["id"].as_str().unwrap().len(), 36);
+    }
+    #[cfg(feature = "qualification-faults")]
+    #[tokio::test]
+    async fn armed_fault_preserves_page_then_withholds_one_admit_without_replay() {
+        use crate::qualification_faults;
+
+        assert!(qualification_faults::arm_single_reply_drop_for_admit());
+        let (mut page_client, page_peer) = fake_peer_client(|request| {
+            serde_json::to_string(&json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "result":{"schema_version":1},
+            }))
+            .unwrap()
+        });
+        let page = page_client
+            .request("automation.scheduler.page", json!({"scope":"page"}))
+            .await
+            .expect("an armed admit fault must preserve the page reply");
+        assert_eq!(page["schema_version"], 1);
+        drop(page_client);
+        let (page_request, page_following) = page_peer.await.unwrap();
+        assert_eq!(page_request["method"], "automation.scheduler.page");
+        assert!(page_following.is_empty());
+
+        let parameters = json!({"page_id":"exact-page", "cut":"exact-cut"});
+        let (mut admit_client, admit_peer) = fake_peer_client(|request| {
+            serde_json::to_string(&json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "result":{"accepted":true},
+            }))
+            .unwrap()
+        });
+        let error = admit_client
+            .request("automation.scheduler.admit", parameters.clone())
+            .await
+            .expect_err("the actual matched admit reply must be withheld");
+        assert_eq!(
+            error.code,
+            qualification_faults::QUALIFICATION_REPLY_DROPPED
+        );
+        assert!(error.message.contains("withheld_frame_bytes="));
+        let refused = admit_client
+            .request("automation.scheduler.admit", parameters.clone())
+            .await
+            .expect_err("a poisoned connection must send no retry frame");
+        assert_eq!(refused.code, "DISCONNECTED");
+        drop(admit_client);
+        let (request, following) = admit_peer.await.unwrap();
+        assert_eq!(request["method"], "automation.scheduler.admit");
+        assert_eq!(request["params"], parameters);
+        assert!(
+            following.is_empty(),
+            "the peer must observe one unaltered admit frame only"
+        );
+        assert!(
+            !qualification_faults::arm_single_reply_drop_for_admit(),
+            "a spent process fault must never rearm"
+        );
     }
 }

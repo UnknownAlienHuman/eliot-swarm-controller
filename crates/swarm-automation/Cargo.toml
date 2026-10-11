@@ -22,3 +22,9 @@ swarm-contracts = { path = "../swarm-contracts" }
 swarm-process = { path = "../swarm-process" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 zeroize = "1"
+# Qualification-only transport fault hook. The feature is intentionally absent
+# from the default set below: a build that does not request it contains no
+# qualification code path at all.
+[features]
+default = []
+qualification-faults = ["swarm-client/qualification-faults"]

@@ -22,6 +22,29 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
+/// The single hidden qualification flag the Store-owned launch can propagate.
+///
+/// The flag is only recognized when this crate was built with the
+/// qualification-faults feature. A release-default host build never defines the
+/// function at all, so a release-default binary contains no activation path.
+#[cfg(feature = "qualification-faults")]
+const QUALIFICATION_REPLY_FAULT_FLAG: &str = "--qualification-drop-first-admit-reply";
+
+/// Report whether this host process was launched with the qualification flag.
+///
+/// The decision is read once from the host process command line and nowhere
+/// else. There is no configuration key, no environment variable, and no Store
+/// field, so an operator cannot enable the fault by editing a hosted config or
+/// a database row.
+///
+/// Each Store-owned launch receives the flag. The worker's qualification markers
+/// persist in its service directory and expose any later admission across a
+/// worker restart; the transport arming state itself is local to each process.
+#[cfg(feature = "qualification-faults")]
+pub(crate) fn qualification_reply_fault_requested() -> bool {
+    std::env::args_os().any(|argument| argument == QUALIFICATION_REPLY_FAULT_FLAG)
+}
+
 const COORDINATOR_TICK: Duration = Duration::from_secs(2);
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_FAILURES_PER_WINDOW: u32 = 5;
@@ -311,6 +334,17 @@ async fn run_automation_scheduler_worker(
     #[cfg(windows)]
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", system_root);
+    }
+    // Qualification-only. The Store-owned launch stays byte-identical to its
+    // production shape unless this exact flag was requested on the host
+    // process command line. A build without the qualification-faults feature
+    // never evaluates this, so a release-default host cannot carry the flag
+    // at all. The flag reaches the very process the Store launched and owns,
+    // so the owner receipt, the birth identity and the readiness projection
+    // all remain the ones the Store produced.
+    #[cfg(feature = "qualification-faults")]
+    if qualification_reply_fault_requested() {
+        command.arg("--qualification-drop-first-admit-reply");
     }
     let spawn = command
         .arg("run")

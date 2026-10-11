@@ -74,6 +74,19 @@ async fn main() {
     }
 }
 
+/// Name of the only optional worker flag. It is recognized only when the
+/// crate is compiled with the qualification-faults feature.
+#[cfg(feature = "qualification-faults")]
+const QUALIFICATION_DROP_REPLY_FLAG: &str = "--qualification-drop-first-admit-reply";
+
+/// Whether this process records admission intent before each admit request.
+///
+/// Worker-owned state. It is set only after the qualification flag successfully
+/// arms the fault, so the marker and the fault always travel together.
+#[cfg(feature = "qualification-faults")]
+static QUALIFICATION_ADMIT_INTENT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 async fn run_cli() -> Result<()> {
     let mut args = env::args_os().skip(1);
     let mode = args
@@ -94,8 +107,38 @@ async fn run_cli() -> Result<()> {
         .next()
         .map(PathBuf::from)
         .ok_or_else(|| Error::invalid("missing worker config path"))?;
+    // The sole optional flag, accepted only with the qualification-faults
+    // feature. Every other argument is still rejected, and the flag is an
+    // unrecognized token in a release-default build.
+    #[cfg(not(feature = "qualification-faults"))]
     if args.next().is_some() {
         return Err(Error::invalid("unexpected worker argument"));
+    }
+    #[cfg(feature = "qualification-faults")]
+    let qualification_flag = {
+        let mut fault = false;
+        for arg in args {
+            if arg == QUALIFICATION_DROP_REPLY_FLAG && !fault {
+                fault = true;
+            } else {
+                return Err(Error::invalid("unexpected worker argument"));
+            }
+        }
+        fault
+    };
+    // Arm once per process. The arming is exclusive and becomes terminal when
+    // consumed, so exactly one admit reply can be withheld in this lifetime.
+    #[cfg(feature = "qualification-faults")]
+    if qualification_flag {
+        let armed = swarm_client::qualification_faults::arm_single_reply_drop_for_admit();
+        // Bounded evidence that the process accepted the qualification flag.
+        // The line carries no credential, request, or Store decision.
+        eprintln!("swarm-automation-worker: qualification reply fault armed={armed}");
+        // The admission-intent observer is activated only by a successful arm, so
+        // an observer can never exist without the fault that exercises it.
+        if armed {
+            QUALIFICATION_ADMIT_INTENT_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     let config = read_worker_config_file(&path)?;
     let _service_owner =
@@ -205,6 +248,33 @@ async fn run_worker(config: WorkerConfig) -> Result<()> {
                         "swarm-automation-worker: {}; rereading Store page before retry",
                         error.code
                     );
+                    // Qualification-only applied-fault witness. This launch
+                    // sends stderr to a null sink and the host stops reading
+                    // stdout after the readiness frame, so worker logging is
+                    // unreachable. The only observable trace of the withheld
+                    // reply is a bounded create-only marker beside the exact
+                    // private worker config, bound to the live PID and the
+                    // config digest. No Store state or credential is touched.
+                    #[cfg(feature = "qualification-faults")]
+                    if error.code == swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED
+                    {
+                        // The exact withheld frame length is reported by the
+                        // transport seam inside the error message. It is parsed
+                        // strictly and a failure to parse is reported rather than
+                        // defaulting to a fabricated value.
+                        match swarm_client::qualification_faults::parse_withheld_frame_bytes(
+                            &error.message,
+                        ) {
+                            Some(withheld_frame_bytes) => {
+                                record_qualification_fault_witness(&config, withheld_frame_bytes);
+                            }
+                            None => {
+                                eprintln!(
+                                    "swarm-automation-worker: qualification witness refused; withheld frame length was absent from the transport error"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -248,6 +318,19 @@ async fn call_once(
         &IpcConfig::default(),
     )
     .await?;
+    // Qualification-only: record this admission intent before the request is
+    // sent, so a replay leaves a marker the harness can refute. Any marker failure
+    // refuses the request rather than falling back to sending it unobserved.
+    #[cfg(feature = "qualification-faults")]
+    if method == ADMIT_METHOD
+        && QUALIFICATION_ADMIT_INTENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+    {
+        swarm_automation::write_qualification_admit_attempt(
+            std::path::Path::new(&config.store_root),
+            std::process::id(),
+            &config.config_sha256,
+        )?;
+    }
     client.request(method, params).await
 }
 
@@ -262,6 +345,13 @@ fn valid_admit_receipt(value: &serde_json::Value, scope: &DeclaredServiceScope) 
 }
 
 fn retryable(code: &str) -> bool {
+    // The qualification code cannot be produced by a release-default build, so
+    // it is recognized only when that build requested the fault feature. The
+    // reference is compiled out entirely otherwise.
+    #[cfg(feature = "qualification-faults")]
+    if code == swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED {
+        return true;
+    }
     matches!(
         code,
         "HOST_UNAVAILABLE"
@@ -271,4 +361,42 @@ fn retryable(code: &str) -> bool {
             | "DISCONNECTED"
             | "AUTOMATION_SERVICE_OWNER_PENDING"
     )
+}
+
+/// Record the bounded qualification witness for one withheld admit reply.
+///
+/// Called only from the qualification fault path, which is compiled out of any
+/// build that did not request the feature. The worker is the only place that
+/// knows both the live process identity and the exact private config digest the
+/// Store issued, so it is the only place the witness can be bound correctly.
+///
+/// The Store-owned launch sends stderr to a null sink and the host stops
+/// reading stdout after the readiness frame, so no worker output is reachable.
+/// This marker beside the private worker config is the only observable trace
+/// that the fault actually fired in the live Store-owned process.
+///
+/// Failure to write the witness is reported on stderr and never affects the
+/// Store, the credential, or the uncertain branch that follows.
+#[cfg(feature = "qualification-faults")]
+fn record_qualification_fault_witness(config: &WorkerConfig, withheld_frame_bytes: usize) {
+    let witness = swarm_automation::QualificationFaultWitness {
+        owner_launch_pid: std::process::id(),
+        owner_config_sha256: config.config_sha256.clone(),
+        method: "automation.scheduler.admit",
+        withheld_frame_bytes,
+    };
+
+    // The service directory is beside the exact private config this process
+    // loaded, so the witness can never land outside it.
+    let data_root = std::path::Path::new(&config.store_root);
+    if let Err(error) = swarm_automation::write_qualification_fault_witness(data_root, &witness) {
+        eprintln!(
+            "swarm-automation-worker: qualification witness write failed: {}",
+            error.code
+        );
+        return;
+    }
+    eprintln!(
+        "swarm-automation-worker: QUALIFICATION_FAULT_WITNESS_RECORDED method=automation.scheduler.admit reply=withheld replay=refused"
+    );
 }

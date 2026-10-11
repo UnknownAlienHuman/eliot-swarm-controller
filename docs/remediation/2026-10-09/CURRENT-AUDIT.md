@@ -1,5 +1,16 @@
 # Current-source audit and implementation ledger
 
+The [R48 source and packaging](../2026-10-10/R48-SOURCE-AND-PACKAGING.json)
+adds an explicit non-default qualification feature. The existing Store-owned
+worker withholds one matched admit reply at the real transport seam and follows
+its normal authoritative-page readback. Private create-only intent markers make
+a second admission observable across worker restarts; write failure stops before
+the request. Production Clippy passes in default and feature modes on both
+platforms. Current affected cases pass 22/22 on Windows and 23/23 on Linux; real
+writer bytes pass six consumer assertions. Independent source/tooling review
+accepts all 13 hashes without P1/P2. The separate sidecar execution harness,
+fresh feature packages, installed R48 and native/model qualification remain pending.
+
 The [OpenCode dependency repair](../2026-10-10/OPENCODE-DEPENDENCY-REPAIR-EVIDENCE.json)
 updates the vulnerable transitive MCP client to 2.2.0 while retaining direct
 OpenCode 2.0.7 and root MCP core 2.0.0. The client receives its required nested

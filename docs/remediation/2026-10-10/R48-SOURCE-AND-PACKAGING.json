@@ -1,0 +1,152 @@
+{
+  "schema": "eliot.r48_source_and_packaging.v1",
+  "observed_at_utc": "2026-10-11T03:05:26.6886819Z",
+  "source_base_commit": "21d9d954a1c0600543fabdf4d35dc63b8f25bb61",
+  "status": "SOURCE_VERIFIED_INSTALLED_QUALIFICATION_PENDING",
+  "change": {
+    "worker": "existing uncertain branch rereads the authoritative page",
+    "custody": "same Store-owned config, credential and process; no hand relaunch",
+    "feature": "qualification-faults",
+    "observer": "private create-only admission intent1/2 before client.request, derives sequence from retained service directory; marker failure refuses before request; second intent proceeds and remains observable; third is refused",
+    "activation": "explicit host-only CLI flag, propagated through the existing Store-owned scheduler launch",
+    "witness": "immutable PID/config-digest/method/frame-length only",
+    "default_enabled": false,
+    "transport": "one unchanged real admit request, parsed/id-matched reply withheld before delivery, connection stays poisoned"
+  },
+  "packaging": {
+    "default_cargo_arguments_unchanged": true,
+    "manifest_format": "eliot.module_build_manifest.v1",
+    "packages": [
+      "swarm-kernel-host",
+      "swarm-automation"
+    ],
+    "explicit_features": [
+      "qualification-faults"
+    ],
+    "feature_evidence": "existing build.cargo_arguments",
+    "actual_feature_package_build": "pending"
+  },
+  "source_sha256": {
+    "crates/swarm-automation/Cargo.toml": "286eca0078214792880ea8bbe4ba08d756f38e53dbccb80305c4775becb229c9",
+    "crates/swarm-automation/src/bin/worker.rs": "aa76011f5878c1549eae2452d4df5c7eaeb0540441cfaee6b16c77e167674b5e",
+    "crates/swarm-automation/src/lib.rs": "94afaba7081808a3ce0cee93629022862f68b8fbbf5de06e8c606a48cc27ad9a",
+    "crates/swarm-client/Cargo.toml": "fd3f0c75e173d89f8b0c791b056f832455a1aacfdd75eeb5f0ee3d35984022c2",
+    "crates/swarm-client/src/client.rs": "f87c9ae745a7f65e15fb5035dcfedacd5c458f5ffc8d276d685acd57934ec21c",
+    "crates/swarm-client/src/lib.rs": "de11fb5838622b9ce50363323f2cbfcaa8480f5b8730912618a42e5b7e2d9166",
+    "crates/swarm-client/src/qualification_faults.rs": "fbf2cdf8f5af630059acefb447ad02f1480e14f1369cf597fd8614565bcc5227",
+    "crates/swarm-kernel-host/Cargo.toml": "6c72853f4ab34c281d77affde4b4aa9562673f8a7d19df1639698e998d479d34",
+    "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs": "9cbd13fc6c5ecf01c2b2ad083ab950b4da7178941f5e9bfd860523c277f8bdf9",
+    "crates/swarm-kernel-host/src/main.rs": "641d17a2a9fba7243f7da3fee37ced78915050a7b3564796ccaf0c5d7875dc1d",
+    "tools/ci/build-module-package.ps1": "aa0381498e308c3f8ef88dff4b0912b45571dcb25feec577a37580750f735ffd",
+    "tools/ci/Build-SwarmHostProvenance.ps1": "23fe7298cc1990c72649904e531861c6cf2e5a7b3e1a9b46f867baad0adee2eb",
+    "tools/ci/Build-SwarmKernelHostProvenance.ps1": "15b8d3a31b723b45471d623f0c51ed5ca365a6f857835643f4825b4fcfc2cf1b"
+  },
+  "verification": {
+    "independent_review": {
+      "p2_count": 0,
+      "observed_at_utc": "2026-10-11T03:04:42Z",
+      "p1_count": 0,
+      "source_hashes_matched": 13,
+      "verdict": "ACCEPT",
+      "scope": "Source and tooling only. This is the final report. Installed R48 qualification and the PowerShell sidecar remain a separate delivery and are not part of this verdict."
+    },
+    "clippy": [
+      {
+        "platform": "windows",
+        "completed_at_utc": "2026-10-11T02:53:27.6404001Z",
+        "log_sha256": "e777a6208c50210dc264e80d23c2311ae656ea27bde7546fdb0a61d66aaec245",
+        "mode": "default",
+        "source_stable": true,
+        "exit_code": 0
+      },
+      {
+        "platform": "windows",
+        "completed_at_utc": "2026-10-11T02:54:34.8289368Z",
+        "log_sha256": "88eaa367ec788ac3ef82936c9d5606de98123a9e2fa46e38e84595c55bbe37f5",
+        "mode": "qualification-faults",
+        "source_stable": true,
+        "exit_code": 0
+      },
+      {
+        "platform": "linux",
+        "completed_at_utc": "2026-10-11T02:53:36.0807161Z",
+        "log_sha256": "fb21df32d74e1474afc6d42db66a3a9e67f349d31bb99909e1cb7c31f17bc8a4",
+        "mode": "default",
+        "source_stable": true,
+        "exit_code": 0
+      },
+      {
+        "platform": "linux",
+        "completed_at_utc": "2026-10-11T02:54:41.3247405Z",
+        "log_sha256": "13f1bf38ca1e036840c8e8b87dce51bc3818a42f81380dbf80276c364a615303",
+        "mode": "qualification-faults",
+        "source_stable": true,
+        "exit_code": 0
+      }
+    ],
+    "toolchain": "Rust1.98.1",
+    "cohort": {
+      "linux": {
+        "host_cli_feature": 3,
+        "client_feature": 12,
+        "automation_filesystem": 6,
+        "host_cli_default": 2,
+        "total": 23
+      },
+      "windows": {
+        "host_cli_feature": 3,
+        "client_feature": 12,
+        "automation_filesystem": 5,
+        "host_cli_default": 2,
+        "total": 22
+      },
+      "all_current_cases": "PASS"
+    },
+    "marker_consumer_fixture": {
+      "scope": "real feature Rust private-file producers -> PowerShell marker consumer; synthetic test identities; no installed host or native proof",
+      "status": "PASS",
+      "assertions": 6,
+      "completed_at_utc": "2026-10-11T03:02:34.1338446Z",
+      "consumer_function_sha256": "2fe08fde7fd1f71e591ac5d22a8d62d81945d6346aa6e8d426ab485857f6ba26",
+      "model_calls": 0,
+      "native_calls": 0,
+      "cases": [
+        {
+          "owner_mismatch_rejected": true,
+          "second_marker_rejected": true,
+          "platform": "windows",
+          "actual_fixture_root": "C:\\Users\\kleym\\AppData\\Local\\Temp\\r48-admit-first-77260-1791687726281045500",
+          "writer_bytes_accepted": true
+        },
+        {
+          "owner_mismatch_rejected": true,
+          "second_marker_rejected": true,
+          "platform": "linux",
+          "actual_fixture_root": "C:\\Development\\Rust\\projects\\eliot-swarm-controller\\.local\\manager-audit\\r48-linux-writer-fixtures\\r48-admit-first-418-1791687731276724689",
+          "writer_bytes_accepted": true
+        }
+      ]
+    },
+    "manifest_expression_fixture": {
+      "status": "PASS",
+      "assertions": 8,
+      "scope": "actual producer AST -> JSON -> sidecar consumer, existing binary fixture inputs; not a package build"
+    },
+    "post_clippy_delta": "test-only removal and unique fresh-directory helper; worker CRLF to LF only. Independent review confirms unchanged production text/logic"
+  },
+  "preserved_failures": [
+    "feature Clippy typo failure retained separately in prior transcript/receipt history",
+    "incorrect redundant FS test expected refusal of the second intent; removed because it contradicted the specified observable second-admission contract; original Windows/Linux failure logs and results retained",
+    "Linux temporary writer fixtures were unavailable on a later WSL call; test helper now uses unique fresh-only paths and real bytes are exported before WSL exits"
+  ],
+  "repeated_checks_reason": "Only automation FS cases rerun after the shared test helper changed; passing client and host CLI cases retained without repetition",
+  "CompletionProof": {
+    "installed_r48": "not_verified",
+    "native_step5_and_antigravity_gemini38": "not_verified",
+    "final_status": "PARTIAL_PROGRESS",
+    "sidecar_execution_harness": "not_verified",
+    "source_and_packaging_code": "verified",
+    "fresh_release_feature_packages": "not_verified",
+    "source_verification_cohort": "verified"
+  }
+}

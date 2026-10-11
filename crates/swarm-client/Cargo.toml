@@ -18,3 +18,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+# Qualification-only transport fault hook. Not a default feature; a build that
+# does not request it has no activation path for the fault.
+[features]
+qualification-faults = []

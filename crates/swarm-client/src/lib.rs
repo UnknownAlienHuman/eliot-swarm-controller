@@ -27,3 +27,10 @@ pub async fn call(
         .request(method, params)
         .await
 }
+
+/// Qualification-only transport fault hook.
+///
+/// Gated behind the non-default qualification-faults feature so a
+/// release-default build exposes no activation path for the fault.
+#[cfg(feature = "qualification-faults")]
+pub mod qualification_faults;

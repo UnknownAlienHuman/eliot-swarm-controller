@@ -595,6 +595,391 @@ pub fn has_due_source(page: &DuePage) -> bool {
     })
 }
 
+/// Bounded qualification-only witness that one admit reply was withheld.
+///
+/// Written by the live, Store-owned scheduler worker at the moment the
+/// qualification fault fires, into the same private directory that already
+/// holds the worker config. It is the only observable trace of the applied
+/// fault, because that launch pipes stdout only as far as the host readiness
+/// frame and sends stderr to a null sink, so worker logging is unreachable.
+///
+/// The witness binds the PID of the Store-validated worker process, not the host
+/// process, together with the exact worker config digest
+/// that the Store issued, and the method whose reply was withheld. It carries
+/// no credential, no request parameters, no Store decision content, and no
+/// response body: only the length of the discarded frame, so a reader can tell
+/// a real reply was withheld without ever seeing it.
+///
+/// It also binds the withheld frame length against the transport frame bound, so
+/// an implausible count is refused rather than recorded as evidence.
+///
+/// The file is create-only and bounded. A second write never succeeds, which
+/// keeps the single-drop property observable as well as enforceable.
+#[cfg(feature = "qualification-faults")]
+pub struct QualificationFaultWitness {
+    /// PID of the process the Store launched for this worker.
+    pub owner_launch_pid: u32,
+    /// SHA-256 of the private worker config the Store issued for this launch.
+    pub owner_config_sha256: String,
+    /// Method whose single reply was withheld.
+    pub method: &'static str,
+    /// Byte length of the withheld response frame. No content is retained.
+    pub withheld_frame_bytes: usize,
+}
+
+/// Maximum permitted witness size. A larger file is refused rather than
+/// accepted, so a corrupted or oversized witness is never mistaken for
+/// evidence.
+///
+/// This bounds the serialized witness document itself, not the withheld reply
+/// frame. A withheld frame is legitimately 8 KiB to 512 KiB and is bounded
+/// separately against the transport frame limit by the code that parses the
+/// seam message.
+#[cfg(feature = "qualification-faults")]
+const MAX_QUALIFICATION_FAULT_WITNESS_BYTES: usize = 512;
+
+/// Write the bounded witness for one withheld reply.
+///
+/// Called only from the qualification fault path, which is itself compiled out
+/// of any build that did not request the qualification-faults feature. The
+/// path is derived from the worker config location, so the witness can never
+/// be written outside the private service directory the Store already owns.
+#[cfg(feature = "qualification-faults")]
+pub fn write_qualification_fault_witness(
+    data_root: &Path,
+    witness: &QualificationFaultWitness,
+) -> swarm_contracts::error::Result<()> {
+    use swarm_contracts::error::Error;
+    if !is_sha256(&witness.owner_config_sha256) {
+        return Err(Error::invalid(
+            "qualification witness requires the exact owner config digest",
+        ));
+    }
+    if witness.owner_launch_pid == 0
+        || witness.method != ADMIT_METHOD
+        || witness.withheld_frame_bytes == 0
+        || witness.withheld_frame_bytes > swarm_client::IpcConfig::default().max_frame_bytes
+    {
+        return Err(Error::invalid("qualification witness identity is invalid"));
+    }
+    let value = serde_json::json!({
+        "schema":"eliot.swarm.r48.qualification-fault-witness.v1",
+        "owner_launch_pid":witness.owner_launch_pid,
+        "owner_config_sha256":witness.owner_config_sha256,
+        "method":witness.method,
+        "withheld_frame_bytes":witness.withheld_frame_bytes,
+        "replay":"withheld_before_delivery",
+    });
+    let bytes = serde_json::to_vec(&value)?;
+    if bytes.len() > MAX_QUALIFICATION_FAULT_WITNESS_BYTES {
+        return Err(Error::invalid(
+            "qualification witness exceeds its bounded size",
+        ));
+    }
+    let path = data_root
+        .join("automation-scheduler-v1")
+        .join("qualification-fault-witness.json");
+    // Create-only: an existing witness means this process already fired once,
+    // so a second application is refused instead of overwriting evidence.
+    swarm_process::write_private_new(&path, &bytes).map_err(|_| {
+        Error::new(
+            "AUTOMATION_QUALIFICATION_WITNESS_EXISTS",
+            "a qualification fault witness is already recorded for this service directory",
+        )
+    })
+}
+
+///
+/// Bounded, qualification-only direct admission-intent marker.
+///
+/// The fault witness is proof that an injected fault fired; this marker is written
+/// before every real admit request, which is what makes a replay observable. The
+/// consumer rejects a second marker rather than inferring replay from a single
+/// durable receipt.
+///
+/// The ordinal comes from the retained service directory rather than an in-process
+/// counter, because a counter resets on restart and would let a second worker
+/// lifetime restart the sequence. A fresh process continues the sequence the
+/// previous lifetime established.
+///
+/// The caller must treat any error as a refusal: the request is not sent.
+#[cfg(feature = "qualification-faults")]
+pub fn write_qualification_admit_attempt(
+    data_root: &Path,
+    pid: u32,
+    config_sha256: &str,
+) -> swarm_contracts::error::Result<u8> {
+    use swarm_contracts::error::Error;
+
+    let service_dir = data_root.join("automation-scheduler-v1");
+
+    // The ordinal is whatever the retained directory already shows. A retained
+    // first marker means this attempt is the second, so the sequence survives a
+    // restart instead of resetting with the process.
+    let sequence = if service_dir.join(ATTEMPT_ONE_MARKER).exists() {
+        2u8
+    } else {
+        1u8
+    };
+
+    if pid == 0 {
+        return Err(Error::invalid(
+            "admission attempt marker requires a live worker PID",
+        ));
+    }
+    if config_sha256.len() != 64 || !config_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::invalid(
+            "admission attempt marker requires the exact worker config digest",
+        ));
+    }
+
+    let marker = if sequence == 2 {
+        ATTEMPT_TWO_MARKER
+    } else {
+        ATTEMPT_ONE_MARKER
+    };
+    let value = serde_json::json!({
+        "schema":ATTEMPT_SCHEMA,
+        "owner_launch_pid":pid,
+        "owner_config_sha256":config_sha256,
+        "method":"automation.scheduler.admit",
+        "sequence":sequence,
+    });
+    let bytes = serde_json::to_vec(&value)?;
+    if bytes.len() > MAX_ADMIT_ATTEMPT_BYTES {
+        return Err(Error::invalid(
+            "admission attempt marker exceeds its bounded size",
+        ));
+    }
+
+    // Create-only. A retained marker from an earlier lifetime makes this create
+    // fail, which is the terminal signal that bounds the observer: a third attempt
+    // can create nothing and is therefore refused rather than sent.
+    swarm_process::write_private_new(&service_dir.join(marker), &bytes).map_err(|_| {
+        Error::new(
+            "AUTOMATION_ADMIT_ATTEMPT_MARKER_WRITE_FAILED",
+            "admission intent could not be recorded; request was not sent",
+        )
+    })?;
+    Ok(sequence)
+}
+
+/// Closed schema for an admission attempt marker.
+#[cfg(feature = "qualification-faults")]
+pub const ATTEMPT_SCHEMA: &str = "eliot.swarm.r48.qualification-admit-attempt.v1";
+
+/// File name for the first admission attempt marker.
+#[cfg(feature = "qualification-faults")]
+pub const ATTEMPT_ONE_MARKER: &str = "qualification-admit-attempt-1.json";
+
+/// File name for the second admission attempt marker.
+#[cfg(feature = "qualification-faults")]
+pub const ATTEMPT_TWO_MARKER: &str = "qualification-admit-attempt-2.json";
+
+/// Maximum permitted marker size.
+///
+/// The marker binds identity, method, and sequence only, so a small bound is
+/// generous. A larger serialization is refused rather than written.
+#[cfg(feature = "qualification-faults")]
+const MAX_ADMIT_ATTEMPT_BYTES: usize = 512;
+
+#[cfg(test)]
+mod qualification_admit_attempt_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn valid_digest() -> String {
+        "a".repeat(64)
+    }
+
+    /// A fresh private service directory, standing in for a fresh worker lifetime.
+    fn fresh_service_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("r48-admit-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)
+            .expect("a new fixture root is created without replacing evidence");
+        std::fs::create_dir(root.join("automation-scheduler-v1"))
+            .expect("a fresh private service directory is created");
+        root
+    }
+
+    fn marker_one(root: &Path) -> PathBuf {
+        root.join("automation-scheduler-v1")
+            .join(ATTEMPT_ONE_MARKER)
+    }
+
+    fn marker_two(root: &Path) -> PathBuf {
+        root.join("automation-scheduler-v1")
+            .join(ATTEMPT_TWO_MARKER)
+    }
+
+    /// A fresh lifetime records the first marker and reports the sequence.
+    ///
+    /// The retained directory is published so the consumer-side integration test
+    /// can read the real bytes, and a real fault witness is written alongside so
+    /// one fixture root carries both artifact kinds.
+    #[test]
+    fn a_fresh_lifetime_records_marker_one() {
+        let root = fresh_service_root("first");
+        let sequence = write_qualification_admit_attempt(&root, 6001, &valid_digest())
+            .expect("a create-only write into a fresh directory succeeds");
+        assert_eq!(sequence, 1, "a fresh lifetime records the first attempt");
+
+        write_qualification_fault_witness(
+            &root,
+            &QualificationFaultWitness {
+                owner_launch_pid: 6001,
+                owner_config_sha256: valid_digest(),
+                method: "automation.scheduler.admit",
+                withheld_frame_bytes: 2048,
+            },
+        )
+        .expect("the immutable fault witness is written beside the worker config");
+
+        let marker = std::fs::read_to_string(marker_one(&root)).expect("marker one is written");
+        assert!(marker.contains(ATTEMPT_SCHEMA));
+        assert!(marker.contains("automation.scheduler.admit"));
+        assert!(marker.contains("6001"));
+        assert!(marker.contains(&valid_digest()));
+        assert!(marker.contains("\"sequence\":1"));
+
+        // Fixture root for the consumer-side integration test. Test-only, printed
+        // only after the real bytes exist on disk.
+        println!("R48_WITNESS_FIXTURE_ROOT={}", root.display());
+    }
+
+    /// A retained directory advances the sequence across a restart.
+    ///
+    /// This is the restart case. An in-process counter would reset to one here and
+    /// let a replay begin a new first attempt, which is what the ordinal must not
+    /// do.
+    #[test]
+    fn a_retained_directory_advances_the_sequence_across_a_restart() {
+        let root = fresh_service_root("retained");
+        assert_eq!(
+            write_qualification_admit_attempt(&root, 6002, &valid_digest())
+                .expect("marker one is written"),
+            1
+        );
+        // A later lifetime sees the retained marker one and derives sequence two.
+        assert_eq!(
+            write_qualification_admit_attempt(&root, 6003, &valid_digest())
+                .expect("marker two is written"),
+            2,
+            "a retained marker one makes the next attempt the second"
+        );
+        assert!(
+            marker_two(&root).exists(),
+            "marker two is written for the harness to refute"
+        );
+
+        println!("R48_WITNESS_FIXTURE_ROOT={}", root.display());
+    }
+
+    /// A third attempt cannot create a marker and is refused, because a
+    /// create-only marker two always fails.
+    #[test]
+    fn a_third_attempt_is_refused_rather_than_recorded() {
+        let root = fresh_service_root("third-refused");
+        assert_eq!(
+            write_qualification_admit_attempt(&root, 6004, &valid_digest())
+                .expect("marker one is written"),
+            1
+        );
+        assert_eq!(
+            write_qualification_admit_attempt(&root, 6004, &valid_digest())
+                .expect("marker two is written"),
+            2
+        );
+        let third = write_qualification_admit_attempt(&root, 6004, &valid_digest());
+        assert!(
+            third.is_err(),
+            "a third attempt is refused before its request is sent"
+        );
+        let preserved = std::fs::read_to_string(marker_two(&root)).expect("marker two survives");
+        assert!(
+            preserved.contains("\"sequence\":2"),
+            "the refused third attempt never overwrites marker two"
+        );
+    }
+
+    /// A write failure refuses the request rather than falling back.
+    ///
+    /// A read-only service directory stands in for a permissions failure: the
+    /// caller must not send the request on the theory that the marker was optional.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_failure_refuses_the_request_without_a_fallback() {
+        let root = fresh_service_root("unwritable");
+        let service_dir = root.join("automation-scheduler-v1");
+        let mut permissions = std::fs::metadata(&service_dir)
+            .expect("directory metadata is readable")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500);
+        std::fs::set_permissions(&service_dir, permissions)
+            .expect("the service directory is made read-only");
+
+        let outcome = write_qualification_admit_attempt(&root, 6006, &valid_digest());
+        assert!(
+            outcome.is_err(),
+            "a marker create failure must refuse the request"
+        );
+        assert!(!marker_one(&root).exists());
+
+        let mut restored = std::fs::metadata(&service_dir)
+            .expect("directory metadata is readable")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut restored, 0o700);
+        let _ = std::fs::set_permissions(&service_dir, restored);
+    }
+
+    /// Identity is validated before any marker is created.
+    #[test]
+    fn an_invalid_or_zero_identity_fails_before_any_write() {
+        let root = fresh_service_root("invalid-identity");
+
+        let zero_pid = write_qualification_admit_attempt(&root, 0, &valid_digest());
+        assert!(zero_pid.is_err(), "a zero PID is refused");
+
+        let short_digest = write_qualification_admit_attempt(&root, 6007, "abc");
+        assert!(short_digest.is_err(), "a short config digest is refused");
+
+        assert!(
+            !marker_one(&root).exists(),
+            "no marker is written for a rejected identity"
+        );
+    }
+
+    /// The marker schema is exactly the contracted five fields and carries no
+    /// credential, which is why it is closed rather than a passthrough of request
+    /// content.
+    #[test]
+    fn a_written_marker_has_exactly_the_closed_fields() {
+        let root = fresh_service_root("closed-schema");
+        write_qualification_admit_attempt(&root, 6008, &valid_digest())
+            .expect("marker one is written");
+        let marker = std::fs::read_to_string(marker_one(&root)).expect("marker one is written");
+        for forbidden in ["token", "credential", "service_owner_token", "store_root"] {
+            assert!(
+                !marker.contains(forbidden),
+                "a marker must never carry a credential field such as {forbidden}"
+            );
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&marker).expect("the marker is valid JSON");
+        let fields = parsed.as_object().expect("the marker is an object");
+        assert_eq!(
+            fields.len(),
+            5,
+            "the marker schema is exactly the five contracted fields"
+        );
+    }
+}
+
 pub fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

@@ -37,6 +37,23 @@ enum Command {
         /// Gracefully stop when the foreground owner's stdin closes.
         #[arg(long)]
         stop_on_stdin_eof: bool,
+        /// Qualification-only: propagate one hidden transport-fault flag into the
+        /// Store-owned scheduler worker launch.
+        ///
+        /// This field exists only in a build compiled with the qualification-faults
+        /// feature. A release-default build does not contain the token at all, so
+        /// the accepted CLI surface is unchanged and the flag is rejected as
+        /// unknown there.
+        ///
+        /// The field is hidden from help output, so no normal operator surface
+        /// mentions it.
+        ///
+        /// The host reads it only to pass the same single-use flag through to the
+        /// worker it launches. Admission, the schedule cursor, the durable receipt,
+        /// the credential, and the owner receipt stay owned by the Store.
+        #[cfg(feature = "qualification-faults")]
+        #[arg(long, hide = true)]
+        qualification_drop_first_admit_reply: bool,
     },
     /// Serve the application API as MCP tools over stdio for a General Manager
     /// client. A client of the running host over the same local IPC as the CLI;
@@ -886,7 +903,12 @@ fn execute(cli: Cli) -> Result<()> {
 }
 async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(cli.config.as_deref(), cli.data_dir.as_deref())?;
-    if let Command::Host { stop_on_stdin_eof } = &cli.command {
+    // The pattern is deliberately open-ended with `..`, so the qualification-only
+    // field below exists only in a feature build and this arm compiles in both.
+    if let Command::Host {
+        stop_on_stdin_eof, ..
+    } = &cli.command
+    {
         return if *stop_on_stdin_eof {
             host::run_on_stdin_eof(config).await
         } else {
@@ -2089,5 +2111,93 @@ async fn run_gateway_binary(config_path: Option<&Path>, data_dir: Option<&Path>)
                 executable.display()
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    /// The stock host invocation must keep parsing.
+    ///
+    /// This is the regression guard for the default CLI surface: the plain
+    /// host command must remain accepted and must not acquire any new required
+    /// behavior.
+    #[test]
+    fn stock_host_invocation_still_parses() {
+        let parsed = Cli::try_parse_from(["swarm-kernel-host", "host", "--stop-on-stdin-eof"])
+            .expect("the stock host invocation is accepted");
+        assert!(
+            matches!(
+                &parsed.command,
+                super::Command::Host {
+                    stop_on_stdin_eof: true,
+                    ..
+                }
+            ),
+            "the parsed host command carries the stop-on-stdin-eof request"
+        );
+    }
+
+    /// The flag must not be part of the default surface.
+    ///
+    /// A release-default build has no field for the token, so the parser rejects it
+    /// as an unknown argument rather than silently accepting and discarding it. The
+    /// default build therefore has no activation path.
+    #[cfg(not(feature = "qualification-faults"))]
+    #[test]
+    fn default_build_rejects_the_qualification_flag() {
+        let parsed = Cli::try_parse_from([
+            "swarm-kernel-host",
+            "host",
+            "--stop-on-stdin-eof",
+            "--qualification-drop-first-admit-reply",
+        ]);
+        let error = parsed
+            .err()
+            .expect("the token is unknown in a default build");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// The flag must parse in a qualification build.
+    #[cfg(feature = "qualification-faults")]
+    #[test]
+    fn qualification_build_parses_the_hidden_flag() {
+        let parsed = Cli::try_parse_from([
+            "swarm-kernel-host",
+            "host",
+            "--stop-on-stdin-eof",
+            "--qualification-drop-first-admit-reply",
+        ])
+        .expect("a qualification build accepts the hidden flag");
+        assert!(
+            matches!(
+                &parsed.command,
+                super::Command::Host {
+                    stop_on_stdin_eof: true,
+                    qualification_drop_first_admit_reply: true,
+                }
+            ),
+            "the parsed host command records the qualification request"
+        );
+    }
+
+    /// The flag must default to false when it is not supplied.
+    #[cfg(feature = "qualification-faults")]
+    #[test]
+    fn qualification_flag_defaults_to_false() {
+        let parsed = Cli::try_parse_from(["swarm-kernel-host", "host"])
+            .expect("the host command is accepted");
+        assert!(
+            matches!(
+                &parsed.command,
+                super::Command::Host {
+                    stop_on_stdin_eof: false,
+                    qualification_drop_first_admit_reply: false,
+                }
+            ),
+            "an absent flag must read as false"
+        );
     }
 }

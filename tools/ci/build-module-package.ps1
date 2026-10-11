@@ -3,12 +3,17 @@ param(
     [Parameter(Mandatory = $true)][string] $Package,
     [string] $Profile = 'iterate',
     [Parameter(Mandatory = $true)][string] $TargetDir,
-    [Parameter(Mandatory = $true)][string] $OutputDir
+    [Parameter(Mandatory = $true)][string] $OutputDir,
+    [ValidateSet('qualification-faults')][string[]] $Features = @()
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'This packaging script emits Windows executables only.' }
+if ($Features.Count -gt 0 -and $Package -cnotin @('swarm-kernel-host', 'swarm-automation')) {
+    throw 'Qualification features are supported only for the kernel host and automation worker packages.'
+}
+$requestedFeatures = @($Features | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $rootManifest = Join-Path $repoRoot 'Cargo.toml'
@@ -431,6 +436,9 @@ $buildArguments = @(
     '--package', $Package, '--bin', [string]$selectedCoordinate.binary_target, '--locked',
     '--profile', $Profile, '--target-dir', $targetPath
 )
+if ($requestedFeatures.Count -gt 0) {
+    $buildArguments += @('--features', ($requestedFeatures -join ','))
+}
 Push-Location $repoRoot
 try {
     & cargo @buildArguments
