@@ -1,0 +1,31 @@
+{
+  "verification": {
+    "log_sha256": "ea445e7cd5e10324f73ccfc565b674596881533ad8ad746b64a5f7244477712e",
+    "lock_sha256": "7d51850063e021a6155f9c8a0955249a1267bde72c001f99580e3ad1880370da",
+    "validator_sha256": "337ede54fb6ec028897de4e7ef6fd9d3748184a073460218d7efd567dc185e23",
+    "completed_at_utc": "2026-10-11T02:55:23.9032729Z",
+    "exit_code": 0
+  },
+  "failed_ci": "https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/38106139263",
+  "CodeUnderstandingProof": {
+    "exact_anchors": [
+      "package-scope.ps1:612 module package metadata JSON parsing"
+    ],
+    "verifier": "actual ValidateTooling stage for3d5209f ->07fcb71",
+    "graph_findings": "project-scoped semantic query returned no PowerShell node",
+    "project_or_module": "eliot-swarm-controller",
+    "candidate_files": [
+      "tools/ci/package-scope.ps1"
+    ],
+    "edit_allowed": true
+  },
+  "problem": "npm package-lock packages[empty-string] is valid JSON; PSCustomObject conversion rejects empty property names",
+  "CompletionProof": {
+    "installed_native_model_qualification": "not_verified",
+    "validator_on_actual_lock": "verified",
+    "github_after_push": "not_verified"
+  },
+  "schema": "eliot.npm_lock_metadata_validator.v1",
+  "observed_at_utc": "2026-10-11T02:55:54.4352604Z",
+  "change": "ConvertFrom-Json -AsHashtable preserves JSON property names"
+}

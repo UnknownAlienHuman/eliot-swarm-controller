@@ -609,7 +609,7 @@ function Invoke-ToolingValidation($Changes) {
         $fullPath = Get-FullPath $relativePath
         if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { continue }
         try {
-            [void](Get-Content -LiteralPath $fullPath -Raw | ConvertFrom-Json)
+            [void](Get-Content -LiteralPath $fullPath -Raw | ConvertFrom-Json -AsHashtable)
         } catch {
             throw "Module package metadata '$relativePath' is not valid JSON: $($_.Exception.Message)"
         }

@@ -5,10 +5,14 @@ updates the vulnerable transitive MCP client to 2.2.0 while retaining direct
 OpenCode 2.0.7 and root MCP core 2.0.0. The client receives its required nested
 core 2.2.0. Isolated locked installation and dependency-tree checks pass; the
 real initialize, tools/list, ping and schema compatibility fixture passes 48/48.
-The earlier 43/48 fixture failure is retained. Installed closure regeneration,
-GitHub alert closure and native/model qualification remain pending. The three
-other open dependency advisories have no confirmed patched release in the live
-GitHub readback; no resolution is claimed for them.
+The earlier 43/48 fixture failure is retained. GitHub confirms alert #16 fixed at
+2026-10-11T02:44:56Z after delivery `07fcb71`. Installed closure regeneration
+and native/model qualification remain pending. The three other open dependency
+advisories have no confirmed patched release in the live GitHub readback.
+The [npm metadata validator repair](../2026-10-10/NPM-LOCK-METADATA-VALIDATOR.json)
+also accepts npm's standard empty-string package key through hash-table JSON
+parsing. The actual locally reproduced CI tooling gate now passes; the failed
+delivery CI result remains retained.
 
 The [Antigravity dispatch capability](../2026-10-10/ANTIGRAVITY-DISPATCH-CAPABILITY.json)
 uses its actual same-process refresh producer and a strict session/init/model/idle-turn
