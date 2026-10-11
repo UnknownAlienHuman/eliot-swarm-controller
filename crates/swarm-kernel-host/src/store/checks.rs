@@ -11,6 +11,8 @@ use crate::{
     },
     config::Config,
     error::{Error, Result},
+    checks::inputs::ProbeCleanupOwner,
+    hooks::git::GitCleanupOwner,
     model::{self, Principal, Role},
     workspace::LeaseAuthorityRef,
 };
@@ -248,6 +250,28 @@ impl Store {
             }
         };
         let context_fingerprint = snapshot.context_fingerprint.clone();
+        let _probe_operation_guard = self
+            .check_child_custody
+            .probe_cleanup_operation
+            .lock()
+            .await;
+        self.check_child_custody.reap_probe_cleanup_owners().await;
+        if !self
+            .check_child_custody
+            .probe_cleanup_owners
+            .lock()
+            .await
+            .is_empty()
+        {
+            return Ok(CheckPlanResolution {
+                context_fingerprint,
+                result: Err(Error::new(
+                    "CHECK_PROBE_CLEANUP_PENDING",
+                    "an earlier input probe remains in exact Store custody",
+                )),
+                cache_hit: None,
+            });
+        }
         let resolved_context = context_fingerprint.clone();
         let data_dir = self.data_dir.clone();
         let result = self
@@ -261,23 +285,36 @@ impl Store {
                     (snapshot.baseline.is_some() && baseline.is_none())
                         .then(|| "baseline_source_unverified".to_owned())
                 });
-                let mut resolved =
-                    inputs::resolve(&snapshot.profile, &candidate, baseline.as_ref())?;
-                if let Some(reason) = baseline_reason {
-                    resolved.add_widening_reason(&reason)?;
-                }
-                let scope_plan = serde_json::to_value(&resolved.scope_plan)?;
-                Ok(PreparedCheckPlan {
-                    context_fingerprint: resolved_context,
-                    project_id: snapshot.project_id,
-                    resolved_inputs: resolved.resolved_inputs,
-                    scope_plan,
-                    input_fingerprint: resolved.input_fingerprint,
-                    reproducible: snapshot.profile.reproducible,
-                })
+                let (resolved, cleanup_owner) = inputs::resolve_with_cleanup(
+                    &snapshot.profile,
+                    &candidate,
+                    baseline.as_ref(),
+                );
+                let prepared = resolved.and_then(|mut resolved| {
+                    if let Some(reason) = baseline_reason {
+                        resolved.add_widening_reason(&reason)?;
+                    }
+                    let scope_plan = serde_json::to_value(&resolved.scope_plan)?;
+                    Ok(PreparedCheckPlan {
+                        context_fingerprint: resolved_context,
+                        project_id: snapshot.project_id,
+                        resolved_inputs: resolved.resolved_inputs,
+                        scope_plan,
+                        input_fingerprint: resolved.input_fingerprint,
+                        reproducible: snapshot.profile.reproducible,
+                    })
+                });
+                Ok((prepared, cleanup_owner))
             })
             .await;
-        let (result, cache_hit) = match result {
+        let (prepared, cleanup_owner) = match result {
+            Ok((prepared, owner)) => (prepared, owner),
+            Err(error) => (Err(error), None),
+        };
+        if let Some(owner) = cleanup_owner {
+            self.check_child_custody.retain_probe_cleanup(owner).await;
+        }
+        let (result, cache_hit) = match prepared {
             Ok(prepared) if prepared.resolved_inputs["cache_reusable"] == true => {
                 let project_id = prepared.project_id.clone();
                 let lookup = prepared.clone();
@@ -1879,11 +1916,141 @@ struct CheckChildOwner {
 #[derive(Clone, Default)]
 pub(super) struct CheckChildCustody {
     owners: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, CheckChildOwner>>>,
+    git_cleanup_owners: std::sync::Arc<tokio::sync::Mutex<Vec<GitCleanupOwner>>>,
+    git_cleanup_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    probe_cleanup_owners: std::sync::Arc<tokio::sync::Mutex<Vec<ProbeCleanupOwner>>>,
+    probe_cleanup_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CheckChildCustody {
     async fn lock(&self) -> tokio::sync::MutexGuard<'_, BTreeMap<String, CheckChildOwner>> {
         self.owners.lock().await
+    }
+
+    pub(super) async fn retain_git_cleanup(&self, owner: GitCleanupOwner) {
+        if owner.is_pending() {
+            self.git_cleanup_owners.lock().await.push(owner);
+        }
+    }
+
+    async fn reap_git_cleanup_owners(&self) {
+        let mut owners = self.git_cleanup_owners.lock().await;
+        owners.retain_mut(|owner| {
+            owner.poll();
+            owner.is_pending()
+        });
+    }
+
+    async fn retain_probe_cleanup(&self, owner: ProbeCleanupOwner) {
+        if owner.is_pending() {
+            self.probe_cleanup_owners.lock().await.push(owner);
+        }
+    }
+
+    async fn reap_probe_cleanup_owners(&self) {
+        let mut owners = self.probe_cleanup_owners.lock().await;
+        owners.retain_mut(|owner| {
+            owner.poll();
+            owner.is_pending()
+        });
+    }
+}
+
+impl Store {
+    /// Run one closed configured-project Git lifecycle operation in Store
+    /// custody. The owner mutex also prevents a retry from launching another
+    /// helper while an earlier process family is still pending departure.
+    pub(super) async fn execute_hook_local_operation(
+        &self,
+        principal: Principal,
+        request: crate::hooks::git::HookLocalRequest,
+    ) -> Result<Value> {
+        let auth_principal = principal.clone();
+        self.run(move |db| {
+            let current = current_principal(db, auth_principal)?;
+            super::gm::require_authority(db, &current)?;
+            Ok(())
+        })
+        .await?;
+
+        let config = self.config.clone();
+        let project = config
+            .forge
+            .projects
+            .get(&request.project_id)
+            .ok_or_else(|| {
+                Error::new(
+                    "HOOK_PROJECT_UNAVAILABLE",
+                    "project has no configured trusted repository",
+                )
+            })?;
+        let repository = project.repository_path.clone();
+        let git_executable = config.forge.git_executable.clone();
+        if !repository.is_absolute()
+            || !repository.is_dir()
+            || !git_executable.is_absolute()
+            || !git_executable.is_file()
+        {
+            return Err(Error::new(
+                "HOOK_REPOSITORY_UNAVAILABLE",
+                "configured repository and Git executable must be absolute existing paths",
+            ));
+        }
+
+        let operation_name = request.operation.name();
+        let _operation_guard = self
+            .check_child_custody
+            .git_cleanup_operation
+            .lock()
+            .await;
+        self.check_child_custody.reap_git_cleanup_owners().await;
+        if !self
+            .check_child_custody
+            .git_cleanup_owners
+            .lock()
+            .await
+            .is_empty()
+        {
+            return serde_json::to_value(crate::hooks::git::HookLocalResult::CleanupPending {
+                operation: operation_name.to_owned(),
+                cause_code: Some("HOOK_GIT_CLEANUP_PENDING".to_owned()),
+            })
+            .map_err(Into::into);
+        }
+
+        let (operation_result, cleanup_owner) = tokio::task::spawn_blocking(move || {
+            let swarm_executable = std::env::current_exe().map_err(|_| {
+                Error::new(
+                    "HOOK_EXECUTABLE_UNAVAILABLE",
+                    "Store executable path is unavailable",
+                )
+            })?;
+            Ok::<_, Error>(crate::hooks::git::run_local_operation_with_cleanup(
+                request,
+                &repository,
+                &git_executable,
+                &swarm_executable,
+            ))
+        })
+        .await
+        .map_err(|_| Error::new("HOOK_GIT_FAILED", "hook Git verification worker ended"))??;
+
+        if let Some(owner) = cleanup_owner {
+            let pending = owner.is_pending();
+            self.check_child_custody.retain_git_cleanup(owner).await;
+            if pending {
+                let cause_code = operation_result.err().map(|error| error.code);
+                return serde_json::to_value(
+                    crate::hooks::git::HookLocalResult::CleanupPending {
+                        operation: operation_name.to_owned(),
+                        cause_code,
+                    },
+                )
+                .map_err(Into::into);
+            }
+        }
+        let result = operation_result?;
+        serde_json::to_value(result).map_err(Into::into)
     }
 }
 
@@ -2309,7 +2476,20 @@ impl Store {
     }
 
     async fn check_child_count(&self) -> usize {
-        self.check_child_custody.lock().await.len()
+        let check_children = self.check_child_custody.lock().await.len();
+        let git_helpers = self
+            .check_child_custody
+            .git_cleanup_owners
+            .lock()
+            .await
+            .len();
+        let input_probes = self
+            .check_child_custody
+            .probe_cleanup_owners
+            .lock()
+            .await
+            .len();
+        check_children + git_helpers + input_probes
     }
 
     async fn check_child_is_owned(&self, check_id: &str) -> bool {
@@ -2430,6 +2610,8 @@ impl Store {
     }
 
     async fn reap_check_children(&self) -> Result<()> {
+        self.check_child_custody.reap_git_cleanup_owners().await;
+        self.check_child_custody.reap_probe_cleanup_owners().await;
         let check_ids = self
             .check_child_custody
             .lock()

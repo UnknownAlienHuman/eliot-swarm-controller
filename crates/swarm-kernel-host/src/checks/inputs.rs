@@ -9,7 +9,7 @@ use super::{
 use crate::{
     error::{Error, Result},
     model,
-    platform::process_group::{Group, spawned_identity},
+    platform::process_group::{Group, departed_empty, spawned_departed, spawned_identity},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -18,14 +18,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+use swarm_process::capture::{CaptureStream, PollableRead};
 
 const PROBE_MAGIC: &[u8; 8] = b"SWPRB01\0";
 const PROBE_VERSION: u32 = 1;
@@ -39,10 +36,68 @@ const PROBE_CLEANUP_RETRY: Duration = Duration::from_millis(250);
 const PROBE_MAX_CLEANUP_REQUESTS: u8 = 3;
 const PROBE_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const PROBE_HELPER_WAIT_GRACE: Duration = Duration::from_secs(45);
-type ProbeFn = fn(&Path, &[String], &BTreeMap<String, String>, &Path) -> Result<Vec<u8>>;
+const PROBE_HELPER_RESPONSE_FILE: &str = "helper-response.capture";
+pub(crate) const PROBE_STDOUT_CAPTURE_FILE: &str = "probe-stdout.capture";
+pub(crate) const PROBE_STDERR_CAPTURE_FILE: &str = "probe-stderr.capture";
 #[cfg(test)]
 pub(crate) type TestProbeFn =
     fn(&Path, &[String], &BTreeMap<String, String>, &Path) -> Result<Vec<u8>>;
+
+enum ProbeExecutor {
+    Production,
+    #[cfg(test)]
+    Test(TestProbeFn),
+}
+
+struct ProbeContext {
+    executor: ProbeExecutor,
+    cleanup_owner: Option<ProbeCleanupOwner>,
+}
+
+impl ProbeContext {
+    fn production() -> Self {
+        Self {
+            executor: ProbeExecutor::Production,
+            cleanup_owner: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn test(probe: TestProbeFn) -> Self {
+        Self {
+            executor: ProbeExecutor::Test(probe),
+            cleanup_owner: None,
+        }
+    }
+
+    fn run(
+        &mut self,
+        program: &Path,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Vec<u8>> {
+        if self
+            .cleanup_owner
+            .as_ref()
+            .is_some_and(ProbeCleanupOwner::is_pending)
+        {
+            return Err(Error::new(
+                "CHECK_PROBE_CLEANUP_PENDING",
+                "a prior input probe helper remains in Store custody",
+            ));
+        }
+        match &self.executor {
+            ProbeExecutor::Production => {
+                let (result, owner) = command_output_with_cleanup(program, args, env, cwd);
+                self.cleanup_owner = owner;
+                result
+            }
+            #[cfg(test)]
+            ProbeExecutor::Test(probe) => probe(program, args, env, cwd),
+        }
+    }
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +123,275 @@ struct ProbeResponse {
     stderr: Vec<u8>,
 }
 
+/// Custody retained by Store when an input-probe helper or its response pipe
+/// outlives the bounded foreground phase.
+pub(crate) struct ProbeCleanupOwner {
+    custody: ProbeHelperCustody,
+}
+
+impl ProbeCleanupOwner {
+    pub(crate) fn poll(&mut self) {
+        self.custody.poll();
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        !self.custody.cleanup_complete
+    }
+}
+
+impl Drop for ProbeCleanupOwner {
+    fn drop(&mut self) {
+        if self.custody.cleanup_complete && self.custody.response_group_empty == Some(true) {
+            self.custody.capture.take();
+            self.custody.stdout.take();
+            self.custody.response_file.take();
+            cleanup_probe_directory(&self.custody.directory);
+        }
+    }
+}
+
+struct ProbeHelperCustody {
+    child: Child,
+    child_pid: u32,
+    launch_identity: Option<Value>,
+    stdout: Option<ChildStdout>,
+    response_file: Option<File>,
+    capture: Option<CaptureStream<ProbeHelperStdout>>,
+    directory: PathBuf,
+    family_identity: Option<Value>,
+    family_token: Option<String>,
+    exit_status: Option<ExitStatus>,
+    status_observation_failed: bool,
+    capture_setup_failed: bool,
+    response_group_empty: Option<bool>,
+    family_departed_proven: bool,
+    cleanup_complete: bool,
+}
+
+impl ProbeHelperCustody {
+    fn poll(&mut self) {
+        if self.cleanup_complete {
+            return;
+        }
+        self.start_capture_if_possible();
+        if let Some(capture) = self.capture.as_mut() {
+            capture.poll();
+        }
+        if self.exit_status.is_none() {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.exit_status = Some(status);
+                    self.status_observation_failed = false;
+                }
+                Ok(None) => {}
+                Err(_) => self.status_observation_failed = true,
+            }
+        }
+        self.load_family_identity();
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(CaptureStream::is_finished)
+        {
+            self.load_response_group_state();
+        }
+        if self.exit_status.is_none() || !self.family_departed_once() {
+            return;
+        }
+        self.family_departed_proven = true;
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(CaptureStream::is_finished)
+        {
+            self.cleanup_complete = true;
+        } else if self.capture.is_none() {
+            // The exact process family and direct Child are gone. Close any
+            // unusable pipe handles without treating that closure as EOF.
+            self.stdout.take();
+            self.response_file.take();
+            self.capture_setup_failed = true;
+            self.cleanup_complete = true;
+        }
+    }
+
+    fn start_capture_if_possible(&mut self) {
+        if self.capture.is_some() || self.stdout.is_none() || self.response_file.is_none() {
+            return;
+        }
+        let configured = self
+            .stdout
+            .as_ref()
+            .is_some_and(|stdout| stdout.make_nonblocking().is_ok());
+        if !configured {
+            return;
+        }
+        let Some(stdout) = self.stdout.take() else {
+            self.capture_setup_failed = true;
+            return;
+        };
+        let Some(file) = self.response_file.take() else {
+            self.stdout = Some(stdout);
+            self.capture_setup_failed = true;
+            return;
+        };
+        match CaptureStream::new(
+            self.directory.join(PROBE_HELPER_RESPONSE_FILE),
+            file,
+            ProbeHelperStdout(stdout),
+            PROBE_RESPONSE_LIMIT as u64,
+        ) {
+            Ok(capture) => self.capture = Some(capture),
+            Err(_) => self.capture_setup_failed = true,
+        }
+    }
+
+    fn load_response_group_state(&mut self) {
+        if self.response_group_empty.is_some() {
+            return;
+        }
+        let response_path = self.directory.join(PROBE_HELPER_RESPONSE_FILE);
+        let Ok(file) = File::open(response_path) else {
+            return;
+        };
+        let Ok(bytes) = read_bounded(file, PROBE_RESPONSE_LIMIT) else {
+            return;
+        };
+        self.response_group_empty = decode_probe_response(&bytes)
+            .ok()
+            .map(|response| response.group_empty);
+    }
+
+    fn request_stop(&mut self) {
+        if self.exit_status.is_none() {
+            let _ = self.child.kill();
+        }
+    }
+
+    fn load_family_identity(&mut self) {
+        if self.family_identity.is_some() {
+            return;
+        }
+        let owner_path = self.directory.join("probe-owner.json");
+        let Ok(file) = File::open(owner_path) else {
+            return;
+        };
+        let Ok(bytes) = read_bounded(file, 16 * 1024) else {
+            return;
+        };
+        let Ok(identity) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        if identity["purpose"] != "check"
+            || identity["pid"].as_u64() != Some(u64::from(self.child_pid))
+            || self
+                .launch_identity
+                .as_ref()
+                .is_some_and(|launch| launch["pid"].as_u64() != identity["pid"].as_u64())
+        {
+            return;
+        }
+        let Ok(token) = probe_group_token(&identity) else {
+            return;
+        };
+        self.family_identity = Some(identity);
+        self.family_token = Some(token);
+    }
+
+    fn family_departed_once(&self) -> bool {
+        let (Some(identity), Some(token)) =
+            (self.family_identity.as_ref(), self.family_token.as_deref())
+        else {
+            // execute_probe persists this file before it can spawn the
+            // requested executable and never removes it. After the exact
+            // helper Child exits, absence proves that no nested family was
+            // launched; it does not stand in for a departed-family receipt.
+            return self.exit_status.is_some()
+                && matches!(
+                    fs::symlink_metadata(self.directory.join("probe-owner.json")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+        };
+        let group_departed = departed_empty(identity, token).is_ok_and(|departed| departed);
+        let launch_departed = match self.launch_identity.as_ref() {
+            Some(launch) => spawned_departed(launch, token).is_ok_and(|departed| departed),
+            None => self.exit_status.is_some(),
+        };
+        group_departed && launch_departed
+    }
+
+    fn into_output(mut self) -> Result<Vec<u8>> {
+        if !self.cleanup_complete || !self.family_departed_proven {
+            return Err(Error::new(
+                "CHECK_PROBE_CLEANUP_PENDING",
+                "input probe helper custody is not releasable before exact family departure and pipe completion",
+            ));
+        }
+        if self.status_observation_failed {
+            return Err(Error::new(
+                "CHECK_PROBE_CLEANUP_PENDING",
+                "input probe helper exit status observation failed",
+            ));
+        }
+        let status = self.exit_status.take().ok_or_else(|| {
+            Error::new(
+                "CHECK_PROBE_CLEANUP_PENDING",
+                "input probe helper exit was not observed",
+            )
+        })?;
+        if !status.success() {
+            return Err(Error::new(
+                "CHECK_INPUT_RESOLUTION",
+                "owned input probe helper exited without a response",
+            ));
+        }
+        if self.capture_setup_failed {
+            return Err(Error::new(
+                "CHECK_PROBE_CAPTURE_FAILED",
+                "bounded input probe response capture could not be started",
+            ));
+        }
+        let capture = self.capture.take().ok_or_else(|| {
+            Error::new(
+                "CHECK_PROBE_CAPTURE_FAILED",
+                "bounded input probe response capture is unavailable",
+            )
+        })?;
+        let receipt = capture.finish();
+        if !receipt.capture_complete || receipt.capture_error.is_some() || receipt.truncated {
+            return Err(Error::new(
+                "CHECK_PROBE_CAPTURE_FAILED",
+                "bounded input probe response was incomplete or exceeded its frame limit",
+            ));
+        }
+        read_bounded(
+            File::open(self.directory.join(PROBE_HELPER_RESPONSE_FILE))?,
+            PROBE_RESPONSE_LIMIT,
+        )
+    }
+}
+
+struct ProbeHelperStdout(ChildStdout);
+
+impl Read for ProbeHelperStdout {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl PollableRead for ProbeHelperStdout {
+    fn make_nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> std::io::Result<swarm_process::capture::PipeRead> {
+        self.0.read_available(buffer)
+    }
+}
+
 struct TempProbeDir(PathBuf, bool);
 
 impl TempProbeDir {
@@ -85,16 +409,23 @@ impl Drop for TempProbeDir {
         if self.1 {
             return;
         }
-        for name in [
-            "request.json",
-            "probe-owner.json",
-            "stdout.partial",
-            "stderr.partial",
-        ] {
-            let _ = fs::remove_file(self.0.join(name));
-        }
-        let _ = fs::remove_dir(&self.0);
+        cleanup_probe_directory(&self.0);
     }
+}
+
+fn cleanup_probe_directory(directory: &Path) {
+    for name in [
+        "request.json",
+        "probe-owner.json",
+        PROBE_HELPER_RESPONSE_FILE,
+        PROBE_STDOUT_CAPTURE_FILE,
+        PROBE_STDERR_CAPTURE_FILE,
+        "stdout.partial",
+        "stderr.partial",
+    ] {
+        let _ = fs::remove_file(directory.join(name));
+    }
+    let _ = fs::remove_dir(directory);
 }
 
 #[derive(Debug, Clone)]
@@ -611,13 +942,16 @@ fn prefix_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn command_output(
+fn command_output_with_cleanup(
     program: &Path,
     args: &[String],
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<Vec<u8>> {
-    let current_exe = std::env::current_exe()?;
+) -> (Result<Vec<u8>>, Option<ProbeCleanupOwner>) {
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return (Err(error.into()), None),
+    };
     let request = ProbeRequest {
         probe_version: PROBE_VERSION,
         program: program.to_path_buf(),
@@ -629,161 +963,170 @@ fn command_output(
     };
     let temp_root = std::env::temp_dir();
     let temp_dir = temp_root.join(format!("swarm-check-probe-{}", model::new_id()));
-    fs::create_dir(&temp_dir)?;
+    if let Err(error) = fs::create_dir(&temp_dir) {
+        return (Err(error.into()), None);
+    }
     let mut temp_guard = TempProbeDir(temp_dir.clone(), false);
     let request_path = temp_guard.0.join("request.json");
-    let request_bytes = model::canonical(&json!({"check_probe":request}))?.into_bytes();
-    let mut request_file = OpenOptions::new()
+    let request_bytes = match model::canonical(&json!({"check_probe":request})) {
+        Ok(bytes) => bytes.into_bytes(),
+        Err(error) => return (Err(error), None),
+    };
+    let mut request_file = match OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&request_path)?;
-    request_file.write_all(&request_bytes)?;
-    request_file.sync_all()?;
+        .open(&request_path)
+    {
+        Ok(file) => file,
+        Err(error) => return (Err(error.into()), None),
+    };
+    if let Err(error) = request_file
+        .write_all(&request_bytes)
+        .and_then(|()| request_file.sync_all())
+    {
+        return (Err(error.into()), None);
+    }
     drop(request_file);
+    let response_path = temp_guard.0.join(PROBE_HELPER_RESPONSE_FILE);
+    let response_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&response_path)
+    {
+        Ok(file) => file,
+        Err(error) => return (Err(error.into()), None),
+    };
+    let mut helper = Command::new(current_exe);
+    helper
+        .arg("check-worker")
+        .arg("--file")
+        .arg(&request_path)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // This pipe-only probe never needs a Windows console.
+        helper.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+    }
+    let mut child = match helper.spawn() {
+        Ok(child) => child,
+        Err(error) => return (Err(error.into()), None),
+    };
+    temp_guard.preserve();
+    let child_pid = child.id();
+    let launch_identity = spawned_identity(child_pid).ok();
+    let stdout = child.stdout.take();
+    let mut custody = ProbeHelperCustody {
+        child,
+        child_pid,
+        launch_identity,
+        stdout,
+        response_file: Some(response_file),
+        capture: None,
+        directory: temp_guard.0.clone(),
+        family_identity: None,
+        family_token: None,
+        exit_status: None,
+        status_observation_failed: false,
+        capture_setup_failed: false,
+        response_group_empty: None,
+        family_departed_proven: false,
+        cleanup_complete: false,
+    };
+    if custody.stdout.is_none() {
+        custody.capture_setup_failed = true;
+        custody.request_stop();
+    }
 
-    (|| -> Result<Vec<u8>> {
-        let mut helper = Command::new(current_exe);
-        helper
-            .arg("check-worker")
-            .arg("--file")
-            .arg(&request_path)
-            .env_clear()
-            .envs(env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // This pipe-only probe never needs a Windows console.
-            helper.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+    let helper_deadline = Instant::now() + PROBE_HELPER_WAIT_GRACE;
+    let mut drain_deadline = None;
+    let mut kill_deadline = None;
+    loop {
+        custody.poll();
+        if custody.exit_status.is_some() && drain_deadline.is_none() {
+            drain_deadline = Some(Instant::now() + PROBE_CAPTURE_DRAIN_GRACE);
         }
-        let mut child = helper.spawn()?;
-        temp_guard.preserve();
-        let helper_process = spawned_identity(child.id()).ok();
-        let Some(stdout) = child.stdout.take() else {
-            let _ = stop_probe_helper(&mut child);
-            return Err(Error::new(
-                "CHECK_INPUT_RESOLUTION",
-                format!(
-                    "probe response pipe missing{}",
-                    probe_owner_diagnostic(
-                        &temp_guard.0.join("probe-owner.json"),
-                        helper_process.as_ref()
-                    )
-                ),
-            ));
-        };
-        let reader = match thread::Builder::new()
-            .name("check-probe-response".into())
-            .spawn(move || read_bounded(stdout, PROBE_RESPONSE_LIMIT))
-        {
-            Ok(reader) => reader,
-            Err(_) => {
-                let _ = stop_probe_helper(&mut child);
-                return Err(Error::new(
-                    "CHECK_INPUT_RESOLUTION",
-                    format!(
-                        "cannot start bounded input probe response reader{}",
-                        probe_owner_diagnostic(
-                            &temp_guard.0.join("probe-owner.json"),
-                            helper_process.as_ref()
-                        )
-                    ),
-                ));
+        if custody.cleanup_complete {
+            let mut response_group_empty_proven = false;
+            let output = custody.into_output().and_then(|bytes| {
+                let response = decode_probe_response(&bytes)?;
+                if !response.group_empty {
+                    retain_probe_partial(&temp_guard.0, "stdout.partial", &response.stdout)?;
+                    retain_probe_partial(&temp_guard.0, "stderr.partial", &response.stderr)?;
+                    return Err(Error::new(
+                        "CHECK_PROBE_CLEANUP_PENDING",
+                        format!(
+                            "input probe did not prove its process group empty; {}; partial_stdout_bytes={}; partial_stderr_bytes={}",
+                            response.message,
+                            response.stdout.len(),
+                            response.stderr.len()
+                        ),
+                    ));
+                }
+                response_group_empty_proven = true;
+                if !response.success {
+                    let reason = if response.timed_out {
+                        "input metadata/version probe exceeded its deadline".to_string()
+                    } else if response.output_limited {
+                        "input metadata/version probe exceeded its streaming output limit".to_string()
+                    } else if !response.message.is_empty() {
+                        response.message.clone()
+                    } else {
+                        format!("input probe exited with {:?}", response.exit_code)
+                    };
+                    let detail = String::from_utf8_lossy(&response.stderr)
+                        .chars()
+                        .take(1500)
+                        .collect::<String>();
+                    return Err(Error::new(
+                        "CHECK_INPUT_RESOLUTION",
+                        if detail.is_empty() {
+                            reason
+                        } else {
+                            format!("{reason}: {detail}")
+                        },
+                    ));
+                }
+                Ok(response.stdout)
+            });
+            if response_group_empty_proven {
+                temp_guard.allow_cleanup();
             }
-        };
-        let Some(status) = wait_owned_child(&mut child, PROBE_HELPER_WAIT_GRACE) else {
-            let _ = stop_probe_helper(&mut child);
-            return Err(Error::new(
-                "CHECK_PROBE_CLEANUP_PENDING",
-                format!(
-                    "input probe helper did not exit within its bounded wait{}",
-                    probe_owner_diagnostic(
-                        &temp_guard.0.join("probe-owner.json"),
-                        helper_process.as_ref()
-                    )
-                ),
-            ));
-        };
-        let reader_deadline = Instant::now() + PROBE_CAPTURE_DRAIN_GRACE;
-        while !reader.is_finished() && Instant::now() < reader_deadline {
-            thread::sleep(Duration::from_millis(10));
+            return (output, None);
         }
-        if !reader.is_finished() {
-            drop(reader);
-            return Err(Error::new(
-                "CHECK_PROBE_CAPTURE_PENDING",
-                format!(
-                    "input probe response capture did not finish within its bound{}",
-                    probe_owner_diagnostic(
-                        &temp_guard.0.join("probe-owner.json"),
-                        helper_process.as_ref()
-                    )
-                ),
-            ));
+
+        let now = Instant::now();
+        if kill_deadline.is_none() && now >= helper_deadline {
+            custody.request_stop();
+            kill_deadline = Some(now + PROBE_CLEANUP_GRACE);
         }
-        let response = reader.join().map_err(|_| {
-            Error::new("CHECK_INPUT_RESOLUTION", "probe response reader panicked")
-        })??;
-        if !status.success() {
-            return Err(Error::new(
-                "CHECK_INPUT_RESOLUTION",
-                format!(
-                    "owned input probe helper exited without a response{}",
-                    probe_owner_diagnostic(
-                        &temp_guard.0.join("probe-owner.json"),
-                        helper_process.as_ref()
-                    )
-                ),
-            ));
-        }
-        let response = decode_probe_response(&response)?;
-        if !response.group_empty {
-            retain_probe_partial(&temp_guard.0, "stdout.partial", &response.stdout)?;
-            retain_probe_partial(&temp_guard.0, "stderr.partial", &response.stderr)?;
-            return Err(Error::new(
-                "CHECK_PROBE_CLEANUP_PENDING",
-                format!(
-                    "input probe did not prove its process group empty; {}; partial_stdout_bytes={}; partial_stderr_bytes={}{}",
-                    response.message,
-                    response.stdout.len(),
-                    response.stderr.len(),
-                    probe_owner_diagnostic(
-                        &temp_guard.0.join("probe-owner.json"),
-                        helper_process.as_ref()
-                    )
-                ),
-            ));
-        }
-        // The helper wrote this response only after exact group-empty and
-        // successful disarm. Only now may the request and owner evidence go.
-        temp_guard.allow_cleanup();
-        if !response.success {
-            let reason = if response.timed_out {
-                "input metadata/version probe exceeded its deadline".to_string()
-            } else if response.output_limited {
-                "input metadata/version probe exceeded its streaming output limit".to_string()
-            } else if !response.message.is_empty() {
-                response.message.clone()
+        let drain_expired = drain_deadline.is_some_and(|deadline| now >= deadline);
+        let cleanup_expired = kill_deadline.is_some_and(|deadline| now >= deadline);
+        if drain_expired || cleanup_expired {
+            let reason = if drain_expired {
+                "input probe response pipe remained open after the bounded drain grace"
             } else {
-                format!("input probe exited with {:?}", response.exit_code)
+                "input probe helper family remains live after bounded stop grace"
             };
-            let detail = String::from_utf8_lossy(&response.stderr)
-                .chars()
-                .take(1500)
-                .collect::<String>();
-            return Err(Error::new(
-                "CHECK_INPUT_RESOLUTION",
-                if detail.is_empty() {
-                    reason
-                } else {
-                    format!("{reason}: {detail}")
-                },
-            ));
+            let error = Error::new(
+                "CHECK_PROBE_CLEANUP_PENDING",
+                format!(
+                    "{reason}{}",
+                    probe_owner_diagnostic(
+                        &temp_guard.0.join("probe-owner.json"),
+                        custody.launch_identity.as_ref()
+                    )
+                ),
+            );
+            temp_guard.preserve();
+            return (Err(error), Some(ProbeCleanupOwner { custody }));
         }
-        Ok(response.stdout)
-    })()
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn retain_probe_partial(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -797,28 +1140,18 @@ fn retain_probe_partial(directory: &Path, name: &str, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-fn wait_owned_child(
-    child: &mut std::process::Child,
-    grace: Duration,
-) -> Option<std::process::ExitStatus> {
-    let deadline = Instant::now() + grace;
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(20));
+fn probe_group_token(identity: &Value) -> Result<String> {
+    if identity["scope"] == "linux_process_group" {
+        return Ok(String::new());
     }
-}
-
-fn stop_probe_helper(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-    if let Some(status) = wait_owned_child(child, Duration::ZERO) {
-        return Some(status);
-    }
-    let _ = child.kill();
-    wait_owned_child(child, PROBE_CLEANUP_GRACE)
+    let job_name = identity["job_name"]
+        .as_str()
+        .ok_or_else(|| Error::invalid("input probe Job name is missing"))?;
+    job_name
+        .strip_prefix(r"Global\EliotSwarmCheck-")
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::invalid("input probe Job name is invalid"))
 }
 
 fn probe_owner_diagnostic(path: &Path, helper_process: Option<&Value>) -> String {
@@ -937,61 +1270,6 @@ fn decode_probe_response(bytes: &[u8]) -> Result<ProbeResponse> {
     })
 }
 
-fn read_limited_pipe(
-    mut pipe: impl Read,
-    limit: usize,
-    overflow: Arc<AtomicBool>,
-    capture: Arc<Mutex<ProbeCapture>>,
-) {
-    let mut buffer = [0u8; 8192];
-    loop {
-        let count = match pipe.read(&mut buffer) {
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                probe_capture_lock(&capture).error = Some("capture_read_failed".into());
-                return;
-            }
-        };
-        if count == 0 {
-            return;
-        }
-        let mut output = probe_capture_lock(&capture);
-        let room = limit.saturating_sub(output.bytes.len());
-        let keep = room.min(count);
-        output.bytes.extend_from_slice(&buffer[..keep]);
-        if keep != count {
-            overflow.store(true, Ordering::Release);
-        }
-        drop(output);
-        // Continue draining after the cap so a child cannot block on a full pipe.
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct ProbeCapture {
-    bytes: Vec<u8>,
-    error: Option<String>,
-}
-
-fn probe_capture_lock(capture: &Mutex<ProbeCapture>) -> std::sync::MutexGuard<'_, ProbeCapture> {
-    capture
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn finish_probe_reader(reader: thread::JoinHandle<()>, grace: Duration) -> bool {
-    let deadline = Instant::now() + grace;
-    while !reader.is_finished() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    if !reader.is_finished() {
-        drop(reader);
-        return false;
-    }
-    reader.join().is_ok()
-}
-
 struct ProbeOwner {
     group: Group,
 }
@@ -1000,7 +1278,11 @@ impl ProbeOwner {
     fn release(&mut self) -> Result<()> {
         let deadline = Instant::now() + PROBE_CLEANUP_GRACE;
         let mut requests = 0u8;
-        let mut last_request = None;
+        // Give a direct-exit descendant the existing cleanup grace to close
+        // inherited output pipes naturally before the first cancellation.
+        // The parent GitHelperCustody continues polling while this helper
+        // retains the exact Group and child handles.
+        let mut next_cancel = Instant::now() + probe_initial_cleanup_grace();
         let mut last_error = None;
         loop {
             match self.group.children_empty() {
@@ -1013,11 +1295,9 @@ impl ProbeOwner {
                 Ok(false) => {}
                 Err(error) => last_error = Some(cleanup_error_diagnostic(&error)),
             }
-            if requests < PROBE_MAX_CLEANUP_REQUESTS
-                && last_request.is_none_or(|last: Instant| last.elapsed() >= PROBE_CLEANUP_RETRY)
-            {
+            if requests < PROBE_MAX_CLEANUP_REQUESTS && Instant::now() >= next_cancel {
                 requests += 1;
-                last_request = Some(Instant::now());
+                next_cancel = Instant::now() + PROBE_CLEANUP_RETRY;
                 if let Err(error) = self.group.cancel_children() {
                     last_error = Some(cleanup_error_diagnostic(&error));
                 }
@@ -1036,6 +1316,14 @@ impl ProbeOwner {
             thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+fn probe_initial_cleanup_grace() -> Duration {
+    #[cfg(test)]
+    if std::env::var("HOOK_GIT_PROBE_FIXTURE_MODE").as_deref() == Ok("descendant") {
+        return Duration::from_secs(2);
+    }
+    PROBE_CLEANUP_RETRY
 }
 
 fn cleanup_error_diagnostic(error: &Error) -> String {
@@ -1132,18 +1420,61 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
     };
     let mut owner = ProbeOwner { group };
     if let Err(error) = persist_probe_owner(owner_path, &owner.group.identity) {
-        let cleanup = owner.release();
+        let cleanup = release_probe_owner(&mut owner);
         return ProbeResponse {
             success: false,
             timed_out: false,
             output_limited: false,
             exit_code: None,
-            group_empty: cleanup.is_ok(),
+            group_empty: cleanup,
             message: format!("cannot persist input probe process identity: {error}"),
             stdout: Vec::new(),
             stderr: Vec::new(),
         };
     }
+    let stdout_path = owner_path.with_file_name(PROBE_STDOUT_CAPTURE_FILE);
+    let stderr_path = owner_path.with_file_name(PROBE_STDERR_CAPTURE_FILE);
+    let stdout_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let group_empty = release_probe_owner(&mut owner);
+            return ProbeResponse {
+                success: false,
+                timed_out: false,
+                output_limited: false,
+                exit_code: None,
+                group_empty,
+                message: format!("cannot create bounded input probe stdout capture: {error}"),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+        }
+    };
+    let stderr_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&stdout_path);
+            let group_empty = release_probe_owner(&mut owner);
+            return ProbeResponse {
+                success: false,
+                timed_out: false,
+                output_limited: false,
+                exit_code: None,
+                group_empty,
+                message: format!("cannot create bounded input probe stderr capture: {error}"),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+        }
+    };
     let mut command = Command::new(&request.program);
     command
         .args(&request.args)
@@ -1161,127 +1492,143 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let cleanup = owner.release();
+            let group_empty = release_probe_owner(&mut owner);
             return ProbeResponse {
                 success: false,
                 timed_out: false,
                 output_limited: false,
                 exit_code: None,
-                group_empty: cleanup.is_ok(),
+                group_empty,
                 message: format!("unable to start input probe: {error}"),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             };
         }
     };
-    let overflow = Arc::new(AtomicBool::new(false));
-    let stdout_capture = Arc::new(Mutex::new(ProbeCapture::default()));
-    let stderr_capture = Arc::new(Mutex::new(ProbeCapture::default()));
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = stdout.and_then(|pipe| {
-        let overflow = Arc::clone(&overflow);
-        let capture = Arc::clone(&stdout_capture);
-        thread::Builder::new()
-            .name("check-probe-stdout".into())
-            .spawn(move || read_limited_pipe(pipe, request.stdout_limit, overflow, capture))
-            .ok()
-    });
-    let stderr_reader = stderr.and_then(|pipe| {
-        let overflow = Arc::clone(&overflow);
-        let capture = Arc::clone(&stderr_capture);
-        thread::Builder::new()
-            .name("check-probe-stderr".into())
-            .spawn(move || read_limited_pipe(pipe, request.stderr_limit, overflow, capture))
-            .ok()
-    });
-    if stdout_reader.is_none() || stderr_reader.is_none() {
-        drop(child);
-        let cleanup = owner.release();
-        if let Some(reader) = stdout_reader {
-            let _ = finish_probe_reader(reader, PROBE_CAPTURE_DRAIN_GRACE);
-        }
-        if let Some(reader) = stderr_reader {
-            let _ = finish_probe_reader(reader, PROBE_CAPTURE_DRAIN_GRACE);
-        }
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let status = stop_probe_command(&mut child, &owner);
+        let group_empty = release_probe_owner(&mut owner);
         return ProbeResponse {
             success: false,
             timed_out: false,
             output_limited: false,
-            exit_code: None,
-            group_empty: cleanup.is_ok(),
-            message: cleanup.err().map_or_else(
-                || "cannot start bounded input probe readers".into(),
-                |error| format!("cannot start bounded input probe readers; {error}"),
-            ),
-            stdout: probe_capture_lock(&stdout_capture).bytes.clone(),
-            stderr: probe_capture_lock(&stderr_capture).bytes.clone(),
+            exit_code: status.code(),
+            group_empty,
+            message: "input probe child pipes were unavailable".into(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
         };
-    }
-    let stdout_reader = stdout_reader.unwrap();
-    let stderr_reader = stderr_reader.unwrap();
+    };
+    let mut stdout_capture = match swarm_process::capture::CaptureStream::new(
+        stdout_path.clone(),
+        stdout_file,
+        stdout,
+        request.stdout_limit as u64,
+    ) {
+        Ok(capture) => capture,
+        Err(_) => {
+            let status = stop_probe_command(&mut child, &owner);
+            let group_empty = release_probe_owner(&mut owner);
+            return ProbeResponse {
+                success: false,
+                timed_out: false,
+                output_limited: false,
+                exit_code: status.code(),
+                group_empty,
+                message: "input probe stdout capture could not be made pollable".into(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+        }
+    };
+    let mut stderr_capture = match swarm_process::capture::CaptureStream::new(
+        stderr_path.clone(),
+        stderr_file,
+        stderr,
+        request.stderr_limit as u64,
+    ) {
+        Ok(capture) => capture,
+        Err(_) => {
+            let status = stop_probe_command(&mut child, &owner);
+            let group_empty = release_probe_owner(&mut owner);
+            return ProbeResponse {
+                success: false,
+                timed_out: false,
+                output_limited: false,
+                exit_code: status.code(),
+                group_empty,
+                message: "input probe stderr capture could not be made pollable".into(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
     let mut timed_out = false;
     let mut output_limited = false;
-    let mut exit_status = None;
-    loop {
-        if overflow.load(Ordering::Acquire) {
-            output_limited = true;
+    let mut status_observation_failed = false;
+    let mut next_cancel = Instant::now();
+    let exit_status = loop {
+        stdout_capture.poll();
+        stderr_capture.poll();
+        output_limited |= stdout_capture.truncated() || stderr_capture.truncated();
+        let capture_failed = stdout_capture.reader_failed() || stderr_capture.reader_failed();
+        if !timed_out && Instant::now() >= deadline {
+            timed_out = true;
+        }
+        let cancel_requested = timed_out || output_limited || capture_failed;
+        if cancel_requested && Instant::now() >= next_cancel {
             let _ = owner.group.cancel_children();
-            break;
+            next_cancel = Instant::now() + PROBE_CLEANUP_RETRY;
         }
         match child.try_wait() {
-            Ok(Some(status)) => {
-                exit_status = Some(status);
-                break;
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(_) => {
+                status_observation_failed = true;
                 let _ = owner.group.cancel_children();
-                break;
+                next_cancel = Instant::now() + PROBE_CLEANUP_RETRY;
             }
         }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = owner.group.cancel_children();
-            break;
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut had_descendants = false;
+    let mut membership_diagnostic = None;
+    let group_empty = loop {
+        stdout_capture.poll();
+        stderr_capture.poll();
+        output_limited |= stdout_capture.truncated() || stderr_capture.truncated();
+        match owner.group.children_empty() {
+            Ok(empty) => had_descendants |= !empty,
+            Err(error) => membership_diagnostic = Some(cleanup_error_diagnostic(&error)),
+        }
+        if release_probe_owner_once(&mut owner)
+            && stdout_capture.is_finished()
+            && stderr_capture.is_finished()
+        {
+            break true;
         }
         thread::sleep(Duration::from_millis(10));
-    }
-    // On Windows, Job accounting may still include the just-finished direct
-    // child while its process handle is retained. Drop it before checking for
-    // actual remaining Job members; the Job owner remains live throughout.
-    drop(child);
-    // Check and clear the owned process group before joining the pipe readers.
-    // A child can outlive the command while retaining an inherited pipe; joining
-    // first would then wait for EOF and could miss that child after it exits.
-    let (had_descendants, membership_diagnostic) = match owner.group.children_empty() {
-        Ok(empty) => (!empty, None),
-        Err(error) => (false, Some(cleanup_error_diagnostic(&error))),
     };
-    let cleanup = owner.release();
-    let group_empty = cleanup.is_ok();
-    let cleanup_diagnostic = cleanup.as_ref().err().map(cleanup_error_diagnostic);
-    let stdout_reader_ok = finish_probe_reader(stdout_reader, PROBE_CAPTURE_DRAIN_GRACE);
-    let stderr_reader_ok = finish_probe_reader(stderr_reader, PROBE_CAPTURE_DRAIN_GRACE);
-    let stdout_state = probe_capture_lock(&stdout_capture).clone();
-    let stderr_state = probe_capture_lock(&stderr_capture).clone();
-    let reader_errors = [stdout_state.error.as_deref(), stderr_state.error.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    let readers_ok = stdout_reader_ok && stderr_reader_ok && reader_errors.is_empty();
-    let stdout = stdout_state.bytes;
-    let stderr = stderr_state.bytes;
-    let exit_code = exit_status.as_ref().and_then(|status| status.code());
-    let child_succeeded = exit_status.as_ref().is_some_and(|status| status.success());
+    let stdout_receipt = stdout_capture.finish();
+    let stderr_receipt = stderr_capture.finish();
+    output_limited |= stdout_receipt.truncated || stderr_receipt.truncated;
+    let readers_ok = stdout_receipt.capture_complete
+        && stderr_receipt.capture_complete
+        && stdout_receipt.capture_error.is_none()
+        && stderr_receipt.capture_error.is_none();
+    let stdout = read_probe_capture(&stdout_path, request.stdout_limit).unwrap_or_default();
+    let stderr = read_probe_capture(&stderr_path, request.stderr_limit).unwrap_or_default();
+    let exit_code = exit_status.code();
+    let child_succeeded = exit_status.success();
     let membership_failed = membership_diagnostic.is_some();
     let success = group_empty
         && !timed_out
         && !output_limited
         && !had_descendants
         && !membership_failed
+        && !status_observation_failed
         && readers_ok
         && child_succeeded;
     ProbeResponse {
@@ -1290,34 +1637,53 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
         output_limited,
         exit_code,
         group_empty,
-        message: match (membership_diagnostic, cleanup_diagnostic, had_descendants) {
-            (Some(membership), Some(cleanup), _) => {
-                format!(
-                    "input probe process group membership check failed; {membership}; {cleanup}"
-                )
-            }
-            (Some(membership), None, _) => {
-                format!("input probe process group membership check failed; {membership}")
-            }
-            (None, Some(diagnostic), true) => {
-                format!("input probe left descendants after its command exited; {diagnostic}")
-            }
-            (None, Some(diagnostic), false) => {
-                format!("input probe process group could not be released; {diagnostic}")
-            }
-            (None, None, true) => "input probe left descendants after its command exited".into(),
-            (None, None, false) if !group_empty => {
-                "input probe process group could not be released".into()
-            }
-            (None, None, false) if !readers_ok => format!(
-                "input probe output reader did not finish cleanly within its bound: {}",
-                reader_errors.join(",")
-            ),
-            _ => String::new(),
+        message: if let Some(membership) = membership_diagnostic {
+            format!("input probe process group membership check failed; {membership}")
+        } else if had_descendants {
+            "input probe left descendants after its command exited".into()
+        } else if status_observation_failed {
+            "input probe direct exit observation recovered after a transient status error".into()
+        } else if !readers_ok {
+            "input probe output capture ended without natural EOF or complete bytes".into()
+        } else if !group_empty {
+            "input probe process group could not be released".into()
+        } else {
+            String::new()
         },
         stdout,
         stderr,
     }
+}
+
+fn stop_probe_command(child: &mut Child, owner: &ProbeOwner) -> ExitStatus {
+    let mut next_cancel = Instant::now();
+    loop {
+        if Instant::now() >= next_cancel {
+            let _ = owner.group.cancel_children();
+            next_cancel = Instant::now() + PROBE_CLEANUP_RETRY;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) | Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn release_probe_owner(owner: &mut ProbeOwner) -> bool {
+    loop {
+        if release_probe_owner_once(owner) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn release_probe_owner_once(owner: &mut ProbeOwner) -> bool {
+    owner.release().is_ok()
+}
+
+fn read_probe_capture(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    read_bounded(File::open(path)?, limit)
 }
 
 fn persist_probe_owner(path: &Path, process: &Value) -> Result<()> {
@@ -1333,11 +1699,11 @@ fn version_probe(
     prefix: &[String],
     env: &BTreeMap<String, String>,
     cwd: &Path,
-    probe: ProbeFn,
+    probe: &mut ProbeContext,
 ) -> Result<String> {
     let mut args = prefix.to_vec();
     args.push("--version".into());
-    let output = probe(program, &args, env, cwd)?;
+    let output = probe.run(program, &args, env, cwd)?;
     Ok(String::from_utf8(output)
         .map_err(|_| Error::new("CHECK_INPUT_RESOLUTION", "tool version output is not UTF-8"))?
         .trim()
@@ -1348,7 +1714,7 @@ fn rustc_identity(
     cargo_args: &[String],
     env: &BTreeMap<String, String>,
     cwd: &Path,
-    probe: ProbeFn,
+    probe: &mut ProbeContext,
 ) -> Result<Value> {
     let explicit_cargo_toolchain = prefix_args(cargo_args);
     if let Some(rustc_value) = env
@@ -1358,7 +1724,7 @@ fn rustc_identity(
     {
         let rustc = PathBuf::from(rustc_value);
         let rustc = executable(&rustc, env)?;
-        let version = probe(&rustc, &["--version".into(), "--verbose".into()], env, cwd)?;
+        let version = probe.run(&rustc, &["--version".into(), "--verbose".into()], env, cwd)?;
         return rustc_result(rustc, version);
     }
     if !explicit_cargo_toolchain.is_empty() {
@@ -1373,14 +1739,14 @@ fn rustc_identity(
             "--version".into(),
             "--verbose".into(),
         ];
-        let selected = probe(&rustup, &args, env, cwd)?;
+        let selected = probe.run(&rustup, &args, env, cwd)?;
         let args = vec![
             "which".into(),
             "--toolchain".into(),
             toolchain.into(),
             "rustc".into(),
         ];
-        let path = probe(&rustup, &args, env, cwd)?;
+        let path = probe.run(&rustup, &args, env, cwd)?;
         let path = String::from_utf8(path)
             .map_err(|_| Error::new("CHECK_INPUT_RESOLUTION", "rustup path output is not UTF-8"))?
             .trim()
@@ -1393,7 +1759,7 @@ fn rustc_identity(
         }));
     }
     let rustc = executable(Path::new("rustc"), env)?;
-    let version = probe(&rustc, &["--version".into(), "--verbose".into()], env, cwd)?;
+    let version = probe.run(&rustc, &["--version".into(), "--verbose".into()], env, cwd)?;
     rustc_result(rustc, version)
 }
 
@@ -1419,7 +1785,7 @@ fn cargo_metadata(
     profile: &CheckProfile,
     env: &BTreeMap<String, String>,
     source: &VerifiedSource,
-    probe: ProbeFn,
+    probe: &mut ProbeContext,
 ) -> Result<CargoGraph> {
     let prefix = prefix_args(&profile.args);
     let mut args = prefix;
@@ -1437,7 +1803,7 @@ fn cargo_metadata(
             .to_string_lossy()
             .to_string(),
     ]);
-    let bytes = probe(executable, &args, env, &source.directory)?;
+    let bytes = probe.run(executable, &args, env, &source.directory)?;
     let metadata: Value = serde_json::from_slice(&bytes)
         .map_err(|_| Error::new("CHECK_METADATA", "Cargo metadata was not valid JSON"))?;
     CargoGraph::parse(&metadata, &source.directory)
@@ -1568,19 +1934,41 @@ fn fingerprint(resolved_inputs: &Value, scope_plan: &ScopePlan) -> Result<String
 /// Resolve source, Cargo reverse scope, actual argv, toolchain and environment
 /// before Store admission. Artifact/Task/Attempt/Operation IDs never enter the
 /// returned reusable identity.
-pub fn resolve(
+pub(crate) fn resolve_with_cleanup(
     profile: &CheckProfile,
     candidate: &VerifiedSource,
     baseline: Option<&VerifiedSource>,
-) -> Result<ResolvedCheckPlan> {
-    resolve_with_probe(profile, candidate, baseline, command_output)
+) -> (Result<ResolvedCheckPlan>, Option<ProbeCleanupOwner>) {
+    let mut probe = ProbeContext::production();
+    let result = resolve_with_context(profile, candidate, baseline, &mut probe);
+    let owner = probe.cleanup_owner;
+    let result = if owner.as_ref().is_some_and(ProbeCleanupOwner::is_pending) {
+        Err(Error::new(
+            "CHECK_PROBE_CLEANUP_PENDING",
+            "input probe helper custody remains pending in Store",
+        ))
+    } else {
+        result
+    };
+    (result, owner)
 }
 
+#[cfg(test)]
 fn resolve_with_probe(
     profile: &CheckProfile,
     candidate: &VerifiedSource,
     baseline: Option<&VerifiedSource>,
-    probe: ProbeFn,
+    probe: TestProbeFn,
+) -> Result<ResolvedCheckPlan> {
+    let mut probe = ProbeContext::test(probe);
+    resolve_with_context(profile, candidate, baseline, &mut probe)
+}
+
+fn resolve_with_context(
+    profile: &CheckProfile,
+    candidate: &VerifiedSource,
+    baseline: Option<&VerifiedSource>,
+    probe: &mut ProbeContext,
 ) -> Result<ResolvedCheckPlan> {
     let env = effective_environment(profile);
     let configured_executable = executable(&profile.executable, &env)?;

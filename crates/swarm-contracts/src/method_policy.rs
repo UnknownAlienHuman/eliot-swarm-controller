@@ -1021,6 +1021,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "hook.local.operation",
+        class: MethodClass::Internal,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "hook.source.setup",
         class: MethodClass::Internal,
         mcp: false,

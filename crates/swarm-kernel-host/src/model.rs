@@ -602,6 +602,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             crate::scripts::protocol::RunRequest::parse(params)?;
             return Ok(());
         }
+        "hook.local.operation" => {
+            crate::hooks::git::HookLocalRequest::parse(params)?;
+            return Ok(());
+        }
         "hook.source.setup" => {
             crate::hooks::contract::HookSetupRequest::parse(params)?;
             return Ok(());

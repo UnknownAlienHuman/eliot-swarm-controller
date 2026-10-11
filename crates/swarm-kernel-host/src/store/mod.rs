@@ -1853,7 +1853,7 @@ impl Store {
         }
         if matches!(
             method.as_str(),
-            "hook.source.setup" | "hook.emit" | "hook.source.get"
+            "hook.source.setup" | "hook.emit" | "hook.source.get" | "hook.local.operation"
         ) {
             return self.hook_call(principal, method, params).await;
         }
@@ -2396,6 +2396,10 @@ impl Store {
     ) -> Result<Value> {
         let config = self.config.clone();
         match method.as_str() {
+            "hook.local.operation" => {
+                let request = crate::hooks::git::HookLocalRequest::parse(&params)?;
+                self.execute_hook_local_operation(principal, request).await
+            }
             "hook.source.setup" => {
                 let request = crate::hooks::contract::HookSetupRequest::parse(&params)?;
                 self.run(move |db| {
@@ -2421,13 +2425,15 @@ impl Store {
                     })
                     .await?;
                 let verify_scope = scope.clone();
-                let snapshot = tokio::task::spawn_blocking(move || {
-                    crate::hooks::git::resolve_commit(&verify_scope, &commit_oid)
+                let (snapshot_result, cleanup_owner) = tokio::task::spawn_blocking(move || {
+                    crate::hooks::git::resolve_commit_with_cleanup(&verify_scope, &commit_oid)
                 })
                 .await
-                .map_err(|_| {
-                    Error::new("HOOK_GIT_FAILED", "hook Git verification worker ended")
-                })??;
+                .map_err(|_| Error::new("HOOK_GIT_FAILED", "hook Git verification worker ended"))?;
+                if let Some(owner) = cleanup_owner {
+                    self.check_child_custody.retain_git_cleanup(owner).await;
+                }
+                let snapshot = snapshot_result?;
                 let result = self
                     .run(move |db| {
                         let p = current_principal(db, principal)?;

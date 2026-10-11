@@ -1635,6 +1635,13 @@ async fn hook_emit_with_retry(
                     "hook acknowledgment did not identify the requested source and commit",
                 ));
             }
+            Err(error) if error.code == "HOOK_GIT_CLEANUP_PENDING" => {
+                return Err(Error::new(
+                    "HOOK_GIT_CLEANUP_PENDING",
+                    "hook emit remains incomplete; Store retained the exact Git helper for cleanup and did not record this callback",
+                )
+                .with_secondary_error(error));
+            }
             Err(error) if matches!(error.code.as_str(), "HOST_UNAVAILABLE" | "OUTCOME_UNKNOWN") => {
                 let Some(delay_ms) = retry_delay_ms else {
                     return Err(Error::new(
@@ -1670,28 +1677,58 @@ fn hook_emit_ack_matches(reply: &Value, source_id: &str, commit_oid: &str) -> bo
         && reply["observation_id"].as_i64().is_some_and(|id| id > 0)
         && recorded != duplicate
 }
-fn hook_install_context<'a>(config: &'a Config, project_id: &str) -> Result<(&'a Path, &'a Path)> {
-    let project = config.forge.projects.get(project_id).ok_or_else(|| {
+async fn hook_local_operation(
+    config: &Config,
+    operator: &Credential,
+    project_id: &str,
+    operation: swarm_kernel_host::hooks::git::HookLocalOperation,
+) -> Result<swarm_kernel_host::hooks::git::HookLocalResult> {
+    use swarm_kernel_host::hooks::git::{HookLocalRequest, HookLocalResult};
+
+    let value = ipc::call(
+        &config.storage.data_dir,
+        operator,
+        "hook.local.operation",
+        serde_json::to_value(HookLocalRequest {
+            project_id: project_id.to_owned(),
+            operation,
+        })?,
+        &config.ipc,
+    )
+    .await?;
+    let result: HookLocalResult = serde_json::from_value(value).map_err(|_| {
         Error::new(
-            "HOOK_PROJECT_UNAVAILABLE",
-            "project has no configured trusted repository",
+            "HOOK_LOCAL_RESPONSE_INVALID",
+            "Store returned an invalid local hook operation result",
         )
     })?;
-    let repository = project.repository_path.as_path();
-    let git = config.forge.git_executable.as_path();
-    if !repository.is_absolute() || !repository.is_dir() {
-        return Err(Error::new(
-            "HOOK_REPOSITORY_UNAVAILABLE",
-            "configured repository path must be an absolute existing directory",
-        ));
+    hook_local_response(result)
+}
+
+fn hook_local_response(
+    result: swarm_kernel_host::hooks::git::HookLocalResult,
+) -> Result<swarm_kernel_host::hooks::git::HookLocalResult> {
+    use swarm_kernel_host::hooks::git::HookLocalResult;
+
+    match result {
+        HookLocalResult::CleanupPending {
+            operation,
+            cause_code,
+        } => Err(Error::new(
+            "HOOK_GIT_CLEANUP_PENDING",
+            format!(
+                "hook {operation} is incomplete; exact Git helper custody remains in Store until process-family departure{}",
+                cause_code
+                    .map(|code| format!(" ({code})"))
+                    .unwrap_or_default()
+            ),
+        )),
+        other => Ok(other),
     }
-    if !git.is_absolute() || !git.is_file() {
-        return Err(Error::new(
-            "HOOK_GIT_UNAVAILABLE",
-            "configured Git executable must be an absolute existing file",
-        ));
-    }
-    Ok((repository, git))
+}
+
+fn setup_apply_cleanup_is_pending(error: &Error) -> bool {
+    error.code == "HOOK_GIT_CLEANUP_PENDING"
 }
 
 fn hook_source_public_projection(source: &Value) -> Result<Value> {
@@ -1776,28 +1813,39 @@ fn sanitized_hook_install_error(code: &str) -> Error {
 async fn rollback_hook_setup(
     config: &Config,
     operator: &Credential,
-    plan: &swarm_kernel_host::hooks::git::HookInstallPlan,
-    prepared: &swarm_kernel_host::hooks::git::PreparedHookSource,
+    project_id: &str,
+    source_id: &str,
+    client_request_id: &str,
     revision: i64,
-) -> (bool, bool) {
-    let source_revoked = revoke_hook_source(config, operator, &prepared.source_id, revision, None)
-        .await
-        .is_ok();
+) -> Result<(bool, bool)> {
+    let source_revoked = match revoke_hook_source(config, operator, source_id, revision, None).await
+    {
+        Ok(_) => true,
+        Err(error) if error.code == "HOOK_GIT_CLEANUP_PENDING" => return Err(error),
+        Err(_) => false,
+    };
     if !source_revoked {
-        return (false, false);
+        return Ok((false, false));
     }
-    let local_restored = swarm_kernel_host::hooks::git::revoke_post_commit(
-        plan.repository_path(),
-        plan.git_executable(),
-        &prepared.source_id,
+    use swarm_kernel_host::hooks::git::{HookLocalOperation, HookLocalResult};
+    let local = hook_local_operation(
+        config,
+        operator,
+        project_id,
+        HookLocalOperation::RollbackSetup {
+            source_id: source_id.to_owned(),
+            client_request_id: client_request_id.to_owned(),
+        },
     )
-    .is_ok_and(|readback| {
-        matches!(readback.state.as_str(), "restored" | "absent")
-            && !readback.credential_file_present
-    });
-    let pending_removed =
-        swarm_kernel_host::hooks::git::discard_source_setup(plan, prepared).is_ok();
-    (source_revoked, local_restored && pending_removed)
+    .await;
+    match local {
+        Ok(HookLocalResult::RolledBack {
+            restored,
+            pending_removed,
+        }) => Ok((source_revoked, restored && pending_removed)),
+        Err(error) if error.code == "HOOK_GIT_CLEANUP_PENDING" => Err(error),
+        _ => Ok((source_revoked, false)),
+    }
 }
 
 async fn hook_setup(
@@ -1806,17 +1854,30 @@ async fn hook_setup(
     request_id: &Option<String>,
     project_id: &str,
 ) -> Result<()> {
-    use swarm_kernel_host::hooks::git;
+    use swarm_kernel_host::hooks::git::{
+        HookLocalOperation, HookLocalResult, prepare_source_credential,
+    };
 
-    let (repository, git_executable) = hook_install_context(config, project_id)?;
-    let plan = git::preview_post_commit(repository, git_executable)?;
-    let executable = std::env::current_exe().map_err(|_| {
+    let preview =
+        match hook_local_operation(config, operator, project_id, HookLocalOperation::Preview)
+            .await?
+        {
+            HookLocalResult::Preview { preview } => preview,
+            _ => {
+                return Err(Error::new(
+                    "HOOK_LOCAL_RESPONSE_INVALID",
+                    "Store did not return a hook preview",
+                ));
+            }
+        };
+    let git_dir = preview["git_directory"].as_str().ok_or_else(|| {
         Error::new(
-            "HOOK_EXECUTABLE_UNAVAILABLE",
-            "current Swarm executable path is unavailable",
+            "HOOK_LOCAL_RESPONSE_INVALID",
+            "Store hook preview omitted the configured Git directory",
         )
     })?;
-    let prepared = git::prepare_source_credential(&plan, project_id, request_id.as_deref())?;
+    let prepared =
+        prepare_source_credential(Path::new(git_dir), project_id, request_id.as_deref())?;
     eprintln!(
         "hook_setup_request_id={} source_id={}",
         serde_json::to_string(&prepared.client_request_id)?,
@@ -1868,8 +1929,15 @@ async fn hook_setup(
         Ok(source) => source,
         Err(error) => {
             let revision = if raw_revision > 0 { raw_revision } else { 1 };
-            let (source_revoked, local_restored) =
-                rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+            let (source_revoked, local_restored) = rollback_hook_setup(
+                config,
+                operator,
+                project_id,
+                &prepared.source_id,
+                &prepared.client_request_id,
+                revision,
+            )
+            .await?;
             if !source_revoked || !local_restored {
                 return Err(Error::new(
                     "HOOK_SETUP_ROLLBACK_INCOMPLETE",
@@ -1900,8 +1968,15 @@ async fn hook_setup(
             .is_some_and(|repository| public_source["canonical_repository"] == repository);
     if !source_matches {
         let rollback_revision = if revision > 0 { revision } else { 1 };
-        let (source_revoked, local_restored) =
-            rollback_hook_setup(config, operator, &plan, &prepared, rollback_revision).await;
+        let (source_revoked, local_restored) = rollback_hook_setup(
+            config,
+            operator,
+            project_id,
+            &prepared.source_id,
+            &prepared.client_request_id,
+            rollback_revision,
+        )
+        .await?;
         if !source_revoked || !local_restored {
             return Err(Error::new(
                 "HOOK_SETUP_ROLLBACK_INCOMPLETE",
@@ -1917,37 +1992,89 @@ async fn hook_setup(
         ));
     }
 
-    let installation =
-        match git::apply_post_commit(&plan, source_id, &prepared.credential, &executable) {
-            Ok(readback) => readback,
-            Err(error) => {
-                let (source_revoked, local_restored) =
-                    rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
-                if !source_revoked || !local_restored {
-                    return Err(Error::new(
-                        "HOOK_SETUP_ROLLBACK_INCOMPLETE",
-                        format!(
-                            "setup failed with {}; inspect source/request {}/{}",
-                            error.code, prepared.source_id, prepared.client_request_id
-                        ),
-                    ));
-                }
+    let installation = match hook_local_operation(
+        config,
+        operator,
+        project_id,
+        HookLocalOperation::Apply {
+            source_id: source_id.to_owned(),
+            credential: prepared.credential.clone(),
+        },
+    )
+    .await
+    {
+        Ok(HookLocalResult::Installed { installation }) => installation,
+        Ok(_) => {
+            return Err(Error::new(
+                "HOOK_LOCAL_RESPONSE_INVALID",
+                "Store did not return hook installation readback",
+            ));
+        }
+        Err(error) if setup_apply_cleanup_is_pending(&error) => {
+            return Err(Error::new(
+                "HOOK_GIT_CLEANUP_PENDING",
+                format!(
+                    "hook install remains incomplete in Store custody; retry source/request {}/{} after exact Git-family departure",
+                    prepared.source_id, prepared.client_request_id
+                ),
+            ));
+        }
+        Err(error) => {
+            let (source_revoked, local_restored) = rollback_hook_setup(
+                config,
+                operator,
+                project_id,
+                &prepared.source_id,
+                &prepared.client_request_id,
+                revision,
+            )
+            .await?;
+            if !source_revoked || !local_restored {
                 return Err(Error::new(
-                    error.code,
-                    "hook setup failed; its issued source and local installation were rolled back",
+                    "HOOK_SETUP_ROLLBACK_INCOMPLETE",
+                    format!(
+                        "setup failed with {}; inspect source/request {}/{}",
+                        error.code, prepared.source_id, prepared.client_request_id
+                    ),
                 ));
             }
-        };
+            return Err(Error::new(
+                error.code,
+                "hook setup failed; its issued source and local installation were rolled back",
+            ));
+        }
+    };
 
-    let readback = match git::readback_post_commit(repository, git_executable, source_id) {
-        Ok(readback) if readback.state == "installed" && readback.wrapper_matches => readback,
+    let readback = match hook_local_operation(
+        config,
+        operator,
+        project_id,
+        HookLocalOperation::Readback {
+            source_id: source_id.to_owned(),
+        },
+    )
+    .await
+    {
+        Ok(HookLocalResult::Readback { readback })
+            if readback.state == "installed" && readback.wrapper_matches =>
+        {
+            readback
+        }
         result => {
-            let failure_code = result
-                .err()
-                .map(|error| error.code)
-                .unwrap_or_else(|| "HOOK_INSTALL_READBACK_FAILED".to_owned());
-            let (source_revoked, local_restored) =
-                rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+            let failure_code = match result {
+                Err(error) if error.code == "HOOK_GIT_CLEANUP_PENDING" => return Err(error),
+                Err(error) => error.code,
+                Ok(_) => "HOOK_INSTALL_READBACK_FAILED".to_owned(),
+            };
+            let (source_revoked, local_restored) = rollback_hook_setup(
+                config,
+                operator,
+                project_id,
+                &prepared.source_id,
+                &prepared.client_request_id,
+                revision,
+            )
+            .await?;
             if !source_revoked || !local_restored {
                 return Err(Error::new(
                     "HOOK_SETUP_ROLLBACK_INCOMPLETE",
@@ -1961,8 +2088,15 @@ async fn hook_setup(
         }
     };
     if installation.state != "installed" || !installation.wrapper_matches {
-        let (source_revoked, local_restored) =
-            rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+        let (source_revoked, local_restored) = rollback_hook_setup(
+            config,
+            operator,
+            project_id,
+            &prepared.source_id,
+            &prepared.client_request_id,
+            revision,
+        )
+        .await?;
         if !source_revoked || !local_restored {
             return Err(Error::new(
                 "HOOK_SETUP_ROLLBACK_INCOMPLETE",
@@ -1974,14 +2108,28 @@ async fn hook_setup(
         }
         return Err(sanitized_hook_install_error("HOOK_INSTALL_READBACK_FAILED"));
     }
-    if git::complete_source_setup(&plan, &prepared).is_err() {
-        return Err(Error::new(
-            "HOOK_SETUP_FINALIZATION_PENDING",
-            format!(
-                "installation is active; retry source/request {}/{} to complete readback",
-                prepared.source_id, prepared.client_request_id
-            ),
-        ));
+    match hook_local_operation(
+        config,
+        operator,
+        project_id,
+        HookLocalOperation::CompleteSetup {
+            source_id: prepared.source_id.clone(),
+            client_request_id: prepared.client_request_id.clone(),
+        },
+    )
+    .await
+    {
+        Ok(HookLocalResult::Completed { .. }) => {}
+        Err(error) if error.code == "HOOK_GIT_CLEANUP_PENDING" => return Err(error),
+        _ => {
+            return Err(Error::new(
+                "HOOK_SETUP_FINALIZATION_PENDING",
+                format!(
+                    "installation is active; retry source/request {}/{} to complete readback",
+                    prepared.source_id, prepared.client_request_id
+                ),
+            ));
+        }
     }
     println!(
         "{}",
@@ -2000,7 +2148,7 @@ async fn hook_install(
     request_id: &Option<String>,
     command: &HookInstallCommand,
 ) -> Result<()> {
-    use swarm_kernel_host::hooks::git;
+    use swarm_kernel_host::hooks::git::{HookLocalOperation, HookLocalResult};
 
     match command {
         HookInstallCommand::Preview { project_id } => {
@@ -2009,9 +2157,23 @@ async fn hook_install(
                     "--request-id is not used for local hook preview",
                 ));
             }
-            let (repository, git_executable) = hook_install_context(config, project_id)?;
-            let plan = git::preview_post_commit(repository, git_executable)?;
-            println!("{}", serde_json::to_string_pretty(&plan.public_value())?);
+            let preview = match hook_local_operation(
+                config,
+                operator,
+                project_id,
+                HookLocalOperation::Preview,
+            )
+            .await?
+            {
+                HookLocalResult::Preview { preview } => preview,
+                _ => {
+                    return Err(Error::new(
+                        "HOOK_LOCAL_RESPONSE_INVALID",
+                        "Store did not return a hook preview",
+                    ));
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&preview)?);
         }
         HookInstallCommand::Readback {
             project_id,
@@ -2022,8 +2184,24 @@ async fn hook_install(
                     "--request-id is not used for local hook readback",
                 ));
             }
-            let (repository, git_executable) = hook_install_context(config, project_id)?;
-            let readback = git::readback_post_commit(repository, git_executable, source_id)?;
+            let readback = match hook_local_operation(
+                config,
+                operator,
+                project_id,
+                HookLocalOperation::Readback {
+                    source_id: source_id.clone(),
+                },
+            )
+            .await?
+            {
+                HookLocalResult::Readback { readback } => readback,
+                _ => {
+                    return Err(Error::new(
+                        "HOOK_LOCAL_RESPONSE_INVALID",
+                        "Store did not return hook readback",
+                    ));
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&readback)?);
         }
         HookInstallCommand::Revoke {
@@ -2031,7 +2209,6 @@ async fn hook_install(
             source_id,
             revision,
         } => {
-            let (repository, git_executable) = hook_install_context(config, project_id)?;
             let source = revoke_hook_source(
                 config,
                 operator,
@@ -2040,16 +2217,41 @@ async fn hook_install(
                 request_id.as_deref(),
             )
             .await?;
-            let installation = git::revoke_post_commit(repository, git_executable, source_id)
-                .map_err(|error| {
-                    Error::new(
+            let installation = match hook_local_operation(
+                config,
+                operator,
+                project_id,
+                HookLocalOperation::Revoke {
+                    source_id: source_id.clone(),
+                },
+            )
+            .await
+            {
+                Ok(HookLocalResult::Revoked { installation }) => installation,
+                Ok(_) => {
+                    return Err(Error::new(
+                        "HOOK_LOCAL_RESPONSE_INVALID",
+                        "Store did not return local hook restoration readback",
+                    ));
+                }
+                Err(error) if error.code == "HOOK_GIT_CLEANUP_PENDING" => {
+                    return Err(Error::new(
+                        "HOOK_GIT_CLEANUP_PENDING",
+                        format!(
+                            "source {source_id} is revoked; exact Git cleanup remains in Store custody and local restoration is incomplete"
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Err(Error::new(
                         "HOOK_SOURCE_REVOKED_INSTALL_RESTORE_FAILED",
                         format!(
                             "source {source_id} is revoked; local hook restoration failed with {}",
                             error.code
                         ),
-                    )
-                })?;
+                    ));
+                }
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(
@@ -2116,7 +2318,7 @@ async fn run_gateway_binary(config_path: Option<&Path>, data_dir: Option<&Path>)
 
 #[cfg(test)]
 mod cli_parse_tests {
-    use super::Cli;
+    use super::{Cli, Error, hook_local_response, setup_apply_cleanup_is_pending};
     use clap::Parser;
 
     /// The stock host invocation must keep parsing.
@@ -2137,6 +2339,36 @@ mod cli_parse_tests {
                 }
             ),
             "the parsed host command carries the stop-on-stdin-eof request"
+        );
+    }
+
+    #[test]
+    fn hook_setup_cleanup_pending_result_bypasses_automatic_rollback() {
+        let wire_result: swarm_kernel_host::hooks::git::HookLocalResult =
+            serde_json::from_value(serde_json::json!({
+                "status":"cleanup_pending",
+                "operation":"apply",
+                "cause_code":"HOOK_GIT_CLEANUP_PENDING"
+            }))
+            .expect("parse the Store's CleanupPending wire result");
+        let pending = match hook_local_response(wire_result) {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("a pending Store cleanup must not look like a completed local operation")
+            }
+        };
+
+        assert_eq!(pending.code, "HOOK_GIT_CLEANUP_PENDING");
+        assert!(
+            setup_apply_cleanup_is_pending(&pending),
+            "hook_setup must return before its automatic source rollback branch"
+        );
+        assert!(
+            !setup_apply_cleanup_is_pending(&Error::new(
+                "HOOK_GIT_FAILED",
+                "ordinary apply failure",
+            )),
+            "ordinary apply failures continue to use the existing rollback path"
         );
     }
 

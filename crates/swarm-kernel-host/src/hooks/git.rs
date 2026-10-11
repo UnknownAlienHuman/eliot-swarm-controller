@@ -5,24 +5,47 @@
 //! is observational and cannot veto the commit that already happened.
 
 use crate::{
+    checks::inputs::{PROBE_STDERR_CAPTURE_FILE, PROBE_STDOUT_CAPTURE_FILE},
     error::{Error, Result},
     hooks::contract::{EVENT_NAME, GitCommitSnapshot, validate_hook_credential},
     model::{self, Credential},
     platform,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+use swarm_process::capture::CaptureStream;
+use swarm_process::capture::{PipeRead, PollableRead};
 
 const MAX_HOOK_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES: usize = 4096;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+// The existing check-worker probe owns the actual Git process family and its
+// two bounded output streams. This is a separate, finite bound for its framed
+// reply and exact family-departure readback.
+const GIT_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+#[cfg(test)]
+const GIT_TEST_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+const CHECK_PROBE_HEADER_BYTES: usize = 23;
+const CHECK_PROBE_MESSAGE_BYTES: usize = 1024;
+const CHECK_PROBE_FRAME_BYTES: usize =
+    CHECK_PROBE_HEADER_BYTES + (MAX_GIT_OUTPUT_BYTES * 2) + CHECK_PROBE_MESSAGE_BYTES;
+const CHECK_PROBE_RESPONSE_BYTES: usize = CHECK_PROBE_FRAME_BYTES + 1024;
+const CHECK_PROBE_RESPONSE_MAGIC: &[u8; 8] = b"SWPRB01\0";
+const CHECK_PROBE_VERSION: u32 = 1;
+const CHECK_PROBE_REQUEST_FILE: &str = "request.json";
+const CHECK_PROBE_OWNER_FILE: &str = "probe-owner.json";
+const CHECK_PROBE_RESPONSE_FILE: &str = "probe-response.capture";
+#[cfg(test)]
+const CHECK_PROBE_REQUEST_TEST_ENV: &str = "HOOK_GIT_PROBE_REQUEST";
 const SOURCE_DIRECTORY: &str = "eliot-hook-sources";
 const INSTALL_SCHEMA_VERSION: u32 = 1;
 const HOOK_NAME: &str = "post-commit";
@@ -129,6 +152,225 @@ pub struct HookInstallReadback {
     pub message: String,
 }
 
+/// Closed host-side requests for the repository-local hook lifecycle. The
+/// project ID is resolved against trusted configuration by Store; callers can
+/// never select a Git executable, repository path, or argument vector.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLocalRequest {
+    pub project_id: String,
+    pub operation: HookLocalOperation,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HookLocalOperation {
+    Preview,
+    Apply {
+        source_id: String,
+        credential: Credential,
+    },
+    Readback {
+        source_id: String,
+    },
+    Revoke {
+        source_id: String,
+    },
+    CompleteSetup {
+        source_id: String,
+        client_request_id: String,
+    },
+    RollbackSetup {
+        source_id: String,
+        client_request_id: String,
+    },
+}
+
+impl HookLocalRequest {
+    pub fn parse(value: &serde_json::Value) -> Result<Self> {
+        model::fields(value, &["project_id", "operation"])?;
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| Error::invalid("hook local operation request is invalid"))?;
+        validate_setup_identity(&request.project_id, "project ID")?;
+        match &request.operation {
+            HookLocalOperation::Preview => {}
+            HookLocalOperation::Apply {
+                source_id,
+                credential,
+            } => {
+                validate_source_id(source_id)?;
+                validate_hook_credential(source_id, credential)?;
+            }
+            HookLocalOperation::Readback { source_id }
+            | HookLocalOperation::Revoke { source_id } => validate_source_id(source_id)?,
+            HookLocalOperation::CompleteSetup {
+                source_id,
+                client_request_id,
+            }
+            | HookLocalOperation::RollbackSetup {
+                source_id,
+                client_request_id,
+            } => {
+                validate_source_id(source_id)?;
+                validate_setup_identity(client_request_id, "client request ID")?;
+            }
+        }
+        Ok(request)
+    }
+}
+
+impl HookLocalOperation {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Apply { .. } => "apply",
+            Self::Readback { .. } => "readback",
+            Self::Revoke { .. } => "revoke",
+            Self::CompleteSetup { .. } => "complete_setup",
+            Self::RollbackSetup { .. } => "rollback_setup",
+        }
+    }
+}
+
+/// Execute one closed local hook operation with bounded Git-helper custody.
+/// Any still-live owner is returned alongside the operation result, including
+/// when a later validation/readback step failed.
+pub fn run_local_operation_with_cleanup(
+    request: HookLocalRequest,
+    repository_path: &Path,
+    git_executable: &Path,
+    swarm_executable: &Path,
+) -> (Result<HookLocalResult>, Option<GitCleanupOwner>) {
+    let mut probes = GitProbeContext::default();
+    let result = (|| -> Result<HookLocalResult> {
+        match request.operation {
+            HookLocalOperation::Preview => {
+                let plan = preview_post_commit_inner(&mut probes, repository_path, git_executable)?;
+                Ok(HookLocalResult::Preview {
+                    preview: plan.public_value(),
+                })
+            }
+            HookLocalOperation::Apply {
+                source_id,
+                credential,
+            } => {
+                let plan = preview_post_commit_inner(&mut probes, repository_path, git_executable)?;
+                let installation = apply_post_commit_inner(
+                    &mut probes,
+                    &plan,
+                    &source_id,
+                    &credential,
+                    swarm_executable,
+                )?;
+                Ok(HookLocalResult::Installed { installation })
+            }
+            HookLocalOperation::Readback { source_id } => {
+                let readback = readback_post_commit_inner(
+                    &mut probes,
+                    repository_path,
+                    git_executable,
+                    &source_id,
+                )?;
+                Ok(HookLocalResult::Readback { readback })
+            }
+            HookLocalOperation::Revoke { source_id } => {
+                let installation = revoke_post_commit_inner(
+                    &mut probes,
+                    repository_path,
+                    git_executable,
+                    &source_id,
+                )?;
+                Ok(HookLocalResult::Revoked { installation })
+            }
+            HookLocalOperation::CompleteSetup {
+                source_id,
+                client_request_id,
+            } => {
+                let plan = preview_post_commit_inner(&mut probes, repository_path, git_executable)?;
+                let prepared = prepare_source_credential(
+                    &plan.git_dir,
+                    &request.project_id,
+                    Some(&client_request_id),
+                )?;
+                if prepared.source_id != source_id
+                    || prepared.client_request_id != client_request_id
+                {
+                    return Err(Error::new(
+                        "HOOK_SETUP_PENDING_CONFLICT",
+                        "retained setup identity no longer matches this source",
+                    ));
+                }
+                complete_source_setup(&plan.git_dir, &prepared)?;
+                Ok(HookLocalResult::Completed { source_id })
+            }
+            HookLocalOperation::RollbackSetup {
+                source_id,
+                client_request_id,
+            } => {
+                let plan = preview_post_commit_inner(&mut probes, repository_path, git_executable)?;
+                let prepared = prepare_source_credential(
+                    &plan.git_dir,
+                    &request.project_id,
+                    Some(&client_request_id),
+                )?;
+                if prepared.source_id != source_id
+                    || prepared.client_request_id != client_request_id
+                {
+                    return Err(Error::new(
+                        "HOOK_SETUP_PENDING_CONFLICT",
+                        "retained setup identity no longer matches this source",
+                    ));
+                }
+                let restored = revoke_post_commit_inner(
+                    &mut probes,
+                    repository_path,
+                    git_executable,
+                    &source_id,
+                )
+                .is_ok_and(|readback| {
+                    matches!(readback.state.as_str(), "restored" | "absent")
+                        && !readback.credential_file_present
+                });
+                let pending_removed =
+                    restored && discard_source_setup(&plan.git_dir, &prepared).is_ok();
+                Ok(HookLocalResult::RolledBack {
+                    restored,
+                    pending_removed,
+                })
+            }
+        }
+    })();
+    (result, probes.cleanup_owner)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HookLocalResult {
+    Preview {
+        preview: serde_json::Value,
+    },
+    Installed {
+        installation: HookInstallReadback,
+    },
+    Readback {
+        readback: HookInstallReadback,
+    },
+    Revoked {
+        installation: HookInstallReadback,
+    },
+    Completed {
+        source_id: String,
+    },
+    RolledBack {
+        restored: bool,
+        pending_removed: bool,
+    },
+    CleanupPending {
+        operation: String,
+        cause_code: Option<String>,
+    },
+}
+
 /// Local setup state prepared before sending the closed Store request. This
 /// type intentionally has no Debug implementation because it contains the
 /// HookSource token.
@@ -154,7 +396,8 @@ struct PendingSetupDescriptor {
 /// Read the configured repository's native hook state without changing it.
 /// Any explicit effective `core.hooksPath` is left untouched and unsupported;
 /// no global setting or user hook directory is rewritten.
-pub fn preview_post_commit(
+fn preview_post_commit_inner(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
 ) -> Result<HookInstallPlan> {
@@ -166,6 +409,7 @@ pub fn preview_post_commit(
         )
     })?;
     let top = git_stdout(
+        probes,
         git_executable,
         &repository_path,
         &["rev-parse", "--show-toplevel"],
@@ -178,12 +422,14 @@ pub fn preview_post_commit(
         ));
     }
     let git_dir = canonical_output_path(&git_stdout(
+        probes,
         git_executable,
         &repository_path,
         &["rev-parse", "--absolute-git-dir"],
     )?)?;
 
     match run_git(
+        probes,
         git_executable,
         &repository_path,
         &["config", "--get", "core.hooksPath"],
@@ -207,6 +453,7 @@ pub fn preview_post_commit(
     // repository or a nonrepository directory from receiving a callback that
     // cannot ever produce a commit fact.
     let head = git_stdout(
+        probes,
         git_executable,
         &repository_path,
         &["rev-parse", "--verify", "HEAD^{commit}"],
@@ -219,6 +466,7 @@ pub fn preview_post_commit(
     }
 
     let hooks_value = git_stdout(
+        probes,
         git_executable,
         &repository_path,
         &["rev-parse", "--git-path", "hooks"],
@@ -283,7 +531,7 @@ pub fn preview_post_commit(
 /// request is sent. An unfinished request is resumed with its original source
 /// identity and token; callers must never replace a ready pending credential.
 pub fn prepare_source_credential(
-    plan: &HookInstallPlan,
+    git_dir: &Path,
     project_id: &str,
     request_id: Option<&str>,
 ) -> Result<PreparedHookSource> {
@@ -292,7 +540,7 @@ pub fn prepare_source_credential(
         validate_setup_identity(request_id, "client request ID")?;
     }
 
-    let sources_dir = plan.git_dir.join(SOURCE_DIRECTORY);
+    let sources_dir = git_dir.join(SOURCE_DIRECTORY);
     ensure_private_directory(&sources_dir)?;
     let descriptor_path = pending_descriptor_path(&sources_dir, project_id);
     let mut descriptor = match read_pending_descriptor(&descriptor_path)? {
@@ -325,7 +573,7 @@ pub fn prepare_source_credential(
         ));
     }
 
-    let source_dir = source_dir(&plan.git_dir, &descriptor.source_id);
+    let source_dir = source_dir(git_dir, &descriptor.source_id);
     ensure_private_directory(&source_dir)?;
     let source_descriptor_path = source_dir.join(SETUP_REQUEST_FILE);
     let source_descriptor = PendingSetupDescriptor {
@@ -390,8 +638,8 @@ pub fn prepare_source_credential(
 /// Finish local setup after Store registration and exact Git readback succeed.
 /// The installed credential remains at the wrapper path; only retry metadata
 /// is removed.
-pub fn complete_source_setup(plan: &HookInstallPlan, prepared: &PreparedHookSource) -> Result<()> {
-    validate_prepared_source(plan, prepared)?;
+pub fn complete_source_setup(git_dir: &Path, prepared: &PreparedHookSource) -> Result<()> {
+    validate_prepared_source(git_dir, prepared)?;
     let descriptor =
         read_pending_descriptor(&prepared.pending_descriptor_path)?.ok_or_else(|| {
             Error::new(
@@ -405,7 +653,7 @@ pub fn complete_source_setup(plan: &HookInstallPlan, prepared: &PreparedHookSour
             "pending hook setup identity changed before completion",
         ));
     }
-    let source_request = source_dir(&plan.git_dir, &prepared.source_id).join(SETUP_REQUEST_FILE);
+    let source_request = source_dir(git_dir, &prepared.source_id).join(SETUP_REQUEST_FILE);
     let source_descriptor = read_pending_descriptor(&source_request)?.ok_or_else(|| {
         Error::new(
             "HOOK_SETUP_PENDING_MISSING",
@@ -436,8 +684,8 @@ pub fn complete_source_setup(plan: &HookInstallPlan, prepared: &PreparedHookSour
 /// Remove only the matching pre-IPC credential and setup descriptors after a
 /// definitive Store rejection or confirmed server revocation. This never
 /// edits a Git hook or its preservation backup.
-pub fn discard_source_setup(plan: &HookInstallPlan, prepared: &PreparedHookSource) -> Result<()> {
-    validate_prepared_source(plan, prepared)?;
+pub fn discard_source_setup(git_dir: &Path, prepared: &PreparedHookSource) -> Result<()> {
+    validate_prepared_source(git_dir, prepared)?;
     match fs::symlink_metadata(&prepared.credential_path) {
         Ok(_) => {
             let saved = read_hook_credential(&prepared.credential_path, &prepared.source_id)?;
@@ -451,14 +699,15 @@ pub fn discard_source_setup(plan: &HookInstallPlan, prepared: &PreparedHookSourc
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    remove_matching_setup_descriptors(plan, prepared)?;
+    remove_matching_setup_descriptors(git_dir, prepared)?;
     remove_credential_file(&prepared.credential_path)
 }
 
 /// Apply a previewed local wrapper. The operation re-runs preflight and refuses
 /// hook/config drift; the exact previous extensionless hook is retained and
 /// chained only if Git would have executed it before this installation.
-pub fn apply_post_commit(
+fn apply_post_commit_inner(
+    probes: &mut GitProbeContext,
     plan: &HookInstallPlan,
     source_id: &str,
     credential: &Credential,
@@ -471,7 +720,7 @@ pub fn apply_post_commit(
             "the current Swarm executable is not an absolute existing file",
         ));
     }
-    let current = preview_post_commit(&plan.repository_path, &plan.git_executable)?;
+    let current = preview_post_commit_inner(probes, &plan.repository_path, &plan.git_executable)?;
     if !same_preview(plan, &current) {
         return Err(Error::new(
             "HOOK_INSTALL_PLAN_STALE",
@@ -492,9 +741,15 @@ pub fn apply_post_commit(
         ));
     }
 
-    let existing = readback_post_commit(&plan.repository_path, &plan.git_executable, source_id)?;
+    let existing = readback_post_commit_inner(
+        probes,
+        &plan.repository_path,
+        &plan.git_executable,
+        source_id,
+    )?;
     if existing.state == "installing" {
         return resume_install_post_commit(
+            probes,
             &current,
             source_id,
             swarm_executable,
@@ -589,6 +844,7 @@ pub fn apply_post_commit(
 
     publish_wrapper(&plan.hooks_dir, &plan.hook_path, &wrapper)?;
     finalize_installation(
+        probes,
         &plan.repository_path,
         &plan.git_executable,
         source_id,
@@ -598,6 +854,7 @@ pub fn apply_post_commit(
 }
 
 fn resume_install_post_commit(
+    probes: &mut GitProbeContext,
     plan: &HookInstallPlan,
     source_id: &str,
     swarm_executable: &Path,
@@ -630,7 +887,12 @@ fn resume_install_post_commit(
             "install recovery does not match the retained source identity",
         ));
     }
-    let readback = readback_post_commit(&plan.repository_path, &plan.git_executable, source_id)?;
+    let readback = readback_post_commit_inner(
+        probes,
+        &plan.repository_path,
+        &plan.git_executable,
+        source_id,
+    )?;
     if readback.state != "installing"
         || (manifest.previous_hook_path.is_some() && readback.backup_matches != Some(true))
     {
@@ -646,6 +908,7 @@ fn resume_install_post_commit(
         .is_some_and(|hook| hook.sha256 == manifest.wrapper_sha256)
     {
         return finalize_installation(
+            probes,
             &plan.repository_path,
             &plan.git_executable,
             source_id,
@@ -692,6 +955,7 @@ fn resume_install_post_commit(
     }
 
     finalize_installation(
+        probes,
         &plan.repository_path,
         &plan.git_executable,
         source_id,
@@ -713,13 +977,14 @@ fn publish_wrapper(hooks_dir: &Path, hook_path: &Path, wrapper: &[u8]) -> Result
 }
 
 fn finalize_installation(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
     source_id: &str,
     manifest_path: &Path,
     expected_wrapper_sha256: &str,
 ) -> Result<HookInstallReadback> {
-    let readback = readback_post_commit(repository_path, git_executable, source_id)?;
+    let readback = readback_post_commit_inner(probes, repository_path, git_executable, source_id)?;
     if readback.state != "installing"
         || !readback.wrapper_matches
         || readback.wrapper_sha256.as_deref() != Some(expected_wrapper_sha256)
@@ -741,7 +1006,7 @@ fn finalize_installation(
     }
     manifest.phase = InstallPhase::Installed;
     private_replace_json(manifest_path, &manifest)?;
-    let readback = readback_post_commit(repository_path, git_executable, source_id)?;
+    let readback = readback_post_commit_inner(probes, repository_path, git_executable, source_id)?;
     if readback.state != "installed" || !readback.wrapper_matches {
         return Err(Error::new(
             "HOOK_INSTALL_READBACK_FAILED",
@@ -753,7 +1018,8 @@ fn finalize_installation(
 
 /// Read the repository-local wrapper and its preservation manifest without
 /// exposing the credential bytes.
-pub fn readback_post_commit(
+fn readback_post_commit_inner(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
     source_id: &str,
@@ -767,6 +1033,7 @@ pub fn readback_post_commit(
         )
     })?;
     let git_dir = canonical_output_path(&git_stdout(
+        probes,
         git_executable,
         &canonical,
         &["rev-parse", "--absolute-git-dir"],
@@ -847,6 +1114,7 @@ pub fn readback_post_commit(
         backup_matches == Some(true)
     };
     let hooks_path_is_custom = match run_git(
+        probes,
         git_executable,
         &canonical,
         &["config", "--get", "core.hooksPath"],
@@ -930,30 +1198,33 @@ pub fn readback_post_commit(
 /// wrapper and backup still match their recorded digests. The caller should
 /// revoke the Store credential first so a failed local restore leaves an inert
 /// wrapper rather than an active source.
-pub fn revoke_post_commit(
+fn revoke_post_commit_inner(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
     source_id: &str,
 ) -> Result<HookInstallReadback> {
     validate_source_id(source_id)?;
-    let before = match readback_post_commit(repository_path, git_executable, source_id) {
-        Ok(readback) => readback,
-        Err(error) => {
-            remove_source_credential(repository_path, git_executable, source_id)?;
-            return Err(error);
-        }
-    };
+    let before =
+        match readback_post_commit_inner(probes, repository_path, git_executable, source_id) {
+            Ok(readback) => readback,
+            Err(error) => {
+                remove_source_credential(probes, repository_path, git_executable, source_id)?;
+                return Err(error);
+            }
+        };
     let canonical = fs::canonicalize(repository_path)?;
     let git_dir = canonical_output_path(&git_stdout(
+        probes,
         git_executable,
         &canonical,
         &["rev-parse", "--absolute-git-dir"],
     )?)?;
     let source_dir = source_dir(&git_dir, source_id);
     if before.state == "absent" {
-        remove_source_credential(repository_path, git_executable, source_id)?;
+        remove_source_credential(probes, repository_path, git_executable, source_id)?;
         remove_empty_source_dir_if_present(&source_dir)?;
-        return readback_post_commit(repository_path, git_executable, source_id);
+        return readback_post_commit_inner(probes, repository_path, git_executable, source_id);
     }
     ensure_existing_directory(&source_dir)?;
     let manifest_path = source_dir.join("install.json");
@@ -968,8 +1239,8 @@ pub fn revoke_post_commit(
     )?;
     if manifest.phase != InstallPhase::Revoking {
         if before.state == "modified" {
-            remove_source_credential(repository_path, git_executable, source_id)?;
-            return readback_post_commit(repository_path, git_executable, source_id);
+            remove_source_credential(probes, repository_path, git_executable, source_id)?;
+            return readback_post_commit_inner(probes, repository_path, git_executable, source_id);
         }
         let resumable_phase = (manifest.phase == InstallPhase::Installing
             && before.state == "installing")
@@ -985,6 +1256,7 @@ pub fn revoke_post_commit(
         private_replace_json(&manifest_path, &manifest)?;
     }
     finish_revocation(
+        probes,
         repository_path,
         git_executable,
         source_id,
@@ -995,6 +1267,7 @@ pub fn revoke_post_commit(
 }
 
 fn finish_revocation(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
     source_id: &str,
@@ -1022,7 +1295,7 @@ fn finish_revocation(
                 .as_ref()
                 .is_some_and(|hook| !matches_saved_previous(hook, manifest))
             {
-                return revocation_conflict(repository_path, git_executable, source_id);
+                return revocation_conflict(probes, repository_path, git_executable, source_id);
             }
             let target_is_original = current
                 .as_ref()
@@ -1039,14 +1312,16 @@ fn finish_revocation(
                     atomic_replace_bytes(&target, &backup.bytes, manifest.previous_hook_mode)?;
                 }
                 (None, Some(_)) if target_is_original => {}
-                _ => return revocation_conflict(repository_path, git_executable, source_id),
+                _ => {
+                    return revocation_conflict(probes, repository_path, git_executable, source_id);
+                }
             }
             let restored = read_optional_regular_file(&target)?;
             if !restored
                 .as_ref()
                 .is_some_and(|hook| matches_saved_previous(hook, manifest))
             {
-                return revocation_conflict(repository_path, git_executable, source_id);
+                return revocation_conflict(probes, repository_path, git_executable, source_id);
             }
             if backup.is_some() {
                 let retained = read_optional_regular_file(&previous_path)?;
@@ -1054,7 +1329,7 @@ fn finish_revocation(
                     .as_ref()
                     .is_some_and(|hook| matches_saved_previous(hook, manifest))
                 {
-                    return revocation_conflict(repository_path, git_executable, source_id);
+                    return revocation_conflict(probes, repository_path, git_executable, source_id);
                 }
                 fs::remove_file(previous_path)?;
             }
@@ -1062,7 +1337,9 @@ fn finish_revocation(
         (None, None) => match current.as_ref() {
             Some(hook) if hook.sha256 == manifest.wrapper_sha256 => fs::remove_file(&target)?,
             None => {}
-            Some(_) => return revocation_conflict(repository_path, git_executable, source_id),
+            Some(_) => {
+                return revocation_conflict(probes, repository_path, git_executable, source_id);
+            }
         },
         _ => {
             return Err(Error::new(
@@ -1072,7 +1349,7 @@ fn finish_revocation(
         }
     }
 
-    remove_source_credential(repository_path, git_executable, source_id)?;
+    remove_source_credential(probes, repository_path, git_executable, source_id)?;
     ensure_source_dir_contains_only_manifest(source_dir, &manifest_path)?;
     fs::remove_file(&manifest_path)?;
     remove_empty_source_dir_if_present(source_dir)?;
@@ -1088,12 +1365,13 @@ fn finish_revocation(
 }
 
 fn revocation_conflict(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
     source_id: &str,
 ) -> Result<HookInstallReadback> {
-    remove_source_credential(repository_path, git_executable, source_id)?;
-    readback_post_commit(repository_path, git_executable, source_id)
+    remove_source_credential(probes, repository_path, git_executable, source_id)?;
+    readback_post_commit_inner(probes, repository_path, git_executable, source_id)
 }
 
 fn ensure_source_dir_contains_only_manifest(source_dir: &Path, manifest_path: &Path) -> Result<()> {
@@ -1127,54 +1405,105 @@ fn remove_empty_source_dir_if_present(source_dir: &Path) -> Result<()> {
 
 /// Verify the exact captured commit against the setup-bound checkout. This is
 /// intentionally a local object lookup only: it never fetches, invokes Git
-/// hooks, or accepts a repository path from the event request.
-pub fn resolve_commit(
+/// hooks, or accepts a repository path from the event request. A helper whose
+/// exact process family is still live is returned to Store custody even when
+/// the verification result is already known to be an error.
+pub fn resolve_commit_with_cleanup(
     scope: &crate::hooks::contract::EmitScope,
     commit_oid: &str,
-) -> Result<GitCommitSnapshot> {
-    validate_git_executable(&scope.git_executable)?;
-    if !crate::forge::valid_object_id(commit_oid) {
-        return Err(Error::invalid("commit_oid must be a full Git object ID"));
+) -> (Result<GitCommitSnapshot>, Option<GitCleanupOwner>) {
+    let fail = |error: Error| (Err(error), None);
+    if let Err(error) = validate_git_executable(&scope.git_executable) {
+        return fail(error);
     }
-    let repository_path = fs::canonicalize(&scope.repository_path).map_err(|_| {
-        Error::new(
-            "HOOK_REPOSITORY_UNAVAILABLE",
-            "configured repository path is unavailable",
-        )
-    })?;
+    if !crate::forge::valid_object_id(commit_oid) {
+        return fail(Error::invalid("commit_oid must be a full Git object ID"));
+    }
+    let repository_path = match fs::canonicalize(&scope.repository_path) {
+        Ok(path) => path,
+        Err(_) => {
+            return fail(Error::new(
+                "HOOK_REPOSITORY_UNAVAILABLE",
+                "configured repository path is unavailable",
+            ));
+        }
+    };
     if repository_path != scope.repository_path {
-        return Err(Error::new(
+        return fail(Error::new(
             "HOOK_REPOSITORY_MISMATCH",
             "configured repository path changed after source setup",
         ));
     }
     let typed_commit = format!("{commit_oid}^{{commit}}");
-    let exists = run_git(
+    let (exists, owner) = run_git_with_cleanup(
         &scope.git_executable,
         &repository_path,
         &["cat-file", "-e", &typed_commit],
-    )?;
+    );
+    if let Some(owner) = owner {
+        let error = exists.err().unwrap_or_else(|| {
+            Error::new(
+                "HOOK_GIT_CLEANUP_PENDING",
+                "Git helper custody remains pending",
+            )
+        });
+        return (Err(error), Some(owner));
+    }
+    let exists = match exists {
+        Ok(output) => output,
+        Err(error) => return fail(error),
+    };
     if !exists.status.success() {
-        return Err(Error::new(
+        return fail(Error::new(
             "HOOK_COMMIT_NOT_FOUND",
             "captured commit is not a commit object in the configured repository",
         ));
     }
-    let resolved = git_stdout(
+    let (resolved, owner) = run_git_with_cleanup(
         &scope.git_executable,
         &repository_path,
         &["rev-parse", "--verify", &typed_commit],
-    )?;
+    );
+    if let Some(owner) = owner {
+        let error = resolved.err().unwrap_or_else(|| {
+            Error::new(
+                "HOOK_GIT_CLEANUP_PENDING",
+                "Git helper custody remains pending",
+            )
+        });
+        return (Err(error), Some(owner));
+    }
+    let resolved = match resolved {
+        Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
+            Ok(value) => value,
+            Err(_) => {
+                return fail(Error::new(
+                    "HOOK_GIT_READBACK_FAILED",
+                    "Git returned non-UTF-8 repository data",
+                ));
+            }
+        },
+        Ok(_) => {
+            return fail(Error::new(
+                "HOOK_GIT_READBACK_FAILED",
+                "Git could not resolve the requested commit object",
+            ));
+        }
+        Err(error) => return fail(error),
+    };
     let resolved = resolved.trim();
     if !crate::forge::valid_object_id(resolved) || !resolved.eq_ignore_ascii_case(commit_oid) {
-        return Err(Error::new(
+        return fail(Error::new(
             "HOOK_COMMIT_READBACK_MISMATCH",
             "Git did not resolve the captured object ID to the same commit",
         ));
     }
-    Ok(GitCommitSnapshot {
-        commit_oid: resolved.to_ascii_lowercase(),
-    })
+    (
+        Ok(GitCommitSnapshot {
+            commit_oid: resolved.to_ascii_lowercase(),
+        }),
+        None,
+    )
 }
 
 fn same_preview(before: &HookInstallPlan, after: &HookInstallPlan) -> bool {
@@ -1249,8 +1578,13 @@ fn path_for_shell(path: &Path) -> String {
     }
 }
 
-fn git_stdout(executable: &Path, repository: &Path, args: &[&str]) -> Result<String> {
-    let output = run_git(executable, repository, args)?;
+fn git_stdout(
+    probes: &mut GitProbeContext,
+    executable: &Path,
+    repository: &Path,
+    args: &[&str],
+) -> Result<String> {
+    let output = run_git(probes, executable, repository, args)?;
     if !output.status.success() {
         return Err(Error::new(
             "HOOK_GIT_READBACK_FAILED",
@@ -1265,18 +1599,419 @@ fn git_stdout(executable: &Path, repository: &Path, args: &[&str]) -> Result<Str
     })
 }
 
-fn run_git(executable: &Path, repository: &Path, args: &[&str]) -> Result<Output> {
-    let mut command = Command::new(executable);
+#[derive(Default)]
+struct GitProbeContext {
+    cleanup_owner: Option<GitCleanupOwner>,
+}
+
+fn run_git(
+    probes: &mut GitProbeContext,
+    executable: &Path,
+    repository: &Path,
+    args: &[&str],
+) -> Result<GitOutput> {
+    if probes.cleanup_owner.is_some() {
+        return Err(Error::new(
+            "HOOK_GIT_CLEANUP_PENDING",
+            "Git helper custody remains pending",
+        ));
+    }
+    let (result, owner) = run_git_with_cleanup(executable, repository, args);
+    if let Some(owner) = owner {
+        probes.cleanup_owner = Some(owner);
+        return Err(Error::new(
+            "HOOK_GIT_CLEANUP_PENDING",
+            "Git helper custody remains pending after the bounded foreground phase",
+        ));
+    }
+    result
+}
+
+fn run_git_with_cleanup(
+    executable: &Path,
+    repository: &Path,
+    args: &[&str],
+) -> (Result<GitOutput>, Option<GitCleanupOwner>) {
+    let mut git_args = vec![
+        "--no-optional-locks".to_owned(),
+        "--no-replace-objects".to_owned(),
+    ];
+    git_args.extend(args.iter().map(|arg| (*arg).to_owned()));
+    #[cfg(test)]
+    let helper_command = |request_path: &Path| {
+        let executable = std::env::current_exe()?;
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "hooks::git::tests::check_probe_helper_entry",
+                "--nocapture",
+            ])
+            .env(CHECK_PROBE_REQUEST_TEST_ENV, request_path);
+        Ok(command)
+    };
+    #[cfg(not(test))]
+    let helper_command = |request_path: &Path| {
+        let executable = std::env::current_exe()?;
+        let mut command = Command::new(executable);
+        command.args(["check-worker", "--file"]).arg(request_path);
+        Ok(command)
+    };
+    let (outcome, owner) = run_git_probe_with_helper_with_cleanup(
+        executable,
+        repository,
+        &git_args,
+        helper_command,
+        GIT_HELPER_TIMEOUT,
+    );
+    if let Some(owner) = owner {
+        let error = outcome.err().unwrap_or_else(|| {
+            Error::new(
+                "HOOK_GIT_CLEANUP_PENDING",
+                "Git helper custody remains pending",
+            )
+        });
+        return (Err(error), Some(owner));
+    }
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => return (Err(error), None),
+    };
+    (git_output_from_probe(outcome), None)
+}
+
+fn git_output_from_probe(outcome: GitProbeOutcome) -> Result<GitOutput> {
+    if !outcome.family_departed {
+        return Err(Error::new(
+            "HOOK_GIT_CLEANUP_PENDING",
+            "Git process-family departure was not independently proved",
+        ));
+    }
+    if !outcome.group_empty {
+        return Err(Error::new(
+            "HOOK_GIT_CLEANUP",
+            "Git helper could not disarm its process-family owner",
+        ));
+    }
+    if outcome.timed_out {
+        return Err(Error::new(
+            "HOOK_GIT_TIMEOUT",
+            "bounded Git readback timed out",
+        ));
+    }
+    if outcome.output_limited {
+        return Err(Error::new(
+            "HOOK_GIT_OUTPUT_LIMIT",
+            "Git readback exceeded the fixed output bound",
+        ));
+    }
+    if outcome.had_descendants {
+        return Err(Error::new(
+            "HOOK_GIT_DESCENDANTS",
+            "Git readback spawned a descendant; its process family was stopped and proved gone",
+        ));
+    }
+    if !outcome.probe_success && outcome.exit_code == Some(0) {
+        return Err(Error::new(
+            "HOOK_GIT_OUTPUT",
+            "Git helper reported a failed capture despite a successful direct exit",
+        ));
+    }
+    if !outcome.message.is_empty() && !outcome.message.starts_with("input probe exited with ") {
+        return Err(Error::new(
+            "HOOK_GIT_OUTPUT",
+            "the bounded Git helper could not complete a clean readback",
+        ));
+    }
+    let Some(code) = outcome.exit_code else {
+        return Err(Error::new(
+            "HOOK_GIT_WAIT",
+            "Git process exit status was unavailable",
+        ));
+    };
+    Ok(GitOutput {
+        status: GitStatus { code: Some(code) },
+        stdout: outcome.stdout,
+    })
+}
+
+#[derive(Debug)]
+struct GitStatus {
+    code: Option<i32>,
+}
+
+impl GitStatus {
+    fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    fn code(&self) -> Option<i32> {
+        self.code
+    }
+}
+
+#[derive(Debug)]
+struct GitOutput {
+    status: GitStatus,
+    stdout: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct GitProbeOutcome {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output_limited: bool,
+    group_empty: bool,
+    family_departed: bool,
+    had_descendants: bool,
+    probe_success: bool,
+    stdout: Vec<u8>,
+    #[cfg(test)]
+    stderr: Vec<u8>,
+    message: String,
+}
+
+struct GitProbeFiles {
+    directory: PathBuf,
+    preserve: bool,
+}
+
+impl GitProbeFiles {
+    fn new() -> Result<Self> {
+        let directory = std::env::temp_dir().join(format!("swarm-hook-git-{}", model::new_id()));
+        fs::create_dir(&directory)?;
+        if let Err(error) = platform::private_permissions(&directory, true) {
+            let _ = fs::remove_dir(&directory);
+            return Err(error);
+        }
+        Ok(Self {
+            directory,
+            preserve: false,
+        })
+    }
+
+    fn request_path(&self) -> PathBuf {
+        self.directory.join(CHECK_PROBE_REQUEST_FILE)
+    }
+
+    fn owner_path(&self) -> PathBuf {
+        self.directory.join(CHECK_PROBE_OWNER_FILE)
+    }
+
+    fn response_path(&self) -> PathBuf {
+        self.directory.join(CHECK_PROBE_RESPONSE_FILE)
+    }
+
+    fn preserve(&mut self) {
+        self.preserve = true;
+    }
+}
+
+impl Drop for GitProbeFiles {
+    fn drop(&mut self) {
+        if self.preserve {
+            return;
+        }
+        // Pending owners preserve the directory; reaching Drop with preserve
+        // cleared means the helper's direct exit and exact family departure
+        // have already been proved.
+        for name in [
+            CHECK_PROBE_REQUEST_FILE,
+            CHECK_PROBE_OWNER_FILE,
+            PROBE_STDOUT_CAPTURE_FILE,
+            PROBE_STDERR_CAPTURE_FILE,
+            CHECK_PROBE_RESPONSE_FILE,
+        ] {
+            let _ = fs::remove_file(self.directory.join(name));
+        }
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+/// Test fixtures that expect cleanup completion use this bounded helper seam.
+#[cfg(test)]
+fn run_git_probe_with_helper<F>(
+    program: &Path,
+    repository: &Path,
+    args: &[String],
+    helper_command: F,
+) -> Result<GitProbeOutcome>
+where
+    F: FnOnce(&Path) -> Result<Command>,
+{
+    let (result, owner) = run_git_probe_with_helper_with_cleanup(
+        program,
+        repository,
+        args,
+        helper_command,
+        GIT_HELPER_TIMEOUT,
+    );
+    let Some(mut owner) = owner else {
+        return result;
+    };
+    let cleanup_deadline = Instant::now() + GIT_TEST_CLEANUP_GRACE;
+    while owner.is_pending() && Instant::now() < cleanup_deadline {
+        owner.poll();
+        if owner.is_pending() {
+            thread::sleep(GIT_POLL_INTERVAL);
+        }
+    }
+    if owner.is_pending() {
+        return Err(pending_git_family_error(
+            &owner.custody.files,
+            "test Git helper cleanup remained pending after the bounded late-poll grace",
+        ));
+    }
+    Err(Error::new(
+        "HOOK_GIT_CLEANUP_PENDING",
+        "Git helper exceeded its bounded foreground phase; exact cleanup completed, but this readback remains incomplete",
+    ))
+}
+
+/// Starts the check-worker probe and returns its still-live custody after the
+/// bounded foreground phase. Once spawned, every failure path returns the
+/// Child, response pipe, probe files and captured process identities together.
+fn run_git_probe_with_helper_with_cleanup<F>(
+    program: &Path,
+    repository: &Path,
+    args: &[String],
+    helper_command: F,
+    foreground: Duration,
+) -> (Result<GitProbeOutcome>, Option<GitCleanupOwner>)
+where
+    F: FnOnce(&Path) -> Result<Command>,
+{
+    if !program.is_absolute()
+        || !repository.is_absolute()
+        || args.iter().any(|argument| argument.contains('\0'))
+    {
+        return (
+            Err(Error::invalid("Git probe paths or arguments are invalid")),
+            None,
+        );
+    }
+
+    let files = match GitProbeFiles::new() {
+        Ok(files) => files,
+        Err(error) => return (Err(error), None),
+    };
+    let timeout_ms = match u64::try_from(GIT_COMMAND_TIMEOUT.as_millis()) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(_) => return (Err(Error::invalid("Git probe timeout is invalid")), None),
+    };
+    let request = serde_json::json!({
+        "check_probe": {
+            "probe_version": CHECK_PROBE_VERSION,
+            "program": program,
+            "args": args,
+            "cwd": repository,
+            "timeout_ms": timeout_ms,
+            "stdout_limit": MAX_GIT_OUTPUT_BYTES,
+            "stderr_limit": MAX_GIT_OUTPUT_BYTES,
+        }
+    });
+    if let Err(error) = platform::write_private_new(
+        &files.request_path(),
+        &match serde_json::to_vec(&request) {
+            Ok(bytes) => bytes,
+            Err(error) => return (Err(error.into()), None),
+        },
+    ) {
+        return (Err(error), None);
+    }
+    let response_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(files.response_path())
+    {
+        Ok(file) => Some(file),
+        Err(error) => {
+            return (
+                Err(Error::new(
+                    "HOOK_GIT_OUTPUT",
+                    format!("bounded Git helper capture could not be created: {error}"),
+                )),
+                None,
+            );
+        }
+    };
+
+    let mut command = match helper_command(&files.request_path()) {
+        Ok(command) => command,
+        Err(error) => return (Err(error), None),
+    };
     command
-        .args(["--no-optional-locks", "--no-replace-objects", "-C"])
-        .arg(repository)
-        .args(args)
         .current_dir(repository)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
+    remove_inherited_git_environment(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return (
+                Err(Error::new(
+                    "HOOK_GIT_START",
+                    "the bounded Git process-family helper could not start",
+                )),
+                None,
+            );
+        }
+    };
+    let child_pid = child.id();
+    let launch_identity = platform::process_group::spawned_identity(child_pid).ok();
+    let stdout = child.stdout.take();
+    let custody = GitHelperCustody {
+        child,
+        child_pid,
+        launch_identity,
+        stdout,
+        response_file,
+        capture: None,
+        files,
+        family_identity: None,
+        family_token: None,
+        exit_status: None,
+        status_observation_failed: false,
+        capture_setup_failed: false,
+        family_departed_proven: false,
+        cleanup_complete: false,
+    };
+    let mut owner = GitCleanupOwner { custody };
+    let deadline = Instant::now() + foreground;
+    loop {
+        owner.poll();
+        if !owner.is_pending() {
+            return (owner.into_outcome(), None);
+        }
+        if Instant::now() >= deadline {
+            let error = pending_git_family_error(
+                &owner.custody.files,
+                "Git helper cleanup remains unconfirmed after the bounded foreground phase",
+            );
+            owner.custody.files.preserve();
+            return (Err(error), Some(owner));
+        }
+        thread::sleep(GIT_POLL_INTERVAL);
+    }
+}
+
+fn pending_git_family_error(files: &GitProbeFiles, reason: &str) -> Error {
+    Error::new(
+        "HOOK_GIT_CLEANUP_PENDING",
+        format!("{reason}; owner_evidence={}", files.owner_path().display()),
+    )
+}
+
+fn remove_inherited_git_environment(command: &mut Command) {
     for key in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1305,89 +2040,318 @@ fn run_git(executable: &Path, repository: &Path, args: &[&str]) -> Result<Output
             command.env_remove(key);
         }
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-
-    let mut child = command.spawn().map_err(|_| {
-        Error::new(
-            "HOOK_GIT_START",
-            "configured Git executable could not start",
-        )
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("HOOK_GIT_IO", "Git stdout pipe is unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::new("HOOK_GIT_IO", "Git stderr pipe is unavailable"))?;
-    let stdout_reader = thread::spawn(move || read_capped(stdout, MAX_GIT_OUTPUT_BYTES));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_GIT_OUTPUT_BYTES));
-    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(15)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::new(
-                    "HOOK_GIT_TIMEOUT",
-                    "bounded Git readback timed out",
-                ));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::new(
-                    "HOOK_GIT_WAIT",
-                    "Git process status was unavailable",
-                ));
-            }
-        }
-    };
-    let (stdout, stdout_truncated) = stdout_reader
-        .join()
-        .map_err(|_| Error::new("HOOK_GIT_OUTPUT", "Git stdout reader failed"))??;
-    let (stderr, stderr_truncated) = stderr_reader
-        .join()
-        .map_err(|_| Error::new("HOOK_GIT_OUTPUT", "Git stderr reader failed"))??;
-    let mut output = Output {
-        status,
-        stdout,
-        stderr,
-    };
-    if stdout_truncated || stderr_truncated {
-        // Callers need to distinguish a complete empty result from a cap hit.
-        // Retain that fact out of band by refusing all oversized output here.
-        return Err(Error::new(
-            "HOOK_GIT_OUTPUT_LIMIT",
-            "Git readback exceeded the fixed output bound",
-        ));
-    }
-    output.stdout.shrink_to_fit();
-    Ok(output)
 }
 
-fn read_capped<R: Read>(mut reader: R, cap: usize) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut output = Vec::with_capacity(cap.min(1024));
-    let mut buffer = [0u8; 1024];
-    let mut truncated = false;
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        let remaining = cap.saturating_sub(output.len());
-        let kept = remaining.min(count);
-        output.extend_from_slice(&buffer[..kept]);
-        truncated |= kept != count;
+fn check_probe_group_token(identity: &Value) -> Result<String> {
+    if identity["scope"] == "linux_process_group" {
+        return Ok(String::new());
     }
-    Ok((output, truncated))
+    let job_name = identity["job_name"]
+        .as_str()
+        .ok_or_else(|| Error::invalid("Git helper Job name is missing"))?;
+    let token = job_name
+        .strip_prefix(r"Global\EliotSwarmCheck-")
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Error::invalid("Git helper Job name is invalid"))?;
+    Ok(token.to_owned())
+}
+
+/// Pollable response reader whose handle is configured before it is moved into
+/// CaptureStream. If nonblocking setup fails, the original ChildStdout remains
+/// in GitHelperCustody and is retried on a later poll.
+struct GitHelperStdout(ChildStdout);
+
+impl Read for GitHelperStdout {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl PollableRead for GitHelperStdout {
+    fn make_nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<PipeRead> {
+        self.0.read_available(buffer)
+    }
+}
+
+struct GitHelperCustody {
+    child: Child,
+    child_pid: u32,
+    launch_identity: Option<Value>,
+    stdout: Option<ChildStdout>,
+    response_file: Option<File>,
+    capture: Option<CaptureStream<GitHelperStdout>>,
+    files: GitProbeFiles,
+    family_identity: Option<Value>,
+    family_token: Option<String>,
+    exit_status: Option<ExitStatus>,
+    status_observation_failed: bool,
+    capture_setup_failed: bool,
+    family_departed_proven: bool,
+    cleanup_complete: bool,
+}
+
+/// Exact custody for one started check-worker Git helper. `poll` performs one
+/// bounded capture/status/family observation; the owner becomes releasable
+/// only after the direct Child exit, exact family departure and natural pipe
+/// completion have all been observed.
+pub struct GitCleanupOwner {
+    custody: GitHelperCustody,
+}
+
+impl GitCleanupOwner {
+    /// Advance cleanup without waiting. The caller must retain this value while
+    /// `is_pending()` remains true.
+    pub fn poll(&mut self) {
+        self.custody.poll();
+    }
+
+    /// Whether direct exit plus exact family departure are still unconfirmed.
+    pub fn is_pending(&self) -> bool {
+        !self.custody.cleanup_complete
+    }
+
+    fn into_outcome(self) -> Result<GitProbeOutcome> {
+        if self.is_pending() {
+            return Err(Error::new(
+                "HOOK_GIT_CLEANUP_PENDING",
+                "Git helper custody is not releasable before direct exit and exact family departure",
+            ));
+        }
+        self.custody.into_outcome()
+    }
+}
+
+impl GitHelperCustody {
+    fn poll(&mut self) {
+        if self.cleanup_complete {
+            return;
+        }
+        self.start_capture_if_possible();
+        if let Some(capture) = self.capture.as_mut() {
+            capture.poll();
+        }
+        if self.exit_status.is_none() {
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.exit_status = Some(status),
+                Ok(None) => {}
+                Err(_) => self.status_observation_failed = true,
+            }
+        }
+        self.load_family_identity();
+        if self.exit_status.is_none() || !self.family_departed_once() {
+            return;
+        }
+        self.family_departed_proven = true;
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(CaptureStream::is_finished)
+        {
+            self.cleanup_complete = true;
+        } else if self.capture.is_none() {
+            // No reader can be started, but the exact family and direct child
+            // are now gone. Releasing this unusable pipe is safe; it is never
+            // reported as EOF or as a successful capture.
+            self.stdout.take();
+            self.response_file.take();
+            self.capture_setup_failed = true;
+            self.cleanup_complete = true;
+        }
+        if self.cleanup_complete {
+            self.files.preserve = false;
+        }
+    }
+
+    fn start_capture_if_possible(&mut self) {
+        if self.capture.is_some() || self.stdout.is_none() || self.response_file.is_none() {
+            return;
+        }
+        let configured = self
+            .stdout
+            .as_ref()
+            .is_some_and(|stdout| stdout.make_nonblocking().is_ok());
+        if !configured {
+            return;
+        }
+        let stdout = self.stdout.take().expect("configured stdout remains owned");
+        let file = self
+            .response_file
+            .take()
+            .expect("response capture file remains owned");
+        self.capture = Some(
+            CaptureStream::new(
+                self.files.response_path(),
+                file,
+                GitHelperStdout(stdout),
+                CHECK_PROBE_RESPONSE_BYTES as u64,
+            )
+            .expect("the fixed helper response limit and preconfigured pipe are valid"),
+        );
+    }
+
+    fn load_family_identity(&mut self) {
+        if self.family_identity.is_some() {
+            return;
+        }
+        let Ok(bytes) = read_bounded(&self.files.owner_path()) else {
+            return;
+        };
+        let Ok(identity) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        if identity["purpose"] != "check"
+            || identity["pid"].as_u64() != Some(u64::from(self.child_pid))
+            || self
+                .launch_identity
+                .as_ref()
+                .is_some_and(|launch| launch["pid"].as_u64() != identity["pid"].as_u64())
+        {
+            return;
+        }
+        let Ok(token) = check_probe_group_token(&identity) else {
+            return;
+        };
+        self.family_identity = Some(identity);
+        self.family_token = Some(token);
+    }
+
+    fn family_departed_once(&self) -> bool {
+        let (Some(identity), Some(token)) =
+            (self.family_identity.as_ref(), self.family_token.as_deref())
+        else {
+            if self.exit_status.is_none()
+                || !matches!(
+                    fs::symlink_metadata(self.files.owner_path()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                return false;
+            }
+            // The check-worker writes probe-owner.json before it can spawn the
+            // requested command. An absent file after its exact Child exit
+            // therefore proves that no nested family was launched.
+            return true;
+        };
+        let owner_departed =
+            platform::process_group::departed_empty(identity, token).is_ok_and(|departed| departed);
+        let launch_departed = match self.launch_identity.as_ref() {
+            Some(identity) => platform::process_group::spawned_departed(identity, token)
+                .is_ok_and(|departed| departed),
+            // The exact Child handle has already reported exit, and the
+            // persisted family identity is bound to that Child's PID.
+            None => self.exit_status.is_some(),
+        };
+        owner_departed && launch_departed
+    }
+
+    fn into_outcome(mut self) -> Result<GitProbeOutcome> {
+        if !self.cleanup_complete || !self.family_departed_proven {
+            return Err(Error::new(
+                "HOOK_GIT_CLEANUP_PENDING",
+                "Git helper process-family departure was not independently proved",
+            ));
+        }
+        if self.status_observation_failed {
+            return Err(Error::new(
+                "HOOK_GIT_WAIT",
+                "Git helper status observation failed before its retained exit was confirmed",
+            ));
+        }
+        let status = self.exit_status.take().ok_or_else(|| {
+            Error::new(
+                "HOOK_GIT_WAIT",
+                "Git helper exit status was unavailable after cleanup",
+            )
+        })?;
+        if !status.success() {
+            return Err(Error::new(
+                "HOOK_GIT_HELPER_FAILED",
+                "bounded Git helper exited without a successful response",
+            ));
+        }
+        if self.capture_setup_failed {
+            return Err(Error::new(
+                "HOOK_GIT_OUTPUT",
+                "bounded Git helper response capture could not be started",
+            ));
+        }
+        let capture = self.capture.take().ok_or_else(|| {
+            Error::new(
+                "HOOK_GIT_OUTPUT",
+                "bounded Git helper response capture is unavailable",
+            )
+        })?;
+        let receipt = capture.finish();
+        if !receipt.capture_complete || receipt.capture_error.is_some() || receipt.truncated {
+            return Err(Error::new(
+                "HOOK_GIT_OUTPUT",
+                "bounded Git helper response was incomplete or exceeded its fixed limit",
+            ));
+        }
+        let bytes = read_bounded(&self.files.response_path())?;
+        let mut outcome = decode_git_probe_response(&bytes)?;
+        outcome.family_departed = true;
+        Ok(outcome)
+    }
+}
+
+fn decode_git_probe_response(bytes: &[u8]) -> Result<GitProbeOutcome> {
+    #[cfg(test)]
+    let bytes = {
+        let offset = bytes
+            .windows(CHECK_PROBE_RESPONSE_MAGIC.len())
+            .position(|window| window == CHECK_PROBE_RESPONSE_MAGIC)
+            .unwrap_or(0);
+        &bytes[offset..]
+    };
+    if bytes.len() < CHECK_PROBE_HEADER_BYTES || &bytes[..8] != CHECK_PROBE_RESPONSE_MAGIC {
+        return Err(Error::new(
+            "HOOK_GIT_OUTPUT",
+            "bounded Git helper returned an invalid response frame",
+        ));
+    }
+    let flags = bytes[8];
+    let exit_code = i32::from_le_bytes(bytes[9..13].try_into().unwrap());
+    let stdout_len = u32::from_le_bytes(bytes[13..17].try_into().unwrap()) as usize;
+    let stderr_len = u32::from_le_bytes(bytes[17..21].try_into().unwrap()) as usize;
+    let message_len = u16::from_le_bytes(bytes[21..23].try_into().unwrap()) as usize;
+    let expected = CHECK_PROBE_HEADER_BYTES
+        .checked_add(stdout_len)
+        .and_then(|length| length.checked_add(stderr_len))
+        .and_then(|length| length.checked_add(message_len))
+        .ok_or_else(|| Error::invalid("Git helper response length overflow"))?;
+    if stdout_len > MAX_GIT_OUTPUT_BYTES
+        || stderr_len > MAX_GIT_OUTPUT_BYTES
+        || message_len > CHECK_PROBE_MESSAGE_BYTES
+        || expected != bytes.len()
+    {
+        return Err(Error::new(
+            "HOOK_GIT_OUTPUT",
+            "bounded Git helper returned an invalid response length",
+        ));
+    }
+    let stdout_start = CHECK_PROBE_HEADER_BYTES;
+    let stderr_start = stdout_start + stdout_len;
+    let message_start = stderr_start + stderr_len;
+    let message = String::from_utf8_lossy(&bytes[message_start..]).into_owned();
+    Ok(GitProbeOutcome {
+        exit_code: (exit_code >= 0).then_some(exit_code),
+        timed_out: flags & 2 != 0,
+        output_limited: flags & 4 != 0,
+        group_empty: flags & 8 != 0,
+        family_departed: false,
+        had_descendants: message
+            .starts_with("input probe left descendants after its command exited"),
+        probe_success: flags & 1 != 0,
+        stdout: bytes[stdout_start..stderr_start].to_vec(),
+        #[cfg(test)]
+        stderr: bytes[stderr_start..message_start].to_vec(),
+        message,
+    })
 }
 
 fn canonical_output_path(value: &str) -> Result<PathBuf> {
@@ -1406,6 +2370,24 @@ fn canonical_output_path(value: &str) -> Result<PathBuf> {
     })
 }
 
+/// Opens one regular, nonsymlink file for bounded reading.
+///
+/// The `symlink_metadata` check in the callers rejects links, and the opened
+/// handle is then used as the read snapshot so a later replacement or growth
+/// cannot change what the bound applies to.
+fn open_regular_file(path: &Path) -> Result<File> {
+    File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => Error::new(
+            "HOOK_FILE_INVALID",
+            "hook file disappeared before it could be read",
+        ),
+        _ => Error::new(
+            "HOOK_FILE_INVALID",
+            "hook file could not be opened for a bounded read",
+        ),
+    })
+}
+
 fn read_optional_regular_file(path: &Path) -> Result<Option<PreviousHook>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1421,7 +2403,20 @@ fn read_optional_regular_file(path: &Path) -> Result<Option<PreviousHook>> {
                     "existing Git hook exceeds the preservation bound",
                 ));
             }
-            let bytes = fs::read(path)?;
+            // The opened handle, not the pre-read metadata, is the snapshot.
+            // Reading through take(max+1) keeps a hook that grew or was
+            // replaced after the check from allocating an unbounded body.
+            let file = open_regular_file(path)?;
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(metadata.len()).unwrap_or(MAX_HOOK_FILE_BYTES as usize),
+            );
+            file.take(MAX_HOOK_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_HOOK_FILE_BYTES {
+                return Err(Error::new(
+                    "HOOK_FILE_TOO_LARGE",
+                    "existing Git hook exceeds the preservation bound",
+                ));
+            }
             Ok(Some(PreviousHook {
                 sha256: model::digest(&bytes),
                 bytes,
@@ -1544,7 +2539,22 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
             "hook metadata file is not a bounded regular file",
         ));
     }
-    Ok(fs::read(path)?)
+    // Metadata is a hint, never the bound. Open the regular file once and read
+    // through a capped reader so growth or replacement after the check cannot
+    // allocate more than the retained prefix.
+    let file = open_regular_file(path)?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_HOOK_FILE_BYTES))
+            .unwrap_or(MAX_HOOK_FILE_BYTES as usize),
+    );
+    file.take(MAX_HOOK_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_HOOK_FILE_BYTES {
+        return Err(Error::new(
+            "HOOK_FILE_INVALID",
+            "hook metadata file is not a bounded regular file",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
@@ -1614,6 +2624,7 @@ fn absent_readback(
 }
 
 fn remove_source_credential(
+    probes: &mut GitProbeContext,
     repository_path: &Path,
     git_executable: &Path,
     source_id: &str,
@@ -1626,6 +2637,7 @@ fn remove_source_credential(
         )
     })?;
     let git_dir = canonical_output_path(&git_stdout(
+        probes,
         git_executable,
         &canonical,
         &["rev-parse", "--absolute-git-dir"],
@@ -1858,7 +2870,7 @@ fn same_prepared_identity(
         && descriptor.source_id == prepared.source_id
 }
 
-fn validate_prepared_source(plan: &HookInstallPlan, prepared: &PreparedHookSource) -> Result<()> {
+fn validate_prepared_source(git_dir: &Path, prepared: &PreparedHookSource) -> Result<()> {
     validate_hook_credential(&prepared.source_id, &prepared.credential)?;
     validate_pending_descriptor(&PendingSetupDescriptor {
         schema_version: PENDING_SETUP_SCHEMA_VERSION,
@@ -1867,10 +2879,10 @@ fn validate_prepared_source(plan: &HookInstallPlan, prepared: &PreparedHookSourc
         source_id: prepared.source_id.clone(),
         credential_ready: true,
     })?;
-    let expected_source = source_dir(&plan.git_dir, &prepared.source_id);
+    let expected_source = source_dir(git_dir, &prepared.source_id);
     if prepared.credential_path != expected_source.join("credential.json")
         || prepared.pending_descriptor_path
-            != pending_descriptor_path(&plan.git_dir.join(SOURCE_DIRECTORY), &prepared.project_id)
+            != pending_descriptor_path(&git_dir.join(SOURCE_DIRECTORY), &prepared.project_id)
     {
         return Err(Error::new(
             "HOOK_SETUP_PENDING_CONFLICT",
@@ -1927,11 +2939,8 @@ fn remove_regular_file_if_exists(path: &Path, code: &'static str) -> Result<()> 
     }
 }
 
-fn remove_matching_setup_descriptors(
-    plan: &HookInstallPlan,
-    prepared: &PreparedHookSource,
-) -> Result<()> {
-    let source_request = source_dir(&plan.git_dir, &prepared.source_id).join(SETUP_REQUEST_FILE);
+fn remove_matching_setup_descriptors(git_dir: &Path, prepared: &PreparedHookSource) -> Result<()> {
+    let source_request = source_dir(git_dir, &prepared.source_id).join(SETUP_REQUEST_FILE);
     for path in [&prepared.pending_descriptor_path, &source_request] {
         if let Some(descriptor) = read_pending_descriptor(path)?
             && !same_prepared_identity(&descriptor, prepared)
@@ -1986,7 +2995,7 @@ fn wide_nul(path: &Path) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::{io::Write, process::Command};
 
     const ORIGINAL_HOOK: &[u8] = b"#!/bin/sh\n# retained user post-commit hook\nexit 0\n";
     const MODIFIED_HOOK: &[u8] = b"#!/bin/sh\n# user changed this hook\nexit 0\n";
@@ -2078,20 +3087,28 @@ mod tests {
         }
 
         fn plan(&self) -> HookInstallPlan {
-            preview_post_commit(&self.repository_path, &self.git_executable)
-                .expect("preview isolated test repository")
+            let mut probes = GitProbeContext::default();
+            let plan =
+                preview_post_commit_inner(&mut probes, &self.repository_path, &self.git_executable)
+                    .expect("preview isolated test repository");
+            assert!(probes.cleanup_owner.is_none());
+            plan
         }
 
         fn git_dir(&self) -> PathBuf {
-            canonical_output_path(
+            let mut probes = GitProbeContext::default();
+            let git_dir = canonical_output_path(
                 &git_stdout(
+                    &mut probes,
                     &self.git_executable,
                     &self.repository_path,
                     &["rev-parse", "--absolute-git-dir"],
                 )
                 .expect("read test repository Git directory"),
             )
-            .expect("canonical test repository Git directory")
+            .expect("canonical test repository Git directory");
+            assert!(probes.cleanup_owner.is_none());
+            git_dir
         }
     }
 
@@ -2151,31 +3168,43 @@ mod tests {
         }
 
         fn install(&self) -> HookInstallReadback {
-            apply_post_commit(
+            let mut probes = GitProbeContext::default();
+            let readback = apply_post_commit_inner(
+                &mut probes,
                 &self.repository.plan(),
                 &self.source_id,
                 &self.credential,
                 &self.repository.swarm_executable,
             )
-            .expect("install actual hook fixture")
+            .expect("install actual hook fixture");
+            assert!(probes.cleanup_owner.is_none());
+            readback
         }
 
         fn readback(&self) -> HookInstallReadback {
-            readback_post_commit(
+            let mut probes = GitProbeContext::default();
+            let readback = readback_post_commit_inner(
+                &mut probes,
                 &self.repository.repository_path,
                 &self.repository.git_executable,
                 &self.source_id,
             )
-            .expect("read hook fixture state")
+            .expect("read hook fixture state");
+            assert!(probes.cleanup_owner.is_none());
+            readback
         }
 
         fn revoke(&self) -> HookInstallReadback {
-            revoke_post_commit(
+            let mut probes = GitProbeContext::default();
+            let readback = revoke_post_commit_inner(
+                &mut probes,
                 &self.repository.repository_path,
                 &self.repository.git_executable,
                 &self.source_id,
             )
-            .expect("revoke hook fixture")
+            .expect("revoke hook fixture");
+            assert!(probes.cleanup_owner.is_none());
+            readback
         }
 
         fn restore_from_retained_backup(&self, manifest: &InstallManifest) {
@@ -2212,12 +3241,15 @@ mod tests {
             if let Some(path) = manifest.previous_hook_path.as_deref() {
                 fs::remove_file(path).expect("apply backup deletion effect");
             }
+            let mut probes = GitProbeContext::default();
             remove_source_credential(
+                &mut probes,
                 &self.repository.repository_path,
                 &self.repository.git_executable,
                 &self.source_id,
             )
             .expect("apply source credential and setup descriptor cleanup effect");
+            assert!(probes.cleanup_owner.is_none());
             fs::remove_file(self.manifest_path()).expect("apply manifest deletion effect");
         }
     }
@@ -2492,7 +3524,7 @@ mod tests {
         let repository = TestRepository::new(Some(ORIGINAL_HOOK));
         let plan = repository.plan();
         let prepared = prepare_source_credential(
-            &plan,
+            &plan.git_dir,
             &format!("hook-test-project-{}", model::new_id()),
             Some(&model::new_id()),
         )
@@ -2505,9 +3537,479 @@ mod tests {
         let rollback = fixture.revoke();
         assert_eq!(rollback.state, "restored");
         assert_restored(&fixture, &manifest);
-        discard_source_setup(&plan, &prepared).expect("finish matching setup rollback cleanup");
+        discard_source_setup(&plan.git_dir, &prepared)
+            .expect("finish matching setup rollback cleanup");
         assert!(!prepared.pending_descriptor_path.exists());
         assert!(!fixture.source_dir().join(SETUP_REQUEST_FILE).exists());
         assert_eq!(fixture.readback().state, "absent");
+    }
+
+    /// Proves the read is bounded by the opened handle, not by a length observed
+    /// before the read.
+    ///
+    /// The original code checked `metadata.len()` and then called `fs::read(path)`,
+    /// which resolves the path again. Replacing the file between the check and the
+    /// read defeated that bound. This fixture drives exactly that ordering and
+    /// shows the handle read cannot exceed the retained prefix.
+    #[test]
+    fn the_opened_handle_read_is_bounded_not_the_pre_read_length() {
+        let root = TestRoot::new();
+        let path = root.0.join(HOOK_NAME);
+        write_new(&path, ORIGINAL_HOOK, Some(0o755)).expect("write the original hook");
+
+        // The cheap pre-check sees only the small original body, so it passes.
+        let metadata = fs::symlink_metadata(&path).expect("stat the original hook");
+        assert!(metadata.len() <= MAX_HOOK_FILE_BYTES);
+
+        // Replace the path with a body far past the bound, which is what the old
+        // metadata-then-`fs::read` sequence would then have read in full.
+        let oversized = vec![b'#'; MAX_HOOK_FILE_BYTES as usize + 4096];
+        fs::write(&path, &oversized).expect("replace the hook with an oversized body");
+
+        // The opened handle is the snapshot, and the take(max+1) read retains at
+        // most the cap plus one byte, so nothing unbounded is ever allocated.
+        let file = open_regular_file(&path).expect("open the replaced hook");
+        let mut bytes = Vec::new();
+        file.take(MAX_HOOK_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .expect("read the replaced hook through the handle");
+        assert_eq!(bytes.len() as u64, MAX_HOOK_FILE_BYTES + 1);
+
+        // Both callers refuse on the actual bytes read rather than trusting the
+        // length recorded before the read.
+        let error = read_bounded(&path).expect_err("an oversized hook must be refused");
+        assert_eq!(error.code, "HOOK_FILE_INVALID");
+    }
+
+    #[test]
+    fn a_hook_exactly_at_the_limit_is_retained_in_full() {
+        let root = TestRoot::new();
+        let path = root.0.join(HOOK_NAME);
+        let exact = vec![b'#'; MAX_HOOK_FILE_BYTES as usize];
+        write_new(&path, &exact, Some(0o755)).expect("write a boundary-sized hook");
+
+        let read = read_optional_regular_file(&path)
+            .expect("read the boundary-sized hook")
+            .expect("the hook is present");
+        assert_eq!(read.bytes, exact);
+        assert_eq!(read.sha256, model::digest(&exact));
+        assert_eq!(
+            read_bounded(&path).expect("read the boundary-sized hook"),
+            exact
+        );
+    }
+
+    const PROBE_FIXTURE_MODE_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MODE";
+    const PROBE_FIXTURE_MARKER_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MARKER";
+
+    /// Test-binary entry point used in place of the production `check-worker`
+    /// CLI route. It runs the existing probe and exits before libtest writes a
+    /// footer onto the framed response stream.
+    #[test]
+    fn check_probe_helper_entry() {
+        let Some(request) = std::env::var_os(CHECK_PROBE_REQUEST_TEST_ENV) else {
+            return;
+        };
+        let result = crate::checks::inputs::run_probe(Path::new(&request));
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+
+    #[test]
+    fn probe_command_with_live_descendant() {
+        if std::env::var(PROBE_FIXTURE_MODE_ENV).as_deref() != Ok("descendant") {
+            return;
+        }
+        let marker = std::env::var_os(PROBE_FIXTURE_MARKER_ENV)
+            .map(PathBuf::from)
+            .expect("live-descendant marker path");
+        let direct_identity = platform::process_group::process_birth_identity(std::process::id())
+            .expect("capture the direct command birth identity")
+            .expect("the direct command is still live");
+        fs::write(
+            marker.with_extension("direct-id"),
+            serde_json::to_vec(&direct_identity).expect("encode direct command identity"),
+        )
+        .expect("publish the exact direct command identity");
+        let executable = std::env::current_exe().expect("test executable path");
+        let mut descendant = Command::new(executable)
+            .args([
+                "--exact",
+                "hooks::git::tests::probe_pipe_holder",
+                "--nocapture",
+            ])
+            .env(PROBE_FIXTURE_MODE_ENV, "holder")
+            .env(PROBE_FIXTURE_MARKER_ENV, &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start a process that inherits the real probe write ends");
+
+        std::io::stdout()
+            .write_all(b"direct-git-stdout\n")
+            .expect("write direct stdout bytes");
+        std::io::stderr()
+            .write_all(b"direct-git-stderr\n")
+            .expect("write direct stderr bytes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            if descendant.try_wait().ok().flatten().is_some() {
+                std::process::exit(4);
+            }
+            thread::sleep(GIT_POLL_INTERVAL);
+        }
+        if marker.exists() {
+            // The direct command exits while its descendant is live and holds
+            // the actual stdout/stderr write handles inherited from run_probe.
+            std::process::exit(0);
+        }
+        std::process::exit(5);
+    }
+
+    #[test]
+    fn probe_pipe_holder() {
+        if std::env::var(PROBE_FIXTURE_MODE_ENV).as_deref() != Ok("holder") {
+            return;
+        }
+        let marker = std::env::var_os(PROBE_FIXTURE_MARKER_ENV)
+            .map(PathBuf::from)
+            .expect("pipe-holder marker path");
+        std::io::stdout()
+            .write_all(b"descendant-git-stdout\n")
+            .expect("write descendant stdout bytes");
+        std::io::stderr()
+            .write_all(b"descendant-git-stderr\n")
+            .expect("write descendant stderr bytes");
+        let identity = platform::process_group::process_birth_identity(std::process::id())
+            .expect("capture the live pipe-holder birth identity")
+            .expect("the pipe holder is still live");
+        std::fs::write(
+            marker,
+            serde_json::to_vec(&identity).expect("encode pipe-holder identity"),
+        )
+        .expect("publish live pipe-holder marker");
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn probe_command_over_limit() {
+        if std::env::var(PROBE_FIXTURE_MODE_ENV).as_deref() != Ok("overflow") {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(b"real-overflow-prefix:")
+            .expect("write output prefix");
+        stdout
+            .write_all(&vec![b'x'; MAX_GIT_OUTPUT_BYTES + 256])
+            .expect("write bytes beyond the real stream limit");
+        let _ = stdout.flush();
+        std::process::exit(0);
+    }
+
+    fn run_probe_fixture(
+        repository: &TestRepository,
+        program_test: &str,
+        fixture_mode: &str,
+    ) -> GitProbeOutcome {
+        let program = std::env::current_exe().expect("test executable path");
+        let args = vec![
+            "--exact".to_owned(),
+            program_test.to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let marker = repository
+            .repository_path
+            .join(format!("probe-{fixture_mode}-ready"));
+        let helper_executable = std::env::current_exe().expect("test executable path");
+        run_git_probe_with_helper(
+            &program,
+            &repository.repository_path,
+            &args,
+            move |request_path| {
+                let mut command = Command::new(helper_executable);
+                command
+                    .args([
+                        "--exact",
+                        "hooks::git::tests::check_probe_helper_entry",
+                        "--nocapture",
+                    ])
+                    .env(CHECK_PROBE_REQUEST_TEST_ENV, request_path)
+                    .env(PROBE_FIXTURE_MODE_ENV, fixture_mode)
+                    .env(PROBE_FIXTURE_MARKER_ENV, marker);
+                Ok(command)
+            },
+        )
+        .expect("the real probe capture and family-proof seam returns a bounded result")
+    }
+
+    fn run_local_fixture_operation(
+        fixture: &HookFixture,
+        operation: HookLocalOperation,
+    ) -> HookLocalResult {
+        let request = HookLocalRequest::parse(&serde_json::json!({
+            "project_id":format!("hook-test-project-{}", fixture.source_id),
+            "operation":serde_json::to_value(operation).expect("serialize closed hook operation"),
+        }))
+        .expect("parse the closed configured-project hook request");
+        let (result, cleanup_owner) = run_local_operation_with_cleanup(
+            request,
+            &fixture.repository.repository_path,
+            &fixture.repository.git_executable,
+            &fixture.repository.swarm_executable,
+        );
+        assert!(
+            cleanup_owner.is_none(),
+            "the real fixture Git process families complete within the caller's bounded phase"
+        );
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                panic!(
+                    "local hook operation failed: {}: {}",
+                    error.code, error.message
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_aware_local_hook_caller_runs_preview_apply_readback_and_revoke() {
+        let fixture = HookFixture::new(Some(ORIGINAL_HOOK));
+        let preview = run_local_fixture_operation(&fixture, HookLocalOperation::Preview);
+        let HookLocalResult::Preview { preview } = preview else {
+            panic!("closed preview request returns preview data");
+        };
+        let canonical_repository = std::fs::canonicalize(&fixture.repository.repository_path)
+            .expect("fixture repository canonicalizes");
+        assert_eq!(
+            preview["repository_root"],
+            canonical_repository.to_string_lossy().as_ref()
+        );
+
+        let installed = run_local_fixture_operation(
+            &fixture,
+            HookLocalOperation::Apply {
+                source_id: fixture.source_id.clone(),
+                credential: fixture.credential.clone(),
+            },
+        );
+        let HookLocalResult::Installed { installation } = installed else {
+            panic!("closed apply request returns installation readback");
+        };
+        assert_eq!(installation.state, "installed");
+        assert!(installation.wrapper_matches);
+
+        let readback = run_local_fixture_operation(
+            &fixture,
+            HookLocalOperation::Readback {
+                source_id: fixture.source_id.clone(),
+            },
+        );
+        let HookLocalResult::Readback { readback } = readback else {
+            panic!("closed readback request returns installed state");
+        };
+        assert_eq!(readback.state, "installed");
+        assert!(readback.wrapper_matches);
+
+        let revoked = run_local_fixture_operation(
+            &fixture,
+            HookLocalOperation::Revoke {
+                source_id: fixture.source_id.clone(),
+            },
+        );
+        let HookLocalResult::Revoked { installation } = revoked else {
+            panic!("closed revoke request returns restoration readback");
+        };
+        assert_eq!(installation.state, "restored");
+    }
+
+    fn process_identity_is_current(identity: &Value) -> bool {
+        let Some(pid) = identity["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            return false;
+        };
+        platform::process_group::process_birth_identity(pid)
+            .is_ok_and(|current| current.as_ref() == Some(identity))
+    }
+
+    #[test]
+    fn pending_git_owner_keeps_live_descendant_and_pipe_until_exact_departure() {
+        let repository = TestRepository::new(None);
+        let program = std::env::current_exe().expect("test executable path");
+        let args = vec![
+            "--exact".to_owned(),
+            "hooks::git::tests::probe_command_with_live_descendant".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let marker = repository.repository_path.join("probe-retained-descendant");
+        let helper_executable = std::env::current_exe().expect("test executable path");
+        let (result, owner) = run_git_probe_with_helper_with_cleanup(
+            &program,
+            &repository.repository_path,
+            &args,
+            move |request_path| {
+                let mut command = Command::new(helper_executable);
+                command
+                    .args([
+                        "--exact",
+                        "hooks::git::tests::check_probe_helper_entry",
+                        "--nocapture",
+                    ])
+                    .env(CHECK_PROBE_REQUEST_TEST_ENV, request_path)
+                    .env(PROBE_FIXTURE_MODE_ENV, "descendant")
+                    .env(PROBE_FIXTURE_MARKER_ENV, marker);
+                Ok(command)
+            },
+            Duration::from_millis(50),
+        );
+        let foreground_error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the bounded foreground phase must remain incomplete"),
+        };
+        assert_eq!(foreground_error.code, "HOOK_GIT_CLEANUP_PENDING");
+        let mut owner = match owner {
+            Some(owner) => owner,
+            None => panic!("retain the exact live helper custody"),
+        };
+        assert!(owner.is_pending());
+
+        let marker = repository.repository_path.join("probe-retained-descendant");
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < marker_deadline {
+            owner.poll();
+            thread::sleep(GIT_POLL_INTERVAL);
+        }
+        assert!(
+            marker.exists(),
+            "the real descendant published its identity"
+        );
+        let descendant_identity: Value =
+            serde_json::from_slice(&fs::read(&marker).expect("read the live descendant identity"))
+                .expect("decode the live descendant identity");
+        let direct_identity: Value = serde_json::from_slice(
+            &fs::read(marker.with_extension("direct-id"))
+                .expect("read the direct command identity"),
+        )
+        .expect("decode the direct command identity");
+        let direct_exit_deadline = Instant::now() + Duration::from_secs(5);
+        while process_identity_is_current(&direct_identity) && Instant::now() < direct_exit_deadline
+        {
+            owner.poll();
+            thread::sleep(GIT_POLL_INTERVAL);
+        }
+        assert!(
+            !process_identity_is_current(&direct_identity),
+            "the direct command must exit while its descendant remains live"
+        );
+        assert!(process_identity_is_current(&descendant_identity));
+        while owner.custody.family_identity.is_none() && Instant::now() < direct_exit_deadline {
+            owner.poll();
+        }
+        let family_identity = owner
+            .custody
+            .family_identity
+            .as_ref()
+            .expect("retain the helper's exact family identity");
+        let family_token = owner
+            .custody
+            .family_token
+            .as_deref()
+            .expect("retain the helper's exact family token");
+        assert!(
+            !platform::process_group::departed_empty(family_identity, family_token)
+                .expect("observe the still-live family")
+        );
+        owner.poll();
+        assert!(owner.is_pending(), "a live family must not release custody");
+
+        let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+        while owner.is_pending() && Instant::now() < cleanup_deadline {
+            owner.poll();
+            if owner.is_pending() {
+                thread::sleep(GIT_POLL_INTERVAL);
+            }
+        }
+        assert!(
+            !owner.is_pending(),
+            "exact family departure releases custody"
+        );
+        assert!(owner.custody.family_departed_proven);
+        assert!(!process_identity_is_current(&descendant_identity));
+        let evidence_dir = owner.custody.files.directory.clone();
+        let outcome = owner
+            .into_outcome()
+            .expect("capture the real bounded helper response after departure");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.had_descendants);
+        assert!(outcome.family_departed);
+        assert!(contains_bytes(&outcome.stdout, b"direct-git-stdout\n"));
+        assert!(contains_bytes(&outcome.stdout, b"descendant-git-stdout\n"));
+        assert!(contains_bytes(&outcome.stderr, b"direct-git-stderr\n"));
+        assert!(contains_bytes(&outcome.stderr, b"descendant-git-stderr\n"));
+        assert!(
+            !evidence_dir.exists(),
+            "completed custody removes its files"
+        );
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn real_git_capture_records_direct_exit_live_descendant_and_family_departure() {
+        let repository = TestRepository::new(None);
+        let output = run_probe_fixture(
+            &repository,
+            "hooks::git::tests::probe_command_with_live_descendant",
+            "descendant",
+        );
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.had_descendants);
+        assert!(output.group_empty);
+        assert!(output.family_departed);
+        assert!(!output.output_limited);
+        assert!(!output.probe_success);
+        assert!(contains_bytes(&output.stdout, b"direct-git-stdout\n"));
+        assert!(contains_bytes(&output.stdout, b"descendant-git-stdout\n"));
+        assert!(contains_bytes(&output.stderr, b"direct-git-stderr\n"));
+        assert!(contains_bytes(&output.stderr, b"descendant-git-stderr\n"));
+    }
+
+    #[test]
+    fn real_git_capture_reports_truncated_bytes_from_the_child_pipe() {
+        let repository = TestRepository::new(None);
+        let output = run_probe_fixture(
+            &repository,
+            "hooks::git::tests::probe_command_over_limit",
+            "overflow",
+        );
+        assert!(output.output_limited);
+        assert!(output.group_empty);
+        assert!(output.family_departed);
+        assert_eq!(output.stdout.len(), MAX_GIT_OUTPUT_BYTES);
+        assert!(contains_bytes(&output.stdout, b"real-overflow-prefix:"));
+    }
+
+    #[test]
+    fn a_git_readback_still_returns_bounded_output() {
+        let repository = TestRepository::new(None);
+        let mut probes = GitProbeContext::default();
+        let output = run_git(
+            &mut probes,
+            &repository.git_executable,
+            &repository.repository_path,
+            &["rev-parse", "--verify", "HEAD"],
+        )
+        .expect("a normal Git readback completes and stays bounded");
+        assert!(probes.cleanup_owner.is_none());
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+        assert!(output.stdout.len() <= MAX_GIT_OUTPUT_BYTES);
     }
 }
