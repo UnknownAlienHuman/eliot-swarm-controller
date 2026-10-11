@@ -1,5 +1,14 @@
 # Current-source audit and implementation ledger
 
+The [native disconnect diagnostic repair](../2026-10-10/NATIVE-DISCONNECT-DIAGNOSTICS.json)
+retains the typed disconnect origin with its exact binding transition in one Store
+transaction, and preserves the first static failed dispatch predicate in the rejected
+Operation result. Strict host production Clippy passes on Windows and Linux; the
+five affected cases pass on each platform, retaining the four unchanged Windows
+passes and rerunning only the repaired savepoint case. The disconnect timestamp
+dates the Store transition after request drain, not the earlier IPC signal.
+Fresh native admission and model qualification remain pending.
+
 The [scheduler owner projection](../2026-10-10/SCHEDULER-OWNER-PROJECTION.json)
 adds bounded active-owner and host-scope readback to `host.status`. Its shared pure
 identity validator and affected fixtures pass strict production Clippy on Windows

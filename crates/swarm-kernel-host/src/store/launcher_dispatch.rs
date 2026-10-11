@@ -514,55 +514,127 @@ fn validate_parent_tuple(
     let task_revision = model::positive(attempt, "task_revision")?;
     let progress = &parent.manifest["progress"];
     let route_alias = launch_manifest_route_alias(&parent.manifest)?;
-    let stage_ok = match dispatch_operation_id {
+    let stage_failure = match dispatch_operation_id {
         None => {
-            progress["task_dispatch"] == "not_started"
-                && progress
-                    .get("task_dispatch_operation_id")
-                    .is_none_or(Value::is_null)
-                && progress
-                    .get("task_dispatch_packet_digest")
-                    .is_none_or(Value::is_null)
-                && attempt["start_operation_id"].is_null()
+            if progress["task_dispatch"] != "not_started" {
+                Some("progress.task_dispatch_not_started")
+            } else if !progress
+                .get("task_dispatch_operation_id")
+                .is_none_or(Value::is_null)
+            {
+                Some("progress.task_dispatch_operation_id_absent_or_null")
+            } else if !progress
+                .get("task_dispatch_packet_digest")
+                .is_none_or(Value::is_null)
+            {
+                Some("progress.task_dispatch_packet_digest_absent_or_null")
+            } else if !attempt["start_operation_id"].is_null() {
+                Some("attempt.start_operation_id_null")
+            } else {
+                None
+            }
         }
         Some(operation_id) => {
-            progress["task_dispatch"] == "queued"
-                && progress["task_dispatch_operation_id"] == operation_id
-                && progress["task_dispatch_packet_digest"]
-                    .as_str()
-                    .is_some_and(valid_digest)
-                && attempt["start_operation_id"] == operation_id
+            if progress["task_dispatch"] != "queued" {
+                Some("progress.task_dispatch_queued")
+            } else if progress["task_dispatch_operation_id"] != operation_id {
+                Some("progress.task_dispatch_operation_id_matches")
+            } else if !progress["task_dispatch_packet_digest"]
+                .as_str()
+                .is_some_and(valid_digest)
+            {
+                Some("progress.task_dispatch_packet_digest_valid")
+            } else if attempt["start_operation_id"] != operation_id {
+                Some("attempt.start_operation_id_matches_dispatch")
+            } else {
+                None
+            }
         }
     };
-    if parent.state != "queued"
-        || parent.task_id.as_deref() != Some(task_id)
-        || parent.attempt_id.as_deref() != Some(attempt_id)
-        || parent.binding_id.as_deref() != Some(binding_id)
-        || parent.binding_generation != Some(generation)
-        || parent.manifest["state"] != "awaiting_native_mcp"
-        || parent.manifest["runtime"]["dispatch_permitted"] != false
-        || parent.manifest["task"]["task_id"] != task_id
-        || parent.manifest["task"]["observed_revision"] != task_revision
-        || parent.manifest["task"]["attempt_id"] != attempt_id
-        || parent.manifest["binding"]["binding_id"] != binding_id
-        || parent.manifest["binding"]["generation"] != generation
-        || !stage_ok
-        || task["state"] != "open"
-        || task["revision"] != task_revision
-        || task["current_attempt_id"] != attempt_id
-        || attempt["state"] != "reserved"
-        || attempt["start_owner"] != "controller"
-        || !attempt["released_at_ms"].is_null()
-        || binding["state"] != "ready"
-        || !binding["released_at_ms"].is_null()
-        || binding["route"]["alias"].as_str() != Some(route_alias)
-    {
-        return Err(Error::new(
-            "STALE_LAUNCH_DISPATCH_SCOPE",
-            "launch parent, Task, Attempt, or ready binding is no longer exact",
-        ));
+    macro_rules! reject_if {
+        ($condition:expr, $predicate:literal) => {
+            if $condition {
+                return Err(stale_scope_predicate($predicate));
+            }
+        };
     }
+    reject_if!(parent.state != "queued", "parent.state_queued");
+    reject_if!(
+        parent.task_id.as_deref() != Some(task_id),
+        "parent.task_id_matches_attempt"
+    );
+    reject_if!(
+        parent.attempt_id.as_deref() != Some(attempt_id),
+        "parent.attempt_id_matches_attempt"
+    );
+    reject_if!(
+        parent.binding_id.as_deref() != Some(binding_id),
+        "parent.binding_id_matches_attempt"
+    );
+    reject_if!(
+        parent.binding_generation != Some(generation),
+        "parent.binding_generation_matches_attempt"
+    );
+    reject_if!(
+        parent.manifest["state"] != "awaiting_native_mcp",
+        "manifest.state_awaiting_native_mcp"
+    );
+    reject_if!(
+        parent.manifest["runtime"]["dispatch_permitted"] != false,
+        "manifest.runtime.dispatch_permitted_false"
+    );
+    reject_if!(
+        parent.manifest["task"]["task_id"] != task_id,
+        "manifest.task.task_id_matches_attempt"
+    );
+    reject_if!(
+        parent.manifest["task"]["observed_revision"] != task_revision,
+        "manifest.task.observed_revision_matches_attempt"
+    );
+    reject_if!(
+        parent.manifest["task"]["attempt_id"] != attempt_id,
+        "manifest.task.attempt_id_matches_attempt"
+    );
+    reject_if!(
+        parent.manifest["binding"]["binding_id"] != binding_id,
+        "manifest.binding.binding_id_matches_attempt"
+    );
+    reject_if!(
+        parent.manifest["binding"]["generation"] != generation,
+        "manifest.binding.generation_matches_attempt"
+    );
+    if let Some(predicate) = stage_failure {
+        return Err(stale_scope_predicate(predicate));
+    }
+    reject_if!(task["state"] != "open", "task.state_open");
+    reject_if!(
+        task["revision"] != task_revision,
+        "task.revision_matches_attempt"
+    );
+    reject_if!(
+        task["current_attempt_id"] != attempt_id,
+        "task.current_attempt_id_matches"
+    );
+    reject_if!(attempt["state"] != "reserved", "attempt.state_reserved");
+    reject_if!(
+        attempt["start_owner"] != "controller",
+        "attempt.start_owner_controller"
+    );
+    reject_if!(!attempt["released_at_ms"].is_null(), "attempt.unreleased");
+    reject_if!(binding["state"] != "ready", "binding.state_ready");
+    reject_if!(!binding["released_at_ms"].is_null(), "binding.unreleased");
+    reject_if!(
+        binding["route"]["alias"].as_str() != Some(route_alias),
+        "binding.route.alias_matches_launch_manifest"
+    );
     Ok(())
+}
+
+fn stale_scope_predicate(predicate: &str) -> Error {
+    Error::new(
+        "STALE_LAUNCH_DISPATCH_SCOPE",
+        format!("launch dispatch scope failed predicate: {predicate}"),
+    )
 }
 
 fn build_packet(

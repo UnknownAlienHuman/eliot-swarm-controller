@@ -3,7 +3,7 @@ use crate::{
     error::{Error, Result},
     model::{self, Credential, Request},
     platform,
-    store::Store,
+    store::{DisconnectReason, Store},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -153,14 +153,18 @@ pub(crate) async fn serve_connection(
         }
     });
     let mut requests = JoinSet::new();
-    loop {
+    let disconnect_reason = loop {
         tokio::select! {
             biased;
-            _=stopping.changed()=>break,
-            _=&mut writer_task=>break,
+            _=stopping.changed()=>break DisconnectReason::HostStopping,
+            _=&mut writer_task=>break DisconnectReason::ResponseWriterStopped,
             Some(_)=requests.join_next(), if !requests.is_empty()=>{},
             incoming=reader.next(), if requests.len()<config.max_inflight_per_connection=>{
-                let line=match incoming{Some(Ok(line))=>line,_=>break};
+                let line=match incoming {
+                    Some(Ok(line))=>line,
+                    Some(Err(_))=>break DisconnectReason::ReadFailure,
+                    None=>break DisconnectReason::PeerEof,
+                };
                 let store=store.clone();let principal=principal.clone();let output=output.clone();let limit=config.max_frame_bytes;
                 requests.spawn(async move{
                     let (id,result)=match decode(&line){
@@ -181,10 +185,12 @@ pub(crate) async fn serve_connection(
                 });
             }
         }
-    }
+    };
     // Admitted application work drains even when the client stops reading/disconnects.
     while requests.join_next().await.is_some() {}
-    let disconnect_result = store.disconnected(principal).await;
+    let disconnect_result = store
+        .disconnected_with_reason(principal, disconnect_reason)
+        .await;
     drop(output);
     if !writer_task.is_finished() {
         let _ = writer_task.await;

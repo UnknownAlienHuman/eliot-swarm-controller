@@ -1,7 +1,8 @@
 //! Module admission and facts, scoped by a credential to one reserved native root.
 //! Network I/O is never performed inside these transactions.
 use super::{
-    Store, meta, operations, prerequisites, producers, results, set_meta, task_prompt, tasks,
+    DisconnectReason, Store, meta, operations, prerequisites, producers, results, set_meta,
+    task_prompt, tasks,
 };
 use crate::{
     artifacts::ArtifactRecord,
@@ -3436,11 +3437,17 @@ fn valid_module_event_key(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
-pub(super) fn disconnected(db: &mut Connection, p: &Principal) -> Result<bool> {
+pub(super) fn disconnected(
+    db: &mut Connection,
+    p: &Principal,
+    reason: DisconnectReason,
+) -> Result<bool> {
     if p.role != Role::Module {
         return Ok(false);
     }
-    let Some(c) = meta(db, &format!("client:{}", p.client_id))? else {
+
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(c) = meta(&tx, &format!("client:{}", p.client_id))? else {
         return Ok(false);
     };
     let (Some(binding_id), Some(generation)) = (
@@ -3449,13 +3456,27 @@ pub(super) fn disconnected(db: &mut Connection, p: &Principal) -> Result<bool> {
     ) else {
         return Ok(false);
     };
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let binding = operations::get_binding(&tx, binding_id, generation)?;
     if !binding["released_at_ms"].is_null() || binding["observation"]["module_link_id"] != p.link_id
     {
         return Ok(false);
     }
+    let prior_state = model::text(&binding, "state")?.to_owned();
+    let prior_connection = binding["observation"]["connection"].as_str();
+    let transitioned = matches!(prior_state.as_str(), "ready" | "opening")
+        || prior_connection != Some("disconnected");
     let now = model::now_ms()?;
+    let binding_changed = tx.execute(
+        "UPDATE bindings SET \
+             state=CASE WHEN state IN ('ready','opening') THEN 'reconciling' ELSE state END, \
+             state_json=json_set(state_json,'$.connection','disconnected') \
+         WHERE binding_id=?1 AND generation=?2 \
+           AND json_extract(state_json,'$.module_link_id')=?3 AND released_at_ms IS NULL",
+        params![binding_id, generation, p.link_id],
+    )?;
+    if binding_changed != 1 {
+        return Ok(false);
+    }
     // The closed module link cannot deliver another outcome. Preserve a
     // conservative unknown Operation state; migration 010 records the bounded
     // operation.outcome_unknown fact in this same transaction.
@@ -3468,13 +3489,25 @@ pub(super) fn disconnected(db: &mut Connection, p: &Principal) -> Result<bool> {
     if unknown > 0 {
         super::capacity::sync_binding(&tx, binding_id, generation, now)?;
     }
-    let binding_changed = tx.execute(
-        "UPDATE bindings SET \
-             state=CASE WHEN state IN ('ready','opening') THEN 'reconciling' ELSE state END, \
-             state_json=json_set(state_json,'$.connection','disconnected') \
-         WHERE binding_id=?1 AND generation=?2 \
-           AND json_extract(state_json,'$.module_link_id')=?3 AND released_at_ms IS NULL",
-        params![binding_id, generation, p.link_id],
+    let observation = json!({
+        "module_link_id":p.link_id,
+        "reason":reason.as_str(),
+        "prior_state":prior_state,
+        "transitioned":transitioned,
+        "disconnected_at_ms":now,
+    });
+    tx.execute(
+        "INSERT INTO observations(\
+             source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms\
+         ) VALUES(?1,?2,?3,?4,'module.link_disconnected',?5,?6)",
+        params![
+            format!("module:{}", p.client_id),
+            format!("disconnect:{}", model::new_id()),
+            binding_id,
+            generation,
+            model::canonical(&observation)?,
+            now,
+        ],
     )?;
     tx.commit()?;
     Ok(unknown > 0 || binding_changed > 0)

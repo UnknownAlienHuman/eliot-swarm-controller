@@ -22,6 +22,14 @@ fn module_principal() -> Principal {
     }
 }
 
+fn manager_principal() -> Principal {
+    Principal {
+        link_id: "runtime-admission-manager-link".to_owned(),
+        client_id: MANAGER_ID.to_owned(),
+        role: Role::Manager,
+    }
+}
+
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
@@ -136,6 +144,201 @@ fn insert_corrupted_launcher_open(db: &Connection) {
         ],
     )
     .unwrap();
+}
+
+fn insert_launch_parent_with_route_mismatch(db: &Connection) {
+    let manifest = json!({
+        "state":"awaiting_native_mcp",
+        "progress":{"task_dispatch":"not_started"},
+        "runtime":{
+            "dispatch_permitted":false,
+            "route":{"alias":"another-route"},
+        },
+        "task":{
+            "task_id":TASK_ID,
+            "observed_revision":1,
+            "attempt_id":ATTEMPT_ID,
+        },
+        "binding":{"binding_id":BINDING_ID,"generation":1},
+    });
+    db.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,native_refs_json,due_at_ms,created_at_ms,updated_at_ms) \
+         VALUES(?1,?2,'runtime-admission-launch-parent-request','swarm.launch','{}',?3,?4,?5,?6,1,'queued','{}',0,1,1)",
+        params![
+            LAUNCH_ID,
+            MANAGER_ID,
+            model::canonical(&json!({"launch_manifest":manifest})).unwrap(),
+            TASK_ID,
+            ATTEMPT_ID,
+            BINDING_ID,
+        ],
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE bindings SET state='ready',state_json=json_set(state_json,'$.connection','connected') WHERE binding_id=?1 AND generation=1",
+        [BINDING_ID],
+    )
+    .unwrap();
+}
+
+#[test]
+fn module_link_disconnect_retains_exact_reason_and_transition_in_one_transaction() {
+    let mut db = fixture();
+
+    assert!(
+        runtime::disconnected(&mut db, &module_principal(), DisconnectReason::PeerEof).unwrap()
+    );
+
+    let (binding_id, generation, recorded_at_ms, payload_json): (String, i64, i64, String) = db
+        .query_row(
+            "SELECT binding_id,binding_generation,recorded_at_ms,payload_json \
+             FROM observations WHERE kind='module.link_disconnected'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload_json).unwrap();
+    assert_eq!(binding_id, BINDING_ID);
+    assert_eq!(generation, 1);
+    assert!(recorded_at_ms > 0);
+    assert_eq!(payload["module_link_id"], MODULE_LINK_ID);
+    assert_eq!(payload["reason"], "peer_eof");
+    assert_eq!(payload["prior_state"], "opening");
+    assert_eq!(payload["transitioned"], true);
+    assert_eq!(payload["disconnected_at_ms"], recorded_at_ms);
+    assert_eq!(payload.as_object().unwrap().len(), 5);
+
+    let binding = operations::get_binding(&db, BINDING_ID, 1).unwrap();
+    assert_eq!(binding["state"], "reconciling");
+    assert_eq!(binding["observation"]["connection"], "disconnected");
+}
+
+#[test]
+fn stale_module_link_does_not_mutate_or_observe_new_binding_generation() {
+    let mut db = fixture();
+    let new_link = "runtime-admission-link-generation-two";
+    let route_json: String = db
+        .query_row(
+            "SELECT route_json FROM bindings WHERE binding_id=?1 AND generation=1",
+            [BINDING_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let state_json = model::canonical(&json!({
+        "module_client_id":MODULE_ID,
+        "module_link_id":new_link,
+        "connection":"connected",
+    }))
+    .unwrap();
+    db.execute(
+        "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
+         VALUES(?1,2,'runtime-admission-lane-two','runtime-admission-instance','eliot-opencode-v2.http.1','ready',?2,?3,2)",
+        params![BINDING_ID, route_json, state_json],
+    )
+    .unwrap();
+    set_meta(
+        &db,
+        &format!("client:{MODULE_ID}"),
+        &json!({
+            "role":"module",
+            "disabled":false,
+            "binding_id":BINDING_ID,
+            "binding_generation":2,
+        }),
+    )
+    .unwrap();
+
+    assert!(
+        !runtime::disconnected(&mut db, &module_principal(), DisconnectReason::PeerEof).unwrap()
+    );
+
+    let binding = operations::get_binding(&db, BINDING_ID, 2).unwrap();
+    assert_eq!(binding["state"], "ready");
+    assert_eq!(binding["observation"]["module_link_id"], new_link);
+    assert_eq!(binding["observation"]["connection"], "connected");
+    let observations: i64 = db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE kind='module.link_disconnected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(observations, 0);
+}
+
+#[test]
+fn host_stop_is_retained_as_a_distinct_disconnect_reason() {
+    let mut db = fixture();
+    assert!(
+        runtime::disconnected(&mut db, &module_principal(), DisconnectReason::HostStopping)
+            .unwrap()
+    );
+    let payload_json: String = db
+        .query_row(
+            "SELECT payload_json FROM observations WHERE kind='module.link_disconnected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload_json).unwrap();
+    assert_eq!(payload["reason"], "host_stopping");
+    assert_eq!(payload["prior_state"], "opening");
+}
+
+#[test]
+fn scope_predicate_is_retained_after_mutation_rejection_savepoint() {
+    let mut db = fixture();
+    // Earlier admission-only fixtures stop before provider-condition reads.
+    // This mutation exercises the real enabled-route admission path as well.
+    db.execute_batch(PROVIDER_CONDITION_SCHEMA).unwrap();
+    insert_launch_parent_with_route_mismatch(&db);
+    let binding = operations::get_binding(&db, BINDING_ID, 1).unwrap();
+    // Current route enablement is checked before the parent tuple. Use the
+    // retained fixture route so this test reaches the intended stale-scope guard.
+    let config = Config {
+        routes: vec![serde_json::from_value(binding["route"].clone()).unwrap()],
+        ..Config::default()
+    };
+    let admission = runtime::binding_route_admission(&db, &binding, Some(&config), None).unwrap();
+    assert!(matches!(
+        admission.decision,
+        provider_conditions::RouteAdmissionDecision::Admit
+    ));
+    let request = json!({
+        "client_request_id":"runtime-admission-dispatch-savepoint",
+        "attempt_id":ATTEMPT_ID,
+        "text":"fixture dispatch input",
+        "launch_operation_id":LAUNCH_ID,
+    });
+    let error = mutate(
+        &mut db,
+        &manager_principal(),
+        "task.dispatch",
+        &request,
+        &config,
+    )
+    .expect_err("mismatched launch route is durably rejected");
+    assert_eq!(error.code, "STALE_LAUNCH_DISPATCH_SCOPE");
+    assert_eq!(
+        error.message,
+        "launch dispatch scope failed predicate: binding.route.alias_matches_launch_manifest"
+    );
+
+    let (state, result_json): (String, String) = db
+        .query_row(
+            "SELECT state,result_json FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+            params![MANAGER_ID, "runtime-admission-dispatch-savepoint"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let retained: Value = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(state, "rejected");
+    assert_eq!(retained["code"], "STALE_LAUNCH_DISPATCH_SCOPE");
+    assert_eq!(
+        retained["message"],
+        "launch dispatch scope failed predicate: binding.route.alias_matches_launch_manifest"
+    );
 }
 
 #[test]

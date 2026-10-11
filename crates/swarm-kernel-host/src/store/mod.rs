@@ -135,6 +135,28 @@ type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
 type Job = swarm_kernel::WriterJob<RunJob, message_batch::Request>;
 type KernelHost = swarm_kernel::KernelHost<RunJob, message_batch::Request, Error>;
 type KernelHostHandle = swarm_kernel::KernelHostHandle<RunJob, message_batch::Request>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisconnectReason {
+    PeerEof,
+    ReadFailure,
+    ResponseWriterStopped,
+    HostStopping,
+    UnknownOrigin,
+}
+
+impl DisconnectReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerEof => "peer_eof",
+            Self::ReadFailure => "read_failure",
+            Self::ResponseWriterStopped => "response_writer_stopped",
+            Self::HostStopping => "host_stopping",
+            Self::UnknownOrigin => "unknown_origin",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     kernel: KernelHostHandle,
@@ -2784,10 +2806,19 @@ impl Store {
         .await
     }
     pub async fn disconnected(&self, principal: Principal) -> Result<()> {
+        self.disconnected_with_reason(principal, DisconnectReason::UnknownOrigin)
+            .await
+    }
+
+    pub(crate) async fn disconnected_with_reason(
+        &self,
+        principal: Principal,
+        reason: DisconnectReason,
+    ) -> Result<()> {
         let client_id = principal.client_id.clone();
         let link_id = principal.link_id.clone();
         let changed = match self
-            .run(move |db| runtime::disconnected(db, &principal))
+            .run(move |db| runtime::disconnected(db, &principal, reason))
             .await
         {
             Ok(changed) => changed,

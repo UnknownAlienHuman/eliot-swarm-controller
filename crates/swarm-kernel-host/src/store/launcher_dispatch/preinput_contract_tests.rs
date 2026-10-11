@@ -399,7 +399,7 @@ fn packet_rejects_assignment_identity_mismatch() {
 }
 
 #[test]
-fn parent_tuple_rejects_binding_route_scope_mismatch() {
+fn parent_tuple_reports_first_binding_scope_predicate() {
     let mut fixture = packet_fixture();
     fixture.binding["route"]["alias"] = json!("another-route");
 
@@ -412,4 +412,24 @@ fn parent_tuple_rejects_binding_route_scope_mismatch() {
     )
     .expect_err("a changed binding route must not satisfy the launch tuple");
     assert_eq!(error.code, "STALE_LAUNCH_DISPATCH_SCOPE");
+    assert_eq!(
+        error.message,
+        "launch dispatch scope failed predicate: binding.route.alias_matches_launch_manifest"
+    );
+
+    fixture.binding["route"]["alias"] = json!(ROUTE_ALIAS);
+    fixture.binding["state"] = json!("reconciling");
+    let error = validate_parent_tuple(
+        &fixture.parent,
+        &fixture.attempt,
+        &fixture.task,
+        &fixture.binding,
+        None,
+    )
+    .expect_err("a reconciling binding must fail its unchanged ready predicate");
+    assert_eq!(error.code, "STALE_LAUNCH_DISPATCH_SCOPE");
+    assert_eq!(
+        error.message,
+        "launch dispatch scope failed predicate: binding.state_ready"
+    );
 }
