@@ -1,5 +1,14 @@
 # Current-source audit and implementation ledger
 
+The [C8 stage digest repair](../2026-10-10/NATIVE-MCP-PROJECTION-DIGEST-REPAIR.json)
+consumes the exact producer format and validates each retained stage digest.
+Unknown hooks keep explicit null digests and stay unknown. Observed and
+unsupported hooks require the canonical raw tool digest; unexpected fields,
+damaged digests and mismatched model/time remain refused. Strict host production
+Clippy and all four new regressions pass on Windows and Linux. Independent Kilo
+review accepted the exact source hashes with no P1/P2 findings. Fresh native
+qualification remains pending.
+
 Fresh [R execution](../2026-10-10/EXECUTION-RESULTS-R.json) built and installed
 eight exact clean `6853278` release packages. OpenCode reached registered and
 connected C8 install, an observed challenge and retained inventory of 11 tools,
@@ -7,8 +16,8 @@ but current readiness timed out with `unavailable`; no dispatch occurred.
 Antigravity was not run. Retained payload and source tracing confirm that the
 native producer always adds stage `digest` fields while the Store's closed stage
 readers reject those fields. This is a confirmed format mismatch; the first
-transaction-time refusal has not been reconstructed. Its repair is pending
-source checks. R remains retained without replay; model consumption and Task
+transaction-time refusal has not been reconstructed. Its source repair is
+verified separately above. R remains retained without replay; model consumption and Task
 completion are unproven.
 
 The [current MCP readiness repair](../2026-10-10/NATIVE-MCP-CURRENT-READINESS-REPAIR.json)

@@ -2581,9 +2581,11 @@ fn project_session_context(raw: &Value, challenge: &Value) -> Result<Value> {
             "agent",
             "tools",
             "reason_code",
+            "digest",
         ],
     )?;
     let status = model::text(raw, "status")?;
+    validate_observation_tools_digest(raw, status)?;
     if status == "unknown"
         && raw["stage"].is_null()
         && raw["observed_at_ms"].is_null()
@@ -2653,9 +2655,11 @@ fn project_provider_request(
             "model",
             "tools",
             "reason_code",
+            "digest",
         ],
     )?;
     let status = model::text(raw, "status")?;
+    validate_observation_tools_digest(raw, status)?;
     if status == "unknown"
         && raw["transport"].is_null()
         && raw["stage"].is_null()
@@ -2720,6 +2724,25 @@ fn project_provider_request(
             "provider-request observation status is invalid",
         )),
     }
+}
+
+// The native producer always emits this field: null before a hook observes
+// schemas, otherwise the digest of its complete tool array. Validate that
+// retained shape before producing the narrower dispatch projection.
+fn validate_observation_tools_digest(raw: &Value, status: &str) -> Result<()> {
+    let digest = raw
+        .get("digest")
+        .ok_or_else(|| record_error("observation tool digest is missing"))?;
+    if status == "unknown" {
+        if !digest.is_null() {
+            return Err(record_error("unknown observation tool digest is not null"));
+        }
+    } else if digest.as_str() != Some(digest_json(&raw["tools"])?.as_str()) {
+        return Err(record_error(
+            "observation tool digest does not match its tools",
+        ));
+    }
+    Ok(())
 }
 
 fn project_context_tools(raw: &Value) -> Result<Value> {
@@ -4113,6 +4136,10 @@ fn stale_scope() -> Error {
 fn record_error(message: &str) -> Error {
     Error::new("NATIVE_MCP_STORE", message)
 }
+
+#[cfg(test)]
+#[path = "launcher_mcp_projection_tests.rs"]
+mod projection_contract_tests;
 
 #[cfg(test)]
 mod failure_event_tests {
