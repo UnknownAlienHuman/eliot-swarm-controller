@@ -1718,8 +1718,20 @@ pub(super) fn ensure_execution_inputs(
     verified: &source::VerifiedSource,
     profile: &CheckProfile,
 ) -> Result<(PathBuf, PathBuf, source::SourceManifest)> {
+    ensure_execution_inputs_for_layout(data_dir, files, candidate, verified, profile, 2)
+}
+
+pub(super) fn ensure_execution_inputs_for_layout(
+    data_dir: &Path,
+    files: &ArtifactFiles,
+    candidate: &ArtifactRecord,
+    verified: &source::VerifiedSource,
+    profile: &CheckProfile,
+    receipt_version: u32,
+) -> Result<(PathBuf, PathBuf, source::SourceManifest)> {
     let data_root = fs::canonicalize(data_dir)?;
-    let (workspace, descriptor) = inputs::execution_paths(&data_root, profile, verified)?;
+    let (workspace, descriptor) =
+        inputs::execution_paths_for_layout(&data_root, profile, verified, receipt_version)?;
     let parent = workspace
         .parent()
         .ok_or_else(|| Error::invalid("content-addressed workspace has no parent"))?;

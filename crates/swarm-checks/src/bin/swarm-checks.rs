@@ -156,7 +156,8 @@ impl CheckControl for FileCheckControl {
             "token": owner.token,
             "process": owner.process,
             "ready_at_ms": now_ms()?,
-            "control_version": 2
+            "control_version": 2,
+            "plan_receipt_version": 2
         });
         write_once(&self.bootstrap.job_dir.join("worker.json"), &identity)?;
         self.owner_process = Some(owner.process.clone());
@@ -474,13 +475,22 @@ fn identity_from_worker(job_dir: &Path, identity: &CheckIdentity) -> Result<Owne
     let value = read_value(&job_dir.join("worker.json"), MAX_CONTROL_BYTES)?;
     exact_fields(
         &value,
-        &["token", "process", "ready_at_ms", "control_version"],
+        &[
+            "token",
+            "process",
+            "ready_at_ms",
+            "control_version",
+            "plan_receipt_version",
+        ],
         "worker identity",
     )?;
     if value["token"] != identity.token {
         return Err(Error::conflict("worker token differs from its bootstrap"));
     }
     if value["control_version"] != 2
+        || value
+            .get("plan_receipt_version")
+            .is_some_and(|version| !matches!(version.as_u64(), Some(1 | 2)))
         || value["ready_at_ms"].as_i64().is_none_or(|value| value < 0)
         || value["process"].is_null()
     {
@@ -562,7 +572,9 @@ fn load_execution_plan(job_dir: &Path, owner: &OwnedCheckProcess) -> Result<Load
         ],
         "plan-ready receipt",
     )?;
-    if receipt["version"] != 1
+    // The retained receipt version binds the host workspace layout. Both
+    // layouts retain the same digest-bound one-use execution plan protocol.
+    if !matches!(receipt["version"].as_u64(), Some(1 | 2))
         || receipt["check_id"] != owner.check_id
         || receipt["operation_id"] != owner.operation_id
         || receipt["token"] != owner.token

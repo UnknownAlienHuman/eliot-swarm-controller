@@ -36,6 +36,9 @@ const EXECUTOR_FAILURE_FILE: &str = "executor-failure.json";
 const EXECUTION_FILE: &str = "execution.json";
 const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PLAN_BYTES: u64 = 4 * 1024 * 1024;
+// The durable receipt selects the physical workspace layout after the executor
+// consumes the raw one-use plan: 1 = legacy nested, 2 = compact full digest.
+const COMPACT_PLAN_RECEIPT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 struct VerifiedExecutor {
@@ -110,6 +113,7 @@ struct StreamEvidence {
     path: PathBuf,
     bytes_written: u64,
     bytes_observed: u64,
+    sha256: String,
     truncated: bool,
     capture_complete: bool,
     capture_disposition: String,
@@ -210,7 +214,8 @@ pub(crate) fn prepare_and_spawn(
                 "the running checks executor image could not be verified",
             )
         })?;
-        if image["image_sha256"].as_str() != Some(executor.sha256.as_str())
+        let expected_image_sha256 = format!("sha256:{}", executor.sha256);
+        if image["image_sha256"].as_str() != Some(expected_image_sha256.as_str())
             || image_path != path_text(&executor.executable)?
         {
             return Err(Error::new(
@@ -264,7 +269,7 @@ pub(crate) fn materialize_plan(
     if ready_path.try_exists()? {
         let receipt: PlanReceipt =
             serde_json::from_value(read_value(&ready_path, MAX_RECEIPT_BYTES)?)?;
-        if receipt.version != 1
+        if !matches!(receipt.version, 1 | COMPACT_PLAN_RECEIPT_VERSION)
             || receipt.check_id != work.check_id
             || receipt.operation_id != work.operation_id
             || receipt.token != work.token
@@ -279,6 +284,7 @@ pub(crate) fn materialize_plan(
         return Ok(());
     }
 
+    let receipt_version = negotiated_plan_receipt_version(work, &current_worker)?;
     let verified = source::verified_content(files, &work.data_dir, &work.candidate)?;
     let context = plan_context(work, &verified)?;
     let (argv, _expected_targets, executable) = if let Some(resolved) = &work.resolved_inputs {
@@ -314,12 +320,13 @@ pub(crate) fn materialize_plan(
             "resolved executable differs from its digest-bound context",
         ));
     }
-    let (source_dir, candidate_file, _) = worker::ensure_execution_inputs(
+    let (source_dir, candidate_file, _) = worker::ensure_execution_inputs_for_layout(
         &work.data_dir,
         files,
         &work.candidate,
         &verified,
         &work.profile,
+        receipt_version,
     )?;
     let mut environment = inputs::effective_environment(&work.profile);
     let data_root = fs::canonicalize(&work.data_dir)?;
@@ -375,7 +382,7 @@ pub(crate) fn materialize_plan(
         ));
     }
     let receipt = PlanReceipt {
-        version: 1,
+        version: receipt_version,
         check_id: work.check_id.clone(),
         operation_id: work.operation_id.clone(),
         token: work.token.clone(),
@@ -475,7 +482,7 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
                 MAX_RECEIPT_BYTES,
             )?)?;
             let expected_context = expected_context(work, files, &plan_ready.context)?;
-            if plan_ready.version != 1
+            if !matches!(plan_ready.version, 1 | COMPACT_PLAN_RECEIPT_VERSION)
                 || plan_ready.check_id != work.check_id
                 || plan_ready.operation_id != work.operation_id
                 || plan_ready.token != work.token
@@ -488,6 +495,15 @@ pub(crate) fn finalize_execution(work: &Work, files: &ArtifactFiles) -> Result<O
                     "execution plan differs from the admitted candidate, profile or process",
                 ));
             }
+            let verified = source::verified_content(files, &work.data_dir, &work.candidate)?;
+            retained_execution_workspace(
+                work,
+                &directory,
+                &identity,
+                &verified,
+                receipt.plan_sha256.as_deref(),
+                receipt.context.as_ref(),
+            )?;
         } else if receipt.context.is_some() || receipt.started_at_ms.is_some() {
             return Err(Error::conflict(
                 "execution without a plan contains plan-dependent evidence",
@@ -697,8 +713,20 @@ fn build_completion(
         }
 
         let verified = source::verified_content(files, &work.data_dir, &work.candidate)?;
-        let data_root = fs::canonicalize(&work.data_dir)?;
-        let (source_dir, _) = inputs::execution_paths(&data_root, &work.profile, &verified)?;
+        let source_dir = retained_execution_workspace(
+            work,
+            directory,
+            identity,
+            &verified,
+            receipt.plan_sha256.as_deref(),
+            receipt.context.as_ref(),
+        )?;
+        let metadata = fs::symlink_metadata(&source_dir)?;
+        if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+            return Err(Error::conflict(
+                "retained execution workspace is not a regular directory",
+            ));
+        }
         let source_dir = fs::canonicalize(source_dir).map_err(|_| {
             Error::new(
                 "CHECK_INPUTS_STALE",
@@ -744,6 +772,7 @@ fn build_completion(
                     "stream":name,
                     "bytes_written":stream.bytes_written,
                     "bytes_observed":stream.bytes_observed,
+                    "captured_prefix_sha256":stream.sha256,
                     "truncated":stream.truncated,
                     "capture_complete":stream.capture_complete,
                     "capture_disposition":stream.capture_disposition,
@@ -1108,10 +1137,72 @@ fn add_stream_gaps(coverage: &mut Value, execution: &ExecutionEvidence) -> Resul
     Ok(())
 }
 
+fn negotiated_plan_receipt_version(work: &Work, worker: &Value) -> Result<u32> {
+    // Old live executors have no advertisement. Their pending one-use plan must
+    // keep the legacy layout and receipt, rather than silently receiving v2.
+    let version = match worker.get("plan_receipt_version") {
+        None => 1,
+        Some(value) if value.as_u64() == Some(1) => 1,
+        Some(value) if value.as_u64() == Some(u64::from(COMPACT_PLAN_RECEIPT_VERSION)) => {
+            COMPACT_PLAN_RECEIPT_VERSION
+        }
+        Some(_) => return Err(Error::conflict("executor plan receipt version is invalid")),
+    };
+    if version == 1
+        && work.resolved_inputs.as_ref().is_some_and(|inputs| {
+            inputs.get("execution_layout").is_some() && inputs["execution_layout"]["version"] != 1
+        })
+    {
+        return Err(Error::new(
+            "CHECK_EXECUTOR_UPGRADE_REQUIRED",
+            "this admitted workspace layout requires a compatible checks executor",
+        ));
+    }
+    Ok(version)
+}
+
+fn retained_execution_workspace(
+    work: &Work,
+    directory: &Path,
+    identity: &Value,
+    verified: &source::VerifiedSource,
+    plan_sha256: Option<&str>,
+    context: Option<&PlanContext>,
+) -> Result<PathBuf> {
+    let plan: PlanReceipt = serde_json::from_value(read_value(
+        &directory.join(PLAN_READY_FILE),
+        MAX_RECEIPT_BYTES,
+    )?)?;
+    if !matches!(plan.version, 1 | COMPACT_PLAN_RECEIPT_VERSION)
+        || plan.check_id != work.check_id
+        || plan.operation_id != work.operation_id
+        || plan.token != work.token
+        || plan.process != identity["process"]
+        || plan_sha256 != Some(plan.plan_sha256.as_str())
+        || context != Some(&plan.context)
+    {
+        return Err(Error::conflict(
+            "retained execution plan owner or context differs",
+        ));
+    }
+    let data_root = fs::canonicalize(&work.data_dir)?;
+    // One layout selector is shared with materialization. The durable receipt
+    // selects the original directory after the raw one-use plan is consumed.
+    Ok(inputs::execution_paths_for_layout(&data_root, &work.profile, verified, plan.version)?.0)
+}
+
 fn verify_stream_path(evidence: &StreamEvidence, expected: &Path, required: bool) -> Result<()> {
     if evidence.path != expected {
         return Err(Error::conflict(
             "output path differs from the fixed CheckRun stream",
+        ));
+    }
+    if !valid_sha256(&evidence.sha256)
+        || evidence.bytes_written > MAX_CAPTURE_BYTES_PER_STREAM
+        || evidence.bytes_observed < evidence.bytes_written
+    {
+        return Err(Error::invalid(
+            "captured output digest or byte count is invalid",
         ));
     }
     if evidence.path.try_exists()? {
@@ -1126,8 +1217,32 @@ fn verify_stream_path(evidence: &StreamEvidence, expected: &Path, required: bool
                 "output file differs from the bounded capture receipt",
             ));
         }
+        let mut file = File::open(&evidence.path)?;
+        let mut hash = Sha256::new();
+        let mut remaining = evidence.bytes_written;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let limit = remaining.min(buffer.len() as u64) as usize;
+            let count = file.read(&mut buffer[..limit])?;
+            if count == 0 {
+                return Err(Error::conflict("captured output prefix is incomplete"));
+            }
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        if format!("{:x}", hash.finalize()) != evidence.sha256
+            || (evidence.capture_complete && file.read(&mut buffer[..1])? != 0)
+        {
+            return Err(Error::conflict(
+                "captured output differs from its digest receipt",
+            ));
+        }
     } else if required || evidence.bytes_written != 0 || evidence.capture_complete {
         return Err(Error::conflict("captured output file is missing"));
+    } else if evidence.sha256 != digest(b"") {
+        return Err(Error::conflict(
+            "absent output differs from the empty capture digest",
+        ));
     }
     Ok(())
 }
@@ -1427,7 +1542,7 @@ mod execution_evidence_fixtures {
         };
         let verified = source::verified_content(&files, &root, &work.candidate).unwrap();
         let (workspace, _) = inputs::execution_paths(&root, &work.profile, &verified).unwrap();
-        fs::create_dir_all(workspace).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
         let directory = check_directory(&work, true).unwrap();
         let identity =
             json!({"token":work.token,"control_version":2,"process":{"fixture_owner":work.token}});
@@ -1437,7 +1552,7 @@ mod execution_evidence_fixtures {
         let stream = |name: &str| {
             let path = directory.join(name);
             fs::write(&path, []).unwrap();
-            json!({"path":path,"bytes_written":0,"bytes_observed":0,"truncated":false,
+            json!({"path":path,"bytes_written":0,"bytes_observed":0,"sha256":digest(b""),"truncated":false,
                 "capture_complete":true,"capture_disposition":"complete","capture_error":null})
         };
         let context = PlanContext {
@@ -1450,11 +1565,19 @@ mod execution_evidence_fixtures {
             profile_identity_sha256: inputs::profile_identity_sha256(&work.profile).unwrap(),
             scope_plan_sha256: digest(canonical(&Value::Null).unwrap().as_bytes()),
         };
-        let plan_sha256 = "c".repeat(64);
+        let plan = json!({
+            "version":1,
+            "identity":{"check_id":work.check_id,"operation_id":work.operation_id,"token":work.token},
+            "process":identity["process"],"context":context,
+            "plan":{"working_directory":path_text(&workspace).unwrap()}
+        });
+        let plan_bytes = canonical(&plan).unwrap().into_bytes();
+        fs::write(directory.join(PLAN_FILE), &plan_bytes).unwrap();
+        let plan_sha256 = digest(&plan_bytes);
         worker::write_once(
             &directory.join(PLAN_READY_FILE),
             &json!(PlanReceipt {
-                version: 1,
+                version: COMPACT_PLAN_RECEIPT_VERSION,
                 check_id: work.check_id.clone(),
                 operation_id: work.operation_id.clone(),
                 token: work.token.clone(),
@@ -1479,6 +1602,149 @@ mod execution_evidence_fixtures {
             }
         });
         (root, work, receipt)
+    }
+
+    #[test]
+    fn retained_legacy_owner_negotiates_v1_and_cannot_execute_compact_cache_provenance() {
+        let (root, mut work, _) = fixture("observed", Some(0));
+        assert_eq!(
+            negotiated_plan_receipt_version(&work, &json!({})).unwrap(),
+            1
+        );
+        work.resolved_inputs = Some(json!({"execution_layout":{"version":2}}));
+        assert_eq!(
+            negotiated_plan_receipt_version(&work, &json!({}))
+                .unwrap_err()
+                .code,
+            "CHECK_EXECUTOR_UPGRADE_REQUIRED"
+        );
+        assert_eq!(
+            negotiated_plan_receipt_version(&work, &json!({"plan_receipt_version":2})).unwrap(),
+            COMPACT_PLAN_RECEIPT_VERSION
+        );
+        assert_eq!(
+            negotiated_plan_receipt_version(&work, &json!({"plan_receipt_version":3}))
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn captured_stream_digest_rejects_corruption_and_verifies_only_retained_prefix() {
+        let (root, work, mut receipt) = fixture("observed", Some(0));
+        let directory = check_directory(&work, false).unwrap();
+        let identity = read_value(&directory.join("worker.json"), MAX_RECEIPT_BYTES).unwrap();
+        fs::write(directory.join("stdout"), b"prefixsuffix").unwrap();
+        receipt["execution"]["stdout"]["bytes_written"] = json!(6);
+        receipt["execution"]["stdout"]["bytes_observed"] = json!(12);
+        receipt["execution"]["stdout"]["sha256"] = json!(digest(b"prefix"));
+        receipt["execution"]["stdout"]["capture_complete"] = json!(false);
+        receipt["execution"]["stdout"]["capture_disposition"] = json!("incomplete");
+        let parsed = serde_json::from_value(receipt.clone()).unwrap();
+        validate_execution_receipt(&work, &identity, &directory, &parsed).unwrap();
+        let files = ArtifactFiles::new(&root).unwrap();
+        let completion =
+            build_completion(&work, &files, &directory, &identity, parsed, true).unwrap();
+        assert_eq!(completion.state, "incomplete");
+        // Later bytes are not covered by the receipt's retained-prefix hash.
+        fs::write(directory.join("stdout"), b"prefixchanged").unwrap();
+        let parsed = serde_json::from_value(receipt.clone()).unwrap();
+        validate_execution_receipt(&work, &identity, &directory, &parsed).unwrap();
+        fs::write(directory.join("stdout"), b"tamperchanged").unwrap();
+        assert_eq!(
+            validate_execution_receipt(&work, &identity, &directory, &parsed)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        fs::write(directory.join("stdout"), b"pre").unwrap();
+        assert_eq!(
+            validate_execution_receipt(&work, &identity, &directory, &parsed)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        fs::write(directory.join("stdout"), b"prefixsuffix").unwrap();
+        receipt["execution"]["stdout"]["capture_complete"] = json!(true);
+        receipt["execution"]["stdout"]["capture_disposition"] = json!("complete");
+        let parsed = serde_json::from_value(receipt.clone()).unwrap();
+        assert_eq!(
+            validate_execution_receipt(&work, &identity, &directory, &parsed)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        receipt["execution"]["stdout"]["sha256"] = json!("sha256:bad");
+        let parsed = serde_json::from_value(receipt).unwrap();
+        assert_eq!(
+            validate_execution_receipt(&work, &identity, &directory, &parsed)
+                .unwrap_err()
+                .code,
+            "INVALID_PARAMS"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_workspace_recovery_uses_durable_receipt_after_one_use_plan_consumption() {
+        let (root, work, mut receipt) = fixture("observed", Some(0));
+        let directory = check_directory(&work, false).unwrap();
+        let identity = read_value(&directory.join("worker.json"), MAX_RECEIPT_BYTES).unwrap();
+        let files = ArtifactFiles::new(&root).unwrap();
+        let verified = source::verified_content(&files, &root, &work.candidate).unwrap();
+        let legacy = root
+            .join("check-inputs")
+            .join(work.profile.resource.to_ascii_lowercase())
+            .join(inputs::profile_identity_sha256(&work.profile).unwrap())
+            .join(&verified.content_sha256);
+        fs::create_dir_all(&legacy).unwrap();
+        let mut plan = read_value(&directory.join(PLAN_FILE), MAX_PLAN_BYTES).unwrap();
+        plan["plan"]["working_directory"] = json!(path_text(&legacy).unwrap());
+        let bytes = canonical(&plan).unwrap().into_bytes();
+        fs::write(directory.join(PLAN_FILE), &bytes).unwrap();
+        receipt["plan_sha256"] = json!(digest(&bytes));
+        let mut ready = read_value(&directory.join(PLAN_READY_FILE), MAX_RECEIPT_BYTES).unwrap();
+        ready["version"] = json!(1);
+        ready["plan_sha256"] = receipt["plan_sha256"].clone();
+        fs::write(directory.join(PLAN_READY_FILE), canonical(&ready).unwrap()).unwrap();
+        fs::remove_file(directory.join(PLAN_FILE)).unwrap();
+        let parsed: ExecutionReceipt = serde_json::from_value(receipt.clone()).unwrap();
+        assert_eq!(
+            retained_execution_workspace(
+                &work,
+                &directory,
+                &identity,
+                &verified,
+                parsed.plan_sha256.as_deref(),
+                parsed.context.as_ref()
+            )
+            .unwrap(),
+            fs::canonicalize(&legacy).unwrap()
+        );
+        worker::write_once(&directory.join(EXECUTION_FILE), &receipt).unwrap();
+        assert_eq!(
+            finalize_execution(&work, &files).unwrap().unwrap().state,
+            "passed"
+        );
+        // An unsupported layout receipt never guesses a workspace directory.
+        ready["version"] = json!(3);
+        fs::write(directory.join(PLAN_READY_FILE), canonical(&ready).unwrap()).unwrap();
+        assert_eq!(
+            retained_execution_workspace(
+                &work,
+                &directory,
+                &identity,
+                &verified,
+                parsed.plan_sha256.as_deref(),
+                parsed.context.as_ref()
+            )
+            .unwrap_err()
+            .code,
+            "CONFLICT"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -809,8 +809,23 @@ pub(crate) fn execution_paths(
     profile: &CheckProfile,
     candidate: &VerifiedSource,
 ) -> Result<(PathBuf, PathBuf)> {
-    if candidate.content_sha256.len() != 64
-        || !candidate
+    execution_paths_for_layout(
+        data_dir,
+        profile,
+        candidate,
+        EXECUTION_WORKSPACE_LAYOUT_VERSION,
+    )
+}
+
+/// Select deterministic physical paths from the retained plan's layout version.
+pub(crate) fn execution_paths_for_layout(
+    data_dir: &Path,
+    profile: &CheckProfile,
+    verified: &VerifiedSource,
+    layout_version: u32,
+) -> Result<(PathBuf, PathBuf)> {
+    if verified.content_sha256.len() != 64
+        || !verified
             .content_sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
@@ -820,13 +835,31 @@ pub(crate) fn execution_paths(
             "candidate content identity is malformed",
         ));
     }
-    let profile_sha256 = profile_identity_sha256(profile)?;
     let base = data_dir
         .join("check-inputs")
-        .join(profile.resource.to_ascii_lowercase())
-        .join(profile_sha256);
-    let workspace = base.join(&candidate.content_sha256);
-    let descriptor = base.join(format!("{}.candidate.json", candidate.content_sha256));
+        .join(profile.resource.to_ascii_lowercase());
+    let (base, workspace_key) = match layout_version {
+        1 => (
+            base.join(profile_identity_sha256(profile)?),
+            verified.content_sha256.clone(),
+        ),
+        EXECUTION_WORKSPACE_LAYOUT_VERSION => {
+            // One full digest binds the profile, resource and candidate without
+            // two nested digest directories exceeding Windows' cwd boundary.
+            let workspace_key = model::digest(
+                model::canonical(&execution_workspace_identity(profile, verified)?)?.as_bytes(),
+            );
+            (base, workspace_key)
+        }
+        _ => {
+            return Err(Error::new(
+                "CHECK_INPUTS_STALE",
+                "execution workspace layout version is unsupported",
+            ));
+        }
+    };
+    let workspace = base.join(&workspace_key);
+    let descriptor = base.join(format!("{workspace_key}.candidate.json"));
     Ok((workspace, descriptor))
 }
 
@@ -1906,9 +1939,24 @@ fn has_versioned_build_environment(profile: &CheckProfile) -> bool {
         .is_some_and(|identity| !identity.trim().is_empty())
 }
 
+// Physical layout version 1 used nested profile/candidate digests; version 2
+// uses the compact digest of the unchanged semantic execution_workspace identity.
+const EXECUTION_WORKSPACE_LAYOUT_VERSION: u32 = 2;
+const LEGACY_INPUT_FINGERPRINT_VERSION: u32 = 1;
+const INPUT_FINGERPRINT_VERSION: u32 = 2;
+
 fn fingerprint(resolved_inputs: &Value, scope_plan: &ScopePlan) -> Result<String> {
-    let fingerprint_input = json!({
-        "version": 1,
+    // Keep the version-1 preimage for durable plans written before physical
+    // layout provenance was recorded. New plans hash both the version-2
+    // preimage and the separate layout descriptor.
+    let layout = resolved_inputs.get("execution_layout");
+    let version = if layout.is_some() {
+        INPUT_FINGERPRINT_VERSION
+    } else {
+        LEGACY_INPUT_FINGERPRINT_VERSION
+    };
+    let mut fingerprint_input = json!({
+        "version": version,
         "candidate_content_sha256": resolved_inputs["candidate_content_sha256"],
         "baseline_content_sha256": resolved_inputs["baseline_content_sha256"],
         "profile_id": resolved_inputs["profile_id"],
@@ -1926,6 +1974,9 @@ fn fingerprint(resolved_inputs: &Value, scope_plan: &ScopePlan) -> Result<String
         "versioned_external_inputs": resolved_inputs["versioned_external_inputs"],
         "scope_plan": scope_plan,
     });
+    if let Some(layout) = layout {
+        fingerprint_input["execution_layout"] = layout.clone();
+    }
     Ok(model::digest(
         model::canonical(&fingerprint_input)?.as_bytes(),
     ))
@@ -2110,6 +2161,9 @@ fn resolve_with_context(
         "external_cargo_config_unverified": external_cargo_config_unverified,
     });
     resolved_inputs["execution_workspace"] = execution_workspace_identity(profile, candidate)?;
+    resolved_inputs["execution_layout"] = json!({
+        "version": EXECUTION_WORKSPACE_LAYOUT_VERSION,
+    });
     resolved_inputs["scope_plan"] = serde_json::to_value(&scope_plan)?;
     let input_fingerprint = fingerprint(&resolved_inputs, &scope_plan)?;
     resolved_inputs["input_fingerprint"] = json!(input_fingerprint);
@@ -2524,6 +2578,102 @@ mod tests {
     }
 
     #[test]
+    fn execution_paths_for_layout_selects_exact_legacy_and_compact_paths() {
+        let data_dir = Path::new("layout-data");
+        let mut profile = profile(true);
+        profile.resource = "Checks".into();
+        let candidate = source(&model::digest(b"candidate-content"), "artifact-a");
+        let base = data_dir.join("check-inputs").join("checks");
+        let legacy_parent = base.join(profile_identity_sha256(&profile).unwrap());
+        let legacy = execution_paths_for_layout(data_dir, &profile, &candidate, 1).unwrap();
+        assert_eq!(
+            legacy,
+            (
+                legacy_parent.join(&candidate.content_sha256),
+                legacy_parent.join(format!("{}.candidate.json", candidate.content_sha256)),
+            )
+        );
+
+        let workspace_key = model::digest(
+            model::canonical(&execution_workspace_identity(&profile, &candidate).unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        let compact = execution_paths_for_layout(data_dir, &profile, &candidate, 2).unwrap();
+        assert_eq!(
+            compact,
+            (
+                base.join(&workspace_key),
+                base.join(format!("{workspace_key}.candidate.json")),
+            )
+        );
+        assert_eq!(compact.0.file_name().unwrap().to_str().unwrap().len(), 64);
+        assert_eq!(
+            execution_paths(data_dir, &profile, &candidate).unwrap(),
+            compact
+        );
+        assert_ne!(legacy, compact);
+
+        for layout_version in [0, 3, u32::MAX] {
+            assert_eq!(
+                execution_paths_for_layout(data_dir, &profile, &candidate, layout_version)
+                    .unwrap_err()
+                    .code,
+                "CHECK_INPUTS_STALE"
+            );
+        }
+        for content_hash in ["short".to_owned(), "g".repeat(64)] {
+            let malformed = source(&content_hash, "artifact-invalid");
+            for layout_version in [1, 2] {
+                assert_eq!(
+                    execution_paths_for_layout(data_dir, &profile, &malformed, layout_version)
+                        .unwrap_err()
+                        .code,
+                    "CHECK_INPUTS_STALE"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn execution_paths_for_layout_keeps_profile_resource_and_content_namespaces_separate() {
+        let data_dir = Path::new("layout-data");
+        let base_profile = profile(true);
+        let candidate = source(&model::digest(b"candidate-content"), "artifact-a");
+        let recaptured = source(&candidate.content_sha256, "artifact-b");
+        let changed_candidate = source(&model::digest(b"changed-content"), "artifact-c");
+        let mut revised_profile = base_profile.clone();
+        revised_profile.profile_revision = "v2".into();
+        let mut other_resource = base_profile.clone();
+        other_resource.resource = "other-checks".into();
+        let mut case_changed_resource = base_profile.clone();
+        case_changed_resource.resource = "CHECKS".into();
+
+        let mut paths = BTreeSet::new();
+        for layout_version in [1, 2] {
+            assert_eq!(
+                execution_paths_for_layout(data_dir, &base_profile, &candidate, layout_version)
+                    .unwrap(),
+                execution_paths_for_layout(data_dir, &base_profile, &recaptured, layout_version)
+                    .unwrap()
+            );
+            for (profile, candidate) in [
+                (&base_profile, &candidate),
+                (&revised_profile, &candidate),
+                (&other_resource, &candidate),
+                (&case_changed_resource, &candidate),
+                (&base_profile, &changed_candidate),
+            ] {
+                let (workspace, descriptor) =
+                    execution_paths_for_layout(data_dir, profile, candidate, layout_version)
+                        .unwrap();
+                assert!(paths.insert(workspace), "workspace namespace collision");
+                assert!(paths.insert(descriptor), "descriptor namespace collision");
+            }
+        }
+    }
+
+    #[test]
     fn reusable_fingerprint_ignores_capture_ids_but_tracks_source_and_profile() {
         let base_profile = profile(true);
         let a = source("same-content", "artifact-a");
@@ -2571,6 +2721,37 @@ mod tests {
         assert_ne!(
             external_plan.resolved_inputs["versioned_external_inputs"],
             changed_external_plan.resolved_inputs["versioned_external_inputs"]
+        );
+    }
+
+    #[test]
+    fn execution_workspace_layout_version_invalidates_reusable_cache_provenance() {
+        let profile = profile(true);
+        let candidate = source("same-content", "artifact-a");
+        let plan = resolve_test(&profile, &candidate, None);
+        assert_eq!(plan.resolved_inputs["cache_reusable"], true);
+
+        let mut legacy_inputs = plan.resolved_inputs.clone();
+        legacy_inputs
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_layout");
+        let legacy_fingerprint = fingerprint(&legacy_inputs, &plan.scope_plan).unwrap();
+
+        assert_ne!(legacy_fingerprint, plan.input_fingerprint);
+        assert_eq!(
+            plan.resolved_inputs["execution_workspace"],
+            execution_workspace_identity(&profile, &candidate).unwrap()
+        );
+        assert_eq!(plan.resolved_inputs["execution_workspace"]["version"], 1);
+        assert_eq!(
+            plan.resolved_inputs["execution_layout"],
+            json!({"version": EXECUTION_WORKSPACE_LAYOUT_VERSION})
+        );
+        assert!(legacy_inputs.get("execution_layout").is_none());
+        assert_eq!(
+            plan.resolved_inputs["input_fingerprint"],
+            json!(plan.input_fingerprint)
         );
     }
 
