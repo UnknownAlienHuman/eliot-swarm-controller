@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-11",
+  "source_base_commit": "fa8e587b9f3c997f033e1a60eab392a53e9f57c7",
+  "verification_checkout_base": "3e6009fee4d92655701e789856370ae64a352b0d",
+  "toolchain": "Rust 1.98.1",
+  "status": "linux_source_verified_full_qualification_pending",
+  "source_sha256": {
+    "modules/antigravity-rust/src/stream.rs": "59e1db50aeed47f628a5f62c6a488496bc02a8cf10b6268994913ee2b8c95283",
+    "modules/antigravity-rust/tests/sequential_retention.rs": "0d61df826a808687e2a06aaab9e24347492ebb8d4c13befe533ea581cffb4277"
+  },
+  "behavior": "Omitted child workspace_uris preserves prior data; explicit [] clears; supplied arrays retain the existing count/character bounds and gap accounting",
+  "linux_checks": [
+    {
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-supervisor-quiescence-y/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 clippy --locked --manifest-path modules/antigravity-rust/Cargo.toml --lib --bins --no-deps -- -D warnings",
+      "gate": "scoped production clippy",
+      "exit_code": 0,
+      "platform": "linux",
+      "source_sha256_before": {
+        "modules/antigravity-rust/tests/sequential_retention.rs": "0d61df826a808687e2a06aaab9e24347492ebb8d4c13befe533ea581cffb4277",
+        "modules/antigravity-rust/src/stream.rs": "59e1db50aeed47f628a5f62c6a488496bc02a8cf10b6268994913ee2b8c95283"
+      },
+      "source_sha256_after": {
+        "modules/antigravity-rust/tests/sequential_retention.rs": "0d61df826a808687e2a06aaab9e24347492ebb8d4c13befe533ea581cffb4277",
+        "modules/antigravity-rust/src/stream.rs": "59e1db50aeed47f628a5f62c6a488496bc02a8cf10b6268994913ee2b8c95283"
+      },
+      "source_stable": true,
+      "started_at_utc": "2026-10-11T13:26:43.5546045Z",
+      "completed_at_utc": "2026-10-11T13:26:50.3124817Z",
+      "log_sha256": "02889703551e58a1193efde7f1a3d886c27d9ec8a9bf567a995947fc64058471"
+    },
+    {
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-supervisor-quiescence-y/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 test --locked --manifest-path modules/antigravity-rust/Cargo.toml --test sequential_retention workspace_uris_preserve_omission_clear_when_empty_and_update_when_present",
+      "gate": "exact workspace URI regression",
+      "exit_code": 0,
+      "platform": "linux",
+      "source_sha256_before": {
+        "modules/antigravity-rust/tests/sequential_retention.rs": "0d61df826a808687e2a06aaab9e24347492ebb8d4c13befe533ea581cffb4277",
+        "modules/antigravity-rust/src/stream.rs": "59e1db50aeed47f628a5f62c6a488496bc02a8cf10b6268994913ee2b8c95283"
+      },
+      "source_sha256_after": {
+        "modules/antigravity-rust/tests/sequential_retention.rs": "0d61df826a808687e2a06aaab9e24347492ebb8d4c13befe533ea581cffb4277",
+        "modules/antigravity-rust/src/stream.rs": "59e1db50aeed47f628a5f62c6a488496bc02a8cf10b6268994913ee2b8c95283"
+      },
+      "source_stable": true,
+      "started_at_utc": "2026-10-11T13:27:06.9074724Z",
+      "completed_at_utc": "2026-10-11T13:27:13.1062856Z",
+      "log_sha256": "b8881084b2f0b187061ffdae1a5d6b741af64df6227395fc137f9be7e89681ee"
+    }
+  ],
+  "linux_test_result": {
+    "ignored": 0,
+    "failed": 0,
+    "passed": 1,
+    "filtered_out": 7
+  },
+  "wrapper_scope": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER for each process only; no global config/security changes or software installation",
+  "windows": {
+    "reported_result": "1 passed / 0 failed / 7 filtered",
+    "status": "owner_reported_pass_receipt_unavailable",
+    "manager_repeated_test": false,
+    "readback_error": "Could not determine whether owner thread exists; unavailable or failed host durable"
+  },
+  "not_qualified": [
+    "Fresh installed/native Gemini 3.8 execution",
+    "Full public/Windows/Linux/crash/load matrix",
+    "Full V27 readiness"
+  ]
+}

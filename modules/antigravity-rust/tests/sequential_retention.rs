@@ -2,7 +2,8 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use swarm_antigravity_adapter::stream::{
-    MAX_RESPONSE_CHARS, MAX_RETAINED_RESPONSES, RetainedResponseMiss, StreamState,
+    MAX_CHILD_STRINGS, MAX_CHILD_URI_CHARS, MAX_RESPONSE_CHARS, MAX_RETAINED_RESPONSES,
+    RetainedResponseMiss, StreamState,
 };
 use swarm_antigravity_adapter::{contract, controller::Controller, module_receipt, result_page};
 use swarm_contracts::{
@@ -57,6 +58,11 @@ fn init() -> Vec<u8> {
 fn result(root: &str, text: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"event":"result","result":{
         "status":"SUCCESS","conversation_id":root,"response":text}}))
+    .unwrap()
+}
+fn step_update(step_index: u64, subagents: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({"event":"step_update","step_update":{
+        "step_index":step_index,"subagent_info":{"subagents":subagents}}}))
     .unwrap()
 }
 fn state() -> StreamState {
@@ -164,6 +170,92 @@ fn page_command(target: &RuntimeCommand, offset: u64, length: u64) -> RuntimeCom
         input_sha256: Some(hash(format!("read-{offset}-{length}").as_bytes())),
         target_input_sha256: target.input_sha256.clone(),
     }
+}
+
+#[test]
+fn workspace_uris_preserve_omission_clear_when_empty_and_update_when_present() {
+    let mut state = state();
+    state.consume_line(&step_update(
+        1,
+        json!([{
+            "conversation_id":"child-1",
+            "type_name":"agent",
+            "role":"planner",
+            "log_uri":"file:///child.log",
+            "workspace_uris":["file:///initial"]
+        }]),
+    ));
+    let initial = state.snapshot();
+    assert_eq!(initial["children"][0]["conversation_id"], "child-1");
+    assert_eq!(
+        initial["children"][0]["workspace_uris"],
+        json!(["file:///initial"])
+    );
+
+    let gaps_before_omission = state.gaps;
+    state.consume_line(&step_update(1, json!([{"conversation_id":"child-1"}])));
+    let omitted = state.snapshot();
+    assert_eq!(omitted["children"][0]["conversation_id"], "child-1");
+    assert_eq!(
+        omitted["children"][0]["workspace_uris"],
+        json!(["file:///initial"])
+    );
+    assert_eq!(omitted["children"][0]["type_name"], "agent");
+    assert_eq!(omitted["children"][0]["role"], "planner");
+    assert_eq!(omitted["children"][0]["log_uri"], "file:///child.log");
+    assert_eq!(omitted["steps"][0]["subagent_ids"], json!(["child-1"]));
+    assert_eq!(state.gaps, gaps_before_omission);
+
+    let gaps_before_clear = state.gaps;
+    state.consume_line(&step_update(
+        1,
+        json!([{"conversation_id":"child-1","workspace_uris":[]}]),
+    ));
+    let cleared = state.snapshot();
+    assert_eq!(cleared["children"][0]["workspace_uris"], json!([]));
+    assert_eq!(cleared["children"][0]["role"], "planner");
+    assert_eq!(cleared["children"][0]["log_uri"], "file:///child.log");
+    assert_eq!(cleared["steps"][0]["subagent_ids"], json!(["child-1"]));
+    assert_eq!(state.gaps, gaps_before_clear);
+
+    let gaps_before_update = state.gaps;
+    state.consume_line(&step_update(
+        1,
+        json!([{
+            "conversation_id":"child-1",
+            "workspace_uris":["file:///updated","file:///also-updated"]
+        }]),
+    ));
+    let updated = state.snapshot();
+    assert_eq!(
+        updated["children"][0]["workspace_uris"],
+        json!(["file:///updated", "file:///also-updated"])
+    );
+    assert_eq!(updated["children"][0]["role"], "planner");
+    assert_eq!(updated["children"][0]["log_uri"], "file:///child.log");
+    assert_eq!(updated["steps"][0]["subagent_ids"], json!(["child-1"]));
+    assert_eq!(state.gaps, gaps_before_update);
+
+    let mut oversized_uris = vec!["u".repeat(MAX_CHILD_URI_CHARS + 1)];
+    oversized_uris
+        .extend((1..=MAX_CHILD_STRINGS).map(|index| format!("file:///workspace-{index}")));
+    let gaps_before_truncation = state.gaps;
+    state.consume_line(&step_update(
+        1,
+        json!([{"conversation_id":"child-1","workspace_uris":oversized_uris}]),
+    ));
+    let bounded = state.snapshot();
+    let workspace_uris = bounded["children"][0]["workspace_uris"].as_array().unwrap();
+    assert_eq!(workspace_uris.len(), MAX_CHILD_STRINGS);
+    assert_eq!(
+        workspace_uris[0].as_str().unwrap().chars().count(),
+        MAX_CHILD_URI_CHARS
+    );
+    assert_eq!(state.gaps, gaps_before_truncation + 1);
+    assert_eq!(bounded["children"][0]["conversation_id"], "child-1");
+    assert_eq!(bounded["children"][0]["role"], "planner");
+    assert_eq!(bounded["children"][0]["log_uri"], "file:///child.log");
+    assert_eq!(bounded["steps"][0]["subagent_ids"], json!(["child-1"]));
 }
 
 #[test]

@@ -613,15 +613,17 @@ impl StreamState {
             child.type_name = string_field(entry, "type_name", 256).or(child.type_name.take());
             child.role = string_field(entry, "role", 128).or(child.role.take());
             child.log_uri = string_field(entry, "log_uri", 2048).or(child.log_uri.take());
-            let (workspace_uris, truncated) = bounded_string_array(
-                entry.get("workspace_uris"),
-                MAX_CHILD_STRINGS,
-                MAX_CHILD_URI_CHARS,
-            );
-            if truncated {
-                self.gaps = self.gaps.saturating_add(1);
+            if let Some(raw_workspace_uris) = entry.get("workspace_uris") {
+                let (workspace_uris, truncated) = bounded_string_array(
+                    Some(raw_workspace_uris),
+                    MAX_CHILD_STRINGS,
+                    MAX_CHILD_URI_CHARS,
+                );
+                if truncated {
+                    self.gaps = self.gaps.saturating_add(1);
+                }
+                child.workspace_uris = workspace_uris;
             }
-            child.workspace_uris = workspace_uris;
             ids.push(child.conversation_id.clone());
         }
         if let Some(step) = self.steps.get_mut(&step_index) {

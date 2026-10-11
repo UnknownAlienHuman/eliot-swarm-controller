@@ -1,5 +1,15 @@
 # Current-source audit and implementation ledger
 
+The [Antigravity child workspace update repair](../2026-10-11/AG-WORKSPACE-URI-EVIDENCE.json)
+preserves prior workspace URIs when a child update omits the field, clears them
+for an explicit empty array, and applies the existing bounds to a supplied array.
+Strict affected production Clippy and the one exact sequential-retention test
+pass on Linux with stable source hashes. Missing ambient sccache was bypassed
+only by unsetting the two wrapper environment variables for these commands.
+The owner's Windows PASS report is retained as reported, because its receipt
+could not be read; the Windows test was not repeated. This source repair does
+not establish installed/native Gemini or full V27 qualification.
+
 The [Claude journal and failed-prepare repair](../2026-10-11/CLAUDE-JOURNAL-LIFECYCLE-EVIDENCE.json)
 removes only a validated stable torn suffix, preserves the saved outcome and
 complete corrupt bytes, and advances independent outbox/callback work without
