@@ -1,0 +1,207 @@
+{
+  "schema": "eliot.antigravity_dispatch_capability.v1",
+  "recorded_at_utc": "2026-10-11T02:29:24.5858220Z",
+  "base_commit": "c95c3353521a6798700694c06a52d698e3357066",
+  "scope": "Route-specific current native dispatch capability and route-neutral readiness card",
+  "production_path": [
+    "Antigravity same-process agent.refresh emits strict typed init/session/model/idle-turn proof",
+    "Store verifies latest settled exact-generation refresh and matching boot/root/opening evidence",
+    "Current Task/revision/Attempt/binding initial or exact queued-child scope and retained ancestry are revalidated",
+    "Existing dispatch_launch_actor checks current authority and exact held workspace lease",
+    "Dispatch packet retains route-specific session proof; OpenCode keeps existing C8 verifier"
+  ],
+  "public_readback": {
+    "fields": [
+      "schema_version",
+      "state",
+      "dispatch_permitted",
+      "model_consumed"
+    ],
+    "dispatch_permitted": false,
+    "model_consumed": "unknown",
+    "visibility": "Existing authorized current launch diagnostic only"
+  },
+  "harness": "One exact AG refresh after open/hello and exact launch phase; uncertain refresh is never replayed; readiness polling precedes sole task.dispatch",
+  "source_files": [
+    {
+      "path": "crates/swarm-kernel-host/src/store/launcher_dispatch.rs",
+      "sha256": "507c043ca088716e15024ae9e54d305e2a46d41c9b1f490c927c0e3355b5fa2f",
+      "bytes": 69421,
+      "scope_hash_match": true,
+      "role": "route selection, strict initial/queued Store scopes, actor/lease delegation, packet admission and neutral readback"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/launcher_dispatch/antigravity_capability.rs",
+      "sha256": "cd81ec5e053e310083eab58dce4aa080445432b2204f75e1824ef3f28f862b8b",
+      "bytes": 16773,
+      "scope_hash_match": true,
+      "role": "descriptor verification, newest settled refresh proof consumer and AG packet construction"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/object_reads.rs",
+      "sha256": "b164935f9a53e053caf2f83d06a46b350c09f847b1133838210a5f97e381d2ed",
+      "bytes": 46243,
+      "scope_hash_match": true,
+      "role": "current operation diagnostic disclosure"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/core_failure_tests.rs",
+      "sha256": "1ce82cb85ae0356637cd0ba95d9d68c365fa8600d3fa46bbd7e8233ab79fc8e8",
+      "bytes": 58404,
+      "scope_hash_match": true,
+      "role": "retained-ready-label and historical-receipt regression assertions"
+    },
+    {
+      "path": "crates/swarm-contracts/src/runtime.rs",
+      "sha256": "231b759baa0591700b474ee428759ee1293da99db0a8bd78b91dc143f2c8253d",
+      "bytes": 30177,
+      "scope_hash_match": true,
+      "role": "closed typed AntigravityDispatchSessionProof DTO and validator"
+    },
+    {
+      "path": "modules/antigravity-rust/src/controller.rs",
+      "sha256": "23c742824dee343084d12c93dacd37c75cc7bf02361de4f522f49aa998c7b533",
+      "bytes": 38634,
+      "scope_hash_match": true,
+      "role": "same-process agent.refresh typed proof producer"
+    },
+    {
+      "path": "tools/qualification/New-NativeQualification.ps1",
+      "sha256": "b9abed291e7f65830fd0837626d7817a5a8e0dd94d79c4315a4438554255e572",
+      "bytes": 160672,
+      "scope_hash_match": true,
+      "role": "single AG refresh, current capability readiness and sole dispatch"
+    },
+    {
+      "path": "tools/qualification/Test-LaunchDispatchReadiness.ps1",
+      "sha256": "75dac49a1f06787be748f38ee4d3b0da6d9df8d9db60f9cebb8e58bfec6a30b7",
+      "bytes": 16153,
+      "scope_hash_match": true,
+      "role": "readiness fixture source including no-replay and closed-card cases"
+    }
+  ],
+  "checks": [
+    {
+      "platform": "windows",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-antigravity-adapter",
+        "-p",
+        "swarm-contracts",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log_sha256": "2794f1601619b49d5f2184596e57c6a4e91ccefe84869646d4e0db9ad72997b0",
+      "completed_at_utc": "2026-10-11T02:27:04.5419382Z",
+      "selected_tests": null
+    },
+    {
+      "platform": "windows",
+      "gate": "tests",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-antigravity-adapter",
+        "--lib",
+        "-E",
+        "package(swarm-antigravity-adapter) + test(antigravity_capability::tests::) + test(native_mcp_connection_readiness_does_not_trust_a_retained_ready_label) + test(launcher_dispatch::preinput_contract_tests::)"
+      ],
+      "log_sha256": "f21e3e9756e6909960197cfd5a80a230c429c17cb183d3390685a61dad1467c0",
+      "completed_at_utc": "2026-10-11T02:28:43.9340608Z",
+      "selected_tests": 14
+    },
+    {
+      "platform": "linux",
+      "gate": "clippy",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-antigravity-adapter",
+        "-p",
+        "swarm-contracts",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log_sha256": "51c601900a7419cff0f0551de0f2b3dffe8cbec424c0c7da01a4ca3a2ef4a028",
+      "completed_at_utc": "2026-10-11T02:27:12.2300555Z",
+      "selected_tests": null
+    },
+    {
+      "platform": "linux",
+      "gate": "tests",
+      "exit_code": 0,
+      "source_stable": true,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-antigravity-adapter",
+        "--lib",
+        "-E",
+        "package(swarm-antigravity-adapter) + test(antigravity_capability::tests::) + test(native_mcp_connection_readiness_does_not_trust_a_retained_ready_label) + test(launcher_dispatch::preinput_contract_tests::)"
+      ],
+      "log_sha256": "454a371851f465d7fca00269bbcc519cfad043367930a566fc4cb45ad1f10f31",
+      "completed_at_utc": "2026-10-11T02:28:50.7497353Z",
+      "selected_tests": 14
+    }
+  ],
+  "readiness_fixture": {
+    "status": "PASS",
+    "exit_code": 0,
+    "assertions": 91,
+    "native_calls": 0,
+    "model_calls": 0,
+    "scope": "Actual extracted production readiness loop and sole dispatch statement, including route-specific one AG refresh and uncertain-reply no replay",
+    "source_sha256": {
+      "tools/qualification/New-NativeQualification.ps1": "b9abed291e7f65830fd0837626d7817a5a8e0dd94d79c4315a4438554255e572",
+      "tools/qualification/Test-LaunchDispatchReadiness.ps1": "75dac49a1f06787be748f38ee4d3b0da6d9df8d9db60f9cebb8e58bfec6a30b7"
+    },
+    "log_sha256": "99adfcf3ce9a30499a02deaaa9ee9fd606914048ce3ad05ea1daa88a056b7096",
+    "recorded_at_utc": "2026-10-11T02:24:50.6382406Z"
+  },
+  "independent_review": {
+    "verdict": "ACCEPT",
+    "p1": 0,
+    "p2": 0,
+    "assessment_sha256": "f670dc73c5ebabf095138bc389d43e8617ffbc91a8553140ab9f961e12e51afe"
+  },
+  "limitations": [
+    "Same-process refresh proof establishes current recorded session identity and idle turn, not model consumption",
+    "Fresh native installation and exact model-result qualification remain pending",
+    "R48 feature/witness qualification is a separate unfinished slice"
+  ],
+  "status": "SOURCE_AND_OFFLINE_HARNESS_VERIFIED"
+}

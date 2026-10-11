@@ -671,7 +671,7 @@ function Test-ReadinessDispatchPhase {
     )
 }
 
-function Get-SafeReadinessNativeMcpConnectionState {
+function Get-SafeReadinessDispatchCapabilityState {
     param([AllowNull()] $Card)
     if (-not (Test-ReadinessRecordShape $Card)) { return 'unknown' }
     $keys = if ($Card -is [System.Collections.IDictionary]) { @($Card.Keys) } else { @($Card.PSObject.Properties.Name) }
@@ -697,7 +697,7 @@ function Get-SafeReadinessIdentifier {
 
 function New-ReadinessFailureFacts {
     param(
-        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase', 'native_mcp_connection')][string] $Reason,
+        [Parameter(Mandatory)][ValidateSet('operation_count_scope', 'applied_readback', 'agent_state', 'supervisor_phase', 'selector_mismatch', 'launch_phase', 'native_dispatch_capability')][string] $Reason,
         [AllowNull()] $TaskId,
         [AllowNull()] $AttemptId,
         [AllowNull()] $ModuleId,
@@ -707,7 +707,7 @@ function New-ReadinessFailureFacts {
         [long] $Generation,
         [AllowNull()] $Projection,
         [AllowNull()] $LaunchPhase,
-        [AllowNull()] $NativeMcpConnectionState,
+        [AllowNull()] $DispatchCapabilityState,
         [AllowNull()] $ErrorCode
     )
 
@@ -737,8 +737,8 @@ function New-ReadinessFailureFacts {
         observed_binding_state = Get-SafeReadinessBindingState $observedBindingState
         observed_supervisor_phase = Get-SafeReadinessSupervisorPhase $observedSupervisorPhase
         observed_launch_phase = Get-SafeReadinessLaunchPhase $LaunchPhase
-        observed_native_mcp_connection_state = if ($NativeMcpConnectionState -is [string] -and
-            $NativeMcpConnectionState -cin @('ready', 'unavailable')) { $NativeMcpConnectionState } else { 'unknown' }
+        observed_native_dispatch_capability_state = if ($DispatchCapabilityState -is [string] -and
+            $DispatchCapabilityState -cin @('ready', 'unavailable')) { $DispatchCapabilityState } else { 'unknown' }
         error_code = $observedErrorCode
     }
 }
@@ -2144,6 +2144,7 @@ try {
     $launch = Invoke-ManagerCall -Method 'swarm.launch' -Params $launchParams -TimeoutMilliseconds 30000
     $parentOperationId = if ($launch.completed -and $launch.exit_code -eq 0 -and $null -ne $launch.value) { [string]$launch.value.operation_id } else { $null }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $sessionRefreshAttempted = $false
     $readyProof = $null
     $launchReadbackFailure = $null
     $readinessFailureReason = 'operation_count_scope'
@@ -2151,10 +2152,10 @@ try {
     [long]$readinessGeneration = 0
     $lastReadinessProjection = Get-SafeReadinessProjection $null
     $lastLaunchPhase = $null
-    $lastNativeMcpConnectionState = 'unknown'
+    $lastDispatchCapabilityState = 'unknown'
     $lastReadinessErrorCode = Get-SafeReadinessErrorCode $launch.error_code
     while ([DateTime]::UtcNow -lt $deadline) {
-        $lastNativeMcpConnectionState = 'unknown'
+        $lastDispatchCapabilityState = 'unknown'
         $operations = Get-Operations -TimeoutMilliseconds 30000
         if (-not $operations.success) {
             $readinessFailureReason = 'operation_count_scope'
@@ -2297,12 +2298,31 @@ try {
             Start-Sleep -Milliseconds 750
             continue
         }
-        # A retained launch phase does not prove the current native MCP link.
+        if ($Adapter -ceq 'Antigravity' -and -not $sessionRefreshAttempted) {
+            # Refresh the already-open exact session once. Lost response stays
+            # uncertain: only the Store's current proof can resolve readiness.
+            $sessionRefreshAttempted = $true
+            $refreshRequestId = New-RequestId
+            $refresh = Invoke-ManagerCall -Method 'agent.refresh' -Params ([ordered]@{
+                binding_id = $bindingId; generation = $generation; client_request_id = $refreshRequestId
+            }) -TimeoutMilliseconds 30000
+            $lastReadinessErrorCode = Get-SafeReadinessErrorCode $refresh.error_code
+            $script:Report.safe_facts.native_session_refresh = [ordered]@{
+                attempted = $true; calls = 1; replayed = $false
+                request_id = $refreshRequestId
+                operation_id = Get-SafeReadinessIdentifier (Get-OptionalField -Object $refresh.value -Name 'operation_id' -PreserveCollection)
+                response_error_code = $lastReadinessErrorCode
+            }
+            $readinessFailureReason = 'native_dispatch_capability'
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+        # A retained launch phase does not prove the current route capability.
         # This diagnostic is readiness evidence, not permission or consumption.
-        $lastNativeMcpConnectionState = Get-SafeReadinessNativeMcpConnectionState (
-            Get-OptionalField -Object $parentOp -Name 'native_mcp_connection_readback' -PreserveCollection)
-        if ($lastNativeMcpConnectionState -cne 'ready') {
-            $readinessFailureReason = 'native_mcp_connection'
+        $lastDispatchCapabilityState = Get-SafeReadinessDispatchCapabilityState (
+            Get-OptionalField -Object $parentOp -Name 'native_dispatch_capability_readback' -PreserveCollection)
+        if ($lastDispatchCapabilityState -cne 'ready') {
+            $readinessFailureReason = 'native_dispatch_capability'
             Start-Sleep -Milliseconds 750
             continue
         }
@@ -2318,7 +2338,7 @@ try {
             -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id `
             -ArtifactVersion $contract.version -BindingId $readinessBindingId -Generation $readinessGeneration `
             -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase `
-            -NativeMcpConnectionState $lastNativeMcpConnectionState -ErrorCode $lastReadinessErrorCode
+            -DispatchCapabilityState $lastDispatchCapabilityState -ErrorCode $lastReadinessErrorCode
         Add-Stage -Name 'module_open_and_hello' -Status 'unknown' -Code $code -Facts ([ordered]@{
             parent_operation_id = $parentOperationId
             dispatch_started = $false
@@ -2330,7 +2350,7 @@ try {
     $openOperationId = [string]$readyProof.open.operation_id
     $bindingId = [string]$readyProof.binding_id
     $generation = [long]$readyProof.generation
-    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; launch_phase = 'awaiting_native_mcp'; native_mcp_connection_state = 'ready'; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
+    $script:Report.safe_facts.launch = [ordered]@{ parent_operation_id = $parentOperationId; parent_state = $readyProof.parent.state; launch_phase = 'awaiting_native_mcp'; native_dispatch_capability_state = 'ready'; open_operation_id = $openOperationId; open_state = $readyProof.open.state; binding_id = $bindingId; generation = $generation; supervisor_phase = 'ready'; module_id = $contract.module_id; artifact_id = $contract.artifact_id; version = $contract.version; handshake = 'store_accepted_ready_observation'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get' }
     Add-Stage -Name 'module_open_and_hello' -Status 'passed' -Facts $script:Report.safe_facts.launch
 
     $script:CurrentStage = 'single_task_dispatch'

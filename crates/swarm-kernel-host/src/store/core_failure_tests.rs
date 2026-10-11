@@ -1025,6 +1025,7 @@ fn native_mcp_connection_readiness_does_not_trust_a_retained_ready_label() {
         "dispatch_permitted":false,"model_consumed":"unknown",
     });
     assert_eq!(read()["native_mcp_connection_readback"], expected);
+    assert_eq!(read()["native_dispatch_capability_readback"], expected);
     let record_key =
         native_mcp_tools_meta_key("launcher:native_mcp_tools:v1:", LAUNCH_OPERATION_ID);
     set_meta(
@@ -1039,10 +1040,12 @@ fn native_mcp_connection_readiness_does_not_trust_a_retained_ready_label() {
     )
     .unwrap();
     assert_eq!(read()["native_mcp_connection_readback"], expected);
+    assert_eq!(read()["native_dispatch_capability_readback"], expected);
     // A historical/list receipt never substitutes for the current readback.
     let receipt =
         super::object_reads::operation(&fixture.db, &caller, LAUNCH_OPERATION_ID).unwrap();
     assert!(receipt.get("native_mcp_connection_readback").is_none());
+    assert!(receipt.get("native_dispatch_capability_readback").is_none());
     assert_eq!(
         stored_admission_result(&fixture.db),
         fixture.admission_result_json

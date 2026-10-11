@@ -12,6 +12,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+#[path = "launcher_dispatch/antigravity_capability.rs"]
+mod antigravity_capability;
+
 const LINK_KEY_PREFIX: &str = "launcher:task_dispatch:v1:";
 const LINK_KIND: &str = "launcher_task_dispatch";
 const PACKET_REVISION: &str = "launch-dispatch-v1";
@@ -88,12 +91,7 @@ pub(super) fn prepare_admission(
 
     let actor = super::launcher::dispatch_launch_actor(tx, &parent.operation_id, None)?;
     validate_dispatch_caller(tx, &actor, caller, attempt)?;
-    let proof = super::launcher_mcp_tools::require_current_connection(
-        tx,
-        config,
-        &parent.operation_id,
-        None,
-    )?;
+    let proof = require_current_dispatch_capability(tx, config, &parent.operation_id, None)?;
     let packet = build_packet(&parent, attempt, binding, &proof)?;
     let packet_digest = digest_value(&packet)?;
     Ok(Some(LaunchDispatchAdmission {
@@ -309,12 +307,8 @@ pub(super) fn validate_before_effect(
     validate_retained_link(tx, operation_id, &parent, &packet, &attempt)?;
     let _actor =
         super::launcher::dispatch_launch_actor(tx, &parent.operation_id, Some(operation_id))?;
-    let proof = super::launcher_mcp_tools::require_current_connection(
-        tx,
-        config,
-        &parent.operation_id,
-        Some(operation_id),
-    )?;
+    let proof =
+        require_current_dispatch_capability(tx, config, &parent.operation_id, Some(operation_id))?;
     let current = build_packet(&parent, &attempt, binding, &proof)?;
     if model::canonical(&packet)? != model::canonical(&current)? {
         return Err(Error::new(
@@ -637,12 +631,158 @@ fn stale_scope_predicate(predicate: &str) -> Error {
     )
 }
 
+/// Revalidate the complete current Store tuple before accepting an
+/// Antigravity session proof, including when this capability helper is called
+/// directly for a readback. `None` means the initial unstarted stage; `Some`
+/// must identify the exact queued child and its retained ancestry.
+fn require_current_antigravity_scope(
+    db: &Connection,
+    parent: &LaunchParent,
+    dispatch_operation_id: Option<&str>,
+) -> Result<Value> {
+    let task_id = parent
+        .task_id
+        .as_deref()
+        .ok_or_else(|| stale_scope_predicate("parent.task_id_present"))?;
+    let attempt_id = parent
+        .attempt_id
+        .as_deref()
+        .ok_or_else(|| stale_scope_predicate("parent.attempt_id_present"))?;
+    let binding_id = parent
+        .binding_id
+        .as_deref()
+        .ok_or_else(|| stale_scope_predicate("parent.binding_id_present"))?;
+    let generation = parent
+        .binding_generation
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| stale_scope_predicate("parent.binding_generation_positive"))?;
+
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    let task = tasks::get_task(db, task_id)?;
+    let binding = super::operations::get_binding(db, binding_id, generation)?;
+    validate_parent_tuple(parent, &attempt, &task, &binding, dispatch_operation_id)?;
+    let _actor =
+        super::launcher::dispatch_launch_actor(db, &parent.operation_id, dispatch_operation_id)?;
+
+    if let Some(dispatch_operation_id) = dispatch_operation_id {
+        let effective_raw: Option<String> = db
+            .query_row(
+                "SELECT effective_request_json FROM operations \
+                 WHERE operation_id=?1 AND method='task.dispatch' AND state='queued'",
+                [dispatch_operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let effective_raw = effective_raw
+            .as_deref()
+            .ok_or_else(|| stale_scope_predicate("dispatch.state_queued"))?;
+        let effective: Value = serde_json::from_str(effective_raw)?;
+        let packet = effective
+            .get("launch_dispatch_packet")
+            .ok_or_else(|| stale_scope_predicate("dispatch.launch_dispatch_packet_present"))?;
+        validate_retained_link(db, dispatch_operation_id, parent, packet, &attempt)?;
+    }
+
+    Ok(binding)
+}
+
+fn dispatch_capability_readback(ready: bool) -> Value {
+    json!({
+        "schema_version":1,
+        "state":if ready { "ready" } else { "unavailable" },
+        "dispatch_permitted":false,
+        "model_consumed":"unknown",
+    })
+}
+
+/// Route-neutral, non-authorizing readback for the current launch dispatch
+/// capability. OpenCode delegates to its bounded C8 readback; Antigravity
+/// exposes only whether its strict current session predicate is satisfied.
+pub(super) fn current_dispatch_capability_readback(
+    db: &Connection,
+    config: &Config,
+    launch_operation_id: &str,
+) -> Value {
+    let Ok(parent) = load_parent(db, launch_operation_id) else {
+        return dispatch_capability_readback(false);
+    };
+    let Ok(route_alias) = launch_manifest_route_alias(&parent.manifest) else {
+        return dispatch_capability_readback(false);
+    };
+    let Ok(route) = config.route(route_alias) else {
+        return dispatch_capability_readback(false);
+    };
+
+    if crate::config::opencode_route_kind(&route.runtime, &route.module_artifact_id).is_some() {
+        let open_code =
+            super::launcher_mcp_tools::current_connection_readback(db, config, launch_operation_id);
+        return dispatch_capability_readback(open_code["state"].as_str() == Some("ready"));
+    }
+
+    let ready = route.runtime == "antigravity"
+        && route.module_artifact_id == antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
+        && require_current_dispatch_capability(db, config, launch_operation_id, None).is_ok();
+    dispatch_capability_readback(ready)
+}
+
+/// Select the current native capability from the trusted route retained by the
+/// launch binding. OpenCode keeps its existing C8 verifier; Antigravity uses
+/// only its same-process session/turn proof and cannot claim MCP readback.
+pub(super) fn require_current_dispatch_capability(
+    db: &Connection,
+    config: &Config,
+    launch_operation_id: &str,
+    dispatch_operation_id: Option<&str>,
+) -> Result<Value> {
+    let parent = load_parent(db, launch_operation_id)?;
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
+    let route = config.route(route_alias)?;
+    if crate::config::opencode_route_kind(&route.runtime, &route.module_artifact_id).is_some() {
+        return super::launcher_mcp_tools::require_current_connection(
+            db,
+            config,
+            launch_operation_id,
+            dispatch_operation_id,
+        );
+    }
+
+    if route.runtime != "antigravity"
+        || route.module_artifact_id != antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
+    {
+        return Err(antigravity_capability::unavailable());
+    }
+
+    let binding = require_current_antigravity_scope(db, &parent, dispatch_operation_id)?;
+    if binding["route"]["alias"].as_str() != Some(route_alias)
+        || binding["route"]["runtime"].as_str() != Some(route.runtime.as_str())
+        || binding["route"]["module_artifact_id"].as_str()
+            != Some(route.module_artifact_id.as_str())
+    {
+        return Err(stale_scope_predicate(
+            "binding.route_matches_trusted_config",
+        ));
+    }
+
+    let selector = binding["observation"].get("module_contract_selector");
+    let identity = super::module_handshake::retained_contract_identity(
+        db,
+        &route.module_artifact_id,
+        selector,
+    )?
+    .ok_or_else(antigravity_capability::unavailable)?;
+    antigravity_capability::validate_retained_descriptor(&identity)?;
+    antigravity_capability::require_current_session_proof(db, &binding)
+}
+
 fn build_packet(
     parent: &LaunchParent,
     attempt: &Value,
     binding: &Value,
     proof: &Value,
 ) -> Result<Value> {
+    if proof["kind"] == antigravity_capability::ANTIGRAVITY_PROOF_KIND {
+        return antigravity_capability::build_packet(parent, attempt, binding, proof);
+    }
     let capability_identity_digest = validate_capability_proof(parent, attempt, binding, proof)?;
     let route_alias = launch_manifest_route_alias(&parent.manifest)?;
     let contracts = crate::mcp::participant_core_tool_contracts()?;

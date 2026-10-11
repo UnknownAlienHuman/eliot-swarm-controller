@@ -113,6 +113,15 @@ pub(super) fn current_operation(
         operation["native_mcp_connection_readback"] =
             super::launcher_mcp_tools::current_connection_readback(db, config, id);
     }
+    if operation["method"] == "swarm.launch"
+        && matches!(
+            object_scope::resolve_launch_diagnostic_read(db, p, id),
+            Ok(true)
+        )
+    {
+        operation["native_dispatch_capability_readback"] =
+            super::launcher_dispatch::current_dispatch_capability_readback(db, config, id);
+    }
     Ok(operation)
 }
 

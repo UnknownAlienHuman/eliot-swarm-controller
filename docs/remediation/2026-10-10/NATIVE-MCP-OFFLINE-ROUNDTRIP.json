@@ -121,8 +121,13 @@
     "no_provider_calls": true
   },
   "independent_review": {
-    "status": "PENDING",
-    "scope": "Independent seven-file read-only source review; parent source review and mechanical gates complete"
+    "status": "ACCEPT",
+    "p1": 0,
+    "p2": 0,
+    "scope": "Exact seven source hashes",
+    "assessment_sha256": "ee807f61bd59911a47e30e3107fb3589af8d32c1cae94bbf95aeaa936b329bd0",
+    "delivered_commit": "c95c3353521a6798700694c06a52d698e3357066",
+    "all_verified_source_blobs_match_delivered_commit": true
   },
   "limitations": [
     "Current Store snapshot, OS/process custody, and provider-auth authority are not qualified by the offline fixture",

@@ -162,6 +162,69 @@ impl TaskDispatchContext {
     }
 }
 
+/// Same-process Antigravity session evidence captured by the exact
+/// `agent.refresh` operation retained by Store. This proves only a ready,
+/// idle native session identity; it carries no MCP inventory or model-use
+/// assertion.
+pub const ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND: &str = "antigravity_dispatch_session_proof_v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AntigravityDispatchSessionProof {
+    pub schema_version: u16,
+    pub kind: String,
+    pub refresh_operation_id: String,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub worker_boot_id: String,
+    pub native_root_id: String,
+    /// SHA-256 of the adapter's retained native scope key, avoiding a second
+    /// copy of a workspace path in the proof packet.
+    pub native_scope_key_sha256: String,
+    pub conversation_id: String,
+    pub requested_model_id: String,
+    pub observed_model_id: String,
+    pub model_readback_state: String,
+    pub stream_phase: String,
+    pub native_events_seen: u64,
+    pub result_ordinal: u64,
+    pub gap_count: u64,
+    pub turn_pending: bool,
+    pub stream_error_code: Option<String>,
+    pub stream_exit_code: Option<i32>,
+}
+
+impl AntigravityDispatchSessionProof {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1
+            || self.kind != ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND
+            || !valid_bounded_identity(&self.refresh_operation_id, 256)
+            || !valid_bounded_identity(&self.binding_id, 256)
+            || self.binding_generation <= 0
+            || !valid_bounded_identity(&self.worker_boot_id, 256)
+            || !valid_bounded_identity(&self.native_root_id, 512)
+            || !is_lower_sha256(&self.native_scope_key_sha256)
+            || !valid_bounded_identity(&self.conversation_id, 512)
+            || self.native_root_id != self.conversation_id
+            || !valid_bounded_identity(&self.requested_model_id, 256)
+            || !valid_bounded_identity(&self.observed_model_id, 256)
+            || self.requested_model_id != self.observed_model_id
+            || self.model_readback_state != "verified"
+            || self.stream_phase != "ready"
+            || self.native_events_seen == 0
+            || self.native_events_seen > i64::MAX as u64
+            || self.result_ordinal > i64::MAX as u64
+            || self.gap_count != 0
+            || self.turn_pending
+            || self.stream_error_code.is_some()
+            || self.stream_exit_code.is_some()
+        {
+            return Err("Antigravity dispatch session proof is invalid");
+        }
+        Ok(())
+    }
+}
+
 /// Normalized evidence that a module admitted the exact dispatch payload.
 /// This records input admission only; it is never Task completion evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

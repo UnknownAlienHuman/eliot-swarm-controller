@@ -1,5 +1,16 @@
 # Current-source audit and implementation ledger
 
+The [Antigravity dispatch capability](../2026-10-10/ANTIGRAVITY-DISPATCH-CAPABILITY.json)
+uses its actual same-process refresh producer and a strict session/init/model/idle-turn
+consumer. Direct checks revalidate exact initial or queued Task/Attempt/binding scope,
+current authority, retained ancestry and the held workspace lease. OpenCode keeps its
+existing C8 verifier and bounded readiness preflight. The shared diagnostic card stays
+non-authorizing. The harness performs one exact AG refresh, preserves no-replay on an
+uncertain receipt, and waits before its sole dispatch. Strict production Clippy and
+14 affected Rust cases pass on each platform; the actual readiness loop passes 91
+assertions. Independent Kilo review accepts all eight source hashes without P1/P2.
+Fresh installed native execution and model consumption remain pending.
+
 The [offline MCP round-trip](../2026-10-10/NATIVE-MCP-OFFLINE-ROUNDTRIP.json)
 now verifies the actual typed producer and versioned JSON serializer through the
 complete retained Store payload consumer into production dispatch admission.
