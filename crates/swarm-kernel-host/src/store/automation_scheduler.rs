@@ -1016,10 +1016,29 @@ pub(crate) async fn call(
         }
     }
     let mut calendar_next_due_at_ms = None;
+    let mut calendar_damage = Vec::new();
     if due[1] {
-        calendar_next_due_at_ms = store
-            .reconcile_automation_cron_once(MAX_SOURCE_PAGE, cut.observed_at_ms)
+        let cron_outcome = store
+            .reconcile_automation_cron_once_with_outcome(MAX_SOURCE_PAGE, cut.observed_at_ms)
             .await?;
+        calendar_next_due_at_ms = cron_outcome.next_due_at_ms;
+        for disposition in cron_outcome.quarantined_subjects {
+            let super::automation_reconcile::SubjectDisposition::Quarantined { code, evidence } =
+                disposition
+            else {
+                return Err(Error::new(
+                    "AUTOMATION_CRON_SUBJECT_DISPOSITION_INVALID",
+                    "cron reconciliation returned a non-quarantined disposition as retained damage",
+                ));
+            };
+            calendar_damage.push(DueSourceEvidence {
+                kind: "manager_calendar",
+                code,
+                evidence,
+                source_key: None,
+                source_raw: None,
+            });
+        }
     }
     // CheckRun recovery follows due automation work. Recognized receipt defects
     // return a bounded degraded result; all other check and Store errors remain
@@ -1054,7 +1073,7 @@ pub(crate) async fn call(
     };
     let source_outcomes = vec![
         cut.source_outcome(&latest, "interval_schedule", due[0], &[], &schedule_pending),
-        cut.source_outcome(&latest, "manager_calendar", due[1], &[], &[]),
+        cut.source_outcome(&latest, "manager_calendar", due[1], &calendar_damage, &[]),
         cut.source_outcome(&latest, "goal_reminder", due[2], &[], &[]),
     ];
     let disposition = aggregate_scheduler_disposition(&source_outcomes, &check_recovery_outcome);

@@ -403,9 +403,6 @@ pub(super) fn scope_readback(
             "binding retains only one half of its native identity",
         ));
     }
-    let native_identity_retained = native_root.is_some()
-        || native_scope.is_some()
-        || !binding["observation"]["managed_owner"].is_null();
     let module_hello_boot_id = match binding["observation"].get("bridge_boot_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(value))
@@ -420,11 +417,91 @@ pub(super) fn scope_readback(
             ));
         }
     };
+    let managed_owner_retained =
+        managed_owner_requires_custody(db, &binding, module_id, generation)?;
+    let native_identity_retained =
+        native_root.is_some() || native_scope.is_some() || managed_owner_retained;
     Ok(ModuleScopeReadback {
         operations,
         native_identity_retained,
         module_hello_boot_id,
     })
+}
+
+fn managed_owner_requires_custody(
+    db: &Connection,
+    binding: &Value,
+    module_id: &str,
+    generation: i64,
+) -> Result<bool> {
+    if binding["observation"]["managed_owner"].is_null() {
+        return Ok(false);
+    }
+    let observation = &binding["observation"];
+    let current = &observation["module_supervisor"];
+    let Some(binding_id) = binding["binding_id"].as_str() else {
+        return Ok(true);
+    };
+    let Some(current_boot_id) = observation["bridge_boot_id"].as_str() else {
+        return Ok(true);
+    };
+    let Some(actor_instance_id) = current["actor_instance_id"].as_str() else {
+        return Ok(true);
+    };
+    let Some(artifact_id) = binding["module_artifact_id"].as_str() else {
+        return Ok(true);
+    };
+    let Some(artifact_version) =
+        observation["module_contract_selector"]["artifact"]["version"].as_str()
+    else {
+        return Ok(true);
+    };
+    let exact_departed_projection = current["schema_version"].as_u64() == Some(1)
+        && current["binding_id"].as_str() == Some(binding_id)
+        && current["generation"].as_i64() == Some(generation)
+        && binding["generation"].as_i64() == Some(generation)
+        && current["module_id"].as_str() == Some(module_id)
+        && current["artifact_id"].as_str() == Some(artifact_id)
+        && current["artifact_version"].as_str() == Some(artifact_version)
+        && current["boot_id"].as_str() == Some(current_boot_id)
+        && matches!(
+            current["phase"].as_str(),
+            Some("exited_proven" | "completed")
+        )
+        && current["effect_certainty"] == "unknown"
+        && current.get("stage").is_some_and(Value::is_null);
+    if !exact_departed_projection {
+        return Ok(true);
+    }
+
+    let family_departure_retained = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM observations
+             WHERE binding_id=?1 AND binding_generation=?2 AND kind=?3
+               AND json_extract(payload_json,'$.schema_version')=1
+               AND json_extract(payload_json,'$.event_kind')=?3
+               AND json_extract(payload_json,'$.occurrence_phase')='module_family_exit'
+               AND json_extract(payload_json,'$.proof')='proven_owner_family_departure'
+               AND json_extract(payload_json,'$.module_id')=?4
+               AND json_extract(payload_json,'$.binding_id')=?1
+               AND json_extract(payload_json,'$.generation')=?2
+               AND json_extract(payload_json,'$.boot_id')=?5
+               AND json_extract(payload_json,'$.actor_instance_id')=?6
+               AND json_extract(payload_json,'$.phase') IN ('exited_proven','completed')
+               AND json_extract(payload_json,'$.effect_certainty')='unknown'
+               AND json_type(payload_json,'$.stage')='null'
+         )",
+        params![
+            binding_id,
+            generation,
+            super::module_supervisor_observation::FAMILY_EXIT_EVENT_KIND,
+            module_id,
+            current_boot_id,
+            actor_instance_id,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(!family_departure_retained)
 }
 
 /// Retain one exact owned-service intent for each selected module opening
@@ -686,6 +763,8 @@ pub(super) fn pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model;
+    use serde_json::json;
 
     fn operations_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
@@ -844,5 +923,78 @@ mod tests {
 
         let missing_table = Connection::open_in_memory().unwrap();
         assert!(scoped_operation_readback(&missing_table, "binding-a", 1).is_err());
+    }
+
+    #[test]
+    fn managed_owner_presence_settles_only_with_exact_family_departure() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE observations(
+                 binding_id TEXT NOT NULL,
+                 binding_generation INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let mut binding = json!({
+            "binding_id":"binding-a",
+            "generation":1,
+            "module_artifact_id":"artifact-a",
+            "observation":{
+                "bridge_boot_id":"boot-a",
+                "managed_owner":{"receipt":"historical-owner"},
+                "module_contract_selector":{"artifact":{"version":"1.0.0"}},
+                "module_supervisor":{
+                    "schema_version":1,
+                    "actor_instance_id":"actor-a",
+                    "binding_id":"binding-a",
+                    "generation":1,
+                    "module_id":"module-a",
+                    "artifact_id":"artifact-a",
+                    "artifact_version":"1.0.0",
+                    "boot_id":"boot-a",
+                    "phase":"exited_proven",
+                    "effect_certainty":"unknown",
+                    "stage":null
+                }
+            }
+        });
+
+        assert!(managed_owner_requires_custody(&db, &binding, "module-a", 1).unwrap());
+
+        let departure = json!({
+            "schema_version":1,
+            "event_kind":"module.family_exited",
+            "occurrence_phase":"module_family_exit",
+            "proof":"proven_owner_family_departure",
+            "module_id":"module-a",
+            "binding_id":"binding-a",
+            "generation":1,
+            "boot_id":"boot-a",
+            "actor_instance_id":"actor-a",
+            "phase":"exited_proven",
+            "effect_certainty":"unknown",
+            "stage":null
+        });
+        db.execute(
+            "INSERT INTO observations(binding_id,binding_generation,kind,payload_json)
+             VALUES(?1,1,?2,?3)",
+            params![
+                "binding-a",
+                super::super::module_supervisor_observation::FAMILY_EXIT_EVENT_KIND,
+                model::canonical(&departure).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert!(!managed_owner_requires_custody(&db, &binding, "module-a", 1).unwrap());
+
+        binding["observation"]["module_supervisor"]["phase"] = json!("owner_retained");
+        assert!(managed_owner_requires_custody(&db, &binding, "module-a", 1).unwrap());
+
+        binding["observation"]["module_supervisor"]["phase"] = json!("exited_proven");
+        binding["observation"]["bridge_boot_id"] = json!("boot-b");
+        assert!(managed_owner_requires_custody(&db, &binding, "module-a", 1).unwrap());
     }
 }

@@ -75,6 +75,43 @@ pub struct StandaloneLaunchConfig {
     pub config: BindingLaunchConfig,
 }
 
+#[cfg(test)]
+mod historical_owner_obligation_tests {
+    use super::StandaloneSupervisor;
+    use crate::LifecycleState;
+
+    #[test]
+    fn settled_owner_and_worker_receipts_do_not_keep_the_registry_alive() {
+        let completed = LifecycleState::Completed { exit_code: Some(0) };
+        assert!(!StandaloneSupervisor::has_unsettled_process_custody(
+            &completed, true, true
+        ));
+
+        let departed = LifecycleState::ProcessExited {
+            exit_code: Some(0),
+            exit_proven: true,
+        };
+        assert!(!StandaloneSupervisor::has_unsettled_process_custody(
+            &departed, true, true
+        ));
+
+        let live = LifecycleState::ProcessRunning {
+            boot_id: "boot-fixture".to_owned(),
+        };
+        assert!(StandaloneSupervisor::has_unsettled_process_custody(
+            &live, true, false
+        ));
+
+        let uncertain = LifecycleState::ProcessExited {
+            exit_code: None,
+            exit_proven: false,
+        };
+        assert!(StandaloneSupervisor::has_unsettled_process_custody(
+            &uncertain, true, true
+        ));
+    }
+}
+
 impl StandaloneLaunchConfig {
     fn validate(&self, module_id: &str) -> Result<()> {
         bounded_text(&self.artifact_id, "artifact_id", 256)?;
@@ -1345,9 +1382,11 @@ impl StandaloneSupervisor {
 
     async fn registry_has_obligations(&self) -> bool {
         self.registry.statuses().await.into_iter().any(|status| {
-            status.owner.is_some()
-                || status.worker.is_some()
-                || status.readback_required
+            Self::has_unsettled_process_custody(
+                &status.lifecycle,
+                status.owner.is_some(),
+                status.worker.is_some(),
+            ) || status.readback_required
                 || status.unknown_operation_count != 0
                 || !status.unknown_operation_ids.is_empty()
                 || matches!(
@@ -1355,6 +1394,22 @@ impl StandaloneSupervisor {
                     crate::ModuleEffectCertainty::Unknown
                 )
         })
+    }
+
+    fn has_unsettled_process_custody(
+        lifecycle: &crate::LifecycleState,
+        owner_retained: bool,
+        worker_retained: bool,
+    ) -> bool {
+        (owner_retained || worker_retained)
+            && !matches!(
+                lifecycle,
+                crate::LifecycleState::Completed { .. }
+                    | crate::LifecycleState::ProcessExited {
+                        exit_proven: true,
+                        ..
+                    }
+            )
     }
 
     async fn start_demand(

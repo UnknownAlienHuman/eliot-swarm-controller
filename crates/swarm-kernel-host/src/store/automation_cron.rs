@@ -133,6 +133,13 @@ struct PreparedBatch {
     candidates: Vec<Candidate>,
     next_due_at_ms: Option<i64>,
     due_remaining: bool,
+    quarantined_subjects: Vec<SubjectDisposition<()>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct CronReconcileOutcome {
+    pub(super) next_due_at_ms: Option<i64>,
+    pub(super) quarantined_subjects: Vec<SubjectDisposition<()>>,
 }
 
 fn logical_id(db: &Connection, entry: &AutomationEntry) -> Result<(String, String)> {
@@ -587,6 +594,30 @@ fn candidate_for_index(
     index_key: String,
     index: DueIndex,
     now_ms: i64,
+    quarantined_subjects: &mut Vec<SubjectDisposition<()>>,
+) -> Result<Option<Candidate>> {
+    let error = match prepare_cron_candidate(db, index_key.clone(), index, now_ms) {
+        Ok(candidate) => return Ok(candidate),
+        Err(error) => error,
+    };
+    match classify_cron_candidate(db, &index_key, error, now_ms)? {
+        SubjectDisposition::Applied(()) => Err(Error::new(
+            "AUTOMATION_CRON_SUBJECT_DISPOSITION_INVALID",
+            "cron subject classification returned applied for a failed subject",
+        )),
+        SubjectDisposition::Pending { .. } | SubjectDisposition::Skipped { .. } => Ok(None),
+        quarantined @ SubjectDisposition::Quarantined { .. } => {
+            quarantined_subjects.push(quarantined);
+            Ok(None)
+        }
+    }
+}
+
+fn prepare_cron_candidate(
+    db: &Transaction<'_>,
+    index_key: String,
+    index: DueIndex,
+    now_ms: i64,
 ) -> Result<Option<Candidate>> {
     if index.schema_version != SCHEMA_VERSION
         || index.wake_at_ms < 0
@@ -658,35 +689,13 @@ fn candidate_for_index(
         &index.generation,
         due.due_at_ms,
     )?;
-    let context = match CronExecutionContext::from_committed_entry(
+    let context = CronExecutionContext::from_committed_entry(
         db,
         &entry,
         &index.generation,
         &occurrence_id,
         due.due_at_ms,
-    ) {
-        Ok(context) => context,
-        Err(error) => {
-            // Exact-subject classification for this one occurrence. A prerequisite
-            // or action of the exact subject may still change, so those codes stay
-            // pending and are retried by a later pass. A retained row that cannot be
-            // decoded as the exact subject is recognized semantic damage and is
-            // isolated with bounded row identity, pointer and digest. Every other
-            // code, including SQL, savepoint and commit failures, aborts the whole
-            // batch transaction instead of silently dropping the occurrence.
-            match classify_cron_candidate(db, &index_key, error, now_ms)? {
-                SubjectDisposition::Applied(()) => {
-                    return Err(Error::new(
-                        "AUTOMATION_CRON_SUBJECT_DISPOSITION_INVALID",
-                        "cron subject classification returned applied for a failed subject",
-                    ));
-                }
-                SubjectDisposition::Pending { .. }
-                | SubjectDisposition::Skipped { .. }
-                | SubjectDisposition::Quarantined { .. } => return Ok(None),
-            }
-        }
-    };
+    )?;
     Ok(Some(Candidate {
         index_key,
         index,
@@ -890,8 +899,13 @@ fn prepare_batch(db: &Transaction<'_>, limit: usize, now_ms: i64) -> Result<Prep
                 "held and due indexes disagree",
             ));
         }
-        if let Some(candidate) = candidate_for_index(db, index_key.clone(), index.clone(), now_ms)?
-        {
+        if let Some(candidate) = candidate_for_index(
+            db,
+            index_key.clone(),
+            index.clone(),
+            now_ms,
+            &mut batch.quarantined_subjects,
+        )? {
             if !batch
                 .candidates
                 .iter()
@@ -935,7 +949,13 @@ fn prepare_batch(db: &Transaction<'_>, limit: usize, now_ms: i64) -> Result<Prep
             .iter()
             .any(|candidate| candidate.index.logical_id == index.logical_id);
         if !already_prepared
-            && let Some(candidate) = candidate_for_index(db, key.clone(), index.clone(), now_ms)?
+            && let Some(candidate) = candidate_for_index(
+                db,
+                key.clone(),
+                index.clone(),
+                now_ms,
+                &mut batch.quarantined_subjects,
+            )?
         {
             batch.next_due_at_ms = min_due(
                 batch.next_due_at_ms,
@@ -1284,6 +1304,16 @@ impl Store {
         limit: usize,
         now_ms: i64,
     ) -> Result<Option<i64>> {
+        self.reconcile_automation_cron_once_with_outcome(limit, now_ms)
+            .await
+            .map(|outcome| outcome.next_due_at_ms)
+    }
+
+    pub(super) async fn reconcile_automation_cron_once_with_outcome(
+        &self,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<CronReconcileOutcome> {
         let prepared = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1294,6 +1324,7 @@ impl Store {
             .await?;
         let config = self.config.clone();
         let mut next_due = prepared.next_due_at_ms;
+        let quarantined_subjects = prepared.quarantined_subjects;
         let mut wake_check_worker = false;
         for candidate in prepared.candidates {
             let context = candidate.context.clone();
@@ -1387,7 +1418,10 @@ impl Store {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
-        Ok(next_due)
+        Ok(CronReconcileOutcome {
+            next_due_at_ms: next_due,
+            quarantined_subjects,
+        })
     }
 }
 

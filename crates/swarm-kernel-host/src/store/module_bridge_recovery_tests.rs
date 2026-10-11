@@ -289,6 +289,38 @@ fn stored_operation_state(db: &Connection) -> (String, i64) {
 }
 
 #[test]
+fn zed_command_intake_preserves_idle_errors_and_taken_operation_state() {
+    let (path, before, _) = durable_prompt_store();
+    let mut db = Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+    let stale_link = principal(PROMPT_RECOVERY_MODULE, Role::Module, "prompt-link-stale");
+    let next_error = runtime::next(&mut db, &stale_link).unwrap_err();
+    assert_eq!(next_error.code, "STALE_LINK");
+    let propagated = runtime::decode_zed_command(Err(next_error))
+        .err()
+        .expect("Store next failure must not become idle");
+    assert_eq!(propagated.code, "STALE_LINK");
+    assert_eq!(stored_operation_state(&db).0, "queued");
+
+    let idle = runtime::decode_zed_command(Ok(json!({"command":null}))).unwrap();
+    assert!(idle.is_none());
+
+    let mut taken = runtime::next(&mut db, &before).unwrap();
+    assert_eq!(taken["command"]["method"], "task.dispatch");
+    assert_eq!(stored_operation_state(&db).0, "sending");
+    taken["command"]["operation_id"] = json!(false);
+    let decode_error = runtime::decode_zed_command(Ok(taken))
+        .err()
+        .expect("malformed taken command must remain an error");
+    assert_eq!(decode_error.code, "INVALID_PARAMS");
+    assert_eq!(stored_operation_state(&db).0, "sending");
+
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn task_prompt_dispatch_context_survives_store_restart_and_worker_replacement() {
     let (path, before, after) = durable_prompt_store();
     let initial_command = initial_prompt_command(&path, &before);

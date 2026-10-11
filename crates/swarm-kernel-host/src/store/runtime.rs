@@ -3916,9 +3916,31 @@ fn batch_result_readback(
     ))
 }
 
+pub(super) fn decode_zed_command(next: Result<Value>) -> Result<Option<RuntimeCommand>> {
+    let envelope = next?;
+    let command = envelope.get("command").ok_or_else(|| {
+        Error::new(
+            "STORE_ERROR",
+            "Zed Store next response omitted its command field",
+        )
+    })?;
+    if command.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(command.clone())?))
+}
+
+async fn join_zed_binding_worker(task: JoinHandle<Result<()>>) {
+    match task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("Zed binding worker: {}", error.code),
+        Err(error) => eprintln!("Zed binding task: {error}"),
+    }
+}
+
 impl Store {
     pub async fn supervise_zed(self, mut stopping: watch::Receiver<bool>) {
-        let mut workers: BTreeMap<(String, i64), JoinHandle<()>> = BTreeMap::new();
+        let mut workers: BTreeMap<(String, i64), JoinHandle<Result<()>>> = BTreeMap::new();
         let mut changed = self.changed.subscribe();
         while !*stopping.borrow() {
             let finished = workers
@@ -3928,7 +3950,7 @@ impl Store {
                 .collect::<Vec<_>>();
             for key in finished {
                 if let Some(task) = workers.remove(&key) {
-                    let _ = task.await;
+                    join_zed_binding_worker(task).await;
                 }
             }
             match self.run(|db| batch_bindings(db)).await {
@@ -3947,7 +3969,7 @@ impl Store {
                             let store = self.clone();
                             let stop = stopping.clone();
                             entry.insert(tokio::spawn(async move {
-                                store.drive_zed_binding(&key.0, key.1, stop).await;
+                                store.drive_zed_binding(&key.0, key.1, stop).await
                             }));
                         }
                     }
@@ -3961,7 +3983,7 @@ impl Store {
             }
         }
         for task in workers.into_values() {
-            let _ = task.await;
+            join_zed_binding_worker(task).await;
         }
     }
 
@@ -4452,34 +4474,18 @@ impl Store {
         binding_id: &str,
         generation: i64,
         mut stopping: watch::Receiver<bool>,
-    ) {
-        let output_root = match ensure_batch_root(&self.data_dir) {
-            Ok(root) => root,
-            Err(error) => {
-                eprintln!("Zed evidence root: {}", error.code);
-                return;
-            }
-        };
+    ) -> Result<()> {
+        let output_root = ensure_batch_root(&self.data_dir)?;
         let binding = {
             let id = binding_id.to_owned();
-            match self
-                .run(move |db| operations::get_binding(db, &id, generation))
-                .await
-            {
-                Ok(binding) => binding,
-                Err(_) => return,
-            }
+            self.run(move |db| operations::get_binding(db, &id, generation))
+                .await?
         };
         let boot = model::new_id();
         let principal = {
             let boot = boot.clone();
-            match self.run(move |db| attach_batch(db, &binding, &boot)).await {
-                Ok(principal) => principal,
-                Err(error) => {
-                    eprintln!("Zed attachment: {}", error.code);
-                    return;
-                }
-            }
+            self.run(move |db| attach_batch(db, &binding, &boot))
+                .await?
         };
         let mut changed = self.changed.subscribe();
         while !*stopping.borrow() {
@@ -4496,13 +4502,7 @@ impl Store {
                 break;
             }
             let p = principal.clone();
-            let command = self
-                .run(move |db| next(db, &p))
-                .await
-                .ok()
-                .and_then(|value| {
-                    serde_json::from_value::<RuntimeCommand>(value["command"].clone()).ok()
-                });
+            let command = decode_zed_command(self.run(move |db| next(db, &p)).await)?;
             if let Some(command) = command {
                 if let Err(error) = self
                     .process_zed_command(&principal, command, &output_root)
@@ -4518,6 +4518,7 @@ impl Store {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {},
             }
         }
+        Ok(())
     }
 }
 

@@ -143,7 +143,7 @@ const REJECTION_EVENT_KIND: &str = "module.supervisor_observation_rejected";
 const ACTIVE_ACTOR_META_KEY: &str = "module_supervisor_current_actor";
 const READY_EVENT_KIND: &str = "module.ready";
 const START_FAILURE_EVENT_KIND: &str = "module.start_failed";
-const FAMILY_EXIT_EVENT_KIND: &str = "module.family_exited";
+pub(super) const FAMILY_EXIT_EVENT_KIND: &str = "module.family_exited";
 const RECOVERY_BLOCKED_EVENT_KIND: &str = "module.recovery_blocked";
 const IDENTITY_UNKNOWN_EVENT_KIND: &str = "module.identity_unknown";
 const OWNER_RETAINED_EVENT_KIND: &str = "module.owner_retained";
@@ -227,6 +227,7 @@ fn is_permanent_observation_error(code: &str) -> bool {
             | "MODULE_OBSERVATION_IDENTITY_MISMATCH"
             | "MODULE_OBSERVATION_OPERATION_SCOPE"
             | "MODULE_OBSERVATION_OPERATION_TERMINAL"
+            | "MODULE_OBSERVATION_TRANSITION_INVALID"
             | "MODULE_OBSERVATION_SCOPE_QUARANTINED"
             | "MODULE_DESCRIPTOR_MISSING"
             | "MODULE_ROUTE_CORRUPT"
@@ -733,6 +734,7 @@ pub(super) fn record(
             "module supervisor callback sequence is older than the retained binding readback",
         ));
     }
+    validate_phase_transition(current, observation)?;
     let transition = lifecycle_transition(current, observation);
     let nonterminal = nonterminal_transition(observation);
     let operation_link = validate_operation_ids(tx, observation, generation)?;
@@ -796,6 +798,28 @@ pub(super) fn record(
         inserted: true,
         diagnostic,
     })
+}
+
+fn validate_phase_transition(
+    previous: &Value,
+    observation: &ModuleSupervisorObservation,
+) -> Result<()> {
+    let same_actor_and_boot = previous["actor_instance_id"].as_str()
+        == Some(observation.actor_instance_id.as_str())
+        && observation
+            .boot_id
+            .as_deref()
+            .is_some_and(|boot_id| previous["boot_id"].as_str() == Some(boot_id));
+    if same_actor_and_boot
+        && previous["phase"] == "ready"
+        && matches!(observation.phase, ModuleSupervisorPhase::Starting)
+    {
+        return Err(Error::new(
+            "MODULE_OBSERVATION_TRANSITION_INVALID",
+            "a ready module supervisor boot cannot return to starting",
+        ));
+    }
+    Ok(())
 }
 
 fn lifecycle_transition(
@@ -2854,6 +2878,101 @@ mod journal_regression_tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn same_boot_ready_rejects_starting_but_a_new_boot_can_start_and_ready_once() {
+        let mut db = fixture_db();
+        let starting = producer_observation(1, ProducerPhase::Starting, None);
+        let ready = producer_observation(2, ProducerPhase::Ready, None);
+        assert!(
+            record_in_transaction(&mut db, &starting, 100)
+                .unwrap()
+                .inserted
+        );
+        assert!(
+            record_in_transaction(&mut db, &ready, 200)
+                .unwrap()
+                .inserted
+        );
+
+        let regression = producer_observation(3, ProducerPhase::Starting, None);
+        let error = expect_record_error(&mut db, &regression, 300);
+        assert_eq!(error.code, "MODULE_OBSERVATION_TRANSITION_INVALID");
+
+        let mut next_starting = producer_observation(4, ProducerPhase::Starting, None);
+        next_starting.boot_id = Some("boot-fixture-next".to_owned());
+        next_starting.event_id = format!(
+            "{}:{}:{}",
+            "boot-fixture-next", ACTOR_INSTANCE_ID, next_starting.sequence
+        );
+        assert!(
+            record_in_transaction(&mut db, &next_starting, 400)
+                .unwrap()
+                .inserted
+        );
+
+        let mut next_ready = producer_observation(5, ProducerPhase::Ready, None);
+        next_ready.boot_id = next_starting.boot_id.clone();
+        next_ready.event_id = format!(
+            "{}:{}:{}",
+            next_starting.boot_id.as_deref().unwrap(),
+            ACTOR_INSTANCE_ID,
+            next_ready.sequence
+        );
+        assert!(
+            record_in_transaction(&mut db, &next_ready, 500)
+                .unwrap()
+                .inserted
+        );
+
+        let mut ready_refresh = next_ready.clone();
+        ready_refresh.sequence = 6;
+        ready_refresh.event_id = format!(
+            "{}:{}:{}",
+            next_starting.boot_id.as_deref().unwrap(),
+            ACTOR_INSTANCE_ID,
+            ready_refresh.sequence
+        );
+        assert!(
+            record_in_transaction(&mut db, &ready_refresh, 600)
+                .unwrap()
+                .inserted
+        );
+
+        let ready_boots: Vec<String> = db
+            .prepare(
+                "SELECT json_extract(payload_json,'$.boot_id') FROM observations
+                 WHERE binding_id=?1 AND binding_generation=?2 AND kind=?3
+                 ORDER BY observation_id",
+            )
+            .unwrap()
+            .query_map(
+                params![BINDING_ID, GENERATION as i64, READY_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            ready_boots,
+            vec![BOOT_ID.to_owned(), "boot-fixture-next".to_owned()]
+        );
+
+        let latest: (String, String, i64) = db
+            .query_row(
+                "SELECT json_extract(state_json,'$.module_supervisor.phase'),
+                        json_extract(state_json,'$.module_supervisor.boot_id'),
+                        json_extract(state_json,'$.module_supervisor.sequence')
+                 FROM bindings WHERE binding_id=?1 AND generation=?2",
+                params![BINDING_ID, GENERATION as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            latest,
+            ("ready".to_owned(), "boot-fixture-next".to_owned(), 6)
+        );
     }
 
     #[test]

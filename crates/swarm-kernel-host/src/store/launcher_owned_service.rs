@@ -25,7 +25,10 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+};
 use tokio::sync::watch;
 
 const MAX_PROOF_BYTES: usize = 8 * 1024;
@@ -293,10 +296,18 @@ impl Store {
         Ok(Some(handle))
     }
 
-    async fn close_owned_service_and_reconcile(&self, handle: OwnedServiceHandle) {
-        if handle.close_gracefully().await.is_ok() {
-            let _ = self.reconcile_owned_opencode_departures_once().await;
-        }
+    async fn close_owned_service_and_reconcile(
+        &self,
+        handle: OwnedServiceHandle,
+        primary_error: Error,
+    ) -> Error {
+        let close = async { handle.close_gracefully().await.map(|_| ()) };
+        let reconcile = async {
+            self.reconcile_owned_opencode_departures_once()
+                .await
+                .map(|_| ())
+        };
+        preserve_owned_service_cleanup_errors(primary_error, close, reconcile).await
     }
 
     /// Resolve the exact queued `agent.open` service, reserve its immutable
@@ -394,8 +405,7 @@ impl Store {
                     .run(move |db| persist_observed_proof(db, &row, &route, &intent, &proof))
                     .await
                 {
-                    self.close_owned_service_and_reconcile(handle).await;
-                    return Err(error);
+                    return Err(self.close_owned_service_and_reconcile(handle, error).await);
                 }
             } else {
                 let existing: Value = serde_json::from_str(&admission.row.proof_json)
@@ -416,12 +426,12 @@ impl Store {
                 })
                 .await
             {
-                self.close_owned_service_and_reconcile(handle).await;
-                return Err(error);
+                return Err(self.close_owned_service_and_reconcile(handle, error).await);
             }
             if *stopping.borrow() {
-                self.close_owned_service_and_reconcile(handle).await;
-                return Err(shutdown_error());
+                return Err(self
+                    .close_owned_service_and_reconcile(handle, shutdown_error())
+                    .await);
             }
             return Ok(handle);
         }
@@ -591,8 +601,7 @@ impl Store {
             .run(move |db| persist_observed_proof(db, &row, &route, &intent, &proof_for_store))
             .await;
         if let Err(error) = persist_result {
-            self.close_owned_service_and_reconcile(handle).await;
-            return Err(error);
+            return Err(self.close_owned_service_and_reconcile(handle, error).await);
         }
 
         // Proof persistence precedes the final current-authority check. If a
@@ -613,12 +622,12 @@ impl Store {
             })
             .await;
         if let Err(error) = final_check {
-            self.close_owned_service_and_reconcile(handle).await;
-            return Err(error);
+            return Err(self.close_owned_service_and_reconcile(handle, error).await);
         }
         if *stopping.borrow() {
-            self.close_owned_service_and_reconcile(handle).await;
-            return Err(shutdown_error());
+            return Err(self
+                .close_owned_service_and_reconcile(handle, shutdown_error())
+                .await);
         }
         Ok(handle)
     }
@@ -3375,6 +3384,65 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+async fn preserve_owned_service_cleanup_errors<Close, Reconcile>(
+    mut primary_error: Error,
+    close: Close,
+    reconcile: Reconcile,
+) -> Error
+where
+    Close: Future<Output = Result<()>>,
+    Reconcile: Future<Output = Result<()>>,
+{
+    if let Err(error) = close.await {
+        primary_error = primary_error.with_secondary_error(error);
+    }
+    if let Err(error) = reconcile.await {
+        primary_error = primary_error.with_secondary_error(error);
+    }
+    primary_error
+}
+
 #[cfg(test)]
 #[path = "owned_actor_provenance_tests.rs"]
 mod owned_actor_provenance_tests;
+
+#[cfg(test)]
+mod owned_service_cleanup_tests {
+    use super::{Error, preserve_owned_service_cleanup_errors};
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn close_failure_still_reconciles_and_both_errors_remain_secondary() {
+        let close_finished = Cell::new(false);
+        let error = preserve_owned_service_cleanup_errors(
+            Error::new("OWNED_OPEN_FAILED", "the original failure remains primary"),
+            async {
+                close_finished.set(true);
+                Err::<(), Error>(Error::new(
+                    "OWNED_SERVICE_STOP_UNKNOWN",
+                    "graceful stop was not confirmed",
+                ))
+            },
+            async {
+                assert!(
+                    close_finished.get(),
+                    "reconciliation follows the close attempt"
+                );
+                Err::<(), Error>(Error::new(
+                    "STORE_BUSY",
+                    "departure reconciliation could not persist its observation",
+                ))
+            },
+        )
+        .await;
+
+        assert_eq!(error.code, "OWNED_OPEN_FAILED");
+        assert_eq!(
+            error.secondary_codes,
+            vec![
+                "OWNED_SERVICE_STOP_UNKNOWN".to_owned(),
+                "STORE_BUSY".to_owned()
+            ]
+        );
+    }
+}
