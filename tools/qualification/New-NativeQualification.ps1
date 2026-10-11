@@ -883,6 +883,132 @@ function Get-SafeErrorCode {
     return 'CLI_EXIT'
 }
 
+function Get-DispatchRequestId {
+    param([AllowNull()] $Operation)
+    if ($null -eq $Operation) { return $null }
+    $value = Get-OptionalField $Operation 'client_request_id' -PreserveCollection
+    if ($value -isnot [string]) { return $null }
+    return $value
+}
+
+function Assert-DispatchRequestIdentity {
+    <#
+    Every task.dispatch readback must satisfy the same identity contract, whichever
+    public read it came from. The contract is the exact method plus the exact
+    client_request_id the harness chose and sent, because one producing caller can
+    own several shape-identical rejected task.dispatch rows that differ only by
+    request id, so caller ownership is not identity.
+
+    Scope then follows from what the row is:
+
+      A pre-admission rejection carries no scope at all. The Store rejects the
+      dispatch before the launch Scope binding is attached, so task_id, attempt_id,
+      binding_id and binding_generation are absent rather than wrong. That absence
+      is the defining shape of a deterministic rejection, and it is the only case
+      where a row with null scopes may be adopted.
+
+      Any other readback, admitted or not, must carry the exact Task, Attempt and
+      Binding identity. A matching request id alone never bypasses scope for those,
+      because a sibling on the same Task and Attempt with a different request id is
+      still a different dispatch.
+
+    A readback must also name the exact operation_id the caller is resolving. The
+    known-id path passes the id it read; the fallback path passes the id it selected,
+    so a wrong operation_id never settles even when request id, method and scope all
+    agree.
+
+    Returns a classification object, or $null when the row is not this dispatch.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()] $Operation,
+        [Parameter(Mandatory)][string] $ExpectedRequestId,
+        [Parameter(Mandatory)][string] $ExpectedMethod,
+        [Parameter(Mandatory)][string] $ExpectedTaskId,
+        [Parameter(Mandatory)][string] $ExpectedAttemptId,
+        [Parameter(Mandatory)][string] $ExpectedBindingId,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()] $ExpectedGeneration,
+        [Parameter(Mandatory)][string] $ExpectedOperationId
+    )
+    if ($null -eq $Operation) { return $null }
+    if ([string]::IsNullOrWhiteSpace($ExpectedRequestId)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($ExpectedOperationId)) { return $null }
+
+    # The operation id is retained independently of method, request id and scope.
+    # A readback that agrees on all of those but names a different Operation is a
+    # different dispatch and must never settle, which is why this check is not
+    # folded into the request-id comparison below.
+    $operationId = Get-OptionalField $Operation 'operation_id' -PreserveCollection
+    if ($operationId -isnot [string] -or $operationId -cne $ExpectedOperationId) { return $null }
+
+    # Exact identity next. Both reads must agree on method and request id.
+    $method = Get-OptionalField $Operation 'method' -PreserveCollection
+    if ($method -isnot [string] -or $method -cne $ExpectedMethod) { return $null }
+    if ((Get-DispatchRequestId $Operation) -cne $ExpectedRequestId) { return $null }
+
+    $taskId = Get-OptionalField $Operation 'task_id' -PreserveCollection
+    $attemptId = Get-OptionalField $Operation 'attempt_id' -PreserveCollection
+    $bindingId = Get-OptionalField $Operation 'binding_id' -PreserveCollection
+    $bindingGeneration = Get-OptionalField $Operation 'binding_generation' -PreserveCollection
+    $state = Get-OptionalField $Operation 'state' -PreserveCollection
+    if ($state -isnot [string]) { return $null }
+    $allScopesAbsent = $null -eq $taskId -and $null -eq $attemptId -and
+        $null -eq $bindingId -and $null -eq $bindingGeneration
+
+    if ($allScopesAbsent) {
+        # Only a deterministic pre-admission rejection may carry no scope.
+        if ($state -cne 'rejected') { return $null }
+        return [pscustomobject]@{
+            operation_id = $operationId
+            state = $state
+            request_id = $ExpectedRequestId
+            scoped = $false
+            pre_admission_rejected = $true
+        }
+    }
+
+    # Any scoped row must match the exact Task, Attempt and Binding identity. A
+    # matching request id alone is not enough for an admitted dispatch.
+    $generationIsInteger = $bindingGeneration -is [int] -or $bindingGeneration -is [long] -or
+        $bindingGeneration -is [uint32] -or $bindingGeneration -is [uint64]
+    if ($taskId -isnot [string] -or $attemptId -isnot [string] -or $bindingId -isnot [string] -or
+        -not $generationIsInteger -or $taskId -cne $ExpectedTaskId -or $attemptId -cne $ExpectedAttemptId -or
+        $bindingId -cne $ExpectedBindingId -or [string]$bindingGeneration -cne ([string]$ExpectedGeneration)) {
+        return $null
+    }
+    return [pscustomobject]@{
+        operation_id = $operationId
+        state = $state
+        request_id = $ExpectedRequestId
+        scoped = $true
+        pre_admission_rejected = $false
+    }
+}
+
+function Select-DispatchOperationByRequest {
+    <#
+    Return every retained task.dispatch row the identity contract accepts, so the
+    caller can demand uniqueness before adopting an operation id. Rows the contract
+    rejects, including a wrong same-caller request id sibling, never appear.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()] $Operations,
+        [Parameter(Mandatory)][string] $ExpectedRequestId,
+        [Parameter(Mandatory)][string] $ExpectedMethod,
+        [Parameter(Mandatory)][string] $ExpectedTaskId,
+        [Parameter(Mandatory)][string] $ExpectedAttemptId,
+        [Parameter(Mandatory)][string] $ExpectedBindingId,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()] $ExpectedGeneration
+    )
+    if ($null -eq $Operations) { return @() }
+    $accepted = @()
+    foreach ($row in $Operations) {
+        $operationId = Get-OptionalField $row 'operation_id' -PreserveCollection
+        if ($operationId -isnot [string] -or [string]::IsNullOrWhiteSpace($operationId)) { continue }
+        $verified = Assert-DispatchRequestIdentity -Operation $row -ExpectedRequestId $ExpectedRequestId -ExpectedMethod $ExpectedMethod -ExpectedTaskId $ExpectedTaskId -ExpectedAttemptId $ExpectedAttemptId -ExpectedBindingId $ExpectedBindingId -ExpectedGeneration $ExpectedGeneration -ExpectedOperationId $operationId
+        if ($verified) { $accepted += $row }
+    }
+    return $accepted
+}
 function New-NativeCaptureState {
     if (-not ('Eliot.NativeQualification.BoundedOutput' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -2145,13 +2271,15 @@ try {
         }
     }
     if (-not (Confirm-CodexStillAttached)) { Stop-Qualification 'CODEX_APP_SERVER_CHANGED_BEFORE_DISPATCH' }
-    $dispatchParams = [ordered]@{ attempt_id = $attemptId; launch_operation_id = $parentOperationId; text = $oneTurnText; client_request_id = New-RequestId }
+    $dispatchClientRequestId = New-RequestId
+    $dispatchParams = [ordered]@{ attempt_id = $attemptId; launch_operation_id = $parentOperationId; text = $oneTurnText; client_request_id = $dispatchClientRequestId }
     $script:DispatchSubmitted = $true
     $script:Report.limits.task_dispatch_calls = 1
     $dispatch = Invoke-ManagerCall -Method 'task.dispatch' -Params $dispatchParams -TimeoutMilliseconds 30000
     $dispatchOperationId = if ($dispatch.completed -and $dispatch.exit_code -eq 0 -and $null -ne $dispatch.value) { [string]$dispatch.value.operation_id } else { $null }
     $dispatchDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $dispatchOperation = $null
+    $dispatchIdentity = $null
     $dispatchReadbackCode = $null
     $terminalDispatchStates = @('settled', 'rejected', 'cancelled', 'outcome_unknown')
     while ([DateTime]::UtcNow -lt $dispatchDeadline) {
@@ -2159,16 +2287,24 @@ try {
             $operationCall = Invoke-ManagerCall -Method 'operation.get' -Params ([ordered]@{ operation_id = $dispatchOperationId }) -TimeoutMilliseconds 5000
             if ($operationCall.completed -and $operationCall.exit_code -eq 0 -and $null -ne $operationCall.value) {
                 $candidate = $operationCall.value
-                if ($candidate.operation_id -ne $dispatchOperationId -or $candidate.method -ne 'task.dispatch' -or
-                    $candidate.task_id -ne $taskId -or $candidate.attempt_id -ne $attemptId -or
-                    $candidate.binding_id -ne $bindingId -or [long]$candidate.binding_generation -ne $generation) {
+                # One identity contract for every readback: exact method plus exact
+                # request id. A pre-admission rejection legitimately carries no scope,
+                # so the known-id path must not demand Task, Attempt or Binding there.
+                # ExpectedOperationId is the id this iteration read out of band, so a
+                # readback that agrees on request id, method and scope but names a
+                # different Operation still fails identity and never settles.
+                $identity = Assert-DispatchRequestIdentity -Operation $candidate -ExpectedRequestId $dispatchClientRequestId -ExpectedMethod 'task.dispatch' -ExpectedTaskId $taskId -ExpectedAttemptId $attemptId -ExpectedBindingId $bindingId -ExpectedGeneration $generation -ExpectedOperationId $dispatchOperationId
+                if ($null -eq $identity) {
                     $dispatchReadbackCode = 'DISPATCH_OPERATION_IDENTITY_MISMATCH'
                 }
                 else {
                     $dispatchOperation = $candidate
-                    $publicResult = Get-OptionalField $candidate 'result'
-                    $publicResultOperationId = Get-OptionalField $publicResult 'operation_id'
-                    if ($null -ne $publicResultOperationId -and $publicResultOperationId -ne $dispatchOperationId) {
+                    $dispatchIdentity = $identity
+                    $dispatchReadbackCode = $null
+                    $publicResult = Get-OptionalField $candidate 'result' -PreserveCollection
+                    $publicResultOperationId = Get-OptionalField $publicResult 'operation_id' -PreserveCollection
+                    if ($null -ne $publicResultOperationId -and
+                        ($publicResultOperationId -isnot [string] -or $publicResultOperationId -cne $dispatchOperationId)) {
                         $dispatchReadbackCode = 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH'
                     }
                     if ($candidate.state -in $terminalDispatchStates) { break }
@@ -2177,14 +2313,19 @@ try {
             }
             else { $dispatchReadbackCode = $operationCall.error_code }
         }
-        if ([string]::IsNullOrWhiteSpace($dispatchOperationId) -or $null -eq $dispatchOperation) {
+        if ([string]::IsNullOrWhiteSpace($dispatchOperationId)) {
             $operations = Get-Operations -TimeoutMilliseconds 5000
             if ($operations.success) {
-                $matches = @($operations.items | Where-Object { $_.method -eq 'task.dispatch' -and $_.task_id -eq $taskId -and $_.attempt_id -eq $attemptId })
-                if ($matches.Count -eq 1) {
-                    $dispatchOperationId = [string]$matches[0].operation_id
+                # Exact request id plus method. A scoped readback only counts when its
+                # own projection also names this request id, so an operation merely on
+                # this Task and Attempt never stands in for this dispatch. Recovering the
+                # id is all this fallback does; the next iteration re-reads it through
+                # operation.get, where the same identity contract is applied to the readback.
+                $requestMatches = @(Select-DispatchOperationByRequest -Operations $operations.items -ExpectedRequestId $dispatchClientRequestId -ExpectedMethod 'task.dispatch' -ExpectedTaskId $taskId -ExpectedAttemptId $attemptId -ExpectedBindingId $bindingId -ExpectedGeneration $generation)
+                if ($requestMatches.Count -eq 1) {
+                    $dispatchOperationId = [string](Get-OptionalField $requestMatches[0] 'operation_id')
                 }
-                elseif ($matches.Count -gt 1) { $dispatchReadbackCode = 'MULTIPLE_DISPATCH_OPERATIONS' }
+                elseif ($requestMatches.Count -gt 1) { $dispatchReadbackCode = 'MULTIPLE_DISPATCH_OPERATIONS' }
             }
             else { $dispatchReadbackCode = $operations.code }
         }
@@ -2192,10 +2333,15 @@ try {
     }
     $codexStillAttached = Confirm-CodexStillAttached
     if ($null -eq $dispatchOperation) {
+        # Unknown stays unknown. The exact request id was never resolved to a retained
+        # Operation, so no rejection is claimed. The single dispatch call is already
+        # counted and the Store owns the authoritative outcome.
         $script:Report.status = 'dispatch_outcome_unknown'
         $script:Report.qualification = 'not_qualified'
         $dispatchCode = if ($dispatch.error_code) { $dispatch.error_code } elseif ($dispatchReadbackCode) { $dispatchReadbackCode } else { 'DISPATCH_READBACK_TIMEOUT' }
-        Add-Stage -Name 'single_task_dispatch' -Status 'unknown' -Code $dispatchCode -Facts ([ordered]@{ dispatch_operation_id = $dispatchOperationId; readback_completed = $false; replayed = $false; codex_process_still_matches = $codexStillAttached })
+        $dispatchUnknownFacts = [ordered]@{ dispatch_operation_id = $dispatchOperationId; readback_completed = $false; replayed = $false; codex_process_still_matches = $codexStillAttached }
+        Add-Stage -Name 'single_task_dispatch' -Status 'unknown' -Code $dispatchCode -Facts $dispatchUnknownFacts
+        $script:Report.safe_facts.dispatch = $dispatchUnknownFacts
     }
     else {
         $rawOperationState = [string]$dispatchOperation.state
@@ -2206,14 +2352,29 @@ try {
         $rawOutcomeValue = Get-OptionalField $operationResult 'outcome'
         $rawOutcome = if ($null -ne $rawOutcomeValue) { [string]$rawOutcomeValue } else { $null }
         $outcome = if ($rawOutcome -in @('accepted', 'applied', 'rejected', 'unknown')) { $rawOutcome } else { $null }
+        # A deterministic Store rejection is terminal and carries its own safe code. Surface it so
+        # the readback names the exact reason without repeating the raw CLI stderr envelope.
+        $rawErrorCodeValue = Get-OptionalField $operationResult 'code'
+        $safeResultCode = if ($rawErrorCodeValue -is [string] -and $rawErrorCodeValue -cmatch '\A[A-Z0-9_]{1,64}\z') { $rawErrorCodeValue } else { $null }
+        # Reuse the validated identity; scope shape is interpreted in one place.
+        $preAdmissionRejected = $null -ne $dispatchIdentity -and $dispatchIdentity.pre_admission_rejected
         $isReadbackInconsistent = $null -ne $stateCode -or $dispatchReadbackCode -eq 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH'
-        $script:Report.status = if ($isReadbackInconsistent) { 'dispatch_readback_inconsistent' } elseif ($operationState -in $terminalDispatchStates) { 'dispatch_readback_complete' } else { 'dispatch_pending' }
-        $script:Report.qualification = 'not_qualified'
-        $safeDiagnostic = if ($stateCode) { $stateCode } elseif ($dispatchReadbackCode -eq 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH') { $dispatchReadbackCode } else { $null }
-        $dispatchFacts = [ordered]@{ task_id = $taskId; attempt_id = $attemptId; operation_id = [string]$dispatchOperation.operation_id; operation_state = $operationState; outcome = $outcome; diagnostic_code = $safeDiagnostic; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get'; replayed = $false; codex_process_still_matches = $codexStillAttached }
-        $stageStatus = if ($isReadbackInconsistent -or $operationState -eq 'outcome_unknown') { 'unknown' } elseif ($operationState -in @('settled', 'rejected', 'cancelled')) { 'observed' } else { 'pending' }
-        Add-Stage -Name 'single_task_dispatch' -Status $stageStatus -Code $safeDiagnostic -Facts $dispatchFacts
-        $script:Report.safe_facts.dispatch = $dispatchFacts
+        $safeDiagnostic = if ($stateCode) { $stateCode } elseif ($dispatchReadbackCode -eq 'DISPATCH_PUBLIC_RESULT_IDENTITY_MISMATCH') { $dispatchReadbackCode } elseif ($safeResultCode) { $safeResultCode } else { $null }
+        if ($preAdmissionRejected -and -not $isReadbackInconsistent) {
+            $dispatchFacts = [ordered]@{ task_id = $null; attempt_id = $null; operation_id = [string]$dispatchOperation.operation_id; operation_state = 'rejected'; error_code = $safeDiagnostic; dispatch_scope = 'pre_admission_no_scope_retained'; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get'; replayed = $false; codex_process_still_matches = $codexStillAttached }
+            $script:Report.status = 'dispatch_rejected_before_admission'
+            $script:Report.qualification = 'not_qualified'
+            Add-Stage -Name 'single_task_dispatch' -Status 'observed' -Code $safeDiagnostic -Facts $dispatchFacts
+            $script:Report.safe_facts.dispatch = $dispatchFacts
+        }
+        else {
+            $script:Report.status = if ($isReadbackInconsistent) { 'dispatch_readback_inconsistent' } elseif ($operationState -in $terminalDispatchStates) { 'dispatch_readback_complete' } else { 'dispatch_pending' }
+            $script:Report.qualification = 'not_qualified'
+            $dispatchFacts = [ordered]@{ task_id = $(if ($dispatchIdentity.scoped) { $taskId } else { $null }); attempt_id = $(if ($dispatchIdentity.scoped) { $attemptId } else { $null }); operation_id = [string]$dispatchOperation.operation_id; operation_state = $operationState; outcome = $outcome; diagnostic_code = $safeDiagnostic; host_receipt_validation = 'store_authoritative'; public_receipt_visibility = 'not_projected_by_operation_get'; replayed = $false; codex_process_still_matches = $codexStillAttached }
+            $stageStatus = if ($isReadbackInconsistent -or $operationState -eq 'outcome_unknown') { 'unknown' } elseif ($operationState -in @('settled', 'rejected', 'cancelled')) { 'observed' } else { 'pending' }
+            Add-Stage -Name 'single_task_dispatch' -Status $stageStatus -Code $safeDiagnostic -Facts $dispatchFacts
+            $script:Report.safe_facts.dispatch = $dispatchFacts
+        }
     }
 
     if (-not $codexStillAttached -and $Adapter -eq 'Codex') {
