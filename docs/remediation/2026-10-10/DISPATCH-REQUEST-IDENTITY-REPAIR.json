@@ -67,9 +67,9 @@
       },
       {
         "path": "tools/qualification/Test-DispatchRequestReadback.ps1",
-        "raw_sha256": "f0cea4f47056b8922766bd233e5429c8a1dcefc1075d928fffd4b359eedbbead",
-        "lf_sha256": "8e8f53001c65a87e1672cfd4ae61ccd70eebccd8fe8b76032454627a0eee2345",
-        "git_blob": "bf7db5eda7f2c8fa6997ae6830ecadeed28cf75b"
+        "raw_sha256": "7b0c3071a318b5971856920e676151a1044acbe14aad0b31d5df184e32f215bc",
+        "lf_sha256": "b3512c0a40439324a81140cf90b5e7bb6bcb57760577e3b5ece4b3e2bf218b28",
+        "git_blob": "1f2cdd2fb74ceb2fe489f3bc9abd0a27914e92a4"
       }
     ],
     "parser": "PASS",
@@ -102,6 +102,13 @@
         "Fixture cases mutate shared transport; current cases assign required inputs",
         "No early mismatch then success transport sequence assertion"
       ]
+    },
+    "post_review_whitespace_followup": {
+      "original_reviewed_fixture_raw_sha256": "f0cea4f47056b8922766bd233e5429c8a1dcefc1075d928fffd4b359eedbbead",
+      "reason": "CI diff --check found an extra blank line at EOF in new untracked fixture",
+      "change": "Remove only trailing extra empty line",
+      "verification": "Parser PASS; staged diff whitespace check PASS; 48 semantic checks retained, no repeat required",
+      "failed_ci_run": "https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/38097731325"
     }
   },
   "delivered_store_commit": "e75aa0498715b1592272a03167020a4f92bfd694"
