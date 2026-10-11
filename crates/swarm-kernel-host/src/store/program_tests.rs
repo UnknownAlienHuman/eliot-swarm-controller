@@ -4107,3 +4107,14 @@ async fn hook_emit_replay_is_one_durable_source_observation_with_exact_registrat
 
 #[cfg(test)]
 mod o9_goal_progression_transfer_regression;
+
+#[path = "program_tests/automatic_acceptance_operation_lifecycle_tests.rs"]
+mod automatic_acceptance_operation_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "program_tests/automatic_github_projection_lifecycle_tests.rs"]
+mod automatic_github_projection_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "program_tests/automatic_publication_operation_lifecycle_tests.rs"]
+mod automatic_publication_operation_lifecycle_tests;

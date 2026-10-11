@@ -1544,7 +1544,7 @@ fn load_retained_effect_record(
     })
 }
 
-fn validate_retained_effect_result(
+pub(super) fn validate_retained_effect_result(
     result: &Value,
     admission: &Value,
     operation_id: &str,
@@ -1563,7 +1563,7 @@ fn validate_retained_effect_result(
     Ok(())
 }
 
-fn validate_effect_tuple(
+pub(super) fn validate_effect_tuple(
     value: &Value,
     operation_id: &str,
     request: &ManagedLabelRequest,

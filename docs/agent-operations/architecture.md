@@ -68,6 +68,18 @@ outcome to that same phase and occurrence. A raw `runtime.outcome` of `unknown`
 aliases `operation.outcome_unknown`; it is not a completion event. Duplicate
 views of one phase collapse, while distinct phases remain separate facts.
 
+Lifecycle state is evidence, not a complete domain result. `NativeAccepted`
+remains `InFlight`. A `rejected` Operation is `RejectedBeforeEffect` only when
+its method-specific structured receipt proves the effect was not attempted;
+generic state or arbitrary error text is not that proof. For Forge,
+`publication_started` records historical attempt evidence: it is false for a
+queued or proven pre-effect result, and terminal status alone must not erase a
+recorded attempt. Parsing literal JSON `null` succeeds, but `null` is not a
+usable terminal domain result; SQL `NULL` is missing evidence. Preserve the
+identity representation required at each boundary: compare retained raw
+request bytes where byte-equivalence is required, and use canonical JSON
+identity only where the contract defines it.
+
 Migration `011` captures new `cancelled` Operations and transitions into that
 state by the same transaction rule. The occurrence names the cancelled target
 Operation, independently of the command requesting cancellation. Its bounded

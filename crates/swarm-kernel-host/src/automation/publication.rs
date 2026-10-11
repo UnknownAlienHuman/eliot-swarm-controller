@@ -8,6 +8,7 @@ use crate::{
     error::{Error, Result},
     forge::{self, PublishRefRequest},
     model::{self},
+    store::{ExistingAutomaticOperation, ExistingAutomaticOperationLookup},
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -113,16 +114,6 @@ pub(crate) struct AcceptedCandidate {
     pub(crate) attempt_id: String,
     pub(crate) submission_ref: String,
     pub(crate) candidate_ref: String,
-}
-
-struct CommittedPublicationOperationRow {
-    caller_id: String,
-    method: String,
-    original_request_json: String,
-    effective_request_json: String,
-    task_id: Option<String>,
-    attempt_id: Option<String>,
-    result_json: Option<String>,
 }
 
 struct AcceptedOperationRow {
@@ -258,52 +249,40 @@ impl PublicationContext {
     /// Task authority: an already admitted unknown effect must remain
     /// readback-only after revocation or acceptance invalidation.
     pub(crate) fn from_committed_operation(db: &Connection, operation_id: &str) -> Result<Self> {
-        let row: Option<CommittedPublicationOperationRow> = db
-            .query_row(
-                "SELECT caller_id,method,original_request_json,effective_request_json,task_id,attempt_id,result_json \
-                 FROM operations WHERE operation_id=?1",
-                [operation_id],
-                |row| {
-                    Ok(CommittedPublicationOperationRow {
-                        caller_id: row.get(0)?,
-                        method: row.get(1)?,
-                        original_request_json: row.get(2)?,
-                        effective_request_json: row.get(3)?,
-                        task_id: row.get(4)?,
-                        attempt_id: row.get(5)?,
-                        result_json: row.get(6)?,
-                    })
-                },
-            )
-            .optional()?;
-        let Some(CommittedPublicationOperationRow {
-            caller_id,
-            method,
-            original_request_json: original_json,
-            effective_request_json: effective_json,
-            task_id,
-            attempt_id,
-            result_json,
-        }) = row
-        else {
-            return Err(Error::new(
-                "NOT_FOUND",
-                "publication Operation was not found",
-            ));
-        };
-        if method != ACTION || caller_id != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        let retained = ExistingAutomaticOperation::load(
+            db,
+            ExistingAutomaticOperationLookup::OperationId(operation_id),
+        )?
+        .ok_or_else(|| Error::new("NOT_FOUND", "publication Operation was not found"))?;
+        Self::from_existing_operation(db, &retained)
+    }
+
+    /// Rehydrate a publication context from the exact row already decoded by
+    /// its Store consumer. This keeps all JSON parsing at the Store loader.
+    pub(crate) fn from_existing_operation(
+        db: &Connection,
+        retained: &ExistingAutomaticOperation,
+    ) -> Result<Self> {
+        let operation_id = retained.operation_id.as_str();
+        if retained.method != ACTION
+            || retained.caller_id != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+            || !retained.has_unbound_execution_scope()
+        {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
-                "publication Operation is not the retained internal Forge action",
+                "publication Operation identity or host-owned execution scope is invalid",
             ));
         }
-        let effective: Value = serde_json::from_str(&effective_json).map_err(|_| {
-            Error::new(
+        if retained.original_request_json != model::canonical(&retained.original_request)?
+            || retained.effective_request_json != model::canonical(&retained.effective_request)?
+        {
+            return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
-                "publication Operation effective request is invalid",
-            )
-        })?;
-        crate::store::validate_publication_effective_request(&effective).map_err(|_| {
+                "publication Operation request bytes are not the retained canonical identity",
+            ));
+        }
+        let effective = &retained.effective_request;
+        crate::store::validate_publication_effective_request(effective).map_err(|_| {
             Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "publication Operation effective request has unexpected fields",
@@ -365,22 +344,21 @@ impl PublicationContext {
                 "publication effective request differs from its retained attribution",
             ));
         }
-        let request_value: Value = serde_json::from_str(&original_json)?;
-        let request = PublishRefRequest::parse(&request_value)?;
+        let request = PublishRefRequest::parse(&retained.original_request)?;
         context.require_request_matches(&request)?;
-        if task_id.as_deref() != Some(context.task_id.as_str())
-            || attempt_id.as_deref() != Some(context.attempt_id.as_str())
+        if retained.client_request_id
+            != model::text(&retained.original_request, "client_request_id")?
+            || retained.task_id.as_deref() != Some(context.task_id.as_str())
+            || retained.attempt_id.as_deref() != Some(context.attempt_id.as_str())
         {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "publication Operation task/Attempt columns differ from its accepted candidate",
             ));
         }
-        let result: Value = result_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?
-            .unwrap_or(Value::Null);
+        // Admission provenance is immutable. Generic cancellation and rejection
+        // replace result_json with their own receipt shapes; the domain lifecycle
+        // classifier validates that current result independently of this context.
         let receipt = effective["receipt"].clone();
         model::fields(&receipt, &["ok", "value"]).map_err(|_| {
             Error::new(
@@ -388,13 +366,10 @@ impl PublicationContext {
                 "publication Operation retained receipt is invalid",
             )
         })?;
-        if receipt["ok"] != true
-            || receipt["value"]["operation_id"] != operation_id
-            || (!result.is_null() && result["operation_id"] != operation_id)
-        {
+        if receipt["ok"] != true || receipt["value"]["operation_id"] != operation_id {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
-                "publication Operation receipt differs from its exact result",
+                "publication Operation admission receipt differs from its exact identity",
             ));
         }
         let intent: crate::forge::PublicationIntent =

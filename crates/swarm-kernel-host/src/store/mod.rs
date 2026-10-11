@@ -77,6 +77,10 @@ mod operation_failure_event_fixture;
 mod operation_failure_event_schema;
 #[cfg(test)]
 mod operation_failure_event_schema_fixture;
+mod operation_lifecycle;
+pub(crate) use operation_lifecycle::{
+    ExistingAutomaticOperation, ExistingAutomaticOperationLookup,
+};
 mod operations;
 pub(crate) mod participant_credentials;
 mod prerequisites;

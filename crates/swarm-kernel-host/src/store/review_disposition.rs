@@ -506,7 +506,7 @@ fn consume_isolated(
                         .to_owned(),
                 });
             }
-            let result = automation_disposition::consume_review_result_for_entry(
+            let mut result = automation_disposition::consume_review_result_for_entry(
                 tx,
                 config,
                 entry,
@@ -514,6 +514,7 @@ fn consume_isolated(
                 &result_operation_id,
                 now_ms,
             )?;
+            retain_acceptance_terminal_disposition(&mut result)?;
             Ok(SubjectDisposition::Applied((
                 assignment_id,
                 result_operation_id,
@@ -631,7 +632,7 @@ fn consume_pending_isolated(
                     "pending review result identity differs from its canonical event",
                 ));
             }
-            let result = automation_disposition::consume_review_result_for_entry(
+            let mut result = automation_disposition::consume_review_result_for_entry(
                 tx,
                 config,
                 entry,
@@ -639,6 +640,7 @@ fn consume_pending_isolated(
                 &result_operation_id,
                 now_ms,
             )?;
+            retain_acceptance_terminal_disposition(&mut result)?;
             Ok(SubjectDisposition::Applied((
                 event,
                 assignment_id,
@@ -656,12 +658,12 @@ fn classify_subject_error(
 ) -> Option<SubjectErrorDisposition> {
     match error.code.as_str() {
         "REVIEW_DISPOSITION_EVENT_DAMAGED"
-        | "AUTOMATION_REVIEW_DISPOSITION_PENDING_EVENT_MISSING" => {
-            Some(SubjectErrorDisposition::Quarantined {
-                code: error.code.clone(),
-                evidence,
-            })
-        }
+        | "AUTOMATION_REVIEW_DISPOSITION_PENDING_EVENT_MISSING"
+        | "AUTOMATION_OPERATION_CORRUPT"
+        | "AUTOMATION_LINK_CORRUPT" => Some(SubjectErrorDisposition::Quarantined {
+            code: error.code.clone(),
+            evidence,
+        }),
         _ => None,
     }
 }
@@ -740,11 +742,53 @@ fn is_unresolved(result: &Value) -> bool {
     ) || result["repair_dispatch"]["status"] == "pending"
         || result["acceptance"]["code"] == "required_checks_incomplete"
         || (result["acceptance"]["task_accepted"] != true
-            && (result["acceptance"]["acceptance_started"] == true
-                || matches!(
-                    result["acceptance"]["receipt"]["state"].as_str(),
-                    Some("queued" | "sending" | "native_accepted" | "outcome_unknown")
-                )))
+            && (matches!(
+                result["acceptance"]["receipt"]["status"].as_str(),
+                Some("acceptance_in_flight" | "acceptance_readback_required")
+            ) || matches!(
+                result["acceptance"]["receipt"]["state"].as_str(),
+                Some("queued" | "sending" | "native_accepted" | "outcome_unknown")
+            )))
+}
+
+/// Keep the committed local receipt while recording an explicit domain skip.
+/// `SubjectDisposition::Applied` releases the subject savepoint; returning its
+/// `Skipped` variant here would roll back other selected action provenance.
+fn retain_acceptance_terminal_disposition(result: &mut Value) -> Result<()> {
+    let acceptance = &result["acceptance"];
+    let receipt = &acceptance["receipt"];
+    let status = match receipt["status"].as_str() {
+        Some("acceptance_cancelled") => "acceptance_cancelled",
+        Some("acceptance_rejected") => "acceptance_rejected",
+        Some("acceptance_not_applied") => "acceptance_not_applied",
+        _ if receipt["terminal_not_applied"] == true => {
+            return Err(Error::new(
+                "AUTOMATION_OPERATION_CORRUPT",
+                "terminal acceptance has no supported domain disposition",
+            ));
+        }
+        _ => return Ok(()),
+    };
+    if receipt["terminal_not_applied"] != true
+        || acceptance["task_accepted"] != false
+        || receipt["task_accepted"] != false
+        || acceptance["operation_id"] != receipt["operation_id"]
+        || result["operation_id"] != receipt["operation_id"]
+    {
+        return Err(Error::new(
+            "AUTOMATION_OPERATION_CORRUPT",
+            "terminal acceptance disposition differs from its validated receipt",
+        ));
+    }
+    result["status"] = json!("skipped");
+    result["effect_status"] = json!(status);
+    result["code"] = json!(status);
+    result["reason"] = json!(
+        "the retained acceptance is terminal without accepting the Task; this automation revision will not replay it"
+    );
+    result["terminal_not_applied"] = json!(true);
+    result["task_accepted"] = json!(false);
+    Ok(())
 }
 
 fn retry_delay(retries: u32) -> i64 {
@@ -816,6 +860,10 @@ fn summarize_event(
         "review_assignment_id":assignment_id,
         "review_result_operation_id":result_operation_id,
         "status":result.get("status").cloned().unwrap_or(Value::Null),
+        "effect_status":result.get("effect_status").cloned().unwrap_or(Value::Null),
+        "terminal_not_applied":result["terminal_not_applied"] == true,
+        "task_accepted":result.get("task_accepted").cloned().unwrap_or(Value::Null),
+        "acceptance_receipt":result["acceptance"]["receipt"],
         "code":result.get("code").cloned().unwrap_or(Value::Null),
         "reason":result.get("reason").cloned().unwrap_or(Value::Null),
         "operation_id":result.get("operation_id").cloned().unwrap_or(Value::Null),
@@ -979,7 +1027,7 @@ fn select_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4",
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<=?3 ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
         .query_map(params![pattern, prefix, before, limit as i64], |row| {

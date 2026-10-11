@@ -9,6 +9,9 @@ use super::automation_reconcile::{
     SubjectErrorDisposition,
 };
 use super::capacity;
+use super::operation_lifecycle::{
+    ExistingAutomaticOperation, ExistingAutomaticOperationLookup, OperationLifecycleState,
+};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -476,15 +479,34 @@ fn reconcile_entry(
             consume_event_isolated(&invocation, Some(event), None, state.activation_cut, replay)?;
         match disposition {
             SubjectDisposition::Applied((subject, accepted_operation_id, result)) => {
+                if publication_unresolved(&result) {
+                    if state.pending.len() >= MAX_PENDING {
+                        remember_capacity_gap(&mut state, Some(subject.observation_id), now_ms);
+                        blocked_on_pending_capacity = true;
+                        break;
+                    }
+                    state.pending.push(PendingAcceptance {
+                        observation_id: subject.observation_id,
+                        accepted_operation_id: accepted_operation_id.clone(),
+                        historical_replay_authorized: replay,
+                        retries: 0,
+                        next_retry_at_ms: now_ms.saturating_add(BASE_RETRY_DELAY_MS),
+                    });
+                }
                 remember_recent(
                     &mut state,
                     json!({
                         "observation_id":subject.observation_id,
                         "accepted_operation_id":accepted_operation_id,
-                        "status":result["status"],
+                        "status":if result["terminal_not_applied"] == true { json!("skipped") } else { result["status"].clone() },
+                        "publication_status":result["status"],
+                        "automation_revision":entry.revision,
                         "code":result.get("code").cloned().unwrap_or(Value::Null),
+                        "reason":result.get("reason").cloned().unwrap_or(Value::Null),
                         "operation_id":result.get("operation_id").cloned().unwrap_or(Value::Null),
                         "operation_state":result.get("operation_state").cloned().unwrap_or(Value::Null),
+                        "effect_operation_id":result.get("effect_operation_id").unwrap_or(&result["operation_id"]),
+                        "effect_operation_state":result.get("effect_operation_state").unwrap_or(&result["operation_state"]),
                         "publication_started":result["publication_started"] == true,
                         "coalesced":result["coalesced"] == true
                     }),
@@ -626,6 +648,15 @@ fn consume_event_isolated(
                         "pending acceptance replay authority no longer matches its activation cut",
                     ));
                 }
+                if let Some(result) =
+                    retained_publication_for_pending(invocation, &event, &accepted_operation_id)?
+                {
+                    return Ok(SubjectDisposition::Applied((
+                        event,
+                        accepted_operation_id,
+                        result,
+                    )));
+                }
             }
             let context = PublicationContext::from_acceptance_observation(
                 invocation.tx,
@@ -655,6 +686,750 @@ fn consume_event_isolated(
     )
 }
 
+/// Resume only an exact retained publication for this pending acceptance.
+/// Fresh admission remains below this check and still requires current GM
+/// authority. The entry index bounds lookup to one owner/project/automation;
+/// the committed loader verifies the immutable Operation link and candidate.
+fn retained_publication_for_pending(
+    invocation: &PublicationInvocation<'_, '_>,
+    event: &AcceptanceEvent,
+    accepted_operation_id: &str,
+) -> Result<Option<Value>> {
+    let entry = invocation.entry;
+    let prefix = config::entry_operation_prefix(
+        &entry.owner_manager_id,
+        &entry.project_id,
+        &entry.automation_id,
+    )?;
+    let upper_bound = format!("{};", prefix.trim_end_matches(':'));
+    let mut statement = invocation.tx.prepare(
+        "SELECT substr(link.key,length(?1)+1) \
+         FROM meta AS link \
+         JOIN operations AS op ON op.operation_id=substr(link.key,length(?1)+1) \
+         WHERE link.key >= ?1 AND link.key < ?2 \
+           AND op.caller_id=?3 AND op.method='forge.publish_ref' \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id') END=?4 \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.project_id') END=?5 \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.automation_id') END=?6 \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.automation_revision') END=?7 \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.cause.observation_id') END=?8 \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.cause.operation_id') END=?9 \
+           AND CASE WHEN json_valid(op.effective_request_json) \
+                    THEN json_extract(op.effective_request_json,'$.automation_on_behalf.cause.id') END=?9 \
+         ORDER BY op.operation_id LIMIT 2",
+    )?;
+    let operation_ids = statement
+        .query_map(
+            params![
+                prefix,
+                upper_bound,
+                crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                entry.owner_manager_id,
+                entry.project_id,
+                entry.automation_id,
+                entry.revision,
+                event.observation_id,
+                accepted_operation_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    if operation_ids.len() > 1 {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "pending acceptance has multiple exact retained publication Operations",
+        ));
+    }
+    let Some(operation_id) = operation_ids.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let retained = ExistingAutomaticOperation::load(
+        invocation.tx,
+        ExistingAutomaticOperationLookup::OperationId(&operation_id),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "indexed publication Operation disappeared during pending recovery",
+        )
+    })?;
+    let context = PublicationContext::from_existing_operation(invocation.tx, &retained)?;
+    let linkage = context.linkage_value();
+    let cause = &linkage["cause"];
+    if linkage["effective_manager_id"] != entry.owner_manager_id
+        || linkage["project_id"] != entry.project_id
+        || linkage["automation_id"] != entry.automation_id
+        || linkage["automation_revision"] != entry.revision
+        || cause["observation_id"] != event.observation_id
+        || cause["operation_id"] != accepted_operation_id
+        || cause["id"] != accepted_operation_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "retained publication does not match this exact pending entry and acceptance",
+        ));
+    }
+
+    let request_value = context.request_value()?;
+    let original_request_json = model::canonical(&request_value)?;
+    if retained.operation_id != operation_id
+        || retained.caller_id != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+        || retained.method != "forge.publish_ref"
+        || retained.client_request_id != model::text(&request_value, "client_request_id")?
+        || retained.original_request_json != original_request_json
+        || retained.original_request != request_value
+    {
+        return Err(publication_state_corrupt(
+            "indexed publication Operation differs from its immutable request",
+        ));
+    }
+    classify_retained_publication(invocation.tx, retained, &context, &request_value).map(Some)
+}
+
+/// Revalidate the committed context and classify one retained publication.
+/// The retained Forge intent binds the immutable request, target and candidate;
+/// a result can prove application only with Forge's exact remote-readback shape.
+fn classify_retained_publication(
+    db: &Connection,
+    retained: ExistingAutomaticOperation,
+    context: &PublicationContext,
+    request_value: &Value,
+) -> Result<Value> {
+    let intent = retained_publication_intent(&retained, context, request_value)?;
+    validate_publication_cancellation(db, &retained, &intent)?;
+    let coalesced_owner = match retained
+        .result
+        .as_ref()
+        .and_then(|result| result.get("outcome"))
+        .and_then(Value::as_str)
+    {
+        Some("coalesced") => {
+            let owner_id = retained
+                .result
+                .as_ref()
+                .and_then(|result| result.get("coalesced_to"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| publication_state_corrupt("coalesced receipt has no owner ID"))?;
+            Some(owner_id.to_owned())
+        }
+        _ => None,
+    };
+    let operation_id = retained.operation_id.clone();
+    let mut classified =
+        classify_publication_lifecycle(retained, &intent, coalesced_owner.as_deref())?;
+    if let Some(owner_id) = coalesced_owner {
+        let (owner, owner_intent) =
+            validate_coalesced_owner(db, &operation_id, &owner_id, &intent)?;
+        if owner
+            .result
+            .as_ref()
+            .is_some_and(|result| result["outcome"] == "coalesced")
+        {
+            return Err(publication_state_corrupt(
+                "coalesced Forge owner is another alias",
+            ));
+        }
+        validate_publication_cancellation(db, &owner, &owner_intent)?;
+        let owner_value = classify_publication_lifecycle(owner, &owner_intent, None)?;
+        for key in [
+            "status",
+            "publication_started",
+            "terminal_not_applied",
+            "readback_required",
+        ] {
+            if let Some(value) = owner_value.get(key) {
+                classified[key] = value.clone();
+            }
+        }
+        classified["effect_operation_id"] = json!(owner_id);
+        classified["effect_operation_state"] = owner_value["operation_state"].clone();
+        classified["effect_receipt"] = owner_value["receipt"].clone();
+    }
+    if classified["terminal_not_applied"] == true {
+        classified["code"] = classified["status"].clone();
+        classified["reason"] = json!(
+            "retained publication effect is terminal without an applied remote readback; this automation revision will not replay it"
+        );
+    }
+    Ok(classified)
+}
+
+fn publication_unresolved(value: &Value) -> bool {
+    matches!(
+        value["status"].as_str(),
+        Some("publication_reserved" | "publication_in_flight" | "publication_readback_required")
+    )
+}
+
+fn validate_publication_cancellation(
+    db: &Connection,
+    retained: &ExistingAutomaticOperation,
+    intent: &crate::forge::PublicationIntent,
+) -> Result<()> {
+    if retained.state != OperationLifecycleState::Cancelled {
+        return Ok(());
+    }
+    let receipt = retained.result.as_ref().ok_or_else(|| {
+        publication_state_corrupt("cancelled Forge Operation has no cancellation receipt")
+    })?;
+    validate_cancelled_receipt(
+        receipt,
+        &retained.operation_id,
+        intent,
+        retained.sent_at_ms.is_some(),
+    )?;
+    let cancellation_id = model::text(receipt, "cancelled_by")?;
+    let cancellation = ExistingAutomaticOperation::load(
+        db,
+        ExistingAutomaticOperationLookup::OperationId(cancellation_id),
+    )?
+    .ok_or_else(|| {
+        publication_state_corrupt("Forge cancellation references a missing Operation")
+    })?;
+    if cancellation.method != "operation.cancel"
+        || cancellation.state != OperationLifecycleState::Settled
+        || cancellation.result.as_ref().is_none_or(|result| {
+            result["operation_id"] != cancellation_id
+                || result["cancelled_operation_id"] != retained.operation_id
+                || result["native_cancel_sent"] != false
+        })
+        || cancellation.original_request["operation_id"] != retained.operation_id
+        || cancellation.original_request["reason"] != receipt["reason"]
+        || cancellation.original_request["client_request_id"] != cancellation.client_request_id
+    {
+        return Err(publication_state_corrupt(
+            "Forge cancellation does not prove the exact unsent target was cancelled",
+        ));
+    }
+    Ok(())
+}
+
+fn retained_publication_intent(
+    retained: &ExistingAutomaticOperation,
+    context: &PublicationContext,
+    request_value: &Value,
+) -> Result<crate::forge::PublicationIntent> {
+    if retained.method != "forge.publish_ref" {
+        return Err(publication_state_corrupt(
+            "retained publication intent belongs to a different Operation method",
+        ));
+    }
+    if retained.client_request_id != model::text(request_value, "client_request_id")?
+        || retained.original_request_json != model::canonical(request_value)?
+        || retained.original_request != *request_value
+    {
+        return Err(publication_state_corrupt(
+            "retained Forge Operation differs from its exact semantic request",
+        ));
+    }
+    let effective = &retained.effective_request;
+    let intent: crate::forge::PublicationIntent =
+        serde_json::from_value(effective["publication_intent"].clone()).map_err(|_| {
+            publication_state_corrupt("retained Forge publication intent is invalid")
+        })?;
+    validate_publication_intent(&intent, &retained.operation_id, context, request_value)?;
+    if effective["automation_on_behalf"] != context.linkage_value() {
+        return Err(publication_state_corrupt(
+            "retained Forge attribution differs from its accepted publication context",
+        ));
+    }
+    Ok(intent)
+}
+
+fn validate_publication_intent(
+    intent: &crate::forge::PublicationIntent,
+    operation_id: &str,
+    context: &PublicationContext,
+    request_value: &Value,
+) -> Result<()> {
+    intent
+        .validate()
+        .map_err(|_| publication_state_corrupt("retained Forge intent failed validation"))?;
+    if context.request_value()? != *request_value
+        || intent.operation_id != operation_id
+        || intent.project_id != context.project_id()
+        || intent.canonical_repository != context.canonical_repository()
+        || intent.attempt_id != context.attempt_id()
+        || intent.task_revision != context.task_revision()
+        || intent.admitted_gm_epoch != context.gm_epoch()
+        || intent.submission_ref != context.submission_ref()
+        || intent.accepted_operation_id != context.accepted_operation_id()
+        || intent.candidate_ref != context.candidate_ref()
+        || intent.policy_revision != context.policy_revision()
+        || intent.target_ref != context.target_ref()
+        || intent.expected_old_ref.as_deref() != context.expected_old_ref()
+        || intent.expected_create != context.expected_create()
+        || intent.force
+    {
+        return Err(publication_state_corrupt(
+            "retained Forge intent differs from its exact accepted request or target",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coalesced_owner(
+    db: &Connection,
+    operation_id: &str,
+    owner_id: &str,
+    intent: &crate::forge::PublicationIntent,
+) -> Result<(ExistingAutomaticOperation, crate::forge::PublicationIntent)> {
+    if owner_id.is_empty() || owner_id == operation_id {
+        return Err(publication_state_corrupt(
+            "coalesced receipt does not identify a distinct retained owner",
+        ));
+    }
+    let owner = ExistingAutomaticOperation::load(
+        db,
+        ExistingAutomaticOperationLookup::OperationId(owner_id),
+    )?
+    .ok_or_else(|| {
+        publication_state_corrupt("coalesced receipt references a missing Forge owner")
+    })?;
+    if owner.method != "forge.publish_ref" {
+        return Err(publication_state_corrupt(
+            "coalesced receipt references a non-Forge Operation",
+        ));
+    }
+    if owner.caller_id.trim().is_empty()
+        || owner.client_request_id.trim().is_empty()
+        || !owner.has_unbound_execution_scope()
+        || owner.original_request["client_request_id"] != owner.client_request_id
+        || owner.original_request_json != model::canonical(&owner.original_request)?
+        || owner.effective_request_json != model::canonical(&owner.effective_request)?
+    {
+        return Err(publication_state_corrupt(
+            "coalesced Forge owner has an invalid caller or immutable request identity",
+        ));
+    }
+    let effective = &owner.effective_request;
+    let owner_intent: crate::forge::PublicationIntent =
+        serde_json::from_value(effective["publication_intent"].clone()).map_err(|_| {
+            publication_state_corrupt("coalesced Forge owner has no valid publication intent")
+        })?;
+    owner_intent
+        .validate()
+        .map_err(|_| publication_state_corrupt("coalesced Forge owner intent is invalid"))?;
+    if owner_intent.operation_id != owner_id || !same_publication_slot(intent, &owner_intent) {
+        return Err(publication_state_corrupt(
+            "coalesced Forge owner does not retain the same exact effect slot",
+        ));
+    }
+    let request = crate::forge::PublishRefRequest::parse(&owner.original_request)
+        .map_err(|_| publication_state_corrupt("coalesced Forge owner request is invalid"))?;
+    if owner_intent.attempt_id != request.attempt_id
+        || owner_intent.task_revision != request.expected_revision
+        || owner_intent.submission_ref != request.submission_ref
+        || owner_intent.accepted_operation_id != request.accepted_operation_id
+        || owner_intent.candidate_ref != request.candidate_ref
+        || owner_intent.policy_revision != request.expected_policy_revision
+        || owner_intent.target_ref != request.target_ref
+        || owner_intent.expected_old_ref != request.expected_old_ref
+        || owner_intent.expected_create != request.expected_create
+    {
+        return Err(publication_state_corrupt(
+            "coalesced Forge owner intent differs from its immutable request",
+        ));
+    }
+    Ok((owner, owner_intent))
+}
+
+fn same_publication_slot(
+    left: &crate::forge::PublicationIntent,
+    right: &crate::forge::PublicationIntent,
+) -> bool {
+    left.project_id == right.project_id
+        && left.canonical_repository == right.canonical_repository
+        && left.candidate_ref == right.candidate_ref
+        && left.candidate_sha256 == right.candidate_sha256
+        && left.commit == right.commit
+        && left.tree == right.tree
+        && left.target_ref == right.target_ref
+        && left.expected_old_ref == right.expected_old_ref
+        && left.expected_create == right.expected_create
+}
+
+fn classify_publication_lifecycle(
+    retained: ExistingAutomaticOperation,
+    intent: &crate::forge::PublicationIntent,
+    verified_coalesced_owner: Option<&str>,
+) -> Result<Value> {
+    let operation_id = retained.operation_id;
+    let sent = retained.sent_at_ms.is_some();
+    let result = retained.result;
+    let publication_started = sent
+        && result
+            .as_ref()
+            .and_then(|receipt| receipt.get("publication_may_have_started"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    let mut value = json!({
+        "operation_id":operation_id,
+        "operation_state":retained.state.as_str(),
+        "publication_started":false,
+    });
+    let object = value
+        .as_object_mut()
+        .expect("publication classification is an object");
+    match retained.state {
+        OperationLifecycleState::Queued => {
+            if let Some(result) = result.as_ref() {
+                validate_queued_forge_receipt(result, &operation_id, intent)?;
+            }
+            object.insert("status".to_owned(), json!("publication_in_flight"));
+            object.insert("coalesced".to_owned(), json!(false));
+        }
+        OperationLifecycleState::Sending | OperationLifecycleState::NativeAccepted => {
+            let result = result.as_ref().ok_or_else(|| {
+                publication_state_corrupt("dispatched Forge Operation has no retained receipt")
+            })?;
+            validate_dispatch_receipt(result, &operation_id)?;
+            object.insert("status".to_owned(), json!("publication_in_flight"));
+            object.insert("publication_started".to_owned(), json!(publication_started));
+            object.insert("coalesced".to_owned(), json!(false));
+        }
+        OperationLifecycleState::OutcomeUnknown => {
+            let result = result.as_ref().ok_or_else(|| {
+                publication_state_corrupt(
+                    "unknown Forge Operation has no retained readback evidence",
+                )
+            })?;
+            validate_unknown_receipt(result, &operation_id)?;
+            object.insert("status".to_owned(), json!("publication_readback_required"));
+            object.insert("publication_started".to_owned(), json!(publication_started));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("readback_required".to_owned(), json!(true));
+        }
+        OperationLifecycleState::Cancelled => {
+            let result = result.as_ref().ok_or_else(|| {
+                publication_state_corrupt("cancelled Forge Operation has no cancellation receipt")
+            })?;
+            validate_cancelled_receipt(result, &operation_id, intent, sent)?;
+            object.insert("status".to_owned(), json!("publication_cancelled"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(true));
+        }
+        OperationLifecycleState::Rejected => {
+            let result = result.as_ref().ok_or_else(|| {
+                publication_state_corrupt("rejected Forge Operation has no structured reason")
+            })?;
+            validate_rejected_receipt(result, &operation_id, sent)?;
+            object.insert("status".to_owned(), json!("publication_rejected"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(true));
+        }
+        OperationLifecycleState::Settled => {
+            if retained.settled_at_ms.is_none() {
+                return Err(publication_state_corrupt(
+                    "settled Forge Operation has no settlement timestamp",
+                ));
+            }
+            let result = result.as_ref().ok_or_else(|| {
+                publication_state_corrupt("settled Forge Operation has no domain result")
+            })?;
+            let classification = validate_settled_receipt(
+                result,
+                &operation_id,
+                intent,
+                sent,
+                verified_coalesced_owner,
+            )?;
+            object.insert("status".to_owned(), json!(classification.status));
+            object.insert(
+                "publication_started".to_owned(),
+                json!(classification.publication_started),
+            );
+            object.insert("coalesced".to_owned(), json!(classification.coalesced));
+            object.insert(
+                "terminal_not_applied".to_owned(),
+                json!(classification.terminal_not_applied),
+            );
+            object.insert("outcome".to_owned(), json!(classification.outcome));
+        }
+    }
+    if let Some(result) = result {
+        object.insert("receipt".to_owned(), result);
+    }
+    Ok(value)
+}
+
+struct SettledPublicationClassification {
+    status: &'static str,
+    outcome: &'static str,
+    publication_started: bool,
+    terminal_not_applied: bool,
+    coalesced: bool,
+}
+
+fn validate_settled_receipt(
+    result: &Value,
+    operation_id: &str,
+    intent: &crate::forge::PublicationIntent,
+    sent: bool,
+    verified_coalesced_owner: Option<&str>,
+) -> Result<SettledPublicationClassification> {
+    require_operation_identity(result, operation_id)?;
+    if result["force"] != false {
+        return Err(publication_state_corrupt(
+            "settled Forge result is missing the non-force proof",
+        ));
+    }
+    match result["outcome"].as_str() {
+        Some("applied") => {
+            if result["publication"] != "confirmed_by_remote_readback"
+                || result["remote_ref"]["present"] != true
+                || result["remote_ref"]["commit"]
+                    .as_str()
+                    .is_none_or(|commit| !commit.eq_ignore_ascii_case(&intent.commit))
+                || result["publication_may_have_started"] != true
+                || result["acceptance_current_at_finish"].as_bool().is_none()
+                || !sent
+            {
+                return Err(publication_state_corrupt(
+                    "applied Forge result lacks the exact accepted target remote readback",
+                ));
+            }
+            Ok(SettledPublicationClassification {
+                status: "publication_applied",
+                outcome: "applied",
+                publication_started: true,
+                terminal_not_applied: false,
+                coalesced: false,
+            })
+        }
+        Some("coalesced") => {
+            validate_coalesced_forge_receipt(result, operation_id, verified_coalesced_owner)?;
+            if sent {
+                return Err(publication_state_corrupt(
+                    "coalesced Forge Operation has a dispatch timestamp",
+                ));
+            }
+            Ok(SettledPublicationClassification {
+                status: "publication_not_applied",
+                outcome: "coalesced",
+                publication_started: false,
+                terminal_not_applied: true,
+                coalesced: true,
+            })
+        }
+        Some("stale_gm_epoch") => {
+            validate_stale_gm_epoch_receipt(result, operation_id, intent)?;
+            if sent {
+                return Err(publication_state_corrupt(
+                    "stale-GM Forge result is inconsistent with a sent publication",
+                ));
+            }
+            Ok(SettledPublicationClassification {
+                status: "publication_not_applied",
+                outcome: "stale_gm_epoch",
+                publication_started: false,
+                terminal_not_applied: true,
+                coalesced: false,
+            })
+        }
+        Some("failed") => {
+            let publication = result["publication"].as_str();
+            let attempted = result["publication_may_have_started"].as_bool();
+            validate_structured_error(&result["error"])?;
+            match (publication, attempted, sent) {
+                (Some("not_started"), Some(false), false) => {}
+                (Some("not_confirmed"), Some(_), true)
+                    if result["acceptance_current_at_finish"].as_bool().is_some() => {}
+                _ => {
+                    return Err(publication_state_corrupt(
+                        "failed Forge result has incoherent attempt evidence",
+                    ));
+                }
+            }
+            Ok(SettledPublicationClassification {
+                status: "publication_not_applied",
+                outcome: "failed",
+                publication_started: sent && attempted == Some(true),
+                terminal_not_applied: true,
+                coalesced: false,
+            })
+        }
+        _ => Err(publication_state_corrupt(
+            "settled Forge result has an unknown domain outcome",
+        )),
+    }
+}
+
+fn validate_queued_forge_receipt(
+    result: &Value,
+    operation_id: &str,
+    intent: &crate::forge::PublicationIntent,
+) -> Result<()> {
+    if result["operation_id"] != operation_id
+        || result["attempt_id"] != intent.attempt_id
+        || result["state"] != "queued"
+        || result["publication"] != "not_started"
+        || result["force"] != false
+    {
+        return Err(publication_state_corrupt(
+            "queued Forge receipt differs from its immutable admission",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dispatch_receipt(result: &Value, operation_id: &str) -> Result<()> {
+    require_operation_identity(result, operation_id)?;
+    if result["force"] != false || result["publication_may_have_started"].as_bool().is_none() {
+        return Err(publication_state_corrupt(
+            "dispatched Forge receipt has invalid attempted-effect evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unknown_receipt(result: &Value, operation_id: &str) -> Result<()> {
+    require_operation_identity(result, operation_id)?;
+    if result["force"] != false
+        || result["publication_may_have_started"].as_bool().is_none()
+        || !(result["outcome"] == "unknown" || result["process_tree_unconfirmed"] == true)
+    {
+        return Err(publication_state_corrupt(
+            "unknown Forge receipt has no exact readback or interrupted-dispatch evidence",
+        ));
+    }
+    if result["outcome"] == "unknown"
+        && (result["reason"].as_str().is_none_or(str::is_empty)
+            || !matches!(
+                result["publication"].as_str(),
+                Some("requires_readback" | "operator_intervention_required")
+            ))
+    {
+        return Err(publication_state_corrupt(
+            "unknown Forge outcome has an invalid readback disposition",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cancelled_receipt(
+    result: &Value,
+    operation_id: &str,
+    intent: &crate::forge::PublicationIntent,
+    sent: bool,
+) -> Result<()> {
+    model::fields(result, &["reason", "cancelled_by", "previous_result"])
+        .map_err(|_| publication_state_corrupt("cancelled Forge receipt has unknown fields"))?;
+    if result["reason"].as_str().is_none_or(str::is_empty)
+        || result["cancelled_by"].as_str().is_none_or(str::is_empty)
+    {
+        return Err(publication_state_corrupt(
+            "cancelled Forge receipt lacks its exact reason or cancelling Operation",
+        ));
+    }
+    if let Some(previous) = result.get("previous_result") {
+        validate_stale_gm_epoch_receipt(previous, operation_id, intent)?;
+    }
+    if sent {
+        return Err(publication_state_corrupt(
+            "cancelled Forge Operation has contradictory dispatch evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rejected_receipt(result: &Value, operation_id: &str, sent: bool) -> Result<()> {
+    if sent {
+        return Err(publication_state_corrupt(
+            "rejected Forge Operation has dispatch evidence without a domain outcome",
+        ));
+    }
+    if result
+        .get("operation_id")
+        .is_some_and(|value| value != operation_id)
+    {
+        return Err(publication_state_corrupt(
+            "rejected Forge result identifies a different Operation",
+        ));
+    }
+    let error = result.get("error").unwrap_or(result);
+    validate_structured_error(error)
+}
+
+fn validate_stale_gm_epoch_receipt(
+    result: &Value,
+    operation_id: &str,
+    intent: &crate::forge::PublicationIntent,
+) -> Result<()> {
+    require_operation_identity(result, operation_id)?;
+    if result["outcome"] != "stale_gm_epoch"
+        || result["publication"] != "not_started"
+        || result["force"] != false
+        || result["admitted_gm_epoch"] != intent.admitted_gm_epoch
+        || result["current_gm_epoch"]
+            .as_i64()
+            .is_none_or(|epoch| epoch < 0 || epoch == intent.admitted_gm_epoch)
+        || result
+            .get("publication_may_have_started")
+            .is_some_and(|value| value != false)
+    {
+        return Err(publication_state_corrupt(
+            "stale-GM Forge result lacks its structured no-write proof",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coalesced_forge_receipt(
+    result: &Value,
+    operation_id: &str,
+    verified_owner: Option<&str>,
+) -> Result<()> {
+    let owner = result["coalesced_to"].as_str();
+    if result["operation_id"] != operation_id
+        || result["outcome"] != "coalesced"
+        || result["state"] != "settled"
+        || result["publication"] != "coalesced"
+        || result["coalesced"] != true
+        || result["publication_may_have_started"] != false
+        || result["force"] != false
+        || owner.is_none_or(str::is_empty)
+        || owner != verified_owner
+    {
+        return Err(publication_state_corrupt(
+            "coalesced Forge result has no matching retained same-slot owner",
+        ));
+    }
+    Ok(())
+}
+
+fn require_operation_identity(result: &Value, operation_id: &str) -> Result<()> {
+    if !result.is_object() || result["operation_id"] != operation_id {
+        return Err(publication_state_corrupt(
+            "retained Forge result does not identify its exact Operation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_structured_error(error: &Value) -> Result<()> {
+    if error["code"].as_str().is_none_or(str::is_empty)
+        || error["message"].as_str().is_none_or(str::is_empty)
+    {
+        return Err(publication_state_corrupt(
+            "Forge failure has no structured error code and message",
+        ));
+    }
+    Ok(())
+}
+
+fn publication_state_corrupt(message: &str) -> Error {
+    Error::new("AUTOMATION_PUBLICATION_STATE_CORRUPT", message)
+}
+
 fn reserve_automatic_publication(
     tx: &Transaction<'_>,
     launcher_config: &Config,
@@ -666,57 +1441,33 @@ fn reserve_automatic_publication(
     let caller = context.technical_requester_id();
     let request_id = model::text(request_value, "client_request_id")?;
     let original_json = model::canonical(request_value)?;
-    let existing: Option<(String, String, String, Option<String>, String)> = tx
-        .query_row(
-            "SELECT operation_id,method,original_request_json,result_json,state FROM operations \
-             WHERE caller_id=?1 AND client_request_id=?2",
-            params![caller, request_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()?;
-    if let Some((operation_id, method, original, result_json, state)) = existing {
-        if method != "forge.publish_ref" || original != original_json {
+    let existing = ExistingAutomaticOperation::load(
+        tx,
+        ExistingAutomaticOperationLookup::ClientRequest {
+            caller_id: caller,
+            client_request_id: request_id,
+        },
+    )?;
+    if let Some(existing) = existing {
+        if existing.caller_id != caller
+            || existing.client_request_id != request_id
+            || existing.method != "forge.publish_ref"
+            || existing.original_request_json != original_json
+            || existing.original_request != *request_value
+        {
             return Err(Error::new(
                 "PUBLICATION_SLOT_CONFLICT",
                 "this automatic publication request ID already retains different inputs",
             ));
         }
-        let retained = PublicationContext::from_committed_operation(tx, &operation_id)?;
-        if retained.request_value()? != *request_value {
+        let retained_context = PublicationContext::from_existing_operation(tx, &existing)?;
+        if retained_context.request_value()? != *request_value {
             return Err(Error::new(
                 "PUBLICATION_SLOT_CONFLICT",
                 "existing automatic request does not retain this exact accepted-candidate slot",
             ));
         }
-        if !matches!(
-            state.as_str(),
-            "queued" | "sending" | "outcome_unknown" | "settled" | "rejected" | "cancelled"
-        ) {
-            return Err(Error::new(
-                "AUTOMATION_OPERATION_CORRUPT",
-                "existing automatic publication Operation has an unsupported state",
-            ));
-        }
-        let result = result_json
-            .map(|raw| serde_json::from_str::<Value>(&raw))
-            .transpose()?
-            .unwrap_or_else(|| json!({"operation_id":operation_id,"state":state}));
-        return Ok(json!({
-            "status":"coalesced",
-            "operation_id":operation_id,
-            "operation_state":state,
-            "coalesced":true,
-            "publication_started":matches!(state.as_str(),"queued"|"sending"|"outcome_unknown"),
-            "receipt":result
-        }));
+        return classify_retained_publication(tx, existing, &retained_context, request_value);
     }
 
     let operation_id = model::new_id();
@@ -743,50 +1494,73 @@ fn reserve_automatic_publication(
         launcher_config,
         Some(forge_preparation),
     )?;
-    let coalesced = reserved["coalesced"] == true
-        || reserved["status"] == "coalesced"
-        || reserved["publication"] == "coalesced";
-    let mut result = reserved;
-    result["operation_id"] = json!(operation_id);
-    result["coalesced"] = json!(coalesced);
-    result["publication_started"] = json!(!coalesced);
-
-    let raw_effective: String = tx.query_row(
-        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-        [&operation_id],
-        |row| row.get(0),
-    )?;
-    let mut effective: Value = serde_json::from_str(&raw_effective)?;
+    let initial = ExistingAutomaticOperation::load(
+        tx,
+        ExistingAutomaticOperationLookup::OperationId(&operation_id),
+    )?
+    .ok_or_else(|| publication_state_corrupt("new Forge Operation disappeared during admission"))?;
+    if initial.caller_id != caller
+        || initial.client_request_id != request_id
+        || initial.method != "forge.publish_ref"
+        || initial.original_request_json != original_json
+        || initial.original_request != *request_value
+    {
+        return Err(publication_state_corrupt(
+            "new Forge Operation differs from its immutable admission",
+        ));
+    }
+    let intent = retained_publication_intent(&initial, context, request_value)?;
+    let coalesced_to = if reserved["outcome"] == "coalesced" {
+        let owner_id = reserved["coalesced_to"]
+            .as_str()
+            .ok_or_else(|| publication_state_corrupt("coalesced receipt has no owner ID"))?;
+        validate_coalesced_owner(tx, &operation_id, owner_id, &intent)?;
+        validate_coalesced_forge_receipt(&reserved, &operation_id, Some(owner_id))?;
+        Some(owner_id.to_owned())
+    } else {
+        validate_queued_forge_receipt(&reserved, &operation_id, &intent)?;
+        None
+    };
+    let coalesced = coalesced_to.is_some();
+    let mut effective = initial.effective_request;
     effective["automation_on_behalf"] = context.linkage_value();
-    effective["receipt"] = json!({"ok":true,"value":result});
-    let state = if coalesced { "settled" } else { "queued" };
-    tx.execute(
-        "UPDATE operations SET state=?2,result_json=?3,settled_at_ms=?4,updated_at_ms=?5,effective_request_json=?6 \
-         WHERE operation_id=?1 AND method='forge.publish_ref' AND state='queued'",
-        params![
-            operation_id,
-            state,
-            model::canonical(&result)?,
-            coalesced.then_some(now_ms),
-            now_ms,
-            model::canonical(&effective)?
-        ],
-    )?;
+    effective["receipt"] = json!({"ok":true,"value":reserved});
+    let effective_json = model::canonical(&effective)?;
+    let changed = if coalesced {
+        tx.execute(
+            "UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3,effective_request_json=?4 \
+             WHERE operation_id=?1 AND method='forge.publish_ref' AND state='queued' AND sent_at_ms IS NULL AND settled_at_ms IS NULL",
+            params![operation_id, model::canonical(&reserved)?, now_ms, effective_json],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE operations SET result_json=?2,updated_at_ms=?3,effective_request_json=?4 \
+             WHERE operation_id=?1 AND method='forge.publish_ref' AND state='queued' AND sent_at_ms IS NULL AND settled_at_ms IS NULL",
+            params![operation_id, model::canonical(&reserved)?, now_ms, effective_json],
+        )?
+    };
+    if changed != 1 {
+        return Err(Error::conflict(
+            "fresh publication reservation changed before its receipt was retained",
+        ));
+    }
     capacity::sync_operation(tx, &operation_id, now_ms)?;
     tx.execute(
         "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
          VALUES('controller',?1,?1,'forge.publish_ref',?2,?3)",
-        params![operation_id, model::canonical(&result)?, now_ms],
+        params![operation_id, model::canonical(&reserved)?, now_ms],
     )?;
     save_operation_link(tx, context, &operation_id, now_ms)?;
-    Ok(json!({
-        "status":if coalesced {"coalesced"} else {"publication_reserved"},
-        "operation_id":operation_id,
-        "operation_state":state,
-        "publication_started":!coalesced,
-        "coalesced":coalesced,
-        "receipt":result
-    }))
+    let retained = ExistingAutomaticOperation::load(
+        tx,
+        ExistingAutomaticOperationLookup::OperationId(&operation_id),
+    )?
+    .ok_or_else(|| publication_state_corrupt("reserved Forge Operation disappeared"))?;
+    let mut classified = classify_retained_publication(tx, retained, context, request_value)?;
+    if !coalesced {
+        classified["status"] = json!("publication_reserved");
+    }
+    Ok(classified)
 }
 
 fn save_operation_link(
@@ -846,17 +1620,28 @@ fn recheck_pending(
         )?;
         match disposition {
             SubjectDisposition::Applied((event, accepted_operation_id, result)) => {
-                state.pending.remove(index);
+                if publication_unresolved(&result) {
+                    let pending = &mut state.pending[index];
+                    pending.retries = pending.retries.saturating_add(1);
+                    pending.next_retry_at_ms = now_ms.saturating_add(retry_delay(pending.retries));
+                } else {
+                    state.pending.remove(index);
+                }
                 processed += 1;
                 remember_recent(
                     state,
                     json!({
                         "observation_id":event.observation_id,
                         "accepted_operation_id":accepted_operation_id,
-                        "status":result["status"],
+                        "status":if result["terminal_not_applied"] == true { json!("skipped") } else { result["status"].clone() },
+                        "publication_status":result["status"],
+                        "automation_revision":invocation.entry.revision,
                         "code":result.get("code").cloned().unwrap_or(Value::Null),
+                        "reason":result.get("reason").cloned().unwrap_or(Value::Null),
                         "operation_id":result.get("operation_id").cloned().unwrap_or(Value::Null),
                         "operation_state":result.get("operation_state").cloned().unwrap_or(Value::Null),
+                        "effect_operation_id":result.get("effect_operation_id").unwrap_or(&result["operation_id"]),
+                        "effect_operation_state":result.get("effect_operation_state").unwrap_or(&result["operation_state"]),
                         "publication_started":result["publication_started"] == true,
                         "coalesced":result["coalesced"] == true
                     }),
@@ -920,11 +1705,12 @@ fn load_event(
     db.query_row(
         "SELECT observation_id,source_event_key,operation_id,payload_json FROM observations \
          WHERE observation_id=?1 AND source_stream_id=?2 AND kind='task.acceptance' \
-           AND source_event_key=?3 AND operation_id=?3",
+           AND source_event_key=?3 AND operation_id=?4",
         params![
             observation_id,
             ACCEPTANCE_STREAM,
-            format!("accept:{accepted_operation_id}")
+            format!("accept:{accepted_operation_id}"),
+            accepted_operation_id
         ],
         |row| {
             Ok(AcceptanceEvent {
@@ -1289,7 +2075,7 @@ fn select_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4",
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<=?3 ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
         .query_map(params![pattern, prefix, before, limit as i64], |row| {
@@ -1476,4 +2262,244 @@ fn state_projection_with_processed(
     value["quarantined"] = json!(quarantined);
     value["high_water"] = json!(high_water);
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExistingAutomaticOperation, classify_publication_lifecycle};
+    use crate::forge::PublicationIntent;
+    use serde_json::{Value, json};
+
+    fn intent() -> PublicationIntent {
+        PublicationIntent {
+            operation_id: "op-publication".to_owned(),
+            project_id: "project-1".to_owned(),
+            canonical_repository: "github.com/owner/repo".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            task_revision: 1,
+            admitted_gm_epoch: 0,
+            submission_ref: "submission-1".to_owned(),
+            accepted_operation_id: "acceptance-1".to_owned(),
+            candidate_ref: "candidate-1".to_owned(),
+            candidate_sha256: "a".repeat(64),
+            commit: "b".repeat(40),
+            tree: "c".repeat(40),
+            remote_name: "origin".to_owned(),
+            target_ref: "refs/heads/main".to_owned(),
+            expected_old_ref: Some("d".repeat(40)),
+            expected_create: false,
+            force: false,
+            policy_revision: "owner-policy-v1".to_owned(),
+        }
+    }
+
+    /// Classify one typed retained row, including its actual dispatch and
+    /// terminal timestamps.
+    fn classify(
+        state: &str,
+        result: Option<Value>,
+        sent_at_ms: Option<i64>,
+        settled_at_ms: Option<i64>,
+        verified_coalesced_owner: Option<&str>,
+    ) -> super::Result<Value> {
+        let retained = ExistingAutomaticOperation::decode(
+            "op-publication".to_owned(),
+            state.to_owned(),
+            result.map(|value| value.to_string()),
+            sent_at_ms,
+            settled_at_ms,
+        )?;
+        classify_publication_lifecycle(retained, &intent(), verified_coalesced_owner)
+    }
+
+    /// The exact applied receipt `store::forge` retains after a confirmed remote
+    /// readback.
+    fn applied_publication_receipt() -> Value {
+        let commit = intent().commit;
+        json!({
+            "operation_id":"op-publication",
+            "outcome":"applied",
+            "publication":"confirmed_by_remote_readback",
+            "publication_may_have_started":true,
+            "acceptance_current_at_finish":true,
+            "remote_ref":{"present":true,"commit":commit},
+            "force":false
+        })
+    }
+
+    #[test]
+    fn cancelled_publication_is_not_coalesced_success() {
+        let classified = classify(
+            "cancelled",
+            Some(json!({"reason":"cancelled before dispatch","cancelled_by":"op-cancel"})),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(classified["status"], "publication_cancelled");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["coalesced"], false);
+        assert_eq!(classified["publication_started"], false);
+    }
+
+    #[test]
+    fn cancelled_stale_epoch_publication_preserves_its_prior_result() {
+        let classified = classify(
+            "cancelled",
+            Some(json!({
+                "reason":"accepted publication became stale",
+                "cancelled_by":"op-cancel",
+                "previous_result":{
+                    "operation_id":"op-publication",
+                    "outcome":"stale_gm_epoch",
+                    "publication":"not_started",
+                    "admitted_gm_epoch":0,
+                    "current_gm_epoch":1,
+                    "force":false
+                }
+            })),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(classified["status"], "publication_cancelled");
+        assert_eq!(
+            classified["receipt"]["previous_result"]["outcome"],
+            "stale_gm_epoch"
+        );
+    }
+
+    #[test]
+    fn rejected_publication_is_not_replayed() {
+        let classified = classify(
+            "rejected",
+            Some(json!({"code":"FORBIDDEN","message":"scope denied"})),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(classified["status"], "publication_rejected");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["coalesced"], false);
+    }
+
+    #[test]
+    fn settled_stale_epoch_publication_is_not_applied() {
+        // A settled state carrying a no-write outcome is a terminal result that
+        // did not apply, so it must never be reported as a satisfied publication.
+        let classified = classify(
+            "settled",
+            Some(json!({
+                "operation_id":"op-publication",
+                "outcome":"stale_gm_epoch",
+                "publication":"not_started",
+                "admitted_gm_epoch":0,
+                "current_gm_epoch":1,
+                "force":false
+            })),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(classified["status"], "publication_not_applied");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["coalesced"], false);
+    }
+
+    #[test]
+    fn settled_confirmed_readback_is_publication_applied() {
+        let classified = classify(
+            "settled",
+            Some(applied_publication_receipt()),
+            Some(1),
+            Some(2),
+            None,
+        )
+        .unwrap();
+        assert_eq!(classified["status"], "publication_applied");
+        assert_eq!(classified["terminal_not_applied"], false);
+        assert_eq!(classified["publication_started"], true);
+    }
+
+    #[test]
+    fn publication_unknown_requires_exact_remote_readback() {
+        let classified = classify(
+            "outcome_unknown",
+            Some(json!({
+                "operation_id":"op-publication",
+                "outcome":"unknown",
+                "publication":"requires_readback",
+                "reason":"push result was lost",
+                "publication_may_have_started":true,
+                "force":false
+            })),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(classified["status"], "publication_readback_required");
+        assert_eq!(classified["readback_required"], true);
+        assert_eq!(classified["coalesced"], false);
+    }
+
+    #[test]
+    fn coalesced_publication_requires_an_exact_owner_reference() {
+        let receipt = json!({
+            "operation_id":"op-publication",
+            "outcome":"coalesced",
+            "state":"settled",
+            "publication":"coalesced",
+            "coalesced":true,
+            "coalesced_to":"op-owner",
+            "publication_may_have_started":false,
+            "force":false
+        });
+        let classified =
+            classify("settled", Some(receipt), None, Some(1), Some("op-owner")).unwrap();
+        assert_eq!(classified["status"], "publication_not_applied");
+        assert_eq!(classified["outcome"], "coalesced");
+        assert_eq!(classified["coalesced"], true);
+        assert_eq!(classified["publication_started"], false);
+    }
+
+    #[test]
+    fn applied_receipt_for_another_remote_ref_is_corrupt() {
+        let mut receipt = applied_publication_receipt();
+        receipt["remote_ref"]["commit"] = json!("e".repeat(40));
+        let error = classify("settled", Some(receipt), Some(1), Some(2), None)
+            .expect_err("the remote readback must match the retained Forge intent");
+        assert_eq!(error.code, "AUTOMATION_PUBLICATION_STATE_CORRUPT");
+    }
+
+    #[test]
+    fn unknown_publication_operation_state_is_corruption_not_a_new_state() {
+        let error = ExistingAutomaticOperation::decode(
+            "op-publication".to_owned(),
+            "maybe_applied".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect_err("an unknown lifecycle state is retained-data corruption");
+        assert_eq!(error.code, "AUTOMATION_OPERATION_CORRUPT");
+    }
+
+    #[test]
+    fn queued_operation_cannot_retain_dispatch_timestamp() {
+        let error = ExistingAutomaticOperation::decode(
+            "op-publication".to_owned(),
+            "queued".to_owned(),
+            None,
+            Some(1),
+            None,
+        )
+        .expect_err("a queued Operation cannot have crossed dispatch");
+        assert_eq!(error.code, "AUTOMATION_OPERATION_CORRUPT");
+    }
 }

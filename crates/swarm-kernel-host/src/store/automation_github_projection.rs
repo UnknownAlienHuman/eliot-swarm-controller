@@ -6,6 +6,9 @@ use super::automation_reconcile::{
     self, DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
     SubjectErrorDisposition,
 };
+use super::operation_lifecycle::{
+    ExistingAutomaticOperation, ExistingAutomaticOperationLookup, OperationLifecycleState,
+};
 use super::{Store, capacity, github_effects};
 use crate::{
     automation::{
@@ -14,9 +17,10 @@ use crate::{
         config::{self, AutomationEntry},
     },
     error::{Error, Result},
+    github::protocol::ManagedLabelRequest,
     model,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -503,17 +507,36 @@ fn reconcile_entry(
         )?;
         match disposition {
             SubjectDisposition::Applied((accepted_operation_id, value)) => {
+                let unresolved = matches!(
+                    value["status"].as_str(),
+                    Some(
+                        "projection_reserved"
+                            | "projection_in_flight"
+                            | "projection_readback_required"
+                    )
+                );
+                let terminal_skip = value["terminal_not_applied"] == true;
                 remember_recent(
                     &mut state,
                     json!({
                         "observation_id":event.observation_id,
                         "accepted_operation_id":accepted_operation_id,
-                        "status":value["status"],
+                        "status":if terminal_skip {json!("skipped")} else {value["status"].clone()},
+                        "effect_status":value["status"],
+                        "automation_revision":entry.revision,
                         "code":value.get("code").cloned().unwrap_or(Value::Null),
+                        "reason":value.get("reason").cloned().unwrap_or(Value::Null),
                         "effect_operation_id":value.get("operation_id").cloned().unwrap_or(Value::Null),
                         "recorded_at_ms":now_ms
                     }),
                 );
+                // This exact acceptance cause remains pending until its one
+                // retained effect is resolved. Reserving a queued Operation
+                // must not move the source cursor past it.
+                if unresolved {
+                    waiting = true;
+                    break;
+                }
                 state.cursor = event.observation_id;
                 processed += 1;
             }
@@ -578,6 +601,101 @@ fn reconcile_entry(
         high_water,
     ))
 }
+/// Classify one retained managed-label Operation truthfully.
+///
+/// The label effect evidence is exactly the shape `store::github_effects`
+/// persists: `outcome` of `applied` or `confirmed_after_transport_error`, with
+/// `readback` of `confirmed` and an `observed_present` matching the request. A
+/// settled Operation without that evidence is a terminal result that did not
+/// apply. `cancelled` and `rejected` are reported as themselves and never as an
+/// applied or coalesced projection. `outcome_unknown` requires the retained
+/// readback and never authorizes a replay.
+fn classify_retained_projection(retained: ExistingAutomaticOperation) -> Value {
+    let operation_id = retained.operation_id.clone();
+    let result = retained.result.clone().unwrap_or(Value::Null);
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let readback = result
+        .get("readback")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let observed_matches_request = result
+        .get("desired_present")
+        .and_then(Value::as_bool)
+        .zip(result.get("observed_present").and_then(Value::as_bool))
+        .is_some_and(|(desired, observed)| desired == observed);
+    // The effect is proven only by the exact readback contract in
+    // `store::github_effects`, never by the generic settled state alone.
+    let label_applied = retained.state == OperationLifecycleState::Settled
+        && result["operation_id"] == operation_id
+        && matches!(
+            outcome,
+            "applied"
+                | "confirmed_after_transport_error"
+                | "reconciled_from_readback"
+                | "already_in_desired_state"
+        )
+        && readback == "confirmed"
+        && observed_matches_request;
+    let effect_started = retained.sent_at_ms.is_some() || result["write_attempted"] == true;
+    let mut value = json!({
+        "operation_id":operation_id,
+        "operation_state":retained.state.as_str(),
+        "effect_started":effect_started,
+    });
+    let object = value.as_object_mut().expect("base receipt is an object");
+    match retained.state {
+        OperationLifecycleState::Queued
+        | OperationLifecycleState::Sending
+        | OperationLifecycleState::NativeAccepted => {
+            object.insert("status".to_owned(), json!("projection_in_flight"));
+            object.insert("coalesced".to_owned(), json!(false));
+        }
+        OperationLifecycleState::OutcomeUnknown => {
+            object.insert("status".to_owned(), json!("projection_readback_required"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("readback_required".to_owned(), json!(true));
+        }
+        OperationLifecycleState::Cancelled => {
+            object.insert("status".to_owned(), json!("projection_cancelled"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(true));
+            object.insert(
+                "code".to_owned(),
+                json!("projection_cancelled_before_effect"),
+            );
+            object.insert("reason".to_owned(), result["reason"].clone());
+        }
+        OperationLifecycleState::Rejected => {
+            object.insert("status".to_owned(), json!("projection_rejected"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(true));
+            object.insert("code".to_owned(), result["error"]["code"].clone());
+            object.insert("reason".to_owned(), result["error"]["message"].clone());
+        }
+        OperationLifecycleState::Settled => {
+            object.insert(
+                "status".to_owned(),
+                json!(if label_applied {
+                    "projection_applied"
+                } else {
+                    "projection_not_applied"
+                }),
+            );
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(!label_applied));
+            object.insert("outcome".to_owned(), json!(outcome));
+            if !label_applied {
+                object.insert("code".to_owned(), result["error"]["code"].clone());
+                object.insert("reason".to_owned(), result["error"]["message"].clone());
+            }
+        }
+    }
+    object.insert("receipt".to_owned(), retained.result.unwrap_or(Value::Null));
+    value
+}
 
 fn reserve_projection(
     tx: &Transaction<'_>,
@@ -589,48 +707,174 @@ fn reserve_projection(
     let caller = context.technical_requester_id();
     let request_id = model::text(request_value, "client_request_id")?;
     let original_json = model::canonical(request_value)?;
-    let existing: Option<(String, String, String, Option<String>, String)> = tx
-        .query_row(
-            "SELECT operation_id,method,original_request_json,result_json,state FROM operations WHERE caller_id=?1 AND client_request_id=?2",
-            params![caller, request_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .optional()?;
-    if let Some((operation_id, method, original, result_json, state)) = existing {
-        if method != METHOD || original != original_json {
+    let existing = ExistingAutomaticOperation::load(
+        tx,
+        ExistingAutomaticOperationLookup::ClientRequest {
+            caller_id: caller,
+            client_request_id: request_id,
+        },
+    )?;
+    if let Some(retained) = existing {
+        if retained.caller_id != caller
+            || retained.client_request_id != request_id
+            || retained.method != METHOD
+            || retained.original_request_json != original_json
+            || retained.original_request != *request_value
+        {
             return Err(Error::new(
                 "AUTOMATION_GITHUB_PROJECTION_SLOT_CONFLICT",
                 "this deterministic managed-label request ID already retains different inputs",
             ));
         }
-        let retained = GithubProjectionContext::from_committed_operation(tx, &operation_id)?;
-        if retained.request_value()? != *request_value {
+        let context = GithubProjectionContext::from_existing_operation(tx, &retained)?;
+        if context.request_value()? != *request_value {
             return Err(Error::new(
                 "AUTOMATION_GITHUB_PROJECTION_SLOT_CONFLICT",
                 "existing managed-label Operation does not retain this exact acceptance cause",
             ));
         }
-        if !matches!(
-            state.as_str(),
-            "queued" | "sending" | "outcome_unknown" | "settled" | "rejected" | "cancelled"
+        let effective = &retained.effective_request;
+        let admission = &effective["receipt"]["value"];
+        let request = ManagedLabelRequest::parse(request_value)?;
+        if effective["receipt"]["ok"] != true {
+            return Err(Error::new(
+                "GITHUB_EFFECT_OPERATION_MISMATCH",
+                "retained projection has no successful exact admission receipt",
+            ));
+        }
+        github_effects::validate_effect_tuple(admission, &retained.operation_id, &request)?;
+        if retained.state == OperationLifecycleState::Cancelled {
+            let result = retained.result.as_ref().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "cancelled label effect has no cancellation receipt",
+                )
+            })?;
+            let cancellation_id = result["cancelled_by"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    Error::new(
+                        "AUTOMATION_OPERATION_CORRUPT",
+                        "cancelled label effect has no cancellation Operation",
+                    )
+                })?;
+            let cancellation = ExistingAutomaticOperation::load(
+                tx,
+                ExistingAutomaticOperationLookup::OperationId(cancellation_id),
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "label cancellation references a missing Operation",
+                )
+            })?;
+            if retained.sent_at_ms.is_some()
+                || result["reason"]
+                    .as_str()
+                    .is_none_or(|reason| reason.trim().is_empty())
+                || cancellation.method != "operation.cancel"
+                || cancellation.state != OperationLifecycleState::Settled
+                || cancellation.result.as_ref().is_none_or(|cancel_result| {
+                    cancel_result["operation_id"] != cancellation_id
+                        || cancel_result["cancelled_operation_id"] != retained.operation_id
+                        || cancel_result["native_cancel_sent"] != false
+                })
+                || cancellation.original_request["operation_id"] != retained.operation_id
+                || cancellation.original_request["reason"] != result["reason"]
+                || cancellation.original_request["client_request_id"]
+                    != cancellation.client_request_id
+            {
+                return Err(Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "label cancellation does not prove the exact queued effect was cancelled",
+                ));
+            }
+        } else if let Some(result) = retained.result.as_ref() {
+            github_effects::validate_retained_effect_result(
+                result,
+                admission,
+                &retained.operation_id,
+                &request,
+            )?;
+            let completed = matches!(
+                result["outcome"].as_str(),
+                Some(
+                    "applied"
+                        | "confirmed_after_transport_error"
+                        | "reconciled_from_readback"
+                        | "already_in_desired_state"
+                )
+            );
+            if completed
+                && (retained.state != OperationLifecycleState::Settled
+                    || result["readback"] != "confirmed"
+                    || result["observed_present"] != request.present)
+            {
+                return Err(Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "label result lacks the exact settled target readback",
+                ));
+            }
+            if matches!(
+                retained.state,
+                OperationLifecycleState::Settled | OperationLifecycleState::Rejected
+            ) && !completed
+                && (result["outcome"] != "rejected_before_write"
+                    || result["write_attempted"] != false
+                    || retained.sent_at_ms.is_some()
+                    || result["error"]["code"]
+                        .as_str()
+                        .is_none_or(|code| code.trim().is_empty())
+                    || result["error"]["message"]
+                        .as_str()
+                        .is_none_or(|message| message.trim().is_empty()))
+            {
+                return Err(Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "terminal label skip lacks a structured no-write disposition",
+                ));
+            }
+            if retained.state == OperationLifecycleState::Rejected
+                && (result["error"]["code"]
+                    .as_str()
+                    .is_none_or(|code| code.trim().is_empty())
+                    || result["error"]["message"]
+                        .as_str()
+                        .is_none_or(|message| message.trim().is_empty()))
+            {
+                return Err(Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "rejected label effect has no structured terminal reason",
+                ));
+            }
+            if retained.state == OperationLifecycleState::Settled
+                && !matches!(
+                    result["outcome"].as_str(),
+                    Some(
+                        "applied"
+                            | "confirmed_after_transport_error"
+                            | "reconciled_from_readback"
+                            | "already_in_desired_state"
+                            | "rejected_before_write"
+                    )
+                )
+            {
+                return Err(Error::new(
+                    "AUTOMATION_OPERATION_CORRUPT",
+                    "settled label effect has no supported domain outcome",
+                ));
+            }
+        } else if matches!(
+            retained.state,
+            OperationLifecycleState::Settled | OperationLifecycleState::Rejected
         ) {
             return Err(Error::new(
                 "AUTOMATION_OPERATION_CORRUPT",
-                "existing managed-label Operation has an unsupported state",
+                "terminal label effect has no domain result",
             ));
         }
-        let result = result_json
-            .map(|raw| serde_json::from_str::<Value>(&raw))
-            .transpose()?
-            .unwrap_or_else(|| json!({"operation_id":operation_id,"state":state}));
-        return Ok(json!({
-            "status":"coalesced",
-            "operation_id":operation_id,
-            "operation_state":state,
-            "coalesced":true,
-            "effect_started":matches!(state.as_str(),"queued"|"sending"|"outcome_unknown"),
-            "receipt":result
-        }));
+        return Ok(classify_retained_projection(retained));
     }
 
     let operation_id = model::new_id();
@@ -931,7 +1175,7 @@ fn select_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4",
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<=?3 ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
         .query_map(params![pattern, prefix, before, limit as i64], |row| {

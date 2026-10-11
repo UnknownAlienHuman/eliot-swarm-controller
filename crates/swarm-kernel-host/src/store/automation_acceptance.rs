@@ -5,6 +5,9 @@
 //! CheckRuns. The asynchronous acceptance worker remains responsible for
 //! artifact byte verification and the final Task transition.
 
+use super::operation_lifecycle::{
+    ExistingAutomaticOperation, ExistingAutomaticOperationLookup, OperationLifecycleState,
+};
 use super::{capacity, operations, results, submissions, tasks};
 use crate::{
     acceptance::{AcceptRequest, AcceptancePolicy, RequirementReview},
@@ -40,17 +43,6 @@ struct CheckRunRow {
     cached_from_check_id: Option<String>,
     result_ref: Option<String>,
     coverage: Value,
-}
-
-struct ExistingAcceptanceOperation {
-    operation_id: String,
-    method: String,
-    original_request_json: String,
-    state: String,
-    result_json: Option<String>,
-    effective_request_json: String,
-    task_id: Option<String>,
-    attempt_id: Option<String>,
 }
 
 /// Consume one exact retained review result in the Store transaction that
@@ -397,8 +389,13 @@ pub(super) fn consume_review_result_for_entry(
     // rechecks the exact context before Task state changes.
     let receipt = reserve_automatic_acceptance(tx, &context, &request_value, now_ms)?;
     let coalesced = receipt["coalesced"].as_bool().unwrap_or(false);
+    let status = receipt["status"].as_str().unwrap_or(if coalesced {
+        "coalesced"
+    } else {
+        "acceptance_reserved"
+    });
     let mut value = json!({
-        "status":if coalesced {"coalesced"} else {"acceptance_reserved"},
+        "status":status,
         "action":"task.accept",
         "operation_id":receipt["operation_id"],
         "acceptance_operation_id":receipt["acceptance_operation_id"],
@@ -415,7 +412,7 @@ pub(super) fn consume_review_result_for_entry(
         "review_policy_generation":context.identity().review_policy_generation,
         "check_ids":context.check_ids(),
         "gm_epoch":context.gm_epoch(),
-        "acceptance_started":matches!(receipt["state"].as_str(), Some("queued" | "sending" | "outcome_unknown")),
+        "acceptance_started":receipt["acceptance_started"] == true || receipt["task_accepted"] == true,
         "task_accepted":receipt["task_accepted"] == true,
         "publication_started":false,
         "ownership_released":false
@@ -431,6 +428,271 @@ pub(super) fn consume_review_result_for_entry(
     value["required_check_profiles"] = json!(policy.required_check_profiles);
     Ok(value)
 }
+/// Classify one retained `task.accept` Operation truthfully.
+///
+/// `cancelled` and `rejected` are terminal states in their own right. They are
+/// reported as themselves and never as corruption and never as applied or
+/// coalesced acceptance success. A `settled` state proves nothing on its own:
+/// only an exact `task_accepted` result tied to this same Operation establishes
+/// that the acceptance applied. `outcome_unknown` requires readback and never
+/// authorizes a replacement or replay under the same semantic request ID.
+fn classify_retained_acceptance(retained: ExistingAutomaticOperation, decision: &Value) -> Value {
+    let operation_id = retained.operation_id.clone();
+    let result = retained.result.clone().unwrap_or(Value::Null);
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // The admission receipt describes reservation, not completion. Only the
+    // current result and the domain-validated decision can prove acceptance.
+    let receipt = result.clone();
+    // The decision receipt must name this exact Operation. A receipt retained
+    // for a different semantic Operation, or one carrying no identity at all,
+    // cannot establish that this acceptance applied.
+    let receipt_names_operation = receipt
+        .get("operation_id")
+        .is_none_or(|named| named == &json!(operation_id));
+    // The acceptance applied only with the exact retained decision evidence.
+    let accepted = retained.state == OperationLifecycleState::Settled
+        && receipt["operation_id"] == operation_id
+        && receipt["task_accepted"] == true
+        && decision["current"] == true
+        && decision["invalidated"] == false;
+    let mut value = json!({
+        "operation_id":operation_id,
+        "acceptance_operation_id":receipt.get("acceptance_operation_id").cloned().unwrap_or_else(|| json!(operation_id)),
+        "operation_state":retained.state.as_str(),
+        "acceptance_started":retained.sent_at_ms.is_some() || accepted,
+        "task_accepted":accepted,
+    });
+    let object = value.as_object_mut().expect("base receipt is an object");
+    if !receipt_names_operation && retained.state != OperationLifecycleState::Cancelled {
+        // The retained receipt cannot be attributed to this Operation, so the
+        // identity mismatch is explicit rather than silently treated as applied.
+        object.insert("receipt_identity_mismatch".to_owned(), json!(true));
+    }
+    match retained.state {
+        OperationLifecycleState::Queued => {
+            object.insert("status".to_owned(), json!("acceptance_in_flight"));
+            object.insert("coalesced".to_owned(), json!(false));
+        }
+        OperationLifecycleState::Sending | OperationLifecycleState::NativeAccepted => {
+            object.insert("status".to_owned(), json!("acceptance_in_flight"));
+            object.insert("coalesced".to_owned(), json!(false));
+        }
+        OperationLifecycleState::OutcomeUnknown => {
+            object.insert("status".to_owned(), json!("acceptance_readback_required"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("readback_required".to_owned(), json!(true));
+        }
+        OperationLifecycleState::Cancelled => {
+            object.insert("status".to_owned(), json!("acceptance_cancelled"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(true));
+            object.insert(
+                "code".to_owned(),
+                json!("acceptance_cancelled_before_effect"),
+            );
+        }
+        OperationLifecycleState::Rejected => {
+            object.insert("status".to_owned(), json!("acceptance_rejected"));
+            object.insert("coalesced".to_owned(), json!(false));
+            object.insert("terminal_not_applied".to_owned(), json!(true));
+            object.insert(
+                "code".to_owned(),
+                receipt
+                    .get("code")
+                    .cloned()
+                    .unwrap_or_else(|| receipt["error"]["code"].clone()),
+            );
+        }
+        OperationLifecycleState::Settled => {
+            object.insert(
+                "status".to_owned(),
+                json!(if accepted {
+                    "acceptance_applied"
+                } else {
+                    "acceptance_not_applied"
+                }),
+            );
+            object.insert("coalesced".to_owned(), json!(receipt["coalesced"] == true));
+            object.insert("terminal_not_applied".to_owned(), json!(!accepted));
+            if !accepted {
+                object.insert(
+                    "code".to_owned(),
+                    if outcome == "failed" {
+                        receipt["error"]["code"].clone()
+                    } else if decision["invalidated"] == true {
+                        json!("acceptance_invalidated")
+                    } else {
+                        json!("acceptance_not_current")
+                    },
+                );
+            }
+        }
+    }
+    object.insert("receipt".to_owned(), receipt);
+    value
+}
+
+/// Validate the retained result against the authoritative acceptance producer,
+/// including a coalesced wrapper's exact original decision. The admission
+/// receipt is never used as a substitute for the terminal result.
+fn retained_acceptance_decision(
+    db: &Connection,
+    retained: &ExistingAutomaticOperation,
+    task_id: &str,
+    request_value: &Value,
+) -> Result<Value> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_OPERATION_CORRUPT",
+            "retained acceptance result does not match its exact lifecycle and decision",
+        )
+    };
+    if !retained.has_unbound_execution_scope() {
+        return Err(corrupt());
+    }
+    let result = retained.result.as_ref();
+    if result.is_some_and(|value| !value.is_object()) {
+        return Err(corrupt());
+    }
+    match retained.state {
+        OperationLifecycleState::Queued
+        | OperationLifecycleState::Sending
+        | OperationLifecycleState::NativeAccepted
+        | OperationLifecycleState::OutcomeUnknown => {
+            if result.is_some_and(|value| {
+                value["operation_id"] != retained.operation_id
+                    || value["task_accepted"] == true
+                    || value["outcome"] == "applied"
+            }) {
+                return Err(corrupt());
+            }
+            Ok(Value::Null)
+        }
+        OperationLifecycleState::Cancelled => {
+            let result = result.ok_or_else(corrupt)?;
+            let cancellation_id = result["cancelled_by"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(corrupt)?;
+            if retained.sent_at_ms.is_some()
+                || result["reason"]
+                    .as_str()
+                    .is_none_or(|reason| reason.trim().is_empty())
+            {
+                return Err(corrupt());
+            }
+            let cancellation = ExistingAutomaticOperation::load(
+                db,
+                ExistingAutomaticOperationLookup::OperationId(cancellation_id),
+            )?
+            .ok_or_else(corrupt)?;
+            if cancellation.method != "operation.cancel"
+                || cancellation.state != OperationLifecycleState::Settled
+                || cancellation.result.as_ref().is_none_or(|result| {
+                    result["operation_id"] != cancellation_id
+                        || result["cancelled_operation_id"] != retained.operation_id
+                        || result["native_cancel_sent"] != false
+                })
+                || cancellation.original_request["operation_id"] != retained.operation_id
+                || cancellation.original_request["reason"] != result["reason"]
+                || cancellation.original_request["client_request_id"]
+                    != cancellation.client_request_id
+            {
+                return Err(corrupt());
+            }
+            Ok(Value::Null)
+        }
+        OperationLifecycleState::Rejected => {
+            let result = result.ok_or_else(corrupt)?;
+            let error = if result["error"].is_object() {
+                &result["error"]
+            } else {
+                result
+            };
+            if error["code"]
+                .as_str()
+                .is_none_or(|code| code.trim().is_empty())
+                || error["message"]
+                    .as_str()
+                    .is_none_or(|message| message.trim().is_empty())
+                || retained.sent_at_ms.is_some()
+                || result
+                    .get("operation_id")
+                    .is_some_and(|id| id != &json!(retained.operation_id))
+                || result["task_accepted"] == true
+                || result["outcome"] == "applied"
+            {
+                return Err(corrupt());
+            }
+            Ok(Value::Null)
+        }
+        OperationLifecycleState::Settled => {
+            let result = result.ok_or_else(corrupt)?;
+            if result["operation_id"] != retained.operation_id {
+                return Err(corrupt());
+            }
+            if result["outcome"] == "failed" {
+                if result["task_accepted"] != false
+                    || result["error"]["code"]
+                        .as_str()
+                        .is_none_or(|code| code.trim().is_empty())
+                    || result["error"]["message"]
+                        .as_str()
+                        .is_none_or(|message| message.trim().is_empty())
+                {
+                    return Err(corrupt());
+                }
+                return Ok(Value::Null);
+            }
+            let decision_id = result["acceptance_operation_id"]
+                .as_str()
+                .ok_or_else(corrupt)?;
+            let coalesced = result["coalesced"] == true;
+            if result["task_accepted"] != true
+                || (!coalesced
+                    && (result["outcome"] != "applied" || decision_id != retained.operation_id))
+                || (coalesced && decision_id == retained.operation_id)
+            {
+                return Err(corrupt());
+            }
+            let decision =
+                super::acceptance::describe(db, &json!({"acceptance_operation_id":decision_id}))?;
+            let request = AcceptRequest::parse(request_value)?;
+            if decision["task_id"] != task_id
+                || decision["attempt_id"] != request.attempt_id
+                || decision["task_revision"] != request.expected_revision
+                || decision["submission_ref"] != request.submission_ref
+                || decision["candidate_ref"] != request.candidate_ref
+                || decision["task_accepted"] != true
+            {
+                return Err(corrupt());
+            }
+            if !coalesced
+                && (decision["reason"] != request.reason
+                    || decision["reviews"] != serde_json::to_value(&request.reviews)?
+                    || decision["check_ids"] != serde_json::to_value(&request.check_ids)?
+                    || decision["feedback_observation_id"]
+                        != request.expected_feedback_observation_id)
+            {
+                return Err(corrupt());
+            }
+            let task = tasks::get_task(db, task_id)?;
+            if decision["current"] == true
+                && (task["state"] != "accepted"
+                    || task["accepted_attempt_id"] != request.attempt_id
+                    || task["accepted_revision"] != request.expected_revision
+                    || task["accepted_candidate_ref"] != request.candidate_ref
+                    || task["accepted_phase"] != decision["phase"])
+            {
+                return Err(corrupt());
+            }
+            Ok(decision)
+        }
+    }
+}
 
 fn reserve_automatic_acceptance(
     tx: &Transaction<'_>,
@@ -441,83 +703,42 @@ fn reserve_automatic_acceptance(
     let caller_id = context.technical_requester_id();
     let request_id = model::text(request_value, "client_request_id")?;
     let original_json = model::canonical(request_value)?;
-    let old: Option<ExistingAcceptanceOperation> = tx
-        .query_row(
-            "SELECT operation_id,method,original_request_json,state,result_json, \
-                    effective_request_json,task_id,attempt_id \
-             FROM operations WHERE caller_id=?1 AND client_request_id=?2",
-            params![caller_id, request_id],
-            |row| {
-                Ok(ExistingAcceptanceOperation {
-                    operation_id: row.get(0)?,
-                    method: row.get(1)?,
-                    original_request_json: row.get(2)?,
-                    state: row.get(3)?,
-                    result_json: row.get(4)?,
-                    effective_request_json: row.get(5)?,
-                    task_id: row.get(6)?,
-                    attempt_id: row.get(7)?,
-                })
-            },
-        )
-        .optional()?;
+    let old = ExistingAutomaticOperation::load(
+        tx,
+        ExistingAutomaticOperationLookup::ClientRequest {
+            caller_id,
+            client_request_id: request_id,
+        },
+    )?;
 
-    if let Some(ExistingAcceptanceOperation {
-        operation_id,
-        method,
-        original_request_json,
-        state,
-        result_json,
-        effective_request_json,
-        task_id,
-        attempt_id,
-    }) = old
-    {
-        if method != "task.accept" || original_request_json != original_json {
+    if let Some(retained) = old {
+        if retained.caller_id != caller_id
+            || retained.client_request_id != request_id
+            || retained.method != "task.accept"
+            || retained.original_request_json != original_json
+        {
             return Err(Error::new(
                 "REQUEST_ID_CONFLICT",
                 "this semantic acceptance request already retains different inputs",
             ));
         }
-        let effective: Value = serde_json::from_str(&effective_request_json)?;
-        if effective["automation_on_behalf"] != context.linkage_value()
-            || task_id.as_deref() != Some(context.identity().task_id.as_str())
-            || attempt_id.as_deref() != Some(context.identity().attempt_id.as_str())
+        if retained.effective_request["automation_on_behalf"] != context.linkage_value()
+            || retained.effective_request["request"] != *request_value
+            || retained.task_id.as_deref() != Some(context.identity().task_id.as_str())
+            || retained.attempt_id.as_deref() != Some(context.identity().attempt_id.as_str())
         {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "existing semantic acceptance request is linked to a different exact scope",
             ));
         }
-        if !matches!(
-            state.as_str(),
-            "queued" | "sending" | "outcome_unknown" | "settled" | "rejected"
-        ) {
-            return Err(Error::new(
-                "AUTOMATION_OPERATION_CORRUPT",
-                "existing semantic acceptance request has an unsupported state",
-            ));
-        }
-        let current_result = result_json
-            .map(|raw| serde_json::from_str::<Value>(&raw))
-            .transpose()?
-            .unwrap_or(Value::Null);
-        let retained_receipt = effective["receipt"]["value"].clone();
-        let mut receipt = if retained_receipt.is_object() {
-            retained_receipt
-        } else if current_result.is_object() {
-            current_result.clone()
-        } else {
-            json!({})
-        };
-        receipt["operation_id"] = json!(operation_id);
-        if receipt["acceptance_operation_id"].as_str().is_none() {
-            receipt["acceptance_operation_id"] = json!(operation_id);
-        }
-        receipt["coalesced"] = json!(true);
-        receipt["state"] = json!(state);
-        receipt["task_accepted"] = json!(current_result["task_accepted"] == true);
-        return Ok(receipt);
+        let decision = retained_acceptance_decision(
+            tx,
+            &retained,
+            &context.identity().task_id,
+            request_value,
+        )?;
+        return Ok(classify_retained_acceptance(retained, &decision));
     }
 
     let operation_id = model::new_id();
@@ -567,12 +788,30 @@ fn reserve_automatic_acceptance(
         receipt["task_accepted"] = json!(false);
     }
 
-    let raw_effective: String = tx.query_row(
-        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-        [&operation_id],
-        |row| row.get(0),
-    )?;
-    let mut effective: Value = serde_json::from_str(&raw_effective)?;
+    let retained = ExistingAutomaticOperation::load(
+        tx,
+        ExistingAutomaticOperationLookup::OperationId(&operation_id),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "ACCEPTANCE_OPERATION_CORRUPT",
+            "reserved Operation disappeared",
+        )
+    })?;
+    if retained.caller_id != caller_id
+        || retained.client_request_id != request_id
+        || retained.method != "task.accept"
+        || retained.original_request_json != original_json
+        || retained.original_request != *request_value
+        || retained.task_id.as_deref() != Some(context.identity().task_id.as_str())
+        || retained.attempt_id.as_deref() != Some(context.identity().attempt_id.as_str())
+    {
+        return Err(Error::new(
+            "ACCEPTANCE_OPERATION_CORRUPT",
+            "reserved Operation differs from its immutable acceptance context",
+        ));
+    }
+    let mut effective = retained.effective_request;
     effective["automation_on_behalf"] = context.linkage_value();
     effective["receipt"] = json!({"ok":true,"value":receipt});
     let state = if decision_was_coalesced {
@@ -892,18 +1131,27 @@ fn current_subject(
 ) -> Result<Option<(Value, Value)>> {
     let task = tasks::get_task(db, &identity.task_id)?;
     let attempt = tasks::get_attempt(db, &identity.attempt_id)?;
-    let current = task["state"] == "open"
-        && task["revision"] == identity.task_revision
+    // Reconciliation must also read back the exact accepted subject. Requiring
+    // an open Task hides the terminal decision immediately after the worker
+    // applies it, leaving the source disposition unable to observe completion.
+    let current_state = (task["state"] == "open"
         && task["current_attempt_id"] == identity.attempt_id
+        && matches!(
+            attempt["state"].as_str(),
+            Some("submitted" | "needs_correction")
+        ))
+        || (task["state"] == "accepted"
+            && task["accepted_attempt_id"] == identity.attempt_id
+            && task["accepted_revision"] == identity.task_revision
+            && task["accepted_candidate_ref"] == identity.candidate_ref
+            && attempt["state"] == "accepted");
+    let current = current_state
+        && task["revision"] == identity.task_revision
         && attempt["task_id"] == identity.task_id
         && attempt["task_revision"] == identity.task_revision
         && attempt["released_at_ms"].is_null()
         && attempt["submission_ref"] == identity.submission_ref
-        && attempt["candidate_ref"] == identity.candidate_ref
-        && matches!(
-            attempt["state"].as_str(),
-            Some("submitted" | "needs_correction")
-        );
+        && attempt["candidate_ref"] == identity.candidate_ref;
     Ok(current.then_some((task, attempt)))
 }
 
@@ -963,4 +1211,402 @@ fn capability_gap(review: &CommittedReviewResult, code: &str, reason: &str) -> V
     let mut value = skipped(review, code, reason);
     value["status"] = json!("capability_gap");
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AutomationEntry, AutomationStep, ExistingAutomaticOperation, classify_retained_acceptance,
+    };
+    use crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID;
+    use rusqlite::{Connection, params};
+    use serde_json::{Value, json};
+
+    /// Classify one retained `task.accept` Operation through the real decoder and
+    /// classifier. The third argument represents the separately validated
+    /// current decision, never the admission receipt.
+    fn classify(state: &str, result: Option<Value>, receipt: Option<Value>) -> Value {
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept".to_owned(),
+            state.to_owned(),
+            result.map(|value| value.to_string()),
+            matches!(state, "sending" | "native_accepted" | "outcome_unknown").then_some(1),
+            matches!(state, "settled" | "rejected" | "cancelled").then_some(2),
+        )
+        .unwrap();
+        classify_retained_acceptance(retained, &receipt.unwrap_or(Value::Null))
+    }
+
+    /// The exact applied decision receipt the acceptance domain retains.
+    fn applied_receipt() -> Value {
+        json!({
+            "operation_id":"op-accept",
+            "acceptance_operation_id":"op-accept",
+            "outcome":"applied",
+            "task_accepted":true
+        })
+    }
+
+    #[test]
+    fn cancelled_automatic_acceptance_is_truthful_not_corrupt() {
+        // A retained `cancelled` Operation is a real terminal state, not
+        // corruption, and never an applied or coalesced acceptance.
+        let classified = classify(
+            "cancelled",
+            Some(json!({"reason":"cancel queued acceptance","cancelled_by":"cancel-op-accept"})),
+            None,
+        );
+        assert_eq!(classified["status"], "acceptance_cancelled");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["coalesced"], false);
+    }
+
+    #[test]
+    fn rejected_acceptance_is_not_task_accepted() {
+        let classified = classify(
+            "rejected",
+            Some(json!({"operation_id":"op-accept","outcome":"rejected","code":"scope_denied"})),
+            None,
+        );
+        assert_eq!(classified["status"], "acceptance_rejected");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["coalesced"], false);
+    }
+
+    #[test]
+    fn settled_nonapplied_acceptance_does_not_satisfy_slot() {
+        // A settled state carrying no accepted decision is a terminal result
+        // that did not apply, so it must not be reported as task accepted.
+        let classified = classify(
+            "settled",
+            Some(json!({"operation_id":"op-accept","outcome":"not_applied"})),
+            None,
+        );
+        assert_eq!(classified["status"], "acceptance_not_applied");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["task_accepted"], false);
+    }
+
+    #[test]
+    fn settled_exact_accepted_decision_is_acceptance_applied() {
+        let classified = classify(
+            "settled",
+            Some(applied_receipt()),
+            Some(json!({"current":true,"invalidated":false})),
+        );
+        assert_eq!(classified["status"], "acceptance_applied");
+        assert_eq!(classified["terminal_not_applied"], false);
+        assert_eq!(classified["task_accepted"], true);
+    }
+
+    #[test]
+    fn acceptance_unknown_stays_pending_without_duplicate_operation() {
+        for state in ["queued", "sending", "native_accepted"] {
+            let classified = classify(state, None, None);
+            assert_eq!(classified["status"], "acceptance_in_flight");
+            assert_eq!(classified["coalesced"], false);
+        }
+        let unknown = classify("outcome_unknown", None, None);
+        assert_eq!(unknown["status"], "acceptance_readback_required");
+        assert_eq!(unknown["readback_required"], true);
+    }
+
+    #[test]
+    fn queued_acceptance_does_not_claim_an_effect_started() {
+        // The generic lifecycle must not invent effect-start proof: a queued
+        // Operation has not been dispatched by the Store runtime.
+        let classified = classify("queued", None, None);
+        assert_eq!(classified["acceptance_started"], false);
+    }
+
+    #[test]
+    fn blank_retained_result_is_corruption_not_absence() {
+        // A blank result column value is retained but malformed JSON, so it must
+        // never be mistaken for an absent result and classified as in flight.
+        let error = ExistingAutomaticOperation::decode(
+            "op-accept".to_owned(),
+            "settled".to_owned(),
+            Some("   ".to_owned()),
+            None,
+            Some(2),
+        )
+        .expect_err("a blank retained result is malformed JSON");
+        assert_eq!(error.code, "AUTOMATION_OPERATION_CORRUPT");
+    }
+
+    #[test]
+    fn absent_retained_result_is_distinct_from_blank() {
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept".to_owned(),
+            "queued".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("an absent result column is not corruption");
+        assert!(retained.result.is_none());
+    }
+
+    /// One isolated Store with the acceptance step selected, mirroring the existing
+    /// sibling fixture convention.
+    fn acceptance_fixture() -> (Connection, AutomationEntry) {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        let mut entry = AutomationEntry::new("manager", "fixture", "acceptance", 1);
+        entry.enabled = true;
+        entry.steps = vec![AutomationStep::Acceptance];
+        (db, entry)
+    }
+
+    /// Insert one retained `task.accept` Operation row exactly as the Store
+    /// persists it, and return its id.
+    ///
+    /// This models retained history only; the lifecycle state is never rewritten to
+    /// make a classification pass.
+    fn insert_acceptance_operation(
+        db: &Connection,
+        caller: &str,
+        request_id: &str,
+        state: &str,
+        result: Option<Value>,
+    ) -> String {
+        let operation_id = format!("op-{request_id}");
+        db.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,settled_at_ms,due_at_ms,created_at_ms,updated_at_ms) \
+         VALUES(?1,?2,?3,'task.accept','{}','{}',?4,?5,?6,1,1,1)",
+        params![
+            operation_id,
+            caller,
+            request_id,
+            state,
+            result.map(|value| value.to_string()),
+            matches!(state, "settled" | "rejected" | "cancelled").then_some(1_i64),
+        ],
+    )
+    .unwrap();
+        operation_id
+    }
+
+    fn count_acceptance_operations(db: &Connection, request_id: &str) -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM operations WHERE client_request_id=?1 AND method='task.accept'",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A retained cancelled acceptance is classified as its own terminal state, is
+    /// never reported as applied or coalesced, and never causes a replacement
+    /// Operation under the same semantic request ID.
+    #[test]
+    fn retained_cancelled_acceptance_is_terminal_not_applied_without_replay() {
+        let (db, _entry) = acceptance_fixture();
+        insert_acceptance_operation(
+            &db,
+            AUTOMATION_TECHNICAL_REQUESTER_ID,
+            "accept-cancelled",
+            "cancelled",
+            Some(json!({
+                "operation_id":"op-accept-cancelled",
+                "outcome":"cancelled_before_effect",
+                "task_accepted":false
+            })),
+        );
+
+        let retained_state: String = db
+            .query_row(
+                "SELECT state FROM operations WHERE client_request_id='accept-cancelled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_state, "cancelled");
+
+        // Classify the retained row through the shared decoder and the real
+        // acceptance classifier rather than asserting on the raw state string.
+        let raw: String = db
+            .query_row(
+                "SELECT result_json FROM operations WHERE client_request_id='accept-cancelled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept-cancelled".to_owned(),
+            retained_state,
+            Some(raw),
+            None,
+            Some(2),
+        )
+        .expect("a cancelled acceptance row decodes");
+        let classified = json!(classify_retained_acceptance(retained, &json!({})));
+        assert_eq!(classified["status"], "acceptance_cancelled");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["coalesced"], false);
+
+        // No replacement row is created for the same semantic request.
+        assert_eq!(count_acceptance_operations(&db, "accept-cancelled"), 1);
+    }
+
+    /// A retained rejected acceptance keeps its own terminal disposition and is
+    /// never reported as task accepted.
+    #[test]
+    fn retained_rejected_acceptance_is_not_task_accepted() {
+        let (db, _entry) = acceptance_fixture();
+        insert_acceptance_operation(
+            &db,
+            AUTOMATION_TECHNICAL_REQUESTER_ID,
+            "accept-rejected",
+            "rejected",
+            Some(json!({
+                "operation_id":"op-accept-rejected",
+                "outcome":"rejected",
+                "code":"scope_denied",
+                "task_accepted":false
+            })),
+        );
+
+        let raw: String = db
+            .query_row(
+                "SELECT result_json FROM operations WHERE client_request_id='accept-rejected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept-rejected".to_owned(),
+            "rejected".to_owned(),
+            Some(raw),
+            None,
+            Some(2),
+        )
+        .expect("a rejected acceptance row decodes");
+        let classified = json!(classify_retained_acceptance(retained, &json!({})));
+        assert_eq!(classified["status"], "acceptance_rejected");
+        assert_eq!(classified["terminal_not_applied"], true);
+        assert_eq!(classified["task_accepted"], false);
+        assert_eq!(count_acceptance_operations(&db, "accept-rejected"), 1);
+    }
+
+    /// A retained unknown acceptance stays unresolved, requires readback, and never
+    /// authorizes a replay under the same semantic request ID.
+    #[test]
+    fn retained_unknown_acceptance_requires_readback_without_replay() {
+        let (db, _entry) = acceptance_fixture();
+        insert_acceptance_operation(
+            &db,
+            AUTOMATION_TECHNICAL_REQUESTER_ID,
+            "accept-unknown",
+            "outcome_unknown",
+            Some(json!({
+                "operation_id":"op-accept-unknown",
+                "outcome":"unknown",
+                "task_accepted":false
+            })),
+        );
+
+        let raw: String = db
+            .query_row(
+                "SELECT result_json FROM operations WHERE client_request_id='accept-unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept-unknown".to_owned(),
+            "outcome_unknown".to_owned(),
+            Some(raw),
+            Some(1),
+            None,
+        )
+        .expect("an unknown acceptance row decodes");
+        let classified = json!(classify_retained_acceptance(retained, &json!({})));
+        assert_eq!(classified["status"], "acceptance_readback_required");
+        assert_eq!(classified["readback_required"], true);
+        assert_eq!(count_acceptance_operations(&db, "accept-unknown"), 1);
+    }
+
+    /// An admission-shaped receipt without a validated current decision cannot
+    /// establish applied acceptance, even when the result names this Operation.
+    #[test]
+    fn unvalidated_admission_receipt_does_not_establish_acceptance() {
+        let (db, _entry) = acceptance_fixture();
+        insert_acceptance_operation(
+            &db,
+            AUTOMATION_TECHNICAL_REQUESTER_ID,
+            "accept-mismatch",
+            "settled",
+            Some(json!({
+                "operation_id":"op-accept-mismatch",
+                "outcome":"applied",
+                "task_accepted":true
+            })),
+        );
+
+        let raw: String = db
+            .query_row(
+                "SELECT result_json FROM operations WHERE client_request_id='accept-mismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept-mismatch".to_owned(),
+            "settled".to_owned(),
+            Some(raw),
+            None,
+            Some(2),
+        )
+        .expect("a settled acceptance row decodes");
+        // The effective-request receipt belongs to a different semantic Operation.
+        let effective = json!({"receipt":{"ok":true,"value":{
+            "operation_id":"op-some-other-operation",
+            "outcome":"applied",
+            "task_accepted":true
+        }}});
+        let classified = json!(classify_retained_acceptance(retained, &effective));
+        assert_eq!(classified["status"], "acceptance_not_applied");
+        assert_eq!(classified["task_accepted"], false);
+        assert_eq!(classified["receipt_identity_mismatch"], Value::Null);
+    }
+
+    /// A settled decision receipt naming this exact Operation is applied.
+    #[test]
+    fn settled_receipt_naming_this_operation_is_applied() {
+        let (db, _entry) = acceptance_fixture();
+        insert_acceptance_operation(
+            &db,
+            AUTOMATION_TECHNICAL_REQUESTER_ID,
+            "accept-applied",
+            "settled",
+            Some(json!({
+                "operation_id":"op-accept-applied",
+                "outcome":"applied",
+                "task_accepted":true
+            })),
+        );
+
+        let raw: String = db
+            .query_row(
+                "SELECT result_json FROM operations WHERE client_request_id='accept-applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained = ExistingAutomaticOperation::decode(
+            "op-accept-applied".to_owned(),
+            "settled".to_owned(),
+            Some(raw),
+            None,
+            Some(2),
+        )
+        .expect("a settled acceptance row decodes");
+        let classified = json!(classify_retained_acceptance(
+            retained,
+            &json!({"current":true,"invalidated":false})
+        ));
+        assert_eq!(classified["status"], "acceptance_applied");
+        assert_eq!(classified["task_accepted"], true);
+    }
 }

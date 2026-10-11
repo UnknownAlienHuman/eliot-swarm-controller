@@ -14,6 +14,7 @@ use crate::{
         PRIMARY_REVIEW_SLOT, ReviewCoverage, ReviewFindingsPackage, ReviewSlotIdentity,
         ReviewSubmitRequest, ReviewVerdict,
     },
+    store::{ExistingAutomaticOperation, ExistingAutomaticOperationLookup},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -127,15 +128,6 @@ pub(crate) struct CronExecutionContext {
     cause: AutomationCause,
 }
 
-struct CommittedManagedLabelOperationRow {
-    caller_id: String,
-    method: String,
-    task_id: Option<String>,
-    attempt_id: Option<String>,
-    original_request_json: String,
-    effective_request_json: String,
-}
-
 impl GithubProjectionContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_acceptance_observation(
@@ -210,43 +202,38 @@ impl GithubProjectionContext {
     /// on-behalf record. Current Manager/GM authority is checked separately
     /// immediately before an unsent effect; uncertain writes remain readback-only.
     pub(crate) fn from_committed_operation(db: &Connection, operation_id: &str) -> Result<Self> {
-        let row: Option<CommittedManagedLabelOperationRow> = db
-            .query_row(
-                "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
-                [operation_id],
-                |row| {
-                    Ok(CommittedManagedLabelOperationRow {
-                        caller_id: row.get(0)?,
-                        method: row.get(1)?,
-                        task_id: row.get(2)?,
-                        attempt_id: row.get(3)?,
-                        original_request_json: row.get(4)?,
-                        effective_request_json: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?;
-        let Some(row) = row else {
-            return Err(Error::new(
+        let retained = ExistingAutomaticOperation::load(
+            db,
+            ExistingAutomaticOperationLookup::OperationId(operation_id),
+        )?
+        .ok_or_else(|| {
+            Error::new(
                 "NOT_FOUND",
                 "automated managed-label Operation was not found",
-            ));
-        };
-        let CommittedManagedLabelOperationRow {
-            caller_id,
-            method,
-            task_id,
-            attempt_id,
-            original_request_json: original_json,
-            effective_request_json: effective_json,
-        } = row;
-        if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID || method != GITHUB_PROJECTION_ACTION {
+            )
+        })?;
+        Self::from_existing_operation(db, &retained)
+    }
+
+    /// Rehydrate from the row already decoded by a Store consumer so the exact
+    /// effect Operation JSON is parsed only at the Store loader boundary.
+    pub(crate) fn from_existing_operation(
+        db: &Connection,
+        retained: &ExistingAutomaticOperation,
+    ) -> Result<Self> {
+        let operation_id = retained.operation_id.as_str();
+        if retained.caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+            || retained.method != GITHUB_PROJECTION_ACTION
+            || !retained.has_unbound_execution_scope()
+            || retained.original_request_json != model::canonical(&retained.original_request)?
+            || retained.effective_request_json != model::canonical(&retained.effective_request)?
+        {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
-                "Operation is not the retained internal managed-label action",
+                "managed-label Operation identity, request bytes, or execution scope is invalid",
             ));
         }
-        let link = operation_link(db, operation_id)?.ok_or_else(|| {
+        let link = operation_link_for_existing(db, retained)?.ok_or_else(|| {
             Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "managed-label Operation has no retained on-behalf attribution",
@@ -261,29 +248,25 @@ impl GithubProjectionContext {
             })?;
         let mut context = Self::from_link(&link, cause);
         context.committed_operation_id = Some(operation_id.to_owned());
-        let effective: Value = serde_json::from_str(&effective_json).map_err(|_| {
-            Error::new(
-                "AUTOMATION_LINK_CORRUPT",
-                "managed-label effective request is invalid",
-            )
-        })?;
-        model::fields(&effective, &["automation_on_behalf", "receipt"]).map_err(|_| {
+        let effective = &retained.effective_request;
+        model::fields(effective, &["automation_on_behalf", "receipt"]).map_err(|_| {
             Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "managed-label effective request has unexpected fields",
             )
         })?;
         if effective["automation_on_behalf"] != context.linkage_value()
-            || task_id.as_deref() != Some(context.task_id.as_str())
-            || attempt_id.as_deref() != Some(context.attempt_id.as_str())
+            || retained.client_request_id
+                != model::text(&retained.original_request, "client_request_id")?
+            || retained.task_id.as_deref() != Some(context.task_id.as_str())
+            || retained.attempt_id.as_deref() != Some(context.attempt_id.as_str())
         {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "managed-label Operation differs from its exact on-behalf cause",
             ));
         }
-        let request_value: Value = serde_json::from_str(&original_json)?;
-        let request = ManagedLabelRequest::parse(&request_value)?;
+        let request = ManagedLabelRequest::parse(&retained.original_request)?;
         context.require_request_matches(&request)?;
         let index_key = config::entry_operation_key(
             &context.effective_manager_id,
@@ -1715,6 +1698,21 @@ pub(crate) fn operation_link(
     db: &Connection,
     operation_id: &str,
 ) -> Result<Option<OnBehalfOperationLink>> {
+    operation_link_inner(db, operation_id, None)
+}
+
+fn operation_link_for_existing(
+    db: &Connection,
+    retained: &ExistingAutomaticOperation,
+) -> Result<Option<OnBehalfOperationLink>> {
+    operation_link_inner(db, &retained.operation_id, Some(retained))
+}
+
+fn operation_link_inner(
+    db: &Connection,
+    operation_id: &str,
+    retained_operation: Option<&ExistingAutomaticOperation>,
+) -> Result<Option<OnBehalfOperationLink>> {
     let key = config::operation_link_key(operation_id)?;
     let Some(value) = config::read_record(db, &key, "on-behalf operation link")? else {
         return Ok(None);
@@ -1755,16 +1753,44 @@ pub(crate) fn operation_link(
             "on-behalf operation link identity is invalid",
         ));
     }
-    let operation: Option<(String, String)> = db
-        .query_row(
-            "SELECT caller_id,method FROM operations WHERE operation_id=?1",
-            [operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    let loaded_operation = if matches!(
+        link.action.as_str(),
+        "forge.publish_ref" | GITHUB_PROJECTION_ACTION
+    ) && retained_operation.is_none()
+    {
+        Some(
+            ExistingAutomaticOperation::load(
+                db,
+                ExistingAutomaticOperationLookup::OperationId(operation_id),
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "linked effect Operation is missing",
+                )
+            })?,
         )
-        .optional()?;
-    if !operation.is_some_and(|(caller, method)| {
-        caller == link.technical_requester_id && method == expected_method
-    }) {
+    } else {
+        None
+    };
+    let retained_operation = retained_operation.or(loaded_operation.as_ref());
+    let operation_matches = if let Some(operation) = retained_operation {
+        operation.operation_id == operation_id
+            && operation.caller_id == link.technical_requester_id
+            && operation.method == expected_method
+    } else {
+        let operation: Option<(String, String)> = db
+            .query_row(
+                "SELECT caller_id,method FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        operation.is_some_and(|(caller, method)| {
+            caller == link.technical_requester_id && method == expected_method
+        })
+    };
+    if !operation_matches {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
             "linked Operation was not admitted by the recorded technical requester",
@@ -1775,9 +1801,21 @@ pub(crate) fn operation_link(
     } else if link.action == "task.accept" {
         validate_acceptance_link(db, &link)?;
     } else if link.action == "forge.publish_ref" {
-        validate_publication_link(db, &link)?;
+        let retained_operation = retained_operation.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "linked publication Operation is missing",
+            )
+        })?;
+        validate_publication_link(db, &link, retained_operation)?;
     } else if link.action == GITHUB_PROJECTION_ACTION {
-        validate_github_projection_link(db, &link)?;
+        let retained_operation = retained_operation.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "linked managed-label Operation is missing",
+            )
+        })?;
+        validate_github_projection_link(db, &link, retained_operation)?;
     } else if link.action == "check.run" {
         validate_cron_check_run_link(db, &link)?;
     } else if matches!(link.action.as_str(), "agent.goal" | "agent.send")
@@ -3607,15 +3645,6 @@ fn validate_acceptance_review_pass(
     Ok(())
 }
 
-struct PublicationOperationRow {
-    caller_id: String,
-    method: String,
-    task_id: Option<String>,
-    attempt_id: Option<String>,
-    original_request_json: String,
-    effective_request_json: String,
-}
-
 struct AcceptedSourceOperationRow {
     method: String,
     state: String,
@@ -3639,17 +3668,11 @@ struct PublicationAttemptSubjectRow {
     candidate_ref: Option<String>,
 }
 
-struct GithubProjectionOperationRow {
-    caller_id: String,
-    method: String,
-    task_id: Option<String>,
-    attempt_id: Option<String>,
-    original_request_json: String,
-    effective_request_json: String,
-    result_json: Option<String>,
-}
-
-fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+fn validate_github_projection_link(
+    db: &Connection,
+    link: &OnBehalfOperationLink,
+    retained: &ExistingAutomaticOperation,
+) -> Result<()> {
     let corrupt = || {
         Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -3681,42 +3704,12 @@ fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink
         &cause.operation_id,
     )
     .map_err(|_| corrupt())?;
-    let operation: Option<GithubProjectionOperationRow> = db
-        .query_row(
-            "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json,result_json FROM operations WHERE operation_id=?1",
-            [&link.operation_id],
-            |row| {
-                Ok(GithubProjectionOperationRow {
-                    caller_id: row.get(0)?,
-                    method: row.get(1)?,
-                    task_id: row.get(2)?,
-                    attempt_id: row.get(3)?,
-                    original_request_json: row.get(4)?,
-                    effective_request_json: row.get(5)?,
-                    result_json: row.get(6)?,
-                })
-            },
-        )
-        .optional()?;
-    let Some(operation) = operation else {
-        return Err(corrupt());
-    };
-    let GithubProjectionOperationRow {
-        caller_id,
-        method,
-        task_id,
-        attempt_id,
-        original_request_json: original_json,
-        effective_request_json: effective_json,
-        result_json,
-    } = operation;
-    let request_value: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
-    let request = ManagedLabelRequest::parse(&request_value).map_err(|_| corrupt())?;
+    let request = ManagedLabelRequest::parse(&retained.original_request).map_err(|_| corrupt())?;
     GithubProjectionContext::from_link(link, cause.clone())
         .require_request_matches(&request)
         .map_err(|_| corrupt())?;
-    let effective: Value = serde_json::from_str(&effective_json).map_err(|_| corrupt())?;
-    model::fields(&effective, &["automation_on_behalf", "receipt"]).map_err(|_| corrupt())?;
+    let effective = &retained.effective_request;
+    model::fields(effective, &["automation_on_behalf", "receipt"]).map_err(|_| corrupt())?;
     let expected_linkage = json!({
         "schema_version":link.schema_version,
         "technical_requester_id":link.technical_requester_id,
@@ -3729,10 +3722,19 @@ fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink
     });
     let receipt = &effective["receipt"];
     model::fields(receipt, &["ok", "value"]).map_err(|_| corrupt())?;
-    if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
-        || method != GITHUB_PROJECTION_ACTION
-        || task_id.as_deref() != Some(cause.task_id.as_str())
-        || attempt_id.as_deref() != Some(cause.attempt_id.as_str())
+    if retained.operation_id != link.operation_id
+        || retained.caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || retained.method != GITHUB_PROJECTION_ACTION
+        || !retained.has_unbound_execution_scope()
+        || retained.client_request_id
+            != model::text(&retained.original_request, "client_request_id")
+                .map_err(|_| corrupt())?
+        || retained.original_request_json
+            != model::canonical(&retained.original_request).map_err(|_| corrupt())?
+        || retained.effective_request_json
+            != model::canonical(&retained.effective_request).map_err(|_| corrupt())?
+        || retained.task_id.as_deref() != Some(cause.task_id.as_str())
+        || retained.attempt_id.as_deref() != Some(cause.attempt_id.as_str())
         || candidate.accepted_operation_id != cause.operation_id
         || candidate.project_id != link.project_id
         || candidate.task_id != cause.task_id
@@ -3764,16 +3766,17 @@ fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink
     {
         return Err(corrupt());
     }
-    if let Some(result_raw) = result_json {
-        let result: Value = serde_json::from_str(&result_raw).map_err(|_| corrupt())?;
-        if result["operation_id"] != link.operation_id {
-            return Err(corrupt());
-        }
-    }
+    // The link proves immutable admission scope. Generic cancellation stores
+    // its own result shape; effect consumers validate current lifecycle and
+    // result evidence separately before treating the slot as applied.
     Ok(())
 }
 
-fn validate_publication_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+fn validate_publication_link(
+    db: &Connection,
+    link: &OnBehalfOperationLink,
+    retained: &ExistingAutomaticOperation,
+) -> Result<()> {
     let corrupt = || {
         Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -3960,33 +3963,10 @@ fn validate_publication_link(db: &Connection, link: &OnBehalfOperationLink) -> R
         Some(_) => return Err(corrupt()),
     }
 
-    let publication_operation: Option<PublicationOperationRow> = db
-        .query_row(
-            "SELECT caller_id,method,task_id,attempt_id,original_request_json, \
-                    effective_request_json \
-             FROM operations WHERE operation_id=?1",
-            [&link.operation_id],
-            |row| {
-                Ok(PublicationOperationRow {
-                    caller_id: row.get(0)?,
-                    method: row.get(1)?,
-                    task_id: row.get(2)?,
-                    attempt_id: row.get(3)?,
-                    original_request_json: row.get(4)?,
-                    effective_request_json: row.get(5)?,
-                })
-            },
-        )
-        .optional()?;
-    let Some(publication_operation) = publication_operation else {
-        return Err(corrupt());
-    };
-    let request_value: Value = serde_json::from_str(&publication_operation.original_request_json)
+    let request = crate::forge::PublishRefRequest::parse(&retained.original_request)
         .map_err(|_| corrupt())?;
-    let request = crate::forge::PublishRefRequest::parse(&request_value).map_err(|_| corrupt())?;
-    let effective: Value = serde_json::from_str(&publication_operation.effective_request_json)
-        .map_err(|_| corrupt())?;
-    crate::store::validate_publication_effective_request(&effective).map_err(|_| corrupt())?;
+    let effective = &retained.effective_request;
+    crate::store::validate_publication_effective_request(effective).map_err(|_| corrupt())?;
     let saved_linkage = effective
         .get("automation_on_behalf")
         .filter(|value| value.is_object())
@@ -4019,10 +3999,19 @@ fn validate_publication_link(db: &Connection, link: &OnBehalfOperationLink) -> R
     intent.validate().map_err(|_| corrupt())?;
     let gm_epoch = cause["gm_epoch"].as_i64().ok_or_else(corrupt)?;
     let policy_revision = cause["policy_revision"].as_str().ok_or_else(corrupt)?;
-    if publication_operation.caller_id != link.technical_requester_id
-        || publication_operation.method != "forge.publish_ref"
-        || publication_operation.task_id.as_deref() != Some(accepted_task_id)
-        || publication_operation.attempt_id.as_deref() != Some(attempt_id)
+    if retained.operation_id != link.operation_id
+        || retained.caller_id != link.technical_requester_id
+        || retained.method != "forge.publish_ref"
+        || !retained.has_unbound_execution_scope()
+        || retained.client_request_id
+            != model::text(&retained.original_request, "client_request_id")
+                .map_err(|_| corrupt())?
+        || retained.original_request_json
+            != model::canonical(&retained.original_request).map_err(|_| corrupt())?
+        || retained.effective_request_json
+            != model::canonical(&retained.effective_request).map_err(|_| corrupt())?
+        || retained.task_id.as_deref() != Some(accepted_task_id)
+        || retained.attempt_id.as_deref() != Some(attempt_id)
         || saved_linkage != &expected_linkage
         || request.accepted_operation_id != accepted_operation_id
         || request.attempt_id != attempt_id
