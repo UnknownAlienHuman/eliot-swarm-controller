@@ -1,5 +1,19 @@
 # Current-source audit and implementation ledger
 
+The [Claude journal and failed-prepare repair](../2026-10-11/CLAUDE-JOURNAL-LIFECYCLE-EVIDENCE.json)
+removes only a validated stable torn suffix, preserves the saved outcome and
+complete corrupt bytes, and advances independent outbox/callback work without
+native replay or fabricated ACK. One shared item-damage classifier keeps actual
+file-open/read failures hard; ordinary journal reads use a cap-plus-one bound.
+Failed SDK prepare emits one Unknown and retires its Node generation; Rust clears
+the current root/snapshot, resolves saved intents once and retires callbacks.
+Strict production Clippy and all four selected regressions pass on Windows/Linux.
+The Windows fixture also crosses a real denied-open boundary. The Node fake-SDK
+bridge selftest passes. These fixtures do not execute the Rust run_owned process
+loop or prove parent-owned family departure. Exited/stdout diagnostic ordering
+can still yield a generic exit reason. Installed/native/crash/load qualification
+remains pending; initial failed receipts are retained.
+
 The [OpenCode torn-ACK recovery repair](../2026-10-11/OPENCODE-TORN-ACK-RECOVERY.json)
 removes only a bounded, stable unterminated suffix after validating the exact
 saved-outcome prefix. It never fabricates an ACK or replays native input. The
@@ -8,7 +22,8 @@ past the batch limit while preserving complete corrupt bytes. Shared opened-file
 identity uses stable platform APIs; validated readers close before Windows
 write-through replacement. Strict production Clippy and the connected drain and
 file-identity cases pass on Windows/Linux. Initial failed receipts are retained.
-Claude follow-up and full installed/native/crash/load qualification remain pending.
+Claude source follow-up is recorded above; full installed/native/crash/load
+qualification remains pending.
 
 The [Issue #115 aggregate quiescence repair](../2026-10-11/ISSUE-115-QUIESCENCE-EVIDENCE.json)
 releases the historical Unknown hold only after exact worker departure and

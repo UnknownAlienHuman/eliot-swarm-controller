@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use swarm_contracts::{
@@ -442,7 +442,7 @@ impl OperationJournal {
 
     pub fn acknowledge(&self, operation_id: &str, outcome: &Value) -> Result<()> {
         let digest = digest_json(outcome)?;
-        let current = self
+        let mut current = self
             .get(operation_id)?
             .ok_or_else(|| Error::new("ADAPTER_OUTBOX", "acknowledged operation is missing"))?;
         if current.compacted {
@@ -462,6 +462,17 @@ impl OperationJournal {
                 "ADAPTER_OUTBOX",
                 "host acknowledgement differs from the exact saved outcome",
             ));
+        }
+        if current.torn_tail_evidence.is_some() {
+            if !self.repair_torn_acknowledgement(operation_id, outcome)? {
+                return Err(torn_ack_recovery_unknown());
+            }
+            current = self.get(operation_id)?.ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_OUTBOX",
+                    "repaired operation acknowledgement disappeared",
+                )
+            })?;
         }
         self.enqueue_cleanup(operation_id, &digest)?;
         self.ensure_outbox_entry(operation_id, Some(digest.clone()))?;
@@ -494,6 +505,71 @@ impl OperationJournal {
         self.finalize_acknowledged(operation_id, &digest)
     }
 
+    fn repair_torn_acknowledgement(&self, operation_id: &str, outcome: &Value) -> Result<bool> {
+        let digest = digest_json(outcome)?;
+        let path = self.path(operation_id)?;
+        ensure_regular(&path).map_err(|_| torn_ack_recovery_unknown())?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        let bytes = read_opened_file_for_repair(&path, &mut file)?;
+        let opened_state = read_operation_state_bytes(&bytes, &path, Some(operation_id))
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        let Some(evidence) = opened_state.torn_tail_evidence.as_ref() else {
+            return Ok(false);
+        };
+        let acknowledged_sha256 = opened_state.acknowledged_sha256.clone();
+        if opened_state.operation_id != operation_id
+            || opened_state.outcome.as_ref() != Some(outcome)
+            || opened_state.outcome_sha256.as_deref() != Some(digest.as_str())
+            || acknowledged_sha256
+                .as_deref()
+                .is_some_and(|saved| saved != digest)
+        {
+            return Err(torn_ack_recovery_unknown());
+        }
+
+        let prefix_bytes = evidence.valid_prefix_bytes;
+        let Some(tail_end) = prefix_bytes.checked_add(evidence.tail_bytes) else {
+            return Err(torn_ack_recovery_unknown());
+        };
+        if evidence.tail_bytes == 0 || tail_end != bytes.len() || prefix_bytes >= bytes.len() {
+            return Err(torn_ack_recovery_unknown());
+        }
+        let repaired_bytes = bytes[..prefix_bytes].to_vec();
+        let opened_metadata = file.metadata().map_err(|_| torn_ack_recovery_unknown())?;
+        if repaired_bytes.len() as u64 > MAX_STATE_BYTES
+            || opened_metadata.len() != bytes.len() as u64
+            || !opened_file_matches_path(&file, &path)
+        {
+            return Err(torn_ack_recovery_unknown());
+        }
+        // Close the validated reader before Windows write-through replacement;
+        // the adapter's single-owner scope remains retained.
+        drop(file);
+        replace_private_durable(&path, &repaired_bytes).map_err(|_| torn_ack_recovery_unknown())?;
+
+        ensure_regular(&path).map_err(|_| torn_ack_recovery_unknown())?;
+        let mut repaired_file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        let verified_bytes = read_opened_file_for_repair(&path, &mut repaired_file)?;
+        let verified_state = read_operation_state_bytes(&verified_bytes, &path, Some(operation_id))
+            .map_err(|_| torn_ack_recovery_unknown())?;
+        if verified_bytes != repaired_bytes
+            || verified_state.torn_tail_evidence.is_some()
+            || verified_state.operation_id != operation_id
+            || verified_state.outcome.as_ref() != Some(outcome)
+            || verified_state.outcome_sha256.as_deref() != Some(digest.as_str())
+            || verified_state.acknowledged_sha256 != acknowledged_sha256
+        {
+            return Err(torn_ack_recovery_unknown());
+        }
+        Ok(true)
+    }
+
     pub fn pending_outcomes(&self) -> Result<Vec<OperationState>> {
         self.process_cleanup_batch(MAX_CURSOR_STEPS)?;
         let mut pending = Vec::new();
@@ -516,7 +592,7 @@ impl OperationJournal {
                     continue;
                 }
             };
-            let operation = match self.get(&entry.operation_id) {
+            let mut operation = match self.get(&entry.operation_id) {
                 Ok(Some(operation)) if operation.operation_key == entry.operation_key => operation,
                 Ok(Some(_)) => {
                     self.note_deferred_damage()?;
@@ -557,6 +633,42 @@ impl OperationJournal {
                 self.advance_outbox_cursor_past(sequence)?;
                 continue;
             }
+            if operation.torn_tail_evidence.is_some() {
+                match self.repair_torn_acknowledgement(&operation.operation_id, outcome) {
+                    Ok(true) => {
+                        operation = match self.get(&entry.operation_id)? {
+                            Some(operation) if operation.operation_key == entry.operation_key => {
+                                operation
+                            }
+                            _ => {
+                                self.note_deferred_damage()?;
+                                self.defer_outbox_item(&entry, None)?;
+                                self.advance_outbox_cursor_past(sequence)?;
+                                continue;
+                            }
+                        };
+                    }
+                    Ok(false) => {
+                        self.note_deferred_damage()?;
+                        self.defer_outbox_item(&entry, None)?;
+                        self.advance_outbox_cursor_past(sequence)?;
+                        continue;
+                    }
+                    Err(error) if error.code == "ADAPTER_JOURNAL_RECOVERY_UNKNOWN" => {
+                        self.note_deferred_damage()?;
+                        self.defer_outbox_item(&entry, None)?;
+                        self.advance_outbox_cursor_past(sequence)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let outcome = operation.outcome.as_ref().ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_OUTBOX",
+                    "pending outcome disappeared during recovery",
+                )
+            })?;
             if operation.acknowledged_sha256 == operation.outcome_sha256 {
                 match outcome["outcome"].as_str() {
                     Some("unknown") => self.note_deferred_unknown()?,
@@ -600,16 +712,21 @@ impl OperationJournal {
                 continue;
             }
             ensure_regular(&path)?;
-            let name = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| Error::new("ADAPTER_JOURNAL", "operation filename is invalid"))?;
-            let state = self.read_path(&path, None)?;
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                self.note_deferred_damage()?;
+                continue;
+            };
+            let state = match self.read_path(&path, None) {
+                Ok(state) => state,
+                Err(error) if is_item_local_operation_damage(&error) => {
+                    self.note_deferred_damage()?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if !state.operation_id.is_empty() && hex_digest(state.operation_id.as_bytes()) != name {
-                return Err(Error::new(
-                    "ADAPTER_JOURNAL",
-                    "operation filename does not match its identity",
-                ));
+                self.note_deferred_damage()?;
+                continue;
             }
             if (state.receipt.is_some() && state.outcome.is_none())
                 || state.torn_tail_evidence.is_some()
@@ -2255,50 +2372,97 @@ impl OperationJournal {
         let mut file = File::open(path)
             .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record cannot be read"))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        Read::by_ref(&mut file)
+            .take(MAX_STATE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
             .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record read failed"))?;
-        let mut state = OperationState {
-            operation_key: path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| Error::new("ADAPTER_JOURNAL", "operation filename is invalid"))?
-                .to_owned(),
-            operation_id: expected_operation_id.unwrap_or_default().to_owned(),
-            ..OperationState::default()
-        };
-        // File I/O is complete before this pure, in-memory domain decoder
-        // runs; no Store call can be misclassified as damaged journal data.
-        let verdict = scan_jsonl(&bytes, MAX_RECORD_BYTES, |_, frame| {
-            let record: JournalRecord = serde_json::from_slice(&frame[..frame.len() - 1])
-                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record is invalid"))?;
-            apply_record(&mut state, record)
-        })?;
-        match verdict {
-            JsonlScanVerdict::Complete { .. } => {}
-            JsonlScanVerdict::TornLastFrame {
-                valid_bytes,
-                tail_digest,
-                tail_bytes,
-                ..
-            } => {
-                state.torn_tail_evidence = Some(TornTailEvidence {
-                    valid_prefix_bytes: valid_bytes,
-                    tail_sha256: tail_digest,
-                    tail_bytes,
-                });
-            }
-            JsonlScanVerdict::Damaged {
-                valid_prefix_bytes,
-                reason,
-            } => {
-                return Err(Error::new(
-                    "ADAPTER_JOURNAL",
-                    format!("operation record damaged at byte {valid_prefix_bytes}: {reason:?}"),
-                ));
-            }
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                "operation record must be a bounded regular file",
+            ));
         }
-        Ok(state)
+        read_operation_state_bytes(&bytes, path, expected_operation_id)
     }
+}
+
+pub(crate) fn is_item_local_operation_damage(error: &Error) -> bool {
+    match error.code.as_str() {
+        "ADAPTER_JOURNAL" => {
+            matches!(
+                error.message.as_str(),
+                "operation identity is invalid"
+                    | "operation record must be a bounded regular file"
+                    | "operation record is invalid"
+                    | "operation record identity changed"
+                    | "intent receipt is missing"
+                    | "intent method is missing"
+                    | "intent marker is missing"
+                    | "intent receipt is invalid"
+                    | "operation intent conflicts with its saved identity"
+                    | "saved outcome is missing"
+                    | "outcome lacks its exact saved intent"
+                    | "saved outcome digest or identity changed"
+                    | "saved outcome changed its durable outbox sequence"
+                    | "acknowledgement digest is missing"
+                    | "acknowledgement differs from the exact saved outcome"
+                    | "unknown operation record kind"
+            ) || error
+                .message
+                .starts_with("operation record damaged at byte ")
+        }
+        "ADAPTER_RETENTION_MARKER_MISMATCH" => true,
+        "ADAPTER_RETENTION_STATE" => error.message == "retention evidence is malformed",
+        _ => false,
+    }
+}
+
+fn read_operation_state_bytes(
+    bytes: &[u8],
+    path: &Path,
+    expected_operation_id: Option<&str>,
+) -> Result<OperationState> {
+    let mut state = OperationState {
+        operation_key: path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| Error::new("ADAPTER_JOURNAL", "operation filename is invalid"))?
+            .to_owned(),
+        operation_id: expected_operation_id.unwrap_or_default().to_owned(),
+        ..OperationState::default()
+    };
+    // File I/O is complete before this pure, in-memory domain decoder runs;
+    // no Store call can be misclassified as damaged journal data.
+    let verdict = scan_jsonl(bytes, MAX_RECORD_BYTES, |_, frame| {
+        let record: JournalRecord = serde_json::from_slice(&frame[..frame.len() - 1])
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record is invalid"))?;
+        apply_record(&mut state, record)
+    })?;
+    match verdict {
+        JsonlScanVerdict::Complete { .. } => {}
+        JsonlScanVerdict::TornLastFrame {
+            valid_bytes,
+            tail_digest,
+            tail_bytes,
+            ..
+        } => {
+            state.torn_tail_evidence = Some(TornTailEvidence {
+                valid_prefix_bytes: valid_bytes,
+                tail_sha256: tail_digest,
+                tail_bytes,
+            });
+        }
+        JsonlScanVerdict::Damaged {
+            valid_prefix_bytes,
+            reason,
+        } => {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                format!("operation record damaged at byte {valid_prefix_bytes}: {reason:?}"),
+            ));
+        }
+    }
+    Ok(state)
 }
 
 fn apply_record(state: &mut OperationState, record: JournalRecord) -> Result<()> {
@@ -2681,6 +2845,59 @@ fn ensure_regular(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn torn_ack_recovery_unknown() -> Error {
+    Error::new(
+        "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+        "torn journal suffix could not be safely removed from the exact saved outcome prefix",
+    )
+}
+
+fn read_opened_file_for_repair(path: &Path, file: &mut File) -> Result<Vec<u8>> {
+    if !opened_file_matches_path(file, path) {
+        return Err(torn_ack_recovery_unknown());
+    }
+    let initial_metadata = file.metadata().map_err(|_| torn_ack_recovery_unknown())?;
+    if initial_metadata.len() > MAX_STATE_BYTES {
+        return Err(torn_ack_recovery_unknown());
+    }
+
+    let mut bytes = Vec::new();
+    Read::by_ref(file)
+        .take(MAX_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| torn_ack_recovery_unknown())?;
+    if bytes.len() as u64 > MAX_STATE_BYTES || initial_metadata.len() != bytes.len() as u64 {
+        return Err(torn_ack_recovery_unknown());
+    }
+    if !opened_file_matches_path(file, path) {
+        return Err(torn_ack_recovery_unknown());
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| torn_ack_recovery_unknown())?;
+    let mut confirmed_bytes = Vec::new();
+    Read::by_ref(file)
+        .take(MAX_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut confirmed_bytes)
+        .map_err(|_| torn_ack_recovery_unknown())?;
+    let final_metadata = file.metadata().map_err(|_| torn_ack_recovery_unknown())?;
+    if confirmed_bytes != bytes
+        || confirmed_bytes.len() as u64 > MAX_STATE_BYTES
+        || final_metadata.len() != bytes.len() as u64
+        || !opened_file_matches_path(file, path)
+    {
+        return Err(torn_ack_recovery_unknown());
+    }
+    Ok(bytes)
+}
+
+fn opened_file_matches_path(file: &File, path: &Path) -> bool {
+    if ensure_regular(path).is_err() {
+        return false;
+    }
+    swarm_process::opened_regular_file_matches_path(file, path).unwrap_or(false)
+}
+
 fn read_limited(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let file = File::open(path)
         .map_err(|_| Error::new("ADAPTER_STATE", "state identity cannot be read"))?;
@@ -2710,6 +2927,7 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
 mod recovery_tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
 
     #[test]
     fn lost_result_ack_recovery_retains_exact_intent_and_never_allows_native_replay() {
@@ -2785,6 +3003,153 @@ mod recovery_tests {
         );
         journal.acknowledge("result-operation", &unknown).unwrap();
         assert!(journal.pending_outcomes().unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_outcomes_discards_torn_suffix_without_ack_then_advances_past_corruption() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-torn-ack-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let make_receipt = |operation_id: &str| -> ModuleReceiptIdentity {
+            let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+                "schema_version":1,"module_id":"eliot.claude",
+                "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+                "protocol":{"major":1,"minor":0},"binding_id":"binding-torn-ack",
+                "binding_generation":1,"operation_id":operation_id,"input_sha256":"c".repeat(64)
+            }))
+            .unwrap();
+            receipt.validate().unwrap();
+            receipt
+        };
+        let acknowledged = json!({
+            "operation_id":"acknowledged-operation","outcome":"unknown",
+            "details":{"reason":"FIXTURE_ACK_RECOVERY"}
+        });
+        let unproved = json!({
+            "operation_id":"unproved-operation","outcome":"unknown",
+            "details":{"reason":"FIXTURE_ACK_RECOVERY"}
+        });
+        let unrelated = json!({
+            "operation_id":"unrelated-operation","outcome":"unknown",
+            "details":{"reason":"FIXTURE_ACK_RECOVERY"}
+        });
+        let journal = OperationJournal::open(
+            &root,
+            "binding-torn-ack",
+            1,
+            "fixture-scope",
+            &"c".repeat(64),
+        )
+        .unwrap();
+        for (operation_id, outcome) in [
+            ("acknowledged-operation", &acknowledged),
+            ("unproved-operation", &unproved),
+            ("unrelated-operation", &unrelated),
+        ] {
+            let receipt = make_receipt(operation_id);
+            let intent = json!({"kind":"result","target_operation_id":"dispatch-operation"});
+            journal
+                .write_intent(operation_id, &receipt, "agent.result", &intent)
+                .unwrap();
+            journal.save_outcome_value(operation_id, outcome).unwrap();
+        }
+
+        let acknowledged_path = journal.path("acknowledged-operation").unwrap();
+        let acknowledged_prefix = std::fs::read(&acknowledged_path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&acknowledged_path)
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+
+        let unproved_path = journal.path("unproved-operation").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&unproved_path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        let unproved_corrupt_bytes = std::fs::read(&unproved_path).unwrap();
+        drop(journal);
+
+        let journal = OperationJournal::open(
+            &root,
+            "binding-torn-ack",
+            1,
+            "fixture-scope",
+            &"c".repeat(64),
+        )
+        .unwrap();
+        journal.recover_uncertain().unwrap();
+        let pending = journal.pending_outcomes().unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|operation| operation.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acknowledged-operation"]
+        );
+        assert_eq!(
+            std::fs::read(&acknowledged_path).unwrap(),
+            acknowledged_prefix
+        );
+        let acknowledged_state = journal.get("acknowledged-operation").unwrap().unwrap();
+        assert!(acknowledged_state.torn_tail_evidence.is_none());
+        assert!(acknowledged_state.acknowledged_sha256.is_none());
+        assert!(!acknowledged_state.native_replay_permitted());
+
+        let host_response = json!({"recorded":true});
+        assert_eq!(host_response["recorded"], true);
+        journal
+            .acknowledge("acknowledged-operation", &acknowledged)
+            .unwrap();
+        let digest = digest_json(&acknowledged).unwrap();
+        let ack_record = JournalRecord {
+            version: 1,
+            operation_id: "acknowledged-operation".to_owned(),
+            kind: "acknowledged".to_owned(),
+            receipt: None,
+            method: None,
+            intent: None,
+            outcome: None,
+            digest: Some(digest.clone()),
+            outbox_sequence: None,
+        };
+        let mut expected_acknowledged_bytes = acknowledged_prefix;
+        expected_acknowledged_bytes.extend_from_slice(&serde_json::to_vec(&ack_record).unwrap());
+        expected_acknowledged_bytes.push(b'\n');
+        assert_eq!(
+            std::fs::read(&acknowledged_path).unwrap(),
+            expected_acknowledged_bytes
+        );
+        let acknowledged_state = journal.get("acknowledged-operation").unwrap().unwrap();
+        assert_eq!(
+            acknowledged_state.acknowledged_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(!acknowledged_state.native_replay_permitted());
+
+        let pending = journal.pending_outcomes().unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|operation| operation.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unrelated-operation"]
+        );
+        assert_eq!(
+            std::fs::read(&unproved_path).unwrap(),
+            unproved_corrupt_bytes
+        );
+        assert_eq!(
+            journal.get("unproved-operation").unwrap_err().code,
+            "ADAPTER_JOURNAL"
+        );
+
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -4,7 +4,7 @@
 //! and reply transitions. The live callback itself remains owned by the SDK
 //! bridge; this journal never authorizes replay after an uncertain delivery.
 
-use crate::journal::{OperationJournal, digest_bytes, digest_json};
+use crate::journal::{OperationJournal, digest_bytes, digest_json, is_item_local_operation_damage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -179,6 +179,40 @@ enum InteractionRetentionDecision {
     Unacknowledged,
     Referenced,
     Damage,
+}
+
+fn is_item_local_interaction_damage(error: &Error) -> bool {
+    match error.code.as_str() {
+        "ADAPTER_INTERACTION_JOURNAL" => matches!(
+            error.message.as_str(),
+            "callback state file violates its type or size boundary"
+                | "callback state record is malformed"
+                | "callback state has inconsistent reply evidence"
+        ),
+        "ADAPTER_INTERACTION_IDENTITY" => matches!(
+            error.message.as_str(),
+            "callback state belongs to another binding or native scope"
+                | "callback request identity is invalid"
+        ),
+        "SDK_INTERACTION_SCHEMA" => {
+            error.message == "Claude SDK callback request violates its typed boundary"
+        }
+        "ADAPTER_INTERACTION_RETENTION" => matches!(
+            error.message.as_str(),
+            "interaction retention file violates its type or size boundary"
+                | "interaction retention file exceeds its size boundary"
+                | "interaction cursor item is malformed"
+                | "interaction cursor item identity is invalid"
+                | "callback compact marker is malformed"
+                | "callback compact marker identity or acknowledgement is invalid"
+        ),
+        _ => false,
+    }
+}
+
+fn interaction_damage_already_deferred(error: &Error) -> bool {
+    error.code == "ADAPTER_INTERACTION_RETENTION"
+        && error.message == "callback compact marker identity or acknowledgement is invalid"
 }
 
 pub struct InteractionJournal {
@@ -620,7 +654,15 @@ impl InteractionJournal {
                             "reply intent has no operation identity",
                         )
                     })?;
-                    if let Some(operation) = operations.get(operation_id)?
+                    let operation = match operations.get(operation_id) {
+                        Ok(operation) => operation,
+                        Err(error) if is_item_local_operation_damage(&error) => {
+                            self.note_deferred_damage()?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(operation) = operation
                         && let Some(outcome) = operation.outcome.as_ref()
                         && outcome["outcome"] == "applied"
                     {
@@ -651,7 +693,14 @@ impl InteractionJournal {
                             "reply intent has no operation identity",
                         )
                     })?;
-                    let operation = operations.get(operation_id)?;
+                    let operation = match operations.get(operation_id) {
+                        Ok(operation) => operation,
+                        Err(error) if is_item_local_operation_damage(&error) => {
+                            self.note_deferred_damage()?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     record.status = match operation.and_then(|state| state.outcome) {
                         Some(outcome) if outcome["outcome"] == "applied" => {
                             InteractionStatus::Acknowledged
@@ -695,9 +744,14 @@ impl InteractionJournal {
         operation_id: &str,
         operations: &OperationJournal,
     ) -> Result<()> {
-        let operation = match operations.get(operation_id)? {
-            Some(operation) if operation.method.as_deref() == Some("agent.reply") => operation,
-            _ => return Ok(()),
+        let operation = match operations.get(operation_id) {
+            Ok(Some(operation)) if operation.method.as_deref() == Some("agent.reply") => operation,
+            Ok(_) => return Ok(()),
+            Err(error) if is_item_local_operation_damage(&error) => {
+                self.note_deferred_damage()?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
         let Some(request_id) = operation
             .intent
@@ -708,18 +762,34 @@ impl InteractionJournal {
         else {
             return Ok(());
         };
-        let record_path = self.path(request_id)?;
+        let record_path = match self.path(request_id) {
+            Ok(path) => path,
+            Err(error) if is_item_local_interaction_damage(&error) => {
+                self.note_deferred_damage()?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if !record_path.exists() {
             let tombstone_path = self.tombstone_path(request_id)?;
             if tombstone_path.exists() {
-                let tombstone = self.read_tombstone(&tombstone_path, request_id)?;
+                let tombstone = match self.read_tombstone(&tombstone_path, request_id) {
+                    Ok(tombstone) => tombstone,
+                    Err(error) if is_item_local_interaction_damage(&error) => {
+                        if !interaction_damage_already_deferred(&error) {
+                            self.note_deferred_damage()?;
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
                 if tombstone.reply_operation_id != operation_id {
                     self.note_deferred_damage()?;
                 } else {
                     match self.operation_acknowledgement(
                         terminal_identity_from_tombstone(&tombstone),
                         operations,
-                    ) {
+                    )? {
                         InteractionRetentionDecision::Ready(digest)
                             if digest == tombstone.acknowledged_sha256 => {}
                         decision => self.note_retention_decision(decision)?,
@@ -732,10 +802,11 @@ impl InteractionJournal {
         }
         let record = match self.read_path(&record_path) {
             Ok(record) => record,
-            Err(_) => {
+            Err(error) if is_item_local_interaction_damage(&error) => {
                 self.note_deferred_damage()?;
                 return Ok(());
             }
+            Err(error) => return Err(error),
         };
         if record.reply_operation_id.as_deref() != Some(operation_id) {
             self.note_deferred_damage()?;
@@ -754,10 +825,15 @@ impl InteractionJournal {
             {
                 item
             }
-            _ => {
+            Ok(_) => {
                 self.note_deferred_damage()?;
                 return Ok(());
             }
+            Err(error) if is_item_local_interaction_damage(&error) => {
+                self.note_deferred_damage()?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
         self.process_retention_item(item.sequence, operations)
     }
@@ -786,20 +862,26 @@ impl InteractionJournal {
         }
         let item = match self.read_retention_item(&item_path) {
             Ok(item) if item.sequence == sequence => item,
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 self.note_deferred_damage()?;
                 return Ok(());
             }
+            Err(error) if is_item_local_interaction_damage(&error) => {
+                self.note_deferred_damage()?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
         let record_path = self.path(&item.request_id)?;
         let tombstone_path = self.tombstone_path(&item.request_id)?;
         if record_path.exists() {
             let record = match self.read_path(&record_path) {
                 Ok(record) => record,
-                Err(_) => {
+                Err(error) if is_item_local_interaction_damage(&error) => {
                     self.note_deferred_damage()?;
                     return Ok(());
                 }
+                Err(error) => return Err(error),
             };
             if record.sequence != Some(sequence)
                 || record.request.request_id != item.request_id
@@ -810,7 +892,7 @@ impl InteractionJournal {
                 return Ok(());
             }
             let acknowledged_sha256 =
-                match self.operation_acknowledgement(terminal_identity(&record), operations) {
+                match self.operation_acknowledgement(terminal_identity(&record), operations)? {
                     InteractionRetentionDecision::Ready(digest) => digest,
                     decision => {
                         self.note_retention_decision(decision)?;
@@ -848,13 +930,20 @@ impl InteractionJournal {
             {
                 tombstone
             }
-            _ => {
+            Ok(_) => {
                 self.note_deferred_damage()?;
                 return Ok(());
             }
+            Err(error) if is_item_local_interaction_damage(&error) => {
+                if !interaction_damage_already_deferred(&error) {
+                    self.note_deferred_damage()?;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
         match self
-            .operation_acknowledgement(terminal_identity_from_tombstone(&tombstone), operations)
+            .operation_acknowledgement(terminal_identity_from_tombstone(&tombstone), operations)?
         {
             InteractionRetentionDecision::Ready(acknowledged_sha256)
                 if acknowledged_sha256 == tombstone.acknowledged_sha256 =>
@@ -870,39 +959,43 @@ impl InteractionJournal {
         &self,
         identity: InteractionTerminalIdentity<'_>,
         operations: &OperationJournal,
-    ) -> InteractionRetentionDecision {
+    ) -> Result<InteractionRetentionDecision> {
         if !matches!(
             identity.status,
             InteractionStatus::Acknowledged | InteractionStatus::Rejected
         ) {
-            return match identity.status {
+            return Ok(match identity.status {
                 InteractionStatus::Unknown => InteractionRetentionDecision::Unknown,
                 _ => InteractionRetentionDecision::Unacknowledged,
-            };
+            });
         }
         let (Some(operation_id), Some(reply_sha256)) =
             (identity.reply_operation_id, identity.reply_sha256)
         else {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         };
         let operation = match operations.get(operation_id) {
             Ok(Some(operation)) => operation,
-            Ok(None) | Err(_) => return InteractionRetentionDecision::Damage,
+            Ok(None) => return Ok(InteractionRetentionDecision::Damage),
+            Err(error) if is_item_local_operation_damage(&error) => {
+                return Ok(InteractionRetentionDecision::Damage);
+            }
+            Err(error) => return Err(error),
         };
         let Some(outcome) = operation.outcome.as_ref() else {
-            return InteractionRetentionDecision::Unknown;
+            return Ok(InteractionRetentionDecision::Unknown);
         };
         let Some(outcome_sha256) = operation.outcome_sha256.as_deref() else {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         };
         if operation.acknowledged_sha256.as_deref() != Some(outcome_sha256) {
-            return InteractionRetentionDecision::Unacknowledged;
+            return Ok(InteractionRetentionDecision::Unacknowledged);
         }
         let Some(receipt) = operation.receipt.as_ref() else {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         };
         let Some(intent) = operation.intent.as_ref() else {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         };
         let native = &intent["native"];
         if operation.operation_id != operation_id
@@ -920,15 +1013,15 @@ impl InteractionJournal {
             || native["reply_sha256"] != reply_sha256
             || outcome["operation_id"] != operation_id
         {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         }
         let expected_outcome = match identity.status {
             InteractionStatus::Acknowledged => "applied",
             InteractionStatus::Rejected => "rejected",
-            _ => return InteractionRetentionDecision::Damage,
+            _ => return Ok(InteractionRetentionDecision::Damage),
         };
         if outcome["outcome"] == "unknown" || outcome["outcome"] == "accepted" {
-            return InteractionRetentionDecision::Unknown;
+            return Ok(InteractionRetentionDecision::Unknown);
         }
         if outcome["outcome"] != expected_outcome
             || (identity.status == InteractionStatus::Acknowledged
@@ -939,15 +1032,17 @@ impl InteractionJournal {
             || (identity.status == InteractionStatus::Rejected
                 && outcome["details"]["completion_condition"] != "rejected_before_native_admission")
         {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         }
         if !operation.compacted {
-            return InteractionRetentionDecision::Referenced;
+            return Ok(InteractionRetentionDecision::Referenced);
         }
         if !valid_sha256(outcome_sha256) {
-            return InteractionRetentionDecision::Damage;
+            return Ok(InteractionRetentionDecision::Damage);
         }
-        InteractionRetentionDecision::Ready(outcome_sha256.to_owned())
+        Ok(InteractionRetentionDecision::Ready(
+            outcome_sha256.to_owned(),
+        ))
     }
 
     fn note_retention_decision(&self, decision: InteractionRetentionDecision) -> Result<()> {
@@ -2157,4 +2252,234 @@ pub fn validate_reply(request: &InteractionRequest, reply: &Value) -> Result<()>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_regression_tests {
+    use super::*;
+    use serde_json::json;
+    use std::{fs::OpenOptions, io::Write};
+    use swarm_contracts::runtime::ModuleReceiptIdentity;
+
+    fn request(
+        journal: &InteractionJournal,
+        request_id: &str,
+        bridge_boot_id: &str,
+    ) -> InteractionRequest {
+        let input = json!({"command":"echo fixture"});
+        let request_sha256 = digest_json(&json!({
+            "schema_version":1,
+            "request_id":request_id,
+            "kind":"permission",
+            "tool_name":"Bash",
+                "input":input.clone()
+        }))
+        .unwrap();
+        journal
+            .record_request(InteractionRequestEvidence {
+                bridge_boot_id,
+                native_root_id: "fixture-root",
+                request_id,
+                kind: InteractionKind::Permission,
+                tool_name: "Bash",
+                input: &input,
+                request_sha256: &request_sha256,
+            })
+            .unwrap()
+    }
+
+    fn write_operation(
+        operations: &OperationJournal,
+        request: &InteractionRequest,
+        operation_id: &str,
+        reply_sha256: &str,
+        outcome: Option<Value>,
+    ) {
+        let intent = json!({
+            "bridge_boot_id":request.bridge_boot_id,
+            "native":{
+                "native_root_id":request.native_root_id,
+                "native_scope_key":request.native_scope_key,
+                "interaction_request_id":request.request_id,
+                "interaction_kind":request.kind.as_str(),
+                "tool_name":request.tool_name,
+                "request_sha256":request.request_sha256,
+                "reply_sha256":reply_sha256
+            }
+        });
+        let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":"eliot.claude",
+            "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+            "protocol":{"major":1,"minor":0},
+            "binding_id":request.binding_id,
+            "binding_generation":request.generation,
+            "operation_id":operation_id,
+            "input_sha256":"a".repeat(64)
+        }))
+        .unwrap();
+        receipt.validate().unwrap();
+        operations
+            .write_intent(operation_id, &receipt, "agent.reply", &intent)
+            .unwrap();
+        if let Some(outcome) = outcome {
+            operations
+                .save_outcome_value(operation_id, &outcome)
+                .unwrap();
+        }
+    }
+
+    fn begin_reply(journal: &InteractionJournal, request: &InteractionRequest, operation_id: &str) {
+        let reply = json!({"decision":"allow"});
+        let reply_sha256 = digest_json(&reply).unwrap();
+        journal
+            .begin_reply(&request.request_id, operation_id, &reply, &reply_sha256)
+            .unwrap();
+    }
+
+    #[test]
+    fn damaged_operation_defers_without_blocking_independent_recovery_or_reclaim() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-interaction-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operations = OperationJournal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"b".repeat(64),
+        )
+        .unwrap();
+        let interactions =
+            InteractionJournal::open(&root, "fixture-binding", 1, "fixture-scope").unwrap();
+
+        let damaged_request = request(&interactions, "damaged-request", "fixture-boot");
+        let reply_sha256 = digest_json(&json!({"decision":"allow"})).unwrap();
+        write_operation(
+            &operations,
+            &damaged_request,
+            "damaged-operation",
+            &reply_sha256,
+            None,
+        );
+        begin_reply(&interactions, &damaged_request, "damaged-operation");
+
+        let healthy_request = request(&interactions, "healthy-request", "fixture-boot");
+        write_operation(
+            &operations,
+            &healthy_request,
+            "healthy-operation",
+            &reply_sha256,
+            Some(json!({
+                "operation_id":"healthy-operation",
+                "outcome":"unknown",
+                "details":{"reason":"FIXTURE_UNKNOWN"}
+            })),
+        );
+        begin_reply(&interactions, &healthy_request, "healthy-operation");
+
+        let later_request = request(&interactions, "later-request", "later-boot");
+        let damaged_path = root.join(format!("{}.jsonl", digest_bytes(b"damaged-operation")));
+        OpenOptions::new()
+            .append(true)
+            .open(&damaged_path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        let damaged_operation_bytes = std::fs::read(&damaged_path).unwrap();
+        let damaged_interaction_path = interactions.path(&damaged_request.request_id).unwrap();
+        let damaged_interaction_bytes = std::fs::read(&damaged_interaction_path).unwrap();
+
+        interactions
+            .retire_bridge("fixture-boot", &operations)
+            .unwrap();
+        let retained = interactions.read_path(&damaged_interaction_path).unwrap();
+        assert_eq!(retained.status, InteractionStatus::ReplyIntent);
+        assert_eq!(
+            retained.reply_operation_id.as_deref(),
+            Some("damaged-operation")
+        );
+        let deferred_unknown = interactions
+            .read_path(&interactions.path(&healthy_request.request_id).unwrap())
+            .unwrap();
+        assert_eq!(deferred_unknown.status, InteractionStatus::Unknown);
+        assert_eq!(
+            deferred_unknown.reply_operation_id.as_deref(),
+            Some("healthy-operation")
+        );
+        assert_eq!(
+            interactions
+                .read_path(&interactions.path(&later_request.request_id).unwrap())
+                .unwrap()
+                .status,
+            InteractionStatus::Pending
+        );
+
+        interactions.recover_stale(&operations).unwrap();
+        assert_eq!(
+            interactions
+                .read_path(&interactions.path(&later_request.request_id).unwrap())
+                .unwrap()
+                .status,
+            InteractionStatus::Retired
+        );
+        interactions
+            .reclaim_acknowledged_operation("damaged-operation", &operations)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&damaged_path).unwrap(),
+            damaged_operation_bytes
+        );
+        assert_eq!(
+            std::fs::read(&damaged_interaction_path).unwrap(),
+            damaged_interaction_bytes
+        );
+        let damage = operations.get("damaged-operation").unwrap_err();
+        assert_eq!(damage.code, "ADAPTER_JOURNAL");
+        assert!(
+            damage
+                .message
+                .starts_with("operation record damaged at byte ")
+        );
+        assert!(damage.message.ends_with(": InvalidCompleteRecord"));
+        assert!(is_item_local_operation_damage(&damage));
+        assert!(!is_item_local_operation_damage(&Error::new(
+            "ADAPTER_JOURNAL",
+            "operation record cannot be read"
+        )));
+        assert!(!is_item_local_operation_damage(&Error::new(
+            "ADAPTER_JOURNAL",
+            "operation record read failed"
+        )));
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&damaged_path)
+                .unwrap();
+            let failed_scan = operations.unresolved();
+            drop(held);
+            let error = failed_scan.unwrap_err();
+            assert_eq!(error.code, "ADAPTER_JOURNAL");
+            assert_eq!(error.message, "operation record cannot be read");
+            assert_eq!(
+                std::fs::read(&damaged_path).unwrap(),
+                damaged_operation_bytes
+            );
+        }
+        let healthy_operation = operations.get("healthy-operation").unwrap().unwrap();
+        assert_eq!(
+            healthy_operation.outcome.as_ref().unwrap()["outcome"],
+            "unknown"
+        );
+        assert!(!healthy_operation.native_replay_permitted());
+
+        drop(interactions);
+        drop(operations);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -4,8 +4,10 @@
 // are authored from the pinned SDK's own message types (see fixtures/*.json).
 // Run after `npm ci --ignore-scripts`:  node selftest.mjs
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startup } from '@anthropic-ai/claude-agent-sdk';
@@ -277,6 +279,67 @@ function messageById(snap, id) {
   const missingErrorFlag = resultFor({ subtype: 'success' }, null).input_executions[0];
   assert.equal(missingErrorFlag.terminal_status, null, 'missing SDK error flag is not normalized to success');
   console.log('PASS result-subtype-whitelist: four SDK errors and success/error map; unknown or malformed result remains unresolved');
+}
+
+// 7. A failed adapter-bridge startup emits one Unknown and closes this boot.
+// The temporary SDK throws before creating any native session or process.
+{
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'claude-prepare-failure-'));
+  try {
+    const runtimeRoot = path.join(fixtureRoot, 'runtime');
+    const packageRoot = path.join(runtimeRoot, 'node_modules', '@anthropic-ai', 'claude-agent-sdk');
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({
+      name: '@anthropic-ai/claude-agent-sdk',
+      version: '0.3.287',
+      type: 'module',
+      exports: { '.': './index.mjs' },
+    }));
+    await writeFile(path.join(packageRoot, 'index.mjs'), [
+      "import { appendFileSync } from 'node:fs';",
+      'export async function startup() {',
+      "  appendFileSync(process.env.ELIOT_CLAUDE_FIXTURE_STARTUP_MARKER, 'called\\n');",
+      "  throw new Error('fixture startup failure');",
+      '}',
+      '',
+    ].join('\n'));
+
+    const repositoryRoot = path.resolve(here, '../..');
+    const bridgePath = path.join(repositoryRoot, 'crates', 'swarm-adapter-claude', 'sdk-harness', 'bridge.mjs');
+    const startupMarker = path.join(fixtureRoot, 'startup-calls.txt');
+    const firstPrepare = {
+      kind: 'prepare', operation_id: 'fixture-failed-prepare',
+      workspace_root: repositoryRoot, sdk_runtime_root: runtimeRoot,
+      native_scope_key: 'claude:fixture', bridge_boot_id: 'fixture-boot',
+      binding_id: 'fixture-binding', generation: 1, model_id: 'fixture-model',
+      permission_mode: null,
+    };
+    const secondPrepare = { ...firstPrepare, operation_id: 'fixture-second-prepare' };
+    const child = spawn(process.execPath, [bridgePath], {
+      cwd: repositoryRoot,
+      env: { ...process.env, ELIOT_CLAUDE_FIXTURE_STARTUP_MARKER: startupMarker },
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    const closed = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    child.stdin.end(`${JSON.stringify(firstPrepare)}\n${JSON.stringify(secondPrepare)}\n`);
+    const { code, signal } = await closed;
+
+    assert.equal(signal, null, 'startup failure closes the bridge cleanly');
+    assert.equal(code, 0);
+    assert.deepEqual(stdout.trim().split(/\r?\n/).map(line => JSON.parse(line)), [
+      { kind: 'operation_unknown', operation_id: 'fixture-failed-prepare', diagnostic_code: 'SDK_STARTUP_UNKNOWN' },
+    ], 'the failed prepare is reported once and a second prepare is never accepted');
+    assert.equal(await readFile(startupMarker, 'utf8'), 'called\n', 'SDK startup was invoked exactly once');
+    console.log('PASS adapter-bridge-failed-prepare: one Unknown frame, one startup call, bridge retired');
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
 }
 
 console.log('Claude bridge self-test: all fixture assertions passed');

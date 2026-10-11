@@ -315,14 +315,20 @@ async function prepare(command) {
     }
     options.pathToClaudeCodeExecutable = command.native_executable;
   }
-  session = sess;
   try {
     // Exact legacy bridge behavior: prepare once, with no native user input.
     sess.preparedQuery = await prepareQuery(sdk.startup, options);
   } catch {
+    sess.ended = true;
+    sess.input.close();
+    try { sess.query?.close(); } catch { /* startup may have left a partial stream */ }
+    try { sess.preparedQuery?.close(); } catch { /* startup may have left a partial warm handle */ }
     emit({ kind: 'operation_unknown', operation_id: command.operation_id, diagnostic_code: 'SDK_STARTUP_UNKNOWN' });
+    stopping = true;
+    lines.close();
     return;
   }
+  session = sess;
   emit({
     kind: 'prepared',
     operation_id: command.operation_id,

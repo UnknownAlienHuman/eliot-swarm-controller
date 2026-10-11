@@ -115,6 +115,9 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         )?;
                         if action.retire_bridge {
                             interactions.retire_bridge(&boot_id, &journal)?;
+                            // Closing stdin ends this generation's Node owner;
+                            // the parent still proves process-family departure.
+                            drop(harness.take());
                             // Retire this adapter process instead of serving a
                             // dead bridge or reopening it in-process. The
                             // parent owner retains the process-family identity
@@ -2037,6 +2040,20 @@ fn handle_frame(
                         }
                     }
                     native_control.forget_operation(operation_id);
+                    if code == "SDK_STARTUP_UNKNOWN"
+                        && saved.method.as_deref() == Some("agent.open")
+                    {
+                        *harness_alive = false;
+                        *native_prepared = false;
+                        *latest_state = Value::Null;
+                        *session_root = None;
+                        journal.recover_uncertain_with_code(&code)?;
+                        native_control.clear_pending();
+                        return Ok(FrameAction {
+                            reconnect: false,
+                            retire_bridge: true,
+                        });
+                    }
                     Ok(FrameAction::default())
                 }
                 "operation_rejected" => {
@@ -2786,6 +2803,300 @@ fn unknown_outcome_from_saved(
         native_input_id: native["user_message_uuid"].as_str().map(ToOwned::to_owned),
         details,
     })
+}
+
+#[cfg(test)]
+mod failed_prepare_lifecycle_fixture {
+    use super::*;
+    use crate::{
+        config::{AdapterConfig, NativeOptions},
+        interactions::{InteractionKind, InteractionRequestEvidence},
+        journal::digest_json,
+    };
+    use serde_json::json;
+    use std::{fs, path::PathBuf};
+
+    struct FixtureDirectory(PathBuf);
+
+    impl FixtureDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "swarm-claude-failed-prepare-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&path).expect("create isolated fixture directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_context() -> (
+        FixtureDirectory,
+        AdapterConfig,
+        OperationJournal,
+        InteractionJournal,
+    ) {
+        let directory = FixtureDirectory::new();
+        let root = &directory.0;
+        let state_dir = root.join("state");
+        let native_options = NativeOptions {
+            workspace_root: root.to_owned(),
+            sdk_runtime_root: root.join("runtime"),
+            node_executable: root.join("node.exe"),
+            native_executable: None,
+            claude_config_dir: root.join("claude-config"),
+            model_id: "fixture-model".to_owned(),
+            permission_mode: None,
+            allow_dangerously_skip_permissions: false,
+        };
+        let config = AdapterConfig {
+            host_data_dir: root.to_owned(),
+            credential_file: root.join("credential.json"),
+            state_dir: state_dir.clone(),
+            sdk_harness_dir: root.join("sdk-harness"),
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_options,
+            ipc: serde_json::from_value(json!({})).expect("default IPC bounds"),
+        };
+        let journal = OperationJournal::open(
+            &state_dir,
+            &config.binding_id,
+            config.generation,
+            &config.native_options.scope_key(),
+            &"a".repeat(64),
+        )
+        .expect("open isolated operation journal");
+        let interactions = InteractionJournal::open(
+            &state_dir,
+            &config.binding_id,
+            config.generation,
+            &config.native_options.scope_key(),
+        )
+        .expect("open isolated interaction journal");
+        (directory, config, journal, interactions)
+    }
+
+    fn fixture_receipt(operation_id: &str) -> swarm_contracts::runtime::ModuleReceiptIdentity {
+        serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":"claude",
+            "artifact":{"artifact_id":"claude-agent-sdk-rust-controller.5","version":"5","build_id":null},
+            "protocol":{"major":1,"minor":0},
+            "binding_id":"fixture-binding",
+            "binding_generation":1,
+            "operation_id":operation_id,
+            "input_sha256":"a".repeat(64)
+        }))
+        .expect("deserialize exact fixture receipt")
+    }
+
+    fn write_fixture_intent(
+        journal: &OperationJournal,
+        config: &AdapterConfig,
+        operation_id: &str,
+        method: &str,
+        native_root_id: Option<&str>,
+    ) {
+        let scope = config.native_options.scope_key();
+        journal
+            .write_intent(
+                operation_id,
+                &fixture_receipt(operation_id),
+                method,
+                &json!({
+                    "native_root_id":native_root_id,
+                    "native":{
+                        "native_scope_key":scope,
+                        "native_root_id":native_root_id
+                    }
+                }),
+            )
+            .expect("write one fixture intent");
+    }
+
+    #[test]
+    fn exact_failed_prepare_frame_retires_and_resolves_each_intent_once() {
+        let (_directory, config, journal, interactions) = fixture_context();
+        write_fixture_intent(&journal, &config, "failed-open", "agent.open", None);
+        write_fixture_intent(
+            &journal,
+            &config,
+            "unresolved-send",
+            "agent.send/next_turn",
+            Some("fixture-root"),
+        );
+
+        let callback_input = json!({"command":"fixture"});
+        let callback_digest = digest_json(&json!({
+            "schema_version":1,
+            "request_id":"fixture-request",
+            "kind":"permission",
+            "tool_name":"Bash",
+            "input":callback_input.clone()
+        }))
+        .expect("digest fixture callback");
+        interactions
+            .record_request(InteractionRequestEvidence {
+                bridge_boot_id: "fixture-boot",
+                native_root_id: "fixture-root",
+                request_id: "fixture-request",
+                kind: InteractionKind::Permission,
+                tool_name: "Bash",
+                input: &callback_input,
+                request_sha256: &callback_digest,
+            })
+            .expect("record a pending callback for retirement");
+
+        let mut harness_alive = true;
+        let mut native_prepared = true;
+        let mut latest_state = json!({"stale_snapshot":true});
+        let mut session_root = Some("fixture-root".to_owned());
+        let mut native_control = NativeControl::default();
+        let action = handle_frame(
+            HarnessFrame::Message(json!({
+                "kind":"operation_unknown",
+                "operation_id":"failed-open",
+                "diagnostic_code":"SDK_STARTUP_UNKNOWN"
+            })),
+            &config,
+            "fixture-boot",
+            &journal,
+            &interactions,
+            &mut harness_alive,
+            &mut native_prepared,
+            &mut latest_state,
+            &mut session_root,
+            &mut native_control,
+        )
+        .expect("handle real failed-prepare frame");
+
+        assert!(
+            action.retire_bridge,
+            "startup Unknown selects the existing module-retirement seam"
+        );
+        assert!(
+            !action.reconnect,
+            "retirement never reconnects the dead generation"
+        );
+        assert!(!harness_alive);
+        assert!(!native_prepared);
+        assert!(latest_state.is_null());
+        assert!(session_root.is_none());
+        let open_outcome = journal
+            .get("failed-open")
+            .expect("read open intent")
+            .expect("open intent exists");
+        assert_eq!(open_outcome.outcome.as_ref().unwrap()["outcome"], "unknown");
+        let send_outcome = journal
+            .get("unresolved-send")
+            .expect("read unresolved send")
+            .expect("send intent exists");
+        let saved_send_outcome = send_outcome
+            .outcome
+            .expect("startup retires unresolved send once");
+        assert_eq!(saved_send_outcome["outcome"], "unknown");
+        assert_eq!(saved_send_outcome["native_root_id"], "fixture-root");
+        journal
+            .recover_uncertain_with_code("SDK_STARTUP_UNKNOWN")
+            .expect("repeated recovery is idempotent");
+        assert_eq!(
+            journal
+                .get("unresolved-send")
+                .expect("read recovered send")
+                .unwrap()
+                .outcome
+                .unwrap(),
+            saved_send_outcome,
+            "recovery keeps the one saved Unknown outcome"
+        );
+        assert!(
+            journal
+                .unresolved()
+                .expect("list unresolved intents")
+                .is_empty()
+        );
+
+        // Exercise callback retirement selected by the real frame handler.
+        // run_owned's stdin drop and return path are inspected separately;
+        // this fixture does not launch that process-owning loop.
+        interactions
+            .retire_bridge("fixture-boot", &journal)
+            .expect("retire callbacks with the bridge generation");
+        assert!(
+            interactions
+                .pending_snapshot("fixture-boot", "fixture-root")
+                .expect("read current callbacks")
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            interactions
+                .begin_reply(
+                    "fixture-request",
+                    "late-reply",
+                    &json!({"decision":"allow"}),
+                    &"b".repeat(64),
+                )
+                .is_err(),
+            "a callback from the retired bridge cannot be answered"
+        );
+    }
+
+    #[test]
+    fn ordinary_operation_unknown_does_not_retire_the_module() {
+        let (_directory, config, journal, interactions) = fixture_context();
+        write_fixture_intent(
+            &journal,
+            &config,
+            "ordinary-unknown",
+            "agent.send/next_turn",
+            Some("fixture-root"),
+        );
+        let mut harness_alive = true;
+        let mut native_prepared = true;
+        let mut latest_state = json!({"current":true});
+        let mut session_root = Some("fixture-root".to_owned());
+        let mut native_control = NativeControl::default();
+        let action = handle_frame(
+            HarnessFrame::Message(json!({
+                "kind":"operation_unknown",
+                "operation_id":"ordinary-unknown",
+                "diagnostic_code":"SDK_EFFECT_UNKNOWN"
+            })),
+            &config,
+            "fixture-boot",
+            &journal,
+            &interactions,
+            &mut harness_alive,
+            &mut native_prepared,
+            &mut latest_state,
+            &mut session_root,
+            &mut native_control,
+        )
+        .expect("handle ordinary operation Unknown");
+
+        assert!(!action.retire_bridge);
+        assert!(harness_alive);
+        assert!(native_prepared);
+        assert_eq!(latest_state, json!({"current":true}));
+        assert_eq!(session_root.as_deref(), Some("fixture-root"));
+        assert_eq!(
+            journal
+                .get("ordinary-unknown")
+                .expect("read ordinary Unknown")
+                .unwrap()
+                .outcome
+                .unwrap()["outcome"],
+            "unknown"
+        );
+    }
 }
 
 fn rejected_outcome_from_saved(
