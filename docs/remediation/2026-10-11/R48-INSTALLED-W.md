@@ -33,6 +33,16 @@ marker exists. The original qualification receipt is retained at SHA-256
 the execution log is
 `75f5498ff69df99f0139d3ee087291507afb067306087bc96ff2036efa18b09e`.
 
+Read-only terminal readback at `2026-10-11T16:28:47Z` found the same W
+CheckRun `5fa62345-85a1-41e9-b582-1d23b7d5c2d8` **incomplete**, with
+`check.run` settled and its resource released at `10:20:24.097Z`. The result
+retains `worker_lost_without_terminal_receipt`, no exit code, and exact
+Windows-job `departed_group_observed_empty` recovery. The Task is still open
+and unaccepted. This is a terminal incomplete result, not a running CheckRun
+or a passing command. The [terminal evidence](R48-W-CHECKRUN-TERMINAL-READBACK.json)
+records the unchanged private Store and retained result-artifact digests;
+no W replay, build or native/model call was performed.
+
 The failed V receipt and older U/T/T2 observations remain unchanged. W's
 CheckRun evidence establishes exact admission links; it does not establish
 Task acceptance. Native Step 5 free/Gemini 3.8 execution and causal result
