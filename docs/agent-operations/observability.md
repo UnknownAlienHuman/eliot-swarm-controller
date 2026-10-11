@@ -48,6 +48,19 @@ their existing separate forms. An event identifies evidence for current scoped
 admission; its ID alone never grants permission to run a script or repeat a
 native effect.
 
+### OpenCode catalog rejection receipt
+
+For a rejected `agent.open`, public `operation.get` can retain
+`result.failure = {"code":"NATIVE_MODEL_UNAVAILABLE","catalog_failure_category":"model_absent"}`.
+The category is exactly one of `catalog_unavailable`, `model_absent`,
+`model_disabled` or `variant_absent`. The adapter preserves the original error
+code; HTTP, schema and directory failures keep their existing codes. The Store
+projects this object only for the exact rejected open and matching diagnostic
+code. Other outcomes, methods, codes and unknown categories receive no such
+object. Private details, catalog entries, error messages and credentials remain
+outside the public receipt. This diagnostic neither grants readiness nor
+authorizes dispatch, replay or Task acceptance.
+
 ## 2. Configurable depth without a restart
 
 Log **level** and captured **content** are separate settings. Levels are

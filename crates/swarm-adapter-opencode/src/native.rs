@@ -39,6 +39,47 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogFailureCategory {
+    CatalogUnavailable,
+    ModelAbsent,
+    ModelDisabled,
+    VariantAbsent,
+}
+
+impl CatalogFailureCategory {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogUnavailable => "catalog_unavailable",
+            Self::ModelAbsent => "model_absent",
+            Self::ModelDisabled => "model_disabled",
+            Self::VariantAbsent => "variant_absent",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreflightOpenFailure {
+    pub(crate) error: Error,
+    pub(crate) catalog_failure_category: Option<CatalogFailureCategory>,
+}
+
+impl PreflightOpenFailure {
+    fn classified(error: Error, category: CatalogFailureCategory) -> Self {
+        Self {
+            error,
+            catalog_failure_category: Some(category),
+        }
+    }
+
+    fn unclassified(error: Error) -> Self {
+        Self {
+            error,
+            catalog_failure_category: None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConnectionRecord {
@@ -252,9 +293,14 @@ impl NativeClient {
         &self.version
     }
 
-    pub async fn preflight_open(&self, options: &NativeOptions) -> Result<Value> {
+    pub async fn preflight_open(
+        &self,
+        options: &NativeOptions,
+    ) -> std::result::Result<Value, PreflightOpenFailure> {
         self.wait_route_model_available(options).await?;
-        self.location(options).await
+        self.location(options)
+            .await
+            .map_err(PreflightOpenFailure::unclassified)
     }
 
     pub async fn preflight_send(
@@ -1061,13 +1107,16 @@ impl NativeClient {
         Ok(json!({"directory":value["directory"]}))
     }
 
-    async fn wait_route_model_available(&self, options: &NativeOptions) -> Result<()> {
-        // The pinned SDK can serve its bundled snapshot before the public
-        // catalogue refresh completes. Poll only this read before any root POST.
-        tokio::time::timeout(MODEL_CATALOG_READY_TIMEOUT, async {
+    async fn wait_route_model_available(
+        &self,
+        options: &NativeOptions,
+    ) -> std::result::Result<(), PreflightOpenFailure> {
+        let mut last_category = None;
+        match tokio::time::timeout(MODEL_CATALOG_READY_TIMEOUT, async {
             loop {
-                match self.check_route_model_available(options).await {
-                    Err(error) if error.code == "NATIVE_MODEL_UNAVAILABLE" => {
+                match self.check_route_model_available_classified(options).await {
+                    Err(failure) if failure.error.code == "NATIVE_MODEL_UNAVAILABLE" => {
+                        last_category = failure.catalog_failure_category;
                         tokio::time::sleep(MODEL_CATALOG_POLL_INTERVAL).await;
                     }
                     result => return result,
@@ -1075,15 +1124,28 @@ impl NativeClient {
             }
         })
         .await
-        .unwrap_or_else(|_| {
-            Err(Error::new(
-                "NATIVE_MODEL_UNAVAILABLE",
-                "exact route provider/model/variant did not become ready within the catalogue deadline",
-            ))
-        })
+        {
+            Ok(result) => result,
+            Err(_) => Err(PreflightOpenFailure::classified(
+                Error::new(
+                    "NATIVE_MODEL_UNAVAILABLE",
+                    "exact route provider/model/variant did not become ready within the catalogue deadline",
+                ),
+                last_category.unwrap_or(CatalogFailureCategory::CatalogUnavailable),
+            )),
+        }
     }
 
     async fn check_route_model_available(&self, options: &NativeOptions) -> Result<()> {
+        self.check_route_model_available_classified(options)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn check_route_model_available_classified(
+        &self,
+        options: &NativeOptions,
+    ) -> std::result::Result<(), PreflightOpenFailure> {
         let value = self
             .get(
                 "/api/model",
@@ -1092,25 +1154,41 @@ impl NativeClient {
                     options.directory.to_string_lossy().into_owned(),
                 )],
             )
-            .await?;
-        verify_directory(&options.directory, &value["location"])?;
-        let models = value["data"]
-            .as_array()
-            .ok_or_else(|| Error::new("NATIVE_MODEL_SCHEMA", "native model catalog is invalid"))?;
+            .await
+            .map_err(|error| {
+                PreflightOpenFailure::classified(error, CatalogFailureCategory::CatalogUnavailable)
+            })?;
+        verify_directory(&options.directory, &value["location"])
+            .map_err(PreflightOpenFailure::unclassified)?;
+        let models = value["data"].as_array().ok_or_else(|| {
+            PreflightOpenFailure::classified(
+                Error::new("NATIVE_MODEL_SCHEMA", "native model catalog is invalid"),
+                CatalogFailureCategory::CatalogUnavailable,
+            )
+        })?;
         let mut matching_models = 0usize;
         let mut model_enabled = false;
+        let mut model_enabled_is_boolean = false;
         let mut matching_variants = 0usize;
         for model in models {
             if model["id"] == options.model.id && model["providerID"] == options.model.provider_id {
                 matching_models += 1;
-                model_enabled = model["enabled"].as_bool() == Some(true);
+                let enabled = model["enabled"].as_bool();
+                model_enabled = enabled == Some(true);
+                model_enabled_is_boolean = enabled.is_some();
                 let variants = model["variants"].as_array().ok_or_else(|| {
-                    Error::new("NATIVE_MODEL_SCHEMA", "native model variants are invalid")
+                    PreflightOpenFailure::classified(
+                        Error::new("NATIVE_MODEL_SCHEMA", "native model variants are invalid"),
+                        CatalogFailureCategory::CatalogUnavailable,
+                    )
                 })?;
                 if variants.len() > 256 {
-                    return Err(Error::new(
-                        "NATIVE_MODEL_SCHEMA",
-                        "native model variants exceed their protocol bound",
+                    return Err(PreflightOpenFailure::classified(
+                        Error::new(
+                            "NATIVE_MODEL_SCHEMA",
+                            "native model variants exceed their protocol bound",
+                        ),
+                        CatalogFailureCategory::CatalogUnavailable,
                     ));
                 }
                 let mut seen = BTreeSet::new();
@@ -1123,15 +1201,21 @@ impl NativeClient {
                                 && !id.bytes().any(|b| b.is_ascii_control())
                         })
                         .ok_or_else(|| {
-                            Error::new(
-                                "NATIVE_MODEL_SCHEMA",
-                                "native model variant identity is invalid",
+                            PreflightOpenFailure::classified(
+                                Error::new(
+                                    "NATIVE_MODEL_SCHEMA",
+                                    "native model variant identity is invalid",
+                                ),
+                                CatalogFailureCategory::CatalogUnavailable,
                             )
                         })?;
                     if !seen.insert(id.to_owned()) {
-                        return Err(Error::new(
-                            "NATIVE_MODEL_SCHEMA",
-                            "native model contains duplicate variants",
+                        return Err(PreflightOpenFailure::classified(
+                            Error::new(
+                                "NATIVE_MODEL_SCHEMA",
+                                "native model contains duplicate variants",
+                            ),
+                            CatalogFailureCategory::CatalogUnavailable,
                         ));
                     }
                     if id == options.model.variant {
@@ -1141,9 +1225,21 @@ impl NativeClient {
             }
         }
         if matching_models != 1 || !model_enabled || matching_variants != 1 {
-            return Err(Error::new(
-                "NATIVE_MODEL_UNAVAILABLE",
-                "exact route provider/model/variant is absent or disabled",
+            let category = match matching_models {
+                0 => CatalogFailureCategory::ModelAbsent,
+                1 if !model_enabled && model_enabled_is_boolean => {
+                    CatalogFailureCategory::ModelDisabled
+                }
+                1 if !model_enabled => CatalogFailureCategory::CatalogUnavailable,
+                1 => CatalogFailureCategory::VariantAbsent,
+                _ => CatalogFailureCategory::CatalogUnavailable,
+            };
+            return Err(PreflightOpenFailure::classified(
+                Error::new(
+                    "NATIVE_MODEL_UNAVAILABLE",
+                    "exact route provider/model/variant is absent or disabled",
+                ),
+                category,
             ));
         }
         Ok(())
@@ -2346,10 +2442,48 @@ mod catalog_readiness_tests {
             .wait_route_model_available(&options)
             .await
             .unwrap_err();
-        assert_eq!(error.code, "NATIVE_MODEL_SCHEMA");
+        assert_eq!(error.error.code, "NATIVE_MODEL_SCHEMA");
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_failure_categories_preserve_the_exact_preflight_classification() {
+        let cases = [
+            (Value::Null, CatalogFailureCategory::CatalogUnavailable),
+            (json!([]), CatalogFailureCategory::ModelAbsent),
+            (
+                json!([{
+                    "id":"step-5-preview-free",
+                    "providerID":"opencode",
+                    "enabled":false,
+                    "variants":[{"id":"high"}]
+                }]),
+                CatalogFailureCategory::ModelDisabled,
+            ),
+            (
+                json!([{
+                    "id":"step-5-preview-free",
+                    "providerID":"opencode",
+                    "enabled":true,
+                    "variants":[{"id":"low"}]
+                }]),
+                CatalogFailureCategory::VariantAbsent,
+            ),
+        ];
+        for (catalog, expected_category) in cases {
+            let (client, options, server) = catalog_fixture(vec![catalog]).await;
+            let failure = client
+                .check_route_model_available_classified(&options)
+                .await
+                .unwrap_err();
+            assert_eq!(failure.catalog_failure_category, Some(expected_category));
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }

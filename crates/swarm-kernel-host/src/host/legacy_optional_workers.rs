@@ -335,6 +335,7 @@ async fn run_automation_scheduler_worker(
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", system_root);
     }
+    command.arg("run").arg("--config").arg(config_path);
     // Qualification-only. The Store-owned launch stays byte-identical to its
     // production shape unless this exact flag was requested on the host
     // process command line. A build without the qualification-faults feature
@@ -342,14 +343,12 @@ async fn run_automation_scheduler_worker(
     // at all. The flag reaches the very process the Store launched and owns,
     // so the owner receipt, the birth identity and the readiness projection
     // all remain the ones the Store produced.
+    // The worker accepts this optional flag only after run --config <path>.
     #[cfg(feature = "qualification-faults")]
     if qualification_reply_fault_requested() {
         command.arg("--qualification-drop-first-admit-reply");
     }
     let spawn = command
-        .arg("run")
-        .arg("--config")
-        .arg(config_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

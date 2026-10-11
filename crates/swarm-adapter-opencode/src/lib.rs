@@ -1194,7 +1194,13 @@ async fn handle_open(
     };
     let location = match native.preflight_open(options).await {
         Ok(location) => location,
-        Err(error) => {
+        Err(failure) => {
+            let mut details = diagnostic(&failure.error);
+            if failure.error.code == "NATIVE_MODEL_UNAVAILABLE"
+                && let Some(category) = failure.catalog_failure_category
+            {
+                details["catalog_failure_category"] = json!(category.as_str());
+            }
             let mut rejected = outcome(
                 command,
                 claim,
@@ -1202,7 +1208,7 @@ async fn handle_open(
                 options,
                 None,
                 None,
-                diagnostic(&error),
+                details,
             )?;
             attach_owned_service_ready_only(&mut rejected, owner_ready.as_ref(), options);
             journal.queue_outcome(&rejected)?;

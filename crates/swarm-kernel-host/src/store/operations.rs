@@ -486,7 +486,30 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
     {
         projected.insert("code".into(), json!(code));
     }
+    if let Some(failure) = project_native_catalog_failure(method, result) {
+        projected.insert("failure".to_owned(), failure);
+    }
     Ok(Some(Value::Object(projected)))
+}
+
+fn project_native_catalog_failure(method: &str, result: &Value) -> Option<Value> {
+    if method != "agent.open"
+        || result["outcome"] != "rejected"
+        || result["details"]["diagnostic_code"] != "NATIVE_MODEL_UNAVAILABLE"
+    {
+        return None;
+    }
+    let category = match result["details"]["catalog_failure_category"].as_str()? {
+        "catalog_unavailable" => "catalog_unavailable",
+        "model_absent" => "model_absent",
+        "model_disabled" => "model_disabled",
+        "variant_absent" => "variant_absent",
+        _ => return None,
+    };
+    Some(json!({
+        "code":"NATIVE_MODEL_UNAVAILABLE",
+        "catalog_failure_category":category,
+    }))
 }
 
 fn public_launch_phase(value: Option<&Value>) -> &'static str {
@@ -4082,5 +4105,177 @@ mod launch_phase_public_projection_tests {
                 .unwrap()
                 .contains(PRIVATE_MARKER)
         );
+    }
+}
+#[cfg(test)]
+mod native_catalog_failure_public_projection_tests {
+    use super::*;
+
+    const CALLER: &str = "native-catalog-failure-caller";
+    const PRIVATE_MARKER: &str = "private-catalog-diagnostic-marker";
+
+    fn fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db
+    }
+
+    fn retain_operation(
+        db: &Connection,
+        operation_id: &str,
+        method: &str,
+        state: &str,
+        result: &Value,
+    ) {
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,settled_at_ms,due_at_ms,created_at_ms,updated_at_ms) \
+             VALUES(?1,?2,?3,?4,'{}','{}',?5,?6,CASE WHEN ?5 IN ('settled','rejected','cancelled') THEN 1 ELSE NULL END,1,1,1)",
+            rusqlite::params![
+                operation_id,
+                CALLER,
+                format!("request-{operation_id}"),
+                method,
+                state,
+                model::canonical(result).unwrap(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn operation_get(db: &Connection, operation_id: &str) -> Value {
+        let principal = Principal {
+            link_id: "native-catalog-failure-link".into(),
+            client_id: CALLER.into(),
+            role: Role::Observer,
+        };
+        super::super::read(
+            db,
+            &principal,
+            "operation.get",
+            &json!({"operation_id":operation_id}),
+            &Config::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn operation_get_projects_only_closed_rejected_agent_open_catalog_failure() {
+        let db = fixture();
+        let categories = [
+            "catalog_unavailable",
+            "model_absent",
+            "model_disabled",
+            "variant_absent",
+        ];
+        for category in categories {
+            let operation_id = format!("catalog-{category}");
+            retain_operation(
+                &db,
+                &operation_id,
+                "agent.open",
+                "rejected",
+                &json!({
+                    "operation_id":operation_id.clone(),
+                    "outcome":"rejected",
+                    "details":{
+                        "diagnostic_code":"NATIVE_MODEL_UNAVAILABLE",
+                        "catalog_failure_category":category,
+                        "selected_model":PRIVATE_MARKER,
+                        "credential":PRIVATE_MARKER,
+                        "unbounded_native_error":{"message":PRIVATE_MARKER},
+                    },
+                    "error":{"code":"NATIVE_MODEL_UNAVAILABLE","message":PRIVATE_MARKER},
+                }),
+            );
+        }
+        retain_operation(
+            &db,
+            "catalog-invalid-category",
+            "agent.open",
+            "rejected",
+            &json!({
+                "operation_id":"catalog-invalid-category",
+                "outcome":"rejected",
+                "details":{
+                    "diagnostic_code":"NATIVE_MODEL_UNAVAILABLE",
+                    "catalog_failure_category":["model_absent"],
+                    "private":PRIVATE_MARKER,
+                },
+            }),
+        );
+        retain_operation(
+            &db,
+            "catalog-wrong-diagnostic",
+            "agent.open",
+            "rejected",
+            &json!({
+                "operation_id":"catalog-wrong-diagnostic",
+                "outcome":"rejected",
+                "details":{
+                    "diagnostic_code":"NATIVE_READ_FAILED",
+                    "catalog_failure_category":"model_absent",
+                },
+            }),
+        );
+        retain_operation(
+            &db,
+            "catalog-applied",
+            "agent.open",
+            "settled",
+            &json!({
+                "operation_id":"catalog-applied",
+                "outcome":"applied",
+                "details":{
+                    "diagnostic_code":"NATIVE_MODEL_UNAVAILABLE",
+                    "catalog_failure_category":"model_absent",
+                },
+            }),
+        );
+        retain_operation(
+            &db,
+            "catalog-other-method",
+            "agent.send",
+            "rejected",
+            &json!({
+                "operation_id":"catalog-other-method",
+                "outcome":"rejected",
+                "details":{
+                    "diagnostic_code":"NATIVE_MODEL_UNAVAILABLE",
+                    "catalog_failure_category":"model_absent",
+                },
+            }),
+        );
+
+        for category in categories {
+            let operation_id = format!("catalog-{category}");
+            let operation = operation_get(&db, &operation_id);
+            assert_eq!(operation["state"], "rejected");
+            assert_eq!(
+                operation["result"]["failure"],
+                json!({
+                    "code":"NATIVE_MODEL_UNAVAILABLE",
+                    "catalog_failure_category":category,
+                })
+            );
+            assert!(
+                !serde_json::to_string(&operation)
+                    .unwrap()
+                    .contains(PRIVATE_MARKER)
+            );
+        }
+        for operation_id in [
+            "catalog-invalid-category",
+            "catalog-wrong-diagnostic",
+            "catalog-applied",
+            "catalog-other-method",
+        ] {
+            let operation = operation_get(&db, operation_id);
+            assert!(operation["result"].get("failure").is_none());
+            assert!(
+                !serde_json::to_string(&operation)
+                    .unwrap()
+                    .contains(PRIVATE_MARKER)
+            );
+        }
     }
 }

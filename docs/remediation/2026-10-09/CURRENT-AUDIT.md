@@ -1,5 +1,14 @@
 # Current-source audit and implementation ledger
 
+The [OpenCode catalog and R48 worker source repair](../2026-10-11/CATALOG-AND-R48-SOURCE-REPAIR.md)
+preserves a closed catalog subreason in public rejected-open receipts and fixes
+the actual host/worker qualification-flag order. Strict affected production
+Clippy passes in default and qualification modes on Windows/Linux; three catalog
+cases and the public Store receipt case pass on each platform. The real feature
+worker parser accepts the corrected argv and rejects the historical order
+before Store/service effects. Fresh installed/native qualification is still
+required; historical runs and unknown outcomes remain retained.
+
 The [installed R48 public-contract repair](../2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md)
 passes 15/15 on Windows and Linux, including real public entry, params-only CLI
 input, Operation/Check binding and actual-child idempotent EOF cleanup. The
