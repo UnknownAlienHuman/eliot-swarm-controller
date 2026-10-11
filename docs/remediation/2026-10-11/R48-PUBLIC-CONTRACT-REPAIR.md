@@ -2,6 +2,21 @@
 
 Status: source verified; installed R48 remains unqualified.
 
+The fresh T2 run `r48-91c5d1b40b3b4e568e04d5f8630bc6b6` completed at
+`2026-10-11T05:08:41Z` with exit0. Bootstrap, current-owner readiness, linked
+one-shot CheckRun admission and host liveness are verified (4/5 observations).
+The applied-fault witness is absent, so uncertain-admit no-replay stays UNKNOWN.
+The first admission-intent marker proves that the actual worker armed the
+qualification flag; absence of the applied marker does not prove otherwise.
+No second intent marker exists, but that alone does not establish the fault.
+The first admit RPC's terminal outcome and witness-write result were not
+retained. A single witness sample immediately after CheckRun admission is also
+insufficient to exclude a delayed reply. The independent diagnosis separates
+that observer defect from the unknown producer outcome. Retained receipt
+SHA-256: `7adee78e7ef582b3b678e3073ff1063ca613ed61ab1ffaf35150caaf2337970c`;
+diagnosis SHA-256: `41b7089a38ad801c61a3dfdb7a2bd58cec64a87d021c84d897c2625e26b11a53`.
+The receipt is not promoted to full installed R48 qualification.
+
 ## Fresh source3449 installed observation and admission repair
 
 The fresh T run `r48-0cfa2b5cbf32463393a9cc664d2c9162` used the rebuilt
@@ -30,8 +45,8 @@ Current fixture SHA-256:
 
 T cleanup confirmed host exit. Its historical receipt remains unchanged; the
 one-shot admission, uncertain-admit no-replay and complete liveness subgates are
-not retroactively promoted. A fresh run must bind the new sidecar to the retained
-T preparation. This PowerShell-only follow-up requires no binary rebuild or
+not retroactively promoted. T2 bound the new sidecar to the retained T preparation
+in a separate create-only binding receipt. This PowerShell-only follow-up required no binary rebuild or
 repeat of the already-passed Rust gates. The older hashes and observations below
 describe the preceding edition only.
 

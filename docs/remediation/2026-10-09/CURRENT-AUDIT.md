@@ -1,11 +1,16 @@
 # Current-source audit and implementation ledger
 
-The [fresh installed R48 T observation](../2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md)
-verifies bootstrap and real scheduler-owner readiness on source3449. Its actual
-CheckRun Operation reached `native_accepted`; a harness whitelist mismatch
-stopped further qualification. The corrected assertion passes 18/18 on Windows
-and Linux. Full installed R48 remains pending a fresh run; historical receipts
-are unchanged.
+The [watcher ancestor repair](../2026-10-11/WATCHER-ANCESTOR-REPAIR.md) removes
+braces/micromatch from the source lock and fresh Windows/Linux closures. The
+actual core native-loader watcher checks and MCP compatibility pass on both
+systems. The sprintf-js/cache advisories remain open.
+
+The [fresh installed R48 T2 observation](../2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md)
+verifies bootstrap, real scheduler-owner readiness, linked one-shot CheckRun
+admission and host liveness on source3449. The corrected public assertion passes
+18/18 on Windows and Linux. Applied-fault/no-replay evidence remains UNKNOWN;
+the first admission-intent marker proves arming, and the missing producer
+terminal outcome still needs diagnosis. Historical receipts are unchanged.
 
 The [three remaining dependency advisories](../2026-10-11/DEPENDENCIES-REMAINING.md)
 were rechecked against live GitHub and registry metadata at 04:32UTC on 2026-10-11.

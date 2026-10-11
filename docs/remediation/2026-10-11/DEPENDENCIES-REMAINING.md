@@ -1,5 +1,11 @@
 # Remaining dependency advisories
 
+The [scoped watcher ancestor repair](WATCHER-ANCESTOR-REPAIR.md) now removes
+braces and micromatch from the source lock and fresh Windows/Linux installs.
+Native watcher and MCP compatibility pass on both systems. Post-delivery
+GitHub alert readback is pending; the two other advisory repairs remain open.
+The three-alert table below is the retained pre-repair readback.
+
 Live GitHub/advisory/registry readback at `2026-10-11T04:32:36Z` retains three
 open alerts. Alert #16, the MCP client, is fixed at 2.2.0 and was confirmed fixed by
 GitHub at `2026-10-11T02:44:56Z`.
