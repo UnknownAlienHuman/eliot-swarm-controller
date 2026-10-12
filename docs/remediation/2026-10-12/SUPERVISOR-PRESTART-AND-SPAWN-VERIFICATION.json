@@ -1,0 +1,142 @@
+{
+  "schema": "swarm.supervisor_prestart_spawn_verification.v1",
+  "verified_at_utc": "2026-10-12T15:25:28.707Z",
+  "base_main": "35af157a6bf42a9d014be61834894706f2a420b4",
+  "ledger_ids": [
+    "APP-363",
+    "APP-369"
+  ],
+  "original_rows": 459,
+  "original_obligation_objects_preserved": true,
+  "owned_source_sha256": {
+    "crates/swarm-process/src/module_owner.rs": "F29E80BE662776EB3D443448A21CB21AF98A498DD295CB7AB818D0D6C548BD6B",
+    "crates/swarm-supervisor/src/observation.rs": "5CF7C4221A6E8727CB28F337F36C9E7C27D11CF0BFA9C46F6038F49CEBF944B4",
+    "crates/swarm-supervisor/src/supervisor.rs": "75D4B74BB738D29FD0A6219E5391AF18FE51837D35BB2848E659054D5BC3B229",
+    "crates/swarm-kernel-host/src/store/module_supervisor_observation.rs": "0702DCADF0897B9FE145D948D556378AF8B9ED6453DDF83CCE98F5A5529A58E8"
+  },
+  "behavior": [
+    "Validate the existing ELIOT_SWARM_CONFIG_ composed name before persisting a restart attempt; 109 raw ASCII bytes accepted, 110/lowercase rejected without custody or restart-history mutation.",
+    "Actual Command::spawn refusal publishes an exact 16-field not_started receipt only after empty-family proof; supervisor typed stage and Store projection accept certified spawn while preserving artifact identity and retry refusal."
+  ],
+  "independent_review": {
+    "artifact": "app363369-independent-final-source-review-v4-20261012.json",
+    "sha256": "4B7F245848A19B293999121FC1CDCCEACF1EA5669FFCDF5A31A26683C25950F1",
+    "p1": 0,
+    "p2": 0,
+    "scope": "Frozen four-file source repair; manager admitted exact guarded four-file WIP preimages and narrow semantic deltas"
+  },
+  "ownership_admission_sha256": "EB805FCDE8DDA7B0EA57D7989A3088469CBEB423605E355D64BC361717FB1B6C",
+  "source_manifest_sha256": "FECEE65F1EABE7A921D55D74C24F574C836B1C90DB98179B2039C885B21955C5",
+  "source_inputs": 850,
+  "gates": [
+    {
+      "platform": "windows",
+      "gate": "clippy",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-process",
+        "-p",
+        "swarm-supervisor",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_stable": true,
+      "record_sha256": "D6F47D84F12A3A6165DF30D2AA884307F55CC9AE3D295BDD89B997C0EC31108A",
+      "log_sha256": "4C8AEEF9C2C49E5E67DE26C8D3839256AB028A39950D081CBF7224443FFED27E"
+    },
+    {
+      "platform": "windows",
+      "gate": "tests",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-process",
+        "-p",
+        "swarm-supervisor",
+        "--lib",
+        "-E",
+        "test(module_config_final_name_uses_exact_prefix_and_128_byte_predicate) | test(startup_invalid_module_config_name_rejects_before_restart_budget_or_owner_launch) | test(spawn_failure_publishes_exact_not_started_receipt_with_artifact_version)"
+      ],
+      "source_stable": true,
+      "record_sha256": "92439EB820A61AC29B7BB4DA13670F70D94DFF70A59A0FD0ECD0AF35CC9FCAF1",
+      "log_sha256": "E42E5461F0A5F0583E80EDE1B13C308C6ADCA97C5B93E65AE36A66A3ABA7FF3F",
+      "test_count": 3
+    },
+    {
+      "platform": "linux",
+      "gate": "clippy",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-process",
+        "-p",
+        "swarm-supervisor",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_stable": true,
+      "record_sha256": "900FE221D7682787F87D5E468A430AB8A11121ABB0F9EF9AB0FDD0FFE0DD6192",
+      "log_sha256": "AF2B98DCAE624223AC3F1B798AEA8A839F7AEC8168175C987E98F9568471F60F"
+    },
+    {
+      "platform": "linux",
+      "gate": "tests",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-process",
+        "-p",
+        "swarm-supervisor",
+        "--lib",
+        "-E",
+        "test(module_config_final_name_uses_exact_prefix_and_128_byte_predicate) | test(startup_invalid_module_config_name_rejects_before_restart_budget_or_owner_launch) | test(spawn_failure_publishes_exact_not_started_receipt_with_artifact_version)"
+      ],
+      "source_stable": true,
+      "record_sha256": "480A667542E8FDEBCCA27F255C1C58343ED9F7366227B773BCC0EEAE477ECA13",
+      "log_sha256": "0368B8664893A24F062DD5E05F886F99095480B4E17A46394581F773B2BD7656",
+      "test_count": 3
+    }
+  ],
+  "clippy_scope": "swarm-process, swarm-supervisor and swarm-kernel-host production --lib --bins --no-deps with -D warnings",
+  "consumer_scope": "Actual Service::run_lifecycle preflight and real ModuleOwner OS spawn refusal. No successful native worker launch is claimed.",
+  "pending_connected_consumers": [
+    "Actual supervisor recovery of produced spawn receipt",
+    "Retained Store readback of certified spawn-stage observation"
+  ],
+  "app369_full_connected_qualification": false,
+  "unrelated_app320": "Pending owned-launch fixture is byte-preserved in a separate snapshot and has no dependency on these gates",
+  "checks_not_run": [
+    "Composed supervisor recovery and retained Store readback for the produced spawn receipt",
+    "Whole workspace/native/model/crash/fault/load/Step5 free/Antigravity Gemini3.8 qualification"
+  ],
+  "scope_status": "APP363 scoped preflight qualified and APP369 production/producer repair qualified; APP369 connected recovery remains pending",
+  "audit_complete": false,
+  "full_v27_qualified": false
+}

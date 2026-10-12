@@ -568,7 +568,9 @@ impl ModuleFailureStage {
     }
 
     fn proves_pre_spawn(self) -> bool {
-        matches!(self, Self::ResolveRefs | Self::ValidateLaunch)
+        // A proven Command::spawn failure (empty family, exact pre-spawn receipt)
+        // is a certified not-started event like resolve_refs and validate_launch.
+        matches!(self, Self::ResolveRefs | Self::ValidateLaunch | Self::Spawn)
     }
 }
 
@@ -2202,7 +2204,11 @@ pub(super) fn public_projection(value: &Value) -> Value {
     };
     if stage.is_some() && error_code.is_none()
         || certainty == "not_started"
-            && !stage.is_some_and(|stage| matches!(stage, "resolve_refs" | "validate_launch"))
+            // A certified pre-spawn not_started stage is resolve_refs,
+            // validate_launch, or a proven spawn failure (empty family).
+            && !stage.is_some_and(|stage| {
+                matches!(stage, "resolve_refs" | "validate_launch" | "spawn")
+            })
     {
         return Value::Null;
     }

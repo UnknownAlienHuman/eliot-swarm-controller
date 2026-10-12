@@ -60,6 +60,7 @@ impl ModuleFailureStage {
         match value {
             "resolve_refs" => Some(Self::ResolveRefs),
             "validate_launch" => Some(Self::ValidateLaunch),
+            "spawn" => Some(Self::Spawn),
             _ => None,
         }
     }

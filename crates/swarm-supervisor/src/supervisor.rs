@@ -44,6 +44,7 @@ const OWNER_RECORD_LIMIT: u64 = 65_536;
 const LAUNCH_RECORD_LIMIT: u64 = 65_536;
 const MODULE_PLAN_LIMIT: u64 = 65_536;
 const RESTART_HISTORY_LIMIT: u64 = 16_384;
+const MODULE_CONFIG_ENV_PREFIX: &str = "ELIOT_SWARM_CONFIG_";
 const OWNER_DRAIN_POLL: Duration = Duration::from_millis(500);
 const HELPER_START_POLL: Duration = Duration::from_millis(100);
 const HELPER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -1826,6 +1827,20 @@ impl Service {
             {
                 continue;
             }
+            if let Err(error) = self.validate_launch_config_final_names() {
+                self.record_failure(
+                    &error.code,
+                    "launch config final environment name failed before restart accounting",
+                );
+                self.update_status(|status| {
+                    status.lifecycle = LifecycleState::Isolated {
+                        reason: "launch config produces an invalid final environment name"
+                            .to_owned(),
+                    };
+                    status.restart.exhausted = true;
+                });
+                return;
+            }
             if let Err(error) = self.clear_prior_helper_result() {
                 self.record_failure(
                     &error.code,
@@ -2308,8 +2323,7 @@ impl Service {
             )?;
         }
         for (key, value) in &self.launch_config.values {
-            validate_environment_name(key)?;
-            let name = format!("ELIOT_SWARM_CONFIG_{key}");
+            let name = Self::module_config_environment_name(key)?;
             self.add_launch_value(
                 &name,
                 value,
@@ -2493,6 +2507,40 @@ impl Service {
         Ok(path)
     }
 
+    /// Validate every composed environment name before restart accounting or
+    /// launch intent. BindingLaunchConfig validates raw keys, while this shared
+    /// predicate checks the exact ELIOT_SWARM_CONFIG_<rawKey> name emitted to the
+    /// native module.
+    fn validate_launch_config_final_names(&self) -> Result<()> {
+        for key in self.launch_config.values.keys() {
+            Self::module_config_environment_name(key)?;
+        }
+        Ok(())
+    }
+
+    fn module_config_environment_name(key: &str) -> Result<String> {
+        validate_environment_name(key)?;
+        let name = format!("{MODULE_CONFIG_ENV_PREFIX}{key}");
+        Self::prefixed_config_name_valid(&name)?;
+        Ok(name)
+    }
+
+    /// The single source of truth for a valid final module-config environment
+    /// name: exactly the ELIOT_SWARM_CONFIG_ prefix, at most 128 bytes, and ASCII
+    /// uppercase letters, digits, or underscores. Preflight and emission both
+    /// use this predicate so the raw-key and final-name contracts cannot diverge.
+    fn prefixed_config_name_valid(name: &str) -> Result<()> {
+        if !name.starts_with(MODULE_CONFIG_ENV_PREFIX)
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(Error::invalid("module config environment name is invalid"));
+        }
+        Ok(())
+    }
+
     fn add_launch_value(
         &self,
         name: &str,
@@ -2506,14 +2554,8 @@ impl Service {
                 "descriptor launch values cannot override module owner identity",
             ));
         }
-        if name.starts_with("ELIOT_SWARM_CONFIG_") {
-            if name.len() > 128
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-            {
-                return Err(Error::invalid("module config environment name is invalid"));
-            }
+        if name.starts_with(MODULE_CONFIG_ENV_PREFIX) {
+            Self::prefixed_config_name_valid(name)?;
         } else {
             validate_environment_name(name)?;
         }
@@ -2999,7 +3041,12 @@ impl Service {
             || receipt.get("disposition").and_then(Value::as_str) != Some("not_started")
             || receipt.get("worker_started").and_then(Value::as_bool) != Some(false)
             || receipt.get("family_empty").and_then(Value::as_bool) != Some(true)
-            || !matches!(stage, Some("resolve_refs" | "validate_launch"))
+            // "spawn" is the proven Command::spawn failure stage: the helper
+            // published the exact pre-spawn not_started receipt after proving an
+            // empty family, so recovery can consume it like the resolver and
+            // launch-validation stages instead of reporting launch evidence
+            // missing for a worker that was never started.
+            || !matches!(stage, Some("resolve_refs" | "validate_launch" | "spawn"))
             || !valid_error_code
         {
             return Err(Error::new(
@@ -4230,6 +4277,114 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    async fn startup_with_config_key(raw_key: String) -> (StartupFixture, Vec<u8>, Vec<u8>) {
+        let mut fixture = StartupFixture::new();
+        Arc::get_mut(&mut fixture.service)
+            .expect("startup fixture owns its service uniquely")
+            .launch_config
+            .values
+            .insert(raw_key, LaunchValue::Literal("fixture-value".to_owned()));
+        fixture.service.launch_config.validate().unwrap();
+        fixture.prepare_accounting();
+        fixture
+            .service
+            .write_restart_history(&VecDeque::new())
+            .unwrap();
+        let history_before =
+            fs::read(fixture.service.state_dir.join("restart-history.json")).unwrap();
+        let marker_before = fs::read(fixture.service.state_dir.join("module.lock")).unwrap();
+        lock(&fixture.service.demands).insert("fixture-demand".to_owned(), 1);
+        time::timeout(
+            Duration::from_secs(5),
+            fixture.service.clone().run_lifecycle(),
+        )
+        .await
+        .unwrap();
+        (fixture, history_before, marker_before)
+    }
+
+    async fn assert_invalid_module_config_key_rejected_before_accounting(raw_key: String) {
+        let (fixture, history_before, marker_before) =
+            startup_with_config_key(raw_key.clone()).await;
+        let service = &fixture.service;
+        let status = service.current_status();
+        assert!(matches!(
+            &status.lifecycle,
+            LifecycleState::Isolated { reason }
+                if reason == "launch config produces an invalid final environment name"
+        ));
+        assert!(status.last_failure.is_some());
+        assert_eq!(status.restart.starts_in_window, 0);
+        assert!(status.restart.exhausted);
+        assert!(status.owner.is_none());
+        assert!(status.worker.is_none());
+        assert!(status.worker_boot_id.is_none());
+        assert!(matches!(
+            &status.effect_certainty,
+            ModuleEffectCertainty::Unknown
+        ));
+        assert!(!status.readback_required);
+        assert!(service.read_restart_history().unwrap().is_empty());
+        assert_eq!(
+            fs::read(service.state_dir.join("restart-history.json")).unwrap(),
+            history_before,
+            "invalid raw key {raw_key:?} must not persist a restart attempt"
+        );
+        assert_eq!(
+            fs::read(service.state_dir.join("module.lock")).unwrap(),
+            marker_before,
+            "invalid raw key {raw_key:?} must preserve the existing custody marker"
+        );
+        assert!(!service.state_dir.join("launch-attempt.json").exists());
+        assert!(!service.state_dir.join("owner.json").exists());
+        assert!(!service.state_dir.join("worker.json").exists());
+        assert!(!service.state_dir.join("launch-result.json").exists());
+        assert!(service.helper_child_custody.lock().await.is_none());
+    }
+
+    #[test]
+    fn module_config_final_name_uses_exact_prefix_and_128_byte_predicate() {
+        let raw_limit = 128 - MODULE_CONFIG_ENV_PREFIX.len();
+        let raw_key = "A".repeat(raw_limit);
+        let final_name = Service::module_config_environment_name(&raw_key).unwrap();
+        assert_eq!(final_name, format!("ELIOT_SWARM_CONFIG_{raw_key}"));
+        assert_eq!(final_name.len(), 128);
+
+        let over_limit_key = "A".repeat(raw_limit + 1);
+        assert!(Service::module_config_environment_name(&over_limit_key).is_err());
+        assert!(Service::module_config_environment_name("opencode_service_id").is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_invalid_module_config_name_rejects_before_restart_budget_or_owner_launch() {
+        let raw_limit = 128 - MODULE_CONFIG_ENV_PREFIX.len();
+        let (at_limit, history_before, _) = startup_with_config_key("A".repeat(raw_limit)).await;
+        assert_eq!(
+            at_limit
+                .service
+                .current_status()
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.code.as_str()),
+            Some("MODULE_EXECUTABLE_UNAVAILABLE"),
+            "a 128-byte final name must pass preflight"
+        );
+        assert_eq!(at_limit.service.read_restart_history().unwrap().len(), 1);
+        assert_ne!(
+            fs::read(at_limit.service.state_dir.join("restart-history.json")).unwrap(),
+            history_before,
+            "the admitted boundary name must reach restart accounting"
+        );
+        assert!(at_limit.service.helper_child_custody.lock().await.is_none());
+
+        assert_invalid_module_config_key_rejected_before_accounting("A".repeat(raw_limit + 1))
+            .await;
+        assert_invalid_module_config_key_rejected_before_accounting(
+            "opencode_service_id".to_owned(),
+        )
+        .await;
     }
 
     #[cfg(any(windows, target_os = "linux"))]

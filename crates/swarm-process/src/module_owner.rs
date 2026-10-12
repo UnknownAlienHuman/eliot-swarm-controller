@@ -551,7 +551,23 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     for (name, value) in &resolved.environment {
         command.env(name, value);
     }
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_spawn_error) => {
+            // A Command::spawn failure is a proven pre-spawn not-started event:
+            // no child process was created, so the family is empty. Publish the
+            // exact negative launch receipt the supervisor consumes, but only
+            // after its empty-family proof. If that proof or publication fails,
+            // fail closed as Unknown rather than silently reporting not_started
+            // or returning a bare spawn error with no launch-result evidence.
+            let error = Error::new(
+                "MODULE_OWNER_SPAWN_FAILED",
+                "module worker process could not be started",
+            );
+            publish_pre_spawn_failure(&dir, &plan, &owner, &group, "spawn", &error)?;
+            return Err(error);
+        }
+    };
     if let Some(stderr_drain) = stderr_drain.as_mut() {
         stderr_drain.attach(child.stderr.take());
     }
@@ -1403,6 +1419,122 @@ fn canonical_json(value: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EmptyRefResolver;
+
+    impl ProtectedRefResolver for EmptyRefResolver {
+        fn resolve(&self, plan: &ModuleOwnerPlan, _: &Path, _: &Value) -> Result<ResolvedLaunch> {
+            Ok(ResolvedLaunch {
+                executable: plan.executable.clone(),
+                argv: plan.argv.clone(),
+                environment: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn spawn_failure_publishes_exact_not_started_receipt_with_artifact_version() {
+        let root = env::temp_dir().join(format!(
+            "swarm-module-owner-spawn-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        private_permissions(&root, true).unwrap();
+
+        let executable = root.join("not-a-native-executable.exe");
+        fs::write(&executable, b"not a native executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&executable, permissions).unwrap();
+        }
+
+        let state_dir = root.join("module-state");
+        let plan = ModuleOwnerPlan {
+            state_dir: state_dir.clone(),
+            executable,
+            argv: Vec::new(),
+            protected_refs: Vec::new(),
+            environment: Vec::new(),
+            module: "fixture.module".to_owned(),
+            binding: "fixture.binding".to_owned(),
+            generation: "7".to_owned(),
+            artifact_id: "fixture.artifact".to_owned(),
+            artifact_version: "9.4.1".to_owned(),
+            build_id: Some("fixture-build".to_owned()),
+            protocol: "1.0".to_owned(),
+            module_contract: "{}".to_owned(),
+            module_client_id: "fixture.client".to_owned(),
+            boot_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        let error = run_module_with_resolver(plan.clone(), &EmptyRefResolver).unwrap_err();
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(state_dir.join("launch-result.json")).unwrap())
+                .unwrap();
+        let owner: Value =
+            serde_json::from_slice(&fs::read(state_dir.join("owner.json")).unwrap()).unwrap();
+        let actual_fields = receipt
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected_fields = BTreeSet::from([
+            "version",
+            "boot_id",
+            "module",
+            "module_client_id",
+            "binding",
+            "generation",
+            "artifact_id",
+            "artifact_version",
+            "build_id",
+            "protocol",
+            "owner",
+            "disposition",
+            "worker_started",
+            "family_empty",
+            "stage",
+            "error_code",
+        ]);
+
+        assert_eq!(actual_fields, expected_fields);
+        assert_eq!(receipt["version"].as_u64(), Some(1));
+        assert_eq!(receipt["boot_id"].as_str(), Some(plan.boot_id.as_str()));
+        assert_eq!(receipt["module"].as_str(), Some(plan.module.as_str()));
+        assert_eq!(
+            receipt["module_client_id"].as_str(),
+            Some(plan.module_client_id.as_str())
+        );
+        assert_eq!(receipt["binding"].as_str(), Some(plan.binding.as_str()));
+        assert_eq!(
+            receipt["generation"].as_str(),
+            Some(plan.generation.as_str())
+        );
+        assert_eq!(
+            receipt["artifact_id"].as_str(),
+            Some(plan.artifact_id.as_str())
+        );
+        assert_eq!(
+            receipt["artifact_version"].as_str(),
+            Some(plan.artifact_version.as_str())
+        );
+        assert_eq!(receipt["build_id"].as_str(), plan.build_id.as_deref());
+        assert_eq!(receipt["protocol"].as_str(), Some(plan.protocol.as_str()));
+        assert_eq!(receipt["owner"], owner);
+        assert_eq!(receipt["disposition"].as_str(), Some("not_started"));
+        assert_eq!(receipt["worker_started"].as_bool(), Some(false));
+        assert_eq!(receipt["family_empty"].as_bool(), Some(true));
+        assert_eq!(receipt["stage"].as_str(), Some("spawn"));
+        assert_eq!(receipt["error_code"].as_str(), Some(error.code.as_str()));
+        assert_eq!(error.code, "MODULE_OWNER_SPAWN_FAILED");
+        assert!(!state_dir.join("worker.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn closed_worker_error_code_parser_rejects_ambiguous_stderr() {
