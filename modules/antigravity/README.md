@@ -130,9 +130,12 @@ a live run, `unavailable` is an honest absence — never an emulation.
   no encoder for them. Unknown event names from a newer CLI are skipped
   and counted, mirroring the native tolerance.
 - **EOF ends the channel.** Closing stdin is the documented graceful end;
-  the bridge closes stdin only on explicit module termination, then waits
-  for the current turn before any kill fallback on its own child. Host IPC
-  loss never touches the native process.
+  the bridge closes stdin on explicit module termination or failed native
+  initialization. A fresh open has a 30-second init deadline; timeout retains
+  Unknown, starts graceful cleanup and applies a bounded kill fallback to
+  its own child. Late init cannot restore readiness or admit a send. Child
+  and stream ownership remain retained until close. Host IPC loss never
+  touches the native process.
 
 ## Fixtures and self-test
 

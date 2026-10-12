@@ -12,8 +12,11 @@ import {
   bindPendingLocalResults, localResultMatches, snapshotObservation,
 } from './receipt-state.mjs';
 import {
+  createInitializationWait, finishSession, observeNativeInit,
+} from './bridge.mjs';
+import {
   createStreamState, applyNativeEvent, encodeUserMessage, snapshot,
-  terminalResultDisposition,
+  noteStreamEnd, terminalResultDisposition,
 } from './codec.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -26,6 +29,19 @@ function feed(messages) {
   const state = createStreamState();
   for (const message of messages) applyNativeEvent(state, message);
   return state;
+}
+function lifecycleSession() {
+  const child = {
+    stdin: { endCalls: 0, end() { this.endCalls++; } },
+    killCalls: 0,
+    kill() { this.killCalls++; return true; },
+  };
+  return {
+    state: createStreamState(), child, rootId: null, scopeKey: 'antigravity:fixture',
+    pendingSends: [], openWait: null, initTimer: null, cleanupTimer: null,
+    ended: false, initAborted: false, initCleanupStarted: false,
+    killRequested: false, inputFailed: false,
+  };
 }
 
 // 1. Init identity, step mapping and a SUCCESS terminal result.
@@ -187,6 +203,66 @@ function feed(messages) {
   assert.equal(liveResults[0].observation_id, undefined,
     'citing an observation does not mutate the captured native receipt');
   console.log('PASS receipt binding: new result gets a fresh immutable observation before outcome');
+}
+
+// 8. Initialization success, a deadline followed by late init, and child
+// close racing the deadline all settle the same production waiter safely.
+{
+  const ready = lifecycleSession();
+  const readyWait = createInitializationWait(ready, 50, 5);
+  const init = { event: 'init', conversation_id: 'conv_ready', init: { tools: [] } };
+  applyNativeEvent(ready.state, init);
+  assert.equal(observeNativeInit(ready, init), true);
+  await readyWait;
+  assert.equal(ready.rootId, 'conv_ready');
+  assert.equal(ready.initTimer, null, 'observed init cancels the deadline');
+  finishSession(ready);
+
+  const timedOut = lifecycleSession();
+  const timedOutWait = createInitializationWait(timedOut, 5, 8);
+  await assert.rejects(timedOutWait, error =>
+    error.diagnosticCode === 'NATIVE_INIT_TIMEOUT'
+      && error.nativeAdmissionPossible === true,
+  'a spawned child without init settles open as unknown');
+  assert.equal(timedOut.openWait, null, 'the timed-out waiter is settled exactly once');
+  assert.equal(timedOut.ended, false, 'timeout does not release child custody');
+  assert.equal(timedOut.child.stdin.endCalls, 1, 'timeout begins graceful owned cleanup');
+
+  const lateInit = { event: 'init', conversation_id: 'conv_late', init: { tools: [] } };
+  applyNativeEvent(timedOut.state, lateInit);
+  assert.equal(observeNativeInit(timedOut, lateInit), true, 'late native identity remains observable');
+  assert.equal(timedOut.rootId, 'conv_late');
+  assert.equal(timedOut.initAborted, true, 'late init cannot restore readiness or replay the open');
+  await new Promise(resolve => setTimeout(resolve, 12));
+  assert.equal(timedOut.child.killCalls, 1, 'the graceful window has a bounded kill fallback');
+  const retainedChild = timedOut.child;
+  finishSession(timedOut);
+  assert.equal(timedOut.child, retainedChild, 'close settlement does not drop the child capture');
+  assert.equal(timedOut.ended, true);
+
+  const closedDuringCleanup = lifecycleSession();
+  const cleanupRaceWait = createInitializationWait(closedDuringCleanup, 5, 20);
+  await assert.rejects(cleanupRaceWait, error => error.diagnosticCode === 'NATIVE_INIT_TIMEOUT');
+  const cleanupRaceChild = closedDuringCleanup.child;
+  finishSession(closedDuringCleanup);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(closedDuringCleanup.child, cleanupRaceChild, 'close during cleanup retains the child capture');
+  assert.equal(closedDuringCleanup.child.killCalls, 0, 'close cancels the pending kill fallback');
+
+  const closed = lifecycleSession();
+  const closedWait = createInitializationWait(closed, 20, 5);
+  const closeRejection = assert.rejects(closedWait, error =>
+    error.diagnosticCode === 'INIT_FAILURE'
+      && error.nativeAdmissionPossible === true,
+  'child close before init rejects the open as unknown');
+  noteStreamEnd(closed.state);
+  finishSession(closed);
+  await closeRejection;
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(closed.initTimer, null, 'close cancels the pending deadline');
+  assert.equal(closed.child.stdin.endCalls, 0, 'an already closed child needs no cleanup request');
+  assert.equal(closed.child.killCalls, 0, 'close winning the race prevents a late kill');
+  console.log('PASS native init lifecycle: success, unknown timeout, late init and close race');
 }
 
 console.log('Antigravity bridge self-test: all fixture assertions passed');

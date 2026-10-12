@@ -17,6 +17,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { Control } from './control.mjs';
 import {
   bindPendingLocalResults, localResultMatches, snapshotObservation,
@@ -29,6 +30,8 @@ import {
 
 const ENTRYPOINT = 'antigravity_cli_warm_stream';
 const ARTIFACT_ID = 'antigravity-cli-warm-bridge.2';
+const INIT_DEADLINE_MS = 30_000;
+const INIT_CLEANUP_GRACE_MS = 5_000;
 const EFFORTS = ['low', 'medium', 'high'];
 const CAPABILITIES = {
   describe: 'implemented',
@@ -63,17 +66,23 @@ function capabilityError(capability) {
   return error;
 }
 
+const isBridgeEntrypoint = process.argv[1] !== undefined
+  && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 const argv = process.argv.slice(2);
-if (argv.length !== 2 || argv[0] !== '--config') {
+if (isBridgeEntrypoint && (argv.length !== 2 || argv[0] !== '--config')) {
   console.error('Usage: node bridge.mjs --config <local-module.json>'); process.exit(2);
 }
-const config = JSON.parse(await readFile(argv[1], 'utf8'));
-const credential = JSON.parse(await readFile(required(config, 'credentialFile'), 'utf8'));
-required(config, 'endpoint');
-if (required(config, 'moduleArtifactId') !== ARTIFACT_ID) throw new Error('MODULE_ARTIFACT_MISMATCH');
-if (typeof config.command !== 'string' || !path.isAbsolute(config.command)) throw new Error('NATIVE_EXECUTABLE_MUST_BE_ABSOLUTE');
-if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(config.command)) throw new Error('USE_NATIVE_EXE_NOT_SHELL_WRAPPER');
-if (config.args !== undefined) throw new Error('ARGS_NOT_CONFIGURABLE_BRIDGE_OWNS_ARGV');
+const config = isBridgeEntrypoint ? JSON.parse(await readFile(argv[1], 'utf8')) : null;
+const credential = isBridgeEntrypoint
+  ? JSON.parse(await readFile(required(config, 'credentialFile'), 'utf8'))
+  : null;
+if (isBridgeEntrypoint) {
+  required(config, 'endpoint');
+  if (required(config, 'moduleArtifactId') !== ARTIFACT_ID) throw new Error('MODULE_ARTIFACT_MISMATCH');
+  if (typeof config.command !== 'string' || !path.isAbsolute(config.command)) throw new Error('NATIVE_EXECUTABLE_MUST_BE_ABSOLUTE');
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(config.command)) throw new Error('USE_NATIVE_EXE_NOT_SHELL_WRAPPER');
+  if (config.args !== undefined) throw new Error('ARGS_NOT_CONFIGURABLE_BRIDGE_OWNS_ARGV');
+}
 
 // The module-run owner (when used) provides a stable boot identity and the
 // managed_owner record for module.hello. This artifact keeps no checkpoint:
@@ -82,7 +91,7 @@ if (config.args !== undefined) throw new Error('ARGS_NOT_CONFIGURABLE_BRIDGE_OWN
 // (exact resume is an explicit new agent.open, never an automatic replay).
 let managedOwner = null;
 let bootId = randomUUID();
-{
+if (isBridgeEntrypoint) {
   const dir = process.env.ELIOT_SWARM_MODULE_STATE;
   const ownerFile = process.env.ELIOT_SWARM_MODULE_OWNER;
   if (dir && ownerFile) {
@@ -266,16 +275,79 @@ function failNativeInput(sess) {
   changed();
 }
 
-function finishSession(sess) {
+function initFailureError(sess) {
+  const failure = sess.state.init_failure;
+  const error = codedError('INIT_FAILURE', failure?.native_responded === true ? false : true);
+  error.initFailure = failure;
+  return error;
+}
+
+function killOwnedChild(sess, forceRetry = false) {
+  if (sess.ended || (!forceRetry && sess.killRequested) || !sess.child) return false;
+  sess.killRequested = true;
+  try { return sess.child.kill(); } catch { return false; }
+}
+
+function beginInitCleanup(sess, graceMs = INIT_CLEANUP_GRACE_MS) {
+  if (sess.ended || sess.initCleanupStarted || !sess.child) return false;
+  sess.initCleanupStarted = true;
+  // A failed open is an owned abandonment: retain the child and stream
+  // captures while EOF gives it a bounded graceful exit window.
+  try { sess.child.stdin.end(); } catch { /* already closed */ }
+  sess.cleanupTimer = setTimeout(() => {
+    sess.cleanupTimer = null;
+    killOwnedChild(sess);
+  }, graceMs);
+  return true;
+}
+
+function settleOpenWait(sess, error = null) {
+  const wait = sess.openWait;
+  if (!wait) return false;
+  sess.openWait = null;
+  if (sess.initTimer !== null) clearTimeout(sess.initTimer);
+  sess.initTimer = null;
+  if (error) wait.reject(error);
+  else wait.resolve();
+  return true;
+}
+
+export function createInitializationWait(sess, deadlineMs = INIT_DEADLINE_MS, cleanupGraceMs = INIT_CLEANUP_GRACE_MS) {
+  const opened = new Promise((resolve, reject) => { sess.openWait = { resolve, reject }; });
+  sess.initTimer = setTimeout(() => expireInitialization(sess, cleanupGraceMs), deadlineMs);
+  return opened;
+}
+
+function expireInitialization(sess, cleanupGraceMs) {
+  if (sess.ended || !sess.openWait) return false;
+  sess.initAborted = true;
+  const error = codedError('NATIVE_INIT_TIMEOUT', true);
+  noteStreamFailure(sess.state, error);
+  error.initFailure = sess.state.init_failure;
+  settleOpenWait(sess, error);
+  beginInitCleanup(sess, cleanupGraceMs);
+  changed();
+  return true;
+}
+
+export function observeNativeInit(sess, event) {
+  const conversationId = sess.state.init?.conversation_id;
+  if (sess.rootId || event?.event !== 'init' || !conversationId || event.conversation_id !== conversationId) {
+    return false;
+  }
+  sess.rootId = conversationId;
+  if (!sess.initAborted) settleOpenWait(sess);
+  return true;
+}
+
+export function finishSession(sess) {
   if (sess.ended) return;
   sess.ended = true;
-  if (sess.openWait) {
-    const failure = sess.state.init_failure;
-    const error = codedError('INIT_FAILURE', failure?.native_responded === true ? false : true);
-    error.initFailure = failure;
-    sess.openWait.reject(error);
-    sess.openWait = null;
-  }
+  if (sess.initTimer !== null) clearTimeout(sess.initTimer);
+  sess.initTimer = null;
+  if (sess.cleanupTimer !== null) clearTimeout(sess.cleanupTimer);
+  sess.cleanupTimer = null;
+  if (sess.openWait) settleOpenWait(sess, initFailureError(sess));
   for (const entry of sess.pendingSends.splice(0)) {
     saveOutcome(entry.operation_id, {
       outcome: 'unknown',
@@ -296,16 +368,11 @@ async function pump(sess) {
       try { event = JSON.parse(line); } catch { noteMalformedLine(sess.state); changed(); continue; }
       const ordinalBefore = sess.state.result_ordinal;
       applyNativeEvent(sess.state, event);
-      if (!sess.rootId && sess.state.init?.conversation_id) {
-        sess.rootId = sess.state.init.conversation_id;
-        if (sess.openWait) { sess.openWait.resolve(); sess.openWait = null; }
-      }
+      if (event?.event === 'init') observeNativeInit(sess, event);
       if (sess.state.phase === 'init_failed' && sess.openWait) {
-        const failure = sess.state.init_failure;
-        const error = codedError('INIT_FAILURE', failure?.native_responded === true ? false : true);
-        error.initFailure = failure;
-        sess.openWait.reject(error);
-        sess.openWait = null;
+        sess.initAborted = true;
+        settleOpenWait(sess, initFailureError(sess));
+        beginInitCleanup(sess);
       }
       if (sess.state.result_ordinal > ordinalBefore) {
         resultOrdinal = sess.state.result_ordinal;
@@ -341,7 +408,9 @@ async function startNative(command) {
   const state = createStreamState(resultOrdinal);
   const sess = {
     state, child: null, rootId: null, scopeKey: nativeScopeKey(),
-    pendingSends: [], openWait: null, ended: false, inputFailed: false,
+    pendingSends: [], openWait: null, initTimer: null, cleanupTimer: null,
+    ended: false, initAborted: false, initCleanupStarted: false,
+    killRequested: false, inputFailed: false,
   };
   let child;
   try {
@@ -352,17 +421,26 @@ async function startNative(command) {
   }
   sess.child = child;
   session = sess;
+  const opened = createInitializationWait(sess);
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { noteStderr(state, chunk); changed(); });
   child.stdin.on('error', () => { failNativeInput(sess); });
-  child.on('error', error => { noteStreamFailure(state, error); finishSession(sess); });
+  child.on('error', error => {
+    noteStreamFailure(state, error);
+    if (!sess.rootId) {
+      sess.initAborted = true;
+      if (sess.openWait) settleOpenWait(sess, initFailureError(sess));
+      beginInitCleanup(sess);
+    }
+    changed();
+  });
   child.on('close', code => {
     noteProcessExit(state, code);
     noteStreamEnd(state);
     finishSession(sess);
   });
   void pump(sess);
-  await new Promise((resolve, reject) => { sess.openWait = { resolve, reject }; });
+  await opened;
   return {
     native_root_id: sess.rootId,
     native_scope_key: sess.scopeKey,
@@ -376,7 +454,7 @@ async function startNative(command) {
 
 function sendNative(command) {
   const sess = session;
-  if (!sess || sess.ended || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
+  if (!sess || sess.ended || sess.initAborted || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
   if (command.native_root_id !== sess.rootId) throw codedError('NATIVE_IDENTITY_MISMATCH');
   if (sess.inputFailed) throw codedError('NATIVE_INPUT_STREAM_FAILED');
   const p = command.input ?? {};
@@ -418,7 +496,7 @@ async function execute(command) {
       if (sendNative(command) === DEFERRED) return;
     } else if (command.method === 'agent.refresh') {
       const sess = session;
-      if (!sess || sess.ended || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
+      if (!sess || sess.ended || sess.initAborted || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
       const target = command.input?.session_id === undefined ? sess.rootId : required(command.input, 'session_id');
       if (target === sess.rootId) {
         result = {
@@ -520,13 +598,13 @@ async function report(link = control) {
   }
 }
 let reportBusy = false;
-const interval = setInterval(() => {
+const interval = isBridgeEntrypoint ? setInterval(() => {
   if (!connected || reportBusy) return;
   reportBusy = true;
   const link = control;
   void report(link).catch(() => link.close()).finally(() => { reportBusy = false; });
-}, 1000);
-interval.unref();
+}, 1000) : null;
+interval?.unref();
 
 async function stop() {
   if (stopping) return;
@@ -534,9 +612,8 @@ async function stop() {
   connected = false;
   control?.close();
   clearInterval(interval);
-  // Only explicit termination of this bridge ends its own CLI process: EOF
-  // on stdin is the documented graceful end (the process exits after the
-  // current turn completes); the kill fallback covers a wedged process.
+  // Explicit bridge termination also ends its own CLI process: EOF on stdin
+  // is the documented graceful end; the kill fallback covers a wedged child.
   const sess = session;
   if (sess && !sess.ended && sess.child) {
     try { sess.child.stdin.end(); } catch { /* already closed */ }
@@ -544,23 +621,27 @@ async function stop() {
       new Promise(resolve => sess.child.once('close', () => resolve(true))),
       delay(5000).then(() => false),
     ]);
-    if (!exited) { try { sess.child.kill(); } catch { /* already gone */ } }
+    if (!exited) killOwnedChild(sess, true);
   }
 }
-process.once('SIGINT', () => { void stop().then(() => process.exit(0)); });
-process.once('SIGTERM', () => { void stop().then(() => process.exit(0)); });
+if (isBridgeEntrypoint) {
+  process.once('SIGINT', () => { void stop().then(() => process.exit(0)); });
+  process.once('SIGTERM', () => { void stop().then(() => process.exit(0)); });
+}
 
 let admissionTail = Promise.resolve();
-while (!stopping) {
+while (isBridgeEntrypoint && !stopping) {
   try {
     control = new Control(config.endpoint, credential);
     await control.connect();
     const hello = await control.call('module.hello', {
       boot_id: bootId,
       module_artifact_id: config.moduleArtifactId,
-      native_ready: Boolean(session && !session.ended && session.rootId),
+      native_ready: Boolean(session && !session.ended && !session.initAborted && session.rootId),
       ...(managedOwner ? { managed_owner: managedOwner } : {}),
-      ...(session?.rootId ? { native_root_id: session.rootId, native_scope_key: session.scopeKey } : {}),
+      ...(session?.rootId && !session.initAborted
+        ? { native_root_id: session.rootId, native_scope_key: session.scopeKey }
+        : {}),
     });
     if (hello.recovery_required) {
       // This artifact cannot verify or resume a recorded native owner (see
