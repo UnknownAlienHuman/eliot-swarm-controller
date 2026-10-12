@@ -2416,6 +2416,9 @@ fn prepare_outbox_batch(
             }
             Err(error) => return Err(error),
         }
+        if item.kind == "outcome" {
+            journal.validate_pending_outcome(&path, &item)?;
+        }
         prepared.push(PreparedOutboxItem { path, item });
     }
     Ok((prepared, deferred_paths))
@@ -2466,7 +2469,19 @@ where
     R: FnMut(),
 {
     let mut deferred_paths = HashSet::new();
+    let mut deferred_reconcile_summaries = Vec::<(PathBuf, String)>::new();
     loop {
+        let mut ready_summaries = Vec::new();
+        for (path, target_operation_id) in &deferred_reconcile_summaries {
+            if operation_outcome_is_acknowledged(journal, target_operation_id)? {
+                ready_summaries.push(path.clone());
+            }
+        }
+        for path in &ready_summaries {
+            deferred_paths.remove(path);
+        }
+        deferred_reconcile_summaries.retain(|(path, _)| !ready_summaries.contains(path));
+
         let items = journal.pending_items_excluding(&deferred_paths)?;
         if items.is_empty() {
             return Ok(());
@@ -2474,6 +2489,13 @@ where
         let (items, newly_deferred_paths) = prepare_outbox_batch(journal, items)?;
         deferred_paths.extend(newly_deferred_paths);
         for PreparedOutboxItem { path, item } in items {
+            if let Some(target_operation_id) = resolved_reconcile_target_id(journal, &item)?
+                && !operation_outcome_is_acknowledged(journal, &target_operation_id)?
+            {
+                deferred_paths.insert(path.clone());
+                deferred_reconcile_summaries.push((path, target_operation_id));
+                continue;
+            }
             match item.kind.as_str() {
                 "outcome" => {
                     let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
@@ -2716,6 +2738,58 @@ fn optional_identity_field<'a>(value: &'a Value, field: &str) -> Result<Option<&
             "host native identity field must be a nonempty string or null",
         )),
     }
+}
+
+fn resolved_reconcile_target_id(journal: &Journal, item: &PendingItem) -> Result<Option<String>> {
+    if item.kind != "outcome" || item.payload["details"]["resolved"] != true {
+        return Ok(None);
+    }
+    let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
+        Error::new(
+            "ADAPTER_OUTBOX",
+            "saved reconcile summary has no operation ID",
+        )
+    })?;
+    let history = journal.load(operation_id)?;
+    let Some(intent) = history
+        .intent
+        .as_ref()
+        .filter(|intent| intent.method == "agent.reconcile")
+    else {
+        return Ok(None);
+    };
+    let target_operation_id = intent
+        .reconcile_target_operation_id
+        .as_deref()
+        .filter(|target| !target.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+                "resolved reconcile summary has no exact target intent",
+            )
+        })?;
+    if item.payload["details"]["target_operation_id"] != target_operation_id {
+        return Err(Error::new(
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+            "resolved reconcile summary differs from its exact target intent",
+        ));
+    }
+    Ok(Some(target_operation_id.to_owned()))
+}
+
+fn operation_outcome_is_acknowledged(journal: &Journal, operation_id: &str) -> Result<bool> {
+    let history = journal.load(operation_id)?;
+    if history.torn_tail_evidence.is_some() {
+        return Ok(false);
+    }
+    let Some(digest) = history.outcome_sha256.as_deref() else {
+        return Ok(false);
+    };
+    Ok(history
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome["outcome"] == "applied")
+        && history.acknowledged_sha256.as_deref() == Some(digest))
 }
 
 #[cfg(test)]
@@ -3106,5 +3180,364 @@ mod outbox_recovery_tests {
         assert_eq!(pending[0].1.key, "corrupt-operation");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fixture_target_intent(operation_id: &str) -> OperationIntent {
+        let mut intent = fixture_effect_intent(operation_id);
+        intent.native_root_id = Some("fixture-root".to_owned());
+        intent
+    }
+
+    fn fixture_reconcile_intent(operation_id: &str, target_id: &str) -> OperationIntent {
+        let mut intent = fixture_effect_intent(operation_id);
+        intent.method = "agent.reconcile".to_owned();
+        intent.native_root_id = Some("fixture-root".to_owned());
+        intent.native_input_id = None;
+        intent.prompt_sha256 = None;
+        intent.prompt_bytes = None;
+        intent.reconcile_target_operation_id = Some(target_id.to_owned());
+        intent
+    }
+
+    fn fixture_linked_applied(
+        target: &OperationIntent,
+        reconcile_operation_id: &str,
+    ) -> RuntimeOutcome {
+        let applied = applied_from_intent(
+            target,
+            Some(InputEvidence {
+                admitted_sequence: Some(4),
+                prompted_sequence: None,
+            }),
+        )
+        .unwrap();
+        link_reconcile_target(applied, reconcile_operation_id).unwrap()
+    }
+
+    fn fixture_reconcile_outcome(
+        intent: &OperationIntent,
+        target_operation_id: &str,
+    ) -> RuntimeOutcome {
+        let mut details = json!({
+            "completion_condition":"native_readback_recorded",
+            "target_operation_id":target_operation_id,
+            "resolved":true,
+            "native_replay":false
+        });
+        module_receipt::insert_into_details(&mut details, &intent.module_receipt).unwrap();
+        RuntimeOutcome {
+            operation_id: intent.operation_id.clone(),
+            outcome: EffectOutcome::Applied,
+            native_scope_key: Some(intent.native_scope_key.clone()),
+            native_root_id: intent.native_root_id.clone(),
+            turn_id: None,
+            native_input_id: None,
+            details,
+        }
+    }
+
+    /// REG-09: a pending Unknown can be replaced only by the typed, linked
+    /// readback successor, and restart drains the exact latest outcome once.
+    #[tokio::test]
+    async fn unacknowledged_unknown_outcome_is_superseded_by_verified_applied() {
+        let root = std::env::temp_dir().join(format!("reg09-supersede-{}", uuid::Uuid::new_v4()));
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let superseded_id = "superseded-unknown-operation";
+        let target_intent = fixture_target_intent(superseded_id);
+        let reconcile_id = "superseded-unknown-reconcile";
+        let reconcile_intent = fixture_reconcile_intent(reconcile_id, superseded_id);
+        journal.write_intent(&target_intent).unwrap();
+        journal.write_intent(&reconcile_intent).unwrap();
+        let unknown =
+            unknown_from_intent(&target_intent, "NATIVE_EFFECT_MAY_HAVE_OCCURRED").unwrap();
+        journal.queue_outcome(&unknown).unwrap();
+        let slot = root
+            .join("outbox")
+            .join(format!("outcome-{}.json", operation_key(superseded_id)));
+        let unknown_bytes = std::fs::read(&slot).unwrap();
+        assert_eq!(pending_outcome_of(&unknown_bytes), json!("unknown"));
+
+        let applied = fixture_linked_applied(&target_intent, reconcile_id);
+        let reconcile_outcome = fixture_reconcile_outcome(&reconcile_intent, superseded_id);
+        journal.queue_outcome(&applied).unwrap();
+        journal.queue_outcome(&reconcile_outcome).unwrap();
+        let applied_bytes = std::fs::read(&slot).unwrap();
+        assert_eq!(pending_outcome_of(&applied_bytes), json!("applied"));
+        let history = journal.load(superseded_id).unwrap();
+        assert_eq!(history.outcome_revisions.len(), 2);
+        assert!(!history.outcome_revisions[0].acknowledged);
+        assert!(!history.outcome_revisions[1].acknowledged);
+
+        drop(journal);
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        journal.recover_outbox().unwrap();
+        let pending = journal.pending_items().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .all(|(_, item)| item.payload["outcome"] == "applied")
+        );
+
+        let mut deliveries = Vec::new();
+        flush_outbox_with_sender(
+            &journal,
+            |method, payload| {
+                assert_eq!(method, "module.outcome");
+                assert!(!method.starts_with("native."));
+                assert_eq!(payload["outcome"], json!("applied"));
+                deliveries.push(payload);
+                async move { Ok(()) }
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|payload| payload["operation_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![superseded_id, reconcile_id]
+        );
+        let applied_value = serde_json::to_value(&applied).unwrap();
+        let reconcile_value = serde_json::to_value(&reconcile_outcome).unwrap();
+        assert!(deliveries.contains(&applied_value));
+        assert!(deliveries.contains(&reconcile_value));
+
+        let history = journal.load(superseded_id).unwrap();
+        let applied_value = serde_json::to_value(&applied).unwrap();
+        let applied_digest = digest_json(&applied_value).unwrap();
+        assert!(history.torn_tail_evidence.is_none());
+        assert_eq!(
+            history.outcome_sha256.as_deref(),
+            Some(applied_digest.as_str())
+        );
+        assert_eq!(
+            history.acknowledged_sha256.as_deref(),
+            Some(applied_digest.as_str())
+        );
+        assert_eq!(history.outcome_revisions.len(), 2);
+        assert_eq!(history.outcome_revisions[0].outcome["outcome"], "unknown");
+        assert!(!history.outcome_revisions[0].acknowledged);
+        assert!(history.outcome_revisions[1].acknowledged);
+        journal.queue_outcome(&applied).unwrap();
+        assert_eq!(std::fs::read(&slot).unwrap(), applied_bytes);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An acknowledged Unknown remains history, while restart repairs a
+    /// missing publication from the exact durable linked Applied revision.
+    #[tokio::test]
+    async fn acknowledged_unknown_is_retained_and_latest_revision_recovers_after_restart() {
+        let root =
+            std::env::temp_dir().join(format!("reg09-acknowledged-{}", uuid::Uuid::new_v4()));
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let operation_id = "acknowledged-unknown-operation";
+        let reconcile_id = "acknowledged-unknown-reconcile";
+        let target_intent = fixture_target_intent(operation_id);
+        let reconcile_intent = fixture_reconcile_intent(reconcile_id, operation_id);
+        journal.write_intent(&target_intent).unwrap();
+        journal.write_intent(&reconcile_intent).unwrap();
+        let unknown =
+            unknown_from_intent(&target_intent, "NATIVE_EFFECT_MAY_HAVE_OCCURRED").unwrap();
+        journal.queue_outcome(&unknown).unwrap();
+        let slot = root
+            .join("outbox")
+            .join(format!("outcome-{}.json", operation_key(operation_id)));
+        let unknown_bytes = std::fs::read(&slot).unwrap();
+        assert_eq!(pending_outcome_of(&unknown_bytes), json!("unknown"));
+        let mut first_deliveries = Vec::new();
+        flush_outbox_with_sender(
+            &journal,
+            |method, payload| {
+                assert_eq!(method, "module.outcome");
+                first_deliveries.push(payload);
+                async move { Ok(()) }
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_deliveries.len(), 1);
+        assert_eq!(first_deliveries[0], serde_json::to_value(&unknown).unwrap());
+        assert!(!slot.exists());
+        let history = journal.load(operation_id).unwrap();
+        assert!(history.outcome_revisions[0].acknowledged);
+
+        let applied = fixture_linked_applied(&target_intent, reconcile_id);
+        let reconcile_outcome = fixture_reconcile_outcome(&reconcile_intent, operation_id);
+        journal.queue_outcome(&applied).unwrap();
+        journal.queue_outcome(&reconcile_outcome).unwrap();
+        let applied_value = serde_json::to_value(&applied).unwrap();
+        let reconcile_value = serde_json::to_value(&reconcile_outcome).unwrap();
+        let applied_bytes = std::fs::read(&slot).unwrap();
+        let history = journal.load(operation_id).unwrap();
+        assert_eq!(history.acknowledged_sha256, None);
+        assert!(history.outcome_revisions[0].acknowledged);
+        assert!(!history.outcome_revisions[1].acknowledged);
+
+        // Model a crash after the append-only outcome record but before its
+        // deterministic outbox publication.
+        std::fs::remove_file(&slot).unwrap();
+        drop(journal);
+
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        journal.recover_outbox().unwrap();
+        assert_eq!(std::fs::read(&slot).unwrap(), applied_bytes);
+        let mut second_deliveries = Vec::new();
+        let mut native_calls = 0;
+        flush_outbox_with_sender(
+            &journal,
+            |method, payload| {
+                if method.starts_with("native.") {
+                    native_calls += 1;
+                }
+                assert_eq!(method, "module.outcome");
+                second_deliveries.push(payload);
+                async move { Ok(()) }
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_deliveries.len(), 2);
+        assert_eq!(
+            second_deliveries
+                .iter()
+                .map(|payload| payload["operation_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![operation_id, reconcile_id]
+        );
+        assert!(second_deliveries.contains(&applied_value));
+        assert!(second_deliveries.contains(&reconcile_value));
+        assert_eq!(native_calls, 0);
+        let history = journal.load(operation_id).unwrap();
+        assert_eq!(history.outcome_revisions.len(), 2);
+        assert!(history.outcome_revisions[0].acknowledged);
+        assert!(history.outcome_revisions[1].acknowledged);
+        assert_eq!(
+            history.outcome_revisions[0].outcome,
+            serde_json::to_value(&unknown).unwrap()
+        );
+        assert_eq!(history.outcome_revisions[1].outcome, applied_value);
+        let applied_digest = digest_json(&serde_json::to_value(&applied).unwrap()).unwrap();
+        assert_eq!(
+            history.acknowledged_sha256.as_deref(),
+            Some(applied_digest.as_str())
+        );
+        let reconcile_history = journal.load(reconcile_id).unwrap();
+        assert_eq!(reconcile_history.outcome_revisions.len(), 1);
+        assert!(reconcile_history.outcome_revisions[0].acknowledged);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_reconcile_link_and_post_applied_payload_are_rejected_before_append() {
+        let root = std::env::temp_dir().join(format!("reg09-guards-{}", uuid::Uuid::new_v4()));
+        let journal = Journal::open(
+            &root,
+            "fixture-binding",
+            1,
+            "fixture-scope",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let operation_id = "guarded-reconcile-target";
+        let reconcile_id = "guarded-reconcile-operation";
+        let target_intent = fixture_target_intent(operation_id);
+        journal.write_intent(&target_intent).unwrap();
+        let wrong_route_id = "wrong-route-reconcile-operation";
+        let mut wrong_route_intent = fixture_reconcile_intent(wrong_route_id, operation_id);
+        wrong_route_intent.route_sha256 = format!("sha256:{}", "b".repeat(64));
+        journal.write_intent(&wrong_route_intent).unwrap();
+        journal
+            .write_intent(&fixture_reconcile_intent(reconcile_id, operation_id))
+            .unwrap();
+        let unknown =
+            unknown_from_intent(&target_intent, "NATIVE_EFFECT_MAY_HAVE_OCCURRED").unwrap();
+        journal.queue_outcome(&unknown).unwrap();
+        let operation_path = root
+            .join("operations")
+            .join(format!("{}.jsonl", operation_key(operation_id)));
+        let slot = root
+            .join("outbox")
+            .join(format!("outcome-{}.json", operation_key(operation_id)));
+        let operation_bytes = std::fs::read(&operation_path).unwrap();
+        let slot_bytes = std::fs::read(&slot).unwrap();
+
+        let wrong_route = fixture_linked_applied(&target_intent, wrong_route_id);
+        assert_eq!(
+            journal.queue_outcome(&wrong_route).unwrap_err().code,
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+        );
+        let mut wrong_receipt = fixture_linked_applied(&target_intent, reconcile_id);
+        wrong_receipt.details["module_receipt"]["binding_id"] = json!("foreign-binding");
+        assert_eq!(
+            journal.queue_outcome(&wrong_receipt).unwrap_err().code,
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+        );
+        let mut wrong_link = fixture_linked_applied(&target_intent, reconcile_id);
+        wrong_link.details["reconcile_operation_id"] = json!("foreign-reconcile-operation");
+        assert_eq!(
+            journal.queue_outcome(&wrong_link).unwrap_err().code,
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+        );
+        assert_eq!(std::fs::read(&operation_path).unwrap(), operation_bytes);
+        assert_eq!(std::fs::read(&slot).unwrap(), slot_bytes);
+
+        let applied = fixture_linked_applied(&target_intent, reconcile_id);
+        journal.queue_outcome(&applied).unwrap();
+        let applied_bytes = std::fs::read(&operation_path).unwrap();
+        let mut conflicting = applied;
+        conflicting.details["diagnostic_code"] = json!("different-payload");
+        assert_eq!(
+            journal.queue_outcome(&conflicting).unwrap_err().code,
+            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+        );
+        assert_eq!(std::fs::read(&operation_path).unwrap(), applied_bytes);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn pending_outcome_of(bytes: &[u8]) -> Value {
+        serde_json::from_slice::<PendingItem>(bytes)
+            .unwrap()
+            .payload["outcome"]
+            .clone()
     }
 }

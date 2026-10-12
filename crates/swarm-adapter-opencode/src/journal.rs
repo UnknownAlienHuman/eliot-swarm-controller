@@ -17,7 +17,7 @@ use std::{
 };
 use swarm_contracts::{
     error::{Error, Result},
-    runtime::{ModuleReceiptIdentity, RuntimeOutcome, TaskDispatchAdmissionReceipt},
+    runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeOutcome, TaskDispatchAdmissionReceipt},
 };
 use swarm_process::{
     JsonlScanVerdict, private_permissions, remove_private_durable, replace_private_durable,
@@ -111,12 +111,20 @@ pub struct OperationHistory {
     pub outcome: Option<Value>,
     pub outcome_sha256: Option<String>,
     pub acknowledged_sha256: Option<String>,
+    pub outcome_revisions: Vec<OutcomeRevision>,
     pub result_params: Option<Value>,
     pub result_sha256: Option<String>,
     pub result_acknowledged_sha256: Option<String>,
     /// Evidence for an incomplete final frame. The retained prefix remains
     /// available, but the journal must not be appended to or replayed.
     pub torn_tail_evidence: Option<TornTailEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeRevision {
+    pub outcome: Value,
+    pub sha256: String,
+    pub acknowledged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -294,6 +302,13 @@ fn summarize_retained_operation(
         if let Some(result) = intent.result_assistant.as_ref() {
             references.push(result.input_operation_id.clone());
         }
+    }
+    if history_is_unresolved(history) || pending_delivery {
+        references.extend(history.outcome_revisions.iter().filter_map(|revision| {
+            revision.outcome["details"]["reconcile_operation_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+        }));
     }
     let mut result_source = false;
     if let Some(intent) = history.intent.as_ref()
@@ -539,7 +554,29 @@ impl Journal {
             .ok_or_else(|| Error::new("ADAPTER_JOURNAL", "saved outcome has no operation ID"))?;
         let digest = digest_json(value)?;
         let history = self.load(operation_id)?;
+        if let Some(intent) = history
+            .intent
+            .as_ref()
+            .filter(|intent| intent.method == "agent.reconcile")
+        {
+            let summary: RuntimeOutcome = serde_json::from_value(value.clone())
+                .map_err(|_| recovery_outcome_unknown("reconcile summary is malformed"))?;
+            self.validate_reconcile_summary(intent, &summary)?;
+        }
+        if value["details"].get("reconcile_operation_id").is_some() {
+            let outcome: RuntimeOutcome = serde_json::from_value(value.clone()).map_err(|_| {
+                recovery_outcome_unknown("linked reconciliation outcome is malformed")
+            })?;
+            let intent = history.intent.as_ref().ok_or_else(|| {
+                recovery_outcome_unknown("linked reconciliation target has no saved intent")
+            })?;
+            self.validate_linked_reconcile_outcome(intent, &outcome)?;
+        }
         if history.outcome_sha256.as_deref() != Some(digest.as_str()) {
+            self.validate_outcome_publication_predecessor(operation_id, &history)?;
+            if let Some(previous) = history.outcome.as_ref() {
+                validate_outcome_successor(previous, value)?;
+            }
             self.append(
                 operation_id,
                 &JournalRecord {
@@ -742,7 +779,6 @@ impl Journal {
             }
             if let (Some(outcome), Some(digest)) =
                 (history.outcome.as_ref(), history.outcome_sha256.as_ref())
-                && history.acknowledged_sha256.as_deref() != Some(digest.as_str())
             {
                 let Some(operation_id) = outcome["operation_id"].as_str() else {
                     continue;
@@ -751,11 +787,60 @@ impl Journal {
                 if name != expected {
                     continue;
                 }
-                self.write_pending(PendingItem {
-                    kind: "outcome".into(),
-                    key: operation_id.into(),
-                    payload: outcome.clone(),
-                })?;
+                let pending_path = self
+                    .outbox
+                    .join(format!("outcome-{}.json", operation_key(operation_id)));
+                if history.acknowledged_sha256.as_deref() != Some(digest.as_str()) {
+                    if outcome["details"].get("reconcile_operation_id").is_some() {
+                        let linked: RuntimeOutcome = match serde_json::from_value(outcome.clone()) {
+                            Ok(linked) => linked,
+                            Err(_) => {
+                                retention::mark_damaged(self)?;
+                                continue;
+                            }
+                        };
+                        let Some(intent) = history.intent.as_ref() else {
+                            retention::mark_damaged(self)?;
+                            continue;
+                        };
+                        if self
+                            .validate_linked_reconcile_outcome(intent, &linked)
+                            .is_err()
+                        {
+                            retention::mark_damaged(self)?;
+                            continue;
+                        }
+                    }
+                    if self
+                        .write_pending(PendingItem {
+                            kind: "outcome".into(),
+                            key: operation_id.into(),
+                            payload: outcome.clone(),
+                        })
+                        .is_err()
+                    {
+                        retention::mark_damaged(self)?;
+                        continue;
+                    }
+                }
+                match fs::symlink_metadata(&pending_path) {
+                    Ok(_) => {
+                        ensure_regular(&pending_path, "outbox item")?;
+                        let bytes = read_limited(&pending_path, RECORD_LIMIT)?;
+                        let pending: PendingItem = serde_json::from_slice(&bytes)
+                            .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
+                        if self
+                            .validate_pending_outcome(&pending_path, &pending)
+                            .is_err()
+                        {
+                            retention::mark_damaged(self)?;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        retention::mark_damaged(self)?;
+                    }
+                }
             }
             if let (Some(params), Some(digest)) = (
                 history.result_params.as_ref(),
@@ -1283,19 +1368,26 @@ impl Journal {
             let previous = read_limited(&path, RECORD_LIMIT)?;
             let previous_value: Value = serde_json::from_slice(&previous)
                 .map_err(|_| Error::new("ADAPTER_OUTBOX", "existing outbox item is invalid"))?;
-            let new_value = serde_json::to_value(item)?;
+            let new_value = serde_json::to_value(&item)?;
             if previous_value != new_value {
-                return Err(Error::new(
-                    "ADAPTER_OUTBOX",
-                    "pending item identity conflicts with saved result",
-                ));
+                // The slot key is derived from the operation identity, so a
+                // reconciled successor collides with the predecessor it
+                // replaces. Refusing every changed payload would strand the
+                // successor forever; exactly one promotion is allowed.
+                if !self.supersede_unknown_with_linked_applied(&path, &item, &previous_value)? {
+                    return Err(Error::new(
+                        "ADAPTER_OUTBOX",
+                        "pending item identity conflicts with saved result",
+                    ));
+                }
+            } else {
+                replace_private_durable(&path, &previous).map_err(|_| {
+                    Error::new(
+                        "ADAPTER_OUTBOX",
+                        "pending item could not be durably published",
+                    )
+                })?;
             }
-            replace_private_durable(&path, &previous).map_err(|_| {
-                Error::new(
-                    "ADAPTER_OUTBOX",
-                    "pending item could not be durably published",
-                )
-            })?;
             if let Some(operation_id) = retention_operation_id {
                 retention::refresh_operation(self, &operation_id);
             }
@@ -1310,6 +1402,381 @@ impl Journal {
 
     fn load_by_path(&self, path: &Path) -> Result<OperationHistory> {
         read_operation_history(path, None)
+    }
+
+    fn validate_intent_state_identity(&self, intent: &OperationIntent) -> Result<()> {
+        let receipt = &intent.module_receipt;
+        if intent.version != 2
+            || intent.operation_id.trim().is_empty()
+            || intent.binding_id != self.identity.binding_id
+            || intent.generation != self.identity.generation
+            || intent.native_scope_key != self.identity.native_scope_key
+            || !same_route_digest(&intent.route_sha256, &self.identity.route_sha256)
+            || receipt.validate().is_err()
+            || receipt.operation_id != intent.operation_id
+            || receipt.binding_id != intent.binding_id
+            || receipt.binding_generation != intent.generation
+        {
+            return Err(recovery_outcome_unknown(
+                "reconciliation intent differs from the durable adapter identity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_linked_reconcile_outcome(
+        &self,
+        target_intent: &OperationIntent,
+        outcome: &RuntimeOutcome,
+    ) -> Result<()> {
+        self.validate_intent_state_identity(target_intent)?;
+        let reconcile_id = outcome.details["reconcile_operation_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                recovery_outcome_unknown("reconciliation outcome has no exact reconcile link")
+            })?;
+        if outcome.operation_id != target_intent.operation_id
+            || target_intent.method == "agent.reconcile"
+            || reconcile_id == target_intent.operation_id
+            || outcome.native_scope_key.as_deref() != Some(target_intent.native_scope_key.as_str())
+            || outcome.native_root_id.as_deref() != target_intent.native_root_id.as_deref()
+            || outcome.native_input_id.as_deref() != target_intent.native_input_id.as_deref()
+            || outcome.details["native_replay"] != false
+        {
+            return Err(recovery_outcome_unknown(
+                "linked target outcome differs from its immutable intent",
+            ));
+        }
+        let target_receipt: ModuleReceiptIdentity =
+            serde_json::from_value(outcome.details["module_receipt"].clone()).map_err(|_| {
+                recovery_outcome_unknown("linked target outcome has no valid module receipt")
+            })?;
+        if target_receipt != target_intent.module_receipt {
+            return Err(recovery_outcome_unknown(
+                "linked target outcome receipt differs from its immutable intent",
+            ));
+        }
+
+        let reconcile_history = self.load(reconcile_id)?;
+        if reconcile_history.torn_tail_evidence.is_some() {
+            return Err(recovery_outcome_unknown(
+                "linked reconcile operation has a torn journal suffix",
+            ));
+        }
+        let reconcile_intent = reconcile_history.intent.as_ref().ok_or_else(|| {
+            recovery_outcome_unknown("linked reconcile operation has no saved intent")
+        })?;
+        self.validate_intent_state_identity(reconcile_intent)?;
+        if reconcile_intent.operation_id != reconcile_id
+            || reconcile_intent.method != "agent.reconcile"
+            || reconcile_intent.reconcile_target_operation_id.as_deref()
+                != Some(target_intent.operation_id.as_str())
+            || reconcile_intent.binding_id != target_intent.binding_id
+            || reconcile_intent.generation != target_intent.generation
+            || reconcile_intent.native_scope_key != target_intent.native_scope_key
+            || !same_route_digest(&reconcile_intent.route_sha256, &target_intent.route_sha256)
+        {
+            return Err(recovery_outcome_unknown(
+                "reconcile intent does not identify this exact target and route",
+            ));
+        }
+
+        match outcome.outcome {
+            EffectOutcome::Unknown => {}
+            EffectOutcome::Applied => {
+                let exact_input_readback = target_intent.native_input_id.is_some()
+                    && outcome.details["completion_condition"] == "native_input_admitted"
+                    && outcome.details["evidence"] == "durable_session_history"
+                    && outcome.details["execution_complete"] == false;
+                let exact_session_readback = target_intent.native_input_id.is_none()
+                    && outcome.details["completion_condition"] == "native_session_created"
+                    && outcome.details["evidence"] == "exact_session_readback";
+                if !matches!(
+                    target_intent.method.as_str(),
+                    "agent.open"
+                        | "task.dispatch"
+                        | "agent.send"
+                        | "native.opencode.loop_step"
+                        | "agent.reply"
+                ) || !(exact_input_readback || exact_session_readback)
+                {
+                    return Err(recovery_outcome_unknown(
+                        "Applied successor lacks the exact readback evidence for its intent",
+                    ));
+                }
+            }
+            EffectOutcome::Accepted | EffectOutcome::Rejected => {
+                return Err(recovery_outcome_unknown(
+                    "linked target outcome is outside the readback settlement states",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_reconcile_summary(
+        &self,
+        reconcile_intent: &OperationIntent,
+        summary: &RuntimeOutcome,
+    ) -> Result<()> {
+        self.validate_intent_state_identity(reconcile_intent)?;
+        let target_id = reconcile_intent
+            .reconcile_target_operation_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| recovery_outcome_unknown("reconcile intent has no exact target"))?;
+        let summary_receipt: ModuleReceiptIdentity =
+            serde_json::from_value(summary.details["module_receipt"].clone()).map_err(|_| {
+                recovery_outcome_unknown("reconcile summary has no valid module receipt")
+            })?;
+        if summary.operation_id != reconcile_intent.operation_id
+            || summary.operation_id == target_id
+            || summary.outcome != EffectOutcome::Applied
+            || summary.native_scope_key.as_deref()
+                != Some(reconcile_intent.native_scope_key.as_str())
+            || summary.native_root_id.as_deref() != reconcile_intent.native_root_id.as_deref()
+            || summary.native_input_id.is_some()
+            || summary.details["target_operation_id"] != target_id
+            || summary.details["completion_condition"] != "native_readback_recorded"
+            || summary.details["resolved"].as_bool().is_none()
+            || summary.details["native_replay"] != false
+            || summary_receipt != reconcile_intent.module_receipt
+        {
+            return Err(recovery_outcome_unknown(
+                "reconcile summary differs from its exact admitted Operation intent",
+            ));
+        }
+
+        if summary.details["resolved"] == true {
+            let target_history = self.load(target_id)?;
+            if target_history.torn_tail_evidence.is_some() {
+                return Err(recovery_outcome_unknown(
+                    "resolved reconcile target has a torn journal suffix",
+                ));
+            }
+            let target_intent = target_history.intent.as_ref().ok_or_else(|| {
+                recovery_outcome_unknown("resolved reconcile target has no saved intent")
+            })?;
+            self.validate_intent_state_identity(target_intent)?;
+            let target_outcome = target_history.outcome.as_ref().ok_or_else(|| {
+                recovery_outcome_unknown("resolved reconcile target has no saved outcome")
+            })?;
+            let target_receipt: ModuleReceiptIdentity =
+                serde_json::from_value(target_outcome["details"]["module_receipt"].clone())
+                    .map_err(|_| {
+                        recovery_outcome_unknown("resolved target outcome has no valid receipt")
+                    })?;
+            if target_intent.method == "agent.reconcile"
+                || target_intent.binding_id != reconcile_intent.binding_id
+                || target_intent.generation != reconcile_intent.generation
+                || target_intent.native_scope_key != reconcile_intent.native_scope_key
+                || !same_route_digest(&target_intent.route_sha256, &reconcile_intent.route_sha256)
+                || target_outcome["outcome"] != "applied"
+                || target_receipt != target_intent.module_receipt
+            {
+                return Err(recovery_outcome_unknown(
+                    "resolved reconcile summary differs from the saved Applied target Operation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_outcome_publication_predecessor(
+        &self,
+        operation_id: &str,
+        history: &OperationHistory,
+    ) -> Result<()> {
+        if history.torn_tail_evidence.is_some() {
+            return Err(torn_ack_recovery_unknown());
+        }
+        let path = self
+            .outbox
+            .join(format!("outcome-{}.json", operation_key(operation_id)));
+        let latest = history.outcome.as_ref();
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                ensure_regular(&path, "outbox item")?;
+                let bytes = read_limited(&path, RECORD_LIMIT)?;
+                let pending: PendingItem = serde_json::from_slice(&bytes)
+                    .map_err(|_| Error::new("ADAPTER_OUTBOX", "existing outbox item is invalid"))?;
+                let Some(latest) = latest else {
+                    return Err(Error::new(
+                        "ADAPTER_OUTBOX",
+                        "outbox outcome has no durable journal predecessor",
+                    ));
+                };
+                let pending_digest = digest_json(&pending.payload)?;
+                if pending.kind != "outcome"
+                    || pending.key != operation_id
+                    || pending.payload != *latest
+                    || history.outcome_sha256.as_deref() != Some(pending_digest.as_str())
+                {
+                    return Err(Error::new(
+                        "ADAPTER_OUTBOX",
+                        "outbox slot is not the exact durable outcome predecessor",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if latest.is_some()
+                    && history.outcome_sha256.as_deref().is_some_and(|digest| {
+                        history.acknowledged_sha256.as_deref() != Some(digest)
+                    })
+                {
+                    return Err(recovery_outcome_unknown(
+                        "unacknowledged outcome predecessor has no deterministic outbox slot",
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(Error::new(
+                    "ADAPTER_OUTBOX",
+                    "outbox predecessor cannot be inspected",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_pending_outcome(&self, path: &Path, item: &PendingItem) -> Result<()> {
+        let operation_id = item.payload["operation_id"]
+            .as_str()
+            .ok_or_else(|| Error::new("ADAPTER_OUTBOX", "saved outcome has no operation ID"))?;
+        let expected_path = self
+            .outbox
+            .join(format!("outcome-{}.json", operation_key(operation_id)));
+        if item.kind != "outcome" || item.key != operation_id || path != expected_path {
+            return Err(Error::new(
+                "ADAPTER_OUTBOX",
+                "pending outcome identity differs from its deterministic slot",
+            ));
+        }
+        let history = self.load(operation_id)?;
+        if history.torn_tail_evidence.is_some()
+            || history.outcome.as_ref() != Some(&item.payload)
+            || history.outcome_sha256.as_deref() != Some(digest_json(&item.payload)?.as_str())
+        {
+            return Err(recovery_outcome_unknown(
+                "pending outcome is not the exact latest durable revision",
+            ));
+        }
+        if item.payload["details"]
+            .get("reconcile_operation_id")
+            .is_some()
+        {
+            let outcome: RuntimeOutcome =
+                serde_json::from_value(item.payload.clone()).map_err(|_| {
+                    recovery_outcome_unknown("pending linked reconciliation outcome is malformed")
+                })?;
+            let intent = history.intent.as_ref().ok_or_else(|| {
+                recovery_outcome_unknown("pending linked target has no saved intent")
+            })?;
+            self.validate_linked_reconcile_outcome(intent, &outcome)?;
+        }
+        if let Some(intent) = history
+            .intent
+            .as_ref()
+            .filter(|intent| intent.method == "agent.reconcile")
+        {
+            let summary: RuntimeOutcome = serde_json::from_value(item.payload.clone())
+                .map_err(|_| recovery_outcome_unknown("pending reconcile summary is malformed"))?;
+            self.validate_reconcile_summary(intent, &summary)?;
+        }
+        Ok(())
+    }
+
+    /// Promote the exact previous Unknown revision to its linked, verified
+    /// Applied successor in place, without replaying a native mutation.
+    ///
+    /// The outbox slot is `outcome-<hashed operation key>.json`, so a
+    /// predecessor and its reconciled successor share one deterministic path.
+    /// A prior ACK remains part of history; it acknowledges only its own
+    /// revision and does not prohibit this exact readback successor.
+    fn supersede_unknown_with_linked_applied(
+        &self,
+        path: &Path,
+        item: &PendingItem,
+        previous_value: &Value,
+    ) -> Result<bool> {
+        if item.kind != "outcome" {
+            return Ok(false);
+        }
+        if previous_value["kind"] != "outcome"
+            || previous_value["key"] != item.key
+            || previous_value["payload"]["operation_id"] != item.payload["operation_id"]
+        {
+            return Ok(false);
+        }
+        let previous = previous_value["payload"]["outcome"]
+            .as_str()
+            .ok_or_else(|| Error::new("ADAPTER_OUTBOX", "existing outbox item is invalid"))?;
+        let successor = item.payload["outcome"]
+            .as_str()
+            .ok_or_else(|| Error::new("ADAPTER_JOURNAL", "saved outcome has no state"))?;
+        // Only the recovery-ambiguous Unknown state may be upgraded, and only
+        // by the verified native readback that produces Applied.
+        if previous != "unknown" || successor != "applied" {
+            return Ok(false);
+        }
+        if path
+            != self
+                .outbox
+                .join(format!("outcome-{}.json", operation_key(&item.key)))
+        {
+            return Ok(false);
+        }
+        let history = self.load(&item.key)?;
+        if history.torn_tail_evidence.is_some() {
+            return Err(torn_ack_recovery_unknown());
+        }
+        let Some(current) = history.outcome.as_ref() else {
+            return Ok(false);
+        };
+        let current_digest = digest_json(&item.payload)?;
+        if current != &item.payload
+            || history.outcome_sha256.as_deref() != Some(current_digest.as_str())
+        {
+            return Err(recovery_outcome_unknown(
+                "outbox successor is not the exact latest durable outcome revision",
+            ));
+        }
+        let Some(predecessor) = history.outcome_revisions.iter().rev().nth(1) else {
+            return Err(recovery_outcome_unknown(
+                "outbox promotion has no retained predecessor revision",
+            ));
+        };
+        let previous_payload = &previous_value["payload"];
+        let previous_digest = digest_json(previous_payload)?;
+        if predecessor.outcome != *previous_payload
+            || predecessor.sha256 != previous_digest
+            || previous != "unknown"
+            || successor != "applied"
+            || history.outcome_revisions.last().is_none_or(|latest| {
+                latest.outcome != item.payload || latest.sha256 != current_digest
+            })
+        {
+            return Err(recovery_outcome_unknown(
+                "outbox slot is not the exact Unknown predecessor of the durable Applied revision",
+            ));
+        }
+        self.validate_pending_outcome(path, item)?;
+        let bytes = serde_json::to_vec(item)?;
+        if bytes.len() > RECORD_LIMIT {
+            return Err(Error::new(
+                "ADAPTER_OUTBOX",
+                "pending host message exceeds its record limit",
+            ));
+        }
+        replace_private_durable(path, &bytes).map_err(|_| {
+            Error::new(
+                "ADAPTER_OUTBOX",
+                "pending item could not be durably published",
+            )
+        })?;
+        retention::refresh_operation(self, &item.key);
+        Ok(true)
     }
 }
 
@@ -1386,6 +1853,40 @@ fn torn_ack_recovery_unknown() -> Error {
         "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
         "torn journal suffix could not be safely removed from the exact saved payload prefix",
     )
+}
+
+fn recovery_outcome_unknown(message: &'static str) -> Error {
+    Error::new("ADAPTER_JOURNAL_RECOVERY_UNKNOWN", message)
+}
+
+fn same_route_digest(left: &str, right: &str) -> bool {
+    fn route_hex(value: &str) -> Option<&str> {
+        let value = value.strip_prefix("sha256:").unwrap_or(value);
+        (value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(value)
+    }
+
+    route_hex(left).is_some() && route_hex(left) == route_hex(right)
+}
+
+fn validate_outcome_successor(previous: &Value, successor: &Value) -> Result<()> {
+    let linked_reconcile = successor["details"]["reconcile_operation_id"]
+        .as_str()
+        .is_some_and(|operation_id| !operation_id.trim().is_empty());
+    if previous["operation_id"] == successor["operation_id"]
+        && previous["outcome"] == "unknown"
+        && successor["outcome"] == "applied"
+        && linked_reconcile
+        && successor["details"]["native_replay"] == false
+    {
+        return Ok(());
+    }
+    Err(recovery_outcome_unknown(
+        "changed outcome is not an exact readback-linked Unknown-to-Applied successor",
+    ))
 }
 
 fn read_opened_file_for_repair(path: &Path, file: &mut File) -> Result<Vec<u8>> {
@@ -1486,6 +1987,19 @@ fn apply_operation_record(
                     "journal outcome digest mismatch",
                 ));
             }
+            if history.outcome_sha256.as_deref() != Some(digest.as_str()) {
+                if let Some(previous) = history.outcome.as_ref() {
+                    validate_outcome_successor(previous, &outcome)?;
+                }
+                history.outcome_revisions.push(OutcomeRevision {
+                    outcome: outcome.clone(),
+                    sha256: digest.clone(),
+                    acknowledged: false,
+                });
+                // An ACK is scoped to the revision it followed. Keep earlier
+                // ACKs in outcome_revisions while resetting the current slot.
+                history.acknowledged_sha256 = None;
+            }
             history.outcome = Some(outcome);
             history.outcome_sha256 = Some(digest);
         }
@@ -1499,6 +2013,16 @@ fn apply_operation_record(
                     "acknowledgement does not match the latest saved outcome",
                 ));
             }
+            let latest = history.outcome_revisions.last_mut().ok_or_else(|| {
+                Error::new("ADAPTER_JOURNAL", "acknowledgement has no outcome revision")
+            })?;
+            if latest.sha256 != digest {
+                return Err(Error::new(
+                    "ADAPTER_JOURNAL",
+                    "acknowledgement does not match the latest outcome revision",
+                ));
+            }
+            latest.acknowledged = true;
             history.acknowledged_sha256 = Some(digest);
         }
         "result_page" => {
