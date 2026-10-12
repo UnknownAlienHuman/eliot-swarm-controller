@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "slice": "REG-27",
+  "edition": "tests-only-v2",
+  "prepared_at_utc": "2026-10-12T20:27:46.6682433Z",
+  "owner": "main manager",
+  "base_main": "5b047fe046d7c8c080a83389cd045afafa9baa84",
+  "problem": "Missing regression coverage for malformed retained actors and ambiguous historical mailbox delivery IDs",
+  "resulting_behavior": "Three portable consumers exercise exact retained identity, enabled registration and binding-generation checks, permitted historical Task/Attempt reads, and MAILBOX_DELIVERY_AMBIGUOUS through public Store message.cancel",
+  "changed_paths": [
+    {
+      "path": "crates/swarm-kernel-host/src/store/concilium.rs",
+      "baseline_sha256": "C5F48FE0F9E7BFF585BB21C3B096D6E597DEE767BFA3790C36BE198361022DB2",
+      "proposed_sha256": "09D6F3B3782EC1CED25507BDAAD8CEA5B94949FDA1F1BE7C45052E76E20467B5"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/mailbox_tests.rs",
+      "baseline_sha256": "E87F6B54268229EBBE88ED462831FF3A682AD334EFDF882F364B018607D5A699",
+      "proposed_sha256": "3B7AB25780644F4B560C9B7C4F4CF1683A4958FF80ECD74117D4F641396112B4"
+    }
+  ],
+  "production_change": false,
+  "production_concilium_prefix_unchanged_after_lf_normalization": true,
+  "prior_allegation": "Retracted: baseline exact value_text_is already rejects missing/empty retained actor IDs for nonempty readers; no production wildcard repair was required",
+  "tests": [
+    "store::concilium::repair_tests::concilium_retained_participant_selection_rejects_missing_or_empty_actor_client_id",
+    "store::concilium::repair_tests::concilium_retained_participant_read_requires_same_enabled_actor_generation_after_rebind",
+    "store::mailbox_tests::message_cancel_rejects_ambiguous_legacy_delivery_id"
+  ],
+  "gates": [
+    {
+      "platform": "windows",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(concilium_retained_participant_selection_rejects_missing_or_empty_actor_client_id) | test(concilium_retained_participant_read_requires_same_enabled_actor_generation_after_rebind) | test(message_cancel_rejects_ambiguous_legacy_delivery_id)",
+        "--success-output",
+        "immediate"
+      ],
+      "exit_code": 0,
+      "selected_tests": 3,
+      "passed": 3,
+      "source_stable": true,
+      "source_manifest_sha256": "512EFB0ED4EC844A862722702364AAA1A60CD6436D4879D51173EB8439FF18C1",
+      "gate_sha256": "2689875D9E45551408D5C380B4B1D2F72163D9ABE59D0513E680AD2290DF3434",
+      "log_sha256": "CB49BB92CD06F1F93F75D17A200FDAE7134E5EC18EA0EB5BA1A4EEF86C844B47",
+      "scope": "Three named portable Store consumers, not native/model qualification"
+    },
+    {
+      "platform": "linux",
+      "command": "+1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib -E 'test(=store::concilium::repair_tests::concilium_retained_participant_selection_rejects_missing_or_empty_actor_client_id) | test(=store::concilium::repair_tests::concilium_retained_participant_read_requires_same_enabled_actor_generation_after_rebind) | test(=store::mailbox_tests::message_cancel_rejects_ambiguous_legacy_delivery_id)' --success-output immediate",
+      "exit_code": 0,
+      "selected_tests": 3,
+      "passed": 3,
+      "source_stable": true,
+      "source_manifest_sha256": "5C1942850FEAF0C5C2ADA60FCE00F306ACE54CC1C7CFB741112ECC781BC0502A",
+      "gate_sha256": "F7217ECDBA5EFC89851B16D9F254F61923F5C989A56233C5783BCFE1509D43D3",
+      "log_sha256": "8A969478EE1860A7F6C523AD3E031346767E6327129E5F948BB793B8B976054E",
+      "scope": "Three named portable Store consumers, not native/model qualification"
+    }
+  ],
+  "windows_success_repeated": false,
+  "formatting": "rustfmt +1.98.1 --edition 2024 --check on only the two changed files: PASS; git diff --check: PASS",
+  "clippy": "No production source changed by this package; no repeated production Clippy for these test-only insertions",
+  "source_review": {
+    "sha256": "CD1CF21381757DD8FC75E4A8E184C77B10FFFDE25F1C7F4DA41BF93C2ABF99AB",
+    "accepted_scope": "Direct bounded source review; tests-only recommendation; zero P1/P2",
+    "foreign_pending_approval_second_opinion": "Not received; not used as acceptance evidence"
+  },
+  "composition_limits": "Windows and Linux tests ran in full frozen copies containing the separately prepared APP320 context. This commit contains only the two REG27 test files and this proof. The relevant production equality/mailbox paths and host dependency manifest were unchanged from the delivery parent.",
+  "legacy_mailbox_fixture": "Directly seeded settled legacy Operations consumed by public Store message.cancel; not a new production sender execution",
+  "original_obligations": 459,
+  "entire_REG27_complete": false,
+  "audit_complete": false,
+  "core_code_complete": false,
+  "release_qualified": false,
+  "full_v27_qualified": false,
+  "exclusions": [
+    "Recorder clause",
+    "fingerprint preimage unification",
+    "delivery-ID allocator behavior",
+    "live provider/model/native evidence",
+    "whole-product crash/fault/load qualification"
+  ],
+  "preserved": "Protected root WIP, separately prepared APP320 and REG09 changes, and original 459-row ledger"
+}

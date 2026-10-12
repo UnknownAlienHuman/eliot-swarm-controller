@@ -845,6 +845,90 @@ fn insert_legacy_operation(
 }
 
 #[tokio::test]
+async fn message_cancel_rejects_ambiguous_legacy_delivery_id() {
+    let (owner, operator) = start().await;
+    let first_sender = register(&owner.store, &operator, "legacy-ambiguous-sender-a").await;
+    let second_sender = register(&owner.store, &operator, "legacy-ambiguous-sender-b").await;
+    let delivery_id = model::new_id();
+    let first_digest = model::digest(b"first legacy payload");
+    let second_digest = model::digest(b"second legacy payload");
+
+    let first_sender_id = first_sender.client_id.clone();
+    let second_sender_id = second_sender.client_id.clone();
+    let first_delivery_id = delivery_id.clone();
+    let second_delivery_id = delivery_id.clone();
+    let first_digest_for_row = first_digest.clone();
+    let second_digest_for_row = second_digest.clone();
+    owner
+        .store
+        .run(move |db| {
+            let first_request = json!({
+                "client_request_id":"legacy-ambiguous-source-a",
+                "recipient":"legacy-recipient-a",
+                "text":"first legacy payload"
+            });
+            let first_result = json!({
+                "operation_id":"legacy-ambiguous-delivery-a",
+                "sender":first_sender_id,
+                "recipient":"legacy-recipient-a",
+                "delivery_id":first_delivery_id,
+                "payload_digest":first_digest_for_row,
+                "text":"first legacy payload"
+            });
+            insert_legacy_operation(
+                db,
+                "legacy-ambiguous-delivery-a",
+                &first_sender_id,
+                "legacy-ambiguous-source-a",
+                "message.send",
+                &first_request,
+                &first_result,
+            )?;
+
+            let second_request = json!({
+                "client_request_id":"legacy-ambiguous-source-b",
+                "recipient":"legacy-recipient-b",
+                "text":"second legacy payload"
+            });
+            let second_result = json!({
+                "operation_id":"legacy-ambiguous-delivery-b",
+                "sender":second_sender_id,
+                "recipient":"legacy-recipient-b",
+                "delivery_id":second_delivery_id,
+                "payload_digest":second_digest_for_row,
+                "text":"second legacy payload"
+            });
+            insert_legacy_operation(
+                db,
+                "legacy-ambiguous-delivery-b",
+                &second_sender_id,
+                "legacy-ambiguous-source-b",
+                "message.send",
+                &second_request,
+                &second_result,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let error = write(
+        &owner.store,
+        &first_sender,
+        "message.cancel",
+        json!({
+            "delivery_id":delivery_id,
+            "payload_digest":first_digest,
+            "reason":"legacy duplicate identity fixture"
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "MAILBOX_DELIVERY_AMBIGUOUS");
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn reply_addresses_the_original_delivery_by_identity_and_digest() {
     let (owner, operator) = start().await;
     let alice = register(&owner.store, &operator, "alice").await;

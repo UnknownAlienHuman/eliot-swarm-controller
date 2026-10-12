@@ -2599,6 +2599,30 @@ mod repair_tests {
     }
 
     #[test]
+    fn concilium_retained_participant_selection_rejects_missing_or_empty_actor_client_id() {
+        let client_id = "participant-retained-test";
+        for malformed_actor in [
+            json!({"role":"participant"}),
+            json!({"client_id":"","role":"participant"}),
+        ] {
+            let record = json!({
+                "proposal":{
+                    "proposer":malformed_actor.clone(),
+                    "participants":[{"actor":malformed_actor.clone()}]
+                },
+                "slots":[{"participant_actor":malformed_actor}]
+            });
+            assert!(
+                participant_snapshot(&record, client_id).is_none(),
+                "malformed retained actors must not select the current reader"
+            );
+        }
+
+        let exact = json!({"proposal":{"proposer":{"client_id":client_id}}});
+        assert!(participant_snapshot(&exact, client_id).is_some());
+    }
+
+    #[test]
     fn concilium_retained_participant_read_requires_same_enabled_actor_generation_after_rebind() {
         let db = meta_connection();
         let client_id = "participant-repair-test";
@@ -2665,6 +2689,22 @@ mod repair_tests {
                 .code,
             "FORBIDDEN"
         );
+
+        for malformed_actor in [
+            json!({"role":"participant","generation":7}),
+            json!({"client_id":"","role":"participant","generation":7}),
+        ] {
+            let malformed_retained = json!({
+                "actor":malformed_actor,
+                "scope":{"binding_id":"live-binding","binding_generation":7}
+            });
+            assert_eq!(
+                verify_retained_registration(&db, client_id, &malformed_retained)
+                    .unwrap_err()
+                    .code,
+                "FORBIDDEN"
+            );
+        }
 
         let stale_generation = json!({
             "actor":{"client_id":client_id,"role":"participant","generation":6}
