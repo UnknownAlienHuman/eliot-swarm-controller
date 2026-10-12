@@ -84,6 +84,23 @@ pub(super) fn accepted_attempt(db: &Connection, attempt: &Value) -> Result<bool>
     )?)
 }
 
+/// Coalesced acceptance evidence must match the exact retained decision.
+///
+/// The outer Operation ledger already keeps one durable receipt per
+/// `client_request_id`, so that guard only covers an identical replayed request.
+/// A fresh request ID is a new semantic decision, so reuse of a prior acceptance
+/// is only legitimate when the incoming reviews, check IDs and feedback cursor
+/// are byte-identical to the ones the retained decision already consumed.
+/// Comparing only the outer attempt/revision/submission/candidate anchors would
+/// return a prior acceptance for evidence that was never independently reviewed.
+fn same_acceptance_evidence(decision: &Value, input: &AcceptRequest) -> Result<bool> {
+    let expected_reviews = serde_json::to_value(&input.reviews)?;
+    let expected_checks = serde_json::to_value(&input.check_ids)?;
+    Ok(decision["reviews"] == expected_reviews
+        && decision["check_ids"] == expected_checks
+        && decision["feedback_observation_id"] == input.expected_feedback_observation_id)
+}
+
 /// Freeze only a current accepted source candidate from the same project. A
 /// missing, stale, cross-project or otherwise unproven reference is preserved
 /// as an explicit wide-scope reason; it does not prevent claiming the Task.
@@ -584,6 +601,7 @@ fn reserve_with_actor(
             && d["task_revision"] == input.expected_revision
             && d["submission_ref"] == input.submission_ref
             && d["candidate_ref"] == input.candidate_ref
+            && same_acceptance_evidence(&d, &input)?
             && !revoked(tx, prior)?
         {
             if actor.is_on_behalf() {

@@ -1781,3 +1781,150 @@ async fn queued_v2_task_dispatch_rejects_stale_brief_plan_before_delivery() {
         assert_v2_dispatch_rejects_stale_plan(true, uses_task_prompt, true).await;
     }
 }
+
+#[tokio::test]
+async fn coalesced_v2_acceptance_rejects_changed_reviews_checks_and_feedback() {
+    let config = requirement_check_config();
+    let git_executable = config.checks.git_executable.clone();
+    let (owner, directory, _) = start_store_with_config("r22-coalesced-evidence", config).await;
+    let store = &owner.store;
+    seed_clients(store).await;
+    let (task_id, attempt_id) = create_v2_attempt(
+        store,
+        "r22-coalesced-evidence",
+        review_only_v2_spec(),
+        "native_manager",
+        None,
+    )
+    .await;
+    let (subject, feedback_cursor) =
+        capture_and_submit_attempt(store, &directory, &git_executable, task_id, attempt_id).await;
+    let gm = principal("review-gm", Role::Manager);
+    let review = expected_review("R1", &subject.candidate_ref);
+    let original = acceptance_request(
+        &subject.attempt_id,
+        &subject.submission_ref,
+        &subject.candidate_ref,
+        feedback_cursor,
+        std::slice::from_ref(&review),
+        &[],
+    );
+    let accepted = store
+        .call(gm.clone(), "task.accept".into(), original)
+        .await
+        .unwrap();
+    assert_eq!(accepted["coalesced"], Value::Null);
+    let operation_id = accepted["operation_id"].as_str().unwrap().to_owned();
+    let settled = settled_operation(store, &gm, &operation_id).await;
+    assert_eq!(settled["result"]["outcome"], "applied");
+    assert_eq!(settled["result"]["task_accepted"], true);
+
+    // Exact retry of the settled decision under a fresh client_request_id is
+    // legitimate outer-idempotency replay: the same semantic evidence is
+    // consumed once, so the prior decision is returned unchanged.
+    let reused = store
+        .call(
+            gm.clone(),
+            "task.accept".into(),
+            acceptance_request(
+                &subject.attempt_id,
+                &subject.submission_ref,
+                &subject.candidate_ref,
+                feedback_cursor,
+                std::slice::from_ref(&review),
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused["coalesced"], true);
+    assert_eq!(reused["operation_id"], operation_id);
+    assert_eq!(reused["acceptance_operation_id"], operation_id);
+
+    // A fresh request ID carrying *different* review evidence is a new
+    // semantic decision. It must not silently inherit the retained
+    // decision's evidence.
+    let changed_review = expected_review("R1", &subject.candidate_ref);
+    let mut changed_review = changed_review;
+    changed_review["rationale"] =
+        json!("Changed rationale for the same requirement and candidate.");
+    let error = rejected_acceptance(
+        store,
+        &gm,
+        acceptance_request(
+            &subject.attempt_id,
+            &subject.submission_ref,
+            &subject.candidate_ref,
+            feedback_cursor,
+            std::slice::from_ref(&changed_review),
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(
+        error.code, "ALREADY_ACCEPTED",
+        "changed review evidence must not coalesce into the retained decision: {error:?}"
+    );
+
+    // Extra machine evidence that the frozen policy never required is also a
+    // different decision and cannot be absorbed by the prior acceptance.
+    let error = rejected_acceptance(
+        store,
+        &gm,
+        acceptance_request(
+            &subject.attempt_id,
+            &subject.submission_ref,
+            &subject.candidate_ref,
+            feedback_cursor,
+            std::slice::from_ref(&review),
+            &["unresolved-check-id".to_owned()],
+        ),
+    )
+    .await;
+    assert_eq!(
+        error.code, "ALREADY_ACCEPTED",
+        "changed check evidence must not coalesce into the retained decision: {error:?}"
+    );
+
+    // A stale feedback cursor means the reviewer was reacting to different
+    // feedback; reusing the retained decision would be unverified.
+    let error = rejected_acceptance(
+        store,
+        &gm,
+        acceptance_request(
+            &subject.attempt_id,
+            &subject.submission_ref,
+            &subject.candidate_ref,
+            feedback_cursor + 1,
+            std::slice::from_ref(&review),
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(
+        error.code, "ALREADY_ACCEPTED",
+        "changed feedback must not coalesce into the retained decision: {error:?}"
+    );
+
+    // The retained decision itself is untouched by every rejected attempt.
+    let readback = store
+        .call(
+            gm.clone(),
+            "task.acceptance".into(),
+            json!({"acceptance_operation_id":operation_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(readback["task_accepted"], true);
+    assert_eq!(readback["current"], true);
+    assert_eq!(readback["invalidated"], false);
+    let reviews = readback["reviews"].as_array().unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["requirement_id"], "R1");
+    assert_ne!(reviews[0]["rationale"], changed_review["rationale"]);
+    assert!(readback["check_ids"].as_array().unwrap().is_empty());
+    assert_eq!(readback["feedback_observation_id"], json!(feedback_cursor));
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "candidate_base": "ce18ab3a9921d3d399e0e77e7e6ed60336d67f71",
+  "recorded_at_utc": "2026-10-12T02:11:01.0109928Z",
+  "scope": "Original R22 §14 changed acceptance evidence coalescing residual; bounded source delivery",
+  "source_sha256": {
+    "crates/swarm-kernel-host/src/store/acceptance.rs": "F721D286091A996AEAA19F79DE571A3AB7F18B7547D3D8D0E3F2BB4754EE19CF",
+    "crates/swarm-kernel-host/src/store/program_tests/requirement_evidence_plan_tests.rs": "E2C55F2F18D97E384539B3D81ADEFC1BAED7F4B9B4271192F948B7AABCA27A00"
+  },
+  "changes": [
+    "Fresh task.accept request can reuse prior decision only when typed reviews/check_ids/feedbackcursor exactly match consumed retained evidence",
+    "Changed reviews, extra checks and changed feedback return existing ALREADY_ACCEPTED conflict; prior accepted decision remains immutable",
+    "Existing same-request Operation idempotency, current actor/scope and reviewer independence remain intact"
+  ],
+  "verification": [
+    {
+      "artifact": "r22-coalesced-evidence-windows-clippy-production-v1.json",
+      "sha256": "BB8E95CD826BA5C2A04C91A647806171425AF9DA0A139C1FAE2FB558AFDF2936",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "CFA352FD6CEF794C3504DEFDBC5A3550D74E39E295A0EAB7DABBA85831AD64A6",
+      "started_at_utc": "2026-10-12T02:03:16.1323069Z",
+      "completed_at_utc": "2026-10-12T02:03:29.4199278Z",
+      "summary": []
+    },
+    {
+      "artifact": "r22-coalesced-evidence-linux-clippy-production-v1.json",
+      "sha256": "ECF7F7B3D75F1099535010F4753A6373714BB3FB8E85EBA84DCC9266E59B5BF6",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 clippy --locked -p swarm-kernel-host --lib --bins --no-deps -- -D warnings",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "9BC51ABD3DE07E3671CF382F9C4B5A770FEDE481C5008B4994B373F88C728ADC",
+      "started_at_utc": "2026-10-12T02:03:16.1330170Z",
+      "completed_at_utc": "2026-10-12T02:03:36.8622258Z",
+      "summary": []
+    },
+    {
+      "artifact": "r22-coalesced-evidence-windows-test-consumers-v2.json",
+      "sha256": "555A804B62A8B05BF6DF67BCD4239EBB1C05262F73B793891D3964BE8DE81CFF",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(coalesced_v2_acceptance_rejects_changed_reviews_checks_and_feedback)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "E0535C70A47E909CE0BBCC265B230B21E84BCC351FE5AB826DA235209409F44C",
+      "started_at_utc": "2026-10-12T02:07:51.1608739Z",
+      "completed_at_utc": "2026-10-12T02:08:22.3314652Z",
+      "summary": [
+        "Summary [   0.809s] 1 test run: 1 passed, 603 skipped"
+      ]
+    },
+    {
+      "artifact": "r22-coalesced-evidence-linux-test-consumers-v2.json",
+      "sha256": "2A9EC1EF91E6F8941AEED80E102C34F274CAF97B76252D02C40797B49016EE43",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host --lib --no-fail-fast -E 'test(coalesced_v2_acceptance_rejects_changed_reviews_checks_and_feedback)'",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "17051EAD699D60D21E04895B55339D019DBBB1AA2D17D295C37767D969F21944",
+      "started_at_utc": "2026-10-12T02:09:21.4357698Z",
+      "completed_at_utc": "2026-10-12T02:10:06.7865502Z",
+      "summary": [
+        "Summary [   0.622s] 1 test run: 1 passed, 623 skipped"
+      ]
+    }
+  ],
+  "meaningful_consumer": {
+    "name": "coalesced_v2_acceptance_rejects_changed_reviews_checks_and_feedback",
+    "public_paths": [
+      "task.accept",
+      "operation.get",
+      "task.acceptance"
+    ],
+    "coverage": [
+      "Initial V2 review acceptance",
+      "Identical evidence with fresh requestID reuses exact acceptanceOperation",
+      "Changed review rationale refused",
+      "Additional checkID refused",
+      "Changed feedbackcursor refused",
+      "Retained decision readback remains current/unchanged"
+    ],
+    "windows": "1/1PASS",
+    "linux": "1/1PASS"
+  },
+  "manager_source_closure": {
+    "artifact": "r22-coalesced-evidence-manager-source-closure-v2.json",
+    "sha256": "EB1530D9D9C6A726B6F0FFAB5B0B5A1FCE6087DEA859C65544E20766B441061D",
+    "production_v1_v2_same": true
+  },
+  "preserved_failure": {
+    "artifact": "r22-coalesced-evidence-windows-test-consumers-v1.json",
+    "sha256": "FE56D7791E8FFF58ED3EAA3BC71054D5B5889C998752E42FCDAA75A45DF80BA7",
+    "cause": "Incorrect fixture expectationREVIEW_CHANGED on accepted-task feedback difference; observed/documentedexistingALREADY_ACCEPTED",
+    "repair": "Fixture expectation only; production guard unchanged after strictClippy"
+  },
+  "remaining": [
+    "Full R22 installed/native executable check/resource/evidence matrix not proven by one focused consumer",
+    "Full original V27 audit, public/Windows/Linux/model/crash/load qualification and owned all-target warning clearance remain"
+  ],
+  "full_v27_complete": false
+}
