@@ -40,11 +40,7 @@ async fn assigned_changes_requested(
         .call(
             reviewer,
             "review.submit".into(),
-            review_result_request(
-                &subject,
-                &assignment_id,
-                &format!("review-result-{suffix}"),
-            ),
+            review_result_request(&subject, &assignment_id, &format!("review-result-{suffix}")),
         )
         .await
         .unwrap();
@@ -76,22 +72,12 @@ async fn operation_snapshot(store: &Store, operation_id: &str) -> (String, Strin
         .unwrap()
 }
 
-async fn assert_retained_disposition_mismatch(
-    field: &str,
-    replacement: Value,
-    suffix: &str,
-) {
+async fn assert_retained_disposition_mismatch(field: &str, replacement: Value, suffix: &str) {
     let reviewer_id = format!("assigned-reviewer-disposition-{suffix}");
     let reviewer_token = format!("reviewer-disposition-token-{suffix}");
     let label = format!("disposition-mismatch-{suffix}");
     let (owner, directory, subject, manager, assignment_id, result_operation_id) =
-        assigned_changes_requested(
-            &label,
-            &label,
-            &reviewer_id,
-            &reviewer_token,
-        )
-        .await;
+        assigned_changes_requested(&label, &label, &reviewer_id, &reviewer_token).await;
 
     let initial = owner
         .store
@@ -157,7 +143,10 @@ async fn assert_retained_disposition_mismatch(
         )
         .await
         .unwrap_err();
-    assert_eq!(rejected.code, "REVIEW_DISPOSITION_CONFLICT", "retained {field}");
+    assert_eq!(
+        rejected.code, "REVIEW_DISPOSITION_CONFLICT",
+        "retained {field}"
+    );
 
     let deliveries = owner
         .store
@@ -198,7 +187,8 @@ async fn task_request_changes_rejects_retained_review_disposition_reason_or_evid
 }
 
 #[tokio::test]
-async fn task_request_changes_coalesced_fresh_request_keeps_new_operation_and_original_message_link() {
+async fn task_request_changes_coalesced_fresh_request_keeps_new_operation_and_original_message_link()
+ {
     let (owner, directory, subject, manager, assignment_id, result_operation_id) =
         assigned_changes_requested(
             "fresh-coalesced-operation",
@@ -246,7 +236,10 @@ async fn task_request_changes_coalesced_fresh_request_keeps_new_operation_and_or
     let current_operation_id = current["operation_id"].as_str().unwrap().to_owned();
     assert_ne!(current_operation_id, original_operation_id);
     assert_eq!(current["coalesced"], true);
-    assert_eq!(current["coalesced_from_operation_id"], original_operation_id);
+    assert_eq!(
+        current["coalesced_from_operation_id"],
+        original_operation_id
+    );
     assert_eq!(current["message_id"], original_message_id);
 
     let receipt = owner
@@ -400,7 +393,8 @@ async fn make_seeded_submission_target_valid_for_recovery(
 }
 
 #[tokio::test]
-async fn task_submit_recover_same_settled_request_replays_historical_result_but_fresh_request_rechecks_authority() {
+async fn task_submit_recover_same_settled_request_replays_historical_result_but_fresh_request_rechecks_authority()
+ {
     let (owner, directory, bootstrap) = start_store("settled-recovery-replay").await;
     seed_clients(&owner.store).await;
     let suffix = "settled-recovery-replay";
@@ -487,7 +481,10 @@ async fn task_submit_recover_same_settled_request_replays_historical_result_but_
         .await
         .unwrap();
     assert_eq!(fresh_current_request["outcome"], "already_settled");
-    assert_eq!(fresh_current_request["target_operation_id"], target_operation_id);
+    assert_eq!(
+        fresh_current_request["target_operation_id"],
+        target_operation_id
+    );
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();

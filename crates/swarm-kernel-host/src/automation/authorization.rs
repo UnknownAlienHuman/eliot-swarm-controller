@@ -5120,8 +5120,7 @@ fn review_assignment_lineage_task_id(
                 match operation_link(db, &origin_operation_id)? {
                     Some(origin_link) => {
                         if origin_link.action != "review.assign"
-                            || origin_link.technical_requester_id
-                                != link.technical_requester_id
+                            || origin_link.technical_requester_id != link.technical_requester_id
                             || origin_link.effective_manager_id != link.effective_manager_id
                             || origin_link.project_id != link.project_id
                             || origin_link.cause != link.cause
@@ -5164,23 +5163,17 @@ fn review_assignment_lineage_task_id(
                             "automation_on_behalf":origin_linkage,
                             "receipt":{"ok":true,"value":origin_result},
                         });
-                        (
-                            origin_identity,
-                            json!(origin_linkage),
-                            expected_effective,
-                        )
+                        (origin_identity, json!(origin_linkage), expected_effective)
                     }
                     None => {
-                        let Some(origin_identity) =
-                            review_assignment_direct_origin_identity(
-                                &origin_operation_id,
-                                &origin_operation,
-                                &assignment,
-                                &request,
-                                &task_id,
-                                &link.effective_manager_id,
-                            )
-                        else {
+                        let Some(origin_identity) = review_assignment_direct_origin_identity(
+                            &origin_operation_id,
+                            &origin_operation,
+                            &assignment,
+                            &request,
+                            &task_id,
+                            &link.effective_manager_id,
+                        ) else {
                             return Ok(None);
                         };
                         let expected_effective = json!({
