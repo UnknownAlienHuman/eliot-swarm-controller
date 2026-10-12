@@ -578,16 +578,22 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
 
     /// Close only new jobs. The writer and its retained hold continue to
     /// exist so the owning process can reconcile or drain accepted work.
+    /// Repeated calls preserve an existing close reason; state changes are
+    /// published to existing status receivers.
     pub fn close_admission(&self, fault: KernelAdmissionFault) {
         let mut status = self.status_lock();
-        if matches!(
+        if !matches!(
             status.lifecycle,
-            KernelHostLifecycle::Stopped | KernelHostLifecycle::Failed
+            KernelHostLifecycle::Starting | KernelHostLifecycle::Ready
         ) {
             return;
         }
+        let before = *status;
         status.admission = KernelAdmissionState::Closed { fault };
         status.lifecycle = KernelHostLifecycle::AdmissionClosed { fault };
+        if *status != before {
+            let _ = self.status_updates.send_replace(*status);
+        }
     }
 
     /// Wait for the authoritative initialization callback before admitting
@@ -663,7 +669,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
             thread,
             ready: _,
             status,
-            status_updates: _,
+            status_updates,
             writer_finished: _,
             initialization_succeeded: _,
             stop_requested,
@@ -673,11 +679,15 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
             let mut snapshot = status
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = *snapshot;
             snapshot.admission = KernelAdmissionState::Closed {
                 fault: KernelAdmissionFault::ShuttingDown,
             };
             if !matches!(snapshot.lifecycle, KernelHostLifecycle::Failed) {
                 snapshot.lifecycle = KernelHostLifecycle::Stopping;
+            }
+            if *snapshot != before {
+                let _ = status_updates.send_replace(*snapshot);
             }
         }
         stop_requested.store(true, Ordering::Release);
@@ -687,6 +697,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
         let mut snapshot = status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = *snapshot;
         let failure = snapshot.failure;
         let failed = matches!(snapshot.lifecycle, KernelHostLifecycle::Failed) || failure.is_some();
         snapshot.admission = KernelAdmissionState::Closed {
@@ -697,6 +708,9 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
         } else {
             KernelHostLifecycle::Failed
         };
+        if *snapshot != before {
+            let _ = status_updates.send_replace(*snapshot);
+        }
         if result.is_err() {
             Err(KernelHostJoinError::Panicked)
         } else if let Some(failure) = failure {
