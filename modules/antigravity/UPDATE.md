@@ -9,7 +9,7 @@
 | Vendor SDK | None exists for this entrypoint; the bridge depends on Node builtins only (`package.json` has no dependencies) |
 | Native binary | The owner's installed `agy` executable, named explicitly in the local module config; the bridge installs and pins no binary |
 | Installed-version evidence | None: runtime matrix records `installed_runtime_verified: false`; the docs' "installed 1.1.27" note from the old research map is explicitly unverified |
-| Bridge artifact | `antigravity-cli-warm-bridge.3` (source-only candidate; unqualified; new binding required) |
+| Bridge artifact | `antigravity-cli-warm-bridge.3` (committed; bounded fixtures; installed/live unqualified; new binding required) |
 | Executor version reporting | `null` — the native stream reports no version and no version readback is documented for this entrypoint |
 
 ## Local changes to the vendor surface
@@ -32,15 +32,16 @@ or inbox ID. Only `SUCCESS`, `ERROR`, `CANCELED`, and `INTERRUPTED` settle a
 result; `WAITING`, `RUNNING`, unknown statuses, and missing response bytes
 remain unresolved. Existing bridge.1 bindings retain their original artifact.
 
-## bridge.3 source candidate changes
+## bridge.3 committed EOF repair
 
-This isolated source candidate settles pending sends as Unknown at stdout EOF
-and routes the ninth real-child fixture's close through the same handler used
-by production, preserving the existing nonzero process-exit diagnostic and
-child-close custody. The fixture and host changes have not been executed.
-Existing `.2` bindings and their historical live evidence remain tied to the
-old artifact bytes; host receipt routing retains `.2`, while new `.2` bindings
-remain retired. No `.3` execution or qualification is claimed.
+The committed bridge.3 EOF repair has
+[bounded Windows/Linux evidence](../../docs/remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json)
+for nine JS fixture groups and seven warm-stream host consumers. The ninth
+local Node-child fixture uses the production EOF/nonzero-exit handler and
+preserves child custody. Existing `.2` bindings and their historical evidence
+remain tied to their original bytes; host receipt routing retains `.2`, while
+new `.2` admission stays retired. Installed `.3` execution and full runtime
+qualification remain pending.
 
 ## Update procedure
 

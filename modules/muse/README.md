@@ -1,6 +1,6 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). This isolated bridge.11 candidate carries forward the TaskPrompt/checkpoint behavior and adds bounded observation; its host must retain and accept the exact `muse-sdk-1.3.0-bridge.11` descriptor before new bindings use it. Live Muse/Max and Windows native launch remain unqualified; no runtime or model result is claimed.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The committed `muse-sdk-1.3.0-bridge.11` implementation retains TaskPrompt/checkpoint behavior and adds bounded observation. The [APP399 verification record](../../docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json) documents scoped Windows/Linux syntax, SDK import, local fixture and Store-consumer passes for its recorded inputs. Retain and accept the exact descriptor before selecting new bindings. Live Muse/Max inference and Windows native launch remain unqualified.
 
 Before activation, register and retain the exact bridge.11 descriptor before
 selecting it for a new binding. Existing bindings keep their original artifact
@@ -60,9 +60,11 @@ This code requires artifact `muse-sdk-1.3.0-bridge.11` and refuses to announce a
 previous artifact ID. Stage it for new bindings only. Existing bridge.9 and
 bridge.10 bindings and checkpoints retain their original code and identity; they
 are not migrated.
-The SDK pin is unchanged. Verify syntax, SDK import and fixtures for the exact
-staged bridge.11 source before activation, and qualify installed native behavior
-separately. Earlier fixture passes do not qualify bridge.11.
+The SDK pin is unchanged. The APP399 verification record binds the committed
+bridge.11 source to its syntax, SDK import, fixture and Store-consumer checks.
+Changed source requires its own checks before activation; installed native
+behavior requires separate qualification. Earlier artifact evidence retains
+its original hashes and scope.
 
 The bridge.11 observation projection measures the complete serialized
 `module.observe` JSON-RPC line against the existing 1 MiB control cap. When
@@ -223,7 +225,7 @@ For **`d385498b00fe1a049c357613a7777cc4a1c83f72`**, [CI 36872022736](https://git
 
 The bounded invocation passed 13 process-owner/host assertions: explicit fixture-process loss, replacement refusal until group departure, changed-boot admission, stale-link exclusion, historical open receipt retaining reconciling, normal-input refusal until resume, stale/disabled recovery rejection, current-boot resume readiness, serialized Node checkpoint publication/read and clean shutdown. The module selftest also drives the actual bridge over local fixture host/native processes for restored-child freshness, unknown server request handling and exact-turn stale rejection. These fixtures do not start Muse or call a model and do not qualify live resume, Max inference, complete native-child recovery or Windows-runtime behavior. No Cargo test was added.
 
-Next code: direct OpenCode V2 through the same host contract. Qualify actual Muse resume/children on the installed runtime separately; do not reimplement the already saved local recovery path. Complete native family discovery, automatic service/module activation and all missing-identity recovery cases remain separate work. Do not reimplement already completed host results, submission, acceptance or CheckRunner. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code.
+Direct OpenCode V2 through the host contract is implemented; its installed-runtime and in-flight service-restart qualification remain separate work. Qualify actual Muse resume/children on the installed runtime separately; do not reimplement the already saved local recovery path. Complete native family discovery, automatic service/module activation and all missing-identity recovery cases remain separate work. Do not reimplement already completed host results, submission, acceptance or CheckRunner. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code.
 
 ## Updates
 

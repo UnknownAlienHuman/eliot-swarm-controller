@@ -7,12 +7,13 @@ stream entrypoint: one owned process per binding, launched as
 (`init` / `step_update` / `result`, discriminated by `event`) mapped by
 `codec.mjs`. There is no vendor SDK for this runtime and no shared server to
 attach to; the bridge owns the CLI process it starts and nothing else. The
-source candidate is versioned as **`antigravity-cli-warm-bridge.3`** for any
-future new binding; existing `.2` bindings retain their exact artifact
-identity. The existing Windows live observation remains bound to `.2`; `.3`
-is source-only and unqualified. Live Antigravity and Windows native launch
-for `.3` remain unqualified; syntax, fixtures and compilation do not attest
-model execution.
+committed source is versioned as **`antigravity-cli-warm-bridge.3`** for new
+bindings, with bounded Windows/Linux fixture evidence in the
+[EOF verification record](../../docs/remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
+Existing `.2` bindings and their historical Windows live observation retain
+their exact artifact identity. Installed/live Antigravity and Windows native
+launch for `.3` remain unqualified; syntax, fixtures and compilation do not
+attest model execution.
 
 Protocol basis: the vendor's official headless documentation
 (<https://antigravity.google/docs/cli/headless/>, source AG-HEADLESS in
@@ -70,7 +71,7 @@ has host-reconnect behavior, but no recorded process ownership/checkpoint.
 Do not overwrite its executable/scripts in place; use a new artifact/binding
 for changed module code.
 
-## Capability matrix (bridge.3 source candidate; unqualified)
+## Capability matrix (bridge.3 committed; bounded fixtures; installed/live unqualified)
 
 Readiness terms follow the module contract: `implemented` is code in this
 artifact, `documented` is the vendor contract it maps, `observed` requires
@@ -146,5 +147,9 @@ a live run, `unavailable` is an honest absence — never an emulation.
 (each file carries its provenance comment; they are not live captures):
 init + SUCCESS, the two-prompt warm session, a tool error under a SUCCESS
 result, a subagent invocation, and the pre-init error envelope.
-`node selftest.mjs` runs the codec assertions with no dependencies, no
-native executable and no model call.
+`node selftest.mjs` runs the codec, receipt and init-lifecycle assertions and
+a ninth local Node-child fixture through the production stream/child-close
+helpers. That fixture checks exact result custody, Unknown tail-send settlement
+at stdout EOF, replacement refusal and retained nonzero-exit diagnostics. It
+starts no installed `agy` executable and makes no model call; it does not
+qualify the composed public Store-to-native path.

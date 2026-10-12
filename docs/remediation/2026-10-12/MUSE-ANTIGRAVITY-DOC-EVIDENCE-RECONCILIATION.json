@@ -1,0 +1,44 @@
+{
+  "schema": "swarm.documentation_evidence_reconciliation.v1",
+  "checked_at_utc": "2026-10-12T15:32:17.564Z",
+  "base_main": "120d2c0fff2d8ec4637e634d0ea7df220e68b88b",
+  "independent_review": {
+    "artifact": "muse-antigravity-readme-committed-evidence-review-20261012.json",
+    "sha256": "B95894137724C89B6C6236E3965F7E17717F27F888364710DCE0287023019006",
+    "discrepancies": [
+      "README-COMMITTED-EVIDENCE-01",
+      "README-COMMITTED-EVIDENCE-02",
+      "README-COMMITTED-EVIDENCE-03",
+      "README-COMMITTED-EVIDENCE-04"
+    ]
+  },
+  "owned_document_sha256_before": {
+    "README.md": "8B09D3159A086C014DF717B8A74F1F0B9D5122274382D9A5CB2BF1ABE94E8548",
+    "modules/muse/README.md": "600DAA7850BEFD18C1F56E5E0311DE56EAC298DE3C00AAE23875D6B0BF957D62",
+    "modules/antigravity/README.md": "DA2257062BE0E3F3FB2D9086DAE1E0A5C630FC5409F2FAAE8673BEED27CFD7FD",
+    "modules/antigravity/UPDATE.md": "D1B1777247AC2AB9277B70C03603A321C2FE6E504E0437FB56DBE203FD950F02"
+  },
+  "owned_document_sha256_after": {
+    "README.md": "C1CDDD06688137D7260DB0C4ABB51F2FB1253FDD4266006DB13D7B15A8DF0777",
+    "modules/muse/README.md": "1A1DEEC1EAF756518983AF4611BA6256F8B0B079068B5BD90750FDD311943ED9",
+    "modules/antigravity/README.md": "6C05D01C10456FC509EBEA45F4B6788BC246A771C41560A04460EBE4088AEFD1",
+    "modules/antigravity/UPDATE.md": "9903935CC1DAD322572EBB43A9D63F6BA3691455F0EDDE7C37A2DF83DFF5D71B"
+  },
+  "retained_gate_records_verified": 22,
+  "retained_runtime_evidence": [
+    {
+      "path": "docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json",
+      "sha256": "E318D729A3E8F98A3ADCB4653B9332B0D77965538754560783DC018A29C58FCC"
+    },
+    {
+      "path": "docs/remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json",
+      "sha256": "CA38C8416E997192E7C2FD17C89064397EF38B194B53B79454F9DD5808881DF7"
+    }
+  ],
+  "verification": "Exact reviewed documentation replacements, current artifact constants/proofs and all 22 retained gate-record hashes revalidated; git diff --check",
+  "new_builds_or_tests_run": false,
+  "qualification_changes": "Describe committed bridge.11/bridge.3 bounded fixtures truthfully; preserve original artifact-bound historical evidence and installed/live unqualified status",
+  "production_source_changed": false,
+  "audit_complete": false,
+  "full_v27_qualified": false
+}
