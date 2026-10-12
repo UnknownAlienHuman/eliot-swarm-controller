@@ -178,15 +178,12 @@ impl ModuleSupervisorHostConfig {
 
 pub(crate) struct OptionalModuleSupervisor {
     task: JoinHandle<Result<()>>,
-    health_control: Option<SupervisorControlClient>,
+    health_store: Store,
 }
 
 impl OptionalModuleSupervisor {
     pub(crate) async fn join(self) -> Result<()> {
-        let OptionalModuleSupervisor {
-            task,
-            health_control,
-        } = self;
+        let OptionalModuleSupervisor { task, health_store } = self;
         match task.await {
             Ok(result) => result,
             Err(_) => {
@@ -194,15 +191,14 @@ impl OptionalModuleSupervisor {
                     "MODULE_SUPERVISOR_JOIN_FAILED",
                     "module supervisor task failed",
                 );
-                if let Some(control) = health_control
-                    && let Err(health_error) = record_module_actor_status(
-                        &control,
-                        "isolated",
-                        1,
-                        Some("MODULE_SUPERVISOR_JOIN_FAILED"),
-                        Some(MODULE_ACTOR_ISOLATED_RETRY),
-                    )
-                    .await
+                if let Err(health_error) = record_module_actor_status(
+                    &health_store,
+                    "isolated",
+                    1,
+                    Some("MODULE_SUPERVISOR_JOIN_FAILED"),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
                 {
                     return Err(join_error.with_secondary_error(health_error));
                 }
@@ -229,8 +225,8 @@ pub(crate) fn spawn_independent_module_supervisor(
 ) -> OptionalModuleSupervisor {
     let control =
         SupervisorControlClient::new(root.clone(), supervisor_credential.clone(), ipc.clone());
-    let health_control = control.as_ref().ok().cloned();
-    let panic_control = health_control.clone();
+    let health_store = store.clone();
+    let panic_store = store.clone();
     let task = tokio::spawn(async move {
         let run = AssertUnwindSafe(async move {
             let control = match control {
@@ -246,7 +242,7 @@ pub(crate) fn spawn_independent_module_supervisor(
                     Ok(None) => return Ok(()),
                     Err(error) => {
                         let error = match record_module_actor_status(
-                            &control,
+                            &store,
                             "isolated",
                             1,
                             Some(&error.code),
@@ -271,7 +267,7 @@ pub(crate) fn spawn_independent_module_supervisor(
                     Ok(bootstrap) => bootstrap,
                     Err(error) => {
                         let error = match record_module_actor_status(
-                            &control,
+                            &store,
                             "isolated",
                             1,
                             Some(&error.code),
@@ -300,15 +296,14 @@ pub(crate) fn spawn_independent_module_supervisor(
             Err(_) => {
                 let panic_error =
                     Error::new(SUPERVISOR_CHILD_PANICKED, "module supervisor task panicked");
-                if let Some(control) = panic_control
-                    && let Err(health_error) = record_module_actor_status(
-                        &control,
-                        "isolated",
-                        1,
-                        Some(SUPERVISOR_CHILD_PANICKED),
-                        Some(MODULE_ACTOR_ISOLATED_RETRY),
-                    )
-                    .await
+                if let Err(health_error) = record_module_actor_status(
+                    &panic_store,
+                    "isolated",
+                    1,
+                    Some(SUPERVISOR_CHILD_PANICKED),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
                 {
                     return Err(panic_error.with_secondary_error(health_error));
                 }
@@ -316,14 +311,11 @@ pub(crate) fn spawn_independent_module_supervisor(
             }
         }
     });
-    OptionalModuleSupervisor {
-        task,
-        health_control,
-    }
+    OptionalModuleSupervisor { task, health_store }
 }
 
-/// The host supplies the existing Store only as an activation oracle. No Store
-/// object or database capability is serialized into the private bootstrap.
+/// The host uses its Store for activation and its own child health receipts.
+/// No Store object or database capability is serialized into the private bootstrap.
 pub(crate) fn spawn_isolated_module_supervisor(
     store: Store,
     supervisor_credential: Credential,
@@ -381,7 +373,7 @@ async fn run_supervisor_process_loop(
                 failures = failures.saturating_add(1).min(32);
                 let (state, delay) = process_failure_state(failures, retry);
                 if let Err(health_error) = record_module_actor_status(
-                    &control,
+                    &store,
                     state,
                     failures,
                     Some(&error.code),
@@ -408,7 +400,7 @@ async fn run_supervisor_process_loop(
                 failures = failures.saturating_add(1).min(32);
                 let (state, delay) = process_failure_state(failures, retry);
                 if let Err(health_error) = record_module_actor_status(
-                    &control,
+                    &store,
                     state,
                     failures,
                     Some(&error.code),
@@ -431,7 +423,7 @@ async fn run_supervisor_process_loop(
             Ok(PriorChildState::Alive(child)) => {
                 failures = failures.saturating_add(1).min(32);
                 record_module_actor_health(
-                    &control,
+                    &store,
                     "isolated",
                     failures,
                     Some("MODULE_SUPERVISOR_PRIOR_CHILD_LIVE"),
@@ -453,7 +445,7 @@ async fn run_supervisor_process_loop(
             Err(error) => {
                 failures = failures.saturating_add(1).min(32);
                 if let Err(health_error) = record_module_actor_status(
-                    &control,
+                    &store,
                     "isolated",
                     failures,
                     Some(&error.code),
@@ -486,7 +478,7 @@ async fn run_supervisor_process_loop(
         {
             failures = failures.saturating_add(1).min(32);
             if let Err(health_error) = record_module_actor_status(
-                &control,
+                &store,
                 "isolated",
                 failures,
                 Some(&error.code),
@@ -516,7 +508,7 @@ async fn run_supervisor_process_loop(
             Err(error) => {
                 let error = module_error(error);
                 let error = match record_module_actor_status(
-                    &control,
+                    &store,
                     "isolated",
                     failures.saturating_add(1).min(32),
                     Some(&error.code),
@@ -531,52 +523,33 @@ async fn run_supervisor_process_loop(
             }
         };
 
-        // Persist the launch intent, then read it back through the same
-        // authenticated Store path before the first exec. A pending intent
+        // Persist the launch intent, then use the existing bounded Store
+        // readback before the first exec. A pending intent
         // with no departed receipt remains a restart fence after this host
         // disappears; a failed write therefore never claims durable health or
         // authorizes a replacement.
         record_module_actor_status(
-            &control,
+            &store,
             "isolated",
             failures,
             Some(SUPERVISOR_SPAWN_PENDING),
             Some(MODULE_ACTOR_ISOLATED_RETRY),
         )
         .await?;
-        let intent = control.read_health().await.map_err(module_error)?;
-        if !spawn_intent_is_confirmed(&intent, prior_departure.as_ref()) {
-            return Err(Error::new(
-                "MODULE_SUPERVISOR_SPAWN_INTENT_UNCONFIRMED",
-                "supervisor launch intent did not read back as a pending, replaceable receipt",
-            ));
+        if !prepare_supervisor_spawn(&store, &stopping, prior_departure.as_ref()).await? {
+            return Ok(());
         }
 
         let started_at = time::Instant::now();
         let (child, bootstrap_pipe, child_identity) =
-            match spawn_supervisor_child(&control, &executable, &frame, &shutdown_custody).await {
+            match spawn_supervisor_child(&store, &executable, &frame, &shutdown_custody).await {
                 Ok(child) => child,
                 Err(error) => {
                     failures = failures.saturating_add(1).min(32);
                     let (state, delay) = process_failure_state(failures, retry);
-                    let status_code = if error.secondary_codes.is_empty() {
-                        error.code.as_str()
-                    } else {
-                        // The reaper still owns an exact child, but its
-                        // initial receipt was rejected. Preserve the durable
-                        // pre-launch uncertainty across a host restart rather
-                        // than replacing the pending fence with a retryable
-                        // primary code.
-                        SUPERVISOR_SPAWN_PENDING
-                    };
-                    if let Err(health_error) = record_module_actor_status(
-                        &control,
-                        state,
-                        failures,
-                        Some(status_code),
-                        Some(delay),
-                    )
-                    .await
+                    if let Err(health_error) =
+                        record_module_actor_spawn_failure(&store, state, failures, &error, delay)
+                            .await
                     {
                         return Err(error.with_secondary_error(health_error));
                     }
@@ -594,7 +567,7 @@ async fn run_supervisor_process_loop(
             child,
             bootstrap_pipe,
             child_identity,
-            control.clone(),
+            store.clone(),
             shutdown_custody.clone(),
         );
         // Own stderr before the running-health write. A failed or panicking
@@ -606,7 +579,7 @@ async fn run_supervisor_process_loop(
         let running_health =
             supervisor_child_health(&child.identity, None, SupervisorChildStopState::Running);
         let running_health_result = record_module_actor_health(
-            &control,
+            &store,
             "running",
             failures,
             None,
@@ -666,7 +639,7 @@ async fn run_supervisor_process_loop(
                 let child_health = supervisor_child_health(&child.identity, exit, stop);
                 let retry = error_code.map(|_| MODULE_ACTOR_ISOLATED_RETRY);
                 record_module_actor_health(
-                    &control,
+                    &store,
                     state,
                     1,
                     error_code,
@@ -702,7 +675,7 @@ async fn run_supervisor_process_loop(
                 failures = failures.saturating_add(1).min(32);
                 let (state, delay) = process_failure_state(failures, retry);
                 if let Err(health_error) = record_module_actor_health(
-                    &control,
+                    &store,
                     state,
                     failures,
                     Some(&error.code),
@@ -721,7 +694,7 @@ async fn run_supervisor_process_loop(
             }
         };
         if !demanded {
-            record_module_actor_health(&control, "dormant", 0, None, None, Some(&child_health))
+            record_module_actor_health(&store, "dormant", 0, None, None, Some(&child_health))
                 .await?;
             failures = 0;
             retry = SUPERVISOR_PROCESS_BASE_RETRY;
@@ -739,7 +712,7 @@ async fn run_supervisor_process_loop(
             Some(Err(_)) | None => "SUPERVISOR_STATUS_UNKNOWN",
         };
         record_module_actor_health(
-            &control,
+            &store,
             state,
             failures,
             Some(status_code),
@@ -894,6 +867,29 @@ async fn reconcile_prior_child(control: &SupervisorControlClient) -> Result<Prio
     Ok(PriorChildState::Alive(child))
 }
 
+/// This gate runs before invoking OS spawn. No awaited IPC separates the
+/// cancellation check from acquiring the exact Child handle.
+async fn prepare_supervisor_spawn(
+    store: &Store,
+    stopping: &watch::Receiver<bool>,
+    prior_departure: Option<&SupervisorChildHealth>,
+) -> Result<bool> {
+    let intent = store.module_supervisor_health_readback().await?;
+    if !spawn_intent_is_confirmed(&intent, prior_departure) {
+        return Err(Error::new(
+            "MODULE_SUPERVISOR_SPAWN_INTENT_UNCONFIRMED",
+            "supervisor launch intent did not read back as a pending, replaceable receipt",
+        ));
+    }
+    if *stopping.borrow() {
+        // OS spawn has not been invoked, so retiring this intent does not
+        // infer departure or erase uncertainty about an attempted launch.
+        record_module_actor_status(store, "dormant", 0, None, None).await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn spawn_intent_is_confirmed(
     readback: &swarm_supervisor::control::SupervisorChildHealthReadback,
     prior_departure: Option<&SupervisorChildHealth>,
@@ -978,7 +974,7 @@ struct SupervisorChildLease {
     stdin: Option<ChildStdin>,
     diagnostic: Option<ChildDiagnosticTask>,
     identity: SupervisorChildIdentity,
-    control: SupervisorControlClient,
+    store: Store,
     shutdown_custody: ShutdownCustody,
     retain_code: &'static str,
     initial_health_result: Option<Result<()>>,
@@ -989,7 +985,7 @@ impl SupervisorChildLease {
         child: Child,
         stdin: ChildStdin,
         identity: SupervisorChildIdentity,
-        control: SupervisorControlClient,
+        store: Store,
         shutdown_custody: ShutdownCustody,
     ) -> Self {
         Self {
@@ -997,7 +993,7 @@ impl SupervisorChildLease {
             stdin: Some(stdin),
             diagnostic: None,
             identity,
-            control,
+            store,
             shutdown_custody,
             retain_code: SUPERVISOR_CHILD_RETAINED,
             initial_health_result: None,
@@ -1043,7 +1039,7 @@ impl Drop for SupervisorChildLease {
         let stdin = self.stdin.take();
         let diagnostic = self.diagnostic.take();
         let identity = self.identity.clone();
-        let control = self.control.clone();
+        let store = self.store.clone();
         let retain_code = self.retain_code;
         let initial_health_result = self.initial_health_result.take();
         let shutdown_custody = self.shutdown_custody.clone();
@@ -1053,7 +1049,7 @@ impl Drop for SupervisorChildLease {
                 stdin,
                 diagnostic,
                 identity,
-                control,
+                store,
                 retain_code,
                 initial_health_result,
             ));
@@ -1334,7 +1330,7 @@ async fn reap_failed_supervisor_child(
     mut child: Child,
     stdin: Option<ChildStdin>,
     identity: Option<SupervisorChildIdentity>,
-    control: &SupervisorControlClient,
+    store: &Store,
     retain_code: &'static str,
     shutdown_custody: &ShutdownCustody,
 ) -> Result<()> {
@@ -1359,7 +1355,7 @@ async fn reap_failed_supervisor_child(
     let retained_health =
         supervisor_child_health(&identity, None, SupervisorChildStopState::Uncertain);
     let health_result = record_module_actor_health(
-        control,
+        store,
         "isolated",
         1,
         Some(retain_code),
@@ -1374,7 +1370,7 @@ async fn reap_failed_supervisor_child(
             stdin,
             diagnostic,
             identity,
-            control.clone(),
+            store.clone(),
             retain_code,
             Some(reaper_health_result),
         ));
@@ -1432,7 +1428,7 @@ async fn reap_owned_supervisor_child(
     stdin: Option<ChildStdin>,
     diagnostic: Option<ChildDiagnosticTask>,
     identity: SupervisorChildIdentity,
-    control: SupervisorControlClient,
+    store: Store,
     retain_code: &'static str,
     initial_health_result: Option<Result<()>>,
 ) -> Result<()> {
@@ -1450,7 +1446,7 @@ async fn reap_owned_supervisor_child(
         let retained_health =
             supervisor_child_health(&identity, None, SupervisorChildStopState::Uncertain);
         if let Err(error) = record_module_actor_health(
-            &control,
+            &store,
             "isolated",
             1,
             Some(retain_code),
@@ -1490,7 +1486,7 @@ async fn reap_owned_supervisor_child(
         SupervisorChildStopState::Confirmed,
     );
     if let Err(error) = record_module_actor_health(
-        &control,
+        &store,
         "isolated",
         1,
         Some(retain_code),
@@ -1559,7 +1555,7 @@ fn child_exit_from_result(
 }
 
 async fn spawn_supervisor_child(
-    control: &SupervisorControlClient,
+    store: &Store,
     executable: &Path,
     frame: &[u8],
     shutdown_custody: &ShutdownCustody,
@@ -1584,7 +1580,7 @@ async fn spawn_supervisor_child(
                 child,
                 None,
                 None,
-                control,
+                store,
                 "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
                 shutdown_custody,
             )
@@ -1601,7 +1597,7 @@ async fn spawn_supervisor_child(
             child,
             None,
             Some(identity),
-            control,
+            store,
             "MODULE_SUPERVISOR_BOOTSTRAP_PIPE_UNAVAILABLE",
             shutdown_custody,
         )
@@ -1621,7 +1617,7 @@ async fn spawn_supervisor_child(
             child,
             None,
             Some(identity),
-            control,
+            store,
             "MODULE_SUPERVISOR_BOOTSTRAP_WRITE_FAILED",
             shutdown_custody,
         )
@@ -1633,18 +1629,41 @@ async fn spawn_supervisor_child(
     }
     Ok((child, stdin, identity))
 }
+async fn record_module_actor_spawn_failure(
+    store: &Store,
+    state: &'static str,
+    failures: u32,
+    error: &Error,
+    retry: Duration,
+) -> Result<()> {
+    let status_code = if error.code == "MODULE_SUPERVISOR_PROCESS_START_FAILED"
+        && error.secondary_codes.is_empty()
+    {
+        error.code.as_str()
+    } else {
+        // Every other failure follows a successful OS spawn. Without a
+        // verified child/departure receipt, even an accepted health write
+        // must preserve the existing restart fence for the retained Child.
+        SUPERVISOR_SPAWN_PENDING
+    };
+    record_module_actor_status(store, state, failures, Some(status_code), Some(retry)).await
+}
+
 async fn record_module_actor_status(
-    control: &SupervisorControlClient,
+    store: &Store,
     state: &'static str,
     failures: u32,
     error_code: Option<&str>,
     retry: Option<Duration>,
 ) -> Result<()> {
-    record_module_actor_health(control, state, failures, error_code, retry, None).await
+    record_module_actor_health(store, state, failures, error_code, retry, None).await
 }
 
+// The host closes IPC before joining this child and its custody reapers.
+// Keep host-owned health on the existing Store writer until custody drains;
+// the standalone supervisor still uses authenticated IPC for durable control.
 async fn record_module_actor_health(
-    control: &SupervisorControlClient,
+    store: &Store,
     state: &'static str,
     failures: u32,
     error_code: Option<&str>,
@@ -1653,10 +1672,20 @@ async fn record_module_actor_health(
 ) -> Result<()> {
     let error_code = error_code.map(safe_optional_worker_code);
     let retry_in_ms = retry.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
-    control
-        .record_health_with_child(state, failures, error_code.as_deref(), retry_in_ms, child)
+    let child_receipt = child
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| Error::invalid("supervisor child health receipt is not serializable"))?;
+    store
+        .record_legacy_worker_status_with_child(
+            "module-supervisor",
+            state,
+            failures,
+            error_code,
+            retry_in_ms,
+            child_receipt,
+        )
         .await
-        .map_err(module_error)
 }
 
 fn safe_optional_worker_code(code: &str) -> String {
@@ -1829,6 +1858,135 @@ mod tests {
         Arc::new(config)
     }
 
+    #[tokio::test]
+    async fn prelaunch_cancel_after_ipc_close_retires_only_unstarted_intent() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-prelaunch-stop-{}", crate::model::new_id()));
+        fs::create_dir_all(&root).expect("create isolated prelaunch Store root");
+        let root = fs::canonicalize(root).expect("canonicalize isolated prelaunch Store root");
+        let TestIpcRuntime {
+            owner,
+            control,
+            stop,
+            accept,
+        } = TestIpcRuntime::start(&root).await;
+        record_module_actor_status(
+            &owner.store,
+            "isolated",
+            0,
+            Some(SUPERVISOR_SPAWN_PENDING),
+            Some(MODULE_ACTOR_ISOLATED_RETRY),
+        )
+        .await
+        .expect("persist actual first-launch intent");
+        stop.send(true).expect("close actual host IPC listener");
+        time::timeout(Duration::from_secs(3), accept)
+            .await
+            .expect("IPC accept task departed")
+            .expect("IPC accept task joined");
+        assert!(
+            control.read_health().await.is_err(),
+            "IPC must actually be closed"
+        );
+        let (_cancel, stopping) = watch::channel(true);
+        assert!(
+            !prepare_supervisor_spawn(&owner.store, &stopping, None)
+                .await
+                .expect("retire only known-unstarted intent using live Store")
+        );
+        let receipt = owner
+            .store
+            .module_supervisor_health_readback()
+            .await
+            .unwrap();
+        assert_eq!(receipt.state, "dormant");
+        assert!(receipt.error_code.is_none());
+        assert!(receipt.child.is_none());
+        owner
+            .close()
+            .await
+            .expect("close cancelled first host Store");
+
+        let restarted = TestIpcRuntime::start(&root).await;
+        assert!(
+            matches!(
+                reconcile_prior_child(&restarted.control).await.unwrap(),
+                PriorChildState::Clear { retained: None }
+            ),
+            "restart must not retain a first-launch fence when no OS spawn occurred"
+        );
+        restarted.close().await;
+        fs::remove_dir_all(&root).expect("remove isolated prelaunch test Store");
+    }
+
+    #[tokio::test]
+    async fn accepted_postspawn_identity_error_preserves_pending_restart_fence() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-postspawn-fence-{}", crate::model::new_id()));
+        fs::create_dir_all(&root).expect("create isolated postspawn Store root");
+        let root = fs::canonicalize(root).expect("canonicalize isolated postspawn Store root");
+        let release = root.join("release-child");
+        let mut release_guard = ReleaseFileGuard::new(release.clone());
+        let runtime = TestIpcRuntime::start(&root).await;
+        let custody = ShutdownCustody::new(runtime.owner.store.clone());
+        record_module_actor_status(
+            &runtime.owner.store,
+            "isolated",
+            0,
+            Some(SUPERVISOR_SPAWN_PENDING),
+            Some(MODULE_ACTOR_ISOLATED_RETRY),
+        )
+        .await
+        .expect("persist actual pending intent before OS spawn");
+        let child = spawn_fixture_child(&release, false);
+        let pid = child.id().expect("real Child has a PID");
+        let birth = wait_for_birth(pid).await;
+        let identity_error = capture_supervisor_child_identity(&child, &root)
+            .expect_err("actual child image cannot match a directory");
+        assert!(identity_error.secondary_codes.is_empty());
+        reap_failed_supervisor_child(
+            child,
+            None,
+            None,
+            &runtime.owner.store,
+            "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+            &custody,
+        )
+        .await
+        .expect("retain actual unidentified Child in host custody");
+        record_module_actor_spawn_failure(
+            &runtime.owner.store,
+            "isolated",
+            1,
+            &identity_error,
+            MODULE_ACTOR_ISOLATED_RETRY,
+        )
+        .await
+        .expect("ordinary health write must succeed without losing uncertainty");
+        let health = runtime.control.read_health().await.unwrap();
+        assert_eq!(health.error_code.as_deref(), Some(SUPERVISOR_SPAWN_PENDING));
+        assert!(health.child.is_none());
+        assert_same_live_process(pid, &birth, "after accepted identity-error health write");
+        match reconcile_prior_child(&runtime.control).await {
+            Err(error) => assert_eq!(error.code, SUPERVISOR_SPAWN_PENDING),
+            Ok(_) => panic!("live unidentified child must retain its restart fence"),
+        }
+        release_guard.release();
+        custody
+            .drain()
+            .await
+            .expect("wait for exact unidentified Child departure");
+        wait_for_process_departure(pid, &birth).await;
+        runtime.close().await;
+        let restarted = TestIpcRuntime::start(&root).await;
+        match reconcile_prior_child(&restarted.control).await {
+            Err(error) => assert_eq!(error.code, SUPERVISOR_SPAWN_PENDING),
+            Ok(_) => panic!("restart must fail closed without a verified child receipt"),
+        }
+        restarted.close().await;
+        fs::remove_dir_all(&root).expect("remove isolated postspawn test Store");
+    }
+
     async fn initialize_store(root: &Path) {
         fs::create_dir_all(root).expect("create temporary Store directory");
         let root = fs::canonicalize(root).expect("canonicalize temporary Store directory");
@@ -1950,7 +2108,7 @@ mod tests {
         let runtime = TestIpcRuntime::start(&root).await;
         let shutdown_custody = ShutdownCustody::new(runtime.owner.store.clone());
         record_module_actor_status(
-            &runtime.control,
+            &runtime.owner.store,
             "isolated",
             0,
             Some(SUPERVISOR_SPAWN_PENDING),
@@ -1969,7 +2127,7 @@ mod tests {
             child,
             None,
             None,
-            &runtime.control,
+            &runtime.owner.store,
             "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
             &shutdown_custody,
         )
@@ -1977,7 +2135,7 @@ mod tests {
         .expect("transfer the exact unidentified Child to its reaper");
 
         let rejected = record_module_actor_status(
-            &runtime.control,
+            &runtime.owner.store,
             "isolated",
             1,
             Some(&capture_error.code),

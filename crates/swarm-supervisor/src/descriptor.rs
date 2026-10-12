@@ -331,11 +331,12 @@ impl ProtectedResolver for ResolverMapDirectory {
 }
 
 /// All evidence needed to publish a binding-scoped resolver map. Keeping the
-/// credential file and digest together prevents callers from omitting the
-/// immediate file-integrity check while keeping this API below seven inputs.
+/// credential file and digest together preserves the immediate integrity
+/// check; the exact binding configuration names any additional protected files.
 pub struct BindingMapPublication<'a> {
     pub context: &'a ProtectedResolverContext,
     pub descriptor: &'a ModuleDescriptor,
+    pub launch_config: &'a BindingLaunchConfig,
     pub claim: &'a ModuleContractClaim,
     pub credential_ref: &'a ProtectedRef,
     pub credential_file: &'a Path,
@@ -351,6 +352,7 @@ impl ResolverMapDirectory {
         let BindingMapPublication {
             context,
             descriptor,
+            launch_config,
             claim,
             credential_ref,
             credential_file,
@@ -360,6 +362,7 @@ impl ResolverMapDirectory {
         descriptor
             .validate()
             .map_err(|error| Error::new("MODULE_DESCRIPTOR_INVALID", error.to_string()))?;
+        launch_config.validate()?;
         if descriptor.module_id != context.module_id
             || descriptor.artifact != context.artifact
             || !descriptor.protocol.contains(context.protocol)
@@ -376,6 +379,11 @@ impl ResolverMapDirectory {
         required.insert(credential_ref.clone());
         for environment in &descriptor.launch.environment {
             if let LaunchValue::Protected(reference) = &environment.value {
+                required.insert(reference.clone());
+            }
+        }
+        for value in launch_config.values.values() {
+            if let LaunchValue::Protected(reference) = value {
                 required.insert(reference.clone());
             }
         }

@@ -153,9 +153,33 @@ impl NativeOwnerController {
         let Some(auth) = config.provider_auth.as_ref() else {
             return Ok(None);
         };
-        provider_auth::bootstrap_once(native, options, auth)
-            .await
-            .map(Some)
+        config.validate_for(options)?;
+        let ready = self.ready.as_ref().ok_or_else(|| {
+            Error::new(
+                "NATIVE_OWNER_RECEIPT_MISSING",
+                "provider authorization has no retained owned-service readiness receipt",
+            )
+        })?;
+        ready.validate().map_err(|_| {
+            Error::new(
+                "NATIVE_OWNER_RECEIPT_INVALID",
+                "provider authorization readiness receipt is invalid",
+            )
+        })?;
+        if ready.owner_nonce != config.owner_nonce
+            || ready.service_id != options.service_id
+            || ready.service_version != native.version()
+            || ready.process.pid != native.pid()
+        {
+            return Err(Error::new(
+                "NATIVE_OWNER_RECEIPT_MISMATCH",
+                "provider authorization connection differs from its owned-service receipt",
+            ));
+        }
+        let projection =
+            provider_auth::StoreProviderAuthProjection::from_ready(options, auth, ready)?;
+        let readback = provider_auth::bootstrap_once(native, options, auth).await?;
+        projection.bind_readback(readback).map(Some)
     }
 }
 

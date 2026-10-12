@@ -2614,4 +2614,233 @@ mod catalog_readiness_tests {
             assert_no_provider_key_request(&listener);
         }
     }
+
+    #[tokio::test]
+    async fn exact_permission_reply_reconcile_uses_native_gets_without_reply_post() {
+        use crate::config::ModelRef;
+        use crate::journal::OperationIntent;
+        use swarm_contracts::runtime::{ModuleReceiptIdentity, RuntimeCommand};
+
+        let directory = std::env::current_dir().unwrap();
+        let options = NativeOptions {
+            service_id: "reg09-reply-readback".into(),
+            connection_file: directory.join("unused-connection.json"),
+            directory: directory.clone(),
+            model: ModelRef {
+                id: "fixture-model".into(),
+                provider_id: "opencode".into(),
+                variant: "fixture-variant".into(),
+            },
+        };
+        let binding_id = "reg09_binding".to_owned();
+        let root = root_id(&binding_id, 1);
+        let model_value = serde_json::to_value(&options.model).unwrap();
+        let model_projection = json!({
+            "id":options.model.id,
+            "providerID":options.model.provider_id,
+            "variant":options.model.variant
+        });
+        let location = json!({
+            "directory":directory.to_string_lossy(),
+            "project":{"id":"reg09-project"}
+        });
+        let session = json!({
+            "id":root,
+            "parentID":null,
+            "fork":null,
+            "location":{"directory":directory.to_string_lossy()},
+            "model":model_projection,
+            "metadata":{"eliot":{"binding":binding_id,"generation":1}}
+        });
+        let request_id = "per_reg09";
+        let asked_data = json!({
+            "id":request_id,
+            "sessionID":root,
+            "action":"read",
+            "resources":[]
+        });
+        let request_fingerprint = sha256(canonical_json(&asked_data).unwrap().as_bytes());
+        let reply_payload_sha256 = digest_json(&json!({"reply":"once"})).unwrap();
+        let saved_identity = json!({
+            "kind":"permission",
+            "action":"once",
+            "session_id":root,
+            "request_id":request_id,
+            "request_fingerprint":request_fingerprint,
+            "affected_request_ids":[request_id],
+            "effect_payload_sha256":reply_payload_sha256,
+            "feedback_present":false
+        });
+        let event = |id: &str, event_type: &str, sequence: u64, data: Value| {
+            json!({
+                "id":id,
+                "type":event_type,
+                "created":sequence as f64,
+                "durable":{"aggregateID":root,"seq":sequence,"version":1},
+                "data":data
+            })
+        };
+        let root_event = event(
+            "evt_reg09_root",
+            "session.created",
+            1,
+            json!({
+                "sessionID":root,
+                "parentID":null,
+                "model":model_value,
+                "metadata":{"eliot":{"binding":binding_id,"generation":1}}
+            }),
+        );
+        let asked_event = event(
+            "evt_reg09_permission_asked",
+            "permission.v2.asked",
+            2,
+            asked_data,
+        );
+        let replied_event = event(
+            "evt_reg09_permission_replied",
+            "permission.v2.replied",
+            3,
+            json!({"sessionID":root,"requestID":request_id,"reply":"once"}),
+        );
+        let history = json!({
+            "data":[root_event.clone(),asked_event,replied_event],
+            "hasMore":false
+        });
+        let log_event = |data: &Value| format!("event: message\ndata: {}\n\n", data);
+        let log_body = format!(
+            "{}{}",
+            log_event(&root_event),
+            log_event(&json!({"type":"log.synced","aggregateID":root,"seq":1}))
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let session_path = format!("/api/session/{root}");
+        let history_path = format!("/api/session/{root}/history");
+        let log_path = format!("/api/experimental/session/{root}/log");
+        let model_id = options.model.id.clone();
+        let model_provider = options.model.provider_id.clone();
+        let model_variant = options.model.variant.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let headers = String::from_utf8_lossy(&request);
+                let request_line = headers.lines().next().unwrap().to_owned();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap().to_owned();
+                let target = parts.next().unwrap().to_owned();
+                assert_eq!(
+                    method, "GET",
+                    "reconcile attempted a native mutation: {request_line}"
+                );
+                let path = target.split('?').next().unwrap();
+                let (content_type, body) = if path == session_path.as_str() {
+                    (
+                        "application/json",
+                        serde_json::to_vec(&json!({"data":session})).unwrap(),
+                    )
+                } else if path == "/api/location" {
+                    ("application/json", serde_json::to_vec(&location).unwrap())
+                } else if path == "/api/model" {
+                    let catalog = json!({
+                        "location":location,
+                        "data":[{
+                            "id":model_id,
+                            "providerID":model_provider,
+                            "enabled":true,
+                            "variants":[{"id":model_variant}]
+                        }]
+                    });
+                    ("application/json", serde_json::to_vec(&catalog).unwrap())
+                } else if path == log_path.as_str() {
+                    ("text/event-stream", log_body.as_bytes().to_vec())
+                } else if path == history_path.as_str() {
+                    ("application/json", serde_json::to_vec(&history).unwrap())
+                } else {
+                    panic!("unexpected native request: {request_line}");
+                };
+                requests.push((method, target));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        let native = NativeClient {
+            client: Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
+            endpoint,
+            pid: std::process::id(),
+            version: "2.0.7".into(),
+        };
+        let route_sha256 = digest_json(&serde_json::to_value(&options).unwrap()).unwrap();
+        let module_receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":"eliot.opencode",
+            "artifact":{"artifact_id":"eliot-opencode-v2.rust-http.1","version":"0.5.0"},
+            "protocol":{"major":1,"minor":0},
+            "binding_id":binding_id,
+            "binding_generation":1,
+            "operation_id":"reply-target",
+            "input_sha256":"c".repeat(64)
+        }))
+        .unwrap();
+        let intent = OperationIntent {
+            version: 2,
+            operation_id: "reply-target".into(),
+            module_receipt,
+            method: "agent.reply".into(),
+            binding_id: binding_id.clone(),
+            generation: 1,
+            native_scope_key: options.scope_key(),
+            native_root_id: Some(root.clone()),
+            native_input_id: None,
+            prompt_sha256: None,
+            prompt_bytes: None,
+            reconcile_target_operation_id: None,
+            result_input_status: None,
+            result_assistant: None,
+            dispatch_admission: None,
+            route_sha256,
+            model: model_value,
+            marker: json!({"native_opencode_reply":saved_identity}),
+        };
+        let command = RuntimeCommand {
+            operation_id: "reply-reconcile".into(),
+            method: "agent.reconcile".into(),
+            created_at_ms: 1,
+            binding_id,
+            generation: 1,
+            native_root_id: Some(root),
+            route: json!({}),
+            input: json!({"operation_id":"reply-target"}),
+            input_sha256: None,
+            target_input_sha256: Some("c".repeat(64)),
+        };
+
+        crate::native_interactions::reconcile_reply(&native, &command, &options, &intent)
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|(method, _)| method == "GET"));
+        assert!(!requests.iter().any(|(method, path)| {
+            method == "POST" && path.ends_with("/permission/per_reg09/reply")
+        }));
+    }
 }

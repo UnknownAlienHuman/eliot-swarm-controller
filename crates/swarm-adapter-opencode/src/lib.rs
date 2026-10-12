@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod app320_connected_consumer;
 mod config;
 mod journal;
 mod mcp_plugin;
@@ -66,6 +68,8 @@ struct HostSession<'a> {
     hello_base: Value,
     root_hint: Mutex<Option<String>>,
     ipc_link: AsyncMutex<Option<swarm_client::ModuleLink>>,
+    #[cfg(test)]
+    outcome_observer: Option<std::sync::Arc<Mutex<Vec<Value>>>>,
     // A partial batch or transient sweep error is retried from the main loop.
     retention_retry_pending: AtomicBool,
 }
@@ -119,6 +123,8 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         hello_base,
         root_hint: Mutex::new(root_hint),
         ipc_link: AsyncMutex::new(None),
+        #[cfg(test)]
+        outcome_observer: None,
         retention_retry_pending: AtomicBool::new(false),
     };
     let run_result = async {
@@ -1206,6 +1212,7 @@ async fn handle_open(
             {
                 details["catalog_failure_category"] = json!(category.as_str());
             }
+            attach_provider_auth_proof(&mut details, provider_auth.as_ref());
             let mut rejected = outcome(
                 command,
                 claim,
@@ -1250,11 +1257,18 @@ async fn handle_open(
             let mut failure =
                 effect_failure(command, claim, options, Some(root), None, &error, true)?;
             attach_owned_service_ready_only(&mut failure, owner_ready.as_ref(), options);
+            attach_provider_auth_proof(&mut failure.details, provider_auth.as_ref());
             failure
         }
     };
     journal.queue_outcome(&outcome)?;
     flush_outbox(host).await
+}
+
+fn attach_provider_auth_proof(details: &mut Value, proof: Option<&Value>) {
+    if let Some(proof) = proof {
+        details["provider_auth"] = proof.clone();
+    }
 }
 
 fn attach_owned_service_ready_only(
@@ -2098,16 +2112,55 @@ fn applied_from_intent(
     intent: &OperationIntent,
     input_evidence: Option<InputEvidence>,
 ) -> Result<RuntimeOutcome> {
+    let reply_identity = if intent.method == "agent.reply" {
+        let identity = intent
+            .marker
+            .get("native_opencode_reply")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "saved reply intent has no exact native reply identity",
+                )
+            })?;
+        if identity["feedback_present"] != false
+            || intent.native_input_id.is_some()
+            || intent.prompt_sha256.is_some()
+            || intent.prompt_bytes.is_some()
+        {
+            return Err(Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved reply intent cannot prove readback without replayable input",
+            ));
+        }
+        Some(identity)
+    } else {
+        None
+    };
     let (completion_condition, evidence, input_id, admitted_sequence, prompted_sequence) =
-        match input_evidence {
-            None => (
+        match (input_evidence, reply_identity.is_some()) {
+            (None, true) => (
+                "native_reply_acknowledged",
+                "complete_contiguous_native_reply_history",
+                None,
+                None,
+                None,
+            ),
+            (None, false) => (
                 "native_session_created",
                 "exact_session_readback",
                 None,
                 None,
                 None,
             ),
-            Some(evidence) => (
+            (Some(_), true) => {
+                return Err(Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "reply readback cannot carry native input admission evidence",
+                ));
+            }
+            (Some(evidence), false) => (
                 "native_input_admitted",
                 "durable_session_history",
                 intent.native_input_id.clone(),
@@ -2156,6 +2209,9 @@ fn applied_from_intent(
             ));
         }
         details["dispatch_admission"] = serde_json::to_value(admission)?;
+    }
+    if let Some(identity) = reply_identity {
+        details["reply_readback_identity"] = identity;
     }
     module_receipt::insert_into_details(&mut details, &intent.module_receipt)?;
     Ok(RuntimeOutcome {
@@ -2346,6 +2402,13 @@ impl<'a> HostSession<'a> {
     /// transport-ambiguous exchange retires it; a later saved-receipt retry
     /// establishes and hello-binds a fresh link before resending those bytes.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        #[cfg(test)]
+        if method == "module.outcome"
+            && let Some(observer) = self.outcome_observer.as_ref()
+            && let Ok(mut calls) = observer.lock()
+        {
+            calls.push(params.clone());
+        }
         let mut saved = self.ipc_link.lock().await;
         if saved.is_none() {
             *saved = Some(self.open_link().await?);
@@ -3188,6 +3251,48 @@ mod outbox_recovery_tests {
         intent
     }
 
+    #[test]
+    fn verified_reply_readback_preserves_exact_identity_without_input_replay() {
+        let mut target = fixture_target_intent("reply-target");
+        target.method = "agent.reply".to_owned();
+        target.native_root_id = Some("ses_fixture".to_owned());
+        target.native_input_id = None;
+        target.prompt_sha256 = None;
+        target.prompt_bytes = None;
+        let reply_identity = json!({
+            "kind":"question",
+            "action":"reply",
+            "session_id":"ses_fixture",
+            "request_id":"que_fixture",
+            "request_fingerprint":"a".repeat(64),
+            "affected_request_ids":["que_fixture"],
+            "effect_payload_sha256":format!("sha256:{}", "b".repeat(64)),
+            "feedback_present":false
+        });
+        target.marker = json!({"native_opencode_reply":reply_identity.clone()});
+
+        let applied = applied_from_intent(&target, None).unwrap();
+        let linked = link_reconcile_target(applied, "reply-reconcile").unwrap();
+
+        assert_eq!(linked.operation_id, "reply-target");
+        assert_eq!(linked.native_root_id.as_deref(), Some("ses_fixture"));
+        assert_eq!(linked.native_input_id, None);
+        assert_eq!(
+            linked.details["completion_condition"],
+            "native_reply_acknowledged"
+        );
+        assert_eq!(
+            linked.details["evidence"],
+            "complete_contiguous_native_reply_history"
+        );
+        assert_eq!(linked.details["reply_readback_identity"], reply_identity);
+        assert_eq!(linked.details["reconcile_operation_id"], "reply-reconcile");
+        assert_eq!(linked.details["native_replay"], false);
+        assert_eq!(
+            linked.details["module_receipt"]["input_sha256"],
+            target.module_receipt.input_sha256
+        );
+    }
     fn fixture_reconcile_intent(operation_id: &str, target_id: &str) -> OperationIntent {
         let mut intent = fixture_effect_intent(operation_id);
         intent.method = "agent.reconcile".to_owned();

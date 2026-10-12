@@ -955,7 +955,10 @@ pub(super) fn registered_module_recovery_contract(
     target_method: &str,
     target_operation_id: Option<&str>,
 ) -> Result<Option<(String, String, &'static str)>> {
-    if !matches!(target_method, "agent.open" | "task.dispatch" | "agent.send") {
+    if !matches!(
+        target_method,
+        "agent.open" | "task.dispatch" | "agent.send" | "agent.reply"
+    ) {
         return Ok(None);
     }
     let Some(selector) = binding["observation"].get("module_contract_selector") else {
@@ -980,15 +983,16 @@ pub(super) fn registered_module_recovery_contract(
             .iter()
             .any(|id| id.as_str() == capability)
     };
-    let target_input = if target_method == "agent.send" {
+    let target_input = if matches!(target_method, "agent.send" | "agent.reply") {
         let Some(target_operation_id) = target_operation_id else {
             return Ok(None);
         };
         let target_request: Option<String> = db
             .query_row(
-                "SELECT original_request_json FROM operations WHERE operation_id=?1 AND method='agent.send' AND binding_id=?2 AND binding_generation=?3",
+                "SELECT original_request_json FROM operations WHERE operation_id=?1 AND method=?2 AND binding_id=?3 AND binding_generation=?4",
                 params![
                     target_operation_id,
+                    target_method,
                     model::text(binding, "binding_id")?,
                     model::positive(binding, "generation")?
                 ],

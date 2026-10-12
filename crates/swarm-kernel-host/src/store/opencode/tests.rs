@@ -1539,3 +1539,214 @@ async fn task_dispatch_execution_diagnostic_is_scoped_and_rejects_damaged_identi
     worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
+#[tokio::test]
+async fn unknown_agent_reply_exposes_only_exact_readback_on_retained_opencode_route() {
+    let f = Fixture::new().await;
+    let descriptor = registered_opencode_descriptor();
+    let (owner, operator, _) = start_module_route(&f, descriptor, true).await;
+    let store = owner.store.clone();
+    let open = write(
+        &store,
+        &operator,
+        "agent.open",
+        json!({"lane_id":"reg09-reply-readback","route":"module-fixture"}),
+    )
+    .await
+    .unwrap();
+    let binding_id = open["binding_id"].as_str().unwrap().to_owned();
+    let open_id = open["operation_id"].as_str().unwrap().to_owned();
+    let native_root_id = "ses_reg09_fixture".to_owned();
+    let native_scope_key = f.options.scope();
+    {
+        let binding = binding_id.clone();
+        let scope = native_scope_key.clone();
+        let root = native_root_id.clone();
+        store
+            .run(move |db| {
+                let opened = model::canonical(&json!({
+                    "operation_id":open_id,
+                    "outcome":"opened",
+                    "native_scope_key":scope,
+                    "native_root_id":root,
+                    "turn_id":null,
+                    "native_input_id":null,
+                    "details":{}
+                }))?;
+                db.execute(
+                    "UPDATE operations SET state='settled',settled_at_ms=updated_at_ms,result_json=?2 WHERE operation_id=?1",
+                    rusqlite::params![open_id, opened],
+                )?;
+                db.execute(
+                    "UPDATE bindings SET state='ready',native_scope_key=?3,native_root_id=?4,\
+                     state_json=json_set(state_json,'$.connection','connected','$.bridge_boot_id','reg09-fixture-boot') \
+                     WHERE binding_id=?1 AND generation=?2",
+                    rusqlite::params![binding, 1, scope, root],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut exact_reply_request = json!({
+        "binding_id":binding_id,
+        "generation":1,
+        "reply":{
+            "kind":"permission",
+            "session_id":native_root_id,
+            "request_id":"per_reg09",
+            "fingerprint":"a".repeat(64),
+            "body":{"decision":"once"}
+        }
+    });
+    exact_reply_request["client_request_id"] = json!(model::new_id());
+    let exact_reply_request_json = model::canonical(&exact_reply_request).unwrap();
+    let reply = store
+        .call(operator.clone(), "agent.reply".into(), exact_reply_request)
+        .await
+        .unwrap();
+    let reply_id = reply["operation_id"].as_str().unwrap().to_owned();
+    let unknown_result = json!({
+        "operation_id":reply_id,
+        "outcome":"unknown",
+        "native_scope_key":native_scope_key,
+        "native_root_id":native_root_id,
+        "turn_id":null,
+        "native_input_id":null,
+        "details":{"diagnostic_code":"NATIVE_OUTCOME_UNKNOWN","native_replay":false}
+    });
+    let unknown_result_json = model::canonical(&unknown_result).unwrap();
+    {
+        let id = reply_id.clone();
+        let outcome = unknown_result_json.clone();
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE operations SET state='outcome_unknown',result_json=?2 \
+                     WHERE operation_id=?1 AND method='agent.reply'",
+                    rusqlite::params![id, outcome],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    let projected = read(
+        &store,
+        &operator,
+        "operation.get",
+        json!({"operation_id":reply_id}),
+    )
+    .await;
+    let readback = &projected["module_outcome_readback_required"];
+    assert_eq!(projected["method"], "agent.reply");
+    assert_eq!(projected["state"], "outcome_unknown");
+    assert_eq!(projected["binding_id"], binding_id);
+    assert_eq!(projected["binding_generation"], 1);
+    assert_eq!(projected["result"]["operation_id"], reply_id);
+    assert_eq!(projected["result"]["outcome"], "unknown");
+    assert_eq!(readback["operation_id"], reply_id);
+    assert_eq!(readback["operation_method"], "agent.reply");
+    assert_eq!(readback["binding_id"], binding_id);
+    assert_eq!(readback["binding_generation"], 1);
+    assert_eq!(readback["readback"]["method"], "agent.reconcile");
+    assert_eq!(readback["readback"]["native_replay"], false);
+    assert_eq!(readback["readback"]["availability"], "available");
+    assert_eq!(readback["readback"]["supported_on_exact_route"], true);
+    assert_eq!(
+        readback["readback"]["request_template"],
+        json!({"binding_id":binding_id,"generation":1,"operation_id":reply_id})
+    );
+
+    let mismatch = store
+        .call(
+            operator.clone(),
+            "agent.reconcile".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "binding_id":binding_id,
+                "generation":2,
+                "operation_id":reply_id
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code, "NOT_FOUND");
+
+    let reconcile = store
+        .call(
+            operator.clone(),
+            "agent.reconcile".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "binding_id":binding_id,
+                "generation":1,
+                "operation_id":reply_id
+            }),
+        )
+        .await
+        .unwrap();
+    let reconcile_id = reconcile["operation_id"].as_str().unwrap().to_owned();
+    assert_ne!(reconcile_id, reply_id);
+    let reconcile_method = {
+        let id = reconcile_id.clone();
+        store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT method FROM operations WHERE operation_id=?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(reconcile_method, "agent.reconcile");
+
+    let target_snapshot = {
+        let id = reply_id.clone();
+        store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT original_request_json,result_json,state,binding_id,binding_generation \
+                     FROM operations WHERE operation_id=?1 AND method='agent.reply'",
+                    rusqlite::params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(target_snapshot.0, exact_reply_request_json);
+    assert_eq!(target_snapshot.1, unknown_result_json);
+    assert_eq!(target_snapshot.2, "outcome_unknown");
+    assert_eq!(target_snapshot.3, binding_id);
+    assert_eq!(target_snapshot.4, 1);
+    let reply_count = {
+        let binding = binding_id.clone();
+        store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=1 AND method='agent.reply'",
+                    rusqlite::params![binding],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(reply_count, 1);
+    owner.close().await.unwrap();
+}

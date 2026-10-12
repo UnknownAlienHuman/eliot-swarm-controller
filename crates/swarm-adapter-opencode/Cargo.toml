@@ -23,3 +23,6 @@ swarm-contracts = { path = "../swarm-contracts" }
 swarm-process = { path = "../swarm-process" }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+swarm-kernel-host = { path = "../swarm-kernel-host" }

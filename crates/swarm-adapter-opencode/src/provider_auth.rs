@@ -7,10 +7,10 @@
 
 use crate::{
     config::{ModelRef, NativeOptions},
-    native::NativeClient,
+    native::{NativeClient, canonical_json},
 };
 use serde::de::{IgnoredAny, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -19,7 +19,10 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
 };
-use swarm_contracts::error::{Error, Result};
+use swarm_contracts::{
+    error::{Error, Result},
+    runtime::OwnedServiceReadyReceipt,
+};
 
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 16 * 1024;
@@ -49,15 +52,115 @@ impl ProviderAuthOptions {
     }
 }
 
+/// Safe metadata returned by the one key POST and its exact integration
+/// readback. It deliberately carries no key, source path, or Store authority.
+#[derive(Debug)]
+pub(crate) struct ProviderAuthReadback {
+    credential_id: String,
+}
+
+/// Route-bound fields projected from the actual owner readiness receipt
+/// before the credential POST. The Store independently validates every value
+/// against its retained start row and route.
+#[derive(Debug)]
+pub(crate) struct StoreProviderAuthProjection {
+    credential_ref: String,
+    provider_id: String,
+    model_digest: String,
+    service_id: String,
+    service_version: String,
+    owner_nonce_digest: String,
+    process_pid: u32,
+    process_birth_token: String,
+}
+
+#[derive(Serialize)]
+struct StoredUnverifiedProviderAuthProof {
+    status: &'static str,
+    credential_ref: String,
+    provider_id: String,
+    model_digest: String,
+    service_id: String,
+    service_version: String,
+    owner_nonce_digest: String,
+    process: StoredUnverifiedProcessProof,
+    integration_id: String,
+    key_method: &'static str,
+    connection_metadata_digest: String,
+}
+
+#[derive(Serialize)]
+struct StoredUnverifiedProcessProof {
+    pid: u32,
+    birth_token: String,
+}
+
+impl StoreProviderAuthProjection {
+    pub(crate) fn from_ready(
+        options: &NativeOptions,
+        auth: &ProviderAuthOptions,
+        ready: &OwnedServiceReadyReceipt,
+    ) -> Result<Self> {
+        auth.validate_for(options)?;
+        ready
+            .validate()
+            .map_err(|_| auth_error("owned service readiness receipt is invalid"))?;
+        let credential_ref = auth
+            .credential_ref
+            .as_deref()
+            .filter(|value| valid_ref(value))
+            .ok_or_else(|| auth_error("owned provider credential reference is missing"))?;
+        if ready.service_id != options.service_id || ready.process.pid == 0 {
+            return Err(auth_error(
+                "owned service readiness receipt differs from the selected route",
+            ));
+        }
+        Ok(Self {
+            credential_ref: credential_ref.to_owned(),
+            provider_id: options.model.provider_id.clone(),
+            model_digest: model_digest(&options.model)?,
+            service_id: ready.service_id.clone(),
+            service_version: ready.service_version.clone(),
+            owner_nonce_digest: hex_digest(&Sha256::digest(ready.owner_nonce.as_bytes())),
+            process_pid: ready.process.pid,
+            process_birth_token: ready.process.birth_token.clone(),
+        })
+    }
+
+    pub(crate) fn bind_readback(self, readback: ProviderAuthReadback) -> Result<Value> {
+        if !safe_metadata_text(&readback.credential_id) {
+            return Err(auth_error("provider credential metadata is malformed"));
+        }
+        let connection_metadata_digest =
+            sha256_canonical_json(&json!({"credential_id":readback.credential_id}))?;
+        Ok(serde_json::to_value(StoredUnverifiedProviderAuthProof {
+            status: "stored_unverified",
+            credential_ref: self.credential_ref,
+            provider_id: self.provider_id.clone(),
+            model_digest: self.model_digest,
+            service_id: self.service_id,
+            service_version: self.service_version,
+            owner_nonce_digest: self.owner_nonce_digest,
+            process: StoredUnverifiedProcessProof {
+                pid: self.process_pid,
+                birth_token: self.process_birth_token,
+            },
+            integration_id: self.provider_id,
+            key_method: "key",
+            connection_metadata_digest,
+        })?)
+    }
+}
+
 /// Perform the single provider key POST for the just-ready native owner.
 /// `NATIVE_REJECTED` is used only for a deterministic preflight or native
 /// rejection; all transport/readback uncertainty remains unknown to the
 /// caller.
-pub async fn bootstrap_once(
+pub(crate) async fn bootstrap_once(
     native: &NativeClient,
     options: &NativeOptions,
     auth: &ProviderAuthOptions,
-) -> Result<Value> {
+) -> Result<ProviderAuthReadback> {
     auth.validate_for(options)?;
     let provider_id = options.model.provider_id.as_str();
     let key = read_selected_key(&auth.source_file, provider_id)?;
@@ -69,16 +172,7 @@ pub async fn bootstrap_once(
         .await?;
     let after = native.provider_integration(&directory).await?;
     let credential_id = validate_integration(&after, &directory, provider_id, true)?;
-    Ok(json!({
-        "status":"stored_unverified",
-        "provider_id":provider_id,
-        "credential_ref":auth.credential_ref,
-        "model_digest":model_digest(&options.model)?,
-        "service":{"pid":native.pid(),"version":native.version()},
-        "integration_id":provider_id,
-        "key_method":"key",
-        "credential_metadata_digest":sha256_json(&json!({"credential_id":credential_id}))
-    }))
+    Ok(ProviderAuthReadback { credential_id })
 }
 
 struct SecretKey(Vec<u8>);
@@ -386,13 +480,13 @@ fn canonical_directory_text(path: &Path) -> Result<String> {
 }
 
 fn model_digest(model: &ModelRef) -> Result<String> {
-    let bytes = serde_json::to_vec(model)?;
-    Ok(hex_digest(&Sha256::digest(&bytes)))
+    sha256_canonical_json(&serde_json::to_value(model)?)
 }
 
-fn sha256_json(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    hex_digest(&Sha256::digest(&bytes))
+fn sha256_canonical_json(value: &Value) -> Result<String> {
+    Ok(hex_digest(&Sha256::digest(
+        canonical_json(value)?.as_bytes(),
+    )))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

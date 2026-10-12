@@ -1505,6 +1505,7 @@ impl StandaloneSupervisor {
             .publish_binding_map(BindingMapPublication {
                 context: &context,
                 descriptor: &demand.descriptor,
+                launch_config: &launch_config,
                 claim: &claim,
                 credential_ref,
                 credential_file: &provisioned.credential_file,
