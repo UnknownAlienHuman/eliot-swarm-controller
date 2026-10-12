@@ -5385,6 +5385,221 @@ mod tests {
         );
         assert!(!service.state_dir.join("launch-attempt.json").exists());
     }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    struct App369EmptyRefResolver;
+
+    #[cfg(any(windows, target_os = "linux"))]
+    impl swarm_process::module_owner::ProtectedRefResolver for App369EmptyRefResolver {
+        fn resolve(
+            &self,
+            plan: &swarm_process::module_owner::ModuleOwnerPlan,
+            _: &std::path::Path,
+            _: &Value,
+        ) -> swarm_contracts::error::Result<swarm_process::module_owner::ResolvedLaunch> {
+            Ok(swarm_process::module_owner::ResolvedLaunch {
+                executable: plan.executable.clone(),
+                argv: plan.argv.clone(),
+                environment: Vec::new(),
+            })
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation() {
+        let fixture = StartupFixture::new_with_current_executable();
+        fixture.prepare_accounting();
+        let service = &fixture.service;
+        let prior_start_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        service
+            .write_restart_history(&VecDeque::from([prior_start_ms]))
+            .unwrap();
+        let state_dir = service.state_dir.clone();
+        let boot_id = Uuid::new_v4().to_string();
+        let worker_executable = fixture.root.join("app369-invalid-worker.exe");
+        fs::write(&worker_executable, b"not a native executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&worker_executable).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&worker_executable, permissions).unwrap();
+        }
+
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::app369_spawn_failure_owner_helper_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ELIOT_SWARM_SUPERVISOR_APP369_HELPER", "1")
+            .env("ELIOT_SWARM_SUPERVISOR_APP369_STATE_DIR", &state_dir)
+            .env("ELIOT_SWARM_SUPERVISOR_APP369_WORKER", &worker_executable)
+            .env("ELIOT_SWARM_SUPERVISOR_APP369_BOOT_ID", &boot_id)
+            .env(
+                "ELIOT_SWARM_SUPERVISOR_APP369_BINDING_ID",
+                &service.scope.binding_id,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start APP-369 owner helper fixture");
+        let helper_pid = helper.id().expect("owner helper fixture has a PID");
+        let identity_deadline = Instant::now() + Duration::from_secs(10);
+        let helper_identity = loop {
+            if Instant::now() >= identity_deadline {
+                let _ = helper.start_kill();
+                let _ = helper.wait().await;
+                panic!("APP-369 helper identity was not readable before deadline");
+            }
+            match capture_identity(helper_pid) {
+                Ok(identity) => break identity,
+                Err(error) if error.code == "PROCESS_GONE" => {
+                    if let Some(exit) = helper.try_wait().unwrap() {
+                        panic!("APP-369 helper exited before launch admission: {exit}");
+                    }
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("APP-369 helper identity failed: {}", error.code),
+            }
+        };
+
+        service
+            .write_launch_attempt(&boot_id, Some(&helper_identity))
+            .unwrap();
+        let attempt_path = state_dir.join("launch-attempt.json");
+        let attempt_before = fs::read(&attempt_path).unwrap();
+        let history_path = state_dir.join("restart-history.json");
+        let history_before = fs::read(&history_path).ok();
+        let restart_starts_before = service.current_status().restart.starts_in_window;
+        let restart_history_before = service.read_restart_history().unwrap();
+        assert_eq!(restart_history_before.len(), 1);
+
+        let result = service
+            .monitor_owner_helper(
+                &mut helper,
+                &boot_id,
+                &helper_identity,
+                None,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("consume the helper's produced launch-result receipt");
+        assert!(result.exit.success());
+        assert_eq!(
+            result.failure_code.as_deref(),
+            Some("MODULE_OWNER_SPAWN_FAILED")
+        );
+        assert_eq!(result.failure_stage.as_deref(), Some("spawn"));
+        assert_eq!(result.effect_certainty, ModuleEffectCertainty::NotStarted);
+        assert!(result.safe_to_replace);
+        assert!(!result.family_departure_proven);
+        assert!(result.worker.is_none());
+
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(state_dir.join("launch-result.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt.as_object().unwrap().len(), 16);
+        assert_eq!(receipt["version"].as_u64(), Some(1));
+        assert_eq!(receipt["boot_id"].as_str(), Some(boot_id.as_str()));
+        assert_eq!(receipt["module"].as_str(), Some("fixture"));
+        assert_eq!(
+            receipt["binding"].as_str(),
+            Some(service.scope.binding_id.as_str())
+        );
+        assert_eq!(receipt["generation"].as_str(), Some("1"));
+        assert_eq!(receipt["artifact_id"].as_str(), Some("fixture.adapter"));
+        assert_eq!(receipt["artifact_version"].as_str(), Some("1"));
+        assert_eq!(receipt["disposition"].as_str(), Some("not_started"));
+        assert_eq!(receipt["worker_started"].as_bool(), Some(false));
+        assert_eq!(receipt["family_empty"].as_bool(), Some(true));
+        assert_eq!(receipt["stage"].as_str(), Some("spawn"));
+        assert_eq!(
+            receipt["error_code"].as_str(),
+            Some("MODULE_OWNER_SPAWN_FAILED")
+        );
+
+        let departed = service
+            .wait_for_prior_owner_to_depart()
+            .await
+            .expect("validate the same receipt during prior-owner recovery")
+            .expect("the exact owner family is now departed");
+        assert_eq!(
+            departed.receipt["process"]["pid"].as_u64(),
+            Some(u64::from(helper_pid))
+        );
+        assert_eq!(fs::read(attempt_path).unwrap(), attempt_before);
+        assert_eq!(fs::read(history_path).ok(), history_before);
+        assert_eq!(
+            service.read_restart_history().unwrap(),
+            restart_history_before
+        );
+        assert_eq!(
+            service.current_status().restart.starts_in_window,
+            restart_starts_before
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "spawned by app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation"]
+    fn app369_spawn_failure_owner_helper_process() {
+        if std::env::var_os("ELIOT_SWARM_SUPERVISOR_APP369_HELPER").is_none() {
+            return;
+        }
+        let state_dir = PathBuf::from(
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_APP369_STATE_DIR")
+                .expect("APP-369 state directory"),
+        );
+        let worker_executable = PathBuf::from(
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_APP369_WORKER")
+                .expect("APP-369 invalid worker executable"),
+        );
+        let boot_id =
+            std::env::var("ELIOT_SWARM_SUPERVISOR_APP369_BOOT_ID").expect("APP-369 boot ID");
+        let binding =
+            std::env::var("ELIOT_SWARM_SUPERVISOR_APP369_BINDING_ID").expect("APP-369 binding ID");
+        let attempt_path = state_dir.join("launch-attempt.json");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !attempt_path.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "APP-369 launch attempt was not admitted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let plan = swarm_process::module_owner::ModuleOwnerPlan {
+            state_dir,
+            executable: worker_executable,
+            argv: Vec::new(),
+            protected_refs: Vec::new(),
+            environment: Vec::new(),
+            module: "fixture".to_owned(),
+            binding,
+            generation: "1".to_owned(),
+            artifact_id: "fixture.adapter".to_owned(),
+            artifact_version: "1".to_owned(),
+            build_id: None,
+            protocol: "1.0".to_owned(),
+            module_contract: "{}".to_owned(),
+            module_client_id: "fixture.client".to_owned(),
+            boot_id,
+        };
+        let error =
+            swarm_process::module_owner::run_module_with_resolver(plan, &App369EmptyRefResolver)
+                .expect_err("invalid native image must fail at the actual worker Command::spawn");
+        assert_eq!(error.code, "MODULE_OWNER_SPAWN_FAILED");
+    }
 }
 
 fn prune_starts(starts: &mut VecDeque<u64>, window_ms: u64, now_ms: u64) {

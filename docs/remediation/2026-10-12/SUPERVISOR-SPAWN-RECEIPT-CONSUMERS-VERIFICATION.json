@@ -1,0 +1,162 @@
+{
+  "schema": "swarm.supervisor_spawn_receipt_consumers_verification.v1",
+  "verified_at_utc": "2026-10-12T17:37:48.244Z",
+  "base_main": "5f3188e927e21287701d1396240f8a2895bb3b3f",
+  "ledger_ids": [
+    "APP-369"
+  ],
+  "original_rows": 459,
+  "original_obligations_unchanged": true,
+  "original_ledger_sha256": "0ECF65782FFEFC88C5BA9D4229688B5CBF2BC4D13714DBA79F86A22F57CA7AAA",
+  "owned_source_sha256": {
+    "crates/swarm-kernel-host/src/store/module_supervisor_observation.rs": "290B883D43551E240D67F45E0DED353F03FE096EE5E27778AB10C3702388F19D",
+    "crates/swarm-supervisor/src/supervisor.rs": "95E70B085D09388940C78CACC09D5E43EB529E0D52FD42C37D3E7F30D7E2DA55"
+  },
+  "production_changed": false,
+  "delivered_issue121_source_prefix_preserved": true,
+  "root_wip_hashes_preserved": 63,
+  "source_manifest_sha256": "E449866E568090A08BFD0911B3A5F862F6CA72DB9852C655D2B262D54583BF7A",
+  "source_inputs": 850,
+  "handoff_sha256": "B1FD2770F9D44E72792D5B70FFBB0018B13726F41F7DA5F4E8896537735B041A",
+  "independent_review": {
+    "artifact": "app369-independent-source-review-nous-step5-v1-20261012.json",
+    "sha256": "9DE025A0E917ECE1EEE74ADE9AD6DB62C1F2AE71ACEACD17A17EF1BF8187EB66",
+    "manager_admission_sha256": "5FAE11B22E9D9FBBE63E933396E8EFD00AEB4DD2AFDD338FAB097B43A8C1F701",
+    "p1": 0,
+    "p2": 0,
+    "scope": "Frozen current test-only producer/consumer seams; source review, no execution by reviewer"
+  },
+  "behavior": [
+    "A real run_module_with_resolver Command::spawn refusal creates the launch-result receipt. Supervisor monitor_owner_helper and prior-owner recovery validate and consume it without changing launch-attempt/restart-history bytes or restart starts-in-window.",
+    "The Store fixture derives typed identity/version/boot/spawn certainty from that produced receipt, uses the production actor-admission and retention methods, then reads get_binding_public; retry_authorized remains false and no Operation is created."
+  ],
+  "gates": [
+    {
+      "platform": "windows",
+      "gate": "clippy",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-supervisor",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_stable": true,
+      "record_sha256": "3DA8522C45CDBFBCCBC51CD24F08EE4573BD498534B14B633DF2922594DDDFFA",
+      "log_sha256": "E63567FB8A7FC1B4E377747F84C2B9ABDED34473E8D8A96ED854F0EE9B0EFA93"
+    },
+    {
+      "platform": "windows",
+      "gate": "tests",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-supervisor",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation) | test(app369_store_reads_back_actual_spawn_receipt_without_retry_or_operation_mutation)"
+      ],
+      "source_stable": true,
+      "record_sha256": "931907B7F6DEA7C6123FF6E8C0F9158F6FC9EEDB6C170067BDA136C2C907BA4D",
+      "log_sha256": "A7F0AF3130E774E96E306F18E36DE7DE6C688098F1FC9223975D31F5980ACC55",
+      "test_count": 2
+    },
+    {
+      "platform": "linux",
+      "gate": "clippy",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-supervisor",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source_stable": true,
+      "record_sha256": "76E7B380EF8AA14B2878F07A7775FA355D706C017A46A635E4F60A83800AE557",
+      "log_sha256": "2CA278408FACBEA182CA6D612630A9F4487C4BF024084BD4B225ED0A4DC4CF39"
+    },
+    {
+      "platform": "linux",
+      "gate": "tests",
+      "status": "PASS",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-supervisor",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation) | test(app369_store_reads_back_actual_spawn_receipt_without_retry_or_operation_mutation)"
+      ],
+      "source_stable": true,
+      "record_sha256": "90FFA19CCAB70ABDE2AE06B02CD07B38FE99AEA1C4865352E8E6C4471AA43E96",
+      "log_sha256": "839E32A39BD80B55C6B1ECC3991BA973170540ED46B706641F78EC0AF4CEF11F",
+      "test_count": 2
+    }
+  ],
+  "limits": [
+    "The Store fixture seeds a binding selector and derives SupervisorStatus from a real receipt; this is a Store consumer proof, not a full host-supervisor callback or installed/native/provider/model qualification.",
+    "The Operation assertion checks unchanged row count in this isolated fixture; it does not qualify arbitrary pre-existing Operation state.",
+    "Both host lib-test builds retain 24 previously observed unrelated warnings; affected production strict Clippy passed. Workspace/test-target lint is not claimed warning-free.",
+    "Full public/native/model/crash/fault/load V27 qualification remains pending."
+  ],
+  "complete_callback_qualification": false,
+  "app369_full_connected_qualification": false,
+  "core_code_complete": false,
+  "audit_complete": false,
+  "full_v27_qualified": false,
+  "completion_proof": {
+    "task_goal": "Deliver the two actual spawn-receipt consumer regressions",
+    "acceptance_items": [
+      {
+        "item": "windows clippy",
+        "status": "verified",
+        "evidence": "3DA8522C45CDBFBCCBC51CD24F08EE4573BD498534B14B633DF2922594DDDFFA"
+      },
+      {
+        "item": "windows tests",
+        "status": "verified",
+        "evidence": "931907B7F6DEA7C6123FF6E8C0F9158F6FC9EEDB6C170067BDA136C2C907BA4D"
+      },
+      {
+        "item": "linux clippy",
+        "status": "verified",
+        "evidence": "76E7B380EF8AA14B2878F07A7775FA355D706C017A46A635E4F60A83800AE557"
+      },
+      {
+        "item": "linux tests",
+        "status": "verified",
+        "evidence": "90FFA19CCAB70ABDE2AE06B02CD07B38FE99AEA1C4865352E8E6C4471AA43E96"
+      }
+    ],
+    "final_status": "DONE_VERIFIED_FOR_BOUNDED_CONSUMERS_ONLY"
+  }
+}

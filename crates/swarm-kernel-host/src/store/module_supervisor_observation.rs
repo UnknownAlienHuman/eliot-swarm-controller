@@ -3293,3 +3293,268 @@ mod journal_regression_tests {
         assert_eq!(error.code, "MODULE_OBSERVATION_IDENTITY_MISMATCH");
     }
 }
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod app369_connected_store_consumer_tests {
+    use super::ObservationDisposition;
+    use crate::{
+        config::Config,
+        platform::{DataRoot, bootstrap_credential},
+        store::StoreOwner,
+    };
+    use rusqlite::params;
+    use serde_json::{Value, json};
+    use std::{fs, path::Path, sync::Arc};
+    use swarm_supervisor::{
+        AdmissionState, FailureSummary, LifecycleState, ModuleEffectCertainty, ModuleFailureStage,
+        ModuleSupervisorObservation, RestartStatus, ServiceScope, SupervisorStatus,
+    };
+
+    struct App369EmptyRefResolver;
+
+    impl swarm_process::module_owner::ProtectedRefResolver for App369EmptyRefResolver {
+        fn resolve(
+            &self,
+            plan: &swarm_process::module_owner::ModuleOwnerPlan,
+            _: &Path,
+            _: &Value,
+        ) -> swarm_contracts::error::Result<swarm_process::module_owner::ResolvedLaunch> {
+            Ok(swarm_process::module_owner::ResolvedLaunch {
+                executable: plan.executable.clone(),
+                argv: plan.argv.clone(),
+                environment: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn app369_store_reads_back_actual_spawn_receipt_without_retry_or_operation_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-app369-connected-store-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        swarm_process::private_permissions(&root, true).unwrap();
+        let producer_root = root.join("producer");
+        fs::create_dir(&producer_root).unwrap();
+        let state_dir = producer_root.join("module-state");
+        let worker_executable = producer_root.join("app369-invalid-worker.exe");
+        fs::write(&worker_executable, b"not a native executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&worker_executable).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&worker_executable, permissions).unwrap();
+        }
+
+        let boot_id = uuid::Uuid::new_v4().to_string();
+        let binding_id = uuid::Uuid::new_v4().to_string();
+        let plan = swarm_process::module_owner::ModuleOwnerPlan {
+            state_dir: state_dir.clone(),
+            executable: worker_executable,
+            argv: Vec::new(),
+            protected_refs: Vec::new(),
+            environment: Vec::new(),
+            module: "app369.module".to_owned(),
+            binding: binding_id.clone(),
+            generation: "7".to_owned(),
+            artifact_id: "app369.artifact".to_owned(),
+            artifact_version: "9.4.1".to_owned(),
+            build_id: Some("app369-build".to_owned()),
+            protocol: "1.0".to_owned(),
+            module_contract: "{}".to_owned(),
+            module_client_id: "fixture.client".to_owned(),
+            boot_id: boot_id.clone(),
+        };
+        let spawn_error =
+            swarm_process::module_owner::run_module_with_resolver(plan, &App369EmptyRefResolver)
+                .expect_err("invalid native image must fail at the actual worker Command::spawn");
+        assert_eq!(spawn_error.code, "MODULE_OWNER_SPAWN_FAILED");
+
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(state_dir.join("launch-result.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt.as_object().unwrap().len(), 16);
+        assert_eq!(receipt["version"].as_u64(), Some(1));
+        assert_eq!(receipt["disposition"].as_str(), Some("not_started"));
+        assert_eq!(receipt["worker_started"].as_bool(), Some(false));
+        assert_eq!(receipt["family_empty"].as_bool(), Some(true));
+        assert_eq!(receipt["stage"].as_str(), Some("spawn"));
+        assert_eq!(
+            receipt["error_code"].as_str(),
+            Some("MODULE_OWNER_SPAWN_FAILED")
+        );
+        assert_eq!(receipt["module"].as_str(), Some("app369.module"));
+        assert_eq!(receipt["binding"].as_str(), Some(binding_id.as_str()));
+        assert_eq!(receipt["generation"].as_str(), Some("7"));
+        assert_eq!(receipt["artifact_id"].as_str(), Some("app369.artifact"));
+        assert_eq!(receipt["artifact_version"].as_str(), Some("9.4.1"));
+        assert_eq!(receipt["boot_id"].as_str(), Some(boot_id.as_str()));
+        let module_id = receipt["module"].as_str().unwrap().to_owned();
+        let artifact_id = receipt["artifact_id"].as_str().unwrap().to_owned();
+        let artifact_version = receipt["artifact_version"].as_str().unwrap().to_owned();
+        let build_id = receipt["build_id"].as_str().map(str::to_owned);
+        let binding_id = receipt["binding"].as_str().unwrap().to_owned();
+        let generation = receipt["generation"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let boot_id = receipt["boot_id"].as_str().unwrap().to_owned();
+        assert_eq!(receipt["module_client_id"].as_str(), Some("fixture.client"));
+        assert_eq!(receipt["artifact_version"].as_str(), Some("9.4.1"));
+
+        let selector_module_id = module_id.clone();
+        let selector_artifact_id = artifact_id.clone();
+        let selector_artifact_version = artifact_version.clone();
+        let selector_build_id = build_id.clone();
+        let binding_artifact_id = artifact_id.clone();
+
+        let store_root = root.join("store");
+        fs::create_dir(&store_root).unwrap();
+        let data_root = DataRoot::acquire(&store_root).unwrap();
+        let mut config = Config::default();
+        config.storage.data_dir = data_root.path.clone();
+        let credential = bootstrap_credential(&data_root.path).unwrap();
+        let owner = StoreOwner::start(data_root, Arc::new(config), credential)
+            .await
+            .unwrap();
+        let store = owner.store.clone();
+
+        // Seed only the immutable binding selector required by the consumer;
+        // actor authority is admitted through the production Store method.
+        let selector = json!({
+            "module_contract_selector": {
+                "schema_version": 1,
+                "registered_revision": 1,
+                "selected_revision": 1,
+                "module_id": selector_module_id,
+                "artifact": {
+                    "artifact_id": selector_artifact_id,
+                    "version": selector_artifact_version,
+                    "build_id": selector_build_id,
+                }
+            }
+        });
+        let inserted_binding = binding_id.clone();
+        let insert_generation = i64::try_from(generation).unwrap();
+        store
+            .run_fixture(move |db| {
+                let state_json = crate::model::canonical(&selector)?;
+                db.execute(
+                    "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) \
+                     VALUES(?1,?2,'app369-lane','app369-instance',?3,'ready',NULL,NULL,'{}',?4,1)",
+                    params![inserted_binding, insert_generation, binding_artifact_id, state_json],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let actor_instance_id = uuid::Uuid::new_v4().to_string();
+        store
+            .admit_module_supervisor_actor(&actor_instance_id)
+            .await
+            .unwrap();
+        let status = SupervisorStatus {
+            module_id: receipt["module"].as_str().unwrap().to_owned(),
+            artifact_id: receipt["artifact_id"].as_str().unwrap().to_owned(),
+            artifact_version: receipt["artifact_version"].as_str().unwrap().to_owned(),
+            build_id: receipt["build_id"].as_str().map(str::to_owned),
+            scope: ServiceScope {
+                binding_id: receipt["binding"].as_str().unwrap().to_owned(),
+                generation,
+            },
+            admission: AdmissionState::Open,
+            lifecycle: LifecycleState::ProcessExited {
+                exit_code: Some(1),
+                exit_proven: false,
+            },
+            owner: None,
+            worker: None,
+            worker_boot_id: Some(receipt["boot_id"].as_str().unwrap().to_owned()),
+            hello_failure: None,
+            worker_diagnostic_code: None,
+            effect_certainty: ModuleEffectCertainty::NotStarted,
+            failure_stage: Some(ModuleFailureStage::Spawn),
+            readback_required: false,
+            unknown_operation_ids: Vec::new(),
+            unknown_operation_count: 0,
+            unknown_operation_ids_truncated: false,
+            restart: RestartStatus {
+                starts_in_window: 1,
+                last_delay_ms: None,
+                exhausted: false,
+            },
+            last_failure: Some(FailureSummary {
+                code: receipt["error_code"].as_str().unwrap().to_owned(),
+                detail: "module worker process could not be started".to_owned(),
+            }),
+        };
+        let observation = ModuleSupervisorObservation::from_status(&status, &actor_instance_id, 1)
+            .expect("typed observation preserves the producer's certified spawn failure");
+        let operation_count_before = store
+            .run_fixture(|db| {
+                let count = db.query_row("SELECT count(*) FROM operations", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                Ok(count)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .record_module_supervisor_observation(observation)
+                .await
+                .unwrap(),
+            ObservationDisposition::Committed
+        ));
+
+        let readback_binding = binding_id.clone();
+        let readback = store
+            .run_fixture(move |db| {
+                super::super::operations::get_binding_public(
+                    db,
+                    &readback_binding,
+                    insert_generation,
+                )
+            })
+            .await
+            .unwrap();
+        let retained = &readback["observation"]["module_supervisor"];
+        assert!(
+            retained.is_object(),
+            "agent.state public projection retained the observation"
+        );
+        assert_eq!(retained["module_id"].as_str(), Some("app369.module"));
+        assert_eq!(retained["binding_id"].as_str(), Some(binding_id.as_str()));
+        assert_eq!(retained["generation"].as_u64(), Some(generation));
+        assert_eq!(retained["artifact_id"].as_str(), Some("app369.artifact"));
+        assert_eq!(retained["artifact_version"].as_str(), Some("9.4.1"));
+        assert_eq!(retained["boot_id"].as_str(), Some(boot_id.as_str()));
+        assert_eq!(retained["phase"].as_str(), Some("exited"));
+        assert_eq!(retained["effect_certainty"].as_str(), Some("not_started"));
+        assert_eq!(retained["stage"].as_str(), Some("spawn"));
+        assert_eq!(
+            retained["error_code"].as_str(),
+            Some("MODULE_OWNER_SPAWN_FAILED")
+        );
+        assert_eq!(retained["retry_authorized"].as_bool(), Some(false));
+        let operation_count_after = store
+            .run_fixture(|db| {
+                let count = db.query_row("SELECT count(*) FROM operations", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                Ok(count)
+            })
+            .await
+            .unwrap();
+        assert_eq!(operation_count_after, operation_count_before);
+
+        drop(store);
+        owner.close().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
