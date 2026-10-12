@@ -1739,6 +1739,182 @@ async fn add_submission_source_fact_with_key(
         .unwrap();
 }
 
+async fn configure_lineage_review_dispatch(
+    store: &Store,
+    sponsor: &Principal,
+    automation_ids: &[&str],
+    profile: &str,
+) {
+    let changes = automation_ids
+        .iter()
+        .map(|automation_id| {
+            json!({
+                "automation_id":automation_id,
+                "expected_revision":0,
+                "include_existing":false,
+                "patch":{
+                    "enabled":true,
+                    "steps":["review_dispatch"],
+                    "review":{"profile":profile,"required_reviewers":1},
+                    "event_rules":[{
+                        "source":"task.submission",
+                        "predicate":"applied",
+                        "action":"review_dispatch"
+                    }]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let applied = store
+        .call(
+            sponsor.clone(),
+            "automation.config.apply".into(),
+            json!({
+                "client_request_id":format!("configure-reg12-review-{}",model::new_id()),
+                "project_id":"fixture",
+                "changes":changes
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied["applied"], true);
+}
+
+async fn insert_queued_review_assignment_fixture(
+    store: &Store,
+    sponsor_id: &str,
+    subject: &ReviewSubject,
+    automation_id: &str,
+    profile: &str,
+) -> String {
+    // The production producer keeps this pre-reservation row transaction-private;
+    // mirror its exact initial shape to exercise public queued read/cancel behavior.
+    let operation_id = model::new_id();
+    let operation_id_for_store = operation_id.clone();
+    let sponsor_id = sponsor_id.to_owned();
+    let subject = subject.clone();
+    let automation_id = automation_id.to_owned();
+    let profile = profile.to_owned();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let entry =
+                crate::automation::config::load_entry(&tx, &sponsor_id, "fixture", &automation_id)?
+                    .ok_or_else(|| {
+                        Error::new("TEST_ENTRY_MISSING", "REG-12 review entry disappeared")
+                    })?;
+            let (observation_id, cause_operation_id): (i64, String) = tx.query_row(
+                "SELECT observation_id,operation_id FROM observations
+                 WHERE source_stream_id='controller' AND kind='task.submission'
+                   AND json_extract(payload_json,'$.attempt_id')=?1
+                   AND json_extract(payload_json,'$.submission_ref')=?2
+                   AND json_extract(payload_json,'$.outcome')='applied'
+                 ORDER BY observation_id DESC LIMIT 1",
+                params![subject.attempt_id, subject.submission_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let cause = crate::automation::actions::AutomationCause::AppliedSubmission {
+                observation_id,
+                operation_id: cause_operation_id,
+                submission_ref: subject.submission_ref.clone(),
+            };
+            let context =
+                crate::automation::authorization::ManagerExecutionContext::from_committed_entry(
+                    &tx, &entry, cause,
+                )?;
+            let client_request_id = format!("reg12-queued-{operation_id_for_store}");
+            let request = json!({
+                "client_request_id":client_request_id,
+                "attempt_id":subject.attempt_id,
+                "expected_revision":1,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "review_profile":profile,
+            });
+            let effective = json!({
+                "request":request,
+                "automation_on_behalf":context.linkage_value(),
+            });
+            let now_ms = 10;
+            tx.execute(
+                "INSERT INTO operations(
+                    operation_id,caller_id,client_request_id,method,original_request_json,
+                    effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+                 ) VALUES(?1,?2,?3,'review.assign',?4,?5,'queued',?6,?6,?6)",
+                params![
+                    operation_id_for_store,
+                    context.technical_requester_id(),
+                    client_request_id,
+                    model::canonical(&request)?,
+                    model::canonical(&effective)?,
+                    now_ms,
+                ],
+            )?;
+            crate::automation::authorization::save_operation_link(
+                &tx,
+                &operation_id_for_store,
+                &context,
+                now_ms,
+            )?;
+            tx.commit()?;
+            Ok(operation_id_for_store)
+        })
+        .await
+        .unwrap()
+}
+
+async fn assert_operation_not_visible(store: &Store, principal: &Principal, operation_id: &str) {
+    let error = store
+        .call(
+            principal.clone(),
+            "operation.get".into(),
+            json!({"operation_id":operation_id}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "NOT_FOUND");
+}
+async fn assert_corrupt_review_assignment_lineage_denied(
+    store: &Store,
+    effective_owner: &Principal,
+    successor: &Principal,
+    operation_id: &str,
+    cancel_client_request_id: &str,
+) {
+    for principal in [effective_owner, successor] {
+        let operation_id = operation_id.to_owned();
+        let principal = principal.clone();
+        let visible = store
+            .run(move |db| {
+                crate::automation::authorization::on_behalf_visible_to(
+                    db,
+                    &principal,
+                    &operation_id,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            !visible,
+            "corrupt review lineage must be invisible to both readers"
+        );
+    }
+
+    let error = store
+        .call(
+            effective_owner.clone(),
+            "operation.cancel".into(),
+            json!({
+                "client_request_id":cancel_client_request_id,
+                "operation_id":operation_id,
+                "reason":"corrupt retained review lineage must fail closed"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "FORBIDDEN");
+}
+
 fn repair_fixture_route() -> Value {
     json!({
         "alias":"repair-continuation-fixture",
@@ -3918,6 +4094,693 @@ async fn typed_applied_submission_rule_uses_review_operation_and_live_entry_auth
         .unwrap();
     assert_eq!(manual_count, 1);
 
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn review_assignment_visibility_requires_exact_settled_and_coalesced_lineage() {
+    let (owner, directory, bootstrap) = start_store("reg12-settled-lineage").await;
+    let operator = owner.store.authenticate(bootstrap).await.unwrap();
+    seed_clients(&owner.store).await;
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"reg12-designate-review-owner","client_id":"review-owner-v2"}),
+        )
+        .await
+        .unwrap();
+    let sponsor = principal("review-owner-v2", Role::Manager);
+    let successor = principal("review-gm", Role::Manager);
+    let unrelated = principal("unrelated-manager", Role::Manager);
+    let profile = "reg12-lineage-reviewers";
+    let subject = seed_subject(
+        &owner.store,
+        "reg12-coalesced",
+        &sponsor.client_id,
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    register_profile_reviewer(
+        &owner.store,
+        &sponsor,
+        &subject,
+        "reg12-lineage-reviewer",
+        "reg12-lineage-reviewer-token",
+        profile,
+    )
+    .await;
+    configure_lineage_review_dispatch(
+        &owner.store,
+        &sponsor,
+        &["reg12-lineage-origin", "reg12-lineage-coalesced"],
+        profile,
+    )
+    .await;
+    add_submission_source_fact(&owner.store, "reg12-coalesced", &subject).await;
+    let dispatch = owner.store.reconcile_automations_once().await.unwrap();
+    assert!(dispatch["review_dispatch"]["entries"].is_array());
+
+    let task_id = subject.task_id.clone();
+    let (operations, assignment_origin): (Vec<(String, Value)>, String) = owner
+        .store
+        .run(move |db| {
+            let mut statement = db.prepare(
+                "SELECT operation_id,result_json FROM operations
+                 WHERE caller_id=?1 AND method='review.assign' AND task_id=?2 AND state='settled'
+                 ORDER BY operation_id",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        task_id
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let operations = rows
+                .into_iter()
+                .map(|(id, raw)| Ok((id, serde_json::from_str::<Value>(&raw)?)))
+                .collect::<Result<Vec<_>>>()?;
+            if operations.len() != 2 {
+                return Err(Error::new(
+                    "TEST_REVIEW_ASSIGNMENT_COUNT",
+                    format!("expected two producer Operations, got {}", operations.len()),
+                ));
+            }
+            let assignment_id = operations[0].1["review_assignment_id"]
+                .as_str()
+                .ok_or_else(|| {
+                    Error::new("TEST_ASSIGNMENT_MISSING", "receipt has no assignment ID")
+                })?;
+            let event_key = format!("assignment:{assignment_id}");
+            let origin = db.query_row(
+                "SELECT operation_id FROM observations
+                 WHERE source_stream_id='controller:review' AND source_event_key=?1
+                   AND kind='review.assignment'",
+                [event_key],
+                |row| row.get(0),
+            )?;
+            Ok((operations, origin))
+        })
+        .await
+        .unwrap();
+    let origin = operations
+        .iter()
+        .find(|(_, result)| result["coalesced"] == false)
+        .expect("one actual producer receipt creates the assignment");
+    let coalesced = operations
+        .iter()
+        .find(|(_, result)| result["coalesced"] == true)
+        .expect("the second actual producer receipt coalesces");
+    assert_ne!(origin.0, coalesced.0);
+    assert_eq!(
+        origin.1["review_assignment_id"],
+        coalesced.1["review_assignment_id"]
+    );
+    assert_eq!(assignment_origin, origin.0);
+    assert_ne!(assignment_origin, coalesced.0);
+
+    owner
+        .store
+        .call(
+            operator,
+            "gm.handover".into(),
+            json!({"client_request_id":"reg12-return-review-gm","client_id":"review-gm"}),
+        )
+        .await
+        .unwrap();
+    for (operation_id, _) in [&origin, &coalesced] {
+        for reader in [&sponsor, &successor] {
+            let visible = owner
+                .store
+                .call(
+                    reader.clone(),
+                    "operation.get".into(),
+                    json!({"operation_id":operation_id}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(visible["method"], "review.assign");
+            assert_eq!(visible["state"], "settled");
+        }
+        assert_operation_not_visible(&owner.store, &unrelated, operation_id).await;
+    }
+    let settled_cancel = owner
+        .store
+        .call(
+            sponsor.clone(),
+            "operation.cancel".into(),
+            json!({
+                "client_request_id":"reg12-cancel-settled-review-assignment",
+                "operation_id":coalesced.0,
+                "reason":"settled assignment remains historical"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(settled_cancel.code, "NOT_QUEUED");
+
+    let coalesced_operation_id = coalesced.0.clone();
+    let (original_effective, original_attempt): (String, String) = owner
+        .store
+        .run({
+            let operation_id = coalesced_operation_id.clone();
+            move |db| {
+                db.query_row(
+                    "SELECT effective_request_json,attempt_id FROM operations WHERE operation_id=?1",
+                    [operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .unwrap();
+
+    owner
+        .store
+        .run({
+            let operation_id = coalesced_operation_id.clone();
+            let mut effective: Value = serde_json::from_str(&original_effective).unwrap();
+            effective["automation_on_behalf"]["cause"]["id"] = json!("wrong-submission-cause");
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, model::canonical(&effective)?],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    assert_corrupt_review_assignment_lineage_denied(
+        &owner.store,
+        &sponsor,
+        &successor,
+        &coalesced_operation_id,
+        "reg12-corrupt-cause-cancel",
+    )
+    .await;
+
+    owner
+        .store
+        .run({
+            let operation_id = coalesced_operation_id.clone();
+            let original_effective = original_effective.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, original_effective],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    owner
+        .store
+        .run({
+            let operation_id = coalesced_operation_id.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET attempt_id=NULL WHERE operation_id=?1",
+                    [operation_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    assert_corrupt_review_assignment_lineage_denied(
+        &owner.store,
+        &sponsor,
+        &successor,
+        &coalesced_operation_id,
+        "reg12-corrupt-attempt-cancel",
+    )
+    .await;
+
+    owner
+        .store
+        .run({
+            let operation_id = coalesced_operation_id.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET attempt_id=?2 WHERE operation_id=?1",
+                    params![operation_id, original_attempt],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let assignment_id = coalesced.1["review_assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let assignment_key = format!("assignment:{assignment_id}");
+    owner
+        .store
+        .run({
+            let operation_id = coalesced_operation_id.clone();
+            let assignment_key = assignment_key.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE observations SET operation_id=?2
+                     WHERE source_stream_id='controller:review' AND source_event_key=?1
+                       AND kind='review.assignment'",
+                    params![assignment_key, operation_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    assert_corrupt_review_assignment_lineage_denied(
+        &owner.store,
+        &sponsor,
+        &successor,
+        &coalesced_operation_id,
+        "reg12-corrupt-observation-cancel",
+    )
+    .await;
+
+    owner
+        .store
+        .run({
+            let assignment_key = assignment_key.clone();
+            let origin_operation_id = assignment_origin;
+            move |db| {
+                db.execute(
+                    "UPDATE observations SET operation_id=?2
+                     WHERE source_stream_id='controller:review' AND source_event_key=?1
+                       AND kind='review.assignment'",
+                    params![assignment_key, origin_operation_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    for reader in [&sponsor, &successor] {
+        let restored = owner
+            .store
+            .call(
+                reader.clone(),
+                "operation.get".into(),
+                json!({"operation_id":coalesced_operation_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored["state"], "settled");
+    }
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn direct_review_assignment_coalescence_preserves_owner_history_after_release_and_handover() {
+    let (owner, directory, bootstrap) = start_store("reg12-direct-origin").await;
+    let operator = owner.store.authenticate(bootstrap).await.unwrap();
+    seed_clients(&owner.store).await;
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"reg12-designate-direct-review-owner","client_id":"review-owner-v2"}),
+        )
+        .await
+        .unwrap();
+
+    let sponsor = principal("review-owner-v2", Role::Manager);
+    let successor = principal("review-gm", Role::Manager);
+    let unrelated = principal("unrelated-manager", Role::Manager);
+    let profile = "reg12-direct-origin-reviewers";
+    let subject = seed_subject(
+        &owner.store,
+        "reg12-direct-origin",
+        &sponsor.client_id,
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    register_profile_reviewer(
+        &owner.store,
+        &sponsor,
+        &subject,
+        "reg12-direct-origin-reviewer",
+        "reg12-direct-origin-reviewer-token",
+        profile,
+    )
+    .await;
+    configure_lineage_review_dispatch(
+        &owner.store,
+        &sponsor,
+        &["reg12-direct-origin-automation"],
+        profile,
+    )
+    .await;
+
+    let direct = owner
+        .store
+        .call(
+            sponsor.clone(),
+            "review.assign".into(),
+            json!({
+                "client_request_id":"reg12-public-direct-review-origin",
+                "attempt_id":subject.attempt_id,
+                "expected_revision":1,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "review_profile":profile,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct["coalesced"], false);
+    assert_eq!(direct["on_behalf"], Value::Null);
+    assert_eq!(direct["technical_requester_id"], sponsor.client_id);
+    assert_eq!(direct["sponsor_client_id"], sponsor.client_id);
+    let direct_operation_id = direct["operation_id"].as_str().unwrap().to_owned();
+    let assignment_id = direct["review_assignment_id"].as_str().unwrap().to_owned();
+
+    add_submission_source_fact(&owner.store, "reg12-direct-origin", &subject).await;
+    let dispatch = owner.store.reconcile_automations_once().await.unwrap();
+    assert!(dispatch["review_dispatch"]["entries"].is_array());
+
+    let task_id = subject.task_id.clone();
+    let event_key = format!("assignment:{assignment_id}");
+    let (automatic_operation_id, automatic_result, assignment_origin) = owner
+        .store
+        .run(move |db| {
+            let mut statement = db.prepare(
+                "SELECT operation_id,result_json FROM operations
+                 WHERE caller_id=?1 AND method='review.assign' AND task_id=?2 AND state='settled'
+                 ORDER BY created_at_ms,operation_id",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        task_id
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if rows.len() != 1 {
+                return Err(Error::new(
+                    "TEST_AUTOMATIC_REVIEW_ASSIGNMENT_COUNT",
+                    format!("expected one automatic Operation, got {}", rows.len()),
+                ));
+            }
+            let (operation_id, result_raw) = rows.into_iter().next().unwrap();
+            let result = serde_json::from_str::<Value>(&result_raw)?;
+            let assignment_origin = db.query_row(
+                "SELECT operation_id FROM observations
+                 WHERE source_stream_id='controller:review' AND source_event_key=?1
+                   AND kind='review.assignment'",
+                [event_key],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok((operation_id, result, assignment_origin))
+        })
+        .await
+        .unwrap();
+    assert_eq!(automatic_result["coalesced"], true);
+    assert_eq!(automatic_result["review_assignment_id"], assignment_id);
+    assert_eq!(
+        automatic_result["technical_requester_id"],
+        sponsor.client_id
+    );
+    assert_eq!(automatic_result["sponsor_client_id"], sponsor.client_id);
+    assert_ne!(automatic_operation_id, direct_operation_id);
+    assert_eq!(assignment_origin, direct_operation_id);
+
+    let released = owner
+        .store
+        .call(
+            sponsor.clone(),
+            "attempt.release".into(),
+            json!({
+                "client_request_id":"reg12-release-direct-origin-attempt",
+                "attempt_id":subject.attempt_id,
+                "outcome":"superseded",
+                "reason":"Release the Attempt after the coalesced assignment is retained.",
+                "assignment_closed":true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(released["released"], true);
+    owner
+        .store
+        .call(
+            operator,
+            "gm.handover".into(),
+            json!({"client_request_id":"reg12-handover-after-direct-origin","client_id":"review-gm"}),
+        )
+        .await
+        .unwrap();
+
+    for reader in [&sponsor, &successor] {
+        let lineage_operation_id = automatic_operation_id.clone();
+        let lineage_principal = reader.clone();
+        let lineage_visible = owner
+            .store
+            .run(move |db| {
+                crate::automation::authorization::on_behalf_visible_to(
+                    db,
+                    &lineage_principal,
+                    &lineage_operation_id,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            lineage_visible,
+            "valid direct-origin lineage should remain visible after release and handover"
+        );
+
+        let visible = owner
+            .store
+            .call(
+                reader.clone(),
+                "operation.get".into(),
+                json!({"operation_id":automatic_operation_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible["operation_id"], automatic_operation_id);
+        assert_eq!(visible["method"], "review.assign");
+        assert_eq!(visible["state"], "settled");
+    }
+    assert_operation_not_visible(&owner.store, &unrelated, &automatic_operation_id).await;
+
+    let settled_cancel = owner
+        .store
+        .call(
+            sponsor.clone(),
+            "operation.cancel".into(),
+            json!({
+                "client_request_id":"reg12-cancel-settled-direct-origin-receipt",
+                "operation_id":automatic_operation_id,
+                "reason":"A settled coalesced assignment remains historical."
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(settled_cancel.code, "NOT_QUEUED");
+
+    let direct_operation_id_for_corruption = direct_operation_id.clone();
+    let unrelated_id = unrelated.client_id.clone();
+    owner
+        .store
+        .run(move |db| {
+            db.execute(
+                "UPDATE operations SET caller_id=?2 WHERE operation_id=?1",
+                params![direct_operation_id_for_corruption, unrelated_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_operation_not_visible(&owner.store, &sponsor, &automatic_operation_id).await;
+
+    let current_gm_projection = owner
+        .store
+        .call(
+            successor.clone(),
+            "operation.get".into(),
+            json!({"operation_id":automatic_operation_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        current_gm_projection["operation_id"],
+        automatic_operation_id
+    );
+    assert_eq!(current_gm_projection["method"], "review.assign");
+    assert_eq!(current_gm_projection["state"], "settled");
+    assert_eq!(current_gm_projection["task_id"], subject.task_id);
+    assert_eq!(current_gm_projection["attempt_id"], subject.attempt_id);
+    assert_eq!(current_gm_projection["result_status"], "not_projected");
+    for private_field in [
+        "result",
+        "caller_id",
+        "client_request_id",
+        "request",
+        "effective_request",
+        "on_behalf",
+        "automation_on_behalf",
+        "diagnostic",
+    ] {
+        assert!(
+            current_gm_projection.get(private_field).is_none(),
+            "current-GM receipt unexpectedly projected {private_field}"
+        );
+    }
+
+    assert_corrupt_review_assignment_lineage_denied(
+        &owner.store,
+        &sponsor,
+        &successor,
+        &automatic_operation_id,
+        "reg12-cancel-corrupt-direct-origin-receipt",
+    )
+    .await;
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn review_assignment_queued_lineage_allows_owner_cancel_and_readback() {
+    let (owner, directory, bootstrap) = start_store("reg12-queued-lineage").await;
+    let operator = owner.store.authenticate(bootstrap).await.unwrap();
+    seed_clients(&owner.store).await;
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"reg12-queued-designate-owner","client_id":"review-owner-v2"}),
+        )
+        .await
+        .unwrap();
+    let sponsor = principal("review-owner-v2", Role::Manager);
+    let successor = principal("review-gm", Role::Manager);
+    let unrelated = principal("unrelated-manager", Role::Manager);
+    let subject = seed_subject(
+        &owner.store,
+        "reg12-queued",
+        &sponsor.client_id,
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    configure_lineage_review_dispatch(
+        &owner.store,
+        &sponsor,
+        &["reg12-queued-review"],
+        "reg12-queued-reviewers",
+    )
+    .await;
+    add_submission_source_fact(&owner.store, "reg12-queued", &subject).await;
+    let operation_id = insert_queued_review_assignment_fixture(
+        &owner.store,
+        &sponsor.client_id,
+        &subject,
+        "reg12-queued-review",
+        "reg12-queued-reviewers",
+    )
+    .await;
+    owner
+        .store
+        .call(
+            operator,
+            "gm.handover".into(),
+            json!({"client_request_id":"reg12-queued-return-review-gm","client_id":"review-gm"}),
+        )
+        .await
+        .unwrap();
+
+    for reader in [&sponsor, &successor] {
+        let queued = owner
+            .store
+            .call(
+                reader.clone(),
+                "operation.get".into(),
+                json!({"operation_id":operation_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued["method"], "review.assign");
+        assert_eq!(queued["state"], "queued");
+    }
+    assert_operation_not_visible(&owner.store, &unrelated, &operation_id).await;
+    let successor_cancel = owner
+        .store
+        .call(
+            successor,
+            "operation.cancel".into(),
+            json!({
+                "client_request_id":"reg12-successor-cannot-cancel-review",
+                "operation_id":operation_id,
+                "reason":"current GM visibility is read-only"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(successor_cancel.code, "FORBIDDEN");
+    let unrelated_cancel = owner
+        .store
+        .call(
+            unrelated.clone(),
+            "operation.cancel".into(),
+            json!({
+                "client_request_id":"reg12-unrelated-cannot-cancel-review",
+                "operation_id":operation_id,
+                "reason":"unrelated manager has no retained ownership"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unrelated_cancel.code, "FORBIDDEN");
+
+    owner
+        .store
+        .call(
+            sponsor.clone(),
+            "operation.cancel".into(),
+            json!({
+                "client_request_id":"reg12-owner-cancels-queued-review",
+                "operation_id":operation_id,
+                "reason":"owner cancellation remains supported"
+            }),
+        )
+        .await
+        .unwrap();
+    for reader in [&sponsor, &principal("review-gm", Role::Manager)] {
+        let cancelled = owner
+            .store
+            .call(
+                reader.clone(),
+                "operation.get".into(),
+                json!({"operation_id":operation_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+    }
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

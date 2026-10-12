@@ -11,8 +11,8 @@ use crate::{
     github::protocol::ManagedLabelRequest,
     model::{self, Principal, Role},
     review::{
-        PRIMARY_REVIEW_SLOT, ReviewCoverage, ReviewFindingsPackage, ReviewSlotIdentity,
-        ReviewSubmitRequest, ReviewVerdict,
+        PRIMARY_REVIEW_SLOT, ReviewAssignRequest, ReviewCoverage, ReviewFindingsPackage,
+        ReviewSlotIdentity, ReviewSubmitRequest, ReviewVerdict,
     },
     store::{ExistingAutomaticOperation, ExistingAutomaticOperationLookup},
 };
@@ -966,6 +966,19 @@ type AcceptanceResultOperationRow = (
     Option<String>,
     String,
 );
+type ReviewAssignmentOperationRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+);
+type ReviewAssignmentAttemptRow = (String, i64, Option<String>, Option<String>, String);
 
 impl ManagerExecutionContext {
     /// Created only from a currently stored, digest-verified enabled entry.
@@ -4482,6 +4495,9 @@ pub(crate) fn on_behalf_visible_to(
         return current_gm_on_behalf_scope_visible_to(db, principal, &link);
     }
     match link {
+        AnyOnBehalfOperationLink::Review(link) if link.action == "review.assign" => {
+            Ok(review_assignment_lineage_task_id(db, &link)?.is_some())
+        }
         AnyOnBehalfOperationLink::Review(_) => Ok(true),
         AnyOnBehalfOperationLink::GoalProgression(link) => {
             let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
@@ -4568,47 +4584,7 @@ fn current_gm_on_behalf_scope_visible_to(
     match link {
         AnyOnBehalfOperationLink::Review(link) => {
             let task_id: Option<String> = if link.action == "review.assign" {
-                db.query_row(
-                    "SELECT assignment_op.task_id
-                     FROM operations AS assignment_op
-                     JOIN observations AS assignment
-                       ON assignment.operation_id=assignment_op.operation_id
-                     JOIN tasks AS target ON target.task_id=assignment_op.task_id
-                     WHERE assignment_op.operation_id=?1
-                       AND assignment_op.caller_id=?2
-                       AND assignment_op.method='review.assign'
-                       AND assignment.source_stream_id='controller:review'
-                       AND assignment.kind='review.assignment'
-                       AND assignment_op.task_id=json_extract(assignment.payload_json,'$.identity.task_id')
-                       AND assignment_op.attempt_id=json_extract(assignment.payload_json,'$.identity.attempt_id')
-                       AND target.project_id=?3
-                       AND json_extract(assignment.payload_json,'$.technical_requester_id')=?2
-                       AND json_extract(assignment.payload_json,'$.sponsor_client_id')=?4
-                       AND json_extract(assignment.payload_json,'$.on_behalf.effective_manager_id')=?4
-                       AND json_extract(assignment.payload_json,'$.on_behalf.project_id')=?3
-                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.kind')=?5
-                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.observation_id')=?6
-                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.operation_id')=?7
-                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.id')=?8
-                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.effective_manager_id')=?4
-                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.project_id')=?3
-                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.cause.observation_id')=?6
-                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.cause.operation_id')=?7
-                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.cause.id')=?8",
-                    params![
-                        link.operation_id,
-                        AUTOMATION_TECHNICAL_REQUESTER_ID,
-                        link.project_id,
-                        link.effective_manager_id,
-                        link.cause["kind"].as_str().unwrap_or_default(),
-                        link.cause["observation_id"].as_i64().unwrap_or_default(),
-                        link.cause["operation_id"].as_str().unwrap_or_default(),
-                        link.cause["id"].as_str().unwrap_or_default(),
-                    ],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten()
+                review_assignment_lineage_task_id(db, link)?
             } else {
                 db.query_row(
                     "SELECT task_id FROM operations WHERE operation_id=?1 AND caller_id=?2 AND method=?3",
@@ -4696,6 +4672,540 @@ fn current_gm_on_behalf_scope_visible_to(
         AnyOnBehalfOperationLink::Repair(link) => {
             current_gm_has_task_project(db, &link.task_id, &link.project_id)
         }
+    }
+}
+
+fn review_assignment_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<ReviewAssignmentOperationRow>> {
+    Ok(db
+        .query_row(
+            "SELECT client_request_id,caller_id,method,state,task_id,attempt_id,
+                    original_request_json,effective_request_json,result_json,settled_at_ms
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?)
+}
+
+fn review_assignment_linkage_value(link: &OnBehalfOperationLink, review_profile: &str) -> Value {
+    json!({
+        "technical_requester_id":link.technical_requester_id,
+        "effective_manager_id":link.effective_manager_id,
+        "automation_id":link.automation_id,
+        "automation_revision":link.automation_revision,
+        "project_id":link.project_id,
+        "action":link.action,
+        "semantic_cause_kind":link.cause["kind"],
+        "semantic_cause_id":link.cause["id"],
+        "cause":link.cause,
+        "review_profile":review_profile,
+    })
+}
+
+fn review_assignment_request_lineage(
+    db: &Connection,
+    operation_id: &str,
+    link: &OnBehalfOperationLink,
+    operation: &ReviewAssignmentOperationRow,
+) -> Result<Option<(ReviewAssignRequest, String, Value)>> {
+    let (client_request_id, caller_id, method, _, _, _, original_request_raw, _, _, _) = operation;
+    if link.schema_version != 1
+        || link.operation_id != operation_id
+        || link.action != "review.assign"
+        || link.technical_requester_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || link.effective_manager_id.trim().is_empty()
+        || link.automation_id.trim().is_empty()
+        || link.automation_revision <= 0
+        || link.project_id.trim().is_empty()
+        || link.linked_at_ms < 0
+        || caller_id != &link.technical_requester_id
+        || caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "review.assign"
+        || link.cause.as_object().is_none_or(|cause| cause.len() != 4)
+        || link.cause["kind"] != "applied_submission"
+        || link.cause["observation_id"]
+            .as_i64()
+            .is_none_or(|id| id <= 0)
+        || link.cause["operation_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Ok(None);
+    }
+
+    let Ok(original_request) = serde_json::from_str::<Value>(original_request_raw) else {
+        return Ok(None);
+    };
+    let Ok(request) = ReviewAssignRequest::parse(&original_request) else {
+        return Ok(None);
+    };
+    let Some(review_profile) = request
+        .review_profile
+        .as_deref()
+        .filter(|profile| !profile.trim().is_empty())
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    if request.client_request_id != *client_request_id
+        || request.reviewer_client_id.is_some()
+        || request.replaces_review_assignment_id.is_some()
+        || request.replacement_reason.is_some()
+        || !request.replacement_evidence_refs.is_empty()
+        || link.cause["id"] != request.submission_ref
+    {
+        return Ok(None);
+    }
+
+    let attempt: Option<ReviewAssignmentAttemptRow> = db
+        .query_row(
+            "SELECT a.task_id,a.task_revision,a.submission_ref,a.candidate_ref,t.project_id
+             FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id
+             WHERE a.attempt_id=?1",
+            [&request.attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((task_id, task_revision, submission_ref, candidate_ref, project_id)) = attempt else {
+        return Ok(None);
+    };
+    if task_revision != request.expected_revision
+        || submission_ref.as_deref() != Some(request.submission_ref.as_str())
+        || candidate_ref.as_deref() != Some(request.candidate_ref.as_str())
+        || project_id != link.project_id
+    {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        request,
+        task_id,
+        review_assignment_linkage_value(link, &review_profile),
+    )))
+}
+
+fn review_assignment_result_identity(
+    result: &Value,
+    operation_id: &str,
+    request: &ReviewAssignRequest,
+    task_id: &str,
+    effective_manager_id: &str,
+    coalesced: bool,
+    expected_technical_requester_id: Option<&str>,
+) -> Option<ReviewSlotIdentity> {
+    let identity: ReviewSlotIdentity =
+        serde_json::from_value(result.get("identity")?.clone()).ok()?;
+    let review_profile = request.review_profile.as_deref()?;
+    if result["operation_id"] != operation_id
+        || result["review_assignment_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || result["state"] != "assigned"
+        || result["coalesced"] != coalesced
+        || result["task_transition"] != "none"
+        || result["technical_requester_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || expected_technical_requester_id
+            .is_some_and(|expected| result["technical_requester_id"] != expected)
+        || result["sponsor_client_id"] != effective_manager_id
+        || result["review_profile"] != review_profile
+        || result["reviewer_client_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || identity.task_id != task_id
+        || identity.attempt_id != request.attempt_id
+        || identity.task_revision != request.expected_revision
+        || identity.submission_ref != request.submission_ref
+        || identity.candidate_ref != request.candidate_ref
+        || identity.review_policy_generation.trim().is_empty()
+        || identity.review_slot != PRIMARY_REVIEW_SLOT
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+// Direct review.assign has no automation link; the settled creator must prove the receipt.
+fn review_assignment_direct_origin_identity(
+    origin_operation_id: &str,
+    operation: &ReviewAssignmentOperationRow,
+    assignment: &Value,
+    request: &ReviewAssignRequest,
+    task_id: &str,
+    effective_manager_id: &str,
+) -> Option<ReviewSlotIdentity> {
+    let (
+        client_request_id,
+        caller_id,
+        method,
+        state,
+        operation_task_id,
+        operation_attempt_id,
+        original_request_raw,
+        effective_request_raw,
+        result_raw,
+        settled_at_ms,
+    ) = operation;
+    if method != "review.assign"
+        || state != "settled"
+        || operation_task_id.as_deref() != Some(task_id)
+        || operation_attempt_id.as_deref() != Some(request.attempt_id.as_str())
+        || settled_at_ms.is_none()
+        || caller_id.trim().is_empty()
+        || caller_id.as_str() != effective_manager_id
+        || assignment["operation_id"] != origin_operation_id
+        || assignment["technical_requester_id"] != caller_id.as_str()
+        || assignment["sponsor_client_id"] != caller_id.as_str()
+        || !assignment["on_behalf"].is_null()
+    {
+        return None;
+    }
+
+    let original_request = serde_json::from_str::<Value>(original_request_raw).ok()?;
+    let direct_request = ReviewAssignRequest::parse(&original_request).ok()?;
+    if direct_request.client_request_id != *client_request_id
+        || direct_request.attempt_id.as_str() != request.attempt_id.as_str()
+        || direct_request.expected_revision != request.expected_revision
+        || direct_request.submission_ref.as_str() != request.submission_ref.as_str()
+        || direct_request.candidate_ref.as_str() != request.candidate_ref.as_str()
+        || direct_request.reviewer_client_id.as_deref() != request.reviewer_client_id.as_deref()
+        || direct_request.review_profile.as_deref() != request.review_profile.as_deref()
+        || direct_request.replaces_review_assignment_id.is_some()
+        || direct_request.replacement_reason.is_some()
+        || !direct_request.replacement_evidence_refs.is_empty()
+    {
+        return None;
+    }
+
+    let origin_result_raw = result_raw.as_deref()?;
+    let origin_result = serde_json::from_str::<Value>(origin_result_raw).ok()?;
+    let identity = review_assignment_result_identity(
+        &origin_result,
+        origin_operation_id,
+        &direct_request,
+        task_id,
+        effective_manager_id,
+        false,
+        Some(caller_id.as_str()),
+    )?;
+    let identity_value = serde_json::to_value(&identity).ok()?;
+    let effective_request = serde_json::from_str::<Value>(effective_request_raw).ok()?;
+    let expected_effective_request = json!({
+        "review_assignment":origin_result,
+        "on_behalf":Value::Null,
+        "receipt":{"ok":true,"value":origin_result},
+    });
+    if effective_request != expected_effective_request
+        || origin_result["on_behalf"] != Value::Null
+        || assignment["schema_version"] != 1
+        || assignment["review_assignment_id"] != origin_result["review_assignment_id"]
+        || assignment["identity"] != identity_value
+        || assignment["assignment_state"] != "assigned"
+        || assignment["reviewer_client_id"] != origin_result["reviewer_client_id"]
+        || assignment["review_profile"] != origin_result["review_profile"]
+        || assignment["supersedes_review_assignment_id"]
+            != origin_result["supersedes_review_assignment_id"]
+        || assignment["replacement_context"] != origin_result["replacement_context"]
+        || assignment["result"] != origin_result
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+/// The effective owner and current-GM read paths share this state-aware check.
+/// A queued/cancelled row is visible only in the producer's pre-reservation
+/// shape; settled/coalesced rows must join the exact originating assignment.
+fn review_assignment_lineage_task_id(
+    db: &Connection,
+    link: &OnBehalfOperationLink,
+) -> Result<Option<String>> {
+    let Some(operation) = review_assignment_operation(db, &link.operation_id)? else {
+        return Ok(None);
+    };
+    let Some((request, task_id, linkage)) =
+        review_assignment_request_lineage(db, &link.operation_id, link, &operation)?
+    else {
+        return Ok(None);
+    };
+    let (
+        _,
+        _,
+        _,
+        state,
+        operation_task_id,
+        operation_attempt_id,
+        _,
+        effective_request_raw,
+        result_raw,
+        settled_at_ms,
+    ) = &operation;
+    let Ok(effective_request) = serde_json::from_str::<Value>(effective_request_raw) else {
+        return Ok(None);
+    };
+
+    match state.as_str() {
+        "queued" | "cancelled" => {
+            if operation_task_id.is_some() || operation_attempt_id.is_some() {
+                return Ok(None);
+            }
+            let expected_effective = json!({
+                "request":serde_json::from_str::<Value>(&operation.6).map_err(|_| {
+                    Error::new("AUTOMATION_LINK_CORRUPT", "review request is malformed")
+                })?,
+                "automation_on_behalf":linkage,
+            });
+            if effective_request != expected_effective {
+                return Ok(None);
+            }
+            let assignment_observation_count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM observations
+                 WHERE operation_id=?1 AND
+                   ((source_stream_id='controller:review' AND kind='review.assignment')
+                    OR (source_stream_id='controller' AND kind='review.assign'))",
+                [&link.operation_id],
+                |row| row.get(0),
+            )?;
+            if assignment_observation_count != 0 {
+                return Ok(None);
+            }
+            if state == "queued" {
+                if result_raw.is_some() || settled_at_ms.is_some() {
+                    return Ok(None);
+                }
+            } else {
+                let Some(result_raw) = result_raw else {
+                    return Ok(None);
+                };
+                let Ok(result) = serde_json::from_str::<Value>(result_raw) else {
+                    return Ok(None);
+                };
+                if settled_at_ms.is_none()
+                    || result["cancelled_by"].as_str().is_none_or(str::is_empty)
+                    || result["reason"].as_str().is_none_or(str::is_empty)
+                {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(task_id))
+        }
+        "settled" => {
+            if operation_task_id.as_deref() != Some(task_id.as_str())
+                || operation_attempt_id.as_deref() != Some(request.attempt_id.as_str())
+                || settled_at_ms.is_none()
+            {
+                return Ok(None);
+            }
+            let Some(result_raw) = result_raw else {
+                return Ok(None);
+            };
+            let Ok(result) = serde_json::from_str::<Value>(result_raw) else {
+                return Ok(None);
+            };
+            let coalesced = result["coalesced"].as_bool().unwrap_or(false);
+            let Some(identity) = review_assignment_result_identity(
+                &result,
+                &link.operation_id,
+                &request,
+                &task_id,
+                &link.effective_manager_id,
+                coalesced,
+                (!coalesced).then_some(AUTOMATION_TECHNICAL_REQUESTER_ID),
+            ) else {
+                return Ok(None);
+            };
+            let expected_effective = json!({
+                "review_assignment":result,
+                "on_behalf":linkage,
+                "automation_on_behalf":linkage,
+                "receipt":{"ok":true,"value":result},
+            });
+            if effective_request != expected_effective {
+                return Ok(None);
+            }
+
+            let assignment_id = result["review_assignment_id"]
+                .as_str()
+                .expect("validated nonempty review assignment ID");
+            let event_key = format!("assignment:{assignment_id}");
+            let assignment_row: Option<(String, String)> = db
+                .query_row(
+                    "SELECT operation_id,payload_json FROM observations
+                     WHERE source_stream_id='controller:review' AND source_event_key=?1
+                       AND kind='review.assignment'",
+                    [&event_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((origin_operation_id, assignment_raw)) = assignment_row else {
+                return Ok(None);
+            };
+            let Ok(assignment) = serde_json::from_str::<Value>(&assignment_raw) else {
+                return Ok(None);
+            };
+            if assignment["schema_version"] != 1
+                || assignment["review_assignment_id"] != assignment_id
+                || assignment["operation_id"] != origin_operation_id
+                || assignment["identity"] != serde_json::to_value(&identity)?
+                || assignment["assignment_state"] != "assigned"
+                || assignment["technical_requester_id"] != result["technical_requester_id"]
+                || assignment["sponsor_client_id"] != link.effective_manager_id
+                || assignment["reviewer_client_id"] != result["reviewer_client_id"]
+                || assignment["review_profile"] != result["review_profile"]
+                || result["on_behalf"] != assignment["on_behalf"]
+                || result["supersedes_review_assignment_id"]
+                    != assignment["supersedes_review_assignment_id"]
+                || result["replacement_context"] != assignment["replacement_context"]
+            {
+                return Ok(None);
+            }
+
+            let Some(origin_operation) = review_assignment_operation(db, &origin_operation_id)?
+            else {
+                return Ok(None);
+            };
+            let (
+                _,
+                _,
+                origin_method,
+                origin_state,
+                origin_task,
+                origin_attempt,
+                _,
+                origin_effective_raw,
+                origin_result_raw,
+                origin_settled_at,
+            ) = &origin_operation;
+            if origin_method != "review.assign"
+                || origin_state != "settled"
+                || origin_task.as_deref() != Some(task_id.as_str())
+                || origin_attempt.as_deref() != Some(request.attempt_id.as_str())
+                || origin_settled_at.is_none()
+            {
+                return Ok(None);
+            }
+            let Some(origin_result_raw) = origin_result_raw else {
+                return Ok(None);
+            };
+            let Ok(origin_result) = serde_json::from_str::<Value>(origin_result_raw) else {
+                return Ok(None);
+            };
+
+            let (origin_identity, origin_linkage, expected_origin_effective) =
+                match operation_link(db, &origin_operation_id)? {
+                    Some(origin_link) => {
+                        if origin_link.action != "review.assign"
+                            || origin_link.technical_requester_id
+                                != link.technical_requester_id
+                            || origin_link.effective_manager_id != link.effective_manager_id
+                            || origin_link.project_id != link.project_id
+                            || origin_link.cause != link.cause
+                        {
+                            return Ok(None);
+                        }
+                        let Some((origin_request, origin_task_id, origin_linkage)) =
+                            review_assignment_request_lineage(
+                                db,
+                                &origin_operation_id,
+                                &origin_link,
+                                &origin_operation,
+                            )?
+                        else {
+                            return Ok(None);
+                        };
+                        if origin_request.attempt_id != request.attempt_id
+                            || origin_request.expected_revision != request.expected_revision
+                            || origin_request.submission_ref != request.submission_ref
+                            || origin_request.candidate_ref != request.candidate_ref
+                            || origin_request.review_profile != request.review_profile
+                            || origin_task_id != task_id
+                        {
+                            return Ok(None);
+                        }
+                        let Some(origin_identity) = review_assignment_result_identity(
+                            &origin_result,
+                            &origin_operation_id,
+                            &origin_request,
+                            &task_id,
+                            &origin_link.effective_manager_id,
+                            false,
+                            Some(AUTOMATION_TECHNICAL_REQUESTER_ID),
+                        ) else {
+                            return Ok(None);
+                        };
+                        let expected_effective = json!({
+                            "review_assignment":origin_result,
+                            "on_behalf":origin_linkage,
+                            "automation_on_behalf":origin_linkage,
+                            "receipt":{"ok":true,"value":origin_result},
+                        });
+                        (
+                            origin_identity,
+                            json!(origin_linkage),
+                            expected_effective,
+                        )
+                    }
+                    None => {
+                        let Some(origin_identity) =
+                            review_assignment_direct_origin_identity(
+                                &origin_operation_id,
+                                &origin_operation,
+                                &assignment,
+                                &request,
+                                &task_id,
+                                &link.effective_manager_id,
+                            )
+                        else {
+                            return Ok(None);
+                        };
+                        let expected_effective = json!({
+                            "review_assignment":origin_result,
+                            "on_behalf":Value::Null,
+                            "receipt":{"ok":true,"value":origin_result},
+                        });
+                        (origin_identity, Value::Null, expected_effective)
+                    }
+                };
+
+            let Ok(origin_effective) = serde_json::from_str::<Value>(origin_effective_raw) else {
+                return Ok(None);
+            };
+            if origin_effective != expected_origin_effective
+                || origin_result != assignment["result"]
+                || origin_identity != identity
+                || assignment["on_behalf"] != origin_linkage
+                || result["coalesced"] != (origin_operation_id != link.operation_id)
+            {
+                return Ok(None);
+            }
+            Ok(Some(task_id))
+        }
+        _ => Ok(None),
     }
 }
 
