@@ -355,7 +355,7 @@ async fn client_without_tasks_gets_the_pre_tasks_response() {
         .unwrap();
     // The pre-Tasks contract, unchanged: the durable Operation handle
     // in the structured result, no task handle anywhere.
-    assert!(result.get("taskId").is_none(), "{result}");
+    assert_no_task_handle(&result);
     let structured = &result["structuredContent"];
     assert_eq!(structured["state"], json!("queued"));
     let operation_id = structured["operation_id"].as_str().unwrap().to_string();
@@ -363,10 +363,42 @@ async fn client_without_tasks_gets_the_pre_tasks_response() {
     // And tasks/get is gated off for this client by the router.
     let gated = client
         .request("tasks/get", json!({"taskId": operation_id}))
-        .await;
-    assert!(gated.is_err(), "tasks/get must be refused: {gated:?}");
+        .await
+        .expect_err("tasks/get requires the client tasks capability");
+    assert_eq!(
+        gated,
+        json!({
+            "code": -32021,
+            "message": "Missing required client capability",
+            "data": {
+                "requiredCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                }
+            }
+        })
+    );
     client.close().await;
     stack.close().await;
+}
+
+fn assert_no_task_handle(value: &Value) {
+    match value {
+        Value::Object(fields) => {
+            assert!(
+                !fields.contains_key("taskId"),
+                "unexpected task handle: {value}"
+            );
+            for field in fields.values() {
+                assert_no_task_handle(field);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_task_handle(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[tokio::test]
@@ -403,8 +435,8 @@ async fn tasks_get_projects_settled_failed_and_unknown_operations() {
         json!({"result": null})
     );
 
-    // Admission-rejected: the rejected operation.cancel row (its target
-    // does not exist) projects as failed, ELIOT error intact in data.
+    // A missing-target cancellation is rejected, but operation.cancel has
+    // no public result vocabulary. Tasks must preserve that closed readback.
     let rejected = stack
         .store_call(
             "operation.cancel",
@@ -415,7 +447,9 @@ async fn tasks_get_projects_settled_failed_and_unknown_operations() {
             }),
         )
         .await;
-    assert!(rejected.is_err());
+    let rejected_error = rejected.expect_err("cancelling a missing Operation must fail");
+    assert_eq!(rejected_error.code, "NOT_FOUND");
+    assert_eq!(rejected_error.message, "Operation missing");
     let list = stack
         .store_call("operation.list", json!({"state": "rejected", "limit": 200}))
         .await
@@ -435,7 +469,64 @@ async fn tasks_get_projects_settled_failed_and_unknown_operations() {
         .await
         .unwrap();
     assert_eq!(polled["status"], json!("failed"));
-    assert_eq!(polled["error"]["data"], rejected["result"]);
+    assert_eq!(rejected["result_status"], json!("not_projected"));
+    assert!(rejected.get("result").is_none());
+    assert_eq!(
+        polled["error"],
+        json!({
+            "code": -32603,
+            "message": "operation rejected",
+            "data": null
+        })
+    );
+
+    // Unlike cancellation, agent.open exposes a closed error-code receipt.
+    // Use a known missing route to anchor both projections independently.
+    let request_id = model::new_id();
+    let rejected_open = stack
+        .store_call(
+            "agent.open",
+            json!({
+                "lane_id": "one",
+                "route": "missing-route",
+                "client_request_id": request_id,
+            }),
+        )
+        .await
+        .expect_err("an unconfigured route must be rejected");
+    assert_eq!(rejected_open.code, "UNKNOWN_ROUTE");
+    assert_eq!(rejected_open.message, "missing-route");
+    let list = stack
+        .store_call("operation.list", json!({"state": "rejected", "limit": 200}))
+        .await
+        .unwrap();
+    let rejected_opens: Vec<_> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["client_request_id"] == request_id)
+        .collect();
+    assert_eq!(rejected_opens.len(), 1);
+    let rejected_open = rejected_opens[0];
+    assert_eq!(rejected_open["method"], json!("agent.open"));
+    assert_eq!(rejected_open["result"], json!({"code": "UNKNOWN_ROUTE"}));
+    let polled = client
+        .request(
+            "tasks/get",
+            json!({"taskId": rejected_open["operation_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled["taskId"], rejected_open["operation_id"]);
+    assert_eq!(polled["status"], json!("failed"));
+    assert_eq!(
+        polled["error"],
+        json!({
+            "code": -32603,
+            "message": "operation rejected",
+            "data": {"code": "UNKNOWN_ROUTE"}
+        })
+    );
 
     // Unknown taskId: the store's NOT_FOUND, preserved in error data.
     let unknown = client

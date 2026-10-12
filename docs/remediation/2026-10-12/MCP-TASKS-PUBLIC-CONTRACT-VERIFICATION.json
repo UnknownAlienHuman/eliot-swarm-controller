@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-12T12:31:08.1911544Z",
+  "source_base_main": "6bba35f9097bd3681e60fb1a5844b99f7ebf8202",
+  "obligations": [
+    "APP-296",
+    "APP-297",
+    "APP-298"
+  ],
+  "original_obligations": [
+    {
+      "ledger_id": "APP-296",
+      "source_document": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+      "original_kind": "appendix",
+      "original_number": null,
+      "original_section": "8",
+      "original_section_title": "Приложение: полный реестр доказанных дефектов, не вошедших в §1-§4",
+      "original_lot": "host-domain",
+      "original_severity": "MED",
+      "original_title": null,
+      "original_line_raw": "- [MED] Test defect: non-tasks client gating is asserted with bare is_err(), no error identity — mcp_integration_tests/tasks.rs:331-350 — a wrong-reason failure passes",
+      "original_text": "Test defect: non-tasks client gating is asserted with bare is_err(), no error identity — mcp_integration_tests/tasks.rs:331-350 — a wrong-reason failure passes",
+      "original_text_anchor": {
+        "file": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+        "line": 432
+      },
+      "original_baseline_sha": "40591a295af94b1541ec2ba30afe8e3247701a71",
+      "evidence_class": "demonstrated",
+      "state": "open",
+      "state_basis": "Appendix demonstrated row with no plan-map row and no later master verdict traced. This is a trace-coverage gap only and does not assert the row is live on current source.",
+      "current_source_anchors": [],
+      "current_source_note": null,
+      "plan_map_row": null,
+      "plan_map_coverage": "no_row",
+      "known_owner": [
+        "#59 donor reviews; test-vacuum assessment"
+      ],
+      "known_owner_source": "inferred from execution map wave / nearest neighbour",
+      "known_owner_basis": "file-name inference from the appendix row text",
+      "known_owner_caveat": "Test-defect rows belong to the outstanding test-vacuum assessment, not to a code PR.",
+      "existing_verifier": "none traced",
+      "pending_exact_evidence": [],
+      "partial_resolution_note": null,
+      "suspicion_scope": false,
+      "current_source_status": "unknown",
+      "state_read_guard": "state=open is a TRACE GAP: no plan-map row and no current-main trace. It does NOT assert this row is a live defect on 248c7af. current_source_status=unknown."
+    },
+    {
+      "ledger_id": "APP-297",
+      "source_document": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+      "original_kind": "appendix",
+      "original_number": null,
+      "original_section": "8",
+      "original_section_title": "Приложение: полный реестр доказанных дефектов, не вошедших в §1-§4",
+      "original_lot": "host-domain",
+      "original_severity": "MED",
+      "original_title": null,
+      "original_line_raw": "- [MED] Test defect: \"no task handle anywhere\" is checked only at the top level — mcp_integration_tests/tasks.rs:335-345 — a handle nested in structuredContent passes",
+      "original_text": "Test defect: \"no task handle anywhere\" is checked only at the top level — mcp_integration_tests/tasks.rs:335-345 — a handle nested in structuredContent passes",
+      "original_text_anchor": {
+        "file": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+        "line": 433
+      },
+      "original_baseline_sha": "40591a295af94b1541ec2ba30afe8e3247701a71",
+      "evidence_class": "demonstrated",
+      "state": "open",
+      "state_basis": "Appendix demonstrated row with no plan-map row and no later master verdict traced. This is a trace-coverage gap only and does not assert the row is live on current source.",
+      "current_source_anchors": [],
+      "current_source_note": null,
+      "plan_map_row": null,
+      "plan_map_coverage": "no_row",
+      "known_owner": [
+        "#59 donor reviews; test-vacuum assessment"
+      ],
+      "known_owner_source": "inferred from execution map wave / nearest neighbour",
+      "known_owner_basis": "file-name inference from the appendix row text",
+      "known_owner_caveat": "Test-defect rows belong to the outstanding test-vacuum assessment, not to a code PR.",
+      "existing_verifier": "none traced",
+      "pending_exact_evidence": [],
+      "partial_resolution_note": null,
+      "suspicion_scope": false,
+      "current_source_status": "unknown",
+      "state_read_guard": "state=open is a TRACE GAP: no plan-map row and no current-main trace. It does NOT assert this row is a live defect on 248c7af. current_source_status=unknown."
+    },
+    {
+      "ledger_id": "APP-298",
+      "source_document": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+      "original_kind": "appendix",
+      "original_number": null,
+      "original_section": "8",
+      "original_section_title": "Приложение: полный реестр доказанных дефектов, не вошедших в §1-§4",
+      "original_lot": "host-domain",
+      "original_severity": "MED",
+      "original_title": null,
+      "original_line_raw": "- [MED] Test defect: failed-task projection compares two values drawn from the same unanchored source — mcp_integration_tests/tasks.rs:382-414 — an empty/wrong recorded result passes as \"ELIOT error intact\"",
+      "original_text": "Test defect: failed-task projection compares two values drawn from the same unanchored source — mcp_integration_tests/tasks.rs:382-414 — an empty/wrong recorded result passes as \"ELIOT error intact\"",
+      "original_text_anchor": {
+        "file": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+        "line": 434
+      },
+      "original_baseline_sha": "40591a295af94b1541ec2ba30afe8e3247701a71",
+      "evidence_class": "demonstrated",
+      "state": "open",
+      "state_basis": "Appendix demonstrated row with no plan-map row and no later master verdict traced. This is a trace-coverage gap only and does not assert the row is live on current source.",
+      "current_source_anchors": [],
+      "current_source_note": null,
+      "plan_map_row": null,
+      "plan_map_coverage": "no_row",
+      "known_owner": [
+        "#59 donor reviews; test-vacuum assessment"
+      ],
+      "known_owner_source": "inferred from execution map wave / nearest neighbour",
+      "known_owner_basis": "file-name inference from the appendix row text",
+      "known_owner_caveat": "Test-defect rows belong to the outstanding test-vacuum assessment, not to a code PR.",
+      "existing_verifier": "none traced",
+      "pending_exact_evidence": [],
+      "partial_resolution_note": null,
+      "suspicion_scope": false,
+      "current_source_status": "unknown",
+      "state_read_guard": "state=open is a TRACE GAP: no plan-map row and no current-main trace. It does NOT assert this row is a live defect on 248c7af. current_source_status=unknown."
+    }
+  ],
+  "behavior": [
+    "Real non-Tasks client receives exact rmcp3.5.0 -32021 requiredCapabilities error",
+    "Entire public response JSON tree excludes taskId while retaining actual Operation handle",
+    "Known missing-route agent.open admission produces exactly one retained rejected Operation and safe UNKNOWN_ROUTE receipt preserved by public Tasks failure",
+    "Nonprojectable cancellation receipt stays absent; Tasks does not disclose private error payload"
+  ],
+  "owned_source_sha256": {
+    "crates/swarm-kernel-host/src/mcp_integration_tests/tasks.rs": "778F20D8B571F7719E665D83F4076EB1BC691BAF2C6826DED3C4BC1C1977D2EE"
+  },
+  "source_manifest_sha256": "D432A983A051012DAF10DEA7A7FA4775C87F62C096A4E669EE5EE012826980E8",
+  "frozen_input_count": 848,
+  "authority_document_sha256": {
+    "ELIOT-Swarm-Controller-Execution-Map-2026-10-09.md": "399704762B1190BA9E06DB8E2CD1586771B566FDF0DD0518E973C223A7FEABDB",
+    "ELIOT-Swarm-Controller-HIGH-Appendix-Source-2026-10-09.md": "4A997D7910046092FA0EDEE66C775C05A8428FD6A7AF5D50D686503FF6FCC858",
+    "ELIOT-Swarm-Controller-Master-Audit-2026-10-09-v27.md": "3DEE8664DABA6AC3551128ECF005BFA4E2E21B423346D9D0CE039A1F4F9D2CFF",
+    "ELIOT-Swarm-Controller-Original-Unverified-Suspicions.md": "2DADAADD9BC56B7ABF66EE564732928BFFE29ED0D7E08297F1893E1C8B8BADB0",
+    "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md": "AE8406869C2026D0837EEC15EAF0AF68FCB16448008850597F25A44F5933A974"
+  },
+  "code_understanding_proof_sha256": "B5FBD450AFD85C2EB294543F6D4382255599202FC567B3DA0963614DE9C07BB5",
+  "verification": {
+    "app296297298-windows-clippy-v1": {
+      "record_sha256": "E6EDC537049E9951557FF32B6058A442549E91242155A5184C6D33CBED917794",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "status": "PASS",
+      "log_sha256": "E44FA73A7F5894FD739455BF13E494856AAE8408F4C1907C93205B18F8CDC5CC",
+      "source_stable": true
+    },
+    "app296297298-windows-tests-v1": {
+      "record_sha256": "D371761FF654492D4C2EDC3D8920629494FC43960668688829FCBEEEEB116AD6",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(mcp_integration_tests::tasks::)"
+      ],
+      "status": "PASS",
+      "log_sha256": "B21F9BDA9B52914A05CF6E819ED34CD97EFA07B55A962BB68A3290595FC415A8",
+      "source_stable": true
+    },
+    "app296297298-linux-clippy-v1": {
+      "record_sha256": "AD28C6EAED472777C611B382E22C344B0E293C6AA76942019ED9A412A8A57913",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "status": "PASS",
+      "log_sha256": "03FADD3EC3DD466E89C116F4A7F70E9A085C7FFA8DDC7269630B11B0EBDA680B",
+      "source_stable": true
+    },
+    "app296297298-linux-tests-v1": {
+      "record_sha256": "5FD954AE6B5BA4DC14A63984BE27FC2A034F749AE1A868A4DFDFEB53D3101700",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(mcp_integration_tests::tasks::)"
+      ],
+      "status": "PASS",
+      "log_sha256": "C74C150C4DCD1EB5FBA64A700F7A6738C3A7B0BEC38F12D25EC9DC4D2DA3613D",
+      "source_stable": true
+    }
+  },
+  "actual_public_consumers": {
+    "windows": [
+      "mcp_integration_tests::tasks::client_without_tasks_gets_the_pre_tasks_response",
+      "mcp_integration_tests::tasks::retried_mutation_with_caller_id_resolves_to_the_same_task",
+      "mcp_integration_tests::tasks::tasks_client_sees_seed_poll_cancel_and_a_single_execution",
+      "mcp_integration_tests::tasks::tasks_get_projects_settled_failed_and_unknown_operations"
+    ],
+    "linux": [
+      "mcp_integration_tests::tasks::client_without_tasks_gets_the_pre_tasks_response",
+      "mcp_integration_tests::tasks::retried_mutation_with_caller_id_resolves_to_the_same_task",
+      "mcp_integration_tests::tasks::tasks_client_sees_seed_poll_cancel_and_a_single_execution",
+      "mcp_integration_tests::tasks::tasks_get_projects_settled_failed_and_unknown_operations"
+    ]
+  },
+  "independent_review": {
+    "sha256": "E69705A588D826EB27C92D84652141942810B54AB38F9A6F98CB2E7DE403A00F",
+    "p1": 0,
+    "p2": 0,
+    "artifact": "app296297298-independent-final-candidate-review-luna-v1-20261012.json"
+  },
+  "production_changes": false,
+  "clippy_scope": "Affected host strict production Clippy passed using unchanged cached production units; only cfg(test) source changed",
+  "boundaries": [
+    "Four actual MCP/Store/IPC Tasks consumers each Windows/Linux; host libtest retains24existingwarnings",
+    "APP299 actual downstream native execution/session count remains open; old single_execution test name is not qualification",
+    "FullV27audit and wholeRust/public/installednative/model/crash/fault/load acceptance remains pending"
+  ],
+  "full_v27_qualified": false
+}
