@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "slice": "APP-299 public-launcher-owned MCP retry connected consumer and affected APP-320 fixture",
+  "created_at_utc": "2026-10-12T23:29:05.6923862+00:00",
+  "base_main": "172a66250ffdd4ab8403618d50a10a74ea492fc7",
+  "code_commit": "b1e00a2173f78d62fb31300dac36f5ee8448ef5a",
+  "qualified_candidate_commit": "eabd910377d21c02e63faec430af192e46741e1e",
+  "code_tree_source_fingerprint": "DA13DBFD9140244A7F7049994C3AC2B8F6D09CA8605BE6A13ADBE4C5E3A19746",
+  "fingerprint_algorithm": "SHA256 over the 852 source paths ordered by PowerShell Sort-Object Name in the manager process, each path + NUL + committed Git blob OID + LF",
+  "candidate_source_input_count": 852,
+  "candidate_raw_source_inputs_exactly_matching_windows_snapshot": 850,
+  "qualified_windows_source_manifest_sha256": "ACDA16AFFFD80342B748B2A1792DA58998FAB097B24616015044442836460AF9",
+  "qualified_linux_source_manifest_sha256": "DA60CEE5339191EBA7755631E02D7E6A2370B3751829412FF50BC67741879C6F",
+  "candidate_formatting_deltas": [
+    {
+      "path": "crates/swarm-kernel-host/src/automation/authorization.rs",
+      "before_sha256": "FBE84F073D780E757C5F2392CB03D40D5CC8E2B58099A40D531532178A1EEF11",
+      "after_sha256": "4AA3FFE94BFE49BE75E4B1A711240FC28734313CA208DD8542C14AA51CB92A23",
+      "canonical_rustfmt_preimage_equals_postimage": true
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/program_tests/submission_disposition_current_consumers.rs",
+      "before_sha256": "E695FCC73A3AC6F3D20E9F5685288F3BA4232349DD17D822D5CC9647A439AA43",
+      "after_sha256": "E803BAC236AE0C7C656B3FFFC58F7FC3611BAB6C7FFF89559890D5B7D1BBD69E",
+      "canonical_rustfmt_preimage_equals_postimage": true
+    }
+  ],
+  "isolated_platform_source_delta": [
+    {
+      "path": "crates/swarm-kernel-host/src/store/c33_restart_diagnosis_fixture.rs",
+      "windows_sha256": "9853C54D7482FA069CFAADFA9CF25E64FF02939B5D94535DD4B2D0ABDC266179",
+      "linux_sha256": "13984744A8F859A6F1E2ADA489AD49457F3810E2C1DD50325D8970D048E0ED40"
+    }
+  ],
+  "source_bindings": [
+    {
+      "path": "Cargo.lock",
+      "candidate_raw_sha256": "D515220E64506491F5F37CAC78411731B49F1BC181DFFE64D26B390911DF1AAD",
+      "git_blob_oid": "f08b5be91b4805b1fc8b6b4be81598ff4b53e0d8",
+      "git_blob_sha256": "D515220E64506491F5F37CAC78411731B49F1BC181DFFE64D26B390911DF1AAD",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/Cargo.toml",
+      "candidate_raw_sha256": "530496ACD52C678055CA2DED8C974779AB16B1A3B8F736077D6FC0B85C6DB7C0",
+      "git_blob_oid": "bb5c1749fa3637c1f30ee148796e649b738b5d25",
+      "git_blob_sha256": "A8A5A2804A367B7F054D915834867C28077DB341674B2BC13AD25556DD8BC7FA",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": true
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/src/app320_connected_consumer.rs",
+      "candidate_raw_sha256": "25C79AAD61246E141C064F0B647557C676AA389F1654EC80E3C167EC83C32ECB",
+      "git_blob_oid": "f30b429dd46004aa88eb5a7d615801fb2ceb3cdb",
+      "git_blob_sha256": "25C79AAD61246E141C064F0B647557C676AA389F1654EC80E3C167EC83C32ECB",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/src/journal/retention_tests.rs",
+      "candidate_raw_sha256": "5A440098E5C931B13170499608D96FD55EB6A043E0F7E76BA4A37BDC54A694A7",
+      "git_blob_oid": "c7a37e9af29b6a125b23c94b3eb8ffbf40001392",
+      "git_blob_sha256": "5A440098E5C931B13170499608D96FD55EB6A043E0F7E76BA4A37BDC54A694A7",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/src/lib.rs",
+      "candidate_raw_sha256": "0107435879F7558C1A2BA8A8FAF763323B36C29614E15835FE0CB48F550E806C",
+      "git_blob_oid": "e90e70ecd02455a9f8088fcfc2c27ea800877305",
+      "git_blob_sha256": "0107435879F7558C1A2BA8A8FAF763323B36C29614E15835FE0CB48F550E806C",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/src/module_runtime.rs",
+      "candidate_raw_sha256": "30E842EDED73CAA8EB2661FEAE562323BD390FF2F470701BEB10067AE8BECE9B",
+      "git_blob_oid": "8a93f2eac404ecf3545e5c78588e85918b6ccf1b",
+      "git_blob_sha256": "30E842EDED73CAA8EB2661FEAE562323BD390FF2F470701BEB10067AE8BECE9B",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/src/native_mcp.rs",
+      "candidate_raw_sha256": "9BFEC2528153BB87F79FFBF1221A79CE3F8BA92CFAFBCE774EECF8EFA8DDD564",
+      "git_blob_oid": "3e43f40569ef793322d21ae3ee8f834e832dc0ef",
+      "git_blob_sha256": "9BFEC2528153BB87F79FFBF1221A79CE3F8BA92CFAFBCE774EECF8EFA8DDD564",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/src/app299_connected_consumer.rs",
+      "candidate_raw_sha256": "13C7C36D2B3EB322D3D8C00BC3FCEC8CB54D17FB75246031903AE817F930696E",
+      "git_blob_oid": "b1b673ab3830ad6219a96862dc0a391c6cea53f8",
+      "git_blob_sha256": "13C7C36D2B3EB322D3D8C00BC3FCEC8CB54D17FB75246031903AE817F930696E",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/automation/authorization.rs",
+      "candidate_raw_sha256": "4AA3FFE94BFE49BE75E4B1A711240FC28734313CA208DD8542C14AA51CB92A23",
+      "git_blob_oid": "6c62a0ab5c716b04efd53b1603dfedac5a71fc0b",
+      "git_blob_sha256": "4AA3FFE94BFE49BE75E4B1A711240FC28734313CA208DD8542C14AA51CB92A23",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/program_tests/submission_disposition_current_consumers.rs",
+      "candidate_raw_sha256": "E803BAC236AE0C7C656B3FFFC58F7FC3611BAB6C7FFF89559890D5B7D1BBD69E",
+      "git_blob_oid": "3db3b926b1f2fc25796a1f709da7dba78f3a9790",
+      "git_blob_sha256": "E803BAC236AE0C7C656B3FFFC58F7FC3611BAB6C7FFF89559890D5B7D1BBD69E",
+      "git_normalization_only": true,
+      "git_line_ending_conversion": false
+    }
+  ],
+  "behavior": "Initial Task and launch child are produced by task.create/swarm.launch.preview/swarm.launch; two public MCP Tasks agent_open retries address that exact retained child before its owned local native fixture executes once. Readbacks enforce held workspace lease, canonical project-root directory, Task/Attempt/Operation/native identity, Store ACK, journal and child cleanup.",
+  "dependency_change": "Three dev-only existing locked libraries: rmcp3.5.0, rusqlite0.40.2, local swarm-mcp; no dependency version changes",
+  "production_change": "No behavioral product change: native_mcp/schema/retention edits repair cfg(test) diagnostics; two pre-existing host files only canonical rustfmt formatting",
+  "independent_source_review": {
+    "artifact": "app299-final-workspace-contract-independent-review-luna-v8-20261012.json",
+    "sha256": "5A386A1E39E88C3DB081D6C9E999ED14C296BE5E33D67A71F831309A5E532D53",
+    "verdict": {
+      "p1_findings": 0,
+      "p2_findings": 0,
+      "summary": "No concrete P1/P2 defect found in the bounded final APP299/affected APP320 source composition."
+    },
+    "source_inputs_matched": 852,
+    "reviewer_executed_runtime": false,
+    "linux_reviewed_by_this_reviewer": false
+  },
+  "isolated_platform_receipts": [
+    {
+      "artifact": "app299-manager-windows-clippy-v7-20261012.json",
+      "artifact_sha256": "94AE23840FC17A7EFB120B780BE8E13A4172D8E176B467D4BAE26C5920CD3EA3",
+      "recorded_result": {
+        "schema_version": 1,
+        "gate": "APP299 supported launcher-first producer and APP320 cfg(test) source strict Clippy after nine-finding structural and exact held-lease/project-root repair",
+        "platform": "windows",
+        "command": [
+          "+1.98.1",
+          "clippy",
+          "--offline",
+          "--locked",
+          "-p",
+          "swarm-adapter-opencode",
+          "--lib",
+          "--tests",
+          "--no-deps",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0,
+        "source_manifest_sha256": "ACDA16AFFFD80342B748B2A1792DA58998FAB097B24616015044442836460AF9",
+        "source_input_count": 852,
+        "source_stable": true,
+        "log_sha256": "4F49D79233408174117AF97117EF2E2215AD691B0084FD4883C2E84E1438FEA5",
+        "started_at_utc": "2026-10-12T18:55:15.8053886-04:00",
+        "completed_at_utc": "2026-10-12T18:55:19.2727587-04:00",
+        "native_fixture_executed": false,
+        "test_executed": false,
+        "full_v27_qualified": false
+      },
+      "scope": "Historical manager execution in manifest-bound isolated composition; not an execution in this candidate checkout"
+    },
+    {
+      "artifact": "app299-manager-windows-connected-tests-v8-20261012.json",
+      "artifact_sha256": "47B7547940E5ADA810CC0BA079AE831C2DB9505CDFD66B0568153DD5D3A8B0D5",
+      "recorded_result": {
+        "schema_version": 1,
+        "gate": "APP299 launcher-first exact MCP child retry and affected APP320 consumer after strict cfg(test) Clippy PASS",
+        "platform": "windows",
+        "command": [
+          "+1.98.1",
+          "nextest",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "swarm-adapter-opencode",
+          "--lib",
+          "-E",
+          "test(=app299_connected_consumer::app299_public_tasks_duplicate_creates_one_exact_native_root) | test(=app320_connected_consumer::app320_provider_auth_survives_real_store_outcome_ack_for_both_failures)",
+          "--test-threads",
+          "1",
+          "--no-fail-fast",
+          "--success-output",
+          "immediate"
+        ],
+        "exit_code": 0,
+        "selected_consumers": [
+          "app299_connected_consumer::app299_public_tasks_duplicate_creates_one_exact_native_root",
+          "app320_connected_consumer::app320_provider_auth_survives_real_store_outcome_ack_for_both_failures"
+        ],
+        "source_manifest_sha256": "ACDA16AFFFD80342B748B2A1792DA58998FAB097B24616015044442836460AF9",
+        "source_input_count": 852,
+        "source_stable": true,
+        "binaries": {
+          "bun": {
+            "sha256": "627D2E4775C24BDEDEE2CD7CCC18DCADAE061E5345274AB6E3C4C797927BFB8F",
+            "path": "C:/Users/kleym/AppData/Local/Eliot/verification-tools/bun-1.4.0-20261010/bun-windows-x64/bun.exe"
+          },
+          "supervisor": {
+            "sha256": "F3BAE6F5F375A7DAA8309070D6DD5406450082507C9D9435B7462192EF2407FF",
+            "path": "C:/Users/kleym/AppData/Local/Eliot/build/swarm-app320-v7-windows-20261012/debug/swarm-supervisor.exe"
+          },
+          "owner_helper": {
+            "sha256": "B72441B8311FC1A9182960EF38FE32C4FA418265D7CDBDB9F195EAC905F16728",
+            "path": "C:/Users/kleym/AppData/Local/Eliot/build/swarm-app320-v7-windows-20261012/debug/swarm-module-owner.exe"
+          }
+        },
+        "log_sha256": "A6B937E6661CCFF186E679603A203BE74D1EC939AA87D54831048FC5A78344CE",
+        "started_at_utc": "2026-10-12T18:59:32.589563-04:00",
+        "completed_at_utc": "2026-10-12T19:00:49.2061048-04:00",
+        "first_admission": "Real public launcher IPC; two exact public MCP retries only",
+        "local_native_fixture_consumers_selected": true,
+        "consumer_suite_passed": true,
+        "native_execution_evidence": "Per-consumer runtime boundary is recorded in the test log; selection alone does not establish execution",
+        "installed_native_provider_model_qualified": false,
+        "full_v27_qualified": false
+      },
+      "scope": "Historical manager execution in manifest-bound isolated composition; not an execution in this candidate checkout"
+    },
+    {
+      "artifact": "app299-manager-linux-clippy-v2-20261012.json",
+      "artifact_sha256": "44A954D2B5D5A6D140CFCCB7F16CF252690FD1A9E3C902DAC1E8C2C167E4C406",
+      "recorded_result": {
+        "schema_version": 1,
+        "gate": "clippy",
+        "platform": "linux",
+        "command": "+1.98.1 clippy --offline --locked -p swarm-adapter-opencode --lib --tests --no-deps -- -D warnings",
+        "exit_code": 0,
+        "cargo_exit_code": 0,
+        "two_tests_selected": false,
+        "both_consumers_passed": false,
+        "source_stable": true,
+        "binary_stable": true,
+        "source_manifest_sha256": "DA60CEE5339191EBA7755631E02D7E6A2370B3751829412FF50BC67741879C6F",
+        "source_input_count": 852,
+        "log_sha256": "40B79D44E20B2603EF54B3948D615572CF22036C7D73D11140F483C4A9ED7B94",
+        "started_at_utc": "2026-10-12T19:02:08.3173556-04:00",
+        "completed_at_utc": "2026-10-12T19:02:42.7696105-04:00",
+        "local_native_fixture_consumers_selected": false,
+        "installed_native_provider_model_qualified": false,
+        "full_v27_qualified": false
+      },
+      "scope": "Historical manager execution in manifest-bound isolated composition; not an execution in this candidate checkout"
+    },
+    {
+      "artifact": "app299-manager-linux-connected-tests-v2-20261012.json",
+      "artifact_sha256": "69CE7701AEFEB4BB12B80438F43A8BB236AFB32D07C2B57ED850FE520704F3D6",
+      "recorded_result": {
+        "schema_version": 1,
+        "gate": "connected-tests",
+        "platform": "linux",
+        "command": "+1.98.1 nextest run --offline --locked -p swarm-adapter-opencode --lib -E 'test(=app299_connected_consumer::app299_public_tasks_duplicate_creates_one_exact_native_root) | test(=app320_connected_consumer::app320_provider_auth_survives_real_store_outcome_ack_for_both_failures)' --test-threads 1 --no-fail-fast --success-output immediate",
+        "exit_code": 0,
+        "cargo_exit_code": 0,
+        "two_tests_selected": true,
+        "both_consumers_passed": true,
+        "source_stable": true,
+        "binary_stable": true,
+        "source_manifest_sha256": "DA60CEE5339191EBA7755631E02D7E6A2370B3751829412FF50BC67741879C6F",
+        "source_input_count": 852,
+        "log_sha256": "7B2D25E8B5A4351618577065E439F4CFB2E946517CC703A97DF3AA6F46DEE104",
+        "started_at_utc": "2026-10-12T19:02:43.0736213-04:00",
+        "completed_at_utc": "2026-10-12T19:06:31.9781407-04:00",
+        "local_native_fixture_consumers_selected": true,
+        "installed_native_provider_model_qualified": false,
+        "full_v27_qualified": false
+      },
+      "scope": "Historical manager execution in manifest-bound isolated composition; not an execution in this candidate checkout"
+    }
+  ],
+  "repository_verify": {
+    "artifact": "app299-candidate-scoped-verify-v14-20261012.json",
+    "sha256": "F9C6A50BCD4B1D99AF054245520AD951C4215BD55AF1D9DF61175F91C20EA658",
+    "recorded_result": {
+      "schema_version": 1,
+      "gate": "Repository Justfile scoped fmt/strict Clippy gate; Cargo.lock classification selects all owned packages",
+      "candidate": "C:/Users/kleym/.codex/worktrees/swarm-v27-current-20261012/eliot-swarm-controller",
+      "base_main": "172a66250ffdd4ab8403618d50a10a74ea492fc7",
+      "code_commit": "eabd910377d21c02e63faec430af192e46741e1e",
+      "rust_toolchain": "1.98.1",
+      "offline": true,
+      "command": [
+        "just",
+        "verify",
+        "172a66250ffdd4ab8403618d50a10a74ea492fc7",
+        "eabd910377d21c02e63faec430af192e46741e1e",
+        "C:/Users/kleym/AppData/Local/Eliot/build/swarm-reg09-manager-v1-20261012"
+      ],
+      "exit_code": 0,
+      "started_at_utc": "2026-10-12T19:26:49.6943382-04:00",
+      "completed_at_utc": "2026-10-12T19:27:42.6433836-04:00",
+      "log_sha256": "56B8A44D9660A60A185A3D03FBFB8EE5D8CE3FE160BD84A8D34ABE8E7C30BEF0",
+      "candidate_clean_after": true,
+      "connected_tests_repeated": false,
+      "provider_or_model_qualification": false,
+      "full_v27_qualified": false
+    },
+    "scope": "Actual candidate repository fmt + strict Clippy --lib --bins; Cargo.lock classification selected all owned packages; cfg(test) strict checks are isolated receipts above"
+  },
+  "historical_failed_gate": {
+    "artifact": "app299-candidate-scoped-verify-v10-20261012.json",
+    "exit_code": 1,
+    "reason": "Two pre-existing host rustfmt failures; stopped before Clippy",
+    "repair_receipt": "app299-candidate-fmt-repair-v13-20261012.json",
+    "repair_sha256": "518F3B510401F6406E31E54A7F373EF94EB2553ECB58064B5699DFA35D90385C"
+  },
+  "CompletionProof": {
+    "task_goal": "Deliver this bounded APP299 connected-fixture slice with evidence",
+    "acceptance_items": [
+      {
+        "item": "Exact frozen final consumer source",
+        "status": "verified",
+        "evidence": "852 raw inputs before commit; 850 remain byte-identical plus two proven canonical host format deltas and explicit Git CRLF conversion bindings"
+      },
+      {
+        "item": "Two selected local connected fixture consumers on Windows and Linux",
+        "status": "verified",
+        "evidence": "2/2 passed on each platform in isolated manager composition"
+      },
+      {
+        "item": "Strict Clippy for final adapter cfg(test), and candidate repository gate",
+        "status": "verified",
+        "evidence": "Windows/Linux final adapter lib+tests strict Clippy and candidate just verify passed"
+      },
+      {
+        "item": "Independent bounded final-byte source review",
+        "status": "verified",
+        "evidence": "0 P1, 0 P2; reviewer did not execute runtime"
+      }
+    ],
+    "changed_files": [
+      "Cargo.lock",
+      "crates/swarm-adapter-opencode/Cargo.toml",
+      "crates/swarm-adapter-opencode/src/app320_connected_consumer.rs",
+      "crates/swarm-adapter-opencode/src/journal/retention_tests.rs",
+      "crates/swarm-adapter-opencode/src/lib.rs",
+      "crates/swarm-adapter-opencode/src/module_runtime.rs",
+      "crates/swarm-adapter-opencode/src/native_mcp.rs",
+      "crates/swarm-adapter-opencode/src/app299_connected_consumer.rs",
+      "crates/swarm-kernel-host/src/automation/authorization.rs",
+      "crates/swarm-kernel-host/src/store/program_tests/submission_disposition_current_consumers.rs"
+    ],
+    "checks_not_run_and_why": [
+      "No repeated connected fixtures after proven formatter-only host changes",
+      "No installed OpenCode/provider/model or full V27 qualification in this slice",
+      "ELIOT/SurrealDB/LSP are not exposed in this runtime; no writeback claimed"
+    ],
+    "remaining_uncertainty": [
+      "Full public/native/model/crash/fault/load V27 program remains open",
+      "APP299 local deterministic fixture is not installed or live provider qualification"
+    ],
+    "final_status": "PARTIAL_PROGRESS"
+  },
+  "whole_APP299_complete": false,
+  "installed_native_provider_model_qualified": false,
+  "full_v27_qualified": false
+}
