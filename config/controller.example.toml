@@ -29,7 +29,7 @@ approvalMode = 'allowAll'
 [[routes]]
 alias = 'claude-manager'
 runtime = 'claude'
-module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.3'
+module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.4'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'

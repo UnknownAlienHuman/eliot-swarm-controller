@@ -13,7 +13,10 @@ import { fileURLToPath } from 'node:url';
 import { startup } from '@anthropic-ai/claude-agent-sdk';
 import { explicitQueryModel } from './model-selection.mjs';
 import { prepareQuery } from './prepared-query.mjs';
-import { createStreamState, applySdkMessage, snapshot } from './stream.mjs';
+import {
+  createStreamState, applySdkMessage, noteStreamEnd, noteStreamFailure, snapshot,
+} from './stream.mjs';
+import { streamEndedSendOutcome } from './pending-outcome.mjs';
 
 assert.equal(typeof startup, 'function', 'pinned SDK must export startup()');
 
@@ -60,9 +63,13 @@ assert.equal(typeof startup, 'function', 'pinned SDK must export startup()');
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-async function load(name) {
+async function loadFixture(name) {
   const parsed = JSON.parse(await readFile(path.join(here, 'fixtures', name), 'utf8'));
   assert.ok(Array.isArray(parsed.messages), `${name}: messages array required`);
+  return parsed;
+}
+async function load(name) {
+  const parsed = await loadFixture(name);
   return parsed.messages;
 }
 function feed(messages) {
@@ -130,6 +137,98 @@ function messageById(snap, id) {
   assert.equal(snap.usage.model_usage['claude-fixture-model'].inputTokens, 230);
   assert.equal(snap.init_failure, null);
   console.log('PASS init-success: identity, block assembly, replay, partials, terminal success');
+}
+
+// 1b. Exact replay-once behavior is retained after the bounded UUID set fills.
+// The first sequence replays an assistant-content frame; the second replays a
+// result frame whose application appends both a turn and an input receipt.
+{
+  function initializeReadyState(state, sessionId) {
+    // This fixture begins after the ordinary init frame, so the first UUID in
+    // each saturation sequence is the replay target under test.
+    state.phase = 'ready';
+    state.init = { session_id: sessionId, model: 'claude-fixture-model' };
+  }
+
+  function appendUniqueFramesTo8193(state, prefix) {
+    const before = state.frame_uuids.size;
+    for (let ordinal = before; ordinal < 8193; ordinal++) {
+      applySdkMessage(state, {
+        type: 'stream_event',
+        event: { type: 'message_start' },
+        uuid: `${prefix}-${ordinal}`,
+      });
+    }
+    assert.equal(state.frame_uuids.size, 8192, 'dedup UUID memory remains bounded');
+    assert.equal(state.gaps, 1, 'the first unseen frame after capacity is explicit as a gap');
+  }
+
+  const contentState = createStreamState();
+  initializeReadyState(contentState, 'ses_frame_capacity_content');
+  const firstContentFrame = {
+    type: 'assistant',
+    session_id: 'ses_frame_capacity_content',
+    uuid: 'frame-capacity-first-content',
+    message: {
+      id: 'msg_frame_capacity_content',
+      model: 'claude-fixture-model',
+      role: 'assistant',
+      stop_reason: null,
+      content: [{ type: 'text', text: 'content appears once' }],
+    },
+  };
+  applySdkMessage(contentState, firstContentFrame);
+  applySdkMessage(contentState, {
+    type: 'result',
+    session_id: 'ses_frame_capacity_content',
+    uuid: 'frame-capacity-content-result',
+    subtype: 'success',
+    is_error: false,
+    user_message_uuid: 'input-frame-capacity-content',
+    user_message_uuids: ['input-frame-capacity-content'],
+    result: 'one terminal result',
+  });
+  appendUniqueFramesTo8193(contentState, 'content-padding');
+  const contentBeforeReplay = snapshot(contentState);
+  applySdkMessage(contentState, firstContentFrame);
+  const contentAfterReplay = snapshot(contentState);
+  assert.deepEqual(contentAfterReplay.messages, contentBeforeReplay.messages,
+    'replayed assistant content does not append a second block or frame');
+  assert.deepEqual(contentAfterReplay.turns, contentBeforeReplay.turns);
+  assert.deepEqual(contentAfterReplay.input_executions, contentBeforeReplay.input_executions);
+  assert.equal(contentAfterReplay.messages[0].blocks.filter(block => block.type === 'text').length, 1);
+  assert.equal(contentAfterReplay.turns.length, 1);
+  assert.equal(contentAfterReplay.input_executions.length, 1);
+  assert.equal(contentAfterReplay.gaps, 1, 'known replay does not add a capacity gap');
+
+  const resultState = createStreamState();
+  initializeReadyState(resultState, 'ses_frame_capacity_result');
+  const firstResultFrame = {
+    type: 'result',
+    session_id: 'ses_frame_capacity_result',
+    uuid: 'frame-capacity-first-result',
+    subtype: 'success',
+    is_error: false,
+    user_message_uuid: 'input-frame-capacity-result',
+    user_message_uuids: ['input-frame-capacity-result'],
+    result: 'one terminal result',
+  };
+  applySdkMessage(resultState, firstResultFrame);
+  appendUniqueFramesTo8193(resultState, 'result-padding');
+  const resultBeforeReplay = snapshot(resultState);
+  applySdkMessage(resultState, firstResultFrame);
+  const resultAfterReplay = snapshot(resultState);
+  assert.deepEqual(resultAfterReplay.messages, resultBeforeReplay.messages,
+    'result replay does not create or duplicate content');
+  assert.deepEqual(resultAfterReplay.turns, resultBeforeReplay.turns,
+    'result replay does not append a duplicate turn');
+  assert.deepEqual(resultAfterReplay.input_executions, resultBeforeReplay.input_executions,
+    'result replay does not append a duplicate input execution receipt');
+  assert.equal(resultAfterReplay.messages.length, 0);
+  assert.equal(resultAfterReplay.turns.length, 1);
+  assert.equal(resultAfterReplay.input_executions.length, 1);
+  assert.equal(resultAfterReplay.gaps, 1, 'known result replay does not add a capacity gap');
+  console.log('PASS frame-uuid capacity: bounded fail-closed keeps replayed content and result once');
 }
 
 // 2. Child linkage and the repeated-message.id block trap inside a child.
@@ -230,7 +329,49 @@ function messageById(snap, id) {
   console.log('PASS task-input-executions: UUID, result frame, model and output digest bind; merged inputs remain ambiguous');
 }
 
-// 6. Only the pinned SDK result subtype union can create terminal evidence.
+// 6. EOF or a lost stream response before the matching UUID leaves the queued
+// send unknown. The shared helper is the exact projection used by finishSession;
+// neither fixture supplies terminal result evidence or authorizes a resend.
+{
+  for (const name of [
+    'eof-after-init-before-input-echo.stream.json',
+    'lost-response-after-assistant-no-result.stream.json',
+  ]) {
+    const fixture = await loadFixture(name);
+    const state = feed(fixture.messages);
+    if (fixture.termination === 'eof') noteStreamEnd(state);
+    else noteStreamFailure(state, new Error(fixture.error));
+
+    const observed = snapshot(state);
+    assert.equal(observed.adapter.phase, fixture.expected_phase, name);
+    assert.equal(observed.input_executions.some(
+      event => event.native_input_id === fixture.unobserved_input_uuid,
+    ), false, 'a missing result cannot fabricate terminal input evidence');
+
+    const outcome = streamEndedSendOutcome(
+      fixture.pending_send, fixture.session, fixture.bridge_boot_id,
+    );
+    assert.equal(outcome.outcome, 'unknown', 'stream loss is not input admission');
+    assert.equal(outcome.details.diagnostic_code, 'STREAM_ENDED_BEFORE_TURN_EVIDENCE');
+    assert.equal(Object.hasOwn(outcome, 'native_input_id'), false);
+    assert.equal(Object.hasOwn(outcome.details, 'user_message_uuid'), false);
+    if (fixture.pending_send.initialTaskDispatch) {
+      assert.equal(Object.hasOwn(outcome, 'native_root_id'), false,
+        'init alone cannot adopt the first binding identity');
+      assert.equal(outcome.details.completion_condition, 'native_input_admission_unknown');
+      assert.equal(outcome.details.bridge_boot_id, fixture.bridge_boot_id);
+    } else {
+      assert.deepEqual(
+        [outcome.native_root_id, outcome.native_scope_key],
+        [fixture.session.rootId, fixture.session.scopeKey],
+        'a retained session keeps its known identity without claiming the input was admitted',
+      );
+    }
+  }
+  console.log('PASS stream-loss-outcomes: EOF and lost response remain unknown without UUID admission or replay');
+}
+
+// 7. Only the pinned SDK result subtype union can create terminal evidence.
 {
   const errorSubtypes = [
     'error_during_execution',
@@ -281,7 +422,7 @@ function messageById(snap, id) {
   console.log('PASS result-subtype-whitelist: four SDK errors and success/error map; unknown or malformed result remains unresolved');
 }
 
-// 7. A failed adapter-bridge startup emits one Unknown and closes this boot.
+// 8. A failed adapter-bridge startup emits one Unknown and closes this boot.
 // The temporary SDK throws before creating any native session or process.
 {
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'claude-prepare-failure-'));

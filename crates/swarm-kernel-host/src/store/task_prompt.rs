@@ -85,7 +85,7 @@ pub(super) fn require_new_binding(
             | "command-mod-0.1.0-glue.3"
             | "command-mod-0.1.0-glue.4"
             | "codex-sdk-18194bf-bridge.3"
-            | "claude-agent-sdk-0.3.287-bridge.3"
+            | "claude-agent-sdk-0.3.287-bridge.3" // retained-only; bridge.4 is current
             | "antigravity-cli-warm-bridge.2"
             | "muse-sdk-1.3.0-bridge.8"
     ) {

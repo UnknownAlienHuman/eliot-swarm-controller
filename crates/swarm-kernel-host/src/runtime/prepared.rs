@@ -12,10 +12,14 @@ use serde_json::{Value, json};
 use swarm_contracts::module_catalog::PreInputOpenContract;
 
 pub const CLAUDE_RUNTIME: &str = "claude";
-pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.3";
+pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.4";
+pub const CLAUDE_RETAINED_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.3";
 
 pub fn is_prepared_claude_route(route: &Value) -> bool {
-    route["runtime"] == CLAUDE_RUNTIME && route["module_artifact_id"] == CLAUDE_ARTIFACT_ID
+    let artifact_id = route["module_artifact_id"].as_str();
+    route["runtime"] == CLAUDE_RUNTIME
+        && (artifact_id == Some(CLAUDE_ARTIFACT_ID)
+            || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID))
 }
 
 fn nonempty<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
@@ -128,7 +132,9 @@ pub fn adopt_first_input_identity(
                 "bridge_boot_id": boot
             }))?,
             CLAUDE_RUNTIME,
-            CLAUDE_ARTIFACT_ID
+            binding["route"]["module_artifact_id"]
+                .as_str()
+                .unwrap_or_default()
         ],
     )?;
     if changed != 1 {
@@ -672,6 +678,68 @@ mod tests {
         let mut wrong_boot = open;
         wrong_boot.details["bridge_boot_id"] = json!("another-boot");
         assert!(validate_prepared_open(&binding, &wrong_boot).is_err());
+    }
+
+    #[test]
+    fn retained_bridge3_binding_uses_its_exact_id_for_first_input_adoption() {
+        let mut retained = binding();
+        retained["route"]["module_artifact_id"] = json!(CLAUDE_RETAINED_ARTIFACT_ID);
+        assert!(is_prepared_claude_route(&retained["route"]));
+        assert!(is_prepared_claude_route(&binding()["route"]));
+        assert!(!is_prepared_claude_route(&json!({
+            "runtime":CLAUDE_RUNTIME,
+            "module_artifact_id":"claude-agent-sdk-0.3.287-bridge.2"
+        })));
+
+        let (outcome, _, _) = initial_dispatch(&retained);
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE bindings (
+                binding_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                native_root_id TEXT,
+                native_scope_key TEXT,
+                state_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                route_json TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let state_json = json!({
+            "bridge_boot_id":retained["observation"]["bridge_boot_id"],
+            "opening_evidence":retained["observation"]["opening_evidence"]
+        });
+        db.execute(
+            "INSERT INTO bindings (
+                binding_id,generation,native_root_id,native_scope_key,state_json,state,route_json
+            ) VALUES (?1,?2,NULL,NULL,?3,'ready',?4)",
+            params![
+                retained["binding_id"].as_str().unwrap(),
+                retained["generation"].as_i64().unwrap(),
+                state_json.to_string(),
+                retained["route"].to_string()
+            ],
+        )
+        .unwrap();
+
+        let tx = db.transaction().unwrap();
+        adopt_first_input_identity(&tx, &retained, &outcome).unwrap();
+        tx.commit().unwrap();
+        let (root, scope, route_json): (String, String, String) = db
+            .query_row(
+                "SELECT native_root_id,native_scope_key,route_json
+                 FROM bindings WHERE binding_id='binding-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let persisted_route: Value = serde_json::from_str(&route_json).unwrap();
+        assert_eq!(root, "actual-sdk-session");
+        assert_eq!(scope, "claude:/fixture/config");
+        assert_eq!(
+            persisted_route["module_artifact_id"],
+            CLAUDE_RETAINED_ARTIFACT_ID
+        );
     }
 
     #[test]

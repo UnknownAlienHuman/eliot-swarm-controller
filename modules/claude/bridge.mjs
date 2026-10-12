@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // SDK-owned native execution for Claude Code through the pinned Claude Agent
 // SDK. Host IPC reconnect never closes the SDK query or repeats input.
-// Artifact scope (bridge.3): rootless SDK preparation at agent.open, the first
+// Artifact scope (bridge.4): rootless SDK preparation at agent.open, the first
 // Task dispatch claims WarmQuery once, then native init/input receipts bind the
 // persistent session. Attach/resume/configure/goal/reply/steer/result pages
 // remain unavailable; see README capability matrix.
@@ -14,13 +14,14 @@ import { startup } from '@anthropic-ai/claude-agent-sdk';
 import { Control } from './control.mjs';
 import { prepareQuery } from './prepared-query.mjs';
 import { explicitQueryModel, modelSelectionFacts } from './model-selection.mjs';
+import { streamEndedSendOutcome } from './pending-outcome.mjs';
 import {
   createStreamState, applySdkMessage, notePermissionRequest, noteStderr,
   noteStreamEnd, noteStreamFailure, snapshot,
 } from './stream.mjs';
 
 const SDK_VERSION = '0.3.287';
-const MODULE_ARTIFACT_ID = 'claude-agent-sdk-0.3.287-bridge.3';
+const MODULE_ARTIFACT_ID = 'claude-agent-sdk-0.3.287-bridge.4';
 const ENTRYPOINT = 'claude_agent_sdk_streaming_input';
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'];
 const CAPABILITIES = {
@@ -250,22 +251,7 @@ function finishSession(sess) {
     sess.openWait = null;
   }
   for (const entry of sess.pendingSends.values()) {
-    saveOutcome(entry.operation_id, {
-      outcome: 'unknown',
-      // The initial binding identity is adopted only with the paired native
-      // input receipt. Keep an init-only root diagnostic out of that boundary.
-      ...(!entry.initialTaskDispatch && sess.rootId
-        ? { native_root_id: sess.rootId, native_scope_key: sess.scopeKey }
-        : {}),
-      details: {
-        diagnostic_code: 'STREAM_ENDED_BEFORE_TURN_EVIDENCE',
-        ...(entry.initialTaskDispatch ? {
-          completion_condition: 'native_input_admission_unknown',
-          initial_task_dispatch: true,
-          bridge_boot_id: bootId,
-        } : {}),
-      },
-    }, entry.method);
+    saveOutcome(entry.operation_id, streamEndedSendOutcome(entry, sess, bootId), entry.method);
   }
   sess.pendingSends.clear();
   changed();

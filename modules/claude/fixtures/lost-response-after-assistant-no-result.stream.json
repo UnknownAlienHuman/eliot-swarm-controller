@@ -1,0 +1,45 @@
+{
+  "scenario": "subsequent-send-lost-response-before-result",
+  "termination": "error",
+  "error": "fixture SDK stream lost before the matching input UUID or result",
+  "expected_phase": "stream_failed",
+  "bridge_boot_id": "bridge-boot-fixture-loss",
+  "pending_send": {
+    "operation_id": "send-lost-response",
+    "method": "agent.send",
+    "initialTaskDispatch": false
+  },
+  "unobserved_input_uuid": "d34d0044-4444-4444-8444-444444444444",
+  "session": {
+    "rootId": "ses_lost_response",
+    "scopeKey": "claude:/fixture/config"
+  },
+  "messages": [
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "ses_lost_response",
+      "model": "claude-fixture-model",
+      "claude_code_version": "2.1.0-fixture",
+      "uuid": "lost-response-init-frame"
+    },
+    {
+      "type": "assistant",
+      "session_id": "ses_lost_response",
+      "parent_tool_use_id": null,
+      "uuid": "lost-response-assistant-frame",
+      "message": {
+        "type": "message",
+        "id": "msg_lost_response_fixture",
+        "role": "assistant",
+        "model": "claude-fixture-model",
+        "content": [
+          { "type": "text", "text": "Possible response before transport loss." }
+        ],
+        "stop_reason": null,
+        "usage": { "input_tokens": 8, "output_tokens": 4 }
+      }
+    }
+  ],
+  "note": "Authored from the pinned SDK message contract, not a live capture. Partial assistant content without the matching user_message_uuid/result cannot settle admission or terminal execution; the pending send remains unknown and is never replayed."
+}

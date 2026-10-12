@@ -12,6 +12,7 @@
 | --- | --- |
 | `bridge.mjs` | Facade only: host commands, explicit route model passed to SDK startup, prepared-session ownership, exact Task input prompt/UUID receipts and outcome classification. No mapper rules. |
 | `stream.mjs` / `model-selection.mjs` | SDK-message → observation mapping, compact uniquely correlated terminal input receipts, and pure route-model selection/projection. Every mapping change needs a fixture that proves the boundary it alters. |
+| `pending-outcome.mjs` | Pure projection for a queued send whose stream ends before native input UUID admission; unknown remains unknown and is never retried. No SDK control or replay.
 | `control.mjs` | Host IPC link; changes must stay wire-compatible with the host's module protocol and the Muse module's link behavior. |
 | `fixtures/`, `selftest.mjs` | Add fixtures before relying on new native message shapes; never edit a fixture to match a mapper regression. |
 | `package.json` / `package-lock.json` | SDK version changes only as one deliberate pin update (below). No `@latest`, no global installs. |
@@ -21,7 +22,7 @@
 
 1. Choose the exact new SDK version; the matching native binary packages (`@anthropic-ai/claude-agent-sdk-<platform>`) carry the same version and update with it — never mix versions.
 2. Update `package.json`, regenerate `package-lock.json` with `npm install --ignore-scripts`, and diff the new `sdk.d.ts` for the operations this adapter uses (`query`, streaming input, init/result shapes, `parent_tool_use_id`, `user_message_uuid` stamping, `canUseTool`, `forwardSubagentText`). A changed mandatory field makes only the affected capability unconfirmed, not the whole module.
-3. Bump the artifact id (`claude-agent-sdk-<version>-bridge.N`) whenever protocol-visible behavior changes; the current slice is `claude-agent-sdk-0.3.287-bridge.3`. It prepares a rootless SDK executor at open, claims the one-shot `WarmQuery` for the first exact Task input, adopts only the later observed `system/init.session_id` plus echoed native user UUID, and records a compact terminal input projection. Update it in `module.example.json`, this file, the module README and the disabled route in `config/controller.example.toml` together.
+3. Bump the artifact id (claude-agent-sdk-<version>-bridge.N) whenever protocol-visible behavior changes; the current slice is claude-agent-sdk-0.3.287-bridge.4 (SDK remains pinned at 0.3.287). It prepares a rootless SDK executor at open, claims the one-shot WarmQuery for the first exact Task input, adopts only the later observed system/init.session_id plus echoed native user UUID, and records a compact terminal input projection. Update the id in bridge.mjs, module.example.json, UPDATE.md, README.md, and the disabled route in config/controller.example.toml together with the host current-artifact recognizer. Preserve bridge.3 recognition for existing bindings while keeping it unavailable for new bindings; host adoption must compare each binding against its exact artifact id.
 4. Run the verification below. A new artifact never edits a running bridge in place.
 
 ## Verification through the real adapter

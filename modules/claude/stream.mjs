@@ -24,6 +24,7 @@ import { createHash } from 'node:crypto';
 const MAX_MESSAGES = 200;
 const MAX_CHILDREN = 100;
 const MAX_TURNS = 32;
+const MAX_FRAME_UUIDS = 8192;
 const MAX_PERMISSION_REQUESTS = 32;
 const MAX_TASK_NOTIFICATIONS = 32;
 const MAX_INPUT_EXECUTIONS = 64;
@@ -348,12 +349,14 @@ export function applySdkMessage(state, msg) {
   state.native_events_seen++;
   if (typeof msg.uuid === 'string') {
     if (state.frame_uuids.has(msg.uuid)) return state; // replayed frame: apply once
-    state.frame_uuids.add(msg.uuid);
-    if (state.frame_uuids.size > 8192) {
-      // Bounded replay memory; dropping old uuids can only re-apply an old
-      // frame, whose blocks merge by index and do not duplicate content.
-      state.frame_uuids.delete(state.frame_uuids.values().next().value);
+    if (state.frame_uuids.size >= MAX_FRAME_UUIDS) {
+      // Keep the exact dedup set bounded without making an old replay new
+      // again. Once full, refuse unseen UUID-bearing frames and expose the
+      // omitted mapping evidence through the existing gaps counter.
+      state.gaps++;
+      return state;
     }
+    state.frame_uuids.add(msg.uuid);
   }
   switch (msg.type) {
     case 'system': applySystem(state, msg); break;

@@ -1,6 +1,7 @@
 # Claude Agent SDK bridge — native integration (first slice)
 
-Uses the complete locked `@anthropic-ai/claude-agent-sdk` **0.3.287** and its matching bundled native binary packages (`@anthropic-ai/claude-agent-sdk-<platform>` **0.3.287**). New bindings use **`claude-agent-sdk-0.3.287-bridge.3`**. The SDK is under Anthropic's Commercial Terms (see [third-party notices](../../THIRD_PARTY_NOTICES.md)); it is not a permissive open-source donor. A direct CLI canary does not qualify this SDK bridge or its host route.
+Uses the complete locked `@anthropic-ai/claude-agent-sdk` **0.3.287** and its matching bundled native binary packages (`@anthropic-ai/claude-agent-sdk-<platform>` **0.3.287**). New bindings use **`claude-agent-sdk-0.3.287-bridge.4`**. The SDK is under Anthropic's Commercial Terms (see [third-party notices](../../THIRD_PARTY_NOTICES.md)); it is not a permissive open-source donor. A direct CLI canary does not qualify this SDK bridge or its host route.
+Existing bridge.3 bindings remain recognized for their retained lifecycle, while bridge.3 is retired for new bindings.
 
 ## Ownership and setup
 
@@ -21,7 +22,7 @@ swarm module-run --state-dir C:\SwarmModules\CC --command 'C:\Program Files\node
 [[routes]]
 alias = 'claude-manager'
 runtime = 'claude'
-module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.3'
+module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.4'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -57,6 +58,7 @@ At `agent.open`, SDK 0.3.287 `startup()` prepares an initialized subprocess and 
 The mapper (`stream.mjs`) is pure and shared by the live path and the fixture self-test, so they cannot drift:
 
 - One API assistant turn arrives as several assistant frames sharing one `message.id`, each carrying the block it delivers at frame-local index 0. Blocks are appended in arrival order under that id; tool blocks dedupe by native tool id. A frame is never deduplicated as a whole message, so a repeated `message.id` cannot lose a tool block. A replayed frame (same frame `uuid`) is applied once.
+- The exact frame UUID set is capped at 8,192: known UUIDs remain ignored after saturation, while unseen UUID-bearing frames are refused and counted in gaps. This bounded mapper policy does not claim the pinned SDK replays frames after the cap.
 - `stream_event` partials are token deltas: counted as `partial_events_seen`, never inventoried as messages or children.
 - Child linkage comes only from complete frames: a root `Task`/`Agent` tool_use block opens a child record keyed by that tool id; subagent frames carry `parent_tool_use_id` (the bridge opens the query with `forwardSubagentText: true`, so complete child messages are forwarded, not only tool heartbeats). A child is completed/failed only by the root `tool_result` for its tool id (or a native `task_notification`); child activity alone never completes it, and family completeness stays `partial`.
 - A `result` frame closes a turn: `success` → `turn_completed`; `error_during_execution` / `error_max_turns` / `error_max_budget_usd` / `error_max_structured_output_retries` → `turn_failed` with the native subtype retained. An `error_during_execution` result before any `system/init` is an **init failure** — a distinct recorded outcome with the native `errors[]`, never an empty successful start and never an invented session identity.
@@ -83,6 +85,7 @@ node selftest.mjs
 ```
 
 It asserts the SDK import surface plus the mapping boundaries above: init identity, multi-frame block assembly without loss, replay applied once, partials excluded from inventory, child linkage/completion, distinct init failure, terminal error subtypes and cumulative-usage replacement. CI runs the same check next to the Muse bridge checks.
+EOF or a lost response before matching input-UUID admission remains unknown and is not replayed; these protocol-shape fixtures are not live captures.
 
 ## Implementation and remaining work
 

@@ -1,0 +1,27 @@
+{
+  "scenario": "initial-task-dispatch-eof-after-init-before-input-echo",
+  "termination": "eof",
+  "expected_phase": "stream_ended",
+  "bridge_boot_id": "bridge-boot-fixture-eof",
+  "pending_send": {
+    "operation_id": "dispatch-eof-before-echo",
+    "method": "task.dispatch",
+    "initialTaskDispatch": true
+  },
+  "unobserved_input_uuid": "d34d0033-3333-4333-8333-333333333333",
+  "session": {
+    "rootId": "ses_eof_before_input_echo",
+    "scopeKey": "claude:/fixture/config"
+  },
+  "messages": [
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "ses_eof_before_input_echo",
+      "model": "claude-fixture-model",
+      "claude_code_version": "2.1.0-fixture",
+      "uuid": "eof-before-input-init-frame"
+    }
+  ],
+  "note": "Authored from the pinned SDK message contract. system/init alone is not the paired native input UUID receipt; EOF leaves initial admission and root adoption unknown."
+}
