@@ -41,6 +41,7 @@ pub(crate) struct ListRequest {
     pub attempt_id: Option<String>,
     pub limit: i64,
     pub after_watch_id: Option<String>,
+    pub after_scan_cursor: Option<String>,
 }
 
 pub fn validate_mutation(method: &str, value: &Value) -> Result<()> {
@@ -67,17 +68,23 @@ pub(crate) fn parse_list(value: &Value) -> Result<ListRequest> {
             "attempt_id",
             "limit",
             "after_watch_id",
+            "after_scan_cursor",
         ],
     )?;
     let (task_id, task_revision, attempt_id) = parse_scope_fields(value)?;
     let limit = crate::coordination::parse_page(value.get("limit"), DEFAULT_PAGE_SIZE)?;
     let after_watch_id = optional_identifier(value.get("after_watch_id"), "after_watch_id")?;
+    let after_scan_cursor = crate::coordination::parse_list_scan_cursor(value)?;
+    if after_watch_id.is_some() && after_scan_cursor.is_some() {
+        return Err(Error::invalid("choose after_watch_id or after_scan_cursor"));
+    }
     Ok(ListRequest {
         task_id,
         task_revision,
         attempt_id,
         limit,
         after_watch_id,
+        after_scan_cursor,
     })
 }
 

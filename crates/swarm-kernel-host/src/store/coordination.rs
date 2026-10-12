@@ -2939,9 +2939,13 @@ fn card_list(
     let mut last = None;
     for indexed in cards {
         last = Some(indexed.client_id.clone());
-        let Ok(participant) = load_current_scope_for_client(db, &indexed.client_id) else {
-            stale = stale.saturating_add(1);
-            continue;
+        let participant = match load_current_scope_for_client(db, &indexed.client_id) {
+            Ok(participant) => participant,
+            Err(error) if is_stale_watch_authority(&error) => {
+                stale = stale.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         if participant.scope_id != scope.scope_id {
             stale = stale.saturating_add(1);
@@ -3029,9 +3033,13 @@ fn contract_cards_for_term(
     let mut last = None;
     for indexed in cards {
         last = Some(indexed.client_id.clone());
-        let Ok(participant) = load_current_scope_for_client(db, &indexed.client_id) else {
-            stale = stale.saturating_add(1);
-            continue;
+        let participant = match load_current_scope_for_client(db, &indexed.client_id) {
+            Ok(participant) => participant,
+            Err(error) if is_stale_watch_authority(&error) => {
+                stale = stale.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         if participant.scope_id != scope.scope_id {
             stale = stale.saturating_add(1);
@@ -3202,9 +3210,13 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
         if !seen.insert(indexed.client_id.clone()) {
             continue;
         }
-        let Ok(candidate) = load_current_scope_for_client(db, &indexed.client_id) else {
-            stale = stale.saturating_add(1);
-            continue;
+        let candidate = match load_current_scope_for_client(db, &indexed.client_id) {
+            Ok(candidate) => candidate,
+            Err(error) if is_stale_watch_authority(&error) => {
+                stale = stale.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         if candidate.scope_id != scope.scope_id {
             stale = stale.saturating_add(1);
@@ -3296,7 +3308,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
         }
         Err(error) => return Err(error),
     };
-    let watch_notifications = super::coordination_watch::notifications(db, principal, 20)?;
+    let watch_notifications = super::coordination_watch::notifications(db, principal, limit)?;
     if scope.registration["inbound_policy"] == "hold" {
         return Ok(json!({
             "items":[],
@@ -4168,7 +4180,18 @@ fn consult(
             }),
         );
     }
-    if field_matches.len() > 1 {
+    // Ambiguity is about distinct peer owners, not the number of cards one
+    // owner published. Keep the fact count for callers, but resolve its
+    // recipient population by the public exact-owner contract.
+    let mut field_owner_matches = Vec::new();
+    let mut seen_field_owners = BTreeSet::new();
+    for candidate in &field_matches {
+        let owner = candidate.indexed.client_id.as_str();
+        if owner != principal.client_id && seen_field_owners.insert(owner.to_owned()) {
+            field_owner_matches.push(*candidate);
+        }
+    }
+    if field_owner_matches.len() > 1 {
         return scoped_consult_result(
             tx,
             operation_id,
@@ -4179,7 +4202,8 @@ fn consult(
                 "target":consult_target_json(&request),
                 "field":request.field,
                 "card_fact_count":field_matches.len(),
-                "candidates":consult_candidates(&field_matches),
+                "candidate_count":field_owner_matches.len(),
+                "candidates":consult_candidates(&field_owner_matches),
                 "delivery_created":false,
                 "coverage":"complete",
                 "gaps":[],
@@ -4189,10 +4213,19 @@ fn consult(
 
     let mut owner_matches = Vec::new();
     let mut seen_owners = BTreeSet::new();
-    for candidate in cards
-        .iter()
-        .filter(|candidate| candidate.indexed.client_id != principal.client_id)
-    {
+    let owner_candidates: Vec<&ConsultCardMatch> =
+        if field_matches.len() > 1 && field_owner_matches.len() == 1 {
+            // Several current cards contain the requested field, but they resolve
+            // to one peer. Ask that exact owner instead of selecting a fact or
+            // reporting false owner ambiguity.
+            field_owner_matches
+        } else {
+            cards
+                .iter()
+                .filter(|candidate| candidate.indexed.client_id != principal.client_id)
+                .collect()
+        };
+    for candidate in owner_candidates {
         if seen_owners.insert(candidate.indexed.client_id.clone()) {
             owner_matches.push(candidate);
         }
@@ -4429,10 +4462,11 @@ fn consult_matching_cards(
         };
         let participant = match load_current_scope_for_client(db, client_id) {
             Ok(participant) => participant,
-            Err(_) => {
+            Err(error) if is_stale_watch_authority(&error) => {
                 stale = stale.saturating_add(1);
                 continue;
             }
+            Err(error) => return Err(error),
         };
         if participant.scope_id != sender.scope_id {
             stale = stale.saturating_add(1);

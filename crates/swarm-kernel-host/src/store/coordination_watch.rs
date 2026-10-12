@@ -97,14 +97,21 @@ pub(super) fn read(db: &Connection, principal: &Principal, value: &Value) -> Res
     let prefix = list_prefix(&scope.id, &principal.client_id);
     let upper = format!("{prefix}g");
     let after_key = if let Some(after_watch_id) = request.after_watch_id.as_deref() {
-        let record = owned_watch(db, after_watch_id, &principal.client_id)?;
-        require_record_scope(&record, &scope)?;
-        Some(
-            record["list_index_key"]
-                .as_str()
-                .ok_or_else(|| damaged("watch has no list index key"))?
-                .to_owned(),
-        )
+        Some(resolve_after_watch_id(
+            db,
+            &scope,
+            &principal.client_id,
+            &prefix,
+            &upper,
+            after_watch_id,
+        )?)
+    } else if let Some(cursor) = request.after_scan_cursor.as_deref() {
+        Some(keys::decode_list_scan_cursor(
+            &prefix,
+            &principal.client_id,
+            &upper,
+            cursor,
+        )?)
     } else {
         None
     };
@@ -122,34 +129,192 @@ pub(super) fn read(db: &Connection, principal: &Principal, value: &Value) -> Res
         .collect::<std::result::Result<_, _>>()?;
     let has_more = rows.len() as i64 > request.limit;
     let mut items = Vec::new();
+    let mut damaged_entries = 0usize;
+    let mut last_examined_watch_id = None;
+    let mut last_examined_key = None;
     for (index_key, raw_index) in rows.iter().take(request.limit as usize) {
-        let index: Value = serde_json::from_str(raw_index)?;
-        let watch_id = model::text(&index, "watch_id")?;
-        let record = owned_watch(db, watch_id, &principal.client_id)?;
-        require_record_scope(&record, &scope)?;
-        if record["list_index_key"] != index_key.as_str() {
-            return Err(damaged("watch list index differs from its record"));
+        // The exact-scope list key retains the server-issued watch id even if
+        // its JSON index payload or retained record is damaged. This id is only
+        // a continuation token; projection still requires every authority and
+        // record-binding check below.
+        last_examined_key = Some(index_key.as_str());
+        last_examined_watch_id = None;
+        let key_watch_id = match watch_id_from_list_key(index_key, &prefix) {
+            Ok(id) => id,
+            Err(error) if watch_list_entry_is_damaged(&error) => {
+                damaged_entries += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        last_examined_watch_id = Some(key_watch_id.clone());
+        let index: Value = match serde_json::from_str(raw_index) {
+            Ok(index) => index,
+            Err(_) => {
+                damaged_entries += 1;
+                continue;
+            }
+        };
+        if index.get("watch_id").and_then(Value::as_str) != Some(key_watch_id.as_str()) {
+            damaged_entries += 1;
+            continue;
         }
+        let record = match (|| {
+            let record = owned_watch(db, &key_watch_id, &principal.client_id)?;
+            require_record_scope(&record, &scope)?;
+            if record["list_index_key"] != index_key.as_str() {
+                return Err(damaged("watch list index differs from its record"));
+            }
+            Ok(record)
+        })() {
+            Ok(record) => record,
+            Err(error) if watch_list_entry_is_damaged(&error) => {
+                damaged_entries += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         items.push(watch_projection(&record));
     }
     let next_after_watch_id = if has_more {
-        items
-            .last()
-            .and_then(|item| item.get("watch_id"))
-            .cloned()
+        last_examined_watch_id
+            .map(Value::String)
             .unwrap_or(Value::Null)
     } else {
         Value::Null
     };
+    let mut gaps = Vec::new();
+    let next_scan_cursor = if has_more {
+        last_examined_key
+            .map(|key| keys::encode_list_scan_cursor(&prefix, &principal.client_id, key))
+            .transpose()?
+    } else {
+        None
+    };
+    if damaged_entries > 0 {
+        gaps.push(json!({
+            "kind":"watch_list_entries_damaged",
+            "count":damaged_entries,
+        }));
+    }
+    if has_more {
+        gaps.push(json!({
+            "kind":"watch_list_window_truncated",
+        }));
+    }
     Ok(json!({
         "items":items,
         "task_id":scope.task_id,
         "task_revision":scope.task_revision,
         "attempt_id":scope.attempt_id,
         "next_after_watch_id":next_after_watch_id,
-        "coverage":if has_more { "partial" } else { "complete" },
-        "gaps":[],
+        "next_scan_cursor":next_scan_cursor,
+        "coverage":if has_more || damaged_entries > 0 { "partial" } else { "complete" },
+        "gaps":gaps,
     }))
+}
+
+fn resolve_after_watch_id(
+    db: &Connection,
+    scope: &ExactScope,
+    creator_id: &str,
+    prefix: &str,
+    upper: &str,
+    watch_id: &str,
+) -> Result<String> {
+    let record_failure = match owned_watch(db, watch_id, creator_id) {
+        Ok(record) => match require_record_scope(&record, scope) {
+            Ok(()) => match record["list_index_key"].as_str() {
+                Some(index_key)
+                    if watch_id_from_list_key(index_key, prefix)
+                        .is_ok_and(|indexed_watch_id| indexed_watch_id == watch_id) =>
+                {
+                    return Ok(index_key.to_owned());
+                }
+                _ => damaged("watch cursor has no valid retained list index key"),
+            },
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    if !watch_list_entry_is_damaged(&record_failure) {
+        return Err(record_failure);
+    }
+    if let Some(index_key) = scoped_list_index_key(db, prefix, upper, watch_id)? {
+        return Ok(index_key);
+    }
+    Err(record_failure)
+}
+
+fn watch_id_from_list_key(index_key: &str, prefix: &str) -> Result<String> {
+    let suffix = index_key
+        .strip_prefix(prefix)
+        .ok_or_else(|| damaged("watch list key is outside its exact owner scope"))?;
+    let (created_at_ms, encoded_watch_id) = suffix
+        .split_once(':')
+        .ok_or_else(|| damaged("watch list key has no encoded watch id"))?;
+    if created_at_ms.len() != 20
+        || !created_at_ms.bytes().all(|byte| byte.is_ascii_digit())
+        || encoded_watch_id.is_empty()
+        || encoded_watch_id.len() % 2 != 0
+    {
+        return Err(damaged("watch list key has an invalid cursor shape"));
+    }
+
+    let mut watch_id_bytes = Vec::with_capacity(encoded_watch_id.len() / 2);
+    for pair in encoded_watch_id.as_bytes().as_chunks::<2>().0 {
+        let pair = std::str::from_utf8(pair)
+            .map_err(|_| damaged("watch list key has a non-hex watch id"))?;
+        watch_id_bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| damaged("watch list key has a non-hex watch id"))?,
+        );
+    }
+    let watch_id = String::from_utf8(watch_id_bytes)
+        .map_err(|_| damaged("watch list key has a non-text watch id"))?;
+    if watch_id.is_empty()
+        || watch_id.len() > 128
+        || watch_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || keys::key_component(&watch_id) != encoded_watch_id
+    {
+        return Err(damaged("watch list key has an invalid watch id"));
+    }
+    Ok(watch_id)
+}
+
+fn scoped_list_index_key(
+    db: &Connection,
+    prefix: &str,
+    upper: &str,
+    watch_id: &str,
+) -> Result<Option<String>> {
+    let watch_id_component = keys::key_component(watch_id);
+    let mut statement = db.prepare(
+        "SELECT key FROM meta \
+         WHERE key>=?1 AND key<?2 \
+           AND substr(key, -length(?3))=?3 \
+           AND substr(key, -length(?3)-1, 1)=':' \
+         ORDER BY key LIMIT 2",
+    )?;
+    let keys: Vec<String> = statement
+        .query_map(params![prefix, upper, watch_id_component], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    match keys.as_slice() {
+        [] => Ok(None),
+        [key] => Ok(Some(key.clone())),
+        _ => Err(damaged(
+            "watch cursor has multiple exact-scope list indexes",
+        )),
+    }
+}
+
+fn watch_list_entry_is_damaged(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "INVALID_PARAMS" | "WATCH_NOT_FOUND" | "WATCH_SCOPE_MISMATCH" | "WATCH_RECORD_DAMAGED"
+    )
 }
 
 /// Process one bounded page of current watches from the shared Store tick.
@@ -177,6 +342,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
         verify_record(&record, watch_id)?;
         if record["state"] != "active" {
             tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+            stale += 1;
             continue;
         }
         let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
@@ -404,13 +570,32 @@ pub(super) fn notifications(db: &Connection, principal: &Principal, limit: i64) 
         .into_iter()
         .map(|(_, _, notification)| notification)
         .collect();
+    let mut gaps = Vec::new();
+    if stale_authority > 0 {
+        gaps.push(json!({
+            "kind":"watch_notice_current_authority_filtered",
+            "count":stale_authority,
+        }));
+    }
+    if has_more {
+        gaps.push(json!({
+            "kind":"watch_notice_window_truncated",
+            "retained_inventory":"coordination.watch.list",
+        }));
+    }
+    if current_scope.is_none() {
+        gaps.push(json!({
+            "kind":"current_scope_unavailable",
+            "projection":"watch_headers_only",
+        }));
+    }
     Ok(json!({
         "items":items,
         "task_id":current_scope.as_ref().map(|scope|json!(scope.task_id)).unwrap_or(Value::Null),
         "task_revision":current_scope.as_ref().map(|scope|json!(scope.task_revision)).unwrap_or(Value::Null),
         "attempt_id":current_scope.as_ref().map(|scope|json!(scope.attempt_id)).unwrap_or(Value::Null),
         "coverage":if has_more { "partial" } else { "complete" },
-        "gaps":if stale_authority > 0 { json!([{"kind":"watch_notice_current_authority_filtered","count":stale_authority}]) } else if has_more { json!([{"kind":"watch_notice_window_truncated","retained_inventory":"coordination.watch.list"}]) } else if current_scope.is_none() { json!([{"kind":"current_scope_unavailable","projection":"watch_headers_only"}]) } else { json!([]) },
+        "gaps":gaps,
     }))
 }
 

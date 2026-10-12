@@ -459,6 +459,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
             f("topic_kind", S),
             f("limit", I),
             f("after_thread_id", S),
+            f("after_scan_cursor", S),
         ],
         &["task_id"],
     ),
@@ -504,6 +505,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
             f("attempt_id", S),
             f("limit", I),
             f("after_watch_id", S),
+            f("after_scan_cursor", S),
         ],
         &[],
     ),
@@ -2886,6 +2888,7 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
             properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":128});
             properties["limit"] = json!({"type":"integer","minimum":1,"maximum":50});
             properties["after_watch_id"] = json!({"type":"string","minLength":1,"maxLength":128});
+            properties["after_scan_cursor"] = json!({"type":["string","null"],"minLength":1,"maxLength":16384,"pattern":"^coordination-scan-v1:","description":"Opaque caller-scoped scan position from next_scan_cursor; choose this or after_watch_id, not both. Store enforces the UTF-8 byte limit."});
             require_all_or_none_scope(schema);
         }
         "coordination.watch.cancel" => {
@@ -3237,6 +3240,7 @@ fn refine_coordination_input_schema(method: &str, schema: &mut Value) {
             properties["topic_kind"] = json!({"type":["string","null"],"minLength":1,"maxLength":128,"pattern":"^\\S+$","description":"The Store enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."});
             properties["limit"] = coordination_optional_page_limit_schema();
             properties["after_thread_id"] = coordination_optional_id_schema();
+            properties["after_scan_cursor"] = json!({"type":["string","null"],"minLength":1,"maxLength":16384,"pattern":"^coordination-scan-v1:","description":"Opaque caller-scoped scan position from next_scan_cursor; choose this or after_thread_id, not both. Store enforces the UTF-8 byte limit."});
         }
         "coordination.message.send" => {
             properties["thread_id"] = coordination_id_schema();

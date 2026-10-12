@@ -1,0 +1,284 @@
+{
+  "schema_version": 1,
+  "candidate_base": "f77f65a6edb888c7046deceb5cd55c59eb2bb63f",
+  "recorded_at_utc": "2026-10-12T03:06:25.3364453Z",
+  "scope": "Original APP004/005/007/016/018-020 coordination/watch consumer corrections, bounded source delivery",
+  "source_sha256": {
+    "crates/swarm-contracts/src/mcp_catalog.rs": "4F1C72AAB673C4D93EE91DD0D9DE9BBE18CEB3E67FDFBF7DAEB13E9E22568DA3",
+    "crates/swarm-kernel-host/src/coordination/mod.rs": "D3DAC33ED289FF4D48085D303BFD0CB45A648A5018EC5C14B701E27C8BD1B350",
+    "crates/swarm-kernel-host/src/coordination/thread.rs": "9A3B9AD3D2BA990D33BA22B040A1D49478323B9EE9EB619D0A9D25B33F66ED7E",
+    "crates/swarm-kernel-host/src/coordination/watch.rs": "CB8E1A29E069648B3A9344C2BBDE0C8E4C36883911BFF12CAAD60C8EA884A467",
+    "crates/swarm-kernel-host/src/store/coordination_threads.rs": "7A75238CC322BAEEF2CCADE41C7993F40981E8CA0ACE63D138F0A5BDA220869E",
+    "crates/swarm-kernel-host/src/store/coordination_watch.rs": "1B1120B17518173169CDD1A4EE1688497E543CB9FFAE94951DE3731AD0A998C0",
+    "crates/swarm-kernel-host/src/store/coordination.rs": "6389D7FF4D3CC8A6C651F828E5D64A17530B45D7963CAA81F4BCC02B1CEAE8A9",
+    "crates/swarm-kernel-host/src/store/program_tests/coordination_watch_submission_reviewed_tests.rs": "A2F8A499639DB495B287F3ABCF90E02AD2F3C6C236C215D941237D3A611E6AE5"
+  },
+  "changes": [
+    "Consult ambiguity counts distinct current remote owners; two cards from one owner route one addressed ask",
+    "All four candidate card/scope consumers distinguish known stale authority from SQLite/JSON errors",
+    "Live inbox watch projection honors validated caller limit and reports authority filtering plus truncation together",
+    "Thread pagination checks actual unreturned index rows at full page and scan bound",
+    "Damaged own watch is a local explicit gap with resumable bounded cursor; inactive watch index rows count stale",
+    "Versioned bounded after_scan_cursor/next_scan_cursor wired through shared position codec, typed parsers, MCP catalog and existing list readers",
+    "Malformed own watch key timestamp/separator/hex/id becomes row-local gap with cursor progress",
+    "Thread all-skipped scan windows resume to later authorized rows; byte trimming rolls cursor back to last returned item"
+  ],
+  "verification": [
+    {
+      "artifact": "coordination-watch-windows-clippy-production-v2.json",
+      "sha256": "5E85EC49AB1C07783E1D7FBF9DD5B10829932A368129DFCF412F206392A8A3E9",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "1191ACF8074CF1517AFD9B2A488DB152AD2BDC3689DD40EC1807F51BCB309B7B",
+      "started_at_utc": "2026-10-12T02:18:32.0819431Z",
+      "completed_at_utc": "2026-10-12T02:18:45.2746588Z",
+      "summary": []
+    },
+    {
+      "artifact": "coordination-watch-linux-clippy-production-v2.json",
+      "sha256": "31A0A51725DB235D7495AFF1FCACD0DE6F009C8BBA374BC889032D413EC67950",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 clippy --locked -p swarm-kernel-host --lib --bins --no-deps -- -D warnings",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "AE6D7D4A153E47335EB9922616C6759079231B7799F4B2E8B173FD8BE73C803A",
+      "started_at_utc": "2026-10-12T02:18:32.0973196Z",
+      "completed_at_utc": "2026-10-12T02:18:52.3766857Z",
+      "summary": []
+    },
+    {
+      "artifact": "coordination-watch-windows-test-v4.json",
+      "sha256": "2B1E4E8D8992DB03E0C4CC30403D2EB5602B50201E2301F9D138B4FC041B3F1B",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(coordination_consult_single_remote_owner_two_matching_field_cards_routes_one_addressed_ask) | test(coordination_consult_multiple_distinct_field_owners_reports_unique_candidate_count_and_never_sends) | test(coordination_card_list_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_contract_cards_for_term_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_peer_find_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_consult_matching_cards_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_inbox_live_watch_notifications_honor_limits_1_and_50) | test(coordination_thread_list_exactly_exhausted_index_reports_has_more_false) | test(coordination_thread_list_one_index_row_after_returned_cursor_reports_has_more_true) | test(coordination_thread_list_exact_scan_bound_requires_a_row_after_bound_before_has_more_true) | test(coordination_watch_list_keeps_healthy_sibling_and_resumes_after_damaged_own_watch) | test(coordination_watch_reconcile_counts_non_active_index_as_stale) | test(coordination_inbox_reports_authority_filter_and_window_truncation_together)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "18EF5E4D02CA9B2E5EC0EC22D1FD11E8F85B007C383F946CC8D62D2D610E84A9",
+      "started_at_utc": "2026-10-12T02:32:57.3230830Z",
+      "completed_at_utc": "2026-10-12T02:33:38.4452482Z",
+      "summary": [
+        "Summary [   0.670s] 13 tests run: 13 passed, 604 skipped"
+      ]
+    },
+    {
+      "artifact": "coordination-watch-linux-test-v4.json",
+      "sha256": "C830961E3B23D73A409E55EAA0FF0E62581EF6D857932D62688E4FB7A7C1C7F0",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host --lib --no-fail-fast -E 'test(coordination_consult_single_remote_owner_two_matching_field_cards_routes_one_addressed_ask) | test(coordination_consult_multiple_distinct_field_owners_reports_unique_candidate_count_and_never_sends) | test(coordination_card_list_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_contract_cards_for_term_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_peer_find_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_consult_matching_cards_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_inbox_live_watch_notifications_honor_limits_1_and_50) | test(coordination_thread_list_exactly_exhausted_index_reports_has_more_false) | test(coordination_thread_list_one_index_row_after_returned_cursor_reports_has_more_true) | test(coordination_thread_list_exact_scan_bound_requires_a_row_after_bound_before_has_more_true) | test(coordination_watch_list_keeps_healthy_sibling_and_resumes_after_damaged_own_watch) | test(coordination_watch_reconcile_counts_non_active_index_as_stale) | test(coordination_inbox_reports_authority_filter_and_window_truncation_together)'",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "8502CC1AF3E1D554A2B2A347E2D1C96018738A4E6B8EE6EDB3CF3FB640454CC7",
+      "started_at_utc": "2026-10-12T02:34:06.4718389Z",
+      "completed_at_utc": "2026-10-12T02:34:55.6332950Z",
+      "summary": [
+        "Summary [   0.940s] 13 tests run: 13 passed, 624 skipped"
+      ]
+    },
+    {
+      "artifact": "coordination-watch-windows-test-retained-v4.json",
+      "sha256": "FBE5886C7ADF07F308AAC891616DB042F254E52A708EB0D204E7B14CCEAB2DCD",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(coordination_watch_submission_reviewed_tests) & !(test(coordination_consult_single_remote_owner_two_matching_field_cards_routes_one_addressed_ask) | test(coordination_consult_multiple_distinct_field_owners_reports_unique_candidate_count_and_never_sends) | test(coordination_card_list_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_contract_cards_for_term_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_peer_find_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_consult_matching_cards_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_inbox_live_watch_notifications_honor_limits_1_and_50) | test(coordination_thread_list_exactly_exhausted_index_reports_has_more_false) | test(coordination_thread_list_one_index_row_after_returned_cursor_reports_has_more_true) | test(coordination_thread_list_exact_scan_bound_requires_a_row_after_bound_before_has_more_true) | test(coordination_watch_list_keeps_healthy_sibling_and_resumes_after_damaged_own_watch) | test(coordination_watch_reconcile_counts_non_active_index_as_stale) | test(coordination_inbox_reports_authority_filter_and_window_truncation_together))"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "CA95D6504B7AF83619D2ADB6C8146534DF73C6B6FF9FC839649D1BAB1EAB5DF1",
+      "started_at_utc": "2026-10-12T02:42:37.4338814Z",
+      "completed_at_utc": "2026-10-12T02:42:39.2122687Z",
+      "summary": [
+        "Summary [   0.529s] 5 tests run: 5 passed, 612 skipped"
+      ]
+    },
+    {
+      "artifact": "coordination-watch-linux-test-retained-v4.json",
+      "sha256": "21B35A558C5698C881C406F9B46E63C3956043E8E15361151A70CE9A52DFF3B4",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host --lib --no-fail-fast -E 'test(coordination_watch_submission_reviewed_tests) & !(test(coordination_consult_single_remote_owner_two_matching_field_cards_routes_one_addressed_ask) | test(coordination_consult_multiple_distinct_field_owners_reports_unique_candidate_count_and_never_sends) | test(coordination_card_list_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_contract_cards_for_term_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_peer_find_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_consult_matching_cards_stale_missing_owner_counts_stale_but_sqlite_and_scope_decode_errors_propagate) | test(coordination_inbox_live_watch_notifications_honor_limits_1_and_50) | test(coordination_thread_list_exactly_exhausted_index_reports_has_more_false) | test(coordination_thread_list_one_index_row_after_returned_cursor_reports_has_more_true) | test(coordination_thread_list_exact_scan_bound_requires_a_row_after_bound_before_has_more_true) | test(coordination_watch_list_keeps_healthy_sibling_and_resumes_after_damaged_own_watch) | test(coordination_watch_reconcile_counts_non_active_index_as_stale) | test(coordination_inbox_reports_authority_filter_and_window_truncation_together))'",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "A4529C64731F989CE55BFF78DB7BE969534EF33A1A91AAA8E84317BE9E9FCA00",
+      "started_at_utc": "2026-10-12T02:43:35.3836277Z",
+      "completed_at_utc": "2026-10-12T02:43:43.3269123Z",
+      "summary": [
+        "Summary [   0.812s] 5 tests run: 5 passed, 632 skipped"
+      ]
+    },
+    {
+      "artifact": "coordination-watch-windows-clippy-v5.json",
+      "sha256": "0781FC516B782D3975E74C09AD38201AF9966A1F74785F4D095C303E8302C050",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-contracts",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "B71D171AEE78CA3405A347BB70D1CAA276947BC590B6BC33D31BBE2437968757",
+      "started_at_utc": "2026-10-12T02:53:52.1171743Z",
+      "completed_at_utc": "2026-10-12T02:54:06.9904123Z",
+      "summary": []
+    },
+    {
+      "artifact": "coordination-watch-linux-clippy-v5.json",
+      "sha256": "5009903219D7051AB481BE447C4216CBD6DE2768669BB54C6BB9E0AD7E90BEE5",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 clippy --locked -p swarm-kernel-host -p swarm-contracts --lib --bins --no-deps -- -D warnings",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "FA27711C6010C508E555DB56E28E22C8AB41F00427BCBECF6461DEA10BC8C988",
+      "started_at_utc": "2026-10-12T02:56:30.2914720Z",
+      "completed_at_utc": "2026-10-12T02:56:53.9126883Z",
+      "summary": []
+    },
+    {
+      "artifact": "coordination-watch-windows-test-v5.json",
+      "sha256": "AC8E5AA2209007176B3FD54A85F3997D93C3C7EFAA6B081FC3253EB4F6AB57DE",
+      "platform": "windows",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(coordination_watch_list_keeps_healthy_sibling_and_resumes_after_damaged_own_watch) | test(coordination_watch_malformed_list_keys_resume_with_scoped_scan_cursor) | test(coordination_thread_list_) | test(coordination_thread_unprojectable_scan_window_reaches_later_authorized_thread) | test(exact_submission_review_watch_recovers_one_inbox_notice_without_work) | test(exact_historical_submission_review_notifies_owner_manager_after_release)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "DDA90746D34803683D68DD2A4975E36868FF58A1B10C7D4535C3250F64B98822",
+      "started_at_utc": "2026-10-12T02:57:16.4798494Z",
+      "completed_at_utc": "2026-10-12T02:58:09.0156433Z",
+      "summary": [
+        "Summary [   0.272s] 8 tests run: 8 passed, 611 skipped"
+      ]
+    },
+    {
+      "artifact": "coordination-watch-linux-test-v5.json",
+      "sha256": "F0635EFEDD2CA4352CDE493787AD8F89AE293D9C6220D5C93B730FAEC1DBCD26",
+      "platform": "linux",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host --lib --no-fail-fast -E 'test(coordination_watch_list_keeps_healthy_sibling_and_resumes_after_damaged_own_watch) | test(coordination_watch_malformed_list_keys_resume_with_scoped_scan_cursor) | test(coordination_thread_list_) | test(coordination_thread_unprojectable_scan_window_reaches_later_authorized_thread) | test(exact_submission_review_watch_recovers_one_inbox_notice_without_work) | test(exact_historical_submission_review_notifies_owner_manager_after_release)'",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "DFAD467525265DD0C7780229DA68A881CC3370C20A403F6FDEC8232687946379",
+      "started_at_utc": "2026-10-12T02:59:47.9064059Z",
+      "completed_at_utc": "2026-10-12T03:00:40.5700649Z",
+      "summary": [
+        "Summary [   0.347s] 8 tests run: 8 passed, 631 skipped"
+      ]
+    }
+  ],
+  "meaningful_consumers": {
+    "public_paths": [
+      "coordination.consult",
+      "coordination.work_card.list",
+      "coordination.contract_card.list",
+      "coordination.peer.find",
+      "coordination.inbox",
+      "coordination.thread.list",
+      "coordination.watch.list",
+      "submission reviewed passive notifications",
+      "after_scan_cursor resume with current actor/Task scope",
+      "cross-actor and mixed-cursor refusal"
+    ],
+    "new_selected_tests": 13,
+    "retained_affected_tests": 5,
+    "windows": "20 retained unique affected cases PASS",
+    "linux": "20 retained unique affected cases PASS",
+    "fault_seam": "Test-only exact-key SQLite TEMP read projection crosses actual typed read/JSON decode; production main.meta STRICT/JSON constraints unchanged",
+    "final_case_union_each_platform": 20,
+    "latest_changed_path_cohort": "8/8 Windows and8/8Linux v5; 12 unaffected earlier v4 cases retained by unchanged corresponding production/test function bodies"
+  },
+  "preserved_failure": {
+    "artifact": "coordination-watch-windows-test-consumers-v3.json",
+    "sha256": "741031C52FCAEA665A52161C6D1D51323C350F970F5E178C34432B30811FF162",
+    "result": "7 PASS / 6 FAIL",
+    "cause": "Fixture setup used unsupported ContractCard assumptions and attempted values forbidden by STRICT/JSON schema",
+    "repair": "Fixture uses supported common interfaces field and exact-key TEMP SQLite read faults; production bytes unchanged after Clippy v2"
+  },
+  "source_metadata_correction": "An inherited assembly syntax_delta_from_review string referred to an unrelated Forge fixture. Actual manager production changes were Thread cast/let-chain syntax and pinned Rust as_chunks cursor decode API; v3-to-v4 changed test fixture only.",
+  "independent_review": {
+    "artifact": "coordination-watch-final-source-review-v5.json",
+    "sha256": "C29A385129D605EF6CE73088565FBD4D16A1BCCAD834BAD70AEAF342C3623C28",
+    "status": "independent_source_review_complete_bounded_pass",
+    "findings": [],
+    "source_guard": "8/8 reviewed production/fixture hashes match final candidate",
+    "execution": "Source-only; manager actual gates recorded separately"
+  },
+  "limitations": [
+    "Host lib-test compilation retains 24 existing warnings; all-target warnings-denied is not qualified",
+    "Full original V27 audit, public/native/Step5free/Gemini3.8/Windows/Linux/crash/load qualification remains"
+  ],
+  "full_v27_complete": false,
+  "v4_review_residues_resolved": {
+    "artifact": "coordination-watch-final-source-review-v4.json",
+    "sha256": "A10918746B0E6F64D6D32DF262909C5E682111EB524470FC71A105944FD4DAFA",
+    "findings": [
+      "P2-001 malformed key page abort",
+      "P2-002 skipped scan-window cursor deadlock"
+    ],
+    "negative_consumers": [
+      "coordination_watch_malformed_list_keys_resume_with_scoped_scan_cursor",
+      "coordination_thread_unprojectable_scan_window_reaches_later_authorized_thread"
+    ],
+    "disposition": "Corrected in final reviewed v5 sources and actual consumers PASS on both platforms"
+  }
+}

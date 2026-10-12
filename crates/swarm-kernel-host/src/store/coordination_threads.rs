@@ -1367,8 +1367,21 @@ fn list_threads(db: &Connection, principal: &Principal, value: &Value) -> Result
             actor_index_prefix(client_id, task_id, attempt_filter.as_deref())
         }
     };
-    let after_key = match after_thread_id {
-        Some(id) => {
+    let upper = format!("{prefix}g");
+    let after_scan_cursor = coordination_keys::parse_list_scan_cursor(value)?;
+    let after_key = match (after_thread_id, after_scan_cursor.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(Error::invalid(
+                "choose after_thread_id or after_scan_cursor",
+            ));
+        }
+        (None, Some(cursor)) => Some(coordination_keys::decode_list_scan_cursor(
+            &prefix,
+            &principal.client_id,
+            &upper,
+            cursor,
+        )?),
+        (Some(id), None) => {
             let cursor = load_context(db, id)?;
             if cursor.task_id != task_id
                 || attempt_filter
@@ -1392,9 +1405,8 @@ fn list_threads(db: &Connection, principal: &Principal, value: &Value) -> Result
                 ),
             })
         }
-        None => None,
+        (None, None) => None,
     };
-    let upper = format!("{prefix}g");
     let scan_limit = (limit * 8 + 1).min(coordination_keys::MAX_INBOX_SCAN);
     let sql = if after_key.is_some() {
         "SELECT key,value_json FROM meta WHERE key>?1 AND key<?2 ORDER BY key LIMIT ?3"
@@ -1404,16 +1416,19 @@ fn list_threads(db: &Connection, principal: &Principal, value: &Value) -> Result
     let mut statement = db.prepare(sql)?;
     let rows: Vec<(String, String)> = statement
         .query_map(
-            params![after_key.unwrap_or(prefix), upper, scan_limit],
+            params![after_key.as_deref().unwrap_or(&prefix), upper, scan_limit],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?
         .collect::<std::result::Result<_, _>>()?;
     let mut items = Vec::new();
+    let mut item_scan_keys = Vec::new();
     let mut next_cursor = None;
-    let mut has_more = rows.len() as i64 >= scan_limit;
+    let mut has_more = false;
     let mut scanned = 0i64;
+    let mut last_scanned_key = None;
     for (key, raw) in rows {
         scanned += 1;
+        last_scanned_key = Some(key.clone());
         let index: Value = serde_json::from_str(&raw)?;
         let thread_id = model::text(&index, "thread_id")?;
         let Some(context) = load_context_optional(db, thread_id)? else {
@@ -1460,16 +1475,34 @@ fn list_threads(db: &Connection, principal: &Principal, value: &Value) -> Result
             continue;
         }
         items.push(public_projection(&context.projection));
+        item_scan_keys.push(key.clone());
         if items.len() as i64 >= limit {
-            has_more = scanned < scan_limit || rows_have_more(db, &key, &upper)?;
+            has_more = rows_have_more(db, &key, &upper)?;
             break;
         }
     }
+    if (items.len() as i64) < limit
+        && scanned == scan_limit
+        && let Some(key) = last_scanned_key.as_deref()
+    {
+        has_more = rows_have_more(db, key, &upper)?;
+    }
+    let next_scan_cursor = if has_more {
+        last_scanned_key
+            .as_deref()
+            .map(|key| {
+                coordination_keys::encode_list_scan_cursor(&prefix, &principal.client_id, key)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let mut page = json!({
         "task_id":task_id,
         "attempt_id":attempt_filter,
         "items":items,
         "next_cursor":next_cursor,
+        "next_scan_cursor":next_scan_cursor,
         "has_more":has_more,
         "coverage":if has_more {"bounded_page"} else {"complete_for_filter"},
     });
@@ -1479,6 +1512,7 @@ fn list_threads(db: &Connection, principal: &Principal, value: &Value) -> Result
             .is_some_and(|items| items.len() > 1)
         {
             page["items"].as_array_mut().unwrap().pop();
+            item_scan_keys.pop();
             page["has_more"] = json!(true);
             page["coverage"] = json!("bounded_page");
             let next_cursor = page["items"]
@@ -1488,6 +1522,14 @@ fn list_threads(db: &Connection, principal: &Principal, value: &Value) -> Result
                 .cloned()
                 .unwrap_or(Value::Null);
             page["next_cursor"] = next_cursor;
+            page["next_scan_cursor"] = item_scan_keys
+                .last()
+                .map(|key| {
+                    coordination_keys::encode_list_scan_cursor(&prefix, &principal.client_id, key)
+                })
+                .transpose()?
+                .map(Value::String)
+                .unwrap_or(Value::Null);
         } else {
             return Err(Error::new(
                 "PAYLOAD_TOO_LARGE",

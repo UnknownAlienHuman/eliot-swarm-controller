@@ -153,6 +153,7 @@ pub fn validate_read(method: &str, value: &Value) -> Result<()> {
                     "topic_kind",
                     "limit",
                     "after_thread_id",
+                    "after_scan_cursor",
                 ],
             )?;
             safe_identifier(
@@ -162,6 +163,13 @@ pub fn validate_read(method: &str, value: &Value) -> Result<()> {
             )?;
             optional_identifier(value, "attempt_id", limits::MAX_IDENTIFIER_BYTES)?;
             optional_identifier(value, "after_thread_id", limits::MAX_IDENTIFIER_BYTES)?;
+            if crate::coordination::parse_list_scan_cursor(value)?.is_some()
+                && value.get("after_thread_id").is_some_and(|id| !id.is_null())
+            {
+                return Err(Error::invalid(
+                    "choose after_thread_id or after_scan_cursor",
+                ));
+            }
             optional_identifier(value, "topic_kind", 128)?;
             if let Some(state) = optional_text(value, "state", 32)?
                 && !matches!(

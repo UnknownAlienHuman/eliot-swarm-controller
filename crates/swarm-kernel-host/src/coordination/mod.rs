@@ -21,6 +21,73 @@ pub const MAX_CARD_BYTES: usize = 32 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_PAGE_SIZE: i64 = 50;
 pub const MAX_INBOX_SCAN: i64 = 1000;
+pub(crate) const MAX_LIST_SCAN_CURSOR_BYTES: usize = 16 * 1024;
+const LIST_SCAN_CURSOR_PREFIX: &str = "coordination-scan-v1:";
+
+pub(crate) fn parse_list_scan_cursor(value: &Value) -> Result<Option<String>> {
+    match value.get("after_scan_cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor))
+            if cursor.len() <= MAX_LIST_SCAN_CURSOR_BYTES
+                && cursor.starts_with(LIST_SCAN_CURSOR_PREFIX) =>
+        {
+            Ok(Some(cursor.clone()))
+        }
+        _ => Err(Error::invalid(
+            "after_scan_cursor is not a bounded list cursor",
+        )),
+    }
+}
+
+// A continuation describes an index position, never read authority. Bind it to
+// the caller and exact range; every resumed item still passes its normal guards.
+pub(crate) fn encode_list_scan_cursor(prefix: &str, actor_id: &str, key: &str) -> Result<String> {
+    let suffix = key
+        .strip_prefix(prefix)
+        .ok_or_else(|| Error::invalid("scan position is outside its list scope"))?;
+    let scope = model::digest(model::canonical(&serde_json::json!([prefix, actor_id]))?.as_bytes());
+    let cursor = format!("{LIST_SCAN_CURSOR_PREFIX}{scope}:{}", key_component(suffix));
+    if cursor.len() > MAX_LIST_SCAN_CURSOR_BYTES {
+        return Err(Error::new(
+            "PAYLOAD_TOO_LARGE",
+            "list scan position exceeds cursor bound",
+        ));
+    }
+    Ok(cursor)
+}
+
+pub(crate) fn decode_list_scan_cursor(
+    prefix: &str,
+    actor_id: &str,
+    upper: &str,
+    cursor: &str,
+) -> Result<String> {
+    let invalid = || Error::invalid("scan cursor is malformed or outside this actor/list scope");
+    let scope = model::digest(model::canonical(&serde_json::json!([prefix, actor_id]))?.as_bytes());
+    let encoded = cursor
+        .strip_prefix(&format!("{LIST_SCAN_CURSOR_PREFIX}{scope}:"))
+        .filter(|suffix| !suffix.is_empty() && suffix.len() % 2 == 0)
+        .ok_or_else(invalid)?;
+    if cursor.len() > MAX_LIST_SCAN_CURSOR_BYTES {
+        return Err(invalid());
+    }
+    let suffix = encoded
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).map_err(|_| invalid())?;
+            u8::from_str_radix(text, 16).map_err(|_| invalid())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let suffix = String::from_utf8(suffix).map_err(|_| invalid())?;
+    let key = format!("{prefix}{suffix}");
+    if key.as_str() <= prefix || key.as_str() >= upper || key_component(&suffix) != encoded {
+        return Err(invalid());
+    }
+    Ok(key)
+}
 
 const CONSULT_QUESTION_KINDS: &[&str] = &[
     "contract_shape",
