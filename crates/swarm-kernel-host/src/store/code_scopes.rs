@@ -152,10 +152,13 @@ pub(super) fn read(
                     "scope intent is outside the requested Task",
                 ));
             }
-            let matches = request
-                .attempt_id
-                .as_deref()
-                .is_none_or(|attempt| record["attempt_id"] == attempt)
+            let resolved_attempt_matches = record["task_revision"].as_i64() == Some(task_revision)
+                && record["attempt_id"].as_str() == Some(attempt_id.as_str());
+            let mut gaps = Vec::new();
+            if !resolved_attempt_matches {
+                gaps.push("requested_scope_attempt_mismatch".to_owned());
+            }
+            let matches = resolved_attempt_matches
                 && request
                     .client_id
                     .as_deref()
@@ -165,7 +168,7 @@ pub(super) fn read(
                 Vec::new(),
                 if matches { vec![record] } else { Vec::new() },
                 false,
-                Vec::new(),
+                gaps,
             )
         } else {
             let after_sequence = request
@@ -211,18 +214,29 @@ pub(super) fn read(
             }
             (scanned_ids, records, has_more, gaps)
         };
+    let mut active_scope_complete = false;
     let active = if method == "code.scope.conflicts" && current_scope_is_live {
-        let (active, active_more) = active_records_page(
+        match active_records_page(
             db,
             &request.task_id,
             task_revision,
             &attempt_id,
             limits::MAX_READ_PAGE_SIZE,
-        )?;
-        if active_more {
-            gaps.push("active_scope_page_truncated".to_owned());
+        ) {
+            Ok((active, active_more, active_gaps)) => {
+                active_scope_complete = !active_more && active_gaps.is_empty();
+                if active_more {
+                    gaps.push("active_scope_page_truncated".to_owned());
+                }
+                gaps.extend(active_gaps);
+                active
+            }
+            Err(error) if is_active_scope_damage(&error) => {
+                gaps.push("active_scope_index_unavailable".to_owned());
+                Vec::new()
+            }
+            Err(error) => return Err(error),
         }
-        active
     } else {
         if method == "code.scope.conflicts" {
             gaps.push("requested_scope_attempt_not_current".to_owned());
@@ -239,13 +253,37 @@ pub(super) fn read(
             let current = records
                 .iter()
                 .find(|record| record["scope_intent_id"] == item["scope_intent_id"]);
-            if let Some(current) = current.filter(|record| {
+            let conflict_scope = current.filter(|record| {
                 current_scope_is_live
                     && record["state"] == "active"
                     && record["task_revision"] == task_revision
                     && record["attempt_id"] == attempt_id
-            }) {
+                    && !is_expired(record, now)
+            });
+            if let Some(current) = conflict_scope {
                 item["conflicts"] = json!(conflicts_for(current, &active));
+                item["conflicts_checked"] = json!(active_scope_complete);
+                item["conflicts_unknown_reason"] = if active_scope_complete {
+                    Value::Null
+                } else {
+                    json!("active_scope_coverage_incomplete")
+                };
+            } else {
+                let unknown_reason = if !current_scope_is_live {
+                    "requested_scope_attempt_not_current"
+                } else if current.is_some_and(|record| {
+                    record["task_revision"] != task_revision || record["attempt_id"] != attempt_id
+                }) {
+                    "scope_not_in_resolved_attempt"
+                } else if current.is_some_and(|record| is_expired(record, now)) {
+                    "scope_expired"
+                } else {
+                    "scope_not_active"
+                };
+                gaps.push(unknown_reason.to_owned());
+                item["conflicts"] = json!([]);
+                item["conflicts_checked"] = json!(false);
+                item["conflicts_unknown_reason"] = json!(unknown_reason);
             }
         }
     }
@@ -324,29 +362,18 @@ pub(crate) fn current_scope_revisions(
     let mut items = Vec::new();
     let mut gaps = Vec::new();
     for row in rows.iter().take(limits::MAX_READ_PAGE_SIZE as usize) {
-        let Some(record) = meta(db, &record_key(&row.scope_intent_id)?)? else {
-            gaps.push("active_scope_record_missing".to_owned());
+        let Some(record) = active_scope_record_or_gap(
+            db,
+            row,
+            task_id,
+            task_revision,
+            attempt_id,
+            now,
+            &mut gaps,
+        )?
+        else {
             continue;
         };
-        if verify_record(&record, &row.scope_intent_id).is_err()
-            || record["state"] != "active"
-            || record["task_id"] != task_id
-            || record["task_revision"] != task_revision
-            || record["attempt_id"] != attempt_id
-        {
-            gaps.push("active_scope_index_mismatch".to_owned());
-            continue;
-        }
-        if record["expires_at_ms"]
-            .as_i64()
-            .is_some_and(|expires| expires <= now)
-        {
-            // Expiry makes an advisory scope unusable, but it does not prove
-            // the retained active writer was explicitly released or otherwise
-            // disposed. Omit the stale scope revision and fail coverage closed.
-            gaps.push("active_scope_expired_without_release".to_owned());
-            continue;
-        }
         items.push(scope_revision_ref(&record));
     }
     if more {
@@ -618,7 +645,18 @@ fn accept(
         "symbols":symbols,
         "interfaces":interfaces,
     });
-    let active = active_records_complete(tx, &task_id, task_revision, &attempt_id)?;
+    // Acceptance derives an exact override set from the complete active set.
+    // A damaged row makes that decision unknown, so refuse before any writes.
+    let active = match active_records_complete(tx, &task_id, task_revision, &attempt_id) {
+        Ok(active) => active,
+        Err(error) if is_active_scope_damage(&error) => {
+            return Err(Error::new(
+                "SCOPE_OVERLAP_UNKNOWN",
+                "active code-scope coverage is incomplete; exact overrides cannot be derived",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let live_active = active
         .iter()
         .filter(|other| {
@@ -1066,10 +1104,12 @@ fn overlap(left: &Value, right: &Value) -> Overlap {
     }
     let matched =
         !matched_paths.is_empty() || !matched_symbols.is_empty() || !matched_interfaces.is_empty();
-    // Classification describes only the pairs that were classified. Keep
-    // unsupported pairs alongside it so uncertainty cannot erase a known
-    // conflict or imply complete path coverage.
-    let class = if matched {
+    // One unsupported pair makes the comparison uncertain even when another
+    // pair matched. Keep known matches and unsupported pairs alongside the
+    // class so consumers cannot mistake unknown coverage for no-conflict.
+    let class = if unknown_path {
+        "unknown"
+    } else if matched {
         if left_mode == "read_review" || right_mode == "read_review" {
             "informational"
         } else if left_mode == "exclusive_edit" || right_mode == "exclusive_edit" {
@@ -1077,8 +1117,6 @@ fn overlap(left: &Value, right: &Value) -> Overlap {
         } else {
             "coordination_required"
         }
-    } else if unknown_path {
-        "unknown"
     } else {
         "none"
     };
@@ -1172,13 +1210,16 @@ fn active_records_complete(
         }
         for row in &rows {
             let record = load_record(db, &row.scope_intent_id)?;
-            if record["state"] == "active"
-                && record["task_id"] == task_id
-                && record["task_revision"] == task_revision
-                && record["attempt_id"] == attempt_id
+            if record["state"] != "active"
+                || record["task_id"] != task_id
+                || record["task_revision"] != task_revision
+                || record["attempt_id"] != attempt_id
             {
-                records.push(record);
+                return Err(damaged(
+                    "active scope index points outside its exact Task and Attempt",
+                ));
             }
+            records.push(record);
         }
         if !more {
             break;
@@ -1194,23 +1235,73 @@ fn active_records_page(
     task_revision: i64,
     attempt_id: &str,
     limit: i64,
-) -> Result<(Vec<Value>, bool)> {
+) -> Result<(Vec<Value>, bool, Vec<String>)> {
     let prefix = active_prefix(task_id, task_revision, attempt_id)?;
     let (rows, more) = active_index_page(db, &prefix, None, limit)?;
     let now = model::now_ms()?;
     let mut records = Vec::new();
+    let mut gaps = Vec::new();
     for row in rows {
-        let record = load_record(db, &row.scope_intent_id)?;
-        if record["state"] == "active"
-            && record["task_id"] == task_id
-            && record["task_revision"] == task_revision
-            && record["attempt_id"] == attempt_id
-            && !is_expired(&record, now)
-        {
+        if let Some(record) = active_scope_record_or_gap(
+            db,
+            &row,
+            task_id,
+            task_revision,
+            attempt_id,
+            now,
+            &mut gaps,
+        )? {
             records.push(record);
         }
     }
-    Ok((records, more))
+    Ok((records, more, gaps))
+}
+
+fn active_scope_record_or_gap(
+    db: &Connection,
+    row: &IndexRow,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    now: i64,
+    gaps: &mut Vec<String>,
+) -> Result<Option<Value>> {
+    let key = match record_key(&row.scope_intent_id) {
+        Ok(key) => key,
+        Err(error) if is_active_scope_damage(&error) => {
+            gaps.push("active_scope_index_mismatch".to_owned());
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let record = match meta(db, &key) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            gaps.push("active_scope_record_missing".to_owned());
+            return Ok(None);
+        }
+        Err(error) if error.code == "INVALID_PARAMS" => {
+            gaps.push("active_scope_index_mismatch".to_owned());
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if verify_record(&record, &row.scope_intent_id).is_err()
+        || record["state"] != "active"
+        || record["task_id"] != task_id
+        || record["task_revision"] != task_revision
+        || record["attempt_id"] != attempt_id
+    {
+        gaps.push("active_scope_index_mismatch".to_owned());
+        return Ok(None);
+    }
+    if is_expired(&record, now) {
+        // Expiry does not prove the retained active writer was explicitly
+        // released or otherwise disposed, so conflict coverage is incomplete.
+        gaps.push("active_scope_expired_without_release".to_owned());
+        return Ok(None);
+    }
+    Ok(Some(record))
 }
 
 fn task_index_page(
@@ -1559,9 +1650,284 @@ fn damaged(message: &str) -> Error {
     Error::new("STORE_INVARIANT", message)
 }
 
+fn is_active_scope_damage(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "INVALID_PARAMS" | "NOT_FOUND" | "STORE_INVARIANT"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manager_read_fixture() -> (Connection, Principal) {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);
+             CREATE TABLE tasks(
+                 task_id TEXT PRIMARY KEY,project_id TEXT,revision INTEGER,state TEXT,
+                 origin_key TEXT,spec_json TEXT,accepted_attempt_id TEXT,
+                 accepted_operation_id TEXT,accepted_revision INTEGER,
+                 accepted_phase TEXT,accepted_candidate_ref TEXT
+             );
+             CREATE TABLE attempts(
+                 attempt_id TEXT PRIMARY KEY,task_id TEXT,task_revision INTEGER,
+                 owner_id TEXT,start_owner TEXT,start_operation_id TEXT,
+                 binding_id TEXT,binding_generation INTEGER,state TEXT,
+                 released_at_ms INTEGER,task_snapshot_json TEXT,producers_json TEXT,
+                 submission_ref TEXT,candidate_ref TEXT
+             );",
+        )
+        .unwrap();
+        let task_id = "task-scope-read-test";
+        let manager_id = "manager-scope-read-test";
+        db.execute(
+            "INSERT INTO tasks(task_id,project_id,revision,state,origin_key,spec_json,
+             accepted_attempt_id,accepted_operation_id,accepted_revision,accepted_phase,
+             accepted_candidate_ref)
+             VALUES(?1,'project-scope-read-test',1,'open','origin-scope-read-test','{}',
+             NULL,NULL,NULL,NULL,NULL)",
+            [task_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,owner_id,start_owner,
+             start_operation_id,binding_id,binding_generation,state,released_at_ms,
+             task_snapshot_json,producers_json,submission_ref,candidate_ref)
+             VALUES('attempt-old-scope-test',?1,1,?2,'manager','seed-old',NULL,NULL,
+             'completed',1,'{}','[]',NULL,NULL)",
+            params![task_id, manager_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,owner_id,start_owner,
+             start_operation_id,binding_id,binding_generation,state,released_at_ms,
+             task_snapshot_json,producers_json,submission_ref,candidate_ref)
+             VALUES('attempt-current-scope-test',?1,1,?2,'manager','seed-current',NULL,NULL,
+             'running',NULL,'{}','[]',NULL,NULL)",
+            params![task_id, manager_id],
+        )
+        .unwrap();
+        set_meta(
+            &db,
+            &format!("client:{manager_id}"),
+            &json!({"role":"manager","disabled":false}),
+        )
+        .unwrap();
+        (
+            db,
+            Principal {
+                link_id: "test-link".into(),
+                client_id: manager_id.into(),
+                role: Role::Manager,
+            },
+        )
+    }
+
+    fn read_scope_record(
+        scope_intent_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+        paths: &[&str],
+        list_sequence: i64,
+    ) -> Value {
+        let mut record = json!({
+            "schema":SCHEMA,
+            "scope_intent_id":scope_intent_id,
+            "state":"active",
+            "state_revision":1,
+            "task_id":task_id,
+            "task_revision":1,
+            "attempt_id":attempt_id,
+            "assignment_id":null,
+            "actor":{"client_id":"participant-scope-read-test","role":"participant","generation":null},
+            "participation_basis":{"kind":"attempt_owner","assignment_id":null,"review_scope":null},
+            "registration_fingerprint":"scope-read-test-registration",
+            "proposal":{
+                "mode":"exclusive_edit",
+                "paths":paths,
+                "symbols":[],
+                "interfaces":[],
+                "baseline_candidate_ref":"candidate-scope-read-test",
+                "reason":"scope read fixture"
+            },
+            "accepted":{
+                "mode":"exclusive_edit",
+                "paths":paths,
+                "symbols":[],
+                "interfaces":[],
+                "proposal_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "reason":"accepted scope read fixture"
+            },
+            "expires_at_ms":null,
+            "override_scope_intent_ids":[],
+            "coordination_required_with":[],
+            "overridden_by_scope_id":null,
+            "created_at_ms":1,
+            "updated_at_ms":1,
+            "list_sequence":list_sequence,
+            "source_operation_id":"scope-read-fixture"
+        });
+        record["digest"] = json!(record_digest(&record).unwrap());
+        record
+    }
+
+    #[test]
+    fn overlap_keeps_unknown_class_for_mixed_known_and_unsupported_pairs() {
+        let left = json!({
+            "mode":"exclusive_edit",
+            "paths":["src/main.rs","src/[ab].rs"],
+            "symbols":[],
+            "interfaces":[]
+        });
+        let right = json!({
+            "mode":"exclusive_edit",
+            "paths":["src/main.rs"],
+            "symbols":[],
+            "interfaces":[]
+        });
+
+        let relation = overlap(&left, &right);
+        assert_eq!(relation.class, "unknown");
+        assert_eq!(
+            relation.paths,
+            vec!["src/main.rs <> src/main.rs".to_owned()]
+        );
+        assert_eq!(relation.unsupported_paths.len(), 1);
+        assert_eq!(relation.unsupported_paths[0].left, "src/[ab].rs");
+        assert_eq!(relation.unsupported_paths[0].right, "src/main.rs");
+    }
+
+    #[test]
+    fn single_scope_read_uses_resolved_attempt_when_selector_is_omitted() {
+        let (db, principal) = manager_read_fixture();
+        let task_id = "task-scope-read-test";
+        let old_scope_id = "cscope-00000000-0000-7000-8000-000000000021";
+        let old_record = read_scope_record(
+            old_scope_id,
+            task_id,
+            "attempt-old-scope-test",
+            &["src/old.rs"],
+            1,
+        );
+        set_meta(&db, &record_key(old_scope_id).unwrap(), &old_record).unwrap();
+
+        let response = read(
+            &db,
+            &principal,
+            "code.scope.inspect",
+            &json!({"task_id":task_id,"scope_intent_id":old_scope_id}),
+        )
+        .unwrap();
+
+        assert_eq!(response["attempt_id"], "attempt-current-scope-test");
+        assert!(response["items"].as_array().unwrap().is_empty());
+        assert_eq!(response["coverage"], "partial");
+        assert!(
+            response["gaps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("requested_scope_attempt_mismatch"))
+        );
+
+        let conflict_response = read(
+            &db,
+            &principal,
+            "code.scope.conflicts",
+            &json!({
+                "task_id":task_id,
+                "attempt_id":"attempt-old-scope-test",
+                "scope_intent_id":old_scope_id
+            }),
+        )
+        .unwrap();
+        let item = &conflict_response["items"][0];
+        assert_eq!(item["conflicts"], json!([]));
+        assert_eq!(item["conflicts_checked"], false);
+        assert_eq!(
+            item["conflicts_unknown_reason"],
+            "requested_scope_attempt_not_current"
+        );
+    }
+
+    #[test]
+    fn conflicts_read_keeps_mixed_overlap_and_marks_damaged_active_coverage_unknown() {
+        let (mut db, principal) = manager_read_fixture();
+        let task_id = "task-scope-read-test";
+        let attempt_id = "attempt-current-scope-test";
+        let target_id = "cscope-00000000-0000-7000-8000-000000000022";
+        let other_id = "cscope-00000000-0000-7000-8000-000000000023";
+        let missing_id = "cscope-00000000-0000-7000-8000-000000000024";
+        let target = read_scope_record(
+            target_id,
+            task_id,
+            attempt_id,
+            &["src/main.rs", "src/[ab].rs"],
+            1,
+        );
+        let other = read_scope_record(other_id, task_id, attempt_id, &["src/main.rs"], 2);
+        let tx = db.transaction().unwrap();
+        set_meta(&tx, &record_key(target_id).unwrap(), &target).unwrap();
+        set_meta(&tx, &record_key(other_id).unwrap(), &other).unwrap();
+        add_active_index(&tx, &target).unwrap();
+        add_active_index(&tx, &other).unwrap();
+        let prefix = active_prefix(task_id, 1, attempt_id).unwrap();
+        set_meta(
+            &tx,
+            &active_key(&prefix, missing_id),
+            &json!({"scope_intent_id":missing_id}),
+        )
+        .unwrap();
+        let malformed_id = "cscope-00000000-0000-7000-8000-000000000026";
+        let mut malformed =
+            read_scope_record(malformed_id, task_id, attempt_id, &["src/bad.rs"], 4);
+        malformed["digest"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
+        set_meta(&tx, &record_key(malformed_id).unwrap(), &malformed).unwrap();
+        set_meta(
+            &tx,
+            &active_key(&prefix, malformed_id),
+            &json!({"scope_intent_id":malformed_id}),
+        )
+        .unwrap();
+
+        let response = read(
+            &tx,
+            &principal,
+            "code.scope.conflicts",
+            &json!({"task_id":task_id,"scope_intent_id":target_id}),
+        )
+        .unwrap();
+
+        let item = &response["items"][0];
+        assert_eq!(item["conflicts_checked"], false);
+        assert_eq!(
+            item["conflicts_unknown_reason"],
+            "active_scope_coverage_incomplete"
+        );
+        assert_eq!(item["conflicts"][0]["classification"], "unknown");
+        assert!(!item["conflicts"][0]["paths"].as_array().unwrap().is_empty());
+        assert!(
+            !item["conflicts"][0]["unsupported_paths"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(response["coverage"], "partial");
+        assert!(
+            response["gaps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("active_scope_record_missing"))
+        );
+        assert!(
+            response["gaps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("active_scope_index_mismatch"))
+        );
+    }
 
     #[test]
     fn accept_rejects_mixed_known_and_unsupported_overlap_before_override_mutation() {
@@ -1727,6 +2093,41 @@ mod tests {
         assert_eq!(retained_old["state_revision"], 1);
         assert!(retained_old["overridden_by_scope_id"].is_null());
         assert_eq!(retained_old["digest"], old["digest"]);
+        let retained_candidate = load_record(&tx, &candidate_id).unwrap();
+        assert_eq!(retained_candidate["state"], "proposed");
+        assert_eq!(retained_candidate["state_revision"], 1);
+
+        let malformed_id = "cscope-00000000-0000-7000-8000-000000000025";
+        let prefix = active_prefix(task_id, task_revision, attempt_id).unwrap();
+        let mismatched = read_scope_record(
+            malformed_id,
+            "task-other-scope-test",
+            "attempt-other-scope-test",
+            &["src/other.rs"],
+            3,
+        );
+        set_meta(&tx, &record_key(malformed_id).unwrap(), &mismatched).unwrap();
+        set_meta(
+            &tx,
+            &active_key(&prefix, malformed_id),
+            &json!({"scope_intent_id":malformed_id}),
+        )
+        .unwrap();
+        let error = apply(
+            &tx,
+            &principal,
+            "code.scope.accept",
+            &request,
+            "accept-incomplete-active-test",
+            4,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "SCOPE_OVERLAP_UNKNOWN");
+
+        let retained_old = load_record(&tx, &old_id).unwrap();
+        assert_eq!(retained_old["state"], "active");
+        assert_eq!(retained_old["state_revision"], 1);
+        assert!(retained_old["overridden_by_scope_id"].is_null());
         let retained_candidate = load_record(&tx, &candidate_id).unwrap();
         assert_eq!(retained_candidate["state"], "proposed");
         assert_eq!(retained_candidate["state_revision"], 1);
