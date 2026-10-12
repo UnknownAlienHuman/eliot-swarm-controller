@@ -30,7 +30,9 @@
     "source_manifest_sha256": "C73A15A2D1C8D2D8D102C90FC032FB90C64AC3D8002CE959FF5C30361E753422",
     "gate_sha256": "C617A64C624D21D9F18354D7F966E998E73D2F2D81C5CB11E0934446ABAD0723",
     "log_sha256": "362F0C9F5CE8A02462EB2C2FFCB7B6F0660BF14D16AF24A6C9BE9206B211A35F",
-    "unchanged_direct_case": "Passed in earlier three-case APP149/150 v2 run; direct function tail is byte-identical between APP150 v1 and v2; not repeated",
+    "unchanged_direct_case": "Passed in earlier three-case APP149/150 v2 run; AST-selected direct function text is byte-identical between APP150 v1 and v2; not repeated",
+    "direct_function_text_sha256": "0110B0D948F2BD08F09A748694EC236D5DF8C045C3637E2A6B01FFA2555D541B",
+    "carry_verification": "Rust AST grep matched one exact function in each source. Comparing the function-to-EOF tail was incorrect because it includes the later changed WorkDispatch function.",
     "aggregate_single_run_all_green": false
   },
   "linux": {
