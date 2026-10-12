@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -34,7 +34,9 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
 };
-use swarm_process::private_permissions;
+use swarm_process::{
+    JsonlScanVerdict, opened_regular_file_matches_path, private_permissions, scan_jsonl,
+};
 
 pub const MAX_DIAGNOSTIC_BYTES: usize = swarm_telemetry::MAX_RECORD_BYTES;
 // The host's existing report handlers accept pages of at most 200 records.
@@ -363,6 +365,9 @@ pub struct RecorderStats {
     pub written_bytes: u64,
     pub dropped_records: u64,
     pub dropped_bytes: u64,
+    /// Hash, length, and disposition for the one incomplete EOF suffix repaired
+    /// while this recorder was running. Raw torn bytes are not retained.
+    pub torn_tail_recovery: Option<TornTailRecovery>,
     pub durability_unknown_records: u64,
     pub durability_unknown_bytes: u64,
     pub sink_failures: u64,
@@ -377,6 +382,20 @@ pub struct RecorderStats {
     pub live_config_reload_failures: u64,
     /// Closed local error code from the latest failed live config reload.
     pub live_config_last_error_code: Option<&'static str>,
+}
+
+/// Explicit loss evidence for an incomplete JSONL suffix removed at startup.
+/// The digest and offsets remain available through RecorderStats; no event is
+/// synthesized from the discarded bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TornTailRecovery {
+    pub segment_index: u64,
+    pub valid_prefix_bytes: u64,
+    pub discarded_tail_bytes: u64,
+    pub discarded_tail_sha256: [u8; 32],
+    /// False means truncation occurred but `sync_all` or the final identity
+    /// check did not establish durability of that disposition.
+    pub truncate_sync_confirmed: bool,
 }
 
 struct Counters {
@@ -395,6 +414,7 @@ struct Counters {
     live_config_version: AtomicU64,
     live_config_reload_failures: AtomicU64,
     live_config_last_error: AtomicU64,
+    torn_tail_recovery: Mutex<Option<TornTailRecovery>>,
     failed: AtomicBool,
 }
 
@@ -416,6 +436,7 @@ impl Default for Counters {
             live_config_version: AtomicU64::new(0),
             live_config_reload_failures: AtomicU64::new(0),
             live_config_last_error: AtomicU64::new(0),
+            torn_tail_recovery: Mutex::new(None),
             failed: AtomicBool::new(false),
         }
     }
@@ -655,6 +676,11 @@ impl Recorder {
             written_bytes: self.counters.written_bytes.load(Ordering::Acquire),
             dropped_records: self.counters.dropped_records.load(Ordering::Acquire),
             dropped_bytes: self.counters.dropped_bytes.load(Ordering::Acquire),
+            torn_tail_recovery: *self
+                .counters
+                .torn_tail_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             durability_unknown_records: self
                 .counters
                 .durability_unknown_records
@@ -937,6 +963,11 @@ fn recorder_loop(
             return;
         }
     };
+    if recover_open_segment(&config.directory, segment_index, &mut file, &counters).is_err() {
+        mark_sink_failed(&counters);
+        reject_queued(&receiver, &counters);
+        return;
+    }
     let mut segment_bytes = match file.metadata() {
         Ok(metadata) => metadata.len(),
         Err(_) => {
@@ -1147,14 +1178,217 @@ fn open_segment(directory: &Path, index: u64) -> std::io::Result<File> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    // Recovery must be able to truncate through this same handle. Windows
+    // append-only access does not grant that right; the single recorder writer
+    // instead preserves the file and positions its writes explicitly.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    verify_opened_segment(&file, &path)?;
     private_permissions(&path, false).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "observer segment ACL could not be restricted",
         )
     })?;
+    verify_opened_segment(&file, &path)?;
+    file.seek(SeekFrom::End(0))?;
     Ok(file)
+}
+
+fn recover_open_segment(
+    directory: &Path,
+    index: u64,
+    file: &mut File,
+    counters: &Counters,
+) -> std::io::Result<()> {
+    let path = directory.join(format!("diagnostics-{index:020}.jsonl"));
+    verify_opened_segment(&*file, &path)?;
+    let original_len = file.metadata()?.len();
+    if original_len == 0 {
+        return Ok(());
+    }
+
+    // Historical records can predate a stricter current config bound. Validate
+    // them against the stable wire maximum; the current bound applies to new
+    // records admitted by Recorder::append.
+    let max_record_bytes = MAX_DIAGNOSTIC_BYTES;
+    let read_limit = u64::try_from(max_record_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(segment_invalid)?;
+    let mut reader = BufReader::new(file.try_clone()?);
+    reader.seek(SeekFrom::Start(0))?;
+    let mut frame = Vec::new();
+    let mut valid_prefix_bytes = 0_u64;
+    let mut scanned_bytes = 0_u64;
+    let mut torn_tail = None;
+    let mut append_final_newline = false;
+
+    loop {
+        frame.clear();
+        let bytes_read = reader
+            .by_ref()
+            .take(read_limit)
+            .read_until(b'\n', &mut frame)?;
+        if bytes_read == 0 {
+            break;
+        }
+        scanned_bytes = scanned_bytes
+            .checked_add(frame.len() as u64)
+            .ok_or_else(segment_invalid)?;
+        if frame.len() > max_record_bytes {
+            return Err(segment_invalid());
+        }
+
+        if frame.last() == Some(&b'\n') {
+            let verdict = scan_jsonl(&frame, max_record_bytes, |_, complete| {
+                validate_complete_record(complete)
+            })
+            .map_err(|_| segment_invalid())?;
+            match verdict {
+                JsonlScanVerdict::Complete { valid_bytes, .. } if valid_bytes == frame.len() => {
+                    valid_prefix_bytes = valid_prefix_bytes
+                        .checked_add(frame.len() as u64)
+                        .ok_or_else(segment_invalid)?;
+                }
+                _ => return Err(segment_invalid()),
+            }
+            continue;
+        }
+
+        let verdict =
+            scan_jsonl(&frame, max_record_bytes, |_, _| Ok(())).map_err(|_| segment_invalid())?;
+        let (tail_digest, tail_bytes) = match verdict {
+            JsonlScanVerdict::TornLastFrame {
+                valid_bytes: 0,
+                tail_digest,
+                tail_bytes,
+                ..
+            } if tail_bytes == frame.len() => (tail_digest, tail_bytes),
+            _ => return Err(segment_invalid()),
+        };
+
+        if decode_line(&frame).is_ok() {
+            // A valid final JSON record without its delimiter is complete
+            // evidence. Finish its framing before accepting another record.
+            if frame.len().saturating_add(1) > max_record_bytes {
+                return Err(segment_invalid());
+            }
+            append_final_newline = true;
+        } else {
+            match serde_json::from_slice::<DiagnosticRecord>(&frame) {
+                Err(error) if error.is_eof() => {
+                    torn_tail = Some(TornTailRecovery {
+                        segment_index: index,
+                        valid_prefix_bytes,
+                        discarded_tail_bytes: tail_bytes as u64,
+                        discarded_tail_sha256: parse_sha256_hex(&tail_digest)
+                            .ok_or_else(segment_invalid)?,
+                        truncate_sync_confirmed: false,
+                    });
+                }
+                _ => return Err(segment_invalid()),
+            }
+        }
+        break;
+    }
+    drop(reader);
+
+    if scanned_bytes != original_len || file.metadata()?.len() != original_len {
+        return Err(segment_invalid());
+    }
+    verify_opened_segment(&*file, &path)?;
+
+    if let Some(mut evidence) = torn_tail {
+        if file.metadata()?.len() != original_len {
+            return Err(segment_invalid());
+        }
+        verify_opened_segment(&*file, &path)?;
+        file.set_len(evidence.valid_prefix_bytes)?;
+        *counters
+            .torn_tail_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence);
+        record_drop(counters, evidence.discarded_tail_bytes);
+        file.sync_all()?;
+        verify_opened_segment(&*file, &path)?;
+        if file.metadata()?.len() != evidence.valid_prefix_bytes {
+            return Err(segment_invalid());
+        }
+        evidence.truncate_sync_confirmed = true;
+        *counters
+            .torn_tail_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence);
+    } else if append_final_newline {
+        if file.metadata()?.len() != original_len {
+            return Err(segment_invalid());
+        }
+        verify_opened_segment(&*file, &path)?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        verify_opened_segment(&*file, &path)?;
+        if file.metadata()?.len() != original_len.saturating_add(1) {
+            return Err(segment_invalid());
+        }
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+fn validate_complete_record(frame: &[u8]) -> Result<()> {
+    let Some(line) = frame.strip_suffix(b"\n") else {
+        return Err(Error::new(
+            "OBSERVER_RECORD_INVALID",
+            "observer segment frame is not newline terminated",
+        ));
+    };
+    decode_line(line).map(|_| ())
+}
+
+fn verify_opened_segment(file: &File, path: &Path) -> std::io::Result<()> {
+    let is_file = file.metadata()?.is_file();
+    let matches_path = opened_regular_file_matches_path(file, path).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "observer segment identity could not be verified",
+        )
+    })?;
+    if !is_file || !matches_path {
+        return Err(segment_invalid());
+    }
+    Ok(())
+}
+
+fn segment_invalid() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "observer segment contains invalid JSONL or changed file identity",
+    )
+}
+
+fn parse_sha256_hex(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        digest[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(digest)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn apply_retention(config: &RecorderConfig, active_index: Option<u64>) -> std::io::Result<()> {
@@ -1895,4 +2129,214 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod recorder_tail_recovery_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    const SEGMENT_NAME: &str = "diagnostics-00000000000000000000.jsonl";
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "swarm-observer-recorder-tail-{}-{}-{}",
+                std::process::id(),
+                now_unix_ms(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            fs::create_dir(&path).expect("create isolated recorder fixture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn segment_path(&self) -> PathBuf {
+            self.0.join(SEGMENT_NAME)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn config(directory: &Path) -> RecorderConfig {
+        RecorderConfig {
+            directory: directory.to_path_buf(),
+            queue_records: 2,
+            queue_bytes: swarm_telemetry::MAX_QUEUE_BYTES,
+            max_record_bytes: MAX_DIAGNOSTIC_BYTES,
+            segment_bytes: MAX_DIAGNOSTIC_BYTES as u64,
+            retention_bytes: MAX_DIAGNOSTIC_BYTES as u64,
+            retention_days: 1,
+        }
+    }
+
+    fn record(sequence: u64) -> DiagnosticRecord {
+        DiagnosticRecord {
+            schema_version: 1,
+            sequence,
+            occurred_at_unix_ms: None,
+            severity: "info".into(),
+            kind: "recorder_failure".into(),
+            phase: "recorder_write".into(),
+            component: None,
+            code: None,
+            client_id: None,
+            link_id: None,
+            binding_id: None,
+            binding_generation: None,
+            operation_id: Some(format!("operation-{sequence}")),
+            module_boot_id: None,
+            event_id: None,
+            module_id: None,
+            artifact_id: None,
+            artifact_version: None,
+            build_id: None,
+            task_id: None,
+            attempt_id: None,
+            redacted_text: None,
+        }
+    }
+
+    fn decoded_lines(bytes: &[u8]) -> Vec<DiagnosticRecord> {
+        std::str::from_utf8(bytes)
+            .expect("recorder output is UTF-8")
+            .lines()
+            .map(|line| decode_line(line.as_bytes()).expect("each persisted line is valid"))
+            .collect()
+    }
+
+    #[test]
+    fn recorder_restart_retains_complete_record_and_appends_after_torn_tail() {
+        let directory = TestDirectory::new();
+        let segment_path = directory.segment_path();
+        let prior = record(1);
+        let first = Recorder::start(config(directory.path())).expect("start initial recorder");
+        first.append(prior).expect("append complete prior record");
+        let first_stats = first.shutdown().expect("sync initial recorder");
+        assert_eq!(first_stats.written_records, 1);
+
+        let valid_prefix = fs::read(&segment_path).expect("read prior complete frame");
+        assert_eq!(valid_prefix.last(), Some(&b'\n'));
+        let torn_tail = br#"{"schema_version":1,"sequence":2"#;
+        let (expected_tail_sha256, expected_tail_bytes) =
+            match scan_jsonl(torn_tail, MAX_DIAGNOSTIC_BYTES, |_, _| Ok(()))
+                .expect("classify fixture tail")
+            {
+                JsonlScanVerdict::TornLastFrame {
+                    valid_bytes: 0,
+                    tail_digest,
+                    tail_bytes,
+                    ..
+                } => (
+                    parse_sha256_hex(&tail_digest).expect("scanner SHA-256 is hexadecimal"),
+                    tail_bytes as u64,
+                ),
+                other => panic!("fixture must be a torn EOF suffix, got {other:?}"),
+            };
+        let mut segment = OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("open fixture segment for simulated interrupted write");
+        segment
+            .write_all(torn_tail)
+            .expect("write persisted partial JSON bytes");
+        segment.sync_all().expect("persist simulated torn suffix");
+        drop(segment);
+
+        let second = Recorder::start(config(directory.path())).expect("restart recorder");
+        second
+            .append(record(2))
+            .expect("append subsequent real recorder event");
+        let stats = second.shutdown().expect("sync restarted recorder");
+
+        let recovery = stats
+            .torn_tail_recovery
+            .expect("recovery disposition is visible in recorder stats");
+        assert_eq!(recovery.segment_index, 0);
+        assert_eq!(recovery.valid_prefix_bytes, valid_prefix.len() as u64);
+        assert_eq!(recovery.discarded_tail_bytes, expected_tail_bytes);
+        assert_eq!(recovery.discarded_tail_sha256, expected_tail_sha256);
+        assert!(recovery.truncate_sync_confirmed);
+        assert_eq!(stats.dropped_records, 1);
+        assert_eq!(stats.dropped_bytes, expected_tail_bytes);
+        assert_eq!(stats.written_records, 1);
+
+        let persisted = fs::read(&segment_path).expect("read repaired and appended segment");
+        assert!(persisted.starts_with(&valid_prefix));
+        assert_eq!(persisted.last(), Some(&b'\n'));
+        let records = decoded_lines(&persisted);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[0].operation_id.as_deref(), Some("operation-1"));
+        assert_eq!(records[1].sequence, 2);
+        assert_eq!(records[1].operation_id.as_deref(), Some("operation-2"));
+    }
+
+    #[test]
+    fn recorder_restart_delimits_a_valid_final_record_without_newline() {
+        let directory = TestDirectory::new();
+        let segment_path = directory.segment_path();
+        let first = Recorder::start(config(directory.path())).expect("start initial recorder");
+        first
+            .append(record(1))
+            .expect("append initial complete record");
+        first.shutdown().expect("sync initial recorder");
+
+        let mut bytes = fs::read(&segment_path).expect("read initial segment");
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&segment_path, &bytes).expect("simulate missing final delimiter");
+
+        let restarted = Recorder::start(config(directory.path())).expect("restart recorder");
+        restarted
+            .append(record(2))
+            .expect("append after recovered delimiter");
+        let stats = restarted.shutdown().expect("sync restarted recorder");
+
+        assert!(stats.torn_tail_recovery.is_none());
+        assert_eq!(stats.dropped_records, 0);
+        let persisted = fs::read(&segment_path).expect("read delimited segment");
+        assert!(persisted.starts_with(&bytes));
+        assert_eq!(persisted.get(bytes.len()), Some(&b'\n'));
+        let records = decoded_lines(&persisted);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[1].sequence, 2);
+    }
+
+    #[test]
+    fn recovery_refuses_malformed_complete_frame_without_changing_segment() {
+        let directory = TestDirectory::new();
+        let segment_path = directory.segment_path();
+        let mut malformed = serde_json::to_vec(&record(1)).expect("serialize valid prefix");
+        malformed.push(b'\n');
+        malformed.extend_from_slice(b"{not-json}\n");
+        fs::write(&segment_path, &malformed).expect("write malformed complete final frame");
+
+        let mut segment = open_segment(directory.path(), 0).expect("open exact segment handle");
+        let counters = Counters::default();
+        assert!(recover_open_segment(directory.path(), 0, &mut segment, &counters).is_err());
+        assert_eq!(
+            fs::read(&segment_path).expect("read refused segment"),
+            malformed
+        );
+        assert_eq!(counters.dropped_records.load(Ordering::Acquire), 0);
+        assert_eq!(counters.dropped_bytes.load(Ordering::Acquire), 0);
+        assert!(
+            counters
+                .torn_tail_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+    }
 }
