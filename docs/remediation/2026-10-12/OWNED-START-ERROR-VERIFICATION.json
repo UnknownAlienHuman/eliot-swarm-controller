@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-12T08:40:47.4350710Z",
+  "source_base_main": "1d2c599f6851b95ac270799a0d765c290a2e9f2e",
+  "obligations": [
+    "APP-078"
+  ],
+  "problem": "A failed startup diagnostic write masked the original Unknown launch error. Returning that error with secondary Store codes also required the real background caller to report those codes.",
+  "behavior": "Keep the launch error primary, preserve bounded diagnostic Store error codes at the existing composition and stderr caller, await persistence before helper EOF, retain the unknown-effect/no-replay fence.",
+  "source_sha256": {
+    "crates/swarm-kernel-host/src/store/launcher_owned_service.rs": "94B3720A6526A46FE6322C8234E88D445C6C7502BB235B694B95A3244ABE3A96",
+    "crates/swarm-kernel-host/src/store/opencode.rs": "B17F8D9B69CBB185D7DF9BC7BD62D0820FB91FD2E9CC7A371A750EA4C9CAEC3B"
+  },
+  "source_before_sha256": {
+    "crates/swarm-kernel-host/src/store/opencode.rs": "B597A525AB3201DC1F74A22139673D8A88D0F8D09ABB6A11193BB2A9D92947CF",
+    "crates/swarm-kernel-host/src/store/launcher_owned_service.rs": "82A98D09E36CB54C4BF27832165C7DA4485B43B8FEE09C6FDC2F4569CF3071D6"
+  },
+  "frozen_input_count": 836,
+  "meaningful_consumers": {
+    "windows": [
+      "store::launcher_owned_service::owned_service_cleanup_tests::close_failure_still_reconciles_and_both_errors_remain_secondary",
+      "store::launcher_owned_service::owned_service_cleanup_tests::start_diagnostic_store_error_stays_secondary_to_unknown_launch_failure"
+    ],
+    "linux": [
+      "store::launcher_owned_service::owned_service_cleanup_tests::close_failure_still_reconciles_and_both_errors_remain_secondary",
+      "store::launcher_owned_service::owned_service_cleanup_tests::start_diagnostic_store_error_stays_secondary_to_unknown_launch_failure"
+    ]
+  },
+  "verification": {
+    "app078-windows-clippy-v2": {
+      "log_sha256": "8DBB6C3137BB1A6FEE77EEA40F397FDB4D07265DC750BEA4CA361CBBB66F3629",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "artifact_sha256": "343D975DB808A1B5C797638F9C179A600045E6B998313C9826D306827D978744",
+      "changed_since_gate": [],
+      "source_stable": true
+    },
+    "app078-windows-tests-v1": {
+      "log_sha256": "D171B50F18F0546EFB8D352D66C2F2F2C662BAC271BC1D1A5358A8F029562ABB",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(owned_service_cleanup_tests::)"
+      ],
+      "artifact_sha256": "0F6A2BD8C0D5BA61772E0A0485DAC567761C7E8DC0FFA124B386B9E72303BEFE",
+      "changed_since_gate": [
+        "crates/swarm-kernel-host/src/store/opencode.rs"
+      ],
+      "source_stable": true
+    },
+    "app078-linux-clippy-v2": {
+      "log_sha256": "BD14FEB9FAC8D343888A294F4B7BECC0592208EEE94D591F229319762A195FBD",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "artifact_sha256": "6CF69F71DE9264061A8EA1C53E88C4885344D8B3EC29B1DF57B84F9DD8BD0370",
+      "changed_since_gate": [],
+      "source_stable": true
+    },
+    "app078-linux-tests-v1": {
+      "log_sha256": "EE860A6618D5B52CD807260163AAA0A21BF532A8475AFACC7BC08BCE0A267978",
+      "exit_code": 0,
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(owned_service_cleanup_tests::)"
+      ],
+      "artifact_sha256": "EED149B8C2A75DA25DD61399303EE19781D0B65D889D8A127C1EE36431DF35EB",
+      "changed_since_gate": [
+        "crates/swarm-kernel-host/src/store/opencode.rs"
+      ],
+      "source_stable": true
+    }
+  },
+  "independent_source_review": {
+    "artifact_sha256": "E4309CE672378357C111EF47024F7373C920D579A0EC49A251D0E3049DD2D870",
+    "findings": 0,
+    "disposition": "no_open_p1_or_p2_in_reviewed_delta",
+    "artifact": "app078-independent-source-review-luna-v2-20261012.json"
+  },
+  "retained_consumer_basis": "Exact launcher source and all other 835 recorded inputs unchanged from v1. Only opencode.rs stderr formatting adds bounded secondary_codes; direct SQLite/cleanup consumers do not call that worker. Final production Clippy and independent final source review cover the caller delta.",
+  "counterexample": "Real SQLite BEFORE INSERT trigger aborts the start_failure diagnostic write: STORE_ERROR stays secondary, zero diagnostic rows survive rollback; successful diagnostic retry retains outcome_unknown, empty proof and exactly one observation.",
+  "prior_review_finding": "APP078-P2-SECONDARY-STORE-ERROR-DROPPED-AT-CALLER preserved in v1 review and repaired at drive_owned_opencode.",
+  "boundaries": [
+    "Two affected tests on each OS; hundreds of other host tests skipped",
+    "Direct production persistence/composition fixture uses actual migrations with foreign keys disabled to isolate that boundary; it does not execute full public/native startup",
+    "Caller reporting is source-reviewed and production-Clippy-checked; stderr capture/native invocation not executed here",
+    "24 retained libtest warnings; strict production Clippy clean only",
+    "Full V27 Rust/public/native Step5/Gemini3.8/fault/load/test-vacuum/donor qualification remains pending"
+  ],
+  "toolchain": "Rust1.98.1, edition2024",
+  "full_v27_qualified": false
+}

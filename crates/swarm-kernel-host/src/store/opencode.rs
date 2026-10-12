@@ -835,7 +835,10 @@ impl Store {
             {
                 Ok(handle) => break handle,
                 Err(error) => {
-                    eprintln!("OpenCode owned-service binding: {}", error.code);
+                    eprintln!(
+                        "OpenCode owned-service binding: {} secondary_codes={:?}",
+                        error.code, error.secondary_codes
+                    );
                     let id = binding_id.clone();
                     let still_active = self
                         .run(move |db| active_owned_binding(db, &id, generation))

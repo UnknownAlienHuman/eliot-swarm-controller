@@ -587,8 +587,7 @@ impl Store {
                 // the durable diagnostic so the next run can identify the
                 // failed startup stage without claiming an observed effect.
                 drop(helper_stdin);
-                persist?;
-                return Err(error);
+                return Err(preserve_start_failure_diagnostic_error(error, persist));
             }
         };
         let proof = handle.readback().store_proof();
@@ -3384,6 +3383,13 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn preserve_start_failure_diagnostic_error(primary_error: Error, persistence: Result<()>) -> Error {
+    match persistence {
+        Ok(()) => primary_error,
+        Err(error) => primary_error.with_secondary_error(error),
+    }
+}
+
 async fn preserve_owned_service_cleanup_errors<Close, Reconcile>(
     mut primary_error: Error,
     close: Close,
@@ -3408,8 +3414,114 @@ mod owned_actor_provenance_tests;
 
 #[cfg(test)]
 mod owned_service_cleanup_tests {
-    use super::{Error, preserve_owned_service_cleanup_errors};
+    use super::{
+        Connection, Error, OwnedServiceStartStage, OwnedStartRow, insert_start_reservation,
+        load_start_row, persist_start_failure_diagnostic, preserve_owned_service_cleanup_errors,
+        preserve_start_failure_diagnostic_error,
+    };
+    use crate::store::{OWNED_SERVICE_SCHEMA, SCHEMA, WORKSPACE_SCHEMA};
     use std::cell::Cell;
+
+    #[test]
+    fn start_diagnostic_store_error_stays_secondary_to_unknown_launch_failure() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+        db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+        let row = OwnedStartRow {
+            launch_operation_id: "diagnostic-launch".to_owned(),
+            open_operation_id: "diagnostic-open".to_owned(),
+            binding_id: "diagnostic-binding".to_owned(),
+            binding_generation: 1,
+            task_id: "diagnostic-task".to_owned(),
+            task_revision: 1,
+            attempt_id: "diagnostic-attempt".to_owned(),
+            lease_id: "diagnostic-lease".to_owned(),
+            lease_generation: 1,
+            technical_requester_id: "diagnostic-manager".to_owned(),
+            effective_manager_id: "diagnostic-manager".to_owned(),
+            service_id: "opencode".to_owned(),
+            service_version: "2.0.7".to_owned(),
+            route_digest: "a".repeat(64),
+            binding_digest: "b".repeat(64),
+            owner_nonce: "diagnostic-owner".to_owned(),
+            intent_digest: "c".repeat(64),
+            state: "outcome_unknown".to_owned(),
+            process_id: None,
+            process_birth_token: None,
+            executable_sha256: None,
+            proof_json: "{}".to_owned(),
+            updated_at_ms: 1,
+        };
+        let tx = db.transaction().unwrap();
+        insert_start_reservation(&tx, &row).unwrap();
+        tx.execute(
+            "UPDATE owned_service_starts SET state='outcome_unknown'",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_start_diagnostic BEFORE INSERT ON observations
+             WHEN NEW.kind='owned_service.start_failure'
+             BEGIN SELECT RAISE(ABORT, 'diagnostic write unavailable'); END;",
+        )
+        .unwrap();
+        let primary = Error::new("OWNED_OPEN_FAILED", "the helper startup effect is unknown");
+        let persistence = persist_start_failure_diagnostic(
+            &mut db,
+            &row,
+            OwnedServiceStartStage::ReadyReceipt,
+            primary.code.clone(),
+            None,
+        );
+        assert_eq!(persistence.as_ref().unwrap_err().code, "STORE_ERROR");
+        let error = preserve_start_failure_diagnostic_error(primary.clone(), persistence);
+
+        assert_eq!(error.code, primary.code);
+        assert_eq!(error.message, primary.message);
+        assert_eq!(error.secondary_codes, vec!["STORE_ERROR".to_owned()]);
+        let diagnostic_count = || {
+            db.query_row(
+                "SELECT COUNT(*) FROM observations WHERE kind='owned_service.start_failure'",
+                [],
+                |record| record.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(diagnostic_count(), 0);
+
+        db.execute_batch("DROP TRIGGER refuse_start_diagnostic;")
+            .unwrap();
+        let persistence = persist_start_failure_diagnostic(
+            &mut db,
+            &row,
+            OwnedServiceStartStage::ReadyReceipt,
+            primary.code.clone(),
+            None,
+        );
+        assert!(persistence.is_ok());
+        let persisted = preserve_start_failure_diagnostic_error(primary.clone(), persistence);
+        assert_eq!(persisted.code, primary.code);
+        assert_eq!(persisted.message, primary.message);
+        assert!(persisted.secondary_codes.is_empty());
+        let retained = load_start_row(&db, &row.binding_id, row.binding_generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, "outcome_unknown");
+        assert_eq!(retained.proof_json, "{}");
+        assert!(retained.process_id.is_none());
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM observations WHERE kind='owned_service.start_failure'",
+                [],
+                |record| record.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn close_failure_still_reconciles_and_both_errors_remain_secondary() {
