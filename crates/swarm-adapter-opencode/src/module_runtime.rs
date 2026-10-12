@@ -270,41 +270,6 @@ pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
     capabilities_match(claim) && command_event_schemas_match(claim)
 }
 
-#[cfg(test)]
-mod schema_tests {
-    use super::*;
-
-    fn command_schemas(native_mcp_version: &str) -> Vec<SchemaDescriptor> {
-        COMMAND_SCHEMAS
-            .iter()
-            .map(|(schema_id, version)| SchemaDescriptor {
-                schema_id: (*schema_id).to_owned(),
-                version: if *schema_id == "swarm.native_mcp_command" {
-                    native_mcp_version.to_owned()
-                } else {
-                    (*version).to_owned()
-                },
-                sha256: None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn native_mcp_schema_requires_exact_v2_while_other_commands_stay_v1() {
-        assert!(schema_set_matches(&command_schemas("2"), &COMMAND_SCHEMAS));
-        assert!(!schema_set_matches(&command_schemas("1"), &COMMAND_SCHEMAS));
-        assert!(!schema_set_matches(&command_schemas("3"), &COMMAND_SCHEMAS));
-
-        let mut wrong_other_version = command_schemas("2");
-        wrong_other_version
-            .iter_mut()
-            .find(|schema| schema.schema_id == "swarm.runtime_command")
-            .unwrap()
-            .version = "2".into();
-        assert!(!schema_set_matches(&wrong_other_version, &COMMAND_SCHEMAS));
-    }
-}
-
 fn parse_protocol(value: &str) -> Result<ProtocolVersion> {
     let (major, minor) = value.split_once('.').ok_or_else(|| {
         Error::new(
@@ -389,4 +354,39 @@ fn absolute_config_path_value(value: String) -> Result<PathBuf> {
         ));
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn command_schemas(native_mcp_version: &str) -> Vec<SchemaDescriptor> {
+        COMMAND_SCHEMAS
+            .iter()
+            .map(|(schema_id, version)| SchemaDescriptor {
+                schema_id: (*schema_id).to_owned(),
+                version: if *schema_id == "swarm.native_mcp_command" {
+                    native_mcp_version.to_owned()
+                } else {
+                    (*version).to_owned()
+                },
+                sha256: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_mcp_schema_requires_exact_v2_while_other_commands_stay_v1() {
+        assert!(schema_set_matches(&command_schemas("2"), &COMMAND_SCHEMAS));
+        assert!(!schema_set_matches(&command_schemas("1"), &COMMAND_SCHEMAS));
+        assert!(!schema_set_matches(&command_schemas("3"), &COMMAND_SCHEMAS));
+
+        let mut wrong_other_version = command_schemas("2");
+        wrong_other_version
+            .iter_mut()
+            .find(|schema| schema.schema_id == "swarm.runtime_command")
+            .unwrap()
+            .version = "2".into();
+        assert!(!schema_set_matches(&wrong_other_version, &COMMAND_SCHEMAS));
+    }
 }

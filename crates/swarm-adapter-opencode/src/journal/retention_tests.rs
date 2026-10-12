@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::json;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 const BINDING_ID: &str = "fixture-binding";
 const GENERATION: i64 = 1;
@@ -79,7 +82,7 @@ fn write_acknowledged_reply(journal: &Journal, operation_id: &str, resolved: Opt
         .unwrap();
 }
 
-fn operation_path(root: &PathBuf, operation_id: &str) -> PathBuf {
+fn operation_path(root: &Path, operation_id: &str) -> PathBuf {
     root.join("operations")
         .join(format!("{}.jsonl", operation_key(operation_id)))
 }

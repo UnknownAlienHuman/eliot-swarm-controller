@@ -124,6 +124,14 @@ async fn app320_owned_adapter_child() {
 }
 
 async fn run_case(invalid_model_catalog: bool) -> FixtureResult<()> {
+    run_connected_case(invalid_model_catalog, false).await
+}
+
+pub(super) async fn run_app299_case() -> std::result::Result<(), String> {
+    run_connected_case(false, true).await
+}
+
+async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> FixtureResult<()> {
     let scratch = unique_directory("eliot-app320-owned-connected")?;
     private_permissions(&scratch, true).map_err(display)?;
     let host_data_dir = scratch.join("host");
@@ -184,8 +192,10 @@ async fn run_case(invalid_model_catalog: bool) -> FixtureResult<()> {
     private_permissions(&auth_source, false).map_err(display)?;
     let bun_executable = configured_bun()?;
     let install_root = scratch.join("native-install");
-    let server_sha256 =
-        write_installed_closure(&install_root, &test_server_source(invalid_model_catalog))?;
+    let server_sha256 = write_installed_closure(
+        &install_root,
+        &test_server_source(invalid_model_catalog, app299_tasks),
+    )?;
     let host_executable =
         install_root.join(format!("swarm-kernel-host{}", std::env::consts::EXE_SUFFIX));
     let supervisor = configured_binary("ELIOT_OPENCODE_TEST_SUPERVISOR")?;
@@ -195,17 +205,20 @@ async fn run_case(invalid_model_catalog: bool) -> FixtureResult<()> {
         install_root.join(format!("swarm-supervisor{}", std::env::consts::EXE_SUFFIX)),
     )
     .map_err(display)?;
+    let native_base = scratch.join("native-state");
     let evidence_file = scratch.join("case-evidence.json");
     let case_file = scratch.join("case.json");
+
     fs::write(
         &case_file,
         serde_json::to_vec(&json!({
             "invalid_model_catalog":invalid_model_catalog,
+            "app299_tasks":app299_tasks,
             "evidence_file":evidence_file,
             "admission_file":scratch.join("admission-evidence.json"),
             "execute_file":scratch.join("execute-after-public-readback"),
             "workspace_root":workspace_root,
-            "native_base":scratch.join("native-state")
+            "native_base":native_base.clone()
         }))
         .map_err(display)?,
     )
@@ -307,10 +320,10 @@ async fn run_case(invalid_model_catalog: bool) -> FixtureResult<()> {
                 if let Some(status) = host.try_wait().map_err(display)? {
                     return Err(format!("public host startup exited before IPC readiness: {status}"));
                 }
-                if let Ok(credential) = load_credential(&host_data_dir.join("operator.json")) {
-                    if call_host(&host_data_dir, &credential, "module.catalog.get", json!({})).await.is_ok() {
-                        break Ok(credential);
-                    }
+                if let Ok(credential) = load_credential(&host_data_dir.join("operator.json"))
+                    && call_host(&host_data_dir, &credential, "module.catalog.get", json!({})).await.is_ok()
+                {
+                    break Ok(credential);
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -336,76 +349,298 @@ async fn run_case(invalid_model_catalog: bool) -> FixtureResult<()> {
         if !catalog["catalog_revision"].is_number() {
             return Err("actual catalog omitted its revision".to_owned());
         }
-        let task = call_host(&host_data_dir, &operator, "task.create", json!({
-            "client_request_id":uuid::Uuid::new_v4().to_string(),"project_id":PROJECT_ID,
-            "spec":{"objective":"Retain provider-auth proof after owned native failure",
-                "phase":"implementation","requirements":[{"id":"R1","statement":"Retain exact post-effect evidence"}],
-                "scope":{"initial_paths":["src/target.rs"]},"owner_policy_id":"owner-policy-v1"}
-        })).await?;
-        let mut request = json!({
-            "task_id":task["task_id"],"expected_task_revision":1,"route":ROUTE_ALIAS,
-            "agent_profile":"app320-agent","mcp_profile":"app320-participant","mcp_surface":"participant-core",
-            "workspace_policy":"manager_owned_worktree","requested_model":null,"requested_effort":null,
-            "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
-            "stop_conditions":[],"purpose":"implementation"
-        });
-        let preview = call_host(&host_data_dir, &operator, "swarm.launch.preview", request.clone()).await?;
-        if !preview["hard_blocks"].as_array().is_some_and(Vec::is_empty) {
-            return Err("real public owned launch preview reported a blocker".to_owned());
-        }
-        request["plan_digest"] = preview["plan_digest"].clone();
-        request["client_request_id"] = json!(uuid::Uuid::new_v4().to_string());
-        let launch = call_host(&host_data_dir, &operator, "swarm.launch", request).await?;
-        let launch_id = launch["operation_id"].as_str().ok_or_else(|| "public launch omitted its operation ID".to_owned())?;
-        // Read the immutable child association before its rejected ACK causes
-        // the launcher to replace progress with a terminal failure projection.
-        let admission = tokio::time::timeout(Duration::from_secs(90), async {
-            loop {
-                if let Ok(bytes) = fs::read(scratch.join("admission-evidence.json")) {
-                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) { break Ok::<_, String>(value); }
+        let mut app299_client = None;
+        let (task, launch_id, launch_readback, admission, app299_operation_id) =
+            if app299_tasks {
+                // Use the supported launcher producer to establish exact Task/Attempt/lease provenance.
+                // The first child admission is the public launcher IPC operation, not an MCP agent_open.
+                let task = call_host(&host_data_dir, &operator, "task.create", json!({
+                    "client_request_id":uuid::Uuid::new_v4().to_string(),"project_id":PROJECT_ID,
+                    "spec":{"objective":"Retain provider-auth proof after owned native failure",
+                        "phase":"implementation","requirements":[{"id":"R1","statement":"Retain exact post-effect evidence"}],
+                        "scope":{"initial_paths":["src/target.rs"]},"owner_policy_id":"owner-policy-v1"}
+                })).await?;
+                let mut request = json!({
+                    "task_id":task["task_id"],"expected_task_revision":1,"route":ROUTE_ALIAS,
+                    "agent_profile":"app320-agent","mcp_profile":"app320-participant","mcp_surface":"participant-core",
+                    "workspace_policy":"manager_owned_worktree","requested_model":null,"requested_effort":null,
+                    "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+                    "stop_conditions":[],"purpose":"implementation"
+                });
+                let preview = call_host(&host_data_dir, &operator, "swarm.launch.preview", request.clone()).await?;
+                if !preview["hard_blocks"].as_array().is_some_and(Vec::is_empty) {
+                    return Err("real APP299 public owned launch preview reported a blocker".to_owned());
                 }
-                if evidence_file.is_file() { return Err("owned adapter failed before public launch readback".to_owned()); }
-                if host.try_wait().map_err(display)?.is_some() { return Err("host exited before admitted command readback".to_owned()); }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }).await.map_err(|_| "real supervisor did not deliver its owned command".to_owned())??;
-        let launch_readback = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":launch_id})).await?;
-        let command_readback = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":admission["operation_id"]})).await?;
-        if command_readback["method"] != "agent.open" || command_readback["task_id"] != task["task_id"]
-            || command_readback["attempt_id"] != launch_readback["attempt_id"]
-            || !command_readback["attempt_id"].as_str().is_some_and(|id| !id.is_empty())
-            || command_readback["prerequisite_operation_id"] != launch_id
-            || command_readback["binding_id"] != admission["binding_id"]
-            || command_readback["binding_generation"] != admission["generation"] {
-            return Err("public launch did not retain this exact admitted agent.open/Task/Attempt/binding".to_owned());
-        }
-        fs::write(scratch.join("execute-after-public-readback"), b"continue\n").map_err(display)?;
+                request["plan_digest"] = preview["plan_digest"].clone();
+                request["client_request_id"] = json!(uuid::Uuid::new_v4().to_string());
+                let launch = call_host(&host_data_dir, &operator, "swarm.launch", request).await?;
+                let launch_id = launch["operation_id"]
+                    .as_str()
+                    .ok_or_else(|| "public APP299 launch omitted its operation ID".to_owned())?
+                    .to_owned();
+                // Wait until the production adapter has received the real launch-created child via module.next.
+                let admission = tokio::time::timeout(Duration::from_secs(90), async {
+                    loop {
+                        if let Ok(bytes) = fs::read(scratch.join("admission-evidence.json"))
+                            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                        {
+                            break Ok::<_, String>(value);
+                        }
+                        if evidence_file.is_file() {
+                            return Err("APP299 adapter failed before launch-child readback".to_owned());
+                        }
+                        if host.try_wait().map_err(display)?.is_some() {
+                            return Err("host exited before APP299 launch-child admission".to_owned());
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .map_err(|_| "production supervisor did not deliver the launcher-created APP299 child".to_owned())??;
+                let launch_readback = call_host(
+                    &host_data_dir,
+                    &operator,
+                    "operation.get",
+                    json!({"operation_id":launch_id}),
+                )
+                .await?;
+                let operation_id = admission["operation_id"]
+                    .as_str()
+                    .ok_or_else(|| "module.next admission omitted the child Operation ID".to_owned())?
+                    .to_owned();
+                let command_readback = call_host(
+                    &host_data_dir,
+                    &operator,
+                    "operation.get",
+                    json!({"operation_id":operation_id}),
+                )
+                .await?;
+                let child_state = command_readback["state"].as_str().unwrap_or_default();
+                if launch_readback["method"] != json!("swarm.launch")
+                    || launch_readback["operation_id"] != json!(launch_id)
+                    || launch_readback["state"] != json!("queued")
+                    || launch_readback["task_id"] != task["task_id"]
+                    || !launch_readback["attempt_id"].as_str().is_some_and(|id| !id.is_empty())
+                    || launch_readback["binding_id"] != admission["binding_id"]
+                    || launch_readback["binding_generation"] != admission["generation"]
+                    || command_readback["operation_id"] != json!(operation_id)
+                    || command_readback["method"] != json!("agent.open")
+                    || command_readback["task_id"] != task["task_id"]
+                    || command_readback["attempt_id"] != launch_readback["attempt_id"]
+                    || !command_readback["attempt_id"].as_str().is_some_and(|id| !id.is_empty())
+                    || command_readback["prerequisite_operation_id"] != json!(launch_id)
+                    || command_readback["binding_id"] != admission["binding_id"]
+                    || command_readback["binding_generation"] != admission["generation"]
+                    || !["queued", "sending"].contains(&child_state)
+                {
+                    return Err("public launch and module.next do not identify the exact child Task/Attempt/parent/binding".to_owned());
+                }
+                let original_request = super::app299_connected_consumer::assert_retained_agent_open(
+                    &host_data_dir,
+                    &operation_id,
+                    &launch_id,
+                    ROUTE_ALIAS,
+                    &workspace_root,
+                )?;
+                let mut client = super::app299_connected_consumer::PublicTasksClient::connect(
+                    host_data_dir.clone(),
+                    operator.clone(),
+                )
+                .await?;
+                let public_task_id = client
+                    .agent_open_duplicate(&original_request, &operation_id)
+                    .await?;
+                if public_task_id != operation_id {
+                    return Err("public MCP duplicates did not replay the exact launcher child Operation".to_owned());
+                }
+                let working = client.task_get(&operation_id).await?;
+                if working["taskId"] != json!(operation_id)
+                    || working["status"] != json!("working")
+                {
+                    return Err("MCP tasks/get did not read the launcher child as working before execution".to_owned());
+                }
+                fs::write(scratch.join("execute-after-public-readback"), b"continue
+")
+                    .map_err(display)?;
+                app299_client = Some(client);
+                (
+                    task,
+                    launch_id,
+                    launch_readback,
+                    admission,
+                    Some(operation_id),
+                )
+            } else {
+                let task = call_host(&host_data_dir, &operator, "task.create", json!({
+                    "client_request_id":uuid::Uuid::new_v4().to_string(),"project_id":PROJECT_ID,
+                    "spec":{"objective":"Retain provider-auth proof after owned native failure",
+                        "phase":"implementation","requirements":[{"id":"R1","statement":"Retain exact post-effect evidence"}],
+                        "scope":{"initial_paths":["src/target.rs"]},"owner_policy_id":"owner-policy-v1"}
+                })).await?;
+                let mut request = json!({
+                    "task_id":task["task_id"],"expected_task_revision":1,"route":ROUTE_ALIAS,
+                    "agent_profile":"app320-agent","mcp_profile":"app320-participant","mcp_surface":"participant-core",
+                    "workspace_policy":"manager_owned_worktree","requested_model":null,"requested_effort":null,
+                    "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+                    "stop_conditions":[],"purpose":"implementation"
+                });
+                let preview = call_host(&host_data_dir, &operator, "swarm.launch.preview", request.clone()).await?;
+                if !preview["hard_blocks"].as_array().is_some_and(Vec::is_empty) {
+                    return Err("real public owned launch preview reported a blocker".to_owned());
+                }
+                request["plan_digest"] = preview["plan_digest"].clone();
+                request["client_request_id"] = json!(uuid::Uuid::new_v4().to_string());
+                let launch = call_host(&host_data_dir, &operator, "swarm.launch", request).await?;
+                let launch_id = launch["operation_id"].as_str().ok_or_else(|| "public launch omitted its operation ID".to_owned())?;
+                // Read the immutable child association before its rejected ACK causes
+                // the launcher to replace progress with a terminal failure projection.
+                let admission = tokio::time::timeout(Duration::from_secs(90), async {
+                    loop {
+                        if let Ok(bytes) = fs::read(scratch.join("admission-evidence.json"))
+                            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                        {
+                            break Ok::<_, String>(value);
+                        }
+                        if evidence_file.is_file() { return Err("owned adapter failed before public launch readback".to_owned()); }
+                        if host.try_wait().map_err(display)?.is_some() { return Err("host exited before admitted command readback".to_owned()); }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }).await.map_err(|_| "real supervisor did not deliver its owned command".to_owned())??;
+                let launch_readback = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":launch_id})).await?;
+                let command_readback = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":admission["operation_id"]})).await?;
+                if command_readback["method"] != "agent.open" || command_readback["task_id"] != task["task_id"]
+                    || command_readback["attempt_id"] != launch_readback["attempt_id"]
+                    || !command_readback["attempt_id"].as_str().is_some_and(|id| !id.is_empty())
+                    || command_readback["prerequisite_operation_id"] != launch_id
+                    || command_readback["binding_id"] != admission["binding_id"]
+                    || command_readback["binding_generation"] != admission["generation"] {
+                    return Err("public launch did not retain this exact admitted agent.open/Task/Attempt/binding".to_owned());
+                }
+                fs::write(scratch.join("execute-after-public-readback"), b"continue\n").map_err(display)?;
+
+                (task, launch_id.to_owned(), launch_readback, admission, None)
+        };
         let mut evidence = tokio::time::timeout(Duration::from_secs(180), async {
             loop {
-                if let Ok(bytes) = fs::read(&evidence_file) {
-                    if let Ok(evidence) = serde_json::from_slice::<Value>(&bytes) { break Ok::<_, String>(evidence); }
+                if let Ok(bytes) = fs::read(&evidence_file)
+                    && let Ok(evidence) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    break Ok::<_, String>(evidence);
                 }
                 if host.try_wait().map_err(display)?.is_some() { return Err("host exited before owned worker evidence".to_owned()); }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }).await.map_err(|_| "owned worker did not publish bounded connected evidence".to_owned())??;
         if evidence.get("fixture_failure").is_some() { return Err("actual owned composition failed; private scratch retained".to_owned()); }
-        let operation_id = evidence["operation_id"].as_str().ok_or_else(|| "worker evidence omitted its actual command".to_owned())?;
-        let operation = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":operation_id})).await?;
-        if operation["method"] != "agent.open" || operation["task_id"] != task["task_id"]
-            || operation["binding_id"] != evidence["binding_id"] || operation["binding_generation"] != evidence["generation"]
-            || operation["attempt_id"] != launch_readback["attempt_id"] || operation["prerequisite_operation_id"] != launch_id
-            || admission["operation_id"] != operation_id || admission["owner_nonce"] != evidence["owner_nonce"]
-            || operation["state"] != "rejected" || operation["result"]["outcome"] != "rejected" {
-            return Err("public readback did not bind the rejected command to this exact owned launch".to_owned());
+        let operation_id = evidence["operation_id"]
+            .as_str()
+            .ok_or_else(|| "worker evidence omitted its actual command".to_owned())?;
+        let operation = call_host(
+            &host_data_dir,
+            &operator,
+            "operation.get",
+            json!({"operation_id":operation_id}),
+        )
+        .await?;
+        if let Some(expected_operation_id) = app299_operation_id.as_deref() {
+            if operation_id != expected_operation_id
+                || operation["method"] != json!("agent.open")
+                || operation["operation_id"] != json!(expected_operation_id)
+                || operation["binding_id"] != admission["binding_id"]
+                || operation["binding_generation"] != admission["generation"]
+                || operation["state"] != json!("settled")
+                || operation["result"]["outcome"] != json!("applied")
+                || admission["owner_nonce"] != evidence["owner_nonce"]
+                || evidence["outcome"]["outcome"] != json!("applied")
+                || evidence["outcome"]["details"]["completion_condition"]
+                    != json!("native_session_created")
+                || evidence["outcome"]["details"]["durable_origin"]
+                    != json!("exact_session_created_event")
+            {
+                return Err("public Operation, adapter outcome and module.next command do not share the APP299 identity".to_owned());
+            }
+            let completed = app299_client
+                .as_mut()
+                .ok_or_else(|| "public Tasks client was not retained through consumption".to_owned())?
+                .task_get(expected_operation_id)
+                .await?;
+            if completed["taskId"] != json!(expected_operation_id)
+                || completed["status"] != json!("completed")
+            {
+                return Err("MCP tasks/get did not project the acknowledged Operation as completed".to_owned());
+            }
+            let owner_nonce = evidence["owner_nonce"]
+                .as_str()
+                .ok_or_else(|| "adapter evidence omitted the native owner nonce".to_owned())?;
+            let native_state = native_base.join("launches").join(owner_nonce);
+            let observation: Value = serde_json::from_slice(
+                &fs::read(native_state.join("fixture-observation.json")).map_err(display)?,
+            )
+            .map_err(display)?;
+            let posted_session = &observation["root_create_request"];
+            let posted_session_id = posted_session["id"].as_str().unwrap_or_default();
+            let operation_marker = posted_session["metadata"]["eliot"]["operation"]
+                .as_str()
+                .unwrap_or_default();
+            let binding_marker = posted_session["metadata"]["eliot"]["binding"]
+                .as_str()
+                .unwrap_or_default();
+            let generation_marker = posted_session["metadata"]["eliot"]["generation"]
+                .as_i64()
+                .unwrap_or_default();
+            let post_count = observation["route_identities"]
+                .as_array()
+                .map(|routes| {
+                    routes
+                        .iter()
+                        .filter(|route| *route == "POST /api/session")
+                        .count()
+                })
+                .unwrap_or_default();
+            if evidence["root_posts"] != json!(1)
+                || observation["root_create_posts"] != json!(1)
+                || post_count != 1
+                || posted_session_id.is_empty()
+                || posted_session_id != evidence["outcome"]["native_root_id"]
+                || posted_session_id != observation["root_session_created_id"]
+                || operation_marker != expected_operation_id
+                || binding_marker != admission["binding_id"].as_str().unwrap_or_default()
+                || generation_marker != admission["generation"].as_i64().unwrap_or_default()
+            {
+                return Err("captured native POST/event identity or count differs from the retained Operation".to_owned());
+            }
+            let client = app299_client
+                .take()
+                .ok_or_else(|| "public Tasks client was not retained through completion".to_owned())?;
+            client.close().await;
+            evidence["tasks_get_readback"] = completed;
+            evidence["native_http_observation"] = observation;
+        } else {
+            if operation["method"] != json!("agent.open")
+                || operation["task_id"] != task["task_id"]
+                || operation["binding_id"] != evidence["binding_id"]
+                || operation["binding_generation"] != evidence["generation"]
+                || operation["attempt_id"] != launch_readback["attempt_id"]
+                || operation["prerequisite_operation_id"] != json!(launch_id)
+                || admission["operation_id"] != json!(operation_id)
+                || admission["owner_nonce"] != evidence["owner_nonce"]
+                || operation["state"] != json!("rejected")
+                || operation["result"]["outcome"] != json!("rejected")
+            {
+                return Err("public readback did not bind the rejected command to this exact owned launch".to_owned());
+            }
         }
-        if operation["result"].get("details").is_some() || operation["result"]["provider_auth"].is_object() {
+        if operation["result"].get("details").is_some()
+            || operation["result"]["provider_auth"].is_object()
+        {
             return Err("public operation.get exposed private outcome details".to_owned());
         }
         let public_bytes = serde_json::to_vec(&operation).map_err(display)?;
         let evidence_bytes = serde_json::to_vec(&evidence).map_err(display)?;
         for bytes in [&public_bytes, &evidence_bytes] {
-            if contains_bytes(bytes, provider_key.as_bytes()) || contains_bytes(bytes, auth_source.to_string_lossy().as_bytes()) {
+            if contains_bytes(bytes, provider_key.as_bytes())
+                || contains_bytes(bytes, auth_source.to_string_lossy().as_bytes())
+            {
                 return Err("provider secret or auth source path entered public/evidence output".to_owned());
             }
         }
@@ -564,7 +799,10 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
     let invalid_model_catalog = case["invalid_model_catalog"]
         .as_bool()
         .ok_or_else(|| "case omitted its scenario".to_owned())?;
-    let scenario = if invalid_model_catalog {
+    let app299_tasks = case["app299_tasks"].as_bool().unwrap_or(false);
+    let scenario = if app299_tasks {
+        "app299-public-tasks-exact-root-session"
+    } else if invalid_model_catalog {
         "post-bootstrap-preflight-schema-rejection"
     } else {
         "post-bootstrap-root-create-http-409"
@@ -580,20 +818,21 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
         .owned_native
         .clone()
         .ok_or_else(|| "real demand omitted fresh owned authority".to_owned())?;
-    let allowed_workspace_root = PathBuf::from(
+    let allowed_workspace_root = fs::canonicalize(
         case["workspace_root"]
             .as_str()
             .ok_or_else(|| "case omitted workspace root".to_owned())?,
-    );
+    )
+    .map_err(display)?;
+    let canonical_native_directory =
+        fs::canonicalize(&native_options.directory).map_err(display)?;
     let native_base = PathBuf::from(
         case["native_base"]
             .as_str()
             .ok_or_else(|| "case omitted native base".to_owned())?,
     );
-    if !native_options
-        .directory
-        .starts_with(&allowed_workspace_root)
-        || native_options.directory == allowed_workspace_root
+    if !canonical_native_directory.starts_with(&allowed_workspace_root)
+        || canonical_native_directory == allowed_workspace_root
         || native_options.model.id != "fixture-model"
         || native_options.model.provider_id != "openai"
         || native_options.model.variant != "fixture-variant"
@@ -656,8 +895,13 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }).await.map_err(|_| "actual module.next did not supply the admitted command".to_owned())??;
-        if command.method != "agent.open" || command.binding_id != binding_id || command.generation != generation
-            || command.route["native_options"]["directory"] != json!(native_options.directory) {
+        if command.method != "agent.open"
+            || command.binding_id != binding_id
+            || command.generation != generation
+            || command.route["alias"] != ROUTE_ALIAS
+            || command.route["workspace_option"] != "directory"
+            || command.route["native_options"]["directory"] != json!(native_options.directory)
+        {
             return Err("actual module.next command differs from protected owned demand".to_owned());
         }
         verify_command_scope(&adapter_config, &command, &claim).map_err(display)?;
@@ -727,7 +971,18 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
             "key_method":"key",
             "connection_metadata_digest":expected_connection_metadata_digest
         });
-        if outcome["outcome"] != "rejected"
+        if app299_tasks {
+            if outcome["outcome"] != "applied"
+                || outcome["native_root_id"] != expected_root
+                || outcome["details"]["provider_auth"] != expected_provider_auth
+                || outcome["details"]["completion_condition"] != "native_session_created"
+                || outcome["details"]["durable_origin"] != "exact_session_created_event"
+                || outcome["details"]["native_replay"] != false
+                || outcome["details"]["owned_service_ready"]["owner_nonce"] != owned_native.owner_nonce
+            {
+                return Err("APP299 production outcome lacks the exact native root and provider-auth readback".to_owned());
+            }
+        } else if outcome["outcome"] != "rejected"
             || outcome["details"]["provider_auth"] != expected_provider_auth
             || outcome["details"]["owned_service_ready_only"] != true
             || outcome["details"]["owned_service_ready"]["owner_nonce"] != owned_native.owner_nonce
@@ -736,19 +991,21 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
                 "{scenario}: Journal outcome changed or omitted fields from the exact provider-auth proof"
             ));
         }
-        if invalid_model_catalog {
-            if !outcome["native_root_id"].is_null()
-                || outcome["details"]["diagnostic_code"] != "NATIVE_MODEL_SCHEMA"
+        if !app299_tasks {
+            if invalid_model_catalog {
+                if !outcome["native_root_id"].is_null()
+                    || outcome["details"]["diagnostic_code"] != "NATIVE_MODEL_SCHEMA"
+                    || outcome["details"]["native_replay"] != false
+                {
+                    return Err("preflight rejection changed its root or diagnostic semantics".to_owned());
+                }
+            } else if outcome["native_root_id"] != expected_root
+                || outcome["details"]["diagnostic_code"] != "NATIVE_REJECTED"
+                || outcome["details"]["native_http_failure"]["status"] != 409
                 || outcome["details"]["native_replay"] != false
             {
-                return Err("preflight rejection changed its root or diagnostic semantics".to_owned());
+                return Err("root-create rejection lost its root or rejection semantics".to_owned());
             }
-        } else if outcome["native_root_id"] != expected_root
-            || outcome["details"]["diagnostic_code"] != "NATIVE_REJECTED"
-            || outcome["details"]["native_http_failure"]["status"] != 409
-            || outcome["details"]["native_replay"] != false
-        {
-            return Err("root-create rejection lost its root or rejection semantics".to_owned());
         }
 
         let serialized_outcome = serde_json::to_vec(&outcome).map_err(display)?;
@@ -1091,13 +1348,14 @@ fn write_installed_closure(install_root: &Path, server_source: &str) -> FixtureR
     Ok(sha256(server_source.as_bytes()))
 }
 
-fn test_server_source(invalid_model_catalog: bool) -> String {
+fn test_server_source(invalid_model_catalog: bool, app299_tasks: bool) -> String {
     r#"import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const INVALID_MODEL_CATALOG = __APP320_INVALID_MODEL__;
+const APP299_SUCCESSFUL_ROOT = __APP299_SUCCESSFUL_ROOT__;
 const arg = (name) => {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -1115,6 +1373,8 @@ const observationFile = path.join(stateRoot, "fixture-observation.json");
 const password = (await readFile(passwordFile, "utf8")).replace(/[\r\n]+$/, "");
 let providerKeyPosts = 0;
 let rootCreatePosts = 0;
+let rootCreateRequest = null;
+let rootSession = null;
 const routes = [];
 let endpoint = "";
 const expectedAuthorization = `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`;
@@ -1164,6 +1424,31 @@ const server = createServer(async (request, response) => {
       send(200, { directory, project: { id: "app320-fixture-project" } });
       return;
     }
+    if (request.method === "GET" && url.pathname.startsWith("/api/experimental/session/") && url.pathname.endsWith("/log")) {
+      const root = url.pathname.split("/")[4];
+      if (!APP299_SUCCESSFUL_ROOT || !rootSession || root !== rootSession.id || url.searchParams.get("follow") !== "false") {
+        send(404, { message: "APP299 exact durable session log not found" });
+        return;
+      }
+      const createdEvent = {
+        id: "evt_app299_session_created",
+        type: "session.created",
+        aggregateID: rootSession.id,
+        data: {
+          sessionID: rootSession.id,
+          parentID: null,
+          metadata: rootSession.metadata,
+          model: rootSession.model
+        },
+        created: 1700000000,
+        durable: { aggregateID: rootSession.id, version: 1, seq: 1 }
+      };
+      const syncedEvent = { type: "log.synced", aggregateID: rootSession.id, seq: 1 };
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: " + JSON.stringify(createdEvent) + "\n\n" +
+                   "data: " + JSON.stringify(syncedEvent) + "\n\n");
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/api/integration/openai/connect/key") {
       for await (const _chunk of request) { /* consume without retaining key bytes */ }
       providerKeyPosts += 1;
@@ -1171,9 +1456,23 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/session") {
-      for await (const _chunk of request) { /* consume without retaining request data */ }
+      const chunks = [];
+      for await (const chunk of request) { chunks.push(chunk); }
+      rootCreateRequest = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       rootCreatePosts += 1;
-      send(409, { message: "APP320 fixture root creation rejected" });
+      if (APP299_SUCCESSFUL_ROOT) {
+        rootSession = {
+          id: rootCreateRequest.id,
+          parentID: null,
+          fork: null,
+          location: rootCreateRequest.location,
+          model: rootCreateRequest.model,
+          metadata: rootCreateRequest.metadata
+        };
+        send(200, { data: rootSession });
+      } else {
+        send(409, { message: "APP320 fixture root creation rejected" });
+      }
       return;
     }
     for await (const _chunk of request) { /* drain unsupported request bodies */ }
@@ -1232,6 +1531,8 @@ function stopFromOwnerEnd() {
         schema_version: 1,
         provider_key_posts: providerKeyPosts,
         root_create_posts: rootCreatePosts,
+        root_create_request: rootCreateRequest,
+        root_session_created_id: rootSession ? rootSession.id : null,
         route_identities: routes,
         endpoint,
       };
@@ -1258,6 +1559,10 @@ process.stdin.resume();
 "#.replace(
         "__APP320_INVALID_MODEL__",
         if invalid_model_catalog { "true" } else { "false" },
+    )
+    .replace(
+        "__APP299_SUCCESSFUL_ROOT__",
+        if app299_tasks { "true" } else { "false" },
     )
 }
 

@@ -25,4 +25,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
+rusqlite = { version = "=0.40.2" }
 swarm-kernel-host = { path = "../swarm-kernel-host" }
+swarm-mcp = { path = "../swarm-mcp" }

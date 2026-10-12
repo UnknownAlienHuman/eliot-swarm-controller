@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod app299_connected_consumer;
+#[cfg(test)]
 mod app320_connected_consumer;
 mod config;
 mod journal;

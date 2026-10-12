@@ -1408,7 +1408,7 @@ mod tests {
         }
     }
 
-    fn assigned_value(directory: &str, session_id: &str) -> Value {
+    fn assigned_value(session_id: &str) -> Value {
         json!({
             "task_id":"task_1",
             "task_revision":1,
@@ -1436,7 +1436,7 @@ mod tests {
     fn assigned_effect(options: &NativeOptions, service_pid: u32) -> Value {
         let directory = options.directory.to_str().unwrap();
         let session_id = "ses_123";
-        let assignment = assigned_value(directory, session_id);
+        let assignment = assigned_value(session_id);
         let assignment_sha256 = digest_json_for_test(&assignment);
         let location_sha256 = raw_sha256(directory.as_bytes());
         json!({
@@ -1478,7 +1478,7 @@ mod tests {
 
     fn installed_server_effect(options: &NativeOptions, service_pid: u32) -> Value {
         let directory = options.directory.to_str().unwrap();
-        let assignment = assigned_value(directory, "ses_123");
+        let assignment = assigned_value("ses_123");
         json!({
             "schema_version":1,
             "kind":"swarm.native_mcp_command",
