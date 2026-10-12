@@ -32,7 +32,7 @@ export async function recoveryState() {
     else if(e instanceof SyntaxError)throw new Error('CHECKPOINT_CORRUPT');
     else throw e;
   }
-  if(saved && (typeof saved!=='object' || Array.isArray(saved)))throw new Error('CHECKPOINT_CORRUPT');
+  if(saved!==undefined && (saved===null || typeof saved!=='object' || Array.isArray(saved)))throw new Error('CHECKPOINT_CORRUPT');
   if(saved && saved.version!==1)throw new Error('UNKNOWN_CHECKPOINT_VERSION');
   let tail=Promise.resolve();
   return {owner,saved,

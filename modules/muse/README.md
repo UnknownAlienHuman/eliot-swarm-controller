@@ -1,10 +1,10 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The TaskPrompt migration targets **`muse-sdk-1.3.0-bridge.9`**. The host must retain and accept the exact bridge.9 descriptor before activating new bindings. Live Muse/Max and Windows native launch remain unqualified; syntax checks do not attest model execution.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The current bridge includes the TaskPrompt migration and uses **`muse-sdk-1.3.0-bridge.10`**. The host must retain and accept the exact bridge.10 descriptor before activating new bindings. Live Muse/Max and Windows native launch remain unqualified; syntax checks do not attest model execution.
 
-**Activation blocker:** the host currently accepts bridge.8. Register and retain
-the bridge.9 descriptor before selecting it for a new binding. Existing bridge.8
-bindings keep their original artifact identity and code.
+Before activation, register and retain the exact bridge.10 descriptor before
+selecting it for a new binding. Existing bindings keep their original artifact
+identity and code; an artifact ID must never be relabelled or cross-served.
 
 ## Ownership and setup
 
@@ -20,7 +20,7 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.9'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.10'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -40,7 +40,7 @@ Use a dedicated initially empty module-state directory, separate from host data.
 
 Inspect `agent.state`, then claim a controller-start Task with binding-id/generation and send `task.dispatch`. Native-manager claims can delegate children without receiving a second controller prompt. Requested effort, applied defaults and actual inference evidence remain distinct. Max is explicit on turns; no silent alternate provider or reduced effort.
 
-## Pending-request refresh — bridge.8
+## Pending-request refresh (introduced in bridge.8)
 
 Server requests and notifications now invalidate the same per-session read
 window. Root and child refresh share one inventory replacement path: every
@@ -56,13 +56,14 @@ This follows the pinned SDK's [approval update field ownership](https://github.c
 No SDK approval handler or automatic decision is installed. Presentation still
 returns `{}`; an answer remains an explicit addressed `agent.reply` Operation.
 
-This code requires artifact `muse-sdk-1.3.0-bridge.9` and refuses to announce a
-previous artifact ID. Stage it for new bindings only. Existing bridge.8 bindings
+This code requires artifact `muse-sdk-1.3.0-bridge.10` and refuses to announce a
+previous artifact ID. Stage it for new bindings only. Existing bridge.9 bindings
 and checkpoints retain their original code and identity; they are not migrated.
-The SDK pin is unchanged. Syntax checks are not behavioral qualification; refresh
-race fixtures, SDK import and native qualification remain pending for bridge.9.
+The SDK pin is unchanged. Verify syntax, SDK import and fixtures for the exact
+staged bridge.10 source before activation, and qualify installed native behavior
+separately. Earlier fixture passes do not qualify bridge.10.
 
-## TaskPrompt v1 — bridge.9
+## TaskPrompt v1 (introduced in bridge.9)
 
 For `task.dispatch`, the bridge consumes the Store-enriched
 `input.task_prompt` and `input.task_dispatch_context`. It checks the exact

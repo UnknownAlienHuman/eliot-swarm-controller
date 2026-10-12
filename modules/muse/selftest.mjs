@@ -146,6 +146,13 @@ function canonicalFixtureJson(value) {
     const { recoveryState } = await import('./checkpoint.mjs');
     const writer = await recoveryState();
     assert.equal(writer.saved, undefined, 'fresh state dir has no checkpoint');
+    const checkpointFile=path.join(dir,'checkpoint.json');
+    await writeFile(checkpointFile,'null','utf8');
+    await assert.rejects(recoveryState(),error=>error.message==='CHECKPOINT_CORRUPT',
+      'a present JSON null checkpoint is corrupt, not an absent checkpoint');
+    await rm(checkpointFile);
+    const missingAgain=await recoveryState();
+    assert.equal(missingAgain.saved,undefined,'removing the corrupt checkpoint restores the existing missing-file behavior');
     await writer.write(fixture.state);
     const reader = await recoveryState();
     assert.equal(reader.saved.version, 1);
@@ -168,6 +175,55 @@ function canonicalFixtureJson(value) {
     await rm(dir, { recursive:true, force:true });
   }
   console.log('PASS checkpoint: pending command round-trips with ID, payload and reconcile fields');
+}
+
+// 4a. Startup recovery must reject a present null checkpoint at the real bridge
+// consumer before connecting to the host or launching the configured native.
+{
+  const dir=await mkdtemp(path.join(os.tmpdir(),'muse-null-checkpoint-startup-'));
+  const stateDir=path.join(dir,'state');
+  await mkdir(stateDir);
+  const ownerFile=path.join(stateDir,'owner.json');
+  const token='fixture-null-checkpoint-boot';
+  await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token}));
+  await writeFile(path.join(stateDir,'checkpoint.json'),'null','utf8');
+  const credentialFile=path.join(dir,'credential.json');
+  const configFile=path.join(dir,'module.json');
+  const nativeScript=path.join(dir,'native-marker.mjs');
+  const nativeMarker=path.join(dir,'native-started');
+  const endpoint=process.platform==='win32'?'\\\\.\\pipe\\muse-null-startup-'+randomUUID():path.join(dir,'control.sock');
+  let controlConnections=0;
+  const server=net.createServer(socket=>{controlConnections++;socket.destroy();});
+  let bridge;
+  let stderr='';
+  try {
+    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
+    await writeFile(credentialFile,JSON.stringify({client_id:'muse-null-fixture',token:'fixture-only'}));
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.10',
+      command:process.execPath,args:[nativeScript]}));
+    await writeFile(nativeScript,
+      `import { writeFile } from 'node:fs/promises';\nawait writeFile(${JSON.stringify(nativeMarker)},'started');\n`,'utf8');
+    const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
+      TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
+    bridge=spawn(process.execPath,[path.join(here,'bridge.mjs'),'--config',configFile],
+      {cwd:here,env,windowsHide:true,stdio:['ignore','ignore','pipe']});
+    bridge.stderr.setEncoding('utf8');
+    bridge.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
+    const closed=new Promise(resolve=>bridge.once('close',(code,signal)=>resolve({code,signal})));
+    let outcome=await Promise.race([closed,delay(5000).then(()=>null)]);
+    if(!outcome){bridge.kill();outcome=await closed;}
+    assert.notEqual(outcome.code,0,'bridge startup refuses the corrupt checkpoint');
+    assert.match(stderr,/CHECKPOINT_CORRUPT/,'bridge exposes the existing recovery-gap classification');
+    assert.equal(controlConnections,0,'corrupt recovery stops before host connection');
+    await assert.rejects(readFile(nativeMarker),error=>error.code==='ENOENT',
+      'corrupt recovery stops before configured native launch');
+    console.log('PASS checkpoint startup fixture: null is a recovery gap before host/native startup');
+  } finally {
+    if(bridge&&bridge.exitCode===null)bridge.kill();
+    if(bridge&&bridge.exitCode===null)await Promise.race([new Promise(resolve=>bridge.once('close',resolve)),delay(3000)]);
+    if(server.listening)await new Promise(resolve=>server.close(resolve));
+    await rm(dir,{recursive:true,force:true});
+  }
 }
 
 // 5. Failed-reconcile classification follows the pinned SDK's durable
@@ -388,7 +444,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.9',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.10',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',nativeFixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};

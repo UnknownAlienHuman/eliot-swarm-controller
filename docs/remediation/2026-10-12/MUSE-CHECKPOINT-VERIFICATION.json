@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-12T10:33:26.9729307Z",
+  "source_base_main": "0783be9605c27c3921a14a064043f8c05b514103",
+  "obligations": [
+    "APP-401"
+  ],
+  "original_obligation": null,
+  "module_artifact": "muse-sdk-1.3.0-bridge.10",
+  "sdk_version": "1.3.0",
+  "node_version": "25.6.1",
+  "behavior": [
+    "A present JSON null, primitive or array checkpoint root is explicitly CHECKPOINT_CORRUPT; absent checkpoint remains saved undefined",
+    "The actual bridge startup fixture refuses corrupt state before host connect or configured native launch",
+    "New artifact bridge10, descriptor version10, examples and operator instructions move together",
+    "Host usage accepts retained bridge9 and new bridge10 while preserving the observed-vs-binding exact artifact guard; authenticated module hello enforces real binding artifact identity"
+  ],
+  "owned_source_sha256": {
+    "modules/muse/checkpoint.mjs": "35C04AEF57335C60E5C75EEAD42771A7BB346AC1B850A022462D7FFBC26B00BA",
+    "modules/muse/selftest.mjs": "BF7AA8900F091FD6BBEB6F0657139DF0909AA4ED590F132098AFF4E04337EA20",
+    "modules/muse/bridge.mjs": "16286D688F8D8197A822CC5C3F4A9CC12A8E8C96827FB6E8D73C73532705C9A8",
+    "modules/muse/module-descriptor.template.json": "1DA95678CE660732AF0B75696DA734B79F8967F5F055640F45A8F499898F1437",
+    "modules/muse/module.example.json": "10EC51FB74A6DE674ACEF08C03C461659A0392B58AD2F134A7024CAE03873DC0",
+    "modules/muse/fixtures/checkpoint-roundtrip.json": "2D452D91BC3172E95690ECA20844FC18B144A576E70820BB9E4314A94A736476",
+    "modules/muse/README.md": "40B7BE7D21CE68B7AD5BCEB1C8863912697067660C23438FE6950F907B345205",
+    "modules/muse/UPDATE.md": "F2DDFEADC078F7F19DBF3898703E06A07C612C6ADC138C6F0892F70F0F778E64",
+    "config/controller.example.toml": "19ECD1EACA15E36ABAD04EA1A2FA8C0C61596F86D9EFD1272D4B0F4022E72008",
+    "crates/swarm-kernel-host/src/store/native_usage.rs": "896BA6505BB8B0048E6BAAC2F27B0E922E878A8EDCC4A3C24BB2D2DC6DE93509"
+  },
+  "authority_document_sha256": {
+    "ELIOT-Swarm-Controller-Execution-Map-2026-10-09.md": "399704762B1190BA9E06DB8E2CD1586771B566FDF0DD0518E973C223A7FEABDB",
+    "ELIOT-Swarm-Controller-HIGH-Appendix-Source-2026-10-09.md": "4A997D7910046092FA0EDEE66C775C05A8428FD6A7AF5D50D686503FF6FCC858",
+    "ELIOT-Swarm-Controller-Master-Audit-2026-10-09-v27.md": "3DEE8664DABA6AC3551128ECF005BFA4E2E21B423346D9D0CE039A1F4F9D2CFF",
+    "ELIOT-Swarm-Controller-Original-Unverified-Suspicions.md": "2DADAADD9BC56B7ABF66EE564732928BFFE29ED0D7E08297F1893E1C8B8BADB0",
+    "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md": "AE8406869C2026D0837EEC15EAF0AF68FCB16448008850597F25A44F5933A974"
+  },
+  "frozen_input_count": 842,
+  "source_manifest_sha256": "E76E06CAC6A502F34D314E3D36645A180707AFCD5AAC7EE1FAE87172D1B60E23",
+  "verification": {
+    "app401-windows-clippy-v2": {
+      "unchanged_code_transfer_delta": [
+        "modules/muse/README.md"
+      ],
+      "exit_code": 0,
+      "record_sha256": "33119191C00A7B710CBFF465A94DE98E985969670F02880B0B14599383AB6954",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log_sha256": "DE220F23B41776FBC1575605DDF63D9824A48FA9BEF2497BCAB01F58CD1924B0",
+      "source_stable": true,
+      "source_edition": "v2"
+    },
+    "app401-windows-tests-v3": {
+      "unchanged_code_transfer_delta": [],
+      "exit_code": 0,
+      "record_sha256": "B5214A404C6265887EE59C19DBB000A708A145AD8AF469CE51936CF6D3BAAA22",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(muse_usage_)"
+      ],
+      "log_sha256": "9D091F22305FEBA710128F53FE212CC93C8C1349410CA19E11F3AD96C37806CA",
+      "source_stable": true,
+      "source_edition": "v3"
+    },
+    "app401-windows-selftest-v3": {
+      "unchanged_code_transfer_delta": [],
+      "exit_code": 0,
+      "record_sha256": "88C86BA3F45BF22F8041CFC42C3448BA15EBA109746D40DD8FB7162ADBB66384",
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "selftest.mjs"
+      ],
+      "log_sha256": "4E41B4AA41BB5764058AF414BDFC824DBA94B730E44E60BFFC0B5DE1EF753205",
+      "source_stable": true,
+      "source_edition": "v3"
+    },
+    "app401-linux-clippy-v2": {
+      "unchanged_code_transfer_delta": [
+        "modules/muse/README.md"
+      ],
+      "exit_code": 0,
+      "record_sha256": "4FD833751FF9844217B0E8320ECAA1B624A627166F8513E093C3949951E5D0F6",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log_sha256": "FE30BB988E77713629727D746E34C8359B38671FBAB520F4656F42B7574E6F9A",
+      "source_stable": true,
+      "source_edition": "v2"
+    },
+    "app401-linux-tests-v3": {
+      "unchanged_code_transfer_delta": [],
+      "exit_code": 0,
+      "record_sha256": "6BC0AA52240270AF7FF86079DB396A441EA957E7929F18E62C82A230134FEFBE",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "-E",
+        "test(muse_usage_)"
+      ],
+      "log_sha256": "6266AF2089D50B5024020DA094A87A9F8BC7D21314D04F77E18DBF5A047CE6D7",
+      "source_stable": true,
+      "source_edition": "v3"
+    },
+    "app401-linux-selftest-v3": {
+      "unchanged_code_transfer_delta": [],
+      "exit_code": 0,
+      "record_sha256": "0F3A03836A05DE80746C703FAE202DAE548BCC3836B5ABFB57CE54F8D38B5C20",
+      "command": [
+        "wsl",
+        "-d",
+        "Ubuntu",
+        "--exec",
+        "bash",
+        "-lc",
+        "set -e; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-v27-current-20261012/eliot-swarm-controller/modules/muse; export PATH=/home/kleymor/.local/share/eliot-js-qualification/node-v25.6.1-linux-x64/bin:/usr/bin:/bin; test \"$(node --version)\" = v25.6.1; node --version; node selftest.mjs"
+      ],
+      "log_sha256": "799D07A1194F7337BB9A9E9D7C2EF94CA7FE2AFEAD98AA4C12C6336086A9F991",
+      "source_stable": true,
+      "source_edition": "v3"
+    },
+    "app401-windows-syntax-sdk-v1": {
+      "unchanged_code_transfer_delta": [
+        "crates/swarm-kernel-host/src/store/native_usage.rs",
+        "modules/muse/README.md"
+      ],
+      "exit_code": 0,
+      "record_sha256": "AE9DF3543E3AAB2FC15620940998CE90CB4D108F83633B411A03AA232CAEDC96",
+      "command": [
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "node --check all modules/muse/*.mjs",
+        "node --input-type=module exact SDK exports"
+      ],
+      "log_sha256": "BA07382D908AF082F6E82C58ACD947B895872D3E26A91831369390A9DBD7C359",
+      "source_stable": true,
+      "source_edition": "v1"
+    },
+    "app401-linux-syntax-sdk-v3": {
+      "unchanged_code_transfer_delta": [],
+      "exit_code": 0,
+      "record_sha256": "DA84FA09D59A81CF375B12C5797AA70DEF05F13BEAF96CFB670EB3E2B6AC4B18",
+      "command": [
+        "wsl",
+        "-d",
+        "Ubuntu",
+        "--exec",
+        "bash",
+        "-lc",
+        "set -e; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-v27-current-20261012/eliot-swarm-controller/modules/muse; export PATH=/home/kleymor/.local/share/eliot-js-qualification/node-v25.6.1-linux-x64/bin:/usr/bin:/bin; test \"$(node --version)\" = v25.6.1; node --version; for file in ./*.mjs; do node --check \"$file\"; printf \"PASS syntax %s\\n\" \"$file\"; done; node --input-type=module -e 'import { spawnMspConnection, Connection } from \"@muse-code/sdk\"; if(typeof spawnMspConnection!==\"function\"||typeof Connection!==\"function\")throw new Error(\"SDK export mismatch\"); console.log(\"PASS pinned SDK exports\");'"
+      ],
+      "log_sha256": "3A272FF94A3332977E4A19684E99F43A2D4E22F820FF607F40CBD825C4595E47",
+      "source_stable": true,
+      "source_edition": "v3"
+    }
+  },
+  "actual_host_consumers": {
+    "windows": [
+      "store::native_usage::tests::muse_usage_rejects_wrong_artifact",
+      "store::native_usage::tests::muse_usage_accepts_module_runtime",
+      "store::native_usage::tests::muse_usage_rejects_unrelated_runtime",
+      "store::native_usage::tests::muse_usage_accepts_documented_muse_runtime",
+      "store::native_usage::tests::muse_usage_accepts_bridge10_without_cross_serving_bridge9",
+      "store::native_usage::tests::muse_usage_requires_observation_sequence"
+    ],
+    "linux": [
+      "store::native_usage::tests::muse_usage_requires_observation_sequence",
+      "store::native_usage::tests::muse_usage_accepts_bridge10_without_cross_serving_bridge9",
+      "store::native_usage::tests::muse_usage_accepts_documented_muse_runtime",
+      "store::native_usage::tests::muse_usage_accepts_module_runtime",
+      "store::native_usage::tests::muse_usage_rejects_wrong_artifact",
+      "store::native_usage::tests::muse_usage_rejects_unrelated_runtime"
+    ]
+  },
+  "independent_review": {
+    "resolved_v2_p2": "README activation/qualification artifact instructions",
+    "p1": 0,
+    "p2": 0,
+    "sha256": "E5185DCA6C1B18DD6B4CE1F58FABFFD2CDD80D251D603C188A8C1981910129CA",
+    "artifact": "app401-independent-final-candidate-review-v3-20261012.json"
+  },
+  "gate_transfer": [
+    "Windows syntax/npm/import v1 retained: all JavaScript and SDK inputs unchanged through v3; deltas are host-only Rust type repair and README",
+    "Strict host Clippy v2 retained: sole v2-to-v3 delta is README; executable bytes unchanged"
+  ],
+  "qualification_inputs": {
+    "unqualified_root_wip_excluded": true,
+    "protected_tracked_wip_paths": 15,
+    "all_842_inputs_tracked": true,
+    "protected_untracked_paths": 49,
+    "isolated_candidate_has_only_owned_source_delta": true,
+    "canonical_base": "0783be9605c27c3921a14a064043f8c05b514103"
+  },
+  "boundaries": [
+    "Six host consumers and seven Muse selftest groups passed on each OS; other Rust tests skipped",
+    "Host lib-test build retains 24 existing warnings; strict affected production Clippy clean",
+    "Fixture host/native children are local Node fixtures; installed Muse/Max activation not performed",
+    "Full Rust/public/native Step5/Gemini3.8/crash/fault/load/test-vacuum/donor acceptance remains pending"
+  ],
+  "full_v27_qualified": false
+}

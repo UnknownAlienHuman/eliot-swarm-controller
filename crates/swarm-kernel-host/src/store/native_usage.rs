@@ -35,11 +35,13 @@ pub(super) fn parse(
     let matching = match snapshot.service {
         UsageService::Codex => artifact == "codex-rust-controller.1",
         UsageService::Muse => {
-            artifact == "muse-sdk-1.3.0-bridge.9"
-                && matches!(
-                    binding["route"]["runtime"].as_str(),
-                    Some("muse" | "module")
-                )
+            matches!(
+                artifact,
+                "muse-sdk-1.3.0-bridge.9" | "muse-sdk-1.3.0-bridge.10"
+            ) && matches!(
+                binding["route"]["runtime"].as_str(),
+                Some("muse" | "module")
+            )
         }
     };
     if !matching
@@ -253,6 +255,35 @@ mod tests {
             result.expect("ordered usage is returned").service,
             UsageService::Muse
         );
+    }
+
+    #[test]
+    fn muse_usage_accepts_bridge10_without_cross_serving_bridge9() {
+        let mut current_observation = observation(snapshot());
+        current_observation["module_artifact_id"] = json!("muse-sdk-1.3.0-bridge.10");
+        for runtime in ["muse", "module"] {
+            let result = parse(
+                &current_observation,
+                &binding(runtime, "muse-sdk-1.3.0-bridge.10"),
+                Some(1),
+            )
+            .expect("bridge10 usage is admitted for its exact binding");
+            assert_eq!(
+                result.expect("ordered usage is returned").service,
+                UsageService::Muse
+            );
+        }
+        for (observed, bound) in [("9", "10"), ("10", "9")] {
+            let mut state = observation(snapshot());
+            state["module_artifact_id"] = json!(format!("muse-sdk-1.3.0-bridge.{observed}"));
+            let error = parse(
+                &state,
+                &binding("muse", &format!("muse-sdk-1.3.0-bridge.{bound}")),
+                Some(1),
+            )
+            .expect_err("different artifact versions never cross-serve a binding");
+            assert_eq!(error.code, "NATIVE_USAGE_SOURCE_MISMATCH");
+        }
     }
 
     #[test]

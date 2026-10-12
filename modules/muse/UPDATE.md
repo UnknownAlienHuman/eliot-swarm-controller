@@ -9,7 +9,7 @@ the new version is activated for new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Module artifact | `muse-sdk-1.3.0-bridge.9` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
+| Module artifact | `muse-sdk-1.3.0-bridge.10` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
 | SDK package | `@muse-code/sdk` **1.3.0**, exact, via `package.json` + `package-lock.json`; installed module-locally with `npm ci`, never globally |
 | SDK canonical source | `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT); the MSP schema is pinned at that commit |
 | Bridge code | ELIOT-owned `*.mjs` in this directory (`bridge`, `checkpoint`, `control`, `owned`, `results`, `settings`) |
@@ -34,7 +34,7 @@ handled at the bridge boundary or by a new pin, not by patching
 
 - SDK version change: artifact becomes `muse-sdk-<new-sdk>-bridge.1`.
 - Bridge-only change on the same SDK: increment the suffix,
-  `bridge.8` → `bridge.9`.
+  `bridge.9` → `bridge.10`.
 
 Any change to shipped bridge code or to the SDK pin gets a new artifact
 id. Reusing an existing id for different code is forbidden: bindings
@@ -73,18 +73,20 @@ or Windows qualification; live qualification of the new pin against the
 installed runtime is a separate step and never follows from these
 checks.
 
-Bridge.9 adds Store-provided TaskPrompt v1 consumption, exact prompt byte/digest
-admission, and native usage evidence projection. The SDK pin and native
-command/recovery protocol are unchanged. The current bridge rejects a
-configuration naming an earlier artifact; do not relabel an existing
-checkpoint or overwrite a running bridge to bypass that check. The host must
-retain and accept the exact bridge.9 descriptor before activation. No earlier
-fixture pass is transferred to bridge.9.
+Bridge.10 retains the TaskPrompt v1 and native usage behavior introduced in
+bridge.9. A present checkpoint containing JSON null now fails with
+CHECKPOINT_CORRUPT before host connection or native launch; an absent checkpoint
+keeps its existing fresh-state behavior. The SDK pin is unchanged. The current
+bridge rejects a configuration naming an earlier artifact; do not relabel an
+existing checkpoint or overwrite a running bridge to bypass that check. The
+host must retain and accept the exact bridge.10 descriptor before activation.
+No earlier fixture pass is transferred to bridge.10.
 
 ## Activation
 
-**Current activation blocker:** the host currently accepts bridge.8. Register
-the exact bridge.9 descriptor before activating this source for new bindings.
+The host native-usage consumer supports bridge.9 and bridge.10 while checking
+each observation against its binding's exact artifact. Register the exact
+bridge.10 descriptor before activating this source for new bindings.
 
 Activation is per binding, through the recorded artifact id:
 

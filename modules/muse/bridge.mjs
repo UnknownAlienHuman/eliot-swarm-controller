@@ -20,8 +20,8 @@ import {
   restoredNativeUsageSnapshot,
 } from './native-usage.mjs';
 
-const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.9';
-const MUSE_ARTIFACT_VERSION = '9';
+const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.10';
+const MUSE_ARTIFACT_VERSION = '10';
 const MAX_TASK_PROMPT_BYTES = 1_000_000;
 const SHA256 = /^[0-9a-f]{64}$/;
 const TASK_PROMPT_FIELDS = [
