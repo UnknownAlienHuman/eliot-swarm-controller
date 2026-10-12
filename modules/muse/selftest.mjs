@@ -199,7 +199,7 @@ function canonicalFixtureJson(value) {
   try {
     await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-null-fixture',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.10',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
       command:process.execPath,args:[nativeScript]}));
     await writeFile(nativeScript,
       `import { writeFile } from 'node:fs/promises';\nawait writeFile(${JSON.stringify(nativeMarker)},'started');\n`,'utf8');
@@ -244,6 +244,8 @@ function canonicalFixtureJson(value) {
 {
   const childFixture=await load('child-freshness.json');
   const unknownFixture=await load('unknown-server-request.json');
+  const oversizedPendingRequestFixture=await load('oversized-pending-request.json');
+  const oversizedViewGapFixture=await load('oversized-view-gap.json');
   const staleFixture=await load('exact-turn-stale.json');
   const checkpointFixture=await load('checkpoint-roundtrip.json');
   const dir=await mkdtemp(path.join(os.tmpdir(),'muse-bridge-selftest-'));
@@ -278,18 +280,67 @@ function canonicalFixtureJson(value) {
 
   const nativeFixturePath=path.join(dir,'native-fixtures.json');
   const auditPath=path.join(dir,'native-audit.json');
-  await writeFile(nativeFixturePath,JSON.stringify({child:childFixture,unknown:unknownFixture,stale:staleFixture}));
+  const approvalRequest=(identity,rawArgsBytes=0)=>({jsonrpc:'2.0',id:identity.request_id,
+    method:oversizedPendingRequestFixture.expected.method,params:{
+      approvalId:identity.approval_id,
+      availableChoices:[{choiceId:'allow-once',decision:'approved',label:'Allow once',scope:'once'}],
+      currentRequirementId:{approvalId:identity.approval_id,sourceIndex:0},
+      itemId:'itm_oversized_fixture',judgeEscalated:false,protectedWrite:false,
+      rawArgs:'x'.repeat(rawArgsBytes),sessionId:identity.session_id,
+      sourceRange:{first:{id:'event_fixture',sequence:1},last:{id:'event_fixture',sequence:1},
+        stream:{id:identity.session_id,kind:'session'}},
+      subject:{kind:'tool',toolName:'fixture'},taskId:'task_oversized_fixture',
+      toolCallId:'toolcall_oversized_fixture',toolName:'fixture',turnId:'turn_oversized_fixture',
+      viewCursor:'cursor_oversized_fixture',
+    }});
+  const oversizedPendingRequest=approvalRequest(oversizedPendingRequestFixture,
+    oversizedPendingRequestFixture.payload_bytes);
+  const identityOverflowRequest=approvalRequest({
+    request_id:oversizedPendingRequestFixture.identity_overflow.request_id,
+    session_id:oversizedPendingRequestFixture.identity_overflow.session_id,
+    approval_id:'x'.repeat(oversizedPendingRequestFixture.identity_overflow.approval_id_bytes),
+  });
+  const fittingSiblingRequest=approvalRequest({
+    request_id:oversizedPendingRequestFixture.fitting_sibling.request_id,
+    session_id:oversizedPendingRequestFixture.fitting_sibling.session_id,
+    approval_id:oversizedPendingRequestFixture.fitting_sibling.approval_id,
+  });
+  const opaqueCursor=(prefix,byteLength,fill)=>{
+    if(prefix.length>byteLength||Buffer.byteLength(prefix)!==prefix.length)throw new Error('INVALID_GAP_CURSOR_FIXTURE');
+    return prefix+fill.repeat(byteLength-prefix.length);
+  };
+  const oversizedViewGap={jsonrpc:'2.0',method:'view/gap',params:{
+    after:opaqueCursor(oversizedViewGapFixture.after_prefix,oversizedViewGapFixture.after_ascii_bytes,'a'),
+    next:opaqueCursor(oversizedViewGapFixture.next_prefix,oversizedViewGapFixture.next_ascii_bytes,'n'),
+    sessionId:oversizedViewGapFixture.session_id,
+  }};
+  const oversizedViewGapBytes=Buffer.byteLength(JSON.stringify(oversizedViewGap))+1;
+  assert.ok(oversizedViewGapBytes>oversizedViewGapFixture.outgoing_frame_limit_bytes,
+    'the native gap bracket exceeds the outbound observation envelope');
+  assert.ok(oversizedViewGapBytes<oversizedViewGapFixture.incoming_frame_limit_bytes,
+    'the valid native view/gap notification remains below the pinned SDK inbound frame cap');
+  const pendingRequestIds=[oversizedPendingRequest.id,identityOverflowRequest.id,fittingSiblingRequest.id];
+  assert.ok(Buffer.byteLength(JSON.stringify(oversizedPendingRequest))>1_048_576,
+    'synthetic approval/request details exceed the frame cap before projection');
+  assert.ok(Buffer.byteLength(JSON.stringify(identityOverflowRequest.params.approvalId))>1_048_576,
+    'the second exact native identity cannot fit in any bounded observation frame');
+  await writeFile(nativeFixturePath,JSON.stringify({child:childFixture,unknown:unknownFixture,stale:staleFixture,
+    oversizedPendingRequest,identityOverflowRequest,fittingSiblingRequest,oversizedViewGap,pendingRequestIds}));
   const nativeScript=path.join(dir,'fake-native.mjs');
   await writeFile(nativeScript,String.raw`
 import { readFile, writeFile } from 'node:fs/promises';
 const arg=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]};
 const home=arg('--home'),auditPath=arg('--audit'),fixturePath=arg('--fixtures');
 const fixtures=JSON.parse(await readFile(fixturePath,'utf8'));
-const audit={methods:[],child_reads:0,unknown_response:null,turn_steer:null,finished:false};
-let auditTail=Promise.resolve(),buffer='',rootReads=0;
+const audit={methods:[],child_reads:0,unknown_response:null,pending_request_responses:[],turn_steer:null,finished:false};
+let auditTail=Promise.resolve(),buffer='',rootReads=0,finishAfterPendingAcks=false;
 const save=()=>{const bytes=JSON.stringify(audit);auditTail=auditTail.then(()=>writeFile(auditPath,bytes));return auditTail};
 const send=packet=>process.stdout.write(JSON.stringify(packet)+'\n');
 const respond=(id,result,error,after)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,...(error?{error}:{result})})+'\n',after);
+async function finishIfReady(){
+  if(!finishAfterPendingAcks||audit.pending_request_responses.length!==fixtures.pendingRequestIds.length)return;
+  audit.finished=true;await save();process.exit(0);
+}
 function sessionRead(id){
   if(id===fixtures.child.root_session.sessionId){
     rootReads++;
@@ -301,6 +352,9 @@ function sessionRead(id){
 function handle(frame){
   if(typeof frame.method!=='string'){
     if(frame.id===fixtures.unknown.request.id){audit.unknown_response=frame;void save();}
+    if(fixtures.pendingRequestIds.includes(frame.id)){
+      audit.pending_request_responses.push(frame);void save();void finishIfReady();
+    }
     return;
   }
   if(!Object.hasOwn(frame,'id')){
@@ -333,6 +387,13 @@ function handle(frame){
   if(frame.method==='turn/steer'){
     audit.turn_steer={expectedTurnId:frame.params?.expectedTurnId,commandId:frame.params?.commandId};
     send({jsonrpc:'2.0',method:fixtures.child.native_event_after_fresh.method,params:fixtures.child.native_event_after_fresh.params});
+    send(fixtures.oversizedViewGap);
+    // Deliver after the refresh read. The first overlarge request is observed
+    // before the identity-overflow siblings arrive, proving projection does
+    // not mutate the bridge's full pending-request inventory.
+    send(fixtures.oversizedPendingRequest);
+    setTimeout(()=>send(fixtures.identityOverflowRequest),1200);
+    setTimeout(()=>send(fixtures.fittingSiblingRequest),1600);
     audit.child_event_after_fresh=true;
     if(frame.params?.expectedTurnId!==fixtures.stale.native.active_turn_id){
       respond(frame.id,null,fixtures.stale.native.stale_error,()=>{void save();});
@@ -346,7 +407,7 @@ function handle(frame){
       audit.unrequested_turn_start_count=(audit.unrequested_turn_start_count??0)+1;
       respond(frame.id,null,fixtures.stale.native.stale_error,()=>{void save();});
     } else respond(frame.id,null,fixtures.stale.nonsettling.native_error,async()=>{
-      audit.finished=true;await save();process.exit(0);
+      finishAfterPendingAcks=true;await finishIfReady();
     });
     return;
   }
@@ -373,6 +434,7 @@ process.stdin.on('end',()=>process.exit(0));
   };
   const commands=[storeCommand(commandIds.recover,AT_MS,'agent.recover',{expected_boot_id:token})];
   const outcomes=new Map(),observations=[],rpcMethods=[],deliveredCommands=[];
+  let oversizedObservation=null,firstIdentityOnlyObservation=false,controlConnectionCount=0;
   let refreshQueued=false,staleQueued=false,nonsettlingQueued=false,resolveFinished,rejectFinished;
   const finished=new Promise((resolve,reject)=>{resolveFinished=resolve;rejectFinished=reject;});
   function maybeAdvance() {
@@ -397,9 +459,9 @@ process.stdin.on('end',()=>process.exit(0));
       nonsettlingQueued=true;commands.push(storeCommand(commandIds.nonsettling,AT_MS+3,'agent.send',
         staleFixture.nonsettling.input));
     }
-    if(outcomes.has(commandIds.nonsettling))resolveFinished();
+    if(outcomes.has(commandIds.nonsettling)&&oversizedObservation)resolveFinished();
   }
-  async function respondHost(socket,packet){
+  async function respondHost(socket,packet,frameBytes){
     rpcMethods.push(packet.method);
     let result={};
     if(packet.method==='client.hello')result={client_id:'muse-fixture-client'};
@@ -415,11 +477,30 @@ process.stdin.on('end',()=>process.exit(0));
     } else if(packet.method==='module.outcome'){
       const outcome=packet.params;outcomes.set(outcome.operation_id,outcome);maybeAdvance();
     } else if(packet.method==='module.observe'){
-      observations.push(packet.params.state);maybeAdvance();
+      const state=packet.params.state;
+      observations.push(state);
+      const gap=state.gap_fill;
+      const hasOversizedViewGap=gap?.status==='unfilled'
+        &&gap?.session_id===oversizedViewGapFixture.session_id
+        &&gap?.projection_state==='incomplete'
+        &&gap?.projection_reason==='opaque_gap_bracket_did_not_fit_complete_observation_frame'
+        &&gap?.projection_omission==='opaque_cursor_bracket'
+        &&gap?.cursors_complete===false&&gap?.after===null&&gap?.next===null;
+      const pending=Array.isArray(state.pending_requests)?state.pending_requests:[];
+      const hasOversizedIdentity=pending.some(request=>request.method===oversizedPendingRequestFixture.expected.method
+        &&request.params?.sessionId===oversizedPendingRequestFixture.session_id
+        &&request.params?.approvalId===oversizedPendingRequestFixture.approval_id);
+      const hasFittingSibling=pending.some(request=>request.method===oversizedPendingRequestFixture.expected.method
+        &&request.params?.sessionId===oversizedPendingRequestFixture.fitting_sibling.session_id
+        &&request.params?.approvalId===oversizedPendingRequestFixture.fitting_sibling.approval_id);
+      if(hasOversizedIdentity&&!hasFittingSibling)firstIdentityOnlyObservation=true;
+      if(hasOversizedIdentity&&hasFittingSibling&&hasOversizedViewGap)oversizedObservation={state,frameBytes};
+      maybeAdvance();
     }
     socket.write(JSON.stringify({jsonrpc:'2.0',id:packet.id,result})+'\n');
   }
   server.on('connection',socket=>{
+    controlConnectionCount++;
     sockets.add(socket);socket.setEncoding('utf8');let buffer='';
     socket.on('close',()=>sockets.delete(socket));
     socket.on('error',error=>{
@@ -432,7 +513,7 @@ process.stdin.on('end',()=>process.exit(0));
       buffer+=chunk;let end;
       while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
         let packet;try{packet=JSON.parse(line);}catch{rejectFinished(new Error('fixture host received invalid JSON'));return;}
-        void respondHost(socket,packet).catch(rejectFinished);
+        void respondHost(socket,packet,Buffer.byteLength(line)).catch(rejectFinished);
       }
     });
   });
@@ -444,7 +525,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.10',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',nativeFixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -461,7 +542,14 @@ process.stdin.on('end',()=>process.exit(0));
     const debug={delivered:deliveredCommands,
       outcomes:[...outcomes.values()].map(({operation_id,outcome,details})=>({operation_id,outcome,details})),
       observed:observations.slice(-4).map(state=>`${state.execution}:${(state.observed_children??[]).map(child=>`${child.sessionId}/${child.snapshot_freshness}/${child.last_refresh_attempt?.status}`).join(',')}`),
-      rpc:[...new Set(rpcMethods)],native:nativeDebug};
+      rpc:[...new Set(rpcMethods)],native:nativeDebug,
+      oversized_observation:oversizedObservation?{frame_bytes:oversizedObservation.frameBytes,
+        pending_requests:oversizedObservation.state.pending_requests,
+        pending_requests_state:oversizedObservation.state.pending_requests_state,
+        pending_requests_count:oversizedObservation.state.pending_requests_count,
+        pending_requests_omitted_count:oversizedObservation.state.pending_requests_omitted_count,
+        gap_fill:oversizedObservation.state.gap_fill}:null,
+      control_connections:controlConnectionCount};
     assert.ok(outcomes.has(commandIds.stale),`bridge did not complete stale-turn fixture: ${stderr}; ${JSON.stringify(debug)}`);
     const auditDeadline=Date.now()+3000;
     let audit;
@@ -470,7 +558,78 @@ process.stdin.on('end',()=>process.exit(0));
       if(audit?.finished)break;
       await delay(25);
     }
-    assert.ok(audit?.finished,'fake native fixture did not finish cleanly');
+    assert.ok(audit?.finished,`fake native fixture did not finish cleanly: ${JSON.stringify({
+      delivered:deliveredCommands,outcomes:[...outcomes.values()].map(x=>({operation_id:x.operation_id,outcome:x.outcome})),
+      native_methods:audit?.methods,pending_response_ids:audit?.pending_request_responses?.map(x=>x.id),
+      native_finished:audit?.finished,oversized_observation:oversizedObservation!==null,
+      projection:observations.at(-1)?.observation_projection_state,
+      gap:observations.at(-1)?.gap_fill?.projection_state,
+      children:observations.at(-1)?.observed_children?.map(x=>({session_id:x.sessionId,freshness:x.snapshot_freshness,reason:x.snapshot_freshness_reason})),
+      stderr,
+    })}`);
+    assert.ok(oversizedObservation,
+      'the connected host receives fitting request siblings with a truthful oversized-gap projection');
+    assert.equal(firstIdentityOnlyObservation,true,
+      'the earlier projection preserves its identity in a later report after sibling overflow arrives');
+    assert.ok(oversizedObservation.frameBytes<=1_048_576,
+      'the complete serialized module.observe JSON-RPC line stays within the control frame cap');
+    const projectedGap=oversizedObservation.state.gap_fill;
+    assert.equal(projectedGap.status,oversizedViewGapFixture.expected.projected_gap.status);
+    assert.equal(projectedGap.reason,oversizedViewGapFixture.expected.projected_gap.reason);
+    assert.equal(projectedGap.session_id,oversizedViewGapFixture.expected.projected_gap.session_id);
+    assert.equal(projectedGap.after,null,'an opaque oversized cursor is omitted whole, never truncated');
+    assert.equal(projectedGap.next,null,'both cursors are omitted together');
+    assert.equal(projectedGap.cursors_complete,false);
+    assert.equal(projectedGap.projection_state,'incomplete');
+    assert.equal(projectedGap.projection_reason,
+      oversizedViewGapFixture.expected.projected_gap.projection_reason);
+    assert.equal(projectedGap.projection_omission,
+      oversizedViewGapFixture.expected.projected_gap.projection_omission);
+    const pendingRequests=oversizedObservation.state.pending_requests;
+    assert.ok(Array.isArray(pendingRequests),'overflow preserves an array of individually addressable pending requests');
+    const oversizedDetails=pendingRequests.find(request=>request.params?.sessionId===oversizedPendingRequestFixture.session_id
+      &&request.params?.approvalId===oversizedPendingRequestFixture.approval_id);
+    const fittingSibling=pendingRequests.find(request=>request.params?.sessionId===oversizedPendingRequestFixture.fitting_sibling.session_id
+      &&request.params?.approvalId===oversizedPendingRequestFixture.fitting_sibling.approval_id);
+    assert.ok(oversizedDetails,'large request details do not erase that request identity');
+    assert.ok(fittingSibling,'an oversized sibling identity does not suppress a later fitting request');
+    for(const expected of oversizedViewGapFixture.expected.fitting_pending_requests){
+      assert.ok(pendingRequests.some(request=>request.method===expected.method
+        &&request.params?.sessionId===expected.params.sessionId
+        &&request.params?.approvalId===expected.params.approvalId),
+      `connected gap projection retains exact Store-addressable request ${expected.params.approvalId}`);
+    }
+    for(const request of [oversizedDetails,fittingSibling]){
+      assert.equal(request.method,oversizedPendingRequestFixture.expected.method);
+      assert.equal(request.request_details_state,oversizedPendingRequestFixture.expected.request_details_state);
+      assert.equal(request.params.rawArgs,undefined,'omitted request details are not presented as complete');
+    }
+    assert.equal(pendingRequests.some(request=>request.params?.approvalId===identityOverflowRequest.params.approvalId),false,
+      'the unrepresentable native identity is not truncated or fabricated');
+    assert.equal(oversizedObservation.state.pending_requests_state,'partial');
+    assert.equal(oversizedObservation.state.pending_requests_count,oversizedPendingRequestFixture.expected.pending_request_count);
+    assert.equal(oversizedObservation.state.pending_requests_omitted_count,
+      oversizedPendingRequestFixture.expected.omitted_identity_count);
+    assert.match(oversizedObservation.state.pending_requests_identity_sha256,/^[0-9a-f]{64}$/,
+      'omitted pending identities remain represented by an inventory digest');
+    const expectedIdentityDigest=createHash('sha256');
+    for(const request of [oversizedPendingRequest,identityOverflowRequest,fittingSiblingRequest]){
+      expectedIdentityDigest.update(JSON.stringify([request.method,request.params.sessionId,request.params.approvalId]));
+      expectedIdentityDigest.update('\n');
+    }
+    assert.equal(oversizedObservation.state.pending_requests_identity_sha256,expectedIdentityDigest.digest('hex'),
+      'the gap digest covers exact native identities, including the omitted oversized ID');
+    assert.ok(oversizedObservation.state.gaps>=1&&oversizedObservation.state.family_completeness==='partial',
+      'omission remains an explicit partial observation gap');
+    assert.equal(controlConnectionCount,1,'oversized pending identities do not force a reconnect loop');
+    assert.equal(audit.pending_request_responses.length,pendingRequestIds.length,
+      'all three native server requests receive a response');
+    for(const response of audit.pending_request_responses){
+      assert.deepEqual(response.result,oversizedPendingRequestFixture.expected.presentation_ack,
+        'request presentation ACK does not decide or settle the native question');
+    }
+    assert.equal(audit.methods.some(method=>method==='approval/decide'||method==='userInput/answer'),false,
+      'projection never sends a native decision');
     const staleOutcome=outcomes.get(commandIds.stale);
     assert.equal(staleOutcome.outcome,staleFixture.expected.operation_outcome,'native stale rejection is preserved as rejected');
     assert.equal(staleOutcome.details.native_kind,staleFixture.expected.native_kind,'settlement comes from native commandRejected');
@@ -508,7 +667,7 @@ process.stdin.on('end',()=>process.exit(0));
     const invalidatedChild=afterNativeEvent?.observed_children?.find(c=>c.sessionId===childFixture.checkpoint_child.sessionId);
     assert.equal(invalidatedChild?.snapshot_freshness,childFixture.expected.after_event_snapshot_freshness,'a later native event invalidates the current marker');
     assert.equal(audit.child_event_after_fresh,true,'the fixture native host emitted a child event after the stable read');
-    console.log('PASS bridge B5 fixtures: restored-child freshness, retained stale evidence, unknown server request, exact-turn stale rejection');
+    console.log('PASS bridge fixtures: restored-child freshness, retained stale evidence, unknown server request, exact-turn stale rejection, bounded pending-request observation');
   } finally {
     teardownStarted=true;
     if(bridge&&bridge.exitCode===null)bridge.kill();

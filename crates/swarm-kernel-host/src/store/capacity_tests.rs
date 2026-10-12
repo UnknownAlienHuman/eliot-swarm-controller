@@ -1778,6 +1778,195 @@ fn attention_projection_addresses_exact_facts_and_is_read_only() {
 }
 
 #[test]
+fn partial_muse_observation_keeps_exact_fitting_request_attentions_and_gap() {
+    let db = fixture_db();
+    let mut route = muse_route();
+    route["module_artifact_id"] = json!("muse-sdk-1.3.0-bridge.11");
+    let native = json!({
+        "native_root_id": "ses_root",
+        "native_scope_key": "muse:fixture:scope",
+        "boot_id": "fixture-boot",
+        "family_completeness": "partial",
+        "gaps": 1,
+        "pending_requests_state": "partial",
+        "pending_requests_count": 3,
+        "pending_requests_omitted_count": 1,
+        "pending_requests_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pending_requests": [
+            {"method":"approval/request", "params":{"sessionId":"ses_root", "approvalId":"approval-kept"},
+             "request_details_state":"unknown"},
+            {"method":"userInput/request", "params":{"sessionId":"ses_child", "userInputId":"input-kept"},
+             "request_details_state":"unknown"}
+        ]
+    });
+    insert_binding(&db, "b1", "lane-1", &route, Some(native));
+
+    let before = dump_tables(&db);
+    let attention = capacity::attention_report(&db, 200, 0).unwrap();
+    assert_eq!(
+        before,
+        dump_tables(&db),
+        "partial attention projection writes nothing"
+    );
+    let items = attention["items"].as_array().unwrap();
+    let waiting: Vec<&Value> = items
+        .iter()
+        .filter(|item| item["kind"] == "waiting_for_native_request")
+        .collect();
+    assert_eq!(
+        waiting.len(),
+        2,
+        "only individually retained request identities become attentions"
+    );
+    assert!(waiting.iter().any(|item| {
+        item["address"]["session_id"] == "ses_root"
+            && item["address"]["request_id"] == "approval-kept"
+            && item["address"]["request_kind"] == "approval"
+    }));
+    assert!(waiting.iter().any(|item| {
+        item["address"]["session_id"] == "ses_child"
+            && item["address"]["request_id"] == "input-kept"
+            && item["address"]["request_kind"] == "user_input"
+    }));
+
+    let stored: String = db
+        .query_row(
+            "SELECT state_json FROM bindings WHERE binding_id='b1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["native"]["pending_requests_count"], 3);
+    assert_eq!(stored["native"]["pending_requests_omitted_count"], 1);
+    assert_eq!(stored["native"]["family_completeness"], "partial");
+    assert_eq!(stored["native"]["gaps"], 1);
+}
+
+#[test]
+fn attention_projection_recommends_refresh_for_incomplete_muse_gap() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../modules/muse/fixtures/oversized-view-gap.json"
+    ))
+    .unwrap();
+    let root_id = fixture["session_id"].as_str().unwrap();
+    let mut gap = fixture["expected"]["projected_gap"].clone();
+    gap["at_ms"] = json!(model::now_ms().unwrap());
+    let native = json!({
+        "native_root_id": root_id,
+        "native_scope_key": "muse:fixture",
+        "session": {"sessionId": root_id},
+        "observed_children": [],
+        "turns": [],
+        "gap_fill": gap,
+        "pending_requests": fixture["expected"]["fitting_pending_requests"].clone(),
+        "family_completeness": "partial",
+        "gaps": 1,
+    });
+    let mut route = muse_route();
+    route["module_artifact_id"] = json!("muse-sdk-1.3.0-bridge.11");
+    let db = fixture_db();
+    insert_binding(&db, "muse-gap", "lane-gap", &route, Some(native));
+
+    let before = dump_tables(&db);
+    let report = capacity::attention_report(&db, 200, 0).unwrap();
+    assert_eq!(
+        before,
+        dump_tables(&db),
+        "gap recovery remains a read-only suggestion"
+    );
+    let items = report["items"].as_array().unwrap();
+    let gap_item = items
+        .iter()
+        .find(|item| {
+            item["kind"] == "observation_stale"
+                && item["address"]["reason"] == "native_view_gap_unfilled"
+        })
+        .expect("the incomplete projected gap reaches the Store attention consumer");
+    assert_eq!(gap_item["address"]["projection_state"], "incomplete");
+    assert_eq!(gap_item["address"]["cursors_complete"], false);
+    assert_eq!(gap_item["address"]["session_id"], root_id);
+    assert_eq!(gap_item["address"]["recovery_target"], "recorded_session");
+    assert!(gap_item["address"].get("after").is_none());
+    assert!(gap_item["address"].get("next").is_none());
+    assert_eq!(gap_item["suggested_action"]["method"], "agent.refresh");
+    assert_eq!(gap_item["suggested_action"]["binding_id"], "muse-gap");
+    assert_eq!(gap_item["suggested_action"]["generation"], 1);
+    assert_eq!(gap_item["suggested_action"]["session_id"], root_id);
+
+    let waiting: Vec<&Value> = items
+        .iter()
+        .filter(|item| item["kind"] == "waiting_for_native_request")
+        .collect();
+    let expected_requests = fixture["expected"]["fitting_pending_requests"]
+        .as_array()
+        .unwrap();
+    assert_eq!(waiting.len(), expected_requests.len());
+    for expected in expected_requests {
+        let request_id = expected["params"]["approvalId"].as_str().unwrap();
+        assert!(
+            waiting.iter().any(|item| {
+                item["address"]["session_id"] == root_id
+                    && item["address"]["request_id"] == request_id
+            }),
+            "exact request {request_id} remains individually addressable"
+        );
+    }
+}
+
+#[test]
+fn attention_projection_does_not_target_an_unobserved_gap_session() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../modules/muse/fixtures/oversized-view-gap.json"
+    ))
+    .unwrap();
+    let mut gap = fixture["expected"]["projected_gap"].clone();
+    gap["session_id"] = json!("ses_not_in_observed_family");
+    gap["at_ms"] = json!(model::now_ms().unwrap());
+    let native = json!({
+        "native_root_id": "ses_not_in_observed_family",
+        "native_scope_key": "muse:fixture",
+        "session": {"sessionId": fixture["session_id"]},
+        "observed_children": [],
+        "turns": [],
+        "gap_fill": gap,
+        "pending_requests": [],
+        "family_completeness": "partial",
+        "gaps": 1,
+    });
+    let mut route = muse_route();
+    route["module_artifact_id"] = json!("muse-sdk-1.3.0-bridge.11");
+    let db = fixture_db();
+    insert_binding(&db, "muse-gap", "lane-gap", &route, Some(native));
+    db.execute(
+        "UPDATE bindings SET native_root_id=?1 WHERE binding_id='muse-gap' AND generation=1",
+        [fixture["session_id"].as_str().unwrap()],
+    )
+    .unwrap();
+
+    let report = capacity::attention_report(&db, 200, 0).unwrap();
+    let gap_item = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["kind"] == "observation_stale"
+                && item["address"]["reason"] == "native_view_gap_unfilled"
+        })
+        .expect("the unknown gap remains visible without authorizing its session");
+    assert_eq!(gap_item["address"]["session_id"], Value::Null);
+    assert_eq!(gap_item["address"]["recovery_target"], "binding_root");
+    assert_eq!(gap_item["suggested_action"]["method"], "agent.refresh");
+    assert_eq!(gap_item["suggested_action"]["binding_id"], "muse-gap");
+    assert_eq!(gap_item["suggested_action"]["generation"], 1);
+    assert!(gap_item["suggested_action"].get("session_id").is_none());
+    assert_ne!(
+        gap_item["suggested_action"]["session_id"],
+        "ses_not_in_observed_family"
+    );
+}
+
+#[test]
 fn doctor_embeds_capacity_attention_and_the_quota_finding() {
     let db = fixture_db();
     insert_binding(&db, "b1", "lane-1", &opencode_route("svc-a"), None);

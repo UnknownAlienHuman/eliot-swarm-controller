@@ -1,8 +1,8 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The current bridge includes the TaskPrompt migration and uses **`muse-sdk-1.3.0-bridge.10`**. The host must retain and accept the exact bridge.10 descriptor before activating new bindings. Live Muse/Max and Windows native launch remain unqualified; syntax checks do not attest model execution.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). This isolated bridge.11 candidate carries forward the TaskPrompt/checkpoint behavior and adds bounded observation; its host must retain and accept the exact `muse-sdk-1.3.0-bridge.11` descriptor before new bindings use it. Live Muse/Max and Windows native launch remain unqualified; no runtime or model result is claimed.
 
-Before activation, register and retain the exact bridge.10 descriptor before
+Before activation, register and retain the exact bridge.11 descriptor before
 selecting it for a new binding. Existing bindings keep their original artifact
 identity and code; an artifact ID must never be relabelled or cross-served.
 
@@ -20,7 +20,7 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.10'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.11'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -56,12 +56,36 @@ This follows the pinned SDK's [approval update field ownership](https://github.c
 No SDK approval handler or automatic decision is installed. Presentation still
 returns `{}`; an answer remains an explicit addressed `agent.reply` Operation.
 
-This code requires artifact `muse-sdk-1.3.0-bridge.10` and refuses to announce a
-previous artifact ID. Stage it for new bindings only. Existing bridge.9 bindings
-and checkpoints retain their original code and identity; they are not migrated.
+This code requires artifact `muse-sdk-1.3.0-bridge.11` and refuses to announce a
+previous artifact ID. Stage it for new bindings only. Existing bridge.9 and
+bridge.10 bindings and checkpoints retain their original code and identity; they
+are not migrated.
 The SDK pin is unchanged. Verify syntax, SDK import and fixtures for the exact
-staged bridge.10 source before activation, and qualify installed native behavior
-separately. Earlier fixture passes do not qualify bridge.10.
+staged bridge.11 source before activation, and qualify installed native behavior
+separately. Earlier fixture passes do not qualify bridge.11.
+
+The bridge.11 observation projection measures the complete serialized
+`module.observe` JSON-RPC line against the existing 1 MiB control cap. When
+request details are too large, it retains exact session/native request IDs and
+marks details unknown. If some identities themselves cannot fit, fitting
+siblings remain individually addressable and the state reports partial
+coverage, total/omitted counts, an identity digest and a gap. The bridge keeps
+the full pending-request inventory and makes no decision or settlement from
+projection. Store attentions are derived only for identities present in the
+array; the partial gap does not fabricate identities for omitted requests.
+
+When a valid `view/gap` bracket fits, `gap_fill.after` and `.next` remain
+byte-exact and opaque. If the complete bracket does not fit the same frame,
+the outbound copy keeps `status: "unfilled"`, the exact session when it fits,
+`cursors_complete: false`, and `projection_state: "incomplete"` with an
+explicit omission reason; both cursor values are omitted together, never
+truncated or compared. If even the session identity cannot fit, it is marked
+omitted and the Store suggests only a binding-root refresh. The authoritative
+in-memory gap and native request inventory remain untouched. The existing
+read-only `observation_stale` attention suggests addressed `agent.refresh`
+for the recorded root/known child, which uses the existing `session/read`
+re-anchor path. This does not splice-fill the hole, decide a request, or claim
+that a refresh has closed the historical gap.
 
 ## TaskPrompt v1 (introduced in bridge.9)
 
@@ -127,7 +151,7 @@ Bridge.6 records three observation facts that bridge.5 only implied:
 
 - **`host_durability`** — the initialize handshake's `sessionDurability` declaration, classified per SS2.13.1: absent or `durable` reads `durable`; `ephemeral` reads `ephemeral`; any other value is **`unrecognized`** and never collapses into `durable` — an unrecognized profile guarantees nothing. The raw declared value is kept beside the classification.
 - **`host_death`** — recorded when the native process exits or fails to spawn: the SS2.11 exit row (`cleanShutdown` is the only non-abnormal row; every other row, however tidy its name, left no `SessionEnd`), the exit evidence, and `session_survives`, which is true only for a `durable` profile. Recording a death invents no terminal turn or session event; a durable session's disposition stays native until explicit recovery, and an ephemeral session is gone with its host.
-- **`gap_fill`** — each `view/gap` is recorded as an `unfilled` hole with its opaque `after`/`next` bracket and session ID verbatim (cursors are relayed, never parsed, ordered or merged), distinct from the `gaps` counter and `view_health`. This bridge does not splice-fill: it holds no live fold, so the inability is the recorded fact, and re-anchoring happens only through the existing read paths (`session/read`, `view/page` result reads).
+- **`gap_fill`** — each `view/gap` remains an `unfilled` hole, distinct from the `gaps` counter and `view_health`. Its exact opaque `after`/`next` bracket and session ID are relayed when they fit. If they do not fit, the bounded outbound copy explicitly marks incomplete coverage and omits both cursors as a pair without altering the full in-memory fact. Store exposes the unresolved gap through existing read-only `observation_stale` attention and suggests the existing addressed `agent.refresh` re-anchor (`session/read`; known-child refresh also subscribes from its read cursor). This bridge still does not splice-fill or claim that the hole was closed.
 
 One boundary stays explicit: transport EOF without process exit is not separately recorded. The SDK facade composes EOF into a host-death notification inside `MuseClient`, which this bridge does not use; on the bridge's transports, EOF surfaces as failed pending requests and `unknown` outcomes, and only the process exit produces a `host_death` record.
 

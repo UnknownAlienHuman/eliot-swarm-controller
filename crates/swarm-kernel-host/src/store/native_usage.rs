@@ -37,7 +37,7 @@ pub(super) fn parse(
         UsageService::Muse => {
             matches!(
                 artifact,
-                "muse-sdk-1.3.0-bridge.9" | "muse-sdk-1.3.0-bridge.10"
+                "muse-sdk-1.3.0-bridge.9" | "muse-sdk-1.3.0-bridge.10" | "muse-sdk-1.3.0-bridge.11"
             ) && matches!(
                 binding["route"]["runtime"].as_str(),
                 Some("muse" | "module")
@@ -258,22 +258,28 @@ mod tests {
     }
 
     #[test]
-    fn muse_usage_accepts_bridge10_without_cross_serving_bridge9() {
-        let mut current_observation = observation(snapshot());
-        current_observation["module_artifact_id"] = json!("muse-sdk-1.3.0-bridge.10");
-        for runtime in ["muse", "module"] {
-            let result = parse(
-                &current_observation,
-                &binding(runtime, "muse-sdk-1.3.0-bridge.10"),
-                Some(1),
-            )
-            .expect("bridge10 usage is admitted for its exact binding");
-            assert_eq!(
-                result.expect("ordered usage is returned").service,
-                UsageService::Muse
-            );
+    fn muse_usage_accepts_exact_artifact_without_cross_serving_other_bindings() {
+        for version in ["9", "10", "11"] {
+            let artifact = format!("muse-sdk-1.3.0-bridge.{version}");
+            let mut current_observation = observation(snapshot());
+            current_observation["module_artifact_id"] = json!(artifact);
+            for runtime in ["muse", "module"] {
+                let result = parse(&current_observation, &binding(runtime, &artifact), Some(1))
+                    .expect("usage is admitted only for its exact binding artifact");
+                assert_eq!(
+                    result.expect("ordered usage is returned").service,
+                    UsageService::Muse
+                );
+            }
         }
-        for (observed, bound) in [("9", "10"), ("10", "9")] {
+        for (observed, bound) in [
+            ("9", "10"),
+            ("9", "11"),
+            ("10", "9"),
+            ("10", "11"),
+            ("11", "9"),
+            ("11", "10"),
+        ] {
             let mut state = observation(snapshot());
             state["module_artifact_id"] = json!(format!("muse-sdk-1.3.0-bridge.{observed}"));
             let error = parse(

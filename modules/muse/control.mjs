@@ -47,6 +47,13 @@ export class Control {
     await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
     return await this.call('client.hello', this.credential);
   }
+  frameByteLength(method, params) {
+    // Control.call always uses a UUIDv4 whose JSON-encoded UTF-8 length is
+    // exactly 36 bytes. A fixed UUID-shaped value measures the complete
+    // outbound JSON-RPC line without consuming an ID or sending it.
+    const id = '00000000-0000-4000-8000-000000000000';
+    return Buffer.byteLength(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  }
   call(method, params) {
     const socket = this.socket;
     if (!socket || socket.destroyed) return Promise.reject(new Error('CONTROL_DISCONNECTED'));

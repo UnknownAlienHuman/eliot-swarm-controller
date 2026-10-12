@@ -20,9 +20,10 @@ import {
   restoredNativeUsageSnapshot,
 } from './native-usage.mjs';
 
-const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.10';
-const MUSE_ARTIFACT_VERSION = '10';
+const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.11';
+const MUSE_ARTIFACT_VERSION = '11';
 const MAX_TASK_PROMPT_BYTES = 1_000_000;
+const MAX_OBSERVATION_STATE_BYTES = 700_000;
 const SHA256 = /^[0-9a-f]{64}$/;
 const TASK_PROMPT_FIELDS = [
   'schema_id', 'schema_version', 'task_id', 'task_revision', 'attempt_id',
@@ -379,6 +380,166 @@ function observation() {
   return { ...latest, native_root_id:rootId, native_scope_key:nativeScope,
     observed_children:[...children.values()], pending_requests:[...pendingRequests.values()].map(x=>x.view),
     boot_id:bootId, native_events_seen:eventsSeen, turns:[...turns.values()] };
+}
+function pendingRequestIdentitySummary(view) {
+  const params = isRecord(view?.params) ? view.params : {};
+  const method=view?.method;
+  const idField=method==='approval/request'?'approvalId'
+    :method==='userInput/request'?'userInputId':null;
+  if(!idField || typeof params.sessionId!=='string' || !params.sessionId
+      || typeof params[idField]!=='string' || !params[idField]) return null;
+  return {method,params:{sessionId:params.sessionId,[idField]:params[idField]},
+    request_details_state:'unknown'};
+}
+function pendingRequestIdentityDigest(requests) {
+  const digest = createHash('sha256');
+  for (const view of requests) {
+    const params = isRecord(view?.params) ? view.params : {};
+    const idField=view?.method==='approval/request'?'approvalId'
+      :view?.method==='userInput/request'?'userInputId':null;
+    digest.update(JSON.stringify([view?.method ?? null,
+      typeof params.sessionId==='string'?params.sessionId:null,
+      idField && typeof params[idField]==='string'?params[idField]:null]));
+    digest.update('\n');
+  }
+  return digest.digest('hex');
+}
+function incompleteGapProjection(gap, omitSessionId = false) {
+  const hasSessionId=typeof gap?.session_id==='string';
+  const sessionIdentityOmitted=hasSessionId&&omitSessionId;
+  return {
+    status:'unfilled',
+    reason:gap?.reason,
+    session_id:hasSessionId&&!omitSessionId?gap.session_id:null,
+    after:null,
+    next:null,
+    cursors_complete:false,
+    ...(Number.isSafeInteger(gap?.at_ms)?{at_ms:gap.at_ms}:{}),
+    projection_state:'incomplete',
+    projection_reason:'opaque_gap_bracket_did_not_fit_complete_observation_frame',
+    projection_omission:sessionIdentityOmitted
+      ?'opaque_cursor_bracket_and_session_id':'opaque_cursor_bracket',
+    ...(sessionIdentityOmitted?{session_identity_omitted:true}:{}),
+  };
+}
+function boundedObservation(state, link, callParams) {
+  const stateBytes = () => Buffer.byteLength(JSON.stringify(state));
+  const callFor = candidate => ({ ...callParams, state:candidate });
+  const frameBytes = candidate => link.frameByteLength('module.observe',callFor(candidate));
+  const fits = candidate => frameBytes(candidate) <= link.limit;
+  if (stateBytes() <= MAX_OBSERVATION_STATE_BYTES && fits(state)) return state;
+
+  const requests=Array.isArray(state.pending_requests)?state.pending_requests:[];
+  const sourceChildren=Array.isArray(state.observed_children)?state.observed_children:[];
+  const sourceTurns=Array.isArray(state.turns)?state.turns:[];
+  const summaries=requests.map(pendingRequestIdentitySummary);
+  const gapCount=Number.isSafeInteger(state.gaps)&&state.gaps>=0?state.gaps+1:1;
+
+  // Retain the established bounded child tail and completeness diagnostic.
+  state.observed_children=sourceChildren.slice(-100);
+  state.gaps=gapCount;
+  state.family_completeness='partial';
+  if (fits(state)) return state;
+
+  // The native map remains authoritative. Only this outbound copy drops the
+  // large request details; each summary keeps the exact addressable identity.
+  state.pending_requests=summaries.filter(Boolean);
+  if (state.pending_requests.length===requests.length && fits(state)) return state;
+
+  // If the aggregate view is still too large, start from a small honest
+  // projection, then keep every individual identity that fits. Each request
+  // is considered independently so one overlarge identity cannot suppress a
+  // later fitting sibling. Omitted identities stay pending in pendingRequests.
+  const compact={
+    execution:typeof state.execution==='string'&&Buffer.byteLength(state.execution)<=128
+      ?state.execution:'unknown',
+    family_completeness:'partial',
+    gaps:gapCount,
+    boot_id:state.boot_id,
+    pending_requests:[],
+    observation_projection_state:'partial',
+  };
+  const identityMetadata=requests.length>0;
+  if(identityMetadata){
+    compact.pending_requests_state='partial';
+    compact.pending_requests_count=requests.length;
+    compact.pending_requests_omitted_count=requests.length;
+    compact.pending_requests_identity_sha256=pendingRequestIdentityDigest(requests);
+  }
+  const sourceGapFill=state.gap_fill;
+  if(isRecord(sourceGapFill)&&sourceGapFill.status==='unfilled'){
+    // Keep the complete opaque bracket when it fits this compact frame. If it
+    // does not, retain an explicit unresolved marker; never trim one cursor or
+    // mutate the authoritative latest.gap_fill object.
+    compact.gap_fill=sourceGapFill;
+    if(!fits(compact)){
+      compact.gap_fill=incompleteGapProjection(sourceGapFill);
+      if(!fits(compact))compact.gap_fill=incompleteGapProjection(sourceGapFill,true);
+      if(!fits(compact))throw new Error('OBSERVATION_FRAME_UNREPRESENTABLE');
+    }
+  }
+  let measured=frameBytes(compact);
+  if(measured>link.limit)throw new Error('OBSERVATION_FRAME_UNREPRESENTABLE');
+  let visibleCount=0;
+  for(const summary of summaries){
+    if(!summary)continue;
+    const identityBytes=Buffer.byteLength(JSON.stringify(summary));
+    const separatorBytes=visibleCount===0?0:1;
+    const oldOmitted=requests.length-visibleCount;
+    const newOmitted=oldOmitted-1;
+    const omittedCountDelta=Buffer.byteLength(String(newOmitted))-Buffer.byteLength(String(oldOmitted));
+    const delta=identityBytes+separatorBytes+omittedCountDelta;
+    if(measured+delta>link.limit)continue;
+    compact.pending_requests.push(summary);
+    visibleCount++;
+    measured+=delta;
+    compact.pending_requests_omitted_count=newOmitted;
+  }
+  const omittedCount=requests.length-visibleCount;
+  if(identityMetadata&&omittedCount===0){
+    delete compact.pending_requests_state;
+    delete compact.pending_requests_count;
+    delete compact.pending_requests_omitted_count;
+    delete compact.pending_requests_identity_sha256;
+  }
+
+  const tryAdd=(key,value)=>{
+    compact[key]=value;
+    if(fits(compact))return true;
+    delete compact[key];
+    return false;
+  };
+  const reserved=new Set(['execution','family_completeness','gaps','boot_id','pending_requests',
+    'pending_requests_state','pending_requests_count','pending_requests_omitted_count',
+    'pending_requests_identity_sha256','observation_projection_state','native_root_id',
+    'native_scope_key','native_events_seen','observed_children','turns','gap_fill']);
+  for(const key of ['native_root_id','native_scope_key','native_events_seen']){
+    if(Object.hasOwn(state,key))tryAdd(key,state[key]);
+  }
+  const omittedFields=[];
+  for(const [key,value] of Object.entries(state)){
+    if(reserved.has(key))continue;
+    if(!tryAdd(key,value))omittedFields.push(key);
+  }
+  const addRows=(key,rows)=>{
+    if(!Array.isArray(rows))return 0;
+    const selected=[];
+    let omitted=0;
+    for(const row of rows.slice(-100)){
+      selected.push(row);
+      compact[key]=selected;
+      if(!fits(compact)){selected.pop();omitted++;}
+    }
+    if(selected.length===0)delete compact[key];
+    return Math.max(0,rows.length-100)+omitted;
+  };
+  const omittedChildren=addRows('observed_children',sourceChildren);
+  const omittedTurns=addRows('turns',sourceTurns);
+  if(omittedChildren>0)omittedFields.push('observed_children');
+  if(omittedTurns>0)omittedFields.push('turns');
+  if(omittedFields.length)tryAdd('observation_projection_omitted_fields',[...new Set(omittedFields)]);
+  if(!fits(compact))throw new Error('OBSERVATION_FRAME_UNREPRESENTABLE');
+  return compact;
 }
 function onNotification(n) {
   const p = n.params ?? {};
@@ -833,12 +994,12 @@ async function report(link = control) {
   }
   if(lastSentRevision!==revision){
     const at=revision;
-    const state=observation();
-    if(Buffer.byteLength(JSON.stringify(state))>700000){
-      // Keep pending protocol requests and mark incomplete inventory rather than discard outcomes.
-      state.observed_children=state.observed_children.slice(-100);state.gaps++;state.family_completeness='partial';
-    }
-    await link.call('module.observe',{event_id:`${bootId}:${at}`,sequence:at,state});lastSentRevision=at;
+    const callParams={event_id:`${bootId}:${at}`,sequence:at};
+    const state=boundedObservation(observation(),link,callParams);
+    const params={...callParams,state};
+    if(link.frameByteLength('module.observe',params)>link.limit)
+      throw new Error('OBSERVATION_FRAME_TOO_LARGE');
+    await link.call('module.observe',params);lastSentRevision=at;
   }
 }
 let admissionTail=Promise.resolve();

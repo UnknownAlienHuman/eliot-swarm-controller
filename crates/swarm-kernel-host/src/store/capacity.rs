@@ -4060,6 +4060,82 @@ fn build_attention_items(db: &Connection, now: i64) -> Result<Vec<Value>> {
             }
         }
         if observation_live {
+            // A native view gap is an unresolved read-continuity fact, not a
+            // decision request. Reuse the existing read-only stale-observation
+            // attention kind and suggest the existing addressed refresh path.
+            // Only a recorded root or currently observed child may be named as
+            // the refresh target; unknown session IDs fall back to this binding's
+            // root refresh and are not projected as an authorized child target.
+            if binding["route"]["runtime"] == "muse" {
+                let gap = &native["gap_fill"];
+                if gap["status"] == "unfilled" {
+                    // The binding row is the Store's recorded authority for
+                    // the root. Copied observation metadata cannot promote a
+                    // different native session into a refresh target.
+                    let root_id = binding["native_root_id"].as_str();
+                    let target_session_id = gap["session_id"].as_str().and_then(|session_id| {
+                        let is_root = Some(session_id) == root_id;
+                        let is_observed_child = native["observed_children"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|child| {
+                                child["observed_now"] != false
+                                    && child["sessionId"].as_str() == Some(session_id)
+                            });
+                        (is_root || is_observed_child).then_some(session_id)
+                    });
+                    let gap_at_ms = gap["at_ms"].as_i64().or(observed_at);
+                    let gap_stale = gap_at_ms
+                        .map(|at| now.saturating_sub(at) > STALE_AFTER_MS)
+                        .unwrap_or(true);
+                    let projection_state = gap["projection_state"].as_str().unwrap_or(
+                        if gap["cursors_complete"] == true {
+                            "complete"
+                        } else {
+                            "incomplete_source"
+                        },
+                    );
+                    let suggested_action = if binding["state"] == "reconciling"
+                        || binding["observation"]["connection"] == "disconnected"
+                    {
+                        Value::Null
+                    } else {
+                        let mut action = json!({
+                            "method": "agent.refresh",
+                            "binding_id": binding_id,
+                            "generation": generation,
+                        });
+                        if let Some(session_id) = target_session_id {
+                            action["session_id"] = json!(session_id);
+                        }
+                        action
+                    };
+                    items.push(attention_item(
+                        "observation_stale",
+                        &scope_key,
+                        Some(&binding_id),
+                        Some(generation),
+                        json!({
+                            "binding_id": binding_id,
+                            "generation": generation,
+                            "reason": "native_view_gap_unfilled",
+                            "session_id": target_session_id,
+                            "recovery_target": if target_session_id.is_some() {
+                                "recorded_session"
+                            } else {
+                                "binding_root"
+                            },
+                            "cursors_complete": gap["cursors_complete"].as_bool().unwrap_or(false),
+                            "projection_state": projection_state,
+                            "gap_at_ms": gap_at_ms,
+                        }),
+                        attention_source("binding_observation", gap_at_ms, gap_stale),
+                        suggested_action,
+                        false,
+                    ));
+                }
+            }
             // --- waiting_for_native_request --------------------------
             if let Some(requests) = native["pending_requests"].as_array() {
                 for request in requests {

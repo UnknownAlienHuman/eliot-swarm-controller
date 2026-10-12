@@ -9,7 +9,7 @@ the new version is activated for new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Module artifact | `muse-sdk-1.3.0-bridge.10` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
+| Module artifact | `muse-sdk-1.3.0-bridge.11` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
 | SDK package | `@muse-code/sdk` **1.3.0**, exact, via `package.json` + `package-lock.json`; installed module-locally with `npm ci`, never globally |
 | SDK canonical source | `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT); the MSP schema is pinned at that commit |
 | Bridge code | ELIOT-owned `*.mjs` in this directory (`bridge`, `checkpoint`, `control`, `owned`, `results`, `settings`) |
@@ -34,7 +34,7 @@ handled at the bridge boundary or by a new pin, not by patching
 
 - SDK version change: artifact becomes `muse-sdk-<new-sdk>-bridge.1`.
 - Bridge-only change on the same SDK: increment the suffix,
-  `bridge.9` → `bridge.10`.
+  `bridge.10` → `bridge.11`.
 
 Any change to shipped bridge code or to the SDK pin gets a new artifact
 id. Reusing an existing id for different code is forbidden: bindings
@@ -67,26 +67,42 @@ the checkpoint round-trip for same-ID reconciliation against fixtures
 authored from the pinned SDK sources. It also drives the actual bridge and
 pinned SDK connection against bounded local fixture host/native processes to
 verify restored-child freshness, unknown-server-request rejection, and
-exact-turn stale rejection. These fixtures do not start the installed Muse
+exact-turn stale rejection, plus a valid oversized `view/gap` with fitting
+request siblings through the bounded observation frame. The Store attention
+fixture consumes that expected projection and checks the existing addressed
+refresh action and the unknown-session fallback. These fixtures do not start the installed Muse
 executable or call a model. Syntax/import and fixture success are not live Muse, Max
 or Windows qualification; live qualification of the new pin against the
 installed runtime is a separate step and never follows from these
 checks.
 
-Bridge.10 retains the TaskPrompt v1 and native usage behavior introduced in
-bridge.9. A present checkpoint containing JSON null now fails with
-CHECKPOINT_CORRUPT before host connection or native launch; an absent checkpoint
-keeps its existing fresh-state behavior. The SDK pin is unchanged. The current
-bridge rejects a configuration naming an earlier artifact; do not relabel an
-existing checkpoint or overwrite a running bridge to bypass that check. The
-host must retain and accept the exact bridge.10 descriptor before activation.
-No earlier fixture pass is transferred to bridge.10.
+Bridge.11 retains the TaskPrompt v1 and native usage behavior introduced in
+bridge.9 and the checkpoint corruption guard introduced in bridge.10. It also
+bounds the complete `module.observe` JSON-RPC frame. Request details may be
+projected to identity-only summaries; exact request identities that fit remain
+in the pending array. Any identities that do not fit stay unresolved in the
+bridge inventory and are represented by partial coverage, counts, an identity
+digest and a gap. An opaque `view/gap` bracket is retained byte-exact when it
+fits; otherwise both cursors are omitted together with an explicit incomplete
+marker, while the authoritative in-memory gap remains intact. The existing
+Store attention projection suggests addressed `agent.refresh` re-anchoring for
+the recorded root/known child and falls back to root refresh for an unknown
+session. No splice-fill, native decision or gap-closure claim is fabricated.
+The Store receives no fabricated native ID or decision.
+
+A present checkpoint containing JSON null fails with CHECKPOINT_CORRUPT before
+host connection or native launch; an absent checkpoint keeps its existing
+fresh-state behavior. The SDK pin is unchanged. The current bridge rejects a
+configuration naming an earlier artifact; do not relabel an existing checkpoint
+or overwrite a running bridge to bypass that check. The host must retain and
+accept the exact bridge.11 descriptor before activation. No earlier fixture
+pass is transferred to bridge.11.
 
 ## Activation
 
-The host native-usage consumer supports bridge.9 and bridge.10 while checking
-each observation against its binding's exact artifact. Register the exact
-bridge.10 descriptor before activating this source for new bindings.
+The host native-usage consumer supports bridge.9, bridge.10 and bridge.11 while
+checking each observation against its binding's exact artifact. Register the
+exact bridge.11 descriptor before activating this source for new bindings.
 
 Activation is per binding, through the recorded artifact id:
 
@@ -94,16 +110,15 @@ Activation is per binding, through the recorded artifact id:
    directory. Never overwrite the scripts or executable of a running
    bridge, and never retrofit proof into it (README rule); a running
    bridge keeps the exact code it started with.
-2. Set the new artifact id in both the controller route
+2. Set `muse-sdk-1.3.0-bridge.11` in both the controller route
    (`module_artifact_id`) and the private module config
    (`moduleArtifactId`). They must match exactly.
 3. Reserve new bindings with `agent.open`. A binding records the
    artifact id of its route at reservation; the bridge announces its id
    in `module.hello` and the host rejects a mismatch with
-   `ARTIFACT_MISMATCH`. New bindings therefore run the new bridge;
-   existing bindings keep the artifact id they recorded (at the
-   bridge.8 update, `muse-sdk-1.3.0-bridge.7`) and are still served
-   by the old bridge. The two bridges never cross-serve a binding.
+   `ARTIFACT_MISMATCH`. New bindings therefore run bridge.11; existing
+   bridge.9/bridge.10 bindings keep their recorded artifact id and original
+   code. The bridges never cross-serve a binding.
 4. Retire the old bridge only after its bindings are released and its
    managed process group has departed on its own. The module-run owner
    is never killed to make room for the new version.
