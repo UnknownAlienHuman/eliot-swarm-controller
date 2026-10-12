@@ -736,7 +736,7 @@ pub(super) fn record(
             "module supervisor callback sequence is older than the retained binding readback",
         ));
     }
-    validate_phase_transition(current, observation)?;
+    validate_phase_transition(tx, current, observation)?;
     let transition = lifecycle_transition(current, observation);
     let nonterminal = nonterminal_transition(observation);
     let operation_link = validate_operation_ids(tx, observation, generation)?;
@@ -802,7 +802,23 @@ pub(super) fn record(
     })
 }
 
+const TERMINAL_BOOT_QUERY: &str = "SELECT EXISTS(SELECT 1 FROM observations \
+     WHERE source_stream_id=?1 AND source_event_key>=?2 AND source_event_key<?3 \
+       AND kind=?4 AND json_extract(payload_json,'$.actor_disposition') IS NULL \
+       AND json_extract(payload_json,'$.module_id')=?5 \
+       AND json_extract(payload_json,'$.artifact_id')=?6 \
+       AND json_extract(payload_json,'$.artifact_version')=?7 \
+       AND json_extract(payload_json,'$.build_id') IS ?8 \
+       AND json_extract(payload_json,'$.boot_id')=?9 \
+       AND json_extract(payload_json,'$.actor_instance_id')=?10 \
+       AND (json_extract(payload_json,'$.phase') IN ('completed','exited_proven') \
+            OR (json_extract(payload_json,'$.phase') IN ('exited','restart_backoff') \
+                AND json_extract(payload_json,'$.effect_certainty')='not_started' \
+                AND json_extract(payload_json,'$.stage') IN \
+                    ('resolve_refs','validate_launch','spawn'))))";
+
 fn validate_phase_transition(
+    tx: &Transaction<'_>,
     previous: &Value,
     observation: &ModuleSupervisorObservation,
 ) -> Result<()> {
@@ -819,6 +835,44 @@ fn validate_phase_transition(
         return Err(Error::new(
             "MODULE_OBSERVATION_TRANSITION_INVALID",
             "a ready module supervisor boot cannot return to starting",
+        ));
+    }
+    if !matches!(
+        observation.phase,
+        ModuleSupervisorPhase::Starting | ModuleSupervisorPhase::Ready
+    ) {
+        return Ok(());
+    }
+    let Some(boot_id) = observation.boot_id.as_deref() else {
+        return Ok(());
+    };
+    // Waiting/backoff may legitimately retain the completed boot's identity.
+    // Consult its immutable facts so a later sample cannot revive that boot.
+    // validate_header fixes event IDs to boot:actor:sequence; the exact prefix
+    // range uses the existing observation_source_dedupe index without LIKE.
+    let terminal_boot: bool = tx.query_row(
+        TERMINAL_BOOT_QUERY,
+        params![
+            format!(
+                "{STREAM_PREFIX}:{}:{}",
+                observation.scope.binding_id, observation.scope.generation
+            ),
+            format!("{boot_id}:{}:", observation.actor_instance_id),
+            format!("{boot_id}:{};", observation.actor_instance_id),
+            EVENT_KIND,
+            observation.module_id,
+            observation.artifact_id,
+            observation.artifact_version,
+            observation.build_id,
+            boot_id,
+            observation.actor_instance_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if terminal_boot {
+        return Err(Error::new(
+            "MODULE_OBSERVATION_TRANSITION_INVALID",
+            "a terminal module supervisor boot cannot resume activity",
         ));
     }
     Ok(())
@@ -2630,13 +2684,13 @@ mod journal_regression_tests {
             assert_eq!(original.unknown_operation_ids, ready.unknown_operation_ids);
             assert_eq!(original.unknown_operation_count, 1);
 
-            // A terminal row remains invalid for ordinary sampled phases.
-            let mut starting = ready;
-            starting.phase = ProducerPhase::Starting;
-            starting.sequence = 2;
-            starting.event_id = format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:2");
+            // Use an ordinary exit sample; Ready -> Starting has its own guard.
+            let mut exited = ready;
+            exited.phase = ProducerPhase::Exited;
+            exited.sequence = 2;
+            exited.event_id = format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:2");
             assert_eq!(
-                expect_record_error(&mut db, &starting, 200).code,
+                expect_record_error(&mut db, &exited, 200).code,
                 "MODULE_OBSERVATION_OPERATION_TERMINAL"
             );
         }
@@ -2979,6 +3033,233 @@ mod journal_regression_tests {
             latest,
             ("ready".to_owned(), "boot-fixture-next".to_owned(), 6)
         );
+    }
+
+    fn retained_observation_snapshot(db: &Connection) -> (String, i64) {
+        db.query_row(
+            "SELECT state_json,(SELECT count(*) FROM observations) \
+             FROM bindings WHERE binding_id=?1 AND generation=?2",
+            params![BINDING_ID, GENERATION as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read exact latest projection and immutable fact count")
+    }
+
+    #[test]
+    fn terminal_boot_cannot_resume_activity_after_a_waiting_observation() {
+        let mut terminals = vec![
+            producer_observation(1, ProducerPhase::Completed, None),
+            producer_observation(1, ProducerPhase::ExitedProven, None),
+        ];
+        for (stage, code) in [
+            (ProducerStage::ResolveRefs, "MODULE_REF_MISSING"),
+            (ProducerStage::ValidateLaunch, "MODULE_PLAN_INVALID"),
+            (ProducerStage::Spawn, "MODULE_PROCESS_SPAWN"),
+        ] {
+            for phase in [ProducerPhase::Exited, ProducerPhase::RestartBackoff] {
+                let mut terminal = producer_observation(1, phase, Some(code));
+                terminal.effect_certainty = ProducerCertainty::NotStarted;
+                terminal.stage = Some(stage);
+                terminals.push(terminal);
+            }
+        }
+        for terminal in terminals {
+            let mut db = fixture_db();
+            assert!(
+                record_in_transaction(&mut db, &terminal, 100)
+                    .unwrap()
+                    .inserted
+            );
+            for waiting in [false, true] {
+                if waiting {
+                    let sample = producer_observation(2, ProducerPhase::WaitingForKernel, None);
+                    assert!(
+                        record_in_transaction(&mut db, &sample, 200)
+                            .unwrap()
+                            .inserted
+                    );
+                }
+                let snapshot = retained_observation_snapshot(&db);
+                for phase in [ProducerPhase::Starting, ProducerPhase::Ready] {
+                    let active = producer_observation(if waiting { 3 } else { 2 }, phase, None);
+                    assert_eq!(
+                        expect_record_error(&mut db, &active, 300).code,
+                        "MODULE_OBSERVATION_TRANSITION_INVALID"
+                    );
+                    assert_eq!(retained_observation_snapshot(&db), snapshot);
+                }
+            }
+            let ready_count: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM observations WHERE kind=?1",
+                    [READY_EVENT_KIND],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                ready_count, 0,
+                "a terminal boot receives no new Ready grant"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_boot_allows_new_boot_start_or_first_ready_and_retains_one_occurrence() {
+        for sampled_start in [false, true] {
+            let mut db = fixture_db();
+            let ready = producer_observation(1, ProducerPhase::Ready, None);
+            let completed = producer_observation(2, ProducerPhase::Completed, None);
+            record_in_transaction(&mut db, &ready, 100).unwrap();
+            record_in_transaction(&mut db, &completed, 200).unwrap();
+
+            let mut next = producer_observation(3, ProducerPhase::Ready, None);
+            next.boot_id = Some("boot-fixture-next".to_owned());
+            next.event_id = format!("boot-fixture-next:{ACTOR_INSTANCE_ID}:3");
+            if sampled_start {
+                let mut starting = next.clone();
+                starting.phase = ProducerPhase::Starting;
+                record_in_transaction(&mut db, &starting, 300).unwrap();
+                next.sequence = 4;
+                next.event_id = format!("boot-fixture-next:{ACTOR_INSTANCE_ID}:4");
+            }
+            assert!(record_in_transaction(&mut db, &next, 400).unwrap().inserted);
+            let mut refresh = next.clone();
+            refresh.sequence += 1;
+            refresh.event_id =
+                format!("boot-fixture-next:{ACTOR_INSTANCE_ID}:{}", refresh.sequence);
+            record_in_transaction(&mut db, &refresh, 500).unwrap();
+
+            let snapshot = retained_observation_snapshot(&db);
+            let old_boot = producer_observation(refresh.sequence + 1, ProducerPhase::Ready, None);
+            assert_eq!(
+                expect_record_error(&mut db, &old_boot, 600).code,
+                "MODULE_OBSERVATION_TRANSITION_INVALID"
+            );
+            assert_eq!(retained_observation_snapshot(&db), snapshot);
+
+            let counts: (i64, i64) = db
+                .query_row(
+                    "SELECT sum(kind=?1),sum(kind=?2) FROM observations",
+                    params![READY_EVENT_KIND, FAMILY_EXIT_EVENT_KIND],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                (2, 1),
+                "one Ready per boot and one terminal occurrence"
+            );
+            for kind in [READY_EVENT_KIND, FAMILY_EXIT_EVENT_KIND] {
+                let event = retained_event(&db, kind);
+                assert!(verified_lifecycle_event(&db, &event).unwrap().is_some());
+            }
+            let conflict = producer_observation(ready.sequence, ProducerPhase::Completed, None);
+            assert_eq!(
+                expect_record_error(&mut db, &conflict, 700).code,
+                "MODULE_OBSERVATION_CONFLICT"
+            );
+            assert_eq!(retained_observation_snapshot(&db), snapshot);
+        }
+    }
+
+    #[test]
+    fn terminal_boot_recovery_diagnostics_are_retained_without_resurrection() {
+        for phase in [ProducerPhase::OwnerRetained, ProducerPhase::IdentityUnknown] {
+            let mut db = fixture_db();
+            let ready = producer_observation(1, ProducerPhase::Ready, None);
+            let completed = producer_observation(2, ProducerPhase::Completed, None);
+            record_in_transaction(&mut db, &ready, 100).unwrap();
+            record_in_transaction(&mut db, &completed, 200).unwrap();
+            let diagnostic = producer_observation(3, phase, Some("MODULE_OWNER_IDENTITY_UNKNOWN"));
+            assert!(
+                record_in_transaction(&mut db, &diagnostic, 300)
+                    .unwrap()
+                    .inserted
+            );
+            let kind = match phase {
+                ProducerPhase::OwnerRetained => OWNER_RETAINED_EVENT_KIND,
+                ProducerPhase::IdentityUnknown => IDENTITY_UNKNOWN_EVENT_KIND,
+                _ => unreachable!(),
+            };
+            let event = retained_event(&db, kind);
+            assert!(verified_lifecycle_event(&db, &event).unwrap().is_some());
+            let snapshot = retained_observation_snapshot(&db);
+            for phase in [ProducerPhase::Starting, ProducerPhase::Ready] {
+                let resurrection = producer_observation(4, phase, None);
+                assert_eq!(
+                    expect_record_error(&mut db, &resurrection, 400).code,
+                    "MODULE_OBSERVATION_TRANSITION_INVALID"
+                );
+                assert_eq!(retained_observation_snapshot(&db), snapshot);
+            }
+            let counts: (i64, i64) = db
+                .query_row(
+                    "SELECT sum(kind=?1),sum(kind=?2) FROM observations",
+                    params![READY_EVENT_KIND, FAMILY_EXIT_EVENT_KIND],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (1, 1));
+        }
+    }
+
+    #[test]
+    fn terminal_boot_history_lookup_uses_existing_event_identity_index() {
+        let db = fixture_db();
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {TERMINAL_BOOT_QUERY}"))
+            .unwrap()
+            .query_map(
+                params![
+                    format!("{STREAM_PREFIX}:{BINDING_ID}:{GENERATION}"),
+                    format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:"),
+                    format!("{BOOT_ID}:{ACTOR_INSTANCE_ID};"),
+                    EVENT_KIND,
+                    MODULE_ID,
+                    ARTIFACT_ID,
+                    ARTIFACT_VERSION,
+                    BUILD_ID,
+                    BOOT_ID,
+                    ACTOR_INSTANCE_ID,
+                ],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("observation_source_dedupe")
+                    && step.contains("source_stream_id=?")
+                    && step.contains("source_event_key>?")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_boot_prefix_neighbor_cannot_block_a_distinct_first_ready() {
+        let mut db = fixture_db();
+        let mut terminal = producer_observation(1, ProducerPhase::Completed, None);
+        let neighbor_boot = format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:neighbor");
+        terminal.boot_id = Some(neighbor_boot.clone());
+        terminal.event_id = format!("{neighbor_boot}:{ACTOR_INSTANCE_ID}:1");
+        record_in_transaction(&mut db, &terminal, 100).unwrap();
+        let ready = producer_observation(2, ProducerPhase::Ready, None);
+        assert!(
+            record_in_transaction(&mut db, &ready, 200)
+                .unwrap()
+                .inserted
+        );
+        let snapshot = retained_observation_snapshot(&db);
+        let mut invalid = terminal;
+        invalid.phase = ProducerPhase::Ready;
+        invalid.sequence = 3;
+        invalid.event_id = format!("{neighbor_boot}:{ACTOR_INSTANCE_ID}:3");
+        assert_eq!(
+            expect_record_error(&mut db, &invalid, 300).code,
+            "MODULE_OBSERVATION_TRANSITION_INVALID"
+        );
+        assert_eq!(retained_observation_snapshot(&db), snapshot);
     }
 
     #[test]
