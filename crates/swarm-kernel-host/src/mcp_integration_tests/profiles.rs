@@ -335,6 +335,25 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
     .await;
     let listing = manager.request("tools/list", json!({})).await.unwrap();
     let manager_tools = listing["tools"].as_array().unwrap();
+    let swarm_launch = manager_tools
+        .iter()
+        .find(|tool| tool["name"] == "swarm_launch")
+        .expect("Manager tools/list must include its core swarm.launch mutation");
+    let advertised_launch: rmcp::model::Tool = serde_json::from_value(swarm_launch.clone())
+        .expect("swarm_launch must be a valid MCP tool");
+    assert!(
+        !advertised_launch
+            .annotations
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false),
+        "swarm_launch must not be advertised read-only"
+    );
+    assert!(
+        swarm_launch["inputSchema"]["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("client_request_id"))),
+        "swarm_launch must advertise the Manager caller request ID"
+    );
     for tool in manager_tools
         .iter()
         .filter(|tool| tool["annotations"]["readOnlyHint"] != json!(true))
@@ -405,6 +424,62 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
             tool["name"]
         );
     }
+    let caller_request_id = crate::model::new_id();
+    let sent_reply = full
+        .request(
+            "tools/call",
+            json!({
+                "name": "message_send",
+                "arguments": {
+                    "recipient": "operator",
+                    "text": "Full profile caller ID readback",
+                    "client_request_id": caller_request_id,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let sent = &sent_reply["structuredContent"];
+    assert_eq!(sent["recipient"], json!("operator"));
+    let operation_id = sent["operation_id"]
+        .as_str()
+        .expect("message_send returns the Store operation identity")
+        .to_owned();
+    let delivery_id = sent["delivery_id"]
+        .as_str()
+        .expect("message_send returns the durable delivery identity")
+        .to_owned();
+    let payload_digest = sent["payload_digest"]
+        .as_str()
+        .expect("message_send returns the payload digest")
+        .to_owned();
+    let readback = full
+        .request(
+            "tools/call",
+            json!({
+                "name": "operation_get",
+                "arguments": {"operation_id": operation_id},
+            }),
+        )
+        .await
+        .unwrap();
+    let operation = &readback["structuredContent"];
+    assert_eq!(operation["operation_id"], json!(operation_id.as_str()));
+    assert_eq!(
+        operation["client_request_id"],
+        json!(caller_request_id.as_str())
+    );
+    assert_eq!(operation["method"], json!("message.send"));
+    assert_eq!(operation["state"], json!("settled"));
+    assert_eq!(
+        operation["result"]["delivery_id"],
+        json!(delivery_id.as_str())
+    );
+    assert_eq!(
+        operation["result"]["payload_digest"],
+        json!(payload_digest.as_str())
+    );
+    assert_eq!(operation["result"]["recipient"], json!("operator"));
     full.close().await;
     host.close().await;
 }
@@ -607,15 +682,16 @@ async fn gm_profile_does_not_elevate_a_manager_credential() {
         .await
         .unwrap();
     let structured = &sent["structuredContent"];
-    let delivery_id = structured["delivery_id"].as_str().unwrap();
-    let mismatched_digest = format!("{}-wrong", structured["payload_digest"].as_str().unwrap());
+    let delivery_id = structured["delivery_id"].as_str().unwrap().to_owned();
+    let payload_digest = structured["payload_digest"].as_str().unwrap().to_owned();
+    let mismatched_digest = format!("{payload_digest}-wrong");
     let cancelled = client
         .request(
             "tools/call",
             json!({
                 "name": "message_cancel",
                 "arguments": {
-                    "delivery_id": delivery_id,
+                    "delivery_id": delivery_id.as_str(),
                     "payload_digest": mismatched_digest,
                     "client_request_id": crate::model::new_id(),
                 },
@@ -627,6 +703,96 @@ async fn gm_profile_does_not_elevate_a_manager_credential() {
     let digest_error: Value =
         serde_json::from_str(cancelled["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(digest_error["error"]["code"], json!("DIGEST_MISMATCH"));
+
+    let cancel_request_id = crate::model::new_id();
+    let cancelled = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "message_cancel",
+                "arguments": {
+                    "delivery_id": delivery_id.as_str(),
+                    "payload_digest": payload_digest.as_str(),
+                    "client_request_id": cancel_request_id,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    assert_ne!(cancelled["isError"], json!(true));
+    let cancellation = &cancelled["structuredContent"];
+    assert_eq!(
+        cancellation["cancellation"],
+        json!({
+            "delivery_id": delivery_id.as_str(),
+            "payload_digest": payload_digest.as_str(),
+        })
+    );
+    assert_eq!(cancellation["original_record_changed"], json!(false));
+    assert_eq!(cancellation["delivery"], json!("durable_mailbox_only"));
+    assert_eq!(
+        cancellation["cancelled_by"]["client_id"],
+        json!(host.manager_credential.client_id.as_str())
+    );
+
+    let cancel_operation_id = cancellation["operation_id"]
+        .as_str()
+        .expect("message_cancel returns its Store operation identity")
+        .to_owned();
+    let cancel_readback = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "operation_get",
+                "arguments": {"operation_id": cancel_operation_id.as_str()},
+            }),
+        )
+        .await
+        .unwrap();
+    let cancel_operation = &cancel_readback["structuredContent"];
+    assert_eq!(
+        cancel_operation["operation_id"],
+        json!(cancel_operation_id.as_str())
+    );
+    assert_eq!(
+        cancel_operation["client_request_id"],
+        json!(cancel_request_id.as_str())
+    );
+    assert_eq!(cancel_operation["method"], json!("message.cancel"));
+    assert_eq!(cancel_operation["state"], json!("settled"));
+    assert_eq!(
+        cancel_operation["result"]["delivery"],
+        json!("durable_mailbox_only")
+    );
+
+    let report = client
+        .request(
+            "tools/call",
+            json!({
+                "name": "report_delta",
+                "arguments": {"after": 0, "limit": 200},
+            }),
+        )
+        .await
+        .unwrap();
+    let items = report["structuredContent"]["items"]
+        .as_array()
+        .expect("report.delta returns a page of durable observations");
+    let cancellation_events: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            item["kind"] == json!("message.cancel")
+                && item["operation_id"] == json!(cancel_operation_id.as_str())
+        })
+        .collect();
+    assert_eq!(cancellation_events.len(), 1);
+    assert_eq!(
+        cancellation_events[0]["payload"]["cancellation"],
+        json!({
+            "delivery_id": delivery_id.as_str(),
+            "payload_digest": payload_digest.as_str(),
+        })
+    );
 
     // host.mode is a GM-only manual tool and is not loaded on the default
     // profile surface. The live Store gate independently denies this
