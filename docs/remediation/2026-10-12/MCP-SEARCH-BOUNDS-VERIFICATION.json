@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-12T10:57:56.8983729Z",
+  "source_base_main": "1233a6dac7a17e3d75dba51ae2a207fcda5acb7f",
+  "obligations": [
+    "APP-358"
+  ],
+  "original_obligation": "Catalog-search advertised schema carries none of the bounds its own parser enforces — crates/swarm-mcp/src/mcp/mod.rs:4656-4760 — schema-valid calls (max_results: 100000) fail at dispatch with invalid_params",
+  "behavior": [
+    "Public swarm.tools.search input schema bounds optional max_results to integer1..8 using existing maximum",
+    "Dispatch accepts represented mathematical integers including1.0,8.0 and exponent1e0 within1..8; fractions, out-of-range values and non-number JSON values rejected",
+    "Omission preserves default5; other MCP numeric boundaries unchanged"
+  ],
+  "owned_source_sha256": {
+    "crates/swarm-contracts/src/mcp_catalog.rs": "838C7886FC3CD875D0956369EAA879262240A3D2D7A82F65EACD8FE666613ADA",
+    "crates/swarm-mcp/src/mcp/mod.rs": "D7A86A4804D5B6324F44CD0F8184C8096881B9D77F34D9CC38EE98BC33FC8C76"
+  },
+  "authority_document_sha256": {
+    "ELIOT-Swarm-Controller-Execution-Map-2026-10-09.md": "399704762B1190BA9E06DB8E2CD1586771B566FDF0DD0518E973C223A7FEABDB",
+    "ELIOT-Swarm-Controller-HIGH-Appendix-Source-2026-10-09.md": "4A997D7910046092FA0EDEE66C775C05A8428FD6A7AF5D50D686503FF6FCC858",
+    "ELIOT-Swarm-Controller-Master-Audit-2026-10-09-v27.md": "3DEE8664DABA6AC3551128ECF005BFA4E2E21B423346D9D0CE039A1F4F9D2CFF",
+    "ELIOT-Swarm-Controller-Original-Unverified-Suspicions.md": "2DADAADD9BC56B7ABF66EE564732928BFFE29ED0D7E08297F1893E1C8B8BADB0",
+    "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md": "AE8406869C2026D0837EEC15EAF0AF68FCB16448008850597F25A44F5933A974"
+  },
+  "source_manifest_sha256": "726F90E28C8D1C1DE4BEAD89146E6BBB5CD9007DF372745EA9483286DC9EF71C",
+  "frozen_input_count": 842,
+  "verification": {
+    "app358-windows-clippy-v1": {
+      "disposition": "PASS in stated scope",
+      "source_stable": true,
+      "exit_code": 0,
+      "log_sha256": "C7E3C34DF2B09FE3A326E8F75B0EE639808DDFD63A13055748693D8D01767AE7",
+      "fixture_only_delta": [
+        "crates/swarm-mcp/src/mcp/mod.rs"
+      ],
+      "record_sha256": "5F2E69667BB6B8264ADA6CEE5811D2F91587E2630E1FBABB1E370B4593E01CD7",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-contracts",
+        "-p",
+        "swarm-mcp",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "app358-windows-tests-v2": {
+      "disposition": "PASS in stated scope",
+      "source_stable": true,
+      "exit_code": 0,
+      "log_sha256": "5641ECF37F3973D510A80F67A39DDEDF39F137DDFEBAB1689806F7E207173B90",
+      "fixture_only_delta": [],
+      "record_sha256": "4E4E68993741FD3E4427F7A99EA50FA5F903A13E93A1B4D0F79C11651035A471",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-mcp",
+        "--lib",
+        "-E",
+        "test(catalog_search_schema_matches_dispatch_max_results_bounds)"
+      ]
+    },
+    "app358-linux-clippy-v1": {
+      "disposition": "PASS in stated scope",
+      "source_stable": true,
+      "exit_code": 0,
+      "log_sha256": "17165BDE69DAE93ED81419C6735658146E8A6ADE5A7E5F4D92A9821F76E04713",
+      "fixture_only_delta": [
+        "crates/swarm-mcp/src/mcp/mod.rs"
+      ],
+      "record_sha256": "5CC24427471315BF30303327F2EEADECCAFA97903D89B64CFAA33A6CD3EA96B7",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-contracts",
+        "-p",
+        "swarm-mcp",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "app358-linux-tests-v2": {
+      "disposition": "PASS in stated scope",
+      "source_stable": true,
+      "exit_code": 0,
+      "log_sha256": "CBBF093AD1F42D3EB163015D4B38B1C110C2AA0D0C8BD645555DC855FE81A3F1",
+      "fixture_only_delta": [],
+      "record_sha256": "4BCBF5DA4648A894A5A9B6BC8E59A2004878084E9B3F35F7A058676A2347AB6F",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-mcp",
+        "--lib",
+        "-E",
+        "test(catalog_search_schema_matches_dispatch_max_results_bounds)"
+      ]
+    }
+  },
+  "actual_consumers": {
+    "windows": [
+      "mcp::tests::catalog_search_schema_matches_dispatch_max_results_bounds"
+    ],
+    "linux": [
+      "mcp::tests::catalog_search_schema_matches_dispatch_max_results_bounds"
+    ]
+  },
+  "independent_review": {
+    "sha256": "522D293900A8B0A990B7C0D4AC2852B96435C91F389D200F7BAF970792400C7E",
+    "artifact": "app358-independent-final-candidate-review-v2-20261012.json",
+    "p1": 0,
+    "p2": 0,
+    "prior_v1_p2": "Integral decimal JSON numbers accepted by actual dispatch"
+  },
+  "manager_delta": "Removed duplicated test-side schema/numeric validator; directly assert actual generated schema fields and fixed expected actual parser cases",
+  "clippy_transfer": {
+    "schema_source_unchanged": true,
+    "production_prefix_sha256": "6BDE86A03AACF54B82E1C6AC0C2404550512B6F18AB86033C46E9564649EEAA3",
+    "production_prefix_byte_identical": true,
+    "delta": "New cfg(test) fixture only",
+    "edition": "v1"
+  },
+  "qualified_consumer_scope": {
+    "scope": "Actual generated schema field assertions and real parser; not a general JSON Schema validator, MCP transport or backend run",
+    "accepted_numeric_cases": 5,
+    "invalid_numeric_and_type_cases": 12,
+    "omitted_default_cases": 1
+  },
+  "protected_wip_excluded": {
+    "foreign_index_preserved": true,
+    "untracked_paths": 49,
+    "tracked_paths": 15
+  },
+  "boundaries": [
+    "One focused consumer with eighteen request cases per platform;19otherMCPtests skipped",
+    "Serde JSON Value represented-number semantics; arbitrary-precision source lexeme validation not claimed",
+    "Strict affected contracts+mcp production Clippy passed Windows/Linux; scoped rustfmt1.98.1 check passed on Windows for the same frozen sources",
+    "Full Rust/public/native Step5/Gemini3.8/crash/fault/load/test-vacuum/donor acceptance remains pending"
+  ],
+  "full_v27_qualified": false
+}

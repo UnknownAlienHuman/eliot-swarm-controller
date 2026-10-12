@@ -2466,6 +2466,13 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         properties["changes"] = automation_config_changes_schema();
     }
     match method {
+        "swarm.tools.search" => {
+            properties["max_results"] = json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_SEARCH_RESULTS,
+            });
+        }
         "task.create" | "task.revise" => {
             properties["spec"] = task_spec_schema();
         }

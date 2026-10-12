@@ -1065,8 +1065,13 @@ fn parse_catalog_search<'a>(
     let max_results = match object.get("max_results") {
         None => 5,
         Some(value) => value
-            .as_u64()
-            .filter(|value| (1..=catalog::MAX_SEARCH_RESULTS as u64).contains(value))
+            .as_f64()
+            .filter(|value| {
+                value.is_finite()
+                    && value.fract() == 0.0
+                    && *value >= 1.0
+                    && *value <= catalog::MAX_SEARCH_RESULTS as f64
+            })
             .map(|value| value as usize)
             .ok_or_else(|| {
                 McpError::invalid_params(
@@ -1440,6 +1445,97 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|field| field == "controller_effects")
+        );
+    }
+
+    #[test]
+    fn catalog_search_schema_matches_dispatch_max_results_bounds() {
+        let (read_only, spec) = find_tool("swarm_tools_search").expect("search tool is public");
+        let schema = serde_json::to_value(input_schema(spec, *read_only, false).as_ref())
+            .expect("public catalog-search schema serializes");
+        let max_results_schema = &schema["properties"]["max_results"];
+        let max_results = swarm_contracts::mcp_catalog::MAX_SEARCH_RESULTS;
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["properties"]["query"]["type"], json!("string"));
+        assert_eq!(max_results_schema["type"], json!("integer"));
+        assert_eq!(max_results_schema["minimum"], json!(1));
+        assert_eq!(max_results_schema["maximum"], json!(max_results));
+        assert!(
+            !schema["required"]
+                .as_array()
+                .expect("generated schema declares its required fields")
+                .iter()
+                .any(|field| field.as_str() == Some("max_results")),
+            "max_results must remain optional"
+        );
+
+        let integral_requests = [
+            (
+                "integer lower boundary",
+                json!({"query": "catalog", "max_results": 1}),
+                1usize,
+            ),
+            (
+                "integer upper boundary",
+                json!({"query": "catalog", "max_results": max_results}),
+                max_results,
+            ),
+            (
+                "decimal-zero lower boundary",
+                json!({"query": "catalog", "max_results": 1.0}),
+                1usize,
+            ),
+            (
+                "decimal-zero upper boundary",
+                json!({"query": "catalog", "max_results": max_results as f64}),
+                max_results,
+            ),
+            (
+                "exponent-form lower boundary",
+                serde_json::from_str::<Value>(r#"{"query":"catalog","max_results":1e0}"#)
+                    .expect("exponent-form request is valid JSON"),
+                1usize,
+            ),
+        ];
+        for (label, arguments, expected) in integral_requests {
+            assert_eq!(
+                parse_catalog_search(&arguments)
+                    .expect("dispatch accepts a schema-valid integral number in range")
+                    .max_results,
+                expected,
+                "dispatch result for {label}"
+            );
+        }
+
+        let invalid_values = [
+            ("negative", json!(-1)),
+            ("zero", json!(0)),
+            ("above integer upper boundary", json!(max_results + 1)),
+            ("fraction just above lower boundary", json!(1.5)),
+            ("fraction below upper boundary", json!(7.5)),
+            ("fraction below range", json!(0.5)),
+            ("fraction above range", json!(8.5)),
+            ("null", Value::Null),
+            ("boolean", json!(true)),
+            ("string", json!("1")),
+            ("array", json!([1])),
+            ("object", json!({"value": 1})),
+        ];
+        for (label, candidate) in invalid_values {
+            let arguments = json!({"query": "catalog", "max_results": candidate});
+            assert!(
+                parse_catalog_search(&arguments).is_err(),
+                "dispatch should reject {label}"
+            );
+        }
+
+        let arguments = json!({"query": "catalog"});
+        assert_eq!(
+            parse_catalog_search(&arguments)
+                .expect("omitted max_results retains the existing default")
+                .max_results,
+            5
         );
     }
 }
