@@ -49,6 +49,7 @@ use crate::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use swarm_contracts::error::NativeHttpFailureKind;
 
 pub(crate) const BACKGROUND_CONTRACT_REVISION: &str = "opencode-background-v1";
 /// Exact first line of the synthetic notice the native service admits when
@@ -98,6 +99,21 @@ fn schema_error() -> Error {
         "NATIVE_SCHEMA_ERROR",
         "native response does not match the selected V2 contract",
     )
+}
+
+fn is_unavailable_background_route(error: &Error) -> bool {
+    error.native_http_failure.is_some_and(|failure| {
+        matches!(failure.status, 404 | 405) && failure.kind == NativeHttpFailureKind::Unclassified
+    })
+}
+
+fn attach_native_http_failure(details: &mut Value, error: &Error) {
+    if let Some(failure) = error.native_http_failure {
+        details["native_http_failure"] = json!({
+            "status": failure.status,
+            "kind": failure.kind,
+        });
+    }
 }
 
 fn validate_timeline_message(message: &Value, session: &str) -> Result<()> {
@@ -350,11 +366,13 @@ impl Service {
                     true,
                 );
             }
-            // The session and its read surfaces were verified immediately
-            // before this body-less POST, so a native rejection here can
-            // only mean the installed service does not serve the route:
-            // report the capability unsupported, never a guessed retry.
-            Err(error) if error.code == "NATIVE_REJECTED" => {
+            // A generic not-found or method-not-allowed response on this exact
+            // route, after the session was read successfully, is the explicit
+            // route-absence signal. Typed session/message failures and all
+            // request-specific rejections retain their rejection facts.
+            Err(error)
+                if error.code == "NATIVE_REJECTED" && is_unavailable_background_route(&error) =>
+            {
                 let mut details = Self::background_details(
                     &target,
                     &root,
@@ -364,6 +382,20 @@ impl Service {
                     "route_rejected_after_session_verification",
                 );
                 details["code"] = json!("UNSUPPORTED_CAPABILITY");
+                attach_native_http_failure(&mut details, &error);
+                return outcome(command, EffectOutcome::Rejected, options, details);
+            }
+            Err(error) if error.code == "NATIVE_REJECTED" => {
+                let mut details = Self::background_details(
+                    &target,
+                    &root,
+                    &before,
+                    None,
+                    "native_background_rejected",
+                    "native_http_rejection",
+                );
+                details["code"] = json!(error.code);
+                attach_native_http_failure(&mut details, &error);
                 return outcome(command, EffectOutcome::Rejected, options, details);
             }
             Err(error) => return failed(command, options, &error, true),
@@ -499,5 +531,153 @@ impl Service {
             options,
             json!({"code":"NATIVE_EVIDENCE_UNAVAILABLE","completion_condition":"native_background_unproven","evidence":"notice_absent_at_readback","session_id":target}),
         )
+    }
+}
+
+#[cfg(test)]
+mod app215_background_rejection_consumer_tests {
+    use super::super::root_id;
+    use super::super::tests::{Fixture, Reply};
+    use crate::runtime::EffectOutcome;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn background_does_not_infer_route_absence_from_oversized_rejection() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let open = fixture.open(&service).await;
+        let root = root_id(&open.binding_id, open.generation);
+        let path = format!("/api/session/{root}/background");
+
+        for status in [404, 405] {
+            fixture.world.lock().unwrap().overrides.insert(
+                ("POST".into(), path.clone()),
+                Reply::Json(
+                    status,
+                    json!({"_tag":"SessionNotFoundError","message":"private".repeat(2048)}),
+                ),
+            );
+            let mut command = fixture.command("agent.background");
+            command.input = json!({});
+            let posts_before = fixture.posts(&path);
+            let result = service.execute(&command, &fixture.options).await;
+            assert!(
+                matches!(result.outcome, EffectOutcome::Rejected),
+                "{result:?}"
+            );
+            assert_eq!(result.details["code"], "NATIVE_REJECTED");
+            assert_eq!(result.details["native_http_failure"]["status"], status);
+            assert_eq!(
+                result.details["native_http_failure"]["kind"],
+                "response_unavailable"
+            );
+            assert_eq!(
+                result.details["completion_condition"],
+                "native_background_rejected"
+            );
+            assert!(!result.details.to_string().contains("private"));
+            assert_eq!(fixture.posts(&path), posts_before + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn background_distinguishes_route_absence_from_typed_session_rejection() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let open = fixture.open(&service).await;
+        let root = root_id(&open.binding_id, open.generation);
+        let path = format!("/api/session/{root}/background");
+
+        fixture.world.lock().unwrap().overrides.insert(
+            ("POST".into(), path.clone()),
+            Reply::Json(404, json!({"missing":true})),
+        );
+        let mut command = fixture.command("agent.background");
+        command.input = json!({});
+        let absent = service.execute(&command, &fixture.options).await;
+        assert!(
+            matches!(absent.outcome, EffectOutcome::Rejected),
+            "{absent:?}"
+        );
+        assert_eq!(absent.details["code"], "UNSUPPORTED_CAPABILITY");
+        assert_eq!(absent.details["native_http_failure"]["status"], 404);
+        assert_eq!(
+            absent.details["native_http_failure"]["kind"],
+            "unclassified"
+        );
+
+        fixture.world.lock().unwrap().overrides.insert(
+            ("POST".into(), path.clone()),
+            Reply::Json(
+                404,
+                json!({"_tag":"SessionNotFoundError","message":"private"}),
+            ),
+        );
+        command.operation_id = crate::model::new_id();
+        let missing_session = service.execute(&command, &fixture.options).await;
+        assert!(
+            matches!(missing_session.outcome, EffectOutcome::Rejected),
+            "{missing_session:?}"
+        );
+        assert_eq!(missing_session.details["code"], "NATIVE_REJECTED");
+        assert_eq!(
+            missing_session.details["native_http_failure"]["status"],
+            404
+        );
+        assert_eq!(
+            missing_session.details["native_http_failure"]["kind"],
+            "session_not_found"
+        );
+        assert!(!missing_session.details.to_string().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn background_preserves_request_auth_conflict_and_size_rejections() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let open = fixture.open(&service).await;
+        let root = root_id(&open.binding_id, open.generation);
+        let path = format!("/api/session/{root}/background");
+        let cases = [
+            (400, "InvalidRequestError", "invalid_request"),
+            (401, "UnauthorizedError", "unauthorized"),
+            (403, "ForbiddenError", "unclassified"),
+            (409, "ConflictError", "conflict"),
+            (413, "PayloadTooLargeError", "unclassified"),
+            (422, "UnprocessableEntityError", "unclassified"),
+        ];
+
+        for (status, tag, kind) in cases {
+            fixture.world.lock().unwrap().overrides.insert(
+                ("POST".into(), path.clone()),
+                Reply::Json(
+                    status,
+                    json!({"_tag":tag,"message":"private rejection detail"}),
+                ),
+            );
+            let mut command = fixture.command("agent.background");
+            command.input = json!({});
+            let result = service.execute(&command, &fixture.options).await;
+            assert!(
+                matches!(result.outcome, EffectOutcome::Rejected),
+                "{status}: {result:?}"
+            );
+            assert_eq!(
+                result.details["code"], "NATIVE_REJECTED",
+                "{status}: {result:?}"
+            );
+            assert_eq!(result.details["native_http_failure"]["status"], status);
+            assert_eq!(result.details["native_http_failure"]["kind"], kind);
+            assert_eq!(
+                result.details["completion_condition"],
+                "native_background_rejected"
+            );
+            assert!(
+                !result
+                    .details
+                    .to_string()
+                    .contains("private rejection detail")
+            );
+        }
     }
 }

@@ -51,6 +51,8 @@ pub enum NativeHttpFailureKind {
     SessionNotFound,
     MessageNotFound,
     InternalServerError,
+    /// The bounded error envelope could not be read completely.
+    ResponseUnavailable,
     Unclassified,
 }
 

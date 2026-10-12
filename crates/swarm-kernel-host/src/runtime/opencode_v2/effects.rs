@@ -16,6 +16,8 @@ use swarm_contracts::{
     task_prompt::TaskPromptEnvelopeV1,
 };
 
+const MAX_OWNED_FAMILY_MEMBERS: usize = 256;
+
 pub(super) fn outcome(
     command: &RuntimeCommand,
     state: EffectOutcome,
@@ -741,7 +743,9 @@ impl Service {
     pub(super) async fn owns_member(&self, root: &str, member: &str) -> Result<()> {
         let mut current = member.to_owned();
         let mut visited = BTreeSet::new();
-        for _ in 0..64 {
+        // Match snapshot::read_family's 256-member bound, including the root.
+        // A cycle or a longer chain still fails closed after this bounded walk.
+        for _ in 0..MAX_OWNED_FAMILY_MEMBERS {
             valid_id(&current, "ses")?;
             if !visited.insert(current.clone()) {
                 break;
@@ -906,6 +910,164 @@ impl Service {
                 }
                 r
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod app214_family_reply_consumer_tests {
+    use super::super::tests::Fixture;
+    use super::super::{root_id, tests::World};
+    use crate::{model, runtime::EffectOutcome};
+    use serde_json::{Value, json};
+
+    const DECLARED_FAMILY_MEMBER_LIMIT: usize = 256;
+
+    fn session(id: &str, parent: &str) -> Value {
+        json!({
+            "id": id,
+            "parentID": parent,
+            "projectID": "prj_fixture",
+            "time": {"created": 1, "updated": 2}
+        })
+    }
+
+    fn seed_reply(world: &mut World, target: &str, request_id: &str) -> Value {
+        let request = json!({
+            "id": request_id,
+            "sessionID": target,
+            "action": "shell",
+            "resources": ["fixture"]
+        });
+        world
+            .permissions
+            .insert(target.to_owned(), vec![request.clone()]);
+        request
+    }
+
+    fn reply_command(
+        fixture: &Fixture,
+        target: &str,
+        request_id: &str,
+        request: &Value,
+    ) -> crate::runtime::RuntimeCommand {
+        let mut command = fixture.command("agent.reply");
+        command.input = json!({"reply": {
+            "kind": "permission",
+            "session_id": target,
+            "request_id": request_id,
+            "fingerprint": model::digest(model::canonical(request).unwrap().as_bytes()),
+            "body": {"decision": "once"}
+        }});
+        command
+    }
+
+    #[tokio::test]
+    async fn reply_accepts_the_deepest_member_of_the_256_member_family() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let open = fixture.open(&service).await;
+        let root = root_id(&open.binding_id, open.generation);
+        let target = {
+            let mut world = fixture.world.lock().unwrap();
+            let mut parent = root.clone();
+            for depth in 1..DECLARED_FAMILY_MEMBER_LIMIT {
+                let id = format!("ses_member_{depth:03}");
+                world.sessions.insert(id.clone(), session(&id, &parent));
+                parent = id;
+            }
+            let request = seed_reply(&mut world, &parent, "per_deep_fixture");
+            (parent, request)
+        };
+        let command = reply_command(&fixture, &target.0, "per_deep_fixture", &target.1);
+
+        let result = service.execute(&command, &fixture.options).await;
+        assert!(
+            matches!(result.outcome, EffectOutcome::Applied),
+            "{result:?}"
+        );
+        assert_eq!(
+            fixture.posts(&format!(
+                "/api/session/{}/permission/per_deep_fixture/reply",
+                target.0
+            )),
+            1
+        );
+        let parent_reads = fixture
+            .world
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| {
+                request.method == "GET"
+                    && request
+                        .path
+                        .strip_prefix("/api/session/")
+                        .is_some_and(|id| id.starts_with("ses_member_") && !id.contains('/'))
+            })
+            .count();
+        assert_eq!(parent_reads, DECLARED_FAMILY_MEMBER_LIMIT - 1);
+    }
+
+    #[tokio::test]
+    async fn reply_rejects_cycle_foreign_root_and_over_limit_before_post() {
+        let fixture = Fixture::new().await;
+        let service = fixture.service().await;
+        let open = fixture.open(&service).await;
+        let root = root_id(&open.binding_id, open.generation);
+
+        let cases = [
+            ("ses_cycle_a", "per_cycle_fixture", "cycle"),
+            ("ses_foreign_child", "per_foreign_fixture", "foreign"),
+            ("ses_over_limit_256", "per_over_limit_fixture", "over_limit"),
+        ];
+        {
+            let mut world = fixture.world.lock().unwrap();
+            world
+                .sessions
+                .insert("ses_cycle_a".into(), session("ses_cycle_a", "ses_cycle_b"));
+            world
+                .sessions
+                .insert("ses_cycle_b".into(), session("ses_cycle_b", "ses_cycle_a"));
+            world.sessions.insert(
+                "ses_foreign_child".into(),
+                session("ses_foreign_child", "ses_foreign_root"),
+            );
+            world.sessions.insert(
+                "ses_foreign_root".into(),
+                json!({"id":"ses_foreign_root","projectID":"prj_foreign","time":{"created":1,"updated":1}}),
+            );
+            let mut parent = root.clone();
+            for depth in 1..=DECLARED_FAMILY_MEMBER_LIMIT {
+                let id = format!("ses_over_limit_{depth:03}");
+                world.sessions.insert(id.clone(), session(&id, &parent));
+                parent = id;
+            }
+            assert_eq!(parent, "ses_over_limit_256");
+            for (target, request_id, _) in cases {
+                seed_reply(&mut world, target, request_id);
+            }
+        }
+
+        for (target, request_id, _) in cases {
+            let request = fixture.world.lock().unwrap().permissions[target][0].clone();
+            let command = reply_command(&fixture, target, request_id, &request);
+            let result = service.execute(&command, &fixture.options).await;
+            assert!(
+                matches!(result.outcome, EffectOutcome::Rejected),
+                "{result:?}"
+            );
+            assert_eq!(
+                result.details["code"], "NATIVE_SCOPE_MISMATCH",
+                "{target}: {result:?}"
+            );
+            assert_eq!(
+                fixture.posts(&format!(
+                    "/api/session/{target}/permission/{request_id}/reply"
+                )),
+                0
+            );
         }
     }
 }

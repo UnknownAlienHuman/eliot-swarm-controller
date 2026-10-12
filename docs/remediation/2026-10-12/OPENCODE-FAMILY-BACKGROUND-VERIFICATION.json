@@ -1,0 +1,399 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-10-12T07:23:19.9972407Z",
+  "scope": "APP208 documents both bounded mailbox mutation methods. APP214 accepts every descendant in the admitted256-member family and denies foreign/cycle/overflow before reply POST. APP215 preserves native validation/auth/session/conflict/size rejection evidence, and distinguishes unavailable error-body evidence so oversized/incomplete404/405 cannot falsely prove unsupported capability.",
+  "target_base_main": "a5c89a590fb01cf0b7455d2d1d2613d2bc35266c",
+  "owned_source_sha256": {
+    "crates/swarm-kernel-host/src/store/message_batch.rs": "BE0E57FAF03DE78A9297D31A3EF7CC7FAEFBBE5336744CD98B920A6D51A32987",
+    "crates/swarm-kernel-host/src/runtime/opencode_v2/effects.rs": "835111B95CCFD4A1201FBDF7DC9364E8FABFF80D53ACD7A9DAA7E95C6A065D49",
+    "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs": "1A7F3FCF4EC9E5403BFED4ADE502F5B10B7127F68CF40A5226CE55555C0C6ABB",
+    "crates/swarm-kernel-host/src/runtime/opencode_v2/http.rs": "E0ECEDEF12A7A406D811767A5791D9BA1142C401E8D810BA4C5D47F73BD9EE6C",
+    "crates/swarm-contracts/src/error.rs": "F555ECAA5E6462B6D8BD582BFB259950E53525AF959E56FBC68874C5D8497DBA"
+  },
+  "source_manifest_sha256": "9F341D8EE909F2D963DD14C8A5AF4E9A9F57308FF3AC3DC17343B590BA17F781",
+  "frozen_inputs_verified": 478,
+  "strict_production_clippy": "Windows/Linux PASS Rust1.98.1 --locked --lib --bins --no-deps -- -D warnings",
+  "gate_artifacts": {
+    "app208214215-opencode-runtime-windows-clippy-v3.json": {
+      "artifact_sha256": "E644154FC2040651C65931D0AA85527D91F865E400245CA7AE1506AF5EB6028B",
+      "platform": "windows",
+      "gate": "clippy",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "started_at_utc": "2026-10-12T07:12:25.7042379Z",
+      "completed_at_utc": "2026-10-12T07:12:42.9308386Z",
+      "log_sha256": "1C76F42A50E9FCE8BF6C6B1CC10F19D08B7EF10BD3904EEFE326ECCF0D18D1B2"
+    },
+    "app208214215-opencode-runtime-linux-clippy-v3.json": {
+      "artifact_sha256": "0F233D8ED68BB10B7FDFE2A5154E6FB008C1517E74AD2A2DD086F3F7364281CC",
+      "platform": "linux",
+      "gate": "clippy",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 clippy --locked -p swarm-kernel-host --lib --bins --no-deps -- -D warnings",
+      "exit_code": 0,
+      "source_stable": true,
+      "started_at_utc": "2026-10-12T07:12:25.7043138Z",
+      "completed_at_utc": "2026-10-12T07:12:50.3644869Z",
+      "log_sha256": "FD2B148C2CC3135FB011655FA99D653D687A771AB264B54F7FE99C591BFBC2A8"
+    },
+    "app208214215-opencode-runtime-windows-tests-v4.json": {
+      "artifact_sha256": "882BCEA23F0C61F6D812164A616D1CC3073F12D9B95023BA561AE4A4A61B8EF6",
+      "platform": "windows",
+      "gate": "tests",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(app215_background_rejection_consumer_tests::)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "started_at_utc": "2026-10-12T07:14:22.7847298Z",
+      "completed_at_utc": "2026-10-12T07:15:46.8413898Z",
+      "log_sha256": "05B8ABA9322EBE7B1E6D51405A41CEAD5BF170C45B0D9C149AAB33C120C0D773"
+    },
+    "app208214215-opencode-runtime-windows-tests-family-v4.json": {
+      "artifact_sha256": "DA120CC35FB6E7E1A99DE3DD8C3FB42715FD888C5B50314CE4DBF2502CCB5DE1",
+      "platform": "windows",
+      "gate": "tests",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(app214_family_reply_consumer_tests::)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "started_at_utc": "2026-10-12T07:19:44.7939447Z",
+      "completed_at_utc": "2026-10-12T07:19:45.8760552Z",
+      "log_sha256": "54C6004603839EDD95C9108328A77600A48EF834FFD166B182199224C34FE1C0"
+    },
+    "app208214215-opencode-runtime-linux-tests-v4.json": {
+      "artifact_sha256": "7C1BF736D75E648FB81997F67CAC037A4CE8769A04A5F6DE400E10C59AFC53BD",
+      "platform": "linux",
+      "gate": "tests",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host --lib --no-fail-fast -E 'test(app214_family_reply_consumer_tests::) | test(app215_background_rejection_consumer_tests::)'",
+      "exit_code": 0,
+      "source_stable": true,
+      "started_at_utc": "2026-10-12T07:16:59.542464Z",
+      "completed_at_utc": "2026-10-12T07:18:13.2061289Z",
+      "log_sha256": "B4BDD2A6D055D5E2B20239348FF0744BCC18BB5E68029963D25F08363001937E"
+    }
+  },
+  "meaningful_consumers": {
+    "windows": [
+      "runtime::opencode_v2::background::app215_background_rejection_consumer_tests::background_distinguishes_route_absence_from_typed_session_rejection",
+      "runtime::opencode_v2::background::app215_background_rejection_consumer_tests::background_does_not_infer_route_absence_from_oversized_rejection",
+      "runtime::opencode_v2::background::app215_background_rejection_consumer_tests::background_preserves_request_auth_conflict_and_size_rejections",
+      "runtime::opencode_v2::effects::app214_family_reply_consumer_tests::reply_accepts_the_deepest_member_of_the_256_member_family",
+      "runtime::opencode_v2::effects::app214_family_reply_consumer_tests::reply_rejects_cycle_foreign_root_and_over_limit_before_post"
+    ],
+    "linux": [
+      "runtime::opencode_v2::background::app215_background_rejection_consumer_tests::background_distinguishes_route_absence_from_typed_session_rejection",
+      "runtime::opencode_v2::background::app215_background_rejection_consumer_tests::background_does_not_infer_route_absence_from_oversized_rejection",
+      "runtime::opencode_v2::background::app215_background_rejection_consumer_tests::background_preserves_request_auth_conflict_and_size_rejections",
+      "runtime::opencode_v2::effects::app214_family_reply_consumer_tests::reply_accepts_the_deepest_member_of_the_256_member_family",
+      "runtime::opencode_v2::effects::app214_family_reply_consumer_tests::reply_rejects_cycle_foreign_root_and_over_limit_before_post"
+    ],
+    "windows_count": 5,
+    "linux_count": 5
+  },
+  "remaining": [
+    "Full original V27 audit/public/native Step5 free/Gemini3.8/crash/load qualification remains pending.",
+    "24 retained host libtest warnings remain; Clippy proof is strict production --lib --bins --no-deps.",
+    "First Windowsv1 run3/4PASS exposed fixture-only GET counter error; corrected predicate passed and current finalWindows5/Linux5 consumersPASS."
+  ],
+  "full_v27_qualified": false,
+  "independent_review": {
+    "schema": "eliot.app208214215_independent_source_review.v4",
+    "status": "source_review_complete_no_current_p1_p2",
+    "repository": "C:/Development/Rust/projects/eliot-swarm-controller",
+    "review_date": "2026-10-12",
+    "reviewed_ref": "main",
+    "reviewed_head": "a5c89a590fb01cf0b7455d2d1d2613d2bc35266c",
+    "scope": "Exact source-only review of the frozen APP208/214/215 v4 five-file manifest, including the ResponseUnavailable contract and updated oversized-404/405 consumer fixture. APP176-200 and unrelated main deliveries were not reviewed.",
+    "ownership": {
+      "only_path_written": ".local/manager-audit/app208214215-independent-source-review-v4-20261012.json",
+      "five_manifest_sources_read_only": true,
+      "v2_review_modified": false,
+      "manager_candidate_touched": false,
+      "root_wip_preserved": true
+    },
+    "inputs": [
+      {
+        "path": ".local/manager-audit/app208214215-opencode-runtime-source-v4.json",
+        "sha256": "9F341D8EE909F2D963DD14C8A5AF4E9A9F57308FF3AC3DC17343B590BA17F781",
+        "role": "Frozen five-file v4 source hash manifest."
+      },
+      {
+        "path": ".local/manager-audit/app215-oversized-rejection-fixture-custody-v4.json",
+        "sha256": "B1674AEC2D7364123052E80D88E71995D3DD237BB99423B1D9F83AA824DEECE3",
+        "role": "Records that the v4 background delta is a cfg(test)-only per-call counter and supplies prior/final background source hashes."
+      },
+      {
+        "path": ".local/manager-audit/app208214215-independent-source-review-20261012.json",
+        "sha256": "6C33649740C021F98B9CF291705C006BADCF4615CD5BE5F4E715BC9BC47C5B78",
+        "role": "Preserved v2 source review, including the accepted APP215 P2 and APP208/214 source findings."
+      },
+      {
+        "path": ".local/manager-audit/app208214215-opencode-runtime-repair-proof-20261012.json",
+        "sha256": "A6E60C2074ACBDD97294BF39A3FC30CA6A4231DF3382F86B4A19B59097FF9779",
+        "role": "Original APP obligations, producer/consumer path, and identification of the existing loopback Service fixture."
+      },
+      {
+        "path": ".local/manager-audit/v27-app201-app225-normative-contract-review-20261012.json",
+        "sha256": "D6E21F57AE3C4F1FB34F41C226B0C69B0C2F2E67D8D44FF935124A85A2C01D4C",
+        "role": "Normative references and prior APP208/214/215 contract reconciliation."
+      }
+    ],
+    "source_hash_guard": {
+      "manifest_path": ".local/manager-audit/app208214215-opencode-runtime-source-v4.json",
+      "manifest_sha256": "9F341D8EE909F2D963DD14C8A5AF4E9A9F57308FF3AC3DC17343B590BA17F781",
+      "observed_sha256": {
+        "crates/swarm-kernel-host/src/store/message_batch.rs": "BE0E57FAF03DE78A9297D31A3EF7CC7FAEFBBE5336744CD98B920A6D51A32987",
+        "crates/swarm-kernel-host/src/runtime/opencode_v2/effects.rs": "835111B95CCFD4A1201FBDF7DC9364E8FABFF80D53ACD7A9DAA7E95C6A065D49",
+        "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs": "1A7F3FCF4EC9E5403BFED4ADE502F5B10B7127F68CF40A5226CE55555C0C6ABB",
+        "crates/swarm-kernel-host/src/runtime/opencode_v2/http.rs": "E0ECEDEF12A7A406D811767A5791D9BA1142C401E8D810BA4C5D47F73BD9EE6C",
+        "crates/swarm-contracts/src/error.rs": "F555ECAA5E6462B6D8BD582BFB259950E53525AF959E56FBC68874C5D8497DBA"
+      },
+      "guard_result": "all_five_match_v4_manifest",
+      "background_v4_custody": {
+        "prior_v3_sha256": "250CCAF908C91210686E855436406E6C850CA5EB69EC99082475C0FFF1A7E2CB",
+        "v4_sha256": "1A7F3FCF4EC9E5403BFED4ADE502F5B10B7127F68CF40A5226CE55555C0C6ABB",
+        "custody_proof_claim": "production_unchanged_proved_by_exact_previous_file_reconstruction; v4 adds a cfg(test)-only per-call POST counter"
+      }
+    },
+    "prior_v2_review_preservation": {
+      "path": ".local/manager-audit/app208214215-independent-source-review-20261012.json",
+      "sha256": "6C33649740C021F98B9CF291705C006BADCF4615CD5BE5F4E715BC9BC47C5B78",
+      "result": "Left unchanged. Its APP215 P2 remains an accurate finding for the earlier v2 source hash; this v4 review assesses the later frozen source."
+    },
+    "normative_support_reused_from_v2_review": [
+      {
+        "path": "docs/agent_swarm.module-contract-v2.md",
+        "sha256": "E2C440D02FF079E1B1196CD997C9C5E570FEC56ED2B14B04AD8D71DD6476D813",
+        "references": "reply must address the current request with stale guard; family identity follows native parent links; background is declared only for a native-contract-confirmed endpoint and verified by the native boundary/readback."
+      },
+      {
+        "path": "docs/agent-operations/architecture.md",
+        "sha256": "50382E0EDDDBFAF5732D21025411EB78A45134D0623F415469387751B2E98A0A",
+        "references": "Rejected-before-effect requires method-specific structured proof; generic state or error text is insufficient."
+      },
+      {
+        "path": "C:/Users/kleym/Downloads/Swarm V27 audit map/ELIOT-Swarm-Controller-Master-Audit-2026-10-09-v27.md",
+        "sha256": "3DEE8664DABA6AC3551128ECF005BFA4E2E21B423346D9D0CE039A1F4F9D2CFF",
+        "references": "The APP208 runtime allegation is not an unbounded-batch defect; the supported remaining issue was narrow documentation drift."
+      }
+    ],
+    "CodeUnderstandingProof": {
+      "task_goal": "Re-review the frozen v4 producer-to-consumer path for APP208, APP214, and APP215, verify the five manifest hashes, and determine whether the accepted v2 APP215 P2 remains in current source.",
+      "domain_concept": "Bounded Store batching documentation; root-inclusive native family ownership and stale-guarded reply; safe classification of incomplete native HTTP error bodies without inferring route absence.",
+      "project_or_module": "eliot-swarm-controller; Store message batching, OpenCode v2 HTTP producer/background consumer, and shared swarm-contracts error envelope.",
+      "candidate_files": [
+        "crates/swarm-kernel-host/src/store/message_batch.rs",
+        "crates/swarm-kernel-host/src/runtime/opencode_v2/effects.rs",
+        "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs",
+        "crates/swarm-kernel-host/src/runtime/opencode_v2/http.rs",
+        "crates/swarm-contracts/src/error.rs"
+      ],
+      "candidate_symbols": [
+        "message_batch::process/process_one",
+        "Service::owns_member/reply",
+        "NativeHttpFailureKind::ResponseUnavailable",
+        "read_native_http_failure",
+        "classify_native_http_failure",
+        "is_unavailable_background_route",
+        "Service::execute_background"
+      ],
+      "graph_findings": [
+        "Codebase Memory was queried using explicit project eliot-swarm-controller; its indexed NativeHttpFailureKind symbol resolves to crates/swarm-contracts/src/error.rs:47-56, including ResponseUnavailable.",
+        "All five current source SHA-256 values match the frozen v4 manifest; the original four source files retain their v2 hashes except background.rs/http.rs, which contain the APP215 repair and consumer fixture, while error.rs is the added shared contract path.",
+        "The custody proof identifies the v4 background delta as a test-only per-call POST counter; the current source shows the counter assertions in the cfg(test) consumer and the production route predicate remains keyed to Unclassified only."
+      ],
+      "exact_anchors": [
+        {
+          "path": "crates/swarm-kernel-host/src/store/message_batch.rs",
+          "lines": [
+            1,
+            7
+          ],
+          "role": "APP208 docs name both accepted methods and the shared bounded/savepoint behavior"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/effects.rs",
+          "lines": [
+            19,
+            19
+          ],
+          "role": "APP214 root-inclusive member cap is 256"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/effects.rs",
+          "lines": [
+            742,
+            761
+          ],
+          "role": "visited bounded ancestry walk accepts only exact root"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/effects.rs",
+          "lines": [
+            965,
+            1071
+          ],
+          "role": "corrected maximum-family session-read fixture and cycle/foreign/257-member pre-POST assertions"
+        },
+        {
+          "path": "crates/swarm-contracts/src/error.rs",
+          "lines": [
+            43,
+            63
+          ],
+          "role": "closed serialized HTTP failure enum and status/kind payload include ResponseUnavailable"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/http.rs",
+          "lines": [
+            618,
+            656
+          ],
+          "role": "effect status mapping retains NATIVE_REJECTED and attaches bounded failure facts"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/http.rs",
+          "lines": [
+            731,
+            775
+          ],
+          "role": "oversize/read failure yields ResponseUnavailable; complete bounded body proceeds to tag classification"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs",
+          "lines": [
+            104,
+            108
+          ],
+          "role": "only 404/405 plus Unclassified is route absence; ResponseUnavailable does not satisfy the predicate"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs",
+          "lines": [
+            368,
+            401
+          ],
+          "role": "route-absence branch is followed by the preserving NATIVE_REJECTED branch"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs",
+          "lines": [
+            545,
+            580
+          ],
+          "role": "loopback consumer iterates 404 and 405 oversized responses, checks ResponseUnavailable/NATIVE_REJECTED, no private body, and one background-route POST per call"
+        },
+        {
+          "path": "crates/swarm-kernel-host/src/runtime/opencode_v2/background.rs",
+          "lines": [
+            583,
+            631
+          ],
+          "role": "complete generic route absence remains distinct from typed SessionNotFound rejection"
+        }
+      ],
+      "execution_path": "APP208: existing bounded Store writer -> process -> per-request savepoint and method gate -> mutation. APP214: agent.reply -> binding validation -> 256-member root-inclusive owns_member walk -> exact pending request/fingerprint -> one POST. APP215: background pre-read -> one HTTP POST -> read_native_http_failure preserves status and closed kind -> ResponseUnavailable bypasses the route-absence predicate -> NATIVE_REJECTED details are returned without native body text.",
+      "state_reads": [
+        "APP208 reads each method/principal/params in the existing batch transaction.",
+        "APP214 reads ancestor session identity and the current addressed native request.",
+        "APP215 reads status and a bounded error envelope; the new ResponseUnavailable variant records that the body could not be completely consumed."
+      ],
+      "state_writes": [
+        "No production state transition was changed by this review.",
+        "The APP215 consumer returns rejection facts for the oversized 404/405 path; the test-only counter observes exactly one POST to the target route per call."
+      ],
+      "API_or_event_surface": [
+        "Store methods message.send and coordination.send.",
+        "OpenCode agent.reply, exact native request identity, and family parent chain.",
+        "NativeHttpFailure { status, kind }, including serialized response_unavailable.",
+        "OpenCode agent.background and /api/session/{session}/background."
+      ],
+      "diagnostics_before": "Read-only git status/HEAD, hash guards, exact lexical anchors, explicit-project Codebase Memory lookup, and ast-grep enum-use query. No LSP diagnostic session was used; no Cargo/build/test/Clippy/native/provider command was run by this reviewer.",
+      "invariants": [
+        "APP208 remains documentation-only and does not weaken batch bounds, per-item authorization, or fatal rollback.",
+        "APP214 counts the root within 256, rejects cycles/foreign roots/257-member families, and preserves the current-request fingerprint guard before POST.",
+        "A body that is oversized or not fully readable cannot be treated as a complete generic 404/405 route-absence signal.",
+        "Typed rejection facts retain status and closed kind only; private response body content is not propagated."
+      ],
+      "blast_radius": "Review is limited to the five v4 manifest sources. No source, fixture, proof outside the new review artifact, manager candidate, or other WIP was changed.",
+      "verifier": "Observed SHA-256 values for all five owned source paths match app208214215-opencode-runtime-source-v4.json. The v2 source conclusions for unchanged APP208/214 paths were preserved; APP215 was traced through shared enum, HTTP producer, background predicate, and current loopback consumer assertions.",
+      "unknowns": [
+        "No test or Clippy result is asserted by this review; the fixture source is reviewed but not executed.",
+        "The current added loopback consumer covers oversized 404 and 405 bodies. The chunk-read-error branch is source-reviewed as ResponseUnavailable but was not independently exercised here.",
+        "No live native service response or runtime capability was observed.",
+        "The manager-reported strict production v3 result is not independently verified or promoted by this source-only review."
+      ],
+      "edit_allowed": [
+        ".local/manager-audit/app208214215-independent-source-review-v4-20261012.json"
+      ]
+    },
+    "adjudications": [
+      {
+        "ledger_id": "APP-208",
+        "result": "bounded_pass_source",
+        "detail": "The current module documentation names message.send and coordination.send, matching process_one. The per-item savepoint and fatal batch rollback behavior remains intact. The Master Audit supports the bounded-writer distinction; this review did not reopen store/mod.rs or claim runtime qualification."
+      },
+      {
+        "ledger_id": "APP-214",
+        "result": "bounded_pass_source_fixture_corrected",
+        "detail": "The 256-member bound includes the root. The admitted fixture has 255 descendants and now counts only single-segment descendant session metadata GETs, excluding the permission child route. Separate fixture source asserts cycle, foreign-root, and root-plus-256-descendant rejection before POST. Assertions were not executed by this reviewer."
+      },
+      {
+        "ledger_id": "APP-215",
+        "prior_v2_result": "accepted P2: incomplete/oversized body collapsed to Unclassified and could become false unsupported 404/405",
+        "v4_result": "source-level repair verified; no current P1/P2 found",
+        "detail": "The shared closed enum adds ResponseUnavailable. HTTP body length above the bound, a chunk beyond the bound, or a chunk-read error yields that variant. Background route detection accepts only status 404/405 with Unclassified; ResponseUnavailable therefore follows the NATIVE_REJECTED branch and retains status/kind without body text. The loopback consumer source exercises oversized 404 and 405 responses and asserts rejection, response_unavailable, private-text absence, and exactly one POST to the background route per call.",
+        "remaining_source_coverage_note": "No separate consumer assertion for a chunk-read error was reviewed; the producer branch and downstream predicate are source-consistent, so this is recorded as unexecuted coverage rather than a current P1/P2 defect."
+      }
+    ],
+    "findings": [],
+    "execution_qualification": {
+      "reviewer_actions": "Source and hash review only.",
+      "cargo_build_tests_clippy_native_provider": "not run by reviewer",
+      "manager_reported_v3_clippy": "Not independently verified or asserted as this review's evidence.",
+      "release_or_runtime_qualification": "none"
+    },
+    "changed_paths": [
+      ".local/manager-audit/app208214215-independent-source-review-v4-20261012.json"
+    ]
+  },
+  "independent_review_sha256": "98B962631E97AF00EB836D01A42A293306C5440420DEA5101488E342894E7C54"
+}

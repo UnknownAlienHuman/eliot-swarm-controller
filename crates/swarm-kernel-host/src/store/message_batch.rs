@@ -1,9 +1,10 @@
-//! Bounded FIFO batching for the one high-volume external mutation.
+//! Bounded FIFO batching for high-volume mailbox mutations.
 //!
-//! The writer queue identifies `message.send` explicitly; no arbitrary Store
-//! closure is coalesced. Each request keeps its own authorization, request
-//! identity, and mutation savepoint, while one FULL-synchronous transaction
-//! commits the contiguous batch before any caller receives a reply.
+//! The Store writer caps this batch at `MAX_BATCH_SIZE`. This processor admits
+//! `message.send` and `coordination.send`; no arbitrary Store closure is
+//! coalesced. Each request keeps its own authorization, request identity, and
+//! mutation savepoint, while one FULL-synchronous transaction commits the
+//! contiguous batch before any caller receives a reply.
 use super::{current_principal, mutate_in_transaction};
 use crate::{
     config::Config,

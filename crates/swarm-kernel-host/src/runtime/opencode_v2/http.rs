@@ -15,6 +15,7 @@ use std::{
     path::{Component, Path},
     time::Duration,
 };
+use swarm_contracts::error::{NativeHttpFailure, NativeHttpFailureKind};
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_RPC_ERROR_BODY: usize = 8 * 1024;
@@ -643,6 +644,11 @@ impl Service {
                 "NATIVE_READ_FAILED"
             };
             let error = Error::new(code, format!("HTTP {}", status.as_u16()));
+            let mut error = error;
+            if effect && !native_mcp_rpc_route {
+                error.native_http_failure =
+                    Some(read_native_http_failure(&mut response, status).await);
+            }
             return Err(match rejection_class {
                 Some(class) => error.with_rejection_class(class),
                 None => error,
@@ -720,6 +726,54 @@ async fn read_native_rpc_rejection_class(
         }
     }
     decode_native_rpc_rejection_class(status, &bytes)
+}
+
+async fn read_native_http_failure(
+    response: &mut reqwest::Response,
+    status: reqwest::StatusCode,
+) -> NativeHttpFailure {
+    let mut bytes = Vec::new();
+    let mut bounded = !response
+        .content_length()
+        .is_some_and(|length| length > MAX_RPC_ERROR_BODY as u64);
+    while bounded {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= MAX_RPC_ERROR_BODY => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) | Err(_) => bounded = false,
+            Ok(None) => break,
+        }
+    }
+    NativeHttpFailure {
+        status: status.as_u16(),
+        kind: if bounded {
+            classify_native_http_failure(status, &bytes)
+        } else {
+            NativeHttpFailureKind::ResponseUnavailable
+        },
+    }
+}
+
+fn classify_native_http_failure(
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+) -> NativeHttpFailureKind {
+    if bytes.len() > MAX_RPC_ERROR_BODY {
+        return NativeHttpFailureKind::ResponseUnavailable;
+    }
+    let tag = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.get("_tag").and_then(Value::as_str).map(str::to_owned));
+    match (status.as_u16(), tag.as_deref()) {
+        (400, Some("InvalidRequestError")) => NativeHttpFailureKind::InvalidRequest,
+        (401, Some("UnauthorizedError")) => NativeHttpFailureKind::Unauthorized,
+        (404, Some("SessionNotFoundError")) => NativeHttpFailureKind::SessionNotFound,
+        (404, Some("MessageNotFoundError")) => NativeHttpFailureKind::MessageNotFound,
+        (409, Some("ConflictError")) => NativeHttpFailureKind::Conflict,
+        (500, Some("UnknownError")) => NativeHttpFailureKind::InternalServerError,
+        _ => NativeHttpFailureKind::Unclassified,
+    }
 }
 
 fn decode_native_rpc_rejection_class(
