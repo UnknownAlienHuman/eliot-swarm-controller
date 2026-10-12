@@ -180,6 +180,8 @@ fn valid_sha256(value: &str) -> bool {
 
 fn valid_provider_id(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value.len() <= 256
         && value
             .bytes()
@@ -809,6 +811,44 @@ fn transport_error(effect: bool) -> Error {
         },
         "native transport failed; no automatic mutation replay",
     )
+}
+
+#[cfg(test)]
+mod provider_path_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn built_in_key_mutation_rejects_navigation_before_process_or_http_checks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = Service {
+            client: Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
+            endpoint: Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap(),
+            pid: std::process::id(),
+            version: "2.0.7".into(),
+            owned_process: None,
+        };
+        for provider_id in [".", ".."] {
+            let error = service
+                .post_integration_key(provider_id, "fixture-key", "workspace")
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "NATIVE_PROVIDER_ID_INVALID");
+        }
+        // An ordinary dotted ID passes the segment guard and reaches the
+        // existing owned-process requirement; that requirement stays intact.
+        let error = service
+            .post_integration_key("provider.v1", "fixture-key", "workspace")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NATIVE_OWNED_PROCESS_MISMATCH");
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(listener.poll_accept(&mut context).is_pending());
+    }
 }
 
 #[cfg(test)]

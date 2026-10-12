@@ -2333,6 +2333,8 @@ fn valid_id(value: &str, prefix: &str) -> Result<()> {
 
 fn valid_provider_id(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value.len() <= 256
         && value
             .bytes()
@@ -2484,6 +2486,132 @@ mod catalog_readiness_tests {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    async fn provider_key_fixture() -> (NativeClient, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let client = NativeClient {
+            client: Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
+            endpoint,
+            pid: std::process::id(),
+            version: "2.0.7".into(),
+        };
+        (client, listener)
+    }
+
+    fn provider_key_options(provider_id: &str) -> NativeOptions {
+        let directory = std::env::current_dir().unwrap();
+        NativeOptions {
+            service_id: "provider-key-fixture".into(),
+            connection_file: directory.join("unused-connection.json"),
+            directory: directory.clone(),
+            model: ModelRef {
+                id: "fixture-model".into(),
+                provider_id: provider_id.into(),
+                variant: "fixture-variant".into(),
+            },
+        }
+    }
+
+    fn assert_no_provider_key_request(listener: &TcpListener) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(listener.poll_accept(&mut context).is_pending());
+    }
+
+    #[tokio::test]
+    async fn provider_key_rejects_exact_dot_segments_before_http_dispatch() {
+        let (client, listener) = provider_key_fixture().await;
+        for provider_id in [".", ".."] {
+            let error = client
+                .post_provider_key(provider_id, "fixture-key", "workspace")
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "NATIVE_PROVIDER_ID_INVALID");
+            assert_eq!(
+                error.message,
+                "selected provider ID is not one safe integration path segment"
+            );
+        }
+        assert_no_provider_key_request(&listener);
+    }
+
+    #[tokio::test]
+    async fn provider_key_posts_once_to_the_exact_dotted_provider_endpoint() {
+        let (client, listener) = provider_key_fixture().await;
+        let listener = std::sync::Arc::new(listener);
+        let server_listener = std::sync::Arc::clone(&listener);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(3), server_listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0 && request.len() + count <= 8192);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let mut request_line = headers.lines().next().unwrap().split_whitespace();
+            assert_eq!(request_line.next(), Some("POST"));
+            let target = request_line.next().unwrap();
+            assert_eq!(
+                target.split('?').next(),
+                Some("/api/integration/provider.v1/connect/key")
+            );
+            assert_eq!(request_line.next(), Some("HTTP/1.1"));
+            assert!(target.contains("workspace"));
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull";
+            stream.write_all(response).await.unwrap();
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.post_provider_key("provider.v1", "fixture-key", "workspace"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        // One accepted connection is the full effect budget; no retry or
+        // second mutation may be queued after the successful response.
+        assert_no_provider_key_request(&listener);
+    }
+
+    #[tokio::test]
+    async fn standalone_bootstrap_rejects_navigation_before_reading_auth_source() {
+        for provider_id in [".", ".."] {
+            let (client, listener) = provider_key_fixture().await;
+            let options = provider_key_options(provider_id);
+            let auth = crate::provider_auth::ProviderAuthOptions {
+                source_file: std::env::temp_dir()
+                    .join(format!("app325-auth-fixture-{}", std::process::id()))
+                    .join("auth.json"),
+                credential_ref: None,
+            };
+            let error = crate::provider_auth::bootstrap_once(&client, &options, &auth)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "OWNED_PROVIDER_AUTH");
+            assert_eq!(
+                error.message,
+                "provider authorization does not match the OpenCode route"
+            );
+            assert_no_provider_key_request(&listener);
         }
     }
 }

@@ -582,6 +582,8 @@ pub(super) fn validate_ref(value: &str) -> Result<()> {
 
 pub(super) fn validate_provider_id(value: &str) -> Result<()> {
     if value.is_empty()
+        || value == "."
+        || value == ".."
         || value.len() > MAX_SAFE_ID_BYTES
         || !value
             .bytes()
@@ -713,4 +715,35 @@ fn parse_selected_auth(
 
 fn auth_error(message: &str) -> Error {
     Error::new("OWNED_PROVIDER_AUTH", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_credential_preparation_rejects_navigation_before_source_access() {
+        for provider_id in [".", ".."] {
+            let model_ref = ModelRef {
+                id: "fixture-model".into(),
+                provider_id: provider_id.into(),
+                variant: "fixture-variant".into(),
+            };
+            let error = match prepare_credential(
+                "fixture-credential",
+                &model_ref,
+                Path::new("source-must-not-be-opened.json"),
+                "owner-nonce",
+                "route-digest",
+                "scope-digest",
+            ) {
+                Ok(_) => panic!("navigation provider ID was admitted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "OWNED_PROVIDER_AUTH");
+            assert_eq!(error.message, "selected provider ID is malformed");
+        }
+
+        assert!(validate_provider_id("provider.v1").is_ok());
+    }
 }

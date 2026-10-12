@@ -415,6 +415,8 @@ fn valid_ref(value: &str) -> bool {
 
 fn valid_provider_id(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value.len() <= MAX_SAFE_ID_BYTES
         && value
             .bytes()
@@ -423,4 +425,54 @@ fn valid_provider_id(value: &str) -> bool {
 
 fn auth_error(message: &str) -> Error {
     Error::new("OWNED_PROVIDER_AUTH", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OwnedNativeOptions;
+
+    fn owner_config(provider_id: &str) -> (OwnedNativeOptions, NativeOptions) {
+        let base = std::env::temp_dir().join("app325-provider-path-fixture");
+        let state_root = base.join("state");
+        let native = NativeOptions {
+            service_id: "provider-path-fixture".into(),
+            connection_file: state_root.join("connection.json"),
+            directory: base.join("workspace"),
+            model: ModelRef {
+                id: "fixture-model".into(),
+                provider_id: provider_id.into(),
+                variant: "fixture-variant".into(),
+            },
+        };
+        let owner = OwnedNativeOptions {
+            origin: "fresh_owned_service".into(),
+            owner_nonce: "00000000-0000-4000-8000-000000000001".into(),
+            bun_executable: base.join("bun"),
+            bun_sha256: "a".repeat(64),
+            server_program: base.join("serve.mjs"),
+            server_program_sha256: "b".repeat(64),
+            state_root: state_root.clone(),
+            password_file: state_root.join("server.password"),
+            port: 1234,
+            model_catalog: "offline".into(),
+            provider_auth: Some(ProviderAuthOptions {
+                source_file: base.join("auth.json"),
+                credential_ref: None,
+            }),
+        };
+        (owner, native)
+    }
+
+    #[test]
+    fn standalone_owner_config_rejects_only_navigation_provider_segments() {
+        for provider_id in [".", ".."] {
+            let (owner, native) = owner_config(provider_id);
+            let error = owner.validate_for(&native).unwrap_err();
+            assert_eq!(error.code, "CONFIG_ERROR");
+        }
+
+        let (owner, native) = owner_config("provider.v1");
+        assert!(owner.validate_for(&native).is_ok());
+    }
 }
