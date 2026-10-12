@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_CELL_MEMBERS: i64 = 50;
 const MAX_CANONICAL_SOURCES: usize = 32;
+const MAX_CELL_ASSUMPTIONS: usize = 40;
 const MAX_OVERLAP_MATCHES: usize = wire::MAX_OVERLAP_RESULTS;
 
 #[derive(Clone)]
@@ -268,6 +269,16 @@ fn sync_integration(
     {
         coverage = "partial".to_owned();
     }
+    let (assumptions, omitted_assumptions) =
+        cell_assumptions(&cell_facts.offers, &cell_facts.requirements);
+    if omitted_assumptions > 0 {
+        coverage = "partial".to_owned();
+        gaps.push(json!({
+            "kind":"cell_assumptions_projection_bound",
+            "limit":MAX_CELL_ASSUMPTIONS,
+            "omitted_count":omitted_assumptions,
+        }));
+    }
     let state = if cell_facts.comparison_status == "mismatch" {
         wire::CellState::Mismatch
     } else if coverage != "complete" || cell_facts.comparison_status == "unknown" {
@@ -277,7 +288,6 @@ fn sync_integration(
     } else {
         wire::CellState::Compatible
     };
-    let assumptions = cell_assumptions(&cell_facts.offers, &cell_facts.requirements);
     let facts = json!({
         "scope_id":scope_id,
         "task_id":task_id,
@@ -299,6 +309,7 @@ fn sync_integration(
     });
     let material = json!({
         "membership_digest":membership_digest,
+        "member_basis_set":member_basis_set,
         "member_card_facts":member_card_facts,
         "offers":material_contributions(&cell_facts.offers, "offer"),
         "requirements":material_contributions(&cell_facts.requirements, "requirement"),
@@ -696,13 +707,44 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
         request.after_position_revision,
         request.limit,
     )?;
-    let current = meta(
-        db,
-        text_at(&location, &["cell_record_key"], "cell record key")?,
-    )?
-    .ok_or_else(|| Error::new("NOT_FOUND", "current integration cell is not retained"))?;
-    let is_current = current["state_revision"] == state_revision
-        && current["material_digest"] == material_digest;
+    let current_pointer =
+        meta(db, &current_cell_index_key(scope_id, contract_key))?.ok_or_else(|| {
+            Error::new(
+                "STORE_INVARIANT",
+                "retained integration cell lacks its authoritative current pointer",
+            )
+        })?;
+    let current_cell_id = text_at(&current_pointer, &["cell_id"], "current cell id")?;
+    let current_record_key = text_at(
+        &current_pointer,
+        &["cell_record_key"],
+        "current cell record key",
+    )?;
+    let expected_current_record_key = cell_record_key(scope_id, contract_key, current_cell_id);
+    if current_record_key != expected_current_record_key.as_str() {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "authoritative current pointer does not reference its canonical cell record",
+        ));
+    }
+    let current = meta(db, current_record_key)?.ok_or_else(|| {
+        Error::new(
+            "STORE_INVARIANT",
+            "authoritative current integration cell is not retained",
+        )
+    })?;
+    if current["cell_id"] != current_cell_id {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "authoritative current pointer disagrees with its cell record",
+        ));
+    }
+    let current_revision = int_at(&current, &["state_revision"], "current state revision")?;
+    let current_material_digest =
+        text_at(&current, &["material_digest"], "current material digest")?;
+    let is_current = current_cell_id == request.cell_id.as_str()
+        && current_revision == state_revision
+        && current_material_digest == material_digest.as_str();
     let classification = if is_current {
         let freshness = current_cell_freshness(
             db,
@@ -1762,7 +1804,7 @@ fn selected_card_dimensions(card: &Value) -> Value {
     Value::Object(selected)
 }
 
-fn cell_assumptions(offers: &[Value], requirements: &[Value]) -> Value {
+fn cell_assumptions(offers: &[Value], requirements: &[Value]) -> (Value, usize) {
     let mut all = BTreeSet::new();
     for contribution in offers {
         add_assumptions(&mut all, contribution.pointer("/offer/assumptions"));
@@ -1770,7 +1812,12 @@ fn cell_assumptions(offers: &[Value], requirements: &[Value]) -> Value {
     for contribution in requirements {
         add_assumptions(&mut all, contribution.pointer("/requirement/assumptions"));
     }
-    json!(all.into_iter().take(40).collect::<Vec<_>>())
+    let omitted_count = all.len().saturating_sub(MAX_CELL_ASSUMPTIONS);
+    let assumptions = all
+        .into_iter()
+        .take(MAX_CELL_ASSUMPTIONS)
+        .collect::<Vec<_>>();
+    (json!(assumptions), omitted_count)
 }
 
 fn add_assumptions(all: &mut BTreeSet<String>, values: Option<&Value>) {

@@ -4165,3 +4165,7 @@ mod logging_exact_operation_current_consumers;
 #[cfg(test)]
 #[path = "program_tests/producer_terminal_metadata_current_consumers.rs"]
 mod producer_terminal_metadata_current_consumers;
+
+#[cfg(test)]
+#[path = "program_tests/coordination_integration_current_consumers.rs"]
+mod coordination_integration_current_consumers;
