@@ -2161,12 +2161,10 @@ mod capture_release_fixture {
             "command_capture_release_recorded"
         );
         let release_outcome_sha256 = store.save_outcome(&release_outcome)?;
-        store.acknowledge(
-            release_operation_id,
-            &release_outcome_sha256,
-            json!({"recorded":true}),
-        )?;
-        store.finalize_release_after_outcome_ack(release_operation_id, &release_outcome_sha256)?;
+        let unacknowledged_cleanup = store
+            .finalize_release_after_outcome_ack(release_operation_id, &release_outcome_sha256)
+            .expect_err("release cleanup must require the durable host ACK");
+        assert_eq!(unacknowledged_cleanup.code, "ADAPTER_EVIDENCE_INVALID");
         store.finalize_acknowledged_releases()?;
 
         let (first_readback, first_hash) = store
@@ -2188,7 +2186,33 @@ mod capture_release_fixture {
             serde_json::to_value(repeat_readback)?,
         );
         assert_eq!(first_hash, repeat_hash);
-        assert!(!first_hash.is_empty());
+        assert_eq!(first_hash, release_outcome_sha256);
+        assert!(store.outcome_pending(release_operation_id, &first_hash)?);
+        assert_eq!(store.pending_outcomes()?.len(), 1);
+
+        store.acknowledge(
+            release_operation_id,
+            &release_outcome_sha256,
+            json!({"recorded":true}),
+        )?;
+        let mismatched_cleanup = store
+            .finalize_release_after_outcome_ack(
+                release_operation_id,
+                &digest(b"different release outcome"),
+            )
+            .expect_err("a different outcome hash must not authorize cleanup");
+        assert_eq!(mismatched_cleanup.code, "ADAPTER_EVIDENCE_INVALID");
+        assert!(store.read_outcome(release_operation_id)?.is_some());
+        store.finalize_release_after_outcome_ack(release_operation_id, &release_outcome_sha256)?;
+        store.finalize_acknowledged_releases()?;
+        assert!(store.read_outcome(release_operation_id)?.is_none());
+        for output in &evidence.outputs {
+            for page in &output.pages {
+                assert!(store.read_result_page(&page.result_operation_id)?.is_none());
+            }
+        }
+        assert!(store.pending_outcomes()?.is_empty());
+        assert!(store.pending_result_pages()?.is_empty());
         assert!(
             store
                 .read_native_output(
@@ -2207,6 +2231,24 @@ mod capture_release_fixture {
                 .join("command-adapter-runs-v3")
                 .join(format!("op-{}", digest(target_id.as_bytes())))
                 .exists()
+        );
+        assert!(
+            !state
+                .0
+                .join("command-adapter-runs-v3")
+                .join(format!("releasing-{}", digest(target_id.as_bytes())))
+                .exists()
+        );
+        assert!(
+            !state
+                .0
+                .join("command-adapter-runs-v3")
+                .join(format!("op-{}", digest(release_operation_id.as_bytes())))
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_dir(state.0.join("command-adapter-runs-v3"))?.count(),
+            0,
         );
         Ok(())
     }

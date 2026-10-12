@@ -291,7 +291,9 @@ impl RunStore {
     }
 
     pub fn read_outcome(&self, operation_id: &str) -> Result<Option<(RuntimeOutcome, String)>> {
-        let dir = self.directory(operation_id)?;
+        let Some(dir) = self.existing_record_directory(operation_id)? else {
+            return Ok(None);
+        };
         let path = dir.join("outcome.json");
         if !path.exists() {
             return Ok(None);
@@ -556,7 +558,9 @@ impl RunStore {
     }
 
     pub fn read_result_page(&self, operation_id: &str) -> Result<Option<(Value, String)>> {
-        let dir = self.directory(operation_id)?;
+        let Some(dir) = self.existing_record_directory(operation_id)? else {
+            return Ok(None);
+        };
         let path = dir.join("result-page.json");
         if !path.exists() {
             return Ok(None);
@@ -1411,6 +1415,27 @@ impl RunStore {
             ));
         }
         Ok(Some(canonical_path))
+    }
+
+    // Record reads must not recreate an Operation retired by an exact ACK.
+    // Retain the ordinary-read refusal while its release tombstone exists.
+    fn existing_record_directory(&self, operation_id: &str) -> Result<Option<PathBuf>> {
+        let path = self
+            .root
+            .join(format!("op-{}", digest(operation_id.as_bytes())));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => self.existing_directory(operation_id).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.existing_release_directory(operation_id)?.is_some() {
+                    return Err(Error::new(
+                        "COMMAND_CAPTURE_RELEASED",
+                        "Command captures moved to an authorized release tombstone",
+                    ));
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn existing_directory(&self, operation_id: &str) -> Result<PathBuf> {
