@@ -105,3 +105,117 @@ fn trigger_shapes(db: &Connection) -> Result<Vec<TriggerShape>> {
 fn schema_mismatch(message: String) -> Error {
     Error::new("SCHEMA_MISMATCH", message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{SCHEMA, meta, set_meta};
+    use super::CANCEL_EVENT_MARKER;
+    use rusqlite::{Connection, TransactionBehavior};
+    use serde_json::json;
+
+    fn empty_database() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db
+    }
+
+    fn install_in_transaction(db: &mut Connection) -> crate::error::Result<()> {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::install(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn changed_marker_is_rejected_by_production_installer() {
+        let mut db = empty_database();
+        {
+            let tx = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            set_meta(
+                &tx,
+                CANCEL_EVENT_MARKER,
+                &json!("deliberately-not-the-schema-digest"),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let error = install_in_transaction(&mut db).unwrap_err();
+        assert_eq!(error.code, "SCHEMA_MISMATCH");
+    }
+
+    #[test]
+    fn changed_registered_cancellation_trigger_definition_is_rejected_by_production_installer() {
+        let mut db = empty_database();
+        install_in_transaction(&mut db).unwrap();
+        db.execute_batch(
+            "DROP TRIGGER operation_cancel_event_after_insert; CREATE TRIGGER operation_cancel_event_after_insert AFTER INSERT ON operations BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+
+        let error = install_in_transaction(&mut db).unwrap_err();
+        assert_eq!(error.code, "SCHEMA_MISMATCH");
+    }
+
+    #[test]
+    fn unregistered_cancellation_trigger_is_not_adopted() {
+        let mut db = empty_database();
+        db.execute_batch(
+            "CREATE TRIGGER operation_cancel_event_after_insert AFTER INSERT ON operations BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+
+        let error = install_in_transaction(&mut db).unwrap_err();
+        assert_eq!(error.code, "SCHEMA_MISMATCH");
+        assert_eq!(meta(&db, CANCEL_EVENT_MARKER).unwrap(), None);
+    }
+
+    #[test]
+    fn missing_required_core_table_is_rejected_without_marker_or_trigger_adoption() {
+        let mut db = empty_database();
+        db.execute_batch("DROP TABLE observations;").unwrap();
+
+        let operations_present: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                ["operations"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let observations_present: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                ["observations"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(operations_present);
+        assert!(!observations_present);
+        assert_eq!(meta(&db, CANCEL_EVENT_MARKER).unwrap(), None);
+
+        let initial_trigger_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN (?1, ?2)",
+                super::TRIGGER_NAMES,
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial_trigger_count, 0);
+
+        let error = install_in_transaction(&mut db).unwrap_err();
+        assert_eq!(error.code, "SCHEMA_MISMATCH");
+        assert_eq!(error.message, "required observations table is missing");
+        assert_eq!(meta(&db, CANCEL_EVENT_MARKER).unwrap(), None);
+
+        let final_trigger_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN (?1, ?2)",
+                super::TRIGGER_NAMES,
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_trigger_count, initial_trigger_count);
+    }
+}
