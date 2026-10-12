@@ -1,5 +1,7 @@
 # ELIOT Swarm Controller — execution map, 2026-10-09
 
+> **Historical snapshot: 2026-10-09, with a dated 2026-10-10 addendum.** The base, PR counts, statuses and work queue below apply to their recorded dates. For the current remainder, read the latest [Issue bodies](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues) and [PR bodies](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pulls), alongside [current implementation status](../../implementation-status.md).
+
 **Verified base:** main c82c54a72f3bed39f45078ffb12d97ed4b9a454b (PR #104 merged).
 **Status:** actionable research and implementation plan; NOT a claim of release readiness.
 **Source of evidence:** full Master Audit v26, accepted owner decisions, existing R01–R51 handoffs, and GitHub PR/Issue status checked on 2026-10-09.
