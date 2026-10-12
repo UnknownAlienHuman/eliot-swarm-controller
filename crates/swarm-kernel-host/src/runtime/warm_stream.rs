@@ -12,7 +12,8 @@ use crate::{
 use serde_json::{Value, json};
 
 pub const RUNTIME: &str = "antigravity";
-pub const ARTIFACT_ID: &str = "antigravity-cli-warm-bridge.2";
+pub const ARTIFACT_ID: &str = "antigravity-cli-warm-bridge.3";
+const RETAINED_BRIDGE_ARTIFACT_ID: &str = "antigravity-cli-warm-bridge.2";
 pub const RUST_HEADLESS_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 const COMPLETION_CONDITION: &str = "native_terminal_result_observed";
 
@@ -33,7 +34,7 @@ pub fn is_route(route: &Value) -> bool {
     route["runtime"] == RUNTIME
         && matches!(
             route["module_artifact_id"].as_str(),
-            Some(ARTIFACT_ID) | Some(RUST_HEADLESS_ARTIFACT_ID)
+            Some(ARTIFACT_ID) | Some(RETAINED_BRIDGE_ARTIFACT_ID) | Some(RUST_HEADLESS_ARTIFACT_ID)
         )
 }
 
@@ -378,6 +379,19 @@ mod tests {
         binding["route"]["module_artifact_id"] = json!("antigravity-cli-warm-bridge.1");
         assert!(!is_route(&binding["route"]));
         assert!(validate(&binding, &operation, &outcome, &observed, observation_id).is_err());
+    }
+
+    #[test]
+    fn retained_bridge_two_remains_supported_for_existing_receipts() {
+        let (mut binding, operation, outcome, observed, observation_id) =
+            fixture("SUCCESS", EffectOutcome::Applied);
+        binding["route"]["module_artifact_id"] = json!("antigravity-cli-warm-bridge.2");
+        assert!(is_route(&binding["route"]));
+        assert!(
+            validate(&binding, &operation, &outcome, &observed, observation_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

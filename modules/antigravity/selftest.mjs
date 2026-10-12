@@ -4,15 +4,20 @@
 // the official Antigravity CLI documentation examples (see fixtures/*.json
 // provenance comments). Run:  node selftest.mjs
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { spawn as spawnProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import * as codec from './codec.mjs';
 import {
   bindPendingLocalResults, localResultMatches, snapshotObservation,
 } from './receipt-state.mjs';
 import {
-  createInitializationWait, finishSession, observeNativeInit,
+  createInitializationWait, enqueueNativeSend, finishSession, handleNativeChildClose,
+  observeNativeInit, pumpNativeStream, spawnOwnedChild,
 } from './bridge.mjs';
 import {
   createStreamState, applyNativeEvent, encodeUserMessage, snapshot,
@@ -24,6 +29,13 @@ async function load(name) {
   const parsed = JSON.parse(await readFile(path.join(here, 'fixtures', name), 'utf8'));
   assert.ok(Array.isArray(parsed.messages), `${name}: messages array required`);
   return parsed.messages;
+}
+async function waitFor(predicate, description, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`FIXTURE_TIMEOUT: ${description}`);
+    await delay(5);
+  }
 }
 function feed(messages) {
   const state = createStreamState();
@@ -39,7 +51,7 @@ function lifecycleSession() {
   return {
     state: createStreamState(), child, rootId: null, scopeKey: 'antigravity:fixture',
     pendingSends: [], openWait: null, initTimer: null, cleanupTimer: null,
-    ended: false, initAborted: false, initCleanupStarted: false,
+    ended: false, streamEnded: false, initAborted: false, initCleanupStarted: false,
     killRequested: false, inputFailed: false,
   };
 }
@@ -263,6 +275,122 @@ function lifecycleSession() {
   assert.equal(closed.child.stdin.endCalls, 0, 'an already closed child needs no cleanup request');
   assert.equal(closed.child.killCalls, 0, 'close winning the race prevents a late kill');
   console.log('PASS native init lifecycle: success, unknown timeout, late init and close race');
+}
+
+// 9. A real child closes stdout while it remains alive: the first admitted
+// operation keeps its result fingerprint, the remaining send becomes Unknown,
+// and child close uses the same production handler before ending custody.
+{
+  const response = 'first process-owned result';
+  const responseSha = createHash('sha256').update(response, 'utf8').digest('hex');
+  const initLine = `${JSON.stringify({
+    event: 'init', conversation_id: 'conv_eof_fixture', init: { tools: [] },
+  })}\n`;
+  const resultLine = `${JSON.stringify({
+    event: 'result',
+    result: {
+      conversation_id: 'conv_eof_fixture',
+      duration_seconds: 0.1,
+      num_turns: 1,
+      response,
+      status: 'SUCCESS',
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    },
+  })}\n`;
+  const childSource = [
+    `process.stdout.write(${JSON.stringify(initLine)});`,
+    'let received = 0;',
+    "process.stdin.setEncoding('utf8');",
+    'process.stdin.on(\'data\', () => {',
+    '  received++;',
+    `  if (received === 1) process.stdout.write(${JSON.stringify(resultLine)});`,
+    '  if (received === 2) setTimeout(() => process.stdout.end(), 100);',
+    '});',
+    'setInterval(() => {}, 1000);',
+    'setTimeout(() => process.exit(7), 800);',
+  ].join('\n');
+  const child = spawnProcess(process.execPath, ['-e', childSource], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const sess = lifecycleSession();
+  sess.child = child;
+  const closed = once(child, 'close').then(([code]) => {
+    const closeFinalizedStream = handleNativeChildClose(sess, code);
+    return { code, closeFinalizedStream };
+  });
+  const pump = pumpNativeStream(sess);
+  try {
+    await waitFor(() => sess.rootId === 'conv_eof_fixture', 'fixture init is consumed');
+    enqueueNativeSend(
+      sess,
+      'op_result_fixture',
+      'agent.send',
+      `${JSON.stringify(encodeUserMessage('first fixture request'))}\n`,
+    );
+    await waitFor(
+      () => sess.state.result_ordinal === 1 && sess.pendingSends.length === 0,
+      'first admitted operation receives its terminal result',
+    );
+    enqueueNativeSend(
+      sess,
+      'op_eof_fixture',
+      'task.dispatch',
+      `${JSON.stringify(encodeUserMessage('second fixture request'))}\n`,
+    );
+
+    const pumpResult = await pump;
+    assert.equal(pumpResult.terminal_results.length, 1);
+    assert.equal(pumpResult.terminal_results[0].operation_id, 'op_result_fixture');
+    assert.equal(pumpResult.terminal_results[0].method, 'agent.send');
+    assert.equal(pumpResult.terminal_results[0].outcome.outcome, 'applied');
+    assert.equal(
+      pumpResult.terminal_results[0].outcome.details.local_execution_ref.input_operation_id,
+      'op_result_fixture',
+    );
+    assert.equal(
+      pumpResult.terminal_results[0].outcome.details.local_execution_ref.response_sha256,
+      responseSha,
+      'the terminal response fingerprint remains bound to its original operation',
+    );
+    assert.equal(pumpResult.stream_end.length, 1);
+    assert.equal(pumpResult.stream_end[0].operation_id, 'op_eof_fixture');
+    assert.equal(pumpResult.stream_end[0].method, 'task.dispatch');
+    assert.equal(pumpResult.stream_end[0].outcome.outcome, 'unknown');
+    assert.deepEqual(pumpResult.stream_end[0].outcome.details, {
+      diagnostic_code: 'STREAM_ENDED_BEFORE_RESULT_EVIDENCE',
+    });
+    assert.equal(sess.streamEnded, true);
+    assert.equal(sess.ended, false, 'stdout EOF does not release a live child');
+    assert.equal(child.stdout.readableEnded, true);
+    assert.equal(child.exitCode, null, 'the child process is still live after stdout EOF');
+    assert.deepEqual(sess.pendingSends, [], 'EOF drains the remaining admitted send once');
+    assert.throws(
+      () => enqueueNativeSend(sess, 'op_late_fixture', 'agent.send', '{}\n'),
+      error => error.diagnosticCode === 'NATIVE_SESSION_NOT_READY',
+      'a stream with no result channel admits no further sends',
+    );
+
+    let replacementSpawnCalls = 0;
+    assert.throws(
+      () => spawnOwnedChild(sess, () => { replacementSpawnCalls++; return null; }),
+      error => error.diagnosticCode === 'SESSION_ALREADY_OPEN',
+      'the production replacement-spawn guard still sees the live owner',
+    );
+    assert.equal(replacementSpawnCalls, 0, 'EOF does not spawn a replacement process');
+
+    const { code: exitCode, closeFinalizedStream } = await closed;
+    assert.equal(exitCode, 7, 'process exit remains observable after earlier stdout EOF');
+    assert.equal(closeFinalizedStream, false, 'child close does not settle the stream twice');
+    assert.equal(sess.ended, true, 'only child close ends the owned session');
+    assert.equal(sess.state.exit_code, 7);
+    assert.equal(sess.state.stream_error, 'native_process_exit_7');
+    assert.deepEqual(sess.pendingSends, []);
+    assert.equal(pumpResult.stream_end.length, 1, 'close does not duplicate EOF settlement');
+    console.log('PASS stdout EOF custody: exact result fingerprint, Unknown tail send, no replacement, nonzero close compensation');
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await Promise.race([closed, delay(2000)]);
+  }
 }
 
 console.log('Antigravity bridge self-test: all fixture assertions passed');

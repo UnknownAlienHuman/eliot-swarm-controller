@@ -40,7 +40,7 @@ modelId = 'sonnet'
 [[routes]]
 alias = 'antigravity-manager'
 runtime = 'antigravity'
-module_artifact_id = 'antigravity-cli-warm-bridge.2'
+module_artifact_id = 'antigravity-cli-warm-bridge.3'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'

@@ -9,7 +9,7 @@
 | Vendor SDK | None exists for this entrypoint; the bridge depends on Node builtins only (`package.json` has no dependencies) |
 | Native binary | The owner's installed `agy` executable, named explicitly in the local module config; the bridge installs and pins no binary |
 | Installed-version evidence | None: runtime matrix records `installed_runtime_verified: false`; the docs' "installed 1.1.27" note from the old research map is explicitly unverified |
-| Bridge artifact | `antigravity-cli-warm-bridge.2` |
+| Bridge artifact | `antigravity-cli-warm-bridge.3` (source-only candidate; unqualified; new binding required) |
 | Executor version reporting | `null` — the native stream reports no version and no version readback is documented for this entrypoint |
 
 ## Local changes to the vendor surface
@@ -32,6 +32,16 @@ or inbox ID. Only `SUCCESS`, `ERROR`, `CANCELED`, and `INTERRUPTED` settle a
 result; `WAITING`, `RUNNING`, unknown statuses, and missing response bytes
 remain unresolved. Existing bridge.1 bindings retain their original artifact.
 
+## bridge.3 source candidate changes
+
+This isolated source candidate settles pending sends as Unknown at stdout EOF
+and routes the ninth real-child fixture's close through the same handler used
+by production, preserving the existing nonzero process-exit diagnostic and
+child-close custody. The fixture and host changes have not been executed.
+Existing `.2` bindings and their historical live evidence remain tied to the
+old artifact bytes; host receipt routing retains `.2`, while new `.2` bindings
+remain retired. No `.3` execution or qualification is claimed.
+
 ## Update procedure
 
 1. Re-read the two basis pages deliberately; diff the documented event
@@ -40,7 +50,7 @@ remain unresolved. Existing bridge.1 bindings retain their original artifact.
 2. Re-author or extend the affected fixtures from the new documentation
    examples, keeping each file's provenance comment accurate, and re-run
    `node selftest.mjs`.
-3. Bump the artifact id (`bridge.2`, …) and the route's
+3. Bump the artifact id (`bridge.3`, …) and the route's
    `module_artifact_id`; existing bindings stay on the previous artifact.
 4. Activate on a new binding and qualify live (below) before any manager
    role is assigned.

@@ -6,10 +6,13 @@ stream entrypoint: one owned process per binding, launched as
 `{"event":"user"}` prompts on stdin, and the native NDJSON event stream
 (`init` / `step_update` / `result`, discriminated by `event`) mapped by
 `codec.mjs`. There is no vendor SDK for this runtime and no shared server to
-attach to; the bridge owns the CLI process it starts and nothing else. New
-bindings use **`antigravity-cli-warm-bridge.2`**. Live Antigravity and
-Windows native launch remain unqualified; syntax, fixtures and compilation
-do not attest model execution.
+attach to; the bridge owns the CLI process it starts and nothing else. The
+source candidate is versioned as **`antigravity-cli-warm-bridge.3`** for any
+future new binding; existing `.2` bindings retain their exact artifact
+identity. The existing Windows live observation remains bound to `.2`; `.3`
+is source-only and unqualified. Live Antigravity and Windows native launch
+for `.3` remain unqualified; syntax, fixtures and compilation do not attest
+model execution.
 
 Protocol basis: the vendor's official headless documentation
 (<https://antigravity.google/docs/cli/headless/>, source AG-HEADLESS in
@@ -49,7 +52,7 @@ module opens.
 [[routes]]
 alias = 'antigravity-manager'
 runtime = 'antigravity'
-module_artifact_id = 'antigravity-cli-warm-bridge.2'
+module_artifact_id = 'antigravity-cli-warm-bridge.3'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -67,7 +70,7 @@ has host-reconnect behavior, but no recorded process ownership/checkpoint.
 Do not overwrite its executable/scripts in place; use a new artifact/binding
 for changed module code.
 
-## Capability matrix (bridge.2)
+## Capability matrix (bridge.3 source candidate; unqualified)
 
 Readiness terms follow the module contract: `implemented` is code in this
 artifact, `documented` is the vendor contract it maps, `observed` requires

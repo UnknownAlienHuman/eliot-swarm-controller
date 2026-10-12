@@ -5,7 +5,7 @@
 // owns exactly one CLI process per binding, feeds it sequential user events
 // and maps its native event stream through codec.mjs. Host IPC reconnect
 // never closes the CLI process or repeats input.
-// Artifact scope (bridge.2): describe, agent.open (fresh or exact
+// Artifact scope (bridge.3): describe, agent.open (fresh or exact
 // conversation resume), next-turn agent.send/task.dispatch and observation
 // snapshots. Durable goal control is not established for this entrypoint,
 // mid-session configure/steer/reply and attach are reported unavailable,
@@ -29,7 +29,7 @@ import {
 } from './codec.mjs';
 
 const ENTRYPOINT = 'antigravity_cli_warm_stream';
-const ARTIFACT_ID = 'antigravity-cli-warm-bridge.2';
+const ARTIFACT_ID = 'antigravity-cli-warm-bridge.3';
 const INIT_DEADLINE_MS = 30_000;
 const INIT_CLEANUP_GRACE_MS = 5_000;
 const EFFORTS = ['low', 'medium', 'high'];
@@ -129,7 +129,9 @@ let lastObservedLocalResults = null; // { observation_id, state } from this brid
 function changed() { revision++; }
 function saveOutcome(operationId, result, method) {
   const old = outcomes.get(operationId);
-  if (old && ['applied', 'rejected'].includes(old.outcome)) return;
+  if (old && ['applied', 'rejected'].includes(old.outcome)) {
+    return { outcome: old, journal: journal.get(operationId), retained: true };
+  }
   const outcome = { operation_id: operationId, ...result };
   outcomes.set(operationId, outcome);
   journal.set(operationId, {
@@ -140,6 +142,7 @@ function saveOutcome(operationId, result, method) {
   });
   if (journal.size > 128) journal.delete(journal.keys().next().value);
   changed();
+  return { outcome, journal: journal.get(operationId), retained: false };
 }
 function currentState() {
   if (session) return session.state;
@@ -220,19 +223,19 @@ function settleSendForResult(sess, turn) {
   // Warm prompts are sequential and result events are consumed in order. The
   // native conversation must match init, and only a terminal result settles.
   const entry = sess.pendingSends[0];
-  if (!entry) return;
-  if (turn.conversation_id !== sess.rootId) return;
+  if (!entry) return null;
+  if (turn.conversation_id !== sess.rootId) return null;
   const disposition = terminalResultDisposition(turn.status);
-  if (!disposition) return;
+  if (!disposition) return null;
   sess.pendingSends.shift();
   if (!turn.response_sha256) {
-    saveOutcome(entry.operation_id, {
+    const saved = saveOutcome(entry.operation_id, {
       outcome: 'unknown',
       native_root_id: sess.rootId,
       native_scope_key: sess.scopeKey,
       details: { diagnostic_code: 'NATIVE_RESULT_FINGERPRINT_UNAVAILABLE' },
     }, entry.method);
-    return;
+    return { operation_id: entry.operation_id, method: entry.method, ...saved };
   }
   const receipt = {
     input_operation_id: entry.operation_id,
@@ -245,7 +248,7 @@ function settleSendForResult(sess, turn) {
   // Keep the observed list independent from the reference carried by the
   // outcome; citing an observation must never mutate that captured receipt.
   localExecutionResults.push({ ...receipt });
-  saveOutcome(entry.operation_id, {
+  const saved = saveOutcome(entry.operation_id, {
     outcome: disposition === 'completed' ? 'applied' : 'rejected',
     native_root_id: sess.rootId,
     native_scope_key: sess.scopeKey,
@@ -256,6 +259,7 @@ function settleSendForResult(sess, turn) {
       local_execution_ref: receipt,
     },
   }, entry.method);
+  return { operation_id: entry.operation_id, method: entry.method, ...saved };
 }
 
 function failNativeInput(sess) {
@@ -273,6 +277,24 @@ function failNativeInput(sess) {
     }, entry.method);
   }
   changed();
+}
+
+export function enqueueNativeSend(sess, operationId, method, line) {
+  if (!sess || sess.ended || sess.streamEnded || sess.initAborted || !sess.rootId) {
+    throw codedError('NATIVE_SESSION_NOT_READY');
+  }
+  if (sess.inputFailed) throw codedError('NATIVE_INPUT_STREAM_FAILED');
+  const pending = { operation_id: operationId, method };
+  sess.pendingSends.push(pending);
+  try {
+    sess.child.stdin.write(line);
+  } catch {
+    const index = sess.pendingSends.indexOf(pending);
+    if (index >= 0) sess.pendingSends.splice(index, 1);
+    failNativeInput(sess);
+    throw codedError('NATIVE_WRITE_FAILED', true);
+  }
+  return pending;
 }
 
 function initFailureError(sess) {
@@ -340,27 +362,60 @@ export function observeNativeInit(sess, event) {
   return true;
 }
 
-export function finishSession(sess) {
-  if (sess.ended) return;
-  sess.ended = true;
-  if (sess.initTimer !== null) clearTimeout(sess.initTimer);
-  sess.initTimer = null;
-  if (sess.cleanupTimer !== null) clearTimeout(sess.cleanupTimer);
-  sess.cleanupTimer = null;
-  if (sess.openWait) settleOpenWait(sess, initFailureError(sess));
+function finishNativeStream(sess) {
+  if (sess.streamEnded) return null;
+  sess.streamEnded = true;
+  noteStreamEnd(sess.state);
+  if (!sess.rootId) {
+    if (sess.openWait) {
+      sess.initAborted = true;
+      settleOpenWait(sess, initFailureError(sess));
+    }
+    // EOF before init is a failed open. Request graceful cleanup, but keep
+    // the session and child owned until the actual close event.
+    beginInitCleanup(sess);
+  }
+  const settled = [];
   for (const entry of sess.pendingSends.splice(0)) {
-    saveOutcome(entry.operation_id, {
+    const saved = saveOutcome(entry.operation_id, {
       outcome: 'unknown',
       native_root_id: sess.rootId,
       native_scope_key: sess.scopeKey,
       details: { diagnostic_code: 'STREAM_ENDED_BEFORE_RESULT_EVIDENCE' },
     }, entry.method);
+    settled.push({ operation_id: entry.operation_id, method: entry.method, ...saved });
   }
   changed();
+  return settled;
 }
 
-async function pump(sess) {
+export function finishSession(sess) {
+  if (sess.ended) return false;
+  sess.ended = true;
+  if (sess.initTimer !== null) clearTimeout(sess.initTimer);
+  sess.initTimer = null;
+  if (sess.cleanupTimer !== null) clearTimeout(sess.cleanupTimer);
+  sess.cleanupTimer = null;
+  if (finishNativeStream(sess) === null) {
+    changed();
+    return false;
+  }
+  return true;
+}
+
+export function handleNativeChildClose(sess, code) {
+  noteProcessExit(sess.state, code);
+  // EOF changes ready to stream_ended before process close. Preserve the
+  // existing non-zero exit diagnostic even when the stream ended first.
+  if (sess.streamEnded && sess.state.phase === 'stream_ended' && code !== 0 && code !== null) {
+    sess.state.stream_error = `native_process_exit_${code}`;
+  }
+  return finishSession(sess);
+}
+
+export async function pumpNativeStream(sess) {
   const lines = createInterface({ input: sess.child.stdout, crlfDelay: Infinity });
+  const terminalResults = [];
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -377,13 +432,26 @@ async function pump(sess) {
       if (sess.state.result_ordinal > ordinalBefore) {
         resultOrdinal = sess.state.result_ordinal;
         const turn = sess.state.turns.at(-1);
-        if (turn?.result_ordinal === resultOrdinal) settleSendForResult(sess, turn);
+        if (turn?.result_ordinal === resultOrdinal) {
+          const settled = settleSendForResult(sess, turn);
+          if (settled) terminalResults.push(settled);
+        }
       }
       changed();
     }
   } catch (error) {
     noteStreamFailure(sess.state, error);
+    changed();
   }
+  return {
+    terminal_results: terminalResults,
+    stream_end: finishNativeStream(sess) ?? [],
+  };
+}
+
+export function spawnOwnedChild(currentSession, spawnChild, ...args) {
+  if (currentSession && !currentSession.ended) throw codedError('SESSION_ALREADY_OPEN');
+  return spawnChild(...args);
 }
 
 async function startNative(command) {
@@ -409,12 +477,13 @@ async function startNative(command) {
   const sess = {
     state, child: null, rootId: null, scopeKey: nativeScopeKey(),
     pendingSends: [], openWait: null, initTimer: null, cleanupTimer: null,
-    ended: false, initAborted: false, initCleanupStarted: false,
+    ended: false, streamEnded: false, initAborted: false, initCleanupStarted: false,
     killRequested: false, inputFailed: false,
   };
   let child;
   try {
-    child = spawn(config.command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: false });
+    child = spawnOwnedChild(session, spawn, config.command, args,
+      { cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: false });
   } catch {
     // Spawn rejected the launch locally; nothing native was started.
     throw codedError('NATIVE_SPAWN_FAILED');
@@ -434,12 +503,8 @@ async function startNative(command) {
     }
     changed();
   });
-  child.on('close', code => {
-    noteProcessExit(state, code);
-    noteStreamEnd(state);
-    finishSession(sess);
-  });
-  void pump(sess);
+  child.on('close', code => handleNativeChildClose(sess, code));
+  void pumpNativeStream(sess);
   await opened;
   return {
     native_root_id: sess.rootId,
@@ -454,7 +519,7 @@ async function startNative(command) {
 
 function sendNative(command) {
   const sess = session;
-  if (!sess || sess.ended || sess.initAborted || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
+  if (!sess || sess.ended || sess.streamEnded || sess.initAborted || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
   if (command.native_root_id !== sess.rootId) throw codedError('NATIVE_IDENTITY_MISMATCH');
   if (sess.inputFailed) throw codedError('NATIVE_INPUT_STREAM_FAILED');
   const p = command.input ?? {};
@@ -470,16 +535,7 @@ function sendNative(command) {
     text = required(p, 'text');
   }
   const line = JSON.stringify(encodeUserMessage(text)) + '\n';
-  const pending = { operation_id: command.operation_id, method: command.method };
-  sess.pendingSends.push(pending);
-  try {
-    sess.child.stdin.write(line);
-  } catch {
-    const index = sess.pendingSends.indexOf(pending);
-    if (index >= 0) sess.pendingSends.splice(index, 1);
-    failNativeInput(sess);
-    throw codedError('NATIVE_WRITE_FAILED', true);
-  }
+  enqueueNativeSend(sess, command.operation_id, command.method, line);
   // Writing the user event is admission into the warm channel only. The
   // outcome settles when this turn's native result event arrives, or becomes
   // unknown when the stream ends without that evidence.
@@ -637,7 +693,7 @@ while (isBridgeEntrypoint && !stopping) {
     const hello = await control.call('module.hello', {
       boot_id: bootId,
       module_artifact_id: config.moduleArtifactId,
-      native_ready: Boolean(session && !session.ended && !session.initAborted && session.rootId),
+      native_ready: Boolean(session && !session.ended && !session.streamEnded && !session.initAborted && session.rootId),
       ...(managedOwner ? { managed_owner: managedOwner } : {}),
       ...(session?.rootId && !session.initAborted
         ? { native_root_id: session.rootId, native_scope_key: session.scopeKey }
