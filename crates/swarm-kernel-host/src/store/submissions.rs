@@ -2031,6 +2031,18 @@ fn retain_review_disposition(
             |row| row.get(0),
         )
         .optional()?;
+    let finding_ids = package.finding_ids();
+    let evidence_refs = package
+        .findings
+        .iter()
+        .flat_map(|finding| finding.evidence_refs.iter().cloned())
+        .collect::<Vec<_>>();
+    // The reason embeds the full ordered findings digest; evidence_refs is the
+    // exact ordered projection retained alongside the finding IDs.
+    let reason = format!(
+        "Applied exact ordered reviewer findings package {}.",
+        package.findings_digest
+    );
     if let Some(raw) = old_disposition {
         let prior: Value = serde_json::from_str(&raw)?;
         review_contract::validate_disposition(&prior).map_err(|_| {
@@ -2044,7 +2056,9 @@ fn retain_review_disposition(
             || prior["review_result_operation_id"] != provenance["review_operation_id"]
             || prior["disposition"]
                 != review_contract::ReviewDisposition::ReturnForCorrection.as_str()
-            || prior["finding_ids"] != json!(package.finding_ids())
+            || prior["finding_ids"] != json!(finding_ids.clone())
+            || prior["reason"] != reason
+            || prior["evidence_refs"] != json!(evidence_refs.clone())
             || prior["task_feedback_operation_id"] != feedback_operation_id
         {
             return Err(Error::new(
@@ -2054,16 +2068,6 @@ fn retain_review_disposition(
         }
         return Ok(());
     }
-    let finding_ids = package.finding_ids();
-    let evidence_refs = package
-        .findings
-        .iter()
-        .flat_map(|finding| finding.evidence_refs.iter().cloned())
-        .collect::<Vec<_>>();
-    let reason = format!(
-        "Applied exact ordered reviewer findings package {}.",
-        package.findings_digest
-    );
     let identity = json!(package.identity);
     let review_result_operation_id = json!(package.review_result_operation_id);
     let disposition = json!({
@@ -2091,6 +2095,164 @@ fn retain_review_disposition(
         params![disposition_key, operation_id, model::canonical(&disposition)?, now],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod disposition_retention_tests {
+    use super::*;
+
+    fn seeded_disposition() -> (Connection, ReviewFindingsPackage, Value) {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE observations (
+                observation_id INTEGER PRIMARY KEY,
+                source_stream_id TEXT NOT NULL,
+                source_event_key TEXT NOT NULL,
+                operation_id TEXT,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                recorded_at_ms INTEGER NOT NULL
+            )",
+        )
+        .unwrap();
+        let package = ReviewFindingsPackage::new(
+            ReviewSlotIdentity {
+                task_id: "task-disposition".into(),
+                attempt_id: "attempt-disposition".into(),
+                task_revision: 4,
+                submission_ref: "submission-disposition".into(),
+                candidate_ref: "candidate-disposition".into(),
+                review_policy_generation: "policy-disposition".into(),
+                review_slot: "primary".into(),
+            },
+            "assignment-disposition".into(),
+            "review-result-disposition".into(),
+            vec![ReviewFinding {
+                finding_id: "finding-disposition".into(),
+                requirement_ids: vec!["requirement-1".into()],
+                reason: "The retained result lacks required evidence.".into(),
+                evidence_refs: vec!["src/lib.rs:17".into()],
+                requested_change: "Add the missing evidence.".into(),
+            }],
+        )
+        .unwrap();
+        let provenance = json!({
+            "review_assignment_id":package.review_assignment_id.clone(),
+            "review_operation_id":package.review_result_operation_id.clone(),
+            "identity":package.identity.clone()
+        });
+        {
+            let tx = db.transaction().unwrap();
+            retain_review_disposition(
+                &tx,
+                ReviewDispositionDelivery {
+                    operation_id: "feedback-operation-first",
+                    feedback_operation_id: "feedback-operation-first",
+                    decision_actor_id: "manager-disposition",
+                },
+                &provenance,
+                &package,
+                1,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        (db, package, provenance)
+    }
+
+    fn alter_retained_field(db: &Connection, field: &str, replacement: Value) {
+        let key = "disposition:assignment-disposition";
+        let raw: String = db
+            .query_row(
+                "SELECT payload_json FROM observations WHERE source_stream_id='controller:review' AND source_event_key=?1 AND kind='review.disposition'",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut prior: Value = serde_json::from_str(&raw).unwrap();
+        prior[field] = replacement;
+        db.execute(
+            "UPDATE observations SET payload_json=?1 WHERE source_stream_id='controller:review' AND source_event_key=?2 AND kind='review.disposition'",
+            params![crate::model::canonical(&prior).unwrap(), key],
+        )
+        .unwrap();
+    }
+
+    fn retry_error(
+        db: &mut Connection,
+        package: &ReviewFindingsPackage,
+        provenance: &Value,
+    ) -> Error {
+        let tx = db.transaction().unwrap();
+        retain_review_disposition(
+            &tx,
+            ReviewDispositionDelivery {
+                operation_id: "feedback-operation-retry",
+                feedback_operation_id: "feedback-operation-first",
+                decision_actor_id: "manager-disposition",
+            },
+            provenance,
+            package,
+            2,
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn retained_review_disposition_conflicts_on_changed_reason() {
+        let (mut db, package, provenance) = seeded_disposition();
+        alter_retained_field(
+            &db,
+            "reason",
+            json!("Applied a different ordered reviewer findings package."),
+        );
+        let error = retry_error(&mut db, &package, &provenance);
+        assert_eq!(error.code, "REVIEW_DISPOSITION_CONFLICT");
+    }
+
+    #[test]
+    fn retained_review_disposition_conflicts_on_changed_evidence_refs() {
+        let (mut db, package, provenance) = seeded_disposition();
+        alter_retained_field(&db, "evidence_refs", json!(["src/other.rs:9"]));
+        let error = retry_error(&mut db, &package, &provenance);
+        assert_eq!(error.code, "REVIEW_DISPOSITION_CONFLICT");
+    }
+
+    #[test]
+    fn retained_review_disposition_accepts_same_facts_for_new_operation_id() {
+        let (mut db, package, provenance) = seeded_disposition();
+        let tx = db.transaction().unwrap();
+        retain_review_disposition(
+            &tx,
+            ReviewDispositionDelivery {
+                operation_id: "feedback-operation-retry",
+                feedback_operation_id: "feedback-operation-first",
+                decision_actor_id: "manager-disposition",
+            },
+            &provenance,
+            &package,
+            2,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE source_stream_id='controller:review' AND source_event_key='disposition:assignment-disposition' AND kind='review.disposition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let raw: String = db
+            .query_row(
+                "SELECT payload_json FROM observations WHERE source_stream_id='controller:review' AND source_event_key='disposition:assignment-disposition' AND kind='review.disposition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(retained["operation_id"], "feedback-operation-first");
+    }
 }
 
 fn require_review_package_provenance(

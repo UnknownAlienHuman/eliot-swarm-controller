@@ -64,6 +64,26 @@ fn insert_task(db: &Connection, task_id: &str) {
     .unwrap();
 }
 
+fn insert_read_scope_manager(db: &Connection, client_id: &str, disabled: bool) {
+    let registration = json!({"role":"manager","disabled":disabled});
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+        params![
+            format!("client:{client_id}"),
+            model::canonical(&registration).unwrap()
+        ],
+    )
+    .unwrap();
+}
+
+fn read_scope_principal(client_id: &str, role: crate::model::Role) -> crate::model::Principal {
+    crate::model::Principal {
+        link_id: format!("fixture-link-{client_id}"),
+        client_id: client_id.to_owned(),
+        role,
+    }
+}
+
 fn insert_attempt(
     db: &Connection,
     attempt_id: &str,
@@ -1077,6 +1097,257 @@ fn scopes_are_isolated_per_service() {
             .all(|item| item["kind"] != "capacity_available"),
         "attention must not assert admission from accounting: {}",
         attention["items"]
+    );
+}
+
+#[test]
+fn manager_read_projections_share_current_task_scope_and_nested_attention_scope() {
+    let db = fixture_db();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+    db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    insert_binding(&db, "b1", "lane-1", &opencode_route("svc-a"), None);
+    insert_binding(&db, "b2", "lane-2", &opencode_route("svc-b"), None);
+    insert_attempt(&db, "att-a", "task-a", "b1", "reserved", json!([]));
+    insert_attempt(&db, "att-b", "task-b", "b2", "reserved", json!([]));
+    insert_attempt(
+        &db,
+        "att-disabled",
+        "task-disabled",
+        "b1",
+        "reserved",
+        json!([]),
+    );
+    for (operation_id, attempt_id, binding_id) in [
+        ("op-cap-a", "att-a", "b1"),
+        ("op-cap-b", "att-b", "b2"),
+        ("op-cap-disabled", "att-disabled", "b1"),
+    ] {
+        insert_op(
+            &db,
+            operation_id,
+            "task.dispatch",
+            "queued",
+            Some(binding_id),
+            Some(attempt_id),
+            json!({}),
+        );
+        capacity::sync_operation(&db, operation_id, 1_500).unwrap();
+    }
+    for (attempt_id, owner_id) in [
+        ("att-a", "manager-a"),
+        ("att-b", "manager-b"),
+        ("att-disabled", "disabled-manager"),
+    ] {
+        for (prefix, kind) in [
+            ("submission", "task_submission"),
+            ("candidate", "candidate"),
+        ] {
+            let artifact_id = format!("{prefix}-{attempt_id}");
+            db.execute(
+                "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,created_at_ms) VALUES(?1,?2,?3,1,1000)",
+                params![artifact_id, format!("{artifact_id}.json"), kind],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE attempts SET owner_id=?2,state='submitted',submission_ref='submission-'||attempt_id,candidate_ref='candidate-'||attempt_id WHERE attempt_id=?1",
+            params![attempt_id, owner_id],
+        )
+        .unwrap();
+    }
+    for (client_id, disabled) in [
+        ("manager-a", false),
+        ("manager-b", false),
+        ("manager-gm", false),
+        ("former-gm", false),
+        ("disabled-manager", true),
+    ] {
+        insert_read_scope_manager(&db, client_id, disabled);
+    }
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES('gm',?1)",
+        [model::canonical(&json!({"client_id":"manager-gm","epoch":1})).unwrap()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES('local_operator_client_id',?1)",
+        [model::canonical(&json!("operator-1")).unwrap()],
+    )
+    .unwrap();
+    // Put another Manager's Task ahead of manager-a's Task in fleet order.
+    // The scoped one-item page must still count and return manager-a's row.
+    db.execute(
+        "UPDATE tasks SET created_at_ms=500 WHERE task_id='task-b'",
+        [],
+    )
+    .unwrap();
+
+    let config = Config::default();
+    let manager_a = read_scope_principal("manager-a", crate::model::Role::Manager);
+    let manager_b = read_scope_principal("manager-b", crate::model::Role::Manager);
+    let current_gm = read_scope_principal("manager-gm", crate::model::Role::Manager);
+    let former_gm = read_scope_principal("former-gm", crate::model::Role::Manager);
+    let disabled = read_scope_principal("disabled-manager", crate::model::Role::Manager);
+    let task_a_scope = vec!["task-a".to_owned()];
+    let capacity_a = capacity::capacity_report_for_scope(&db, 1, 0, &task_a_scope).unwrap();
+    assert_eq!(capacity_a["total_items"], 1);
+    assert_eq!(
+        capacity_a["items"][0]["scope"]["scope_key"],
+        "opencode_v2:svc-a"
+    );
+    assert_eq!(
+        capacity_a["items"][0]["entries"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(capacity_a["items"][0]["entries"][0]["attempt_id"], "att-a");
+    let capacity_a_end = capacity::capacity_report_for_scope(&db, 1, 1, &task_a_scope).unwrap();
+    assert_eq!(capacity_a_end["total_items"], 1);
+    assert!(capacity_a_end["items"].as_array().unwrap().is_empty());
+    let attention_a = capacity::attention_report_for_scope(&db, 1, 0, &task_a_scope).unwrap();
+    let attention_a_total = attention_a["total_items"].as_i64().unwrap();
+    assert!(attention_a_total > 0);
+    let attention_a_end =
+        capacity::attention_report_for_scope(&db, 1, attention_a_total, &task_a_scope).unwrap();
+    assert_eq!(attention_a_end["total_items"], attention_a["total_items"]);
+    assert!(attention_a_end["items"].as_array().unwrap().is_empty());
+
+    let queue_a =
+        super::launcher::queue_get(&db, &manager_a, &json!({"after":0,"limit":1}), &config)
+            .unwrap();
+    assert_eq!(queue_a["total_items"], 1);
+    assert_eq!(queue_a["next_after"], 1);
+    assert_eq!(queue_a["items"].as_array().unwrap().len(), 1);
+    assert_eq!(queue_a["items"][0]["task_id"], "task-a");
+    let queue_a_end =
+        super::launcher::queue_get(&db, &manager_a, &json!({"after":1,"limit":1}), &config)
+            .unwrap();
+    assert_eq!(queue_a_end["total_items"], 1);
+    assert_eq!(queue_a_end["next_after"], 1);
+    assert!(queue_a_end["items"].as_array().unwrap().is_empty());
+    let nested_attention = &queue_a["items"][0]["current_attempt"]["binding"]["manager_attention"];
+    assert_eq!(
+        nested_attention["source"]["total_items"],
+        attention_a["total_items"]
+    );
+    assert_eq!(nested_attention["items"].as_array().unwrap().len(), 1);
+    assert_eq!(nested_attention["items"][0]["address"]["task_id"], "task-a");
+
+    let exceptions_a =
+        super::launcher::exceptions_get(&db, &manager_a, &json!({"after":0,"limit":5})).unwrap();
+    assert_eq!(
+        exceptions_a["source_attention"]["total_items"],
+        attention_a["total_items"]
+    );
+    assert_eq!(exceptions_a["items"].as_array().unwrap().len(), 1);
+    assert_eq!(exceptions_a["items"][0]["address"]["task_id"], "task-a");
+
+    let dashboard_a =
+        super::launcher::dashboard(&db, &manager_a, &json!({"limit":5}), &config).unwrap();
+    assert_eq!(dashboard_a["tasks"]["total"], 1);
+    assert_eq!(
+        dashboard_a["queue_preview"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(dashboard_a["capacity"]["total_items"], 1);
+    assert_eq!(
+        dashboard_a["exceptions"]["items"].as_array().unwrap().len(),
+        1
+    );
+
+    let queue_b =
+        super::launcher::queue_get(&db, &manager_b, &json!({"after":0,"limit":5}), &config)
+            .unwrap();
+    assert_eq!(queue_b["items"].as_array().unwrap().len(), 1);
+    assert_eq!(queue_b["items"][0]["task_id"], "task-b");
+
+    let queue_gm =
+        super::launcher::queue_get(&db, &current_gm, &json!({"after":0,"limit":5}), &config)
+            .unwrap();
+    assert_eq!(queue_gm["items"].as_array().unwrap().len(), 3);
+    let exceptions_gm =
+        super::launcher::exceptions_get(&db, &current_gm, &json!({"after":0,"limit":5})).unwrap();
+    assert_eq!(exceptions_gm["items"].as_array().unwrap().len(), 3);
+    let dashboard_gm =
+        super::launcher::dashboard(&db, &current_gm, &json!({"limit":5}), &config).unwrap();
+    assert_eq!(dashboard_gm["tasks"]["total"], 3);
+    assert_eq!(
+        dashboard_gm["exceptions"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(dashboard_gm["capacity"]["total_items"], 2);
+    assert_eq!(
+        dashboard_gm["capacity"]["items"].as_array().unwrap().len(),
+        2
+    );
+
+    let queue_former =
+        super::launcher::queue_get(&db, &former_gm, &json!({"after":0,"limit":5}), &config)
+            .unwrap();
+    assert!(queue_former["items"].as_array().unwrap().is_empty());
+    let exceptions_former =
+        super::launcher::exceptions_get(&db, &former_gm, &json!({"after":0,"limit":5})).unwrap();
+    assert!(exceptions_former["items"].as_array().unwrap().is_empty());
+    let dashboard_former =
+        super::launcher::dashboard(&db, &former_gm, &json!({"limit":5}), &config).unwrap();
+    assert_eq!(dashboard_former["tasks"]["total"], 0);
+    assert!(
+        dashboard_former["queue_preview"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(
+        super::launcher::queue_get(&db, &disabled, &json!({"after":0,"limit":5}), &config,)
+            .unwrap_err()
+            .code,
+        "FORBIDDEN"
+    );
+    assert_eq!(
+        super::launcher::dashboard(&db, &disabled, &json!({"limit":5}), &config)
+            .unwrap_err()
+            .code,
+        "FORBIDDEN"
+    );
+    assert_eq!(
+        super::launcher::exceptions_get(&db, &disabled, &json!({"after":0,"limit":5}),)
+            .unwrap_err()
+            .code,
+        "FORBIDDEN"
+    );
+
+    let observer = read_scope_principal("observer-1", crate::model::Role::Observer);
+    let dashboard_observer =
+        super::launcher::dashboard(&db, &observer, &json!({"limit":5}), &config).unwrap();
+    assert_eq!(dashboard_observer["tasks"]["total"], 3);
+    assert_eq!(dashboard_observer["coverage"], "aggregate_only");
+    assert!(dashboard_observer.get("queue_preview").is_none());
+
+    let local_operator = read_scope_principal("operator-1", crate::model::Role::Operator);
+    let queue_operator =
+        super::launcher::queue_get(&db, &local_operator, &json!({"after":0,"limit":5}), &config)
+            .unwrap();
+    assert_eq!(queue_operator["items"].as_array().unwrap().len(), 3);
+    let exceptions_operator =
+        super::launcher::exceptions_get(&db, &local_operator, &json!({"after":0,"limit":5}))
+            .unwrap();
+    assert_eq!(exceptions_operator["items"].as_array().unwrap().len(), 3);
+    let dashboard_operator =
+        super::launcher::dashboard(&db, &local_operator, &json!({"limit":5}), &config).unwrap();
+    assert_eq!(dashboard_operator["tasks"]["total"], 3);
+    assert_eq!(dashboard_operator["capacity"]["total_items"], 2);
+    assert_eq!(
+        dashboard_operator["capacity"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
 }
 

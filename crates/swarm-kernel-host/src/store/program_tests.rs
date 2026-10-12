@@ -4145,3 +4145,11 @@ mod automatic_github_projection_lifecycle_tests;
 #[cfg(test)]
 #[path = "program_tests/automatic_publication_operation_lifecycle_tests.rs"]
 mod automatic_publication_operation_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "program_tests/concilium_current_consumers.rs"]
+mod concilium_current_consumers;
+
+#[cfg(test)]
+#[path = "program_tests/submission_disposition_current_consumers.rs"]
+mod submission_disposition_current_consumers;

@@ -1701,15 +1701,125 @@ fn require_dashboard_reader(db: &Connection, p: &Principal) -> Result<()> {
         _ => Err(Error::new("FORBIDDEN", "dashboard read authority required")),
     }
 }
-
-fn count(db: &Connection, sql: &str) -> Result<i64> {
-    Ok(db.query_row(sql, [], |row| row.get(0))?)
+/// The fleet-wide read set a principal may observe across queue,
+/// dashboard, and exception projections. The local Operator and the
+/// current GM retain the whole fleet. Every other Manager is scoped to
+/// the exact Task set the documented launcher read policy grants them:
+/// the Tasks whose current unreleased Attempt they own, resolved through
+/// the same ownership rule the launch path enforces for current Task
+/// scope. Observer has no manager read surface here and is handled by
+/// the aggregate-only dashboard branch.
+#[derive(Debug, Clone)]
+enum FleetReadScope {
+    Fleet,
+    ManagerTasks { task_ids: Vec<String> },
 }
 
-fn grouped_counts(db: &Connection, sql: &str) -> Result<Value> {
+fn fleet_read_scope(db: &Connection, p: &Principal) -> Result<FleetReadScope> {
+    match p.role {
+        Role::Operator | Role::Observer => Ok(FleetReadScope::Fleet),
+        Role::Manager => {
+            crate::automation::authorization::require_registered_manager(db, &p.client_id)?;
+            let current_gm = super::gm::read_current(db)?;
+            if current_gm
+                .as_ref()
+                .is_some_and(|current| current.client_id == p.client_id)
+            {
+                return Ok(FleetReadScope::Fleet);
+            }
+            // Candidate enumeration uses the same latest unreleased Attempt
+            // selected by current_manager_has_task_scope. The helper remains
+            // the authority check for every Task in the resulting read set.
+            let mut stmt = db.prepare(
+                "SELECT t.task_id,t.project_id FROM tasks AS t \
+                 JOIN attempts AS current ON current.attempt_id=( \
+                     SELECT a.attempt_id FROM attempts AS a WHERE a.task_id=t.task_id \
+                       AND a.released_at_ms IS NULL \
+                     ORDER BY a.created_at_ms DESC,a.attempt_id DESC LIMIT 1) \
+                 WHERE current.owner_id=?1 ORDER BY t.created_at_ms,t.task_id",
+            )?;
+            let candidates = stmt
+                .query_map([&p.client_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut task_ids = Vec::with_capacity(candidates.len());
+            for (task_id, project_id) in candidates {
+                if crate::automation::authorization::current_manager_has_task_scope(
+                    db,
+                    p,
+                    &task_id,
+                    &project_id,
+                )? {
+                    task_ids.push(task_id);
+                }
+            }
+            Ok(FleetReadScope::ManagerTasks { task_ids })
+        }
+        _ => Err(Error::new("FORBIDDEN", "manager read authority required")),
+    }
+}
+
+fn task_read_scope(scope: &FleetReadScope, task_id: &str) -> FleetReadScope {
+    match scope {
+        FleetReadScope::Fleet => FleetReadScope::Fleet,
+        FleetReadScope::ManagerTasks { task_ids } => FleetReadScope::ManagerTasks {
+            task_ids: task_ids
+                .iter()
+                .any(|scoped_task_id| scoped_task_id == task_id)
+                .then(|| task_id.to_owned())
+                .into_iter()
+                .collect(),
+        },
+    }
+}
+
+/// A launch projection exposes binding attention only within the exact Task
+/// authorized for this actor. WorkDispatch stays an opaque manager context;
+/// its task grant is checked by manager identity without manufacturing a
+/// Principal.
+fn launch_task_read_scope(
+    db: &Connection,
+    actor: &LaunchActor,
+    task_id: &str,
+    project_id: &str,
+) -> Result<FleetReadScope> {
+    if let Some(principal) = actor.direct_principal() {
+        return Ok(task_read_scope(&fleet_read_scope(db, principal)?, task_id));
+    }
+    let context = actor
+        .work_dispatch_context()
+        .ok_or_else(|| Error::new("FORBIDDEN", "launch read scope is unavailable"))?;
+    let has_scope = crate::automation::authorization::current_manager_id_has_task_scope(
+        db,
+        context.effective_manager_id(),
+        task_id,
+        project_id,
+    )?;
+    Ok(FleetReadScope::ManagerTasks {
+        task_ids: has_scope.then(|| task_id.to_owned()).into_iter().collect(),
+    })
+}
+
+/// Resolve the accessible Task IDs as one JSON SQL parameter. Fleet
+/// (local Operator / current GM) yields None; a restricted Manager gets
+/// the exact Task list approved by current_manager_has_task_scope.
+fn scope_task_ids_json(scope: &FleetReadScope) -> Result<Option<String>> {
+    match scope {
+        FleetReadScope::Fleet => Ok(None),
+        FleetReadScope::ManagerTasks { task_ids } => Ok(Some(model::canonical(&json!(task_ids))?)),
+    }
+}
+
+fn count(db: &Connection, sql: &str, task_ids_json: Option<&str>) -> Result<i64> {
+    Ok(db.query_row(sql, [task_ids_json], |row| row.get(0))?)
+}
+
+fn grouped_counts(db: &Connection, sql: &str, task_ids_json: Option<&str>) -> Result<Value> {
     let mut statement = db.prepare(sql)?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([task_ids_json], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1720,48 +1830,81 @@ fn grouped_counts(db: &Connection, sql: &str) -> Result<Value> {
     Ok(Value::Object(result))
 }
 
-fn task_counts(db: &Connection) -> Result<Value> {
-    let by_state = grouped_counts(db, "SELECT state,count(*) FROM tasks GROUP BY state")?;
-    Ok(json!({"total": count(db,"SELECT count(*) FROM tasks")?, "by_state": by_state}))
+fn task_counts(db: &Connection, scope: &FleetReadScope) -> Result<Value> {
+    // Aggregates are restricted to the same accessible set as the queue
+    // projection so a restricted Manager never sees fleet-wide totals that
+    // would leak the existence of Tasks outside its current scope.
+    let task_ids_json = scope_task_ids_json(scope)?;
+    let by_state = grouped_counts(
+        db,
+        "SELECT state,count(*) FROM tasks WHERE (?1 IS NULL OR task_id IN (SELECT value FROM json_each(?1))) GROUP BY state",
+        task_ids_json.as_deref(),
+    )?;
+    Ok(
+        json!({"total": count(db,"SELECT count(*) FROM tasks WHERE (?1 IS NULL OR task_id IN (SELECT value FROM json_each(?1)))", task_ids_json.as_deref())?, "by_state": by_state}),
+    )
 }
 
-fn attempt_counts(db: &Connection) -> Result<Value> {
+fn attempt_counts(db: &Connection, scope: &FleetReadScope) -> Result<Value> {
+    // Attempt aggregates join the owning Task set: only Attempts bound to an
+    // accessible Task are counted, matching the queue projection.
+    let task_ids_json = scope_task_ids_json(scope)?;
     let current_by_state = grouped_counts(
         db,
-        "SELECT state,count(*) FROM attempts WHERE released_at_ms IS NULL GROUP BY state",
+        "SELECT state,count(*) FROM attempts WHERE released_at_ms IS NULL AND (?1 IS NULL OR task_id IN (SELECT value FROM json_each(?1))) GROUP BY state",
+        task_ids_json.as_deref(),
     )?;
     Ok(json!({
-        "current_total": count(db,"SELECT count(*) FROM attempts WHERE released_at_ms IS NULL")?,
+        "current_total": count(db,"SELECT count(*) FROM attempts WHERE released_at_ms IS NULL AND (?1 IS NULL OR task_id IN (SELECT value FROM json_each(?1)))", task_ids_json.as_deref())?,
         "current_by_state": current_by_state,
-        "released_total": count(db,"SELECT count(*) FROM attempts WHERE released_at_ms IS NOT NULL")?,
+        "released_total": count(db,"SELECT count(*) FROM attempts WHERE released_at_ms IS NOT NULL AND (?1 IS NULL OR task_id IN (SELECT value FROM json_each(?1)))", task_ids_json.as_deref())?,
     }))
 }
 
-fn operation_counts(db: &Connection) -> Result<Value> {
-    let by_state = grouped_counts(db, "SELECT state,count(*) FROM operations GROUP BY state")?;
+fn operation_counts(db: &Connection, scope: &FleetReadScope) -> Result<Value> {
+    // Operation aggregates join the accessible Task set through attempt_id,
+    // so a restricted Manager only counts Operations on its own Tasks.
+    let task_ids_json = scope_task_ids_json(scope)?;
+    let by_state = grouped_counts(
+        db,
+        "SELECT state,count(*) FROM operations WHERE (?1 IS NULL OR COALESCE(task_id,(SELECT task_id FROM attempts AS scoped_attempt WHERE scoped_attempt.attempt_id=operations.attempt_id)) IN (SELECT value FROM json_each(?1))) GROUP BY state",
+        task_ids_json.as_deref(),
+    )?;
     let unresolved = count(
         db,
-        "SELECT count(*) FROM operations WHERE state IN ('queued','sending','native_accepted','outcome_unknown')",
+        "SELECT count(*) FROM operations WHERE state IN ('queued','sending','native_accepted','outcome_unknown') AND (?1 IS NULL OR COALESCE(task_id,(SELECT task_id FROM attempts AS scoped_attempt WHERE scoped_attempt.attempt_id=operations.attempt_id)) IN (SELECT value FROM json_each(?1)))",
+        task_ids_json.as_deref(),
     )?;
     let outcome_unknown = count(
         db,
-        "SELECT count(*) FROM operations WHERE state='outcome_unknown'",
+        "SELECT count(*) FROM operations WHERE state='outcome_unknown' AND (?1 IS NULL OR COALESCE(task_id,(SELECT task_id FROM attempts AS scoped_attempt WHERE scoped_attempt.attempt_id=operations.attempt_id)) IN (SELECT value FROM json_each(?1)))",
+        task_ids_json.as_deref(),
     )?;
     Ok(json!({"by_state":by_state,"unresolved":unresolved,"outcome_unknown":outcome_unknown}))
 }
 
-fn binding_counts(db: &Connection) -> Result<Value> {
-    let by_state = grouped_counts(db, "SELECT state,count(*) FROM bindings GROUP BY state")?;
+fn binding_counts(db: &Connection, scope: &FleetReadScope) -> Result<Value> {
+    // Binding aggregates join the accessible Task set through the Attempt
+    // each Binding serves, so a restricted Manager only counts Bindings on
+    // its own Tasks.
+    let task_ids_json = scope_task_ids_json(scope)?;
+    let by_state = grouped_counts(
+        db,
+        "SELECT state,count(*) FROM bindings WHERE (?1 IS NULL OR EXISTS (SELECT 1 FROM attempts AS scoped_attempt WHERE scoped_attempt.binding_id=bindings.binding_id AND scoped_attempt.binding_generation=bindings.generation AND scoped_attempt.task_id IN (SELECT value FROM json_each(?1)))) GROUP BY state",
+        task_ids_json.as_deref(),
+    )?;
     let connected = count(
         db,
-        "SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json,'$.connection')='connected'",
+        "SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json,'$.connection')='connected' AND (?1 IS NULL OR EXISTS (SELECT 1 FROM attempts AS scoped_attempt WHERE scoped_attempt.binding_id=bindings.binding_id AND scoped_attempt.binding_generation=bindings.generation AND scoped_attempt.task_id IN (SELECT value FROM json_each(?1))))",
+        task_ids_json.as_deref(),
     )?;
     let live = count(
         db,
-        "SELECT count(*) FROM bindings WHERE released_at_ms IS NULL",
+        "SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND (?1 IS NULL OR EXISTS (SELECT 1 FROM attempts AS scoped_attempt WHERE scoped_attempt.binding_id=bindings.binding_id AND scoped_attempt.binding_generation=bindings.generation AND scoped_attempt.task_id IN (SELECT value FROM json_each(?1))))",
+        task_ids_json.as_deref(),
     )?;
     Ok(json!({
-        "recorded_total": count(db,"SELECT count(*) FROM bindings")?,
+        "recorded_total": count(db,"SELECT count(*) FROM bindings WHERE (?1 IS NULL OR EXISTS (SELECT 1 FROM attempts AS scoped_attempt WHERE scoped_attempt.binding_id=bindings.binding_id AND scoped_attempt.binding_generation=bindings.generation AND scoped_attempt.task_id IN (SELECT value FROM json_each(?1))))", task_ids_json.as_deref())?,
         "live_total": live,
         "by_state": by_state,
         "connected_live": connected,
@@ -1906,14 +2049,18 @@ fn optional_i64(params_value: &Value, field: &str, default: i64) -> Result<i64> 
 
 fn query_tasks(
     db: &Connection,
+    scope: &FleetReadScope,
     project_id: Option<&str>,
     task_state: Option<&str>,
     after: i64,
     limit: i64,
 ) -> Result<(i64, Vec<TaskRow>)> {
+    let owned_tasks_json = scope_task_ids_json(scope)?;
     let total: i64 = db.query_row(
-        "SELECT count(*) FROM tasks WHERE (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR state=?2)",
-        params![project_id, task_state],
+        "SELECT count(*) FROM tasks WHERE (?1 IS NULL OR project_id=?1) \
+         AND (?2 IS NULL OR state=?2) \
+         AND (?3 IS NULL OR task_id IN (SELECT value FROM json_each(?3)))",
+        params![project_id, task_state, owned_tasks_json],
         |row| row.get(0),
     )?;
     let after = after.min(total);
@@ -1923,33 +2070,37 @@ fn query_tasks(
                       (SELECT a.attempt_id FROM attempts a WHERE a.task_id=t.task_id
                        AND a.released_at_ms IS NULL ORDER BY a.created_at_ms DESC,a.attempt_id DESC LIMIT 1)
                FROM tasks t WHERE (?1 IS NULL OR t.project_id=?1) AND (?2 IS NULL OR t.state=?2)
+                 AND (?5 IS NULL OR t.task_id IN (SELECT value FROM json_each(?5)))
                ORDER BY t.created_at_ms,t.task_id LIMIT ?3 OFFSET ?4";
     let mut statement = db.prepare(sql)?;
     let rows = statement
-        .query_map(params![project_id, task_state, limit, after], |row| {
-            let spec: String = row.get(9)?;
-            Ok(TaskRow {
-                task_id: row.get(0)?,
-                project_id: row.get(1)?,
-                revision: row.get(2)?,
-                state: row.get(3)?,
-                accepted_attempt_id: row.get(4)?,
-                accepted_operation_id: row.get(5)?,
-                accepted_revision: row.get(6)?,
-                accepted_phase: row.get(7)?,
-                accepted_candidate_ref: row.get(8)?,
-                spec: serde_json::from_str(&spec).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        9,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                created_at_ms: row.get(10)?,
-                updated_at_ms: row.get(11)?,
-                current_attempt_id: row.get(12)?,
-            })
-        })?
+        .query_map(
+            params![project_id, task_state, limit, after, owned_tasks_json],
+            |row| {
+                let spec: String = row.get(9)?;
+                Ok(TaskRow {
+                    task_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    revision: row.get(2)?,
+                    state: row.get(3)?,
+                    accepted_attempt_id: row.get(4)?,
+                    accepted_operation_id: row.get(5)?,
+                    accepted_revision: row.get(6)?,
+                    accepted_phase: row.get(7)?,
+                    accepted_candidate_ref: row.get(8)?,
+                    spec: serde_json::from_str(&spec).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at_ms: row.get(10)?,
+                    updated_at_ms: row.get(11)?,
+                    current_attempt_id: row.get(12)?,
+                })
+            },
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((total, rows))
 }
@@ -2273,10 +2424,12 @@ fn policy_state(policy_id: Option<&str>) -> Result<Value> {
 
 fn task_queue_item(
     db: &Connection,
+    scope: &FleetReadScope,
     row: &TaskRow,
     brief_limit: usize,
     config: &Config,
 ) -> Result<Value> {
+    let task_scope = task_read_scope(scope, &row.task_id);
     let attempt = row
         .current_attempt_id
         .as_deref()
@@ -2321,7 +2474,9 @@ fn task_queue_item(
             "start_owner":attempt.start_owner,
             "start_operation_id":attempt.start_operation_id,
             "binding": match (&attempt.binding_id,attempt.binding_generation) {
-                (Some(id),Some(generation)) => binding_summary(db,id,generation)?,
+                (Some(id), Some(generation)) => {
+                    binding_summary(db, id, generation, &task_scope)?
+                }
                 _ => Value::Null,
             },
             "task_revision_current":attempt.task_revision == row.revision,
@@ -2398,11 +2553,13 @@ fn exact_binding_manager_attention(
     db: &Connection,
     binding_id: &str,
     generation: i64,
+    scope: &FleetReadScope,
 ) -> Result<Value> {
     let page = manager_exceptions_page(
         db,
         &json!({"after":0,"limit":launcher::MAX_PAGE_SIZE}),
         false,
+        scope,
     )?;
     let exact_items = page["items"]
         .as_array()
@@ -2465,7 +2622,12 @@ fn exact_binding_manager_attention(
     }))
 }
 
-fn binding_summary(db: &Connection, binding_id: &str, generation: i64) -> Result<Value> {
+fn binding_summary(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    scope: &FleetReadScope,
+) -> Result<Value> {
     let raw: Option<BindingReadRow> = db
         .query_row(
             "SELECT state,native_scope_key,native_root_id,route_json,state_json,released_at_ms
@@ -2499,7 +2661,7 @@ fn binding_summary(db: &Connection, binding_id: &str, generation: i64) -> Result
     };
     let route: Value = serde_json::from_str(&raw.route_json)?;
     let observation: Value = serde_json::from_str(&raw.state_json)?;
-    let manager_attention = exact_binding_manager_attention(db, binding_id, generation)?;
+    let manager_attention = exact_binding_manager_attention(db, binding_id, generation, scope)?;
     Ok(json!({
         "binding_id":binding_id,
         "generation":generation,
@@ -5026,6 +5188,7 @@ fn launch_preview_inner(
         row.revision,
         exact_current_attempt.map(|attempt| attempt.attempt_id.as_str()),
     )?;
+    let attention_scope = launch_task_read_scope(db, actor, &row.task_id, &row.project_id)?;
     let task_revision_current = request.expected_task_revision == row.revision;
     let (task_brief, task_brief_reference, spec) = source_brief(&row);
     let task_brief =
@@ -5261,7 +5424,7 @@ fn launch_preview_inner(
     let attempt_binding = if let Some(attempt) = exact_current_attempt {
         match (&attempt.binding_id, attempt.binding_generation) {
             (Some(binding_id), Some(generation)) => {
-                let detail = binding_summary(db, binding_id, generation)?;
+                let detail = binding_summary(db, binding_id, generation, &attention_scope)?;
                 let route_alias = detail["route"]["alias"].as_str();
                 if route_alias.is_some_and(|alias| alias != request.route) {
                     hard_blocks.push("requested_route_differs_from_current_attempt_binding");
@@ -6081,6 +6244,7 @@ fn compact_baseline_projection(baseline: &Value) -> Value {
 
 fn queue_page(
     db: &Connection,
+    scope: &FleetReadScope,
     params_value: &Value,
     brief_limit: usize,
     config: &Config,
@@ -6114,6 +6278,7 @@ fn queue_page(
     }
     let (total, rows) = query_tasks(
         db,
+        scope,
         project_id.as_deref(),
         task_state.as_deref(),
         page.after,
@@ -6122,7 +6287,7 @@ fn queue_page(
     let after = page.after.min(total);
     let items = rows
         .iter()
-        .map(|row| task_queue_item(db, row, brief_limit, config))
+        .map(|row| task_queue_item(db, scope, row, brief_limit, config))
         .collect::<Result<Vec<_>>>()?;
     bounded_page("task_queue", after, page.limit, total, items)
 }
@@ -6367,10 +6532,16 @@ fn manager_exceptions_page(
     db: &Connection,
     params_value: &Value,
     include_current_gm_actions: bool,
+    scope: &FleetReadScope,
 ) -> Result<Value> {
     model::fields(params_value, &["after", "limit"])?;
     let page = PageRequest::parse(params_value)?;
-    let raw = capacity::attention_report(db, ATTENTION_SCAN_LIMIT, page.after)?;
+    let raw = match scope {
+        FleetReadScope::Fleet => capacity::attention_report(db, ATTENTION_SCAN_LIMIT, page.after)?,
+        FleetReadScope::ManagerTasks { task_ids } => {
+            capacity::attention_report_for_scope(db, ATTENTION_SCAN_LIMIT, page.after, task_ids)?
+        }
+    };
     let raw_items = raw["items"].as_array().cloned().unwrap_or_default();
     let raw_after = page.after.min(raw["total_items"].as_i64().unwrap_or(0));
     let raw_next = raw["next_after"].as_i64().unwrap_or(raw_after);
@@ -6456,8 +6627,13 @@ fn sanitize_capacity_item(item: &Value) -> Value {
     })
 }
 
-fn dashboard_capacity(db: &Connection) -> Result<Value> {
-    let source = capacity::capacity_report(db, DASHBOARD_PAGE_LIMIT, 0)?;
+fn dashboard_capacity(db: &Connection, scope: &FleetReadScope) -> Result<Value> {
+    let source = match scope {
+        FleetReadScope::Fleet => capacity::capacity_report(db, DASHBOARD_PAGE_LIMIT, 0)?,
+        FleetReadScope::ManagerTasks { task_ids } => {
+            capacity::capacity_report_for_scope(db, DASHBOARD_PAGE_LIMIT, 0, task_ids)?
+        }
+    };
     let total = source["total_items"].as_i64().unwrap_or(0);
     let items = source["items"]
         .as_array()
@@ -6482,10 +6658,14 @@ fn dashboard_summary(
     p: &Principal,
     config: &Config,
 ) -> Result<Value> {
-    let task_summary = task_counts(db)?;
-    let attempts = attempt_counts(db)?;
-    let operations = operation_counts(db)?;
-    let bindings = binding_counts(db)?;
+    // Resolve the accessible fleet read set once and thread it
+    // through every aggregate and the queue preview so queue,
+    // dashboard, and exception projections expose the identical set.
+    let scope = fleet_read_scope(db, p)?;
+    let task_summary = task_counts(db, &scope)?;
+    let attempts = attempt_counts(db, &scope)?;
+    let operations = operation_counts(db, &scope)?;
+    let bindings = binding_counts(db, &scope)?;
     let admission = new_work_state(db)?;
     let generated_at_ms = model::now_ms()?;
     if !include_manager_details {
@@ -6502,13 +6682,14 @@ fn dashboard_summary(
         }));
     }
     let queue_params = json!({"after":0,"limit":limit});
-    let queue = queue_page(db, &queue_params, 4_096, config)?;
-    let capacity = dashboard_capacity(db)?;
+    let queue = queue_page(db, &scope, &queue_params, 4_096, config)?;
+    let capacity = dashboard_capacity(db, &scope)?;
     let include_current_gm_actions = super::gm::require_authority(db, p).is_ok();
     let exception = manager_exceptions_page(
         db,
         &json!({"after":0,"limit":limit}),
         include_current_gm_actions,
+        &scope,
     )?;
     let queue_partial = queue["projection"]["has_newer"] == true
         || queue["projection"]["gap_count"].as_i64().unwrap_or(0) > 0;
@@ -6608,7 +6789,14 @@ pub(super) fn queue_get(
     config: &Config,
 ) -> Result<Value> {
     require_manager(db, p)?;
-    queue_page(db, params_value, launcher::MAX_INLINE_BRIEF_BYTES, config)
+    let scope = fleet_read_scope(db, p)?;
+    queue_page(
+        db,
+        &scope,
+        params_value,
+        launcher::MAX_INLINE_BRIEF_BYTES,
+        config,
+    )
 }
 
 /// Inspect one exact Attempt and its current binding/operation neighborhood.
@@ -6620,6 +6808,7 @@ pub(super) fn agent_inspect(
     config: &Config,
 ) -> Result<Value> {
     require_manager(db, p)?;
+    let read_scope = fleet_read_scope(db, p)?;
     model::fields(
         params_value,
         &[
@@ -6640,6 +6829,7 @@ pub(super) fn agent_inspect(
     if p.role == Role::Manager && attempt.owner_id != p.client_id {
         super::gm::require_authority(db, p)?;
     }
+    let attention_scope = task_read_scope(&read_scope, &attempt.task_id);
     let current_task = current_task(db, &attempt.task_id)?
         .ok_or_else(|| Error::new("NOT_FOUND", format!("Task {}", attempt.task_id)))?;
     let current_revision = current_task.revision;
@@ -6680,7 +6870,7 @@ pub(super) fn agent_inspect(
         "attempt.producers",
     )?;
     let binding = match (&attempt.binding_id, attempt.binding_generation) {
-        (Some(id), Some(generation)) => binding_summary(db, id, generation)?,
+        (Some(id), Some(generation)) => binding_summary(db, id, generation, &attention_scope)?,
         _ => Value::Null,
     };
     let capacity = exact_attempt_capacity(db, &attempt)?;
@@ -6931,9 +7121,11 @@ pub(super) fn exceptions_get(
     params_value: &Value,
 ) -> Result<Value> {
     require_manager(db, p)?;
+    let scope = fleet_read_scope(db, p)?;
     manager_exceptions_page(
         db,
         params_value,
         super::gm::require_authority(db, p).is_ok(),
+        &scope,
     )
 }

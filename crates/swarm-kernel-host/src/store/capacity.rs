@@ -3572,31 +3572,116 @@ fn new_work_enabled(db: &Connection) -> Result<bool> {
     Ok(meta(db, "execution_mode")?.unwrap_or(Value::Null)["new_work"] == "enabled")
 }
 
-/// Computes one accounting item per scope from the ledger and recorded
-/// bindings. Legacy quota incidents are included as historical evidence;
-/// this projection does not assert provider capacity or admission.
-pub(crate) fn capacity_items(db: &Connection) -> Result<Vec<Value>> {
+/// Whether a binding/generation serves an Attempt on one of the
+/// owned Tasks. The task set is JSON so the SQL filter stays a single
+/// bound parameter regardless of its size.
+fn binding_serves_owned_task(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    owned_tasks_json: &str,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts WHERE binding_id=?1 AND binding_generation=?2 \
+         AND task_id IN (SELECT value FROM json_each(?3)))",
+        params![binding_id, generation, owned_tasks_json],
+        |row| row.get(0),
+    )?)
+}
+
+fn capacity_entry_serves_owned_task(
+    db: &Connection,
+    entry: &CapacityEntry,
+    owned_tasks: &std::collections::HashSet<&str>,
+) -> Result<bool> {
+    let task_id = if let Some(task_id) = entry.task_id.as_deref() {
+        Some(task_id.to_owned())
+    } else if let Some(attempt_id) = entry.attempt_id.as_deref() {
+        db.query_row(
+            "SELECT task_id FROM attempts WHERE attempt_id=?1",
+            [attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    Ok(task_id
+        .as_deref()
+        .is_some_and(|task_id| owned_tasks.contains(task_id)))
+}
+
+/// `capacity_items` restricted to the accessible Task set a Manager owns.
+pub(crate) fn capacity_items_for_scope(
+    db: &Connection,
+    owned_tasks: Option<&[String]>,
+) -> Result<Vec<Value>> {
     let scopes = collect_scopes(db)?;
     let new_work = new_work_enabled(db)?;
+    let owned_tasks_json = owned_tasks
+        .map(|tasks| model::canonical(&json!(tasks)))
+        .transpose()?;
+    let owned_task_set = owned_tasks.map(|tasks| {
+        tasks
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>()
+    });
     let mut items = Vec::new();
-    for (_, agg) in scopes {
+    for (_, mut agg) in scopes {
+        if let (Some(owned_json), Some(owned)) =
+            (owned_tasks_json.as_deref(), owned_task_set.as_ref())
+        {
+            let mut bindings = Vec::new();
+            for binding in std::mem::take(&mut agg.bindings) {
+                if let (Some(binding_id), Some(generation)) = (
+                    binding["binding_id"].as_str(),
+                    binding["generation"].as_i64(),
+                ) && binding_serves_owned_task(db, binding_id, generation, owned_json)?
+                {
+                    bindings.push(binding);
+                }
+            }
+            if bindings.is_empty() {
+                continue;
+            }
+            agg.bindings = bindings;
+            let mut entries = Vec::new();
+            for entry in std::mem::take(&mut agg.entries) {
+                if capacity_entry_serves_owned_task(db, &entry, owned)? {
+                    entries.push(entry);
+                }
+            }
+            agg.ledger_updated_at_ms = entries
+                .iter()
+                .map(|entry| entry.last_synced_at_ms)
+                .max()
+                .unwrap_or(0);
+            agg.entries = entries;
+        }
         let scope_key = agg.scope["scope_key"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
         let counts = scope_counts(&agg.entries);
         let (roster_known, roster_reason) = roster_check(db, &agg)?;
-        let historical_quota = historical_quota_incident(db, &scope_key)?;
+        // Historical quota incidents are scope-wide and have no Task
+        // identity, so they are not included in a restricted Manager view.
+        let historical_quota = if owned_tasks.is_some() {
+            None
+        } else {
+            historical_quota_incident(db, &scope_key)?
+        };
         let pending = counts["pending_admissions"].as_i64().unwrap_or(0);
         let bindings: Vec<Value> = agg
             .bindings
             .iter()
-            .map(|b| {
+            .map(|binding| {
                 json!({
-                    "binding_id": b["binding_id"],
-                    "generation": b["generation"],
-                    "state": b["state"],
-                    "released": !b["released_at_ms"].is_null(),
+                    "binding_id": binding["binding_id"],
+                    "generation": binding["generation"],
+                    "state": binding["state"],
+                    "released": !binding["released_at_ms"].is_null(),
                 })
             })
             .collect();
@@ -3614,6 +3699,13 @@ pub(crate) fn capacity_items(db: &Connection) -> Result<Vec<Value>> {
         }));
     }
     Ok(items)
+}
+
+/// Computes one accounting item per scope from the ledger and recorded
+/// bindings. Legacy quota incidents are historical evidence; this projection
+/// does not assert provider capacity or admission.
+pub(crate) fn capacity_items(db: &Connection) -> Result<Vec<Value>> {
+    capacity_items_for_scope(db, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -3693,6 +3785,26 @@ fn paginate(
 pub(crate) fn capacity_report(db: &Connection, limit: i64, after: i64) -> Result<Value> {
     let mut report = paginate(
         capacity_items(db)?,
+        "capacity_accounting",
+        limit,
+        after,
+        capacity_gap_reference,
+    )?;
+    report["generated_at_ms"] = json!(model::now_ms()?);
+    Ok(report)
+}
+
+/// `capacity_report` restricted to a Manager's accessible Task set.
+/// Both the scope bindings and ledger entries are filtered before counts
+/// and page totals are constructed.
+pub(crate) fn capacity_report_for_scope(
+    db: &Connection,
+    limit: i64,
+    after: i64,
+    owned_tasks: &[String],
+) -> Result<Value> {
+    let mut report = paginate(
+        capacity_items_for_scope(db, Some(owned_tasks))?,
         "capacity_accounting",
         limit,
         after,
@@ -4192,6 +4304,81 @@ pub(crate) fn attention_report(db: &Connection, limit: i64, after: i64) -> Resul
     let items = build_attention_items(db, model::now_ms()?)?;
     let mut report = paginate(
         items,
+        "attention_projection",
+        limit,
+        after,
+        attention_gap_reference,
+    )?;
+    report["generated_at_ms"] = json!(model::now_ms()?);
+    Ok(report)
+}
+
+fn attention_item_serves_owned_task(
+    db: &Connection,
+    item: &Value,
+    owned_tasks: &std::collections::HashSet<&str>,
+    owned_tasks_json: &str,
+) -> Result<bool> {
+    let address = &item["address"];
+    if let Some(task_id) = address["task_id"].as_str() {
+        return Ok(owned_tasks.contains(task_id));
+    }
+    if let Some(attempt_id) = address["attempt_id"].as_str() {
+        let task_id: Option<String> = db
+            .query_row(
+                "SELECT task_id FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Ok(task_id
+            .as_deref()
+            .is_some_and(|task_id| owned_tasks.contains(task_id)));
+    }
+    if let Some(operation_id) = address["operation_id"].as_str() {
+        let task_id: Option<String> = db
+            .query_row(
+                "SELECT COALESCE(op.task_id,attempt.task_id) \
+                 FROM operations AS op LEFT JOIN attempts AS attempt ON attempt.attempt_id=op.attempt_id \
+                 WHERE op.operation_id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Ok(task_id
+            .as_deref()
+            .is_some_and(|task_id| owned_tasks.contains(task_id)));
+    }
+    match (item["binding_id"].as_str(), item["generation"].as_i64()) {
+        (Some(binding_id), Some(generation)) => {
+            binding_serves_owned_task(db, binding_id, generation, owned_tasks_json)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The manager-exception caller uses this projection so Task scoping is
+/// applied before the reported count, page, gap references, and cursor.
+pub(crate) fn attention_report_for_scope(
+    db: &Connection,
+    limit: i64,
+    after: i64,
+    owned_task_ids: &[String],
+) -> Result<Value> {
+    let owned_tasks_json = model::canonical(&json!(owned_task_ids))?;
+    let owned_task_set = owned_task_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let items = build_attention_items(db, model::now_ms()?)?;
+    let mut scoped_items = Vec::new();
+    for item in items {
+        if attention_item_serves_owned_task(db, &item, &owned_task_set, &owned_tasks_json)? {
+            scoped_items.push(item);
+        }
+    }
+    let mut report = paginate(
+        scoped_items,
         "attention_projection",
         limit,
         after,

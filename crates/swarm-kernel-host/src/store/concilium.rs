@@ -207,6 +207,13 @@ fn propose(
         task_revision,
         &request.attempt_id,
     )?;
+    let scope_snapshot = json!({
+        "task_id":request.task_id,
+        "task_revision":task_revision,
+        "attempt_id":request.attempt_id,
+        "scope_id":scope["scope_id"],
+        "project_id":task["project_id"],
+    });
     let mut request_value = value.clone();
     request_value
         .as_object_mut()
@@ -234,13 +241,7 @@ fn propose(
         "schema":SCHEMA,
         "concilium_id":concilium_id,
         "proposal_operation_id":operation_id,
-        "scope":{
-            "task_id":request.task_id,
-            "task_revision":task_revision,
-            "attempt_id":request.attempt_id,
-            "scope_id":scope["scope_id"],
-            "project_id":task["project_id"],
-        },
+        "scope":scope_snapshot,
         "manager_id":manager_id,
         "proposal":{
             "operation_id":operation_id,
@@ -369,27 +370,12 @@ fn submit_position(
         &record["scope"],
         &record["proposal"]["proposal_revision_ids"],
     )?;
-    let old_position = &record["slots"][slot_index]["position"];
-    if record["slots"][slot_index]["state"] == "submitted" {
-        if old_position == &position
-            && value_text_is(
-                &record["slots"][slot_index]["packet_digest"],
-                &request.packet_digest,
-            )
-        {
-            return Ok((mutation_receipt(operation_id, &record, false), record));
-        }
-        return Err(Error::new(
-            "CONCILIUM_SLOT_CONFLICT",
-            "this exact participant slot already contains a different position",
-        ));
-    }
     if record["slots"][slot_index]["state"] != "pending"
         || record["slots"][slot_index]["round"] != record["current_round"]
         || !round_is_open(&record)
     {
         return Err(Error::conflict(
-            "the participant slot is not open for response",
+            "only an open current-round pending participant slot accepts a new Operation",
         ));
     }
     record["slots"][slot_index]["state"] = json!("submitted");
@@ -717,6 +703,18 @@ fn verify_proposal_digest_source(db: &Connection, record: &Value) -> Result<()> 
         .get("request")
         .filter(|value| value.is_object())
         .ok_or_else(|| damaged("proposal digest source has no canonical request"))?;
+    let proposal_operation_id = model::text(record, "proposal_operation_id")
+        .map_err(|_| damaged("proposal Operation identity is missing"))?;
+    let task_id = request
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| damaged("proposal source has no Task identity"))?;
+    let attempt_id = request
+        .get("attempt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| damaged("proposal source has no Attempt identity"))?;
+    let scope = &record["scope"];
+    let proposer_scope = &source["proposer"]["scope"];
     if request.get("client_request_id").is_some()
         || source["participants"] != proposal["participants"]
         || source["proposer"]["actor"] != proposal["proposer"]
@@ -724,28 +722,126 @@ fn verify_proposal_digest_source(db: &Connection, record: &Value) -> Result<()> 
         || source["proposer"]["participation_basis"] != proposal["proposer_participation_basis"]
         || source["proposer"]["registration_fingerprint"]
             != proposal["proposer_registration_fingerprint"]
+        || proposal["operation_id"].as_str() != Some(proposal_operation_id)
+        || scope["task_id"].as_str() != Some(task_id)
+        || scope["attempt_id"].as_str() != Some(attempt_id)
+        || proposer_scope["task_id"].as_str() != Some(task_id)
+        || proposer_scope["attempt_id"].as_str() != Some(attempt_id)
+        || scope["task_revision"] != proposer_scope["task_revision"]
+        || scope["scope_id"] != proposer_scope["scope_id"]
+        || model::text(record, "manager_id").is_err()
+        || model::text(scope, "scope_id").is_err()
+        || model::text(scope, "project_id").is_err()
     {
         return Err(damaged(
-            "proposal digest source differs from its retained roster or proposer",
+            "proposal digest source differs from its retained roster, proposer, scope, or Operation identity",
         ));
     }
-    let proposal_operation_id = model::text(record, "proposal_operation_id")?;
-    let (method, caller_id, original_request): (String, String, String) = db.query_row(
-        "SELECT method,caller_id,original_request_json FROM operations WHERE operation_id=?1",
-        [proposal_operation_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+
+    for field in [
+        "failed_thread_id",
+        "decision_question",
+        "material_conflict",
+        "proposal_revision_ids",
+        "evidence_refs",
+        "expected_output",
+        "suggested_max_rounds",
+        "suggested_budget",
+        "close_condition",
+    ] {
+        let canonical = request
+            .get(field)
+            .ok_or_else(|| damaged("proposal source request is missing a canonical field"))?;
+        if proposal.get(field) != Some(canonical) {
+            return Err(damaged(
+                "retained proposal field differs from its canonical admitted request",
+            ));
+        }
+    }
+    verify_resolved_proposal_participants(request, &source["participants"])?;
+
+    let operation: Option<[rusqlite::types::Value; 8]> = db
+        .query_row(
+            "SELECT method,caller_id,client_request_id,original_request_json,task_id,attempt_id,effective_request_json,result_json FROM operations WHERE operation_id=?1",
+            [proposal_operation_id],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ])
+            },
+        )
+        .optional()?;
+    let Some(
+        [
+            method,
+            caller_id,
+            operation_request_id,
+            original_request,
+            operation_task,
+            operation_attempt,
+            effective,
+            operation_result,
+        ],
+    ) = operation
+    else {
+        return Err(damaged(
+            "proposal Operation is missing from the retained ledger",
+        ));
+    };
+    let method = retained_text(&method, "proposal Operation method is not retained text")?;
+    let caller_id = retained_text(&caller_id, "proposal Operation caller is not retained text")?;
+    let operation_request_id = retained_text(
+        &operation_request_id,
+        "proposal Operation request identity is not retained text",
     )?;
-    let mut original_request: Value = serde_json::from_str(&original_request)?;
+    let original_request = retained_text(
+        &original_request,
+        "proposal Operation request is not retained text",
+    )?;
+    let operation_task = retained_text(
+        &operation_task,
+        "proposal Operation Task scope is not retained text",
+    )?;
+    let operation_attempt = retained_text(
+        &operation_attempt,
+        "proposal Operation Attempt scope is not retained text",
+    )?;
+    let effective = retained_text(
+        &effective,
+        "proposal Operation effective request is not retained text",
+    )?;
+    let operation_result = retained_text(
+        &operation_result,
+        "proposal Operation result is not retained text",
+    )?;
+    let mut original_request: Value = serde_json::from_str(&original_request)
+        .map_err(|_| damaged("proposal Operation request is not valid retained JSON"))?;
     let original_object = original_request
         .as_object_mut()
         .ok_or_else(|| damaged("proposal Operation request is not an object"))?;
-    original_object.remove("client_request_id");
+    let original_request_id = original_object
+        .remove("client_request_id")
+        .and_then(|request_id| request_id.as_str().map(str::to_owned));
+    if original_request_id.as_deref() != Some(operation_request_id.as_str()) {
+        return Err(damaged(
+            "proposal Operation request identity differs from its original request",
+        ));
+    }
     if method != "concilium.propose"
         || original_request != *request
         || proposal["proposer"]["client_id"].as_str() != Some(caller_id.as_str())
+        || operation_task.as_str() != task_id
+        || operation_attempt.as_str() != attempt_id
     {
         return Err(damaged(
-            "proposal digest source differs from its originating admitted Operation",
+            "proposal source or scope differs from its originating admitted Operation",
         ));
     }
     let bytes = model::canonical(source)?;
@@ -755,7 +851,102 @@ fn verify_proposal_digest_source(db: &Connection, record: &Value) -> Result<()> 
             "retained proposal digest does not match its canonical source",
         ));
     }
+
+    let effective: Value = serde_json::from_str(&effective)
+        .map_err(|_| damaged("proposal Operation effective request is invalid JSON"))?;
+    let operation_result: Value = serde_json::from_str(&operation_result)
+        .map_err(|_| damaged("proposal Operation result is invalid JSON"))?;
+    if operation_result["operation_id"] != proposal_operation_id
+        || operation_result["concilium_id"] != record["concilium_id"]
+        || operation_result["proposal_operation_id"] != proposal_operation_id
+        || operation_result["task_id"] != scope["task_id"]
+        || operation_result["task_revision"] != scope["task_revision"]
+        || operation_result["attempt_id"] != scope["attempt_id"]
+        || effective["receipt"]["ok"] != true
+        || effective["receipt"]["value"] != operation_result
+    {
+        return Err(damaged(
+            "proposal projection differs from its retained successful Operation receipt",
+        ));
+    }
+    // Task project identity is stable across Task revision and ownership
+    // handover; retained sponsor authorization below uses its original link.
+    let task = tasks::get_task(db, task_id).map_err(|error| {
+        if error.code == "NOT_FOUND" {
+            damaged("proposal Task scope is missing from the retained ledger")
+        } else {
+            error
+        }
+    })?;
+    if scope["project_id"] != task["project_id"] {
+        return Err(damaged(
+            "proposal project scope differs from its retained Task",
+        ));
+    }
+
+    let link = meta(db, &operation_key(proposal_operation_id))?
+        .ok_or_else(|| damaged("proposal Operation link is missing from the retained ledger"))?;
+    if link["schema_version"] != 1
+        || link["concilium_id"] != record["concilium_id"]
+        || link["proposal_operation_id"] != proposal_operation_id
+        || link["task_id"] != scope["task_id"]
+        || link["attempt_id"] != scope["attempt_id"]
+        || link["manager_id"] != record["manager_id"]
+    {
+        return Err(damaged(
+            "proposal projection differs from its originating Operation link",
+        ));
+    }
     Ok(())
+}
+
+fn verify_resolved_proposal_participants(request: &Value, resolved: &Value) -> Result<()> {
+    let requested = request["participants"]
+        .as_array()
+        .ok_or_else(|| damaged("proposal request participant list is missing"))?;
+    let resolved = resolved
+        .as_array()
+        .ok_or_else(|| damaged("proposal participant snapshots are missing"))?;
+    if requested.len() != resolved.len() {
+        return Err(damaged(
+            "resolved proposal participant snapshots differ from the canonical request",
+        ));
+    }
+    for (invitee, participant) in requested.iter().zip(resolved) {
+        let invitee_id = invitee.get("client_id").and_then(Value::as_str);
+        let participant_id = participant["actor"]["client_id"].as_str();
+        let reason = invitee.get("reason").and_then(Value::as_str);
+        let retained_reason = participant.get("reason").and_then(Value::as_str);
+        let requested_generation = match invitee.get("generation") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or_else(|| damaged("proposal request generation is malformed"))?,
+            ),
+        };
+        if invitee_id.is_none()
+            || invitee_id != participant_id
+            || reason.is_none()
+            || reason != retained_reason
+            || participant["actor"]["role"] != "participant"
+            || requested_generation.is_some_and(|generation| {
+                participant["actor"]["generation"].as_i64() != Some(generation)
+            })
+        {
+            return Err(damaged(
+                "resolved proposal participant snapshots differ from the canonical request",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn retained_text(value: &rusqlite::types::Value, message: &str) -> Result<String> {
+    match value {
+        rusqlite::types::Value::Text(value) => Ok(value.clone()),
+        _ => Err(damaged(message)),
+    }
 }
 
 fn round_one_packet(record: &Value, task: &Value) -> Result<Value> {
@@ -1219,8 +1410,21 @@ fn store_projection(tx: &Transaction<'_>, record: &Value) -> Result<()> {
 
 fn load_projection(db: &Connection, id: &str) -> Result<Value> {
     validate_identifier(id, "concilium_id", limits::MAX_IDENTIFIER_BYTES)?;
-    let record = meta(db, &projection_key(id))?
-        .ok_or_else(|| Error::new("NOT_FOUND", "Concilium was not found"))?;
+    let raw: Option<rusqlite::types::Value> = db
+        .query_row(
+            "SELECT value_json FROM meta WHERE key=?1",
+            [projection_key(id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Err(Error::new("NOT_FOUND", "Concilium was not found"));
+    };
+    let rusqlite::types::Value::Text(raw) = raw else {
+        return Err(damaged("Concilium projection row is not retained text"));
+    };
+    let record: Value = serde_json::from_str(&raw)
+        .map_err(|_| damaged("Concilium projection is not valid retained JSON"))?;
     verify_projection(&record)?;
     if !value_text_is(&record["concilium_id"], id) {
         return Err(damaged(
@@ -1421,9 +1625,9 @@ fn list(db: &Connection, principal: &Principal, request: &ListRequest) -> Result
         crate::automation::authorization::require_registered_manager(db, &principal.client_id)?;
     }
     let task_wide_reader = principal.role == Role::Operator
-        || (principal.role == Role::Manager && super::gm::require_authority(db, principal).is_ok());
+        || (principal.role == Role::Manager && current_gm_authorized(db, principal)?);
     let current_scope_attempt = if principal.role == Role::Manager && !task_wide_reader {
-        current_task_scope_attempt(db, principal, task_id, request.attempt_id.as_deref())
+        current_task_scope_attempt(db, principal, task_id, request.attempt_id.as_deref())?
     } else {
         None
     };
@@ -1446,10 +1650,10 @@ fn list(db: &Connection, principal: &Principal, request: &ListRequest) -> Result
     let compare = if after.is_some() { ">" } else { ">=" };
     let upper = format!("{prefix}~");
     let sql = format!(
-        "SELECT key,value_json FROM meta WHERE key {compare} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+        "SELECT CAST(key AS TEXT),value_json FROM meta WHERE key {compare} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
     );
     let mut statement = db.prepare(&sql)?;
-    let rows: Vec<(String, String)> = statement
+    let rows: Vec<(String, rusqlite::types::Value)> = statement
         .query_map(params![lower, upper, limit.saturating_add(1)], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
@@ -1458,12 +1662,39 @@ fn list(db: &Connection, principal: &Principal, request: &ListRequest) -> Result
     let scanned = rows.iter().take(limit as usize);
     let mut items = Vec::new();
     let mut last_scanned = None;
+    let mut gap_count = 0_usize;
     for (key, raw_index) in scanned {
-        let index: Value = serde_json::from_str(raw_index)?;
-        let id = model::text(&index, "concilium_id")?;
-        let record = load_projection(db, id)?;
-        authorize_projection_reader(db, principal, &record)?;
-        last_scanned = key.rsplit(':').next().map(str::to_owned);
+        let indexed_id = key
+            .strip_prefix(&prefix)
+            .ok_or_else(|| damaged("Concilium index key escaped its selected prefix"))?;
+        last_scanned = Some(indexed_id.to_owned());
+        let raw_index = match raw_index {
+            rusqlite::types::Value::Text(raw_index) => raw_index,
+            _ => {
+                gap_count = gap_count.saturating_add(1);
+                continue;
+            }
+        };
+        let record = (|| {
+            let index: Value = serde_json::from_str(raw_index)
+                .map_err(|_| damaged("Concilium index entry is not valid retained JSON"))?;
+            let id = model::text(&index, "concilium_id")
+                .map_err(|_| damaged("Concilium index entry has no valid identity"))?;
+            if id != indexed_id {
+                return Err(damaged("Concilium index key and identity disagree"));
+            }
+            let record = load_projection(db, id)?;
+            authorize_projection_reader(db, principal, &record)?;
+            Ok(record)
+        })();
+        let record = match record {
+            Ok(record) => record,
+            Err(error) if is_list_gap(&error) => {
+                gap_count = gap_count.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !value_text_is(&record["scope"]["task_id"], task_id)
             || effective_attempt
                 .is_some_and(|attempt| !value_text_is(&record["scope"]["attempt_id"], attempt))
@@ -1473,13 +1704,42 @@ fn list(db: &Connection, principal: &Principal, request: &ListRequest) -> Result
         }
         items.push(list_item(&record));
     }
+    let partial = has_more || gap_count != 0;
     Ok(json!({
         "items":items,
         "task_id":task_id,
         "attempt_id":effective_attempt,
         "next_after_concilium_id":if has_more { last_scanned.map(Value::String).unwrap_or(Value::Null) } else { Value::Null },
-        "coverage":if has_more { "partial" } else { "complete" },
+        "coverage":if partial { "partial" } else { "complete" },
+        "gaps":if gap_count == 0 { json!([]) } else { json!([{"kind":"concilium_record","count":gap_count}]) },
     }))
+}
+
+fn is_expected_scope_absence(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "NOT_FOUND"
+            | "FORBIDDEN"
+            | "UNAUTHORIZED"
+            | "STALE_PARTICIPANT"
+            | "STALE_REVISION"
+            | "PARTICIPANT_NOT_ASSIGNED"
+            | "STALE_REVIEW_ASSIGNMENT"
+            | "GM_REGISTRATION_STALE"
+    )
+}
+
+fn is_list_gap(error: &Error) -> bool {
+    is_expected_scope_absence(error)
+        || matches!(error.code.as_str(), "CONCILIUM_CORRUPT" | "INVALID_PARAMS")
+}
+
+fn current_gm_authorized(db: &Connection, principal: &Principal) -> Result<bool> {
+    match super::gm::require_authority(db, principal) {
+        Ok(()) => Ok(true),
+        Err(error) if is_expected_scope_absence(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn project_page(
@@ -1538,16 +1798,18 @@ fn project_page(
     projection["next_after_slot_id"] = next_after;
     projection["coverage"] = json!(if has_more { "partial" } else { "complete" });
     if !manager_view {
-        projection["my_slots"] = json!(
-            slots
-                .iter()
-                .filter(|slot| value_text_is(
+        let my_slots: Vec<Value> = slots
+            .iter()
+            .filter(|slot| {
+                value_text_is(
                     &slot["participant_actor"]["client_id"],
-                    &principal.client_id
-                ))
-                .cloned()
-                .collect::<Vec<_>>()
-        );
+                    &principal.client_id,
+                )
+            })
+            .cloned()
+            .collect();
+        projection["my_slots_complete"] = json!(after_slot_id.is_none() && !has_more);
+        projection["my_slots"] = json!(my_slots);
         sanitize_participant_projection(&mut projection);
     }
     Ok(projection)
@@ -1604,16 +1866,7 @@ fn authorize_projection_reader(
     match principal.role {
         Role::Operator => super::require_local_operator(db, &principal.client_id),
         Role::Manager => {
-            crate::automation::authorization::require_registered_manager(db, &principal.client_id)?;
-            if value_text_is(&record["manager_id"], &principal.client_id)
-                || has_current_task_scope_reader(
-                    db,
-                    principal,
-                    model::text(&record["scope"], "task_id")?,
-                    Some(model::text(&record["scope"], "attempt_id")?),
-                )
-                || super::gm::require_authority(db, principal).is_ok()
-            {
+            if is_manager_reader(db, principal, record)? {
                 Ok(())
             } else {
                 Err(Error::new(
@@ -1629,7 +1882,7 @@ fn authorize_projection_reader(
                     "Participant is not in the retained Concilium read scope",
                 )
             })?;
-            verify_retained_registration(db, &principal.client_id, &record["scope"], &snapshot)
+            verify_retained_registration(db, &principal.client_id, &snapshot)
         }
         _ => Err(Error::new(
             "FORBIDDEN",
@@ -1645,14 +1898,17 @@ fn is_manager_reader(db: &Connection, principal: &Principal, record: &Value) -> 
     }
     if principal.role == Role::Manager {
         crate::automation::authorization::require_registered_manager(db, &principal.client_id)?;
-        return Ok(value_text_is(&record["manager_id"], &principal.client_id)
+        if value_text_is(&record["manager_id"], &principal.client_id)
             || has_current_task_scope_reader(
                 db,
                 principal,
                 model::text(&record["scope"], "task_id")?,
                 Some(model::text(&record["scope"], "attempt_id")?),
-            )
-            || super::gm::require_authority(db, principal).is_ok());
+            )?
+        {
+            return Ok(true);
+        }
+        return current_gm_authorized(db, principal);
     }
     Ok(false)
 }
@@ -1662,8 +1918,8 @@ fn has_current_task_scope_reader(
     principal: &Principal,
     task_id: &str,
     attempt_id: Option<&str>,
-) -> bool {
-    current_task_scope_attempt(db, principal, task_id, attempt_id).is_some()
+) -> Result<bool> {
+    Ok(current_task_scope_attempt(db, principal, task_id, attempt_id)?.is_some())
 }
 
 fn current_task_scope_attempt(
@@ -1671,13 +1927,36 @@ fn current_task_scope_attempt(
     principal: &Principal,
     task_id: &str,
     attempt_id: Option<&str>,
-) -> Option<String> {
-    let task = tasks::get_task(db, task_id).ok()?;
-    let attempt_id = attempt_id.or_else(|| task["current_attempt_id"].as_str())?;
-    let task_revision = task["revision"].as_i64()?;
-    coordination::concilium_manager_scope(db, principal, task_id, task_revision, attempt_id)
-        .ok()?;
-    Some(attempt_id.to_owned())
+) -> Result<Option<String>> {
+    let task = match tasks::get_task(db, task_id) {
+        Ok(task) => task,
+        Err(error) if error.code == "NOT_FOUND" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let attempt_id = match attempt_id {
+        Some(attempt_id) => attempt_id,
+        None => match task.get("current_attempt_id") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::String(attempt_id)) if !attempt_id.is_empty() => attempt_id,
+            _ => {
+                return Err(Error::new(
+                    "STORE_INVARIANT",
+                    "current Task projection has an invalid Attempt identity",
+                ));
+            }
+        },
+    };
+    let task_revision = task["revision"].as_i64().ok_or_else(|| {
+        Error::new(
+            "STORE_INVARIANT",
+            "current Task projection has no numeric revision",
+        )
+    })?;
+    match coordination::concilium_manager_scope(db, principal, task_id, task_revision, attempt_id) {
+        Ok(_) => Ok(Some(attempt_id.to_owned())),
+        Err(error) if is_expected_scope_absence(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn participant_snapshot(record: &Value, client_id: &str) -> Option<Value> {
@@ -1715,7 +1994,7 @@ fn participant_snapshot(record: &Value, client_id: &str) -> Option<Value> {
 fn verify_registered_participant(db: &Connection, client_id: &str) -> Result<Value> {
     let registration = meta(db, &format!("client:{client_id}"))?
         .ok_or_else(|| Error::new("UNAUTHORIZED", "Participant registration no longer exists"))?;
-    if registration["role"] != "participant" || registration["disabled"] == true {
+    if registration["role"] != "participant" || registration["disabled"] != false {
         return Err(Error::new(
             "UNAUTHORIZED",
             "Participant readback requires the same enabled registered identity",
@@ -1724,29 +2003,32 @@ fn verify_registered_participant(db: &Connection, client_id: &str) -> Result<Val
     Ok(registration)
 }
 
-fn verify_retained_registration(
-    db: &Connection,
-    client_id: &str,
-    scope: &Value,
-    snapshot: &Value,
-) -> Result<()> {
+/// Retained reads follow the same enabled actor/binding, not the current Task
+/// assignment. Mutations still require the exact live scope and fingerprint.
+fn verify_retained_registration(db: &Connection, client_id: &str, snapshot: &Value) -> Result<()> {
     let registration = verify_registered_participant(db, client_id)?;
-    let current_fingerprint =
+    // Validate the identity at this registration key without comparing its
+    // Task/Attempt-bearing fingerprint: those fields may change while this
+    // remains a historical read of the same actor.
+    let _identity_fingerprint =
         coordination::concilium_registration_fingerprint(client_id, &registration)?;
     let actor_generation = registration
         .get("binding_generation")
         .cloned()
         .unwrap_or(Value::Null);
-    if registration["task_id"] != scope["task_id"]
-        || registration["task_revision"] != scope["task_revision"]
-        || registration["attempt_id"] != scope["attempt_id"]
-        || snapshot["registration_fingerprint"].as_str() != Some(current_fingerprint.as_str())
+    let binding_id = registration
+        .get("binding_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if snapshot["actor"]["role"] != "participant"
         || !value_text_is(&snapshot["actor"]["client_id"], client_id)
         || snapshot["actor"]["generation"] != actor_generation
+        || snapshot["scope"]["binding_generation"] != actor_generation
+        || snapshot["scope"]["binding_id"] != binding_id
     {
         return Err(Error::new(
             "FORBIDDEN",
-            "registered Participant identity does not match the retained exact scope",
+            "registered Participant identity does not match the retained historical actor",
         ));
     }
     Ok(())
@@ -1874,17 +2156,31 @@ fn validate_evidence_refs(
         } else {
             // A plain exact ID is accepted only when it resolves to an
             // in-scope Operation or artifact; it is never treated as a path.
-            if validate_operation_ref(db, reference, task, attempt_id).is_err()
-                && validate_artifact_ref(db, reference, task, attempt_id, None).is_err()
-            {
-                return Err(Error::new(
-                    "EVIDENCE_NOT_FOUND",
-                    "evidence ref does not name an exact existing in-scope fact",
-                ));
+            match validate_operation_ref(db, reference, task, attempt_id) {
+                Ok(()) => continue,
+                Err(error) if is_evidence_reference_miss(&error) => {}
+                Err(error) => return Err(error),
+            }
+            match validate_artifact_ref(db, reference, task, attempt_id, None) {
+                Ok(()) => {}
+                Err(error) if is_evidence_reference_miss(&error) => {
+                    return Err(Error::new(
+                        "EVIDENCE_NOT_FOUND",
+                        "evidence ref does not name an exact existing in-scope fact",
+                    ));
+                }
+                Err(error) => return Err(error),
             }
         }
     }
     Ok(())
+}
+
+fn is_evidence_reference_miss(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "EVIDENCE_NOT_FOUND" | "EVIDENCE_SCOPE_MISMATCH"
+    )
 }
 
 fn validate_operation_ref(
@@ -1972,13 +2268,11 @@ fn validate_artifact_ref(
     let metadata: Value = serde_json::from_str(&raw_metadata)?;
     if metadata["task_id"] != task["task_id"]
         || !value_text_is(&metadata["attempt_id"], attempt_id)
-        || metadata
-            .get("task_revision")
-            .is_some_and(|revision| revision != &task["revision"])
+        || metadata["task_revision"] != task["revision"]
     {
         return Err(Error::new(
             "EVIDENCE_SCOPE_MISMATCH",
-            "Artifact evidence is outside the exact Concilium Task and Attempt",
+            "Artifact evidence is outside the exact Concilium Task revision and Attempt",
         ));
     }
     Ok(())
@@ -2121,4 +2415,387 @@ fn sha256_digest(bytes: &[u8]) -> String {
 
 fn damaged(message: impl Into<String>) -> Error {
     Error::new("CONCILIUM_CORRUPT", message)
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use rusqlite::{Connection, params};
+    use serde_json::json;
+
+    fn principal(client_id: &str, role: Role) -> Principal {
+        Principal {
+            link_id: "concilium-repair-test-link".to_owned(),
+            client_id: client_id.to_owned(),
+            role,
+        }
+    }
+
+    fn meta_connection() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        db
+    }
+
+    fn list_request(after_concilium_id: Option<&str>) -> ListRequest {
+        ListRequest {
+            task_id: "task-repair-test".to_owned(),
+            attempt_id: None,
+            state: None,
+            limit: 1,
+            after_concilium_id: after_concilium_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn concilium_list_skips_damaged_index_and_advances_cursor() {
+        let db = meta_connection();
+        let client_id = "participant-repair-test";
+        let prefix = viewer_index_prefix(client_id);
+        for (id, raw) in [
+            ("a-damaged-index", "{not-json"),
+            (
+                "b-missing-projection",
+                r#"{"concilium_id":"b-missing-projection"}"#,
+            ),
+            (
+                "c-corrupt-projection",
+                r#"{"concilium_id":"c-corrupt-projection"}"#,
+            ),
+        ] {
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![format!("{prefix}{id}"), raw],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+            params![projection_key("c-corrupt-projection"), "{not-json"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO meta(key,value_json) VALUES(?1,CAST(X'FF' AS BLOB))",
+            [format!("{prefix}d-nontext-index")],
+        )
+        .unwrap();
+        let reader = principal(client_id, Role::Participant);
+
+        let first = list(&db, &reader, &list_request(None)).unwrap();
+        assert_eq!(first["gaps"][0]["count"], 1);
+        assert_eq!(first["next_after_concilium_id"], "a-damaged-index");
+        assert_eq!(first["coverage"], "partial");
+
+        let second = list(&db, &reader, &list_request(Some("a-damaged-index"))).unwrap();
+        assert_eq!(second["gaps"][0]["count"], 1);
+        assert_eq!(second["next_after_concilium_id"], "b-missing-projection");
+
+        let third = list(&db, &reader, &list_request(Some("b-missing-projection"))).unwrap();
+        assert_eq!(third["gaps"][0]["count"], 1);
+        assert_eq!(third["next_after_concilium_id"], "c-corrupt-projection");
+        assert_eq!(third["coverage"], "partial");
+
+        let fourth = list(&db, &reader, &list_request(Some("c-corrupt-projection"))).unwrap();
+        assert_eq!(fourth["gaps"][0]["count"], 1);
+        assert_eq!(fourth["next_after_concilium_id"], Value::Null);
+        assert_eq!(fourth["coverage"], "partial");
+    }
+
+    #[test]
+    fn concilium_list_propagates_sqlite_storage_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        let error = list(
+            &db,
+            &principal("participant-repair-test", Role::Participant),
+            &list_request(None),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "STORE_ERROR");
+    }
+
+    #[test]
+    fn concilium_current_scope_propagates_sqlite_storage_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        let manager = principal("manager-repair-test", Role::Manager);
+        let scope_error = current_task_scope_attempt(&db, &manager, "task", None).unwrap_err();
+        assert_eq!(scope_error.code, "STORE_ERROR");
+
+        let gm_error = current_gm_authorized(&db, &manager).unwrap_err();
+        assert_eq!(gm_error.code, "STORE_ERROR");
+    }
+
+    #[test]
+    fn concilium_scope_absence_does_not_hide_gm_decoder_failures() {
+        for code in [
+            "NOT_FOUND",
+            "FORBIDDEN",
+            "STALE_PARTICIPANT",
+            "GM_REGISTRATION_STALE",
+        ] {
+            assert!(is_expected_scope_absence(&Error::new(
+                code,
+                "expected absence"
+            )));
+        }
+        for code in [
+            "GM_DESIGNATION_MISSING",
+            "GM_DESIGNATION_DAMAGED",
+            "GM_EPOCH_HISTORY_DAMAGED",
+            "GM_EPOCH_HISTORY_UNAVAILABLE",
+            "STORE_ERROR",
+            "STORE_INVARIANT",
+        ] {
+            assert!(!is_expected_scope_absence(&Error::new(
+                code,
+                "hard failure"
+            )));
+        }
+    }
+
+    #[test]
+    fn concilium_my_slots_completeness_is_false_for_page_and_true_only_for_full_initial_page() {
+        let db = Connection::open_in_memory().unwrap();
+        let record = json!({
+            "current_round":1,
+            "rounds":[{"round":1,"status":"ready"}],
+            "proposal":{"participants":[],"proposer":{"client_id":"participant-a"}},
+            "plan":{"participants":[]},
+            "slots":[
+                {
+                    "slot_id":"a-peer",
+                    "participant_actor":{"client_id":"participant-b","role":"participant","generation":1},
+                    "round":1,"state":"submitted","position":{"position":"oppose"},
+                    "response_operation_id":"peer-operation","packet_digest":"peer-digest",
+                    "packet":{"private":"peer"},"source_result_ref":"peer-result"
+                },
+                {
+                    "slot_id":"b-own",
+                    "participant_actor":{"client_id":"participant-a","role":"participant","generation":1},
+                    "round":1,"state":"submitted","position":{"position":"support"},
+                    "response_operation_id":"own-operation","packet_digest":"own-digest",
+                    "packet":{"private":"own"},"source_result_ref":"own-result"
+                }
+            ]
+        });
+        let reader = principal("participant-a", Role::Participant);
+
+        let first_page = project_page(&db, &reader, &record, 1, None).unwrap();
+        assert_eq!(first_page["coverage"], "partial");
+        assert_eq!(first_page["my_slots_complete"], false);
+        assert!(first_page["my_slots"].as_array().unwrap().is_empty());
+
+        let full_page = project_page(&db, &reader, &record, 2, None).unwrap();
+        assert_eq!(full_page["coverage"], "complete");
+        assert_eq!(full_page["my_slots_complete"], true);
+        assert_eq!(full_page["my_slots"].as_array().unwrap().len(), 1);
+        assert!(full_page["slots"][0].get("position").is_none());
+        assert!(full_page["slots"][0].get("packet").is_none());
+
+        let continuation = project_page(&db, &reader, &record, 1, Some("a-peer")).unwrap();
+        assert_eq!(continuation["coverage"], "complete");
+        assert_eq!(continuation["my_slots_complete"], false);
+        assert_eq!(continuation["my_slots"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concilium_retained_participant_read_requires_same_enabled_actor_generation_after_rebind() {
+        let db = meta_connection();
+        let client_id = "participant-repair-test";
+        let registration = json!({
+            "client_id":client_id,
+            "role":"participant","disabled":false,
+            "task_id":"new-task","task_revision":2,"attempt_id":"new-attempt",
+            "binding_id":"live-binding","binding_generation":7
+        });
+        set_meta(&db, &format!("client:{client_id}"), &registration).unwrap();
+        let retained = json!({
+            "actor":{"client_id":client_id,"role":"participant","generation":7},
+            "scope":{
+                "task_id":"old-task","task_revision":1,"attempt_id":"old-attempt",
+                "binding_id":"live-binding","binding_generation":7
+            },
+            "registration_fingerprint":"old-assignment-fingerprint"
+        });
+        assert!(verify_retained_registration(&db, client_id, &retained).is_ok());
+
+        let mut incomplete_registration = registration.clone();
+        incomplete_registration
+            .as_object_mut()
+            .unwrap()
+            .remove("disabled");
+        set_meta(
+            &db,
+            &format!("client:{client_id}"),
+            &incomplete_registration,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_retained_registration(&db, client_id, &retained)
+                .unwrap_err()
+                .code,
+            "UNAUTHORIZED"
+        );
+        set_meta(&db, &format!("client:{client_id}"), &registration).unwrap();
+
+        set_meta(
+            &db,
+            &format!("client:{client_id}"),
+            &json!({
+                "client_id":"foreign-registration",
+                "role":"participant","disabled":false,
+                "binding_id":"live-binding","binding_generation":7
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_retained_registration(&db, client_id, &retained)
+                .unwrap_err()
+                .code,
+            "STALE_PARTICIPANT"
+        );
+        set_meta(&db, &format!("client:{client_id}"), &registration).unwrap();
+
+        let foreign_actor = json!({
+            "actor":{"client_id":"different-participant","role":"participant","generation":7}
+        });
+        assert_eq!(
+            verify_retained_registration(&db, client_id, &foreign_actor)
+                .unwrap_err()
+                .code,
+            "FORBIDDEN"
+        );
+
+        let stale_generation = json!({
+            "actor":{"client_id":client_id,"role":"participant","generation":6}
+        });
+        assert_eq!(
+            verify_retained_registration(&db, client_id, &stale_generation)
+                .unwrap_err()
+                .code,
+            "FORBIDDEN"
+        );
+
+        let stale_binding = json!({
+            "actor":{"client_id":client_id,"role":"participant","generation":7},
+            "scope":{"binding_id":"foreign-binding","binding_generation":7}
+        });
+        assert_eq!(
+            verify_retained_registration(&db, client_id, &stale_binding)
+                .unwrap_err()
+                .code,
+            "FORBIDDEN"
+        );
+    }
+
+    #[test]
+    fn concilium_artifact_evidence_requires_exact_task_revision() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE artifacts(artifact_id TEXT PRIMARY KEY,kind TEXT NOT NULL,metadata_json TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (artifact_id, metadata) in [
+            (
+                "exact",
+                json!({"task_id":"task","attempt_id":"attempt","task_revision":4}),
+            ),
+            (
+                "missing-revision",
+                json!({"task_id":"task","attempt_id":"attempt"}),
+            ),
+            (
+                "stale-revision",
+                json!({"task_id":"task","attempt_id":"attempt","task_revision":3}),
+            ),
+        ] {
+            db.execute(
+                "INSERT INTO artifacts(artifact_id,kind,metadata_json) VALUES(?1,'source_snapshot',?2)",
+                params![artifact_id, serde_json::to_string(&metadata).unwrap()],
+            )
+            .unwrap();
+        }
+        let task = json!({"task_id":"task","revision":4});
+        assert!(validate_artifact_ref(&db, "exact", &task, "attempt", None).is_ok());
+        for artifact_id in ["missing-revision", "stale-revision"] {
+            assert_eq!(
+                validate_artifact_ref(&db, artifact_id, &task, "attempt", None)
+                    .unwrap_err()
+                    .code,
+                "EVIDENCE_SCOPE_MISMATCH"
+            );
+        }
+    }
+
+    #[test]
+    fn concilium_plain_evidence_fallback_propagates_storage_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        let error = validate_evidence_refs(
+            &db,
+            &["plain-evidence-id".to_owned()],
+            &json!({"task_id":"task","revision":1}),
+            "attempt",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "STORE_ERROR");
+    }
+
+    #[test]
+    fn concilium_missing_proposal_operation_is_damaged_record_not_storage_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE operations(operation_id TEXT PRIMARY KEY,method TEXT NOT NULL,caller_id TEXT NOT NULL,client_request_id TEXT NOT NULL,original_request_json TEXT NOT NULL,task_id TEXT,attempt_id TEXT,effective_request_json TEXT,result_json TEXT);",
+        )
+        .unwrap();
+        let actor = json!({"client_id":"participant","role":"participant","generation":1});
+        let scope = json!({
+            "task_id":"task","task_revision":1,"attempt_id":"attempt",
+            "scope_id":"scope","project_id":"project"
+        });
+        let basis = json!({"kind":"attempt_owner"});
+        let request = json!({
+            "task_id":"task","attempt_id":"attempt","failed_thread_id":"thread",
+            "decision_question":"question","material_conflict":"conflict",
+            "participants":[],"proposal_revision_ids":[],"evidence_refs":[],
+            "expected_output":"output","suggested_max_rounds":1,
+            "suggested_budget":{},"close_condition":"condition"
+        });
+        let source = json!({
+            "request":request,
+            "participants":[],
+            "proposer":{
+                "actor":actor,"scope":scope,"participation_basis":basis,
+                "registration_fingerprint":"fingerprint"
+            }
+        });
+        let record = json!({
+            "proposal_operation_id":"missing-operation",
+            "manager_id":"manager",
+            "scope":scope,
+            "proposal":{
+                "operation_id":"missing-operation",
+                "request_source":source,
+                "participants":[],
+                "proposer":actor,
+                "proposer_scope":scope,
+                "proposer_participation_basis":basis,
+                "proposer_registration_fingerprint":"fingerprint",
+                "failed_thread_id":"thread",
+                "decision_question":"question",
+                "material_conflict":"conflict",
+                "proposal_revision_ids":[],
+                "evidence_refs":[],
+                "expected_output":"output",
+                "suggested_max_rounds":1,
+                "suggested_budget":{},
+                "close_condition":"condition"
+            }
+        });
+        assert_eq!(
+            verify_proposal_digest_source(&db, &record)
+                .unwrap_err()
+                .code,
+            "CONCILIUM_CORRUPT"
+        );
+    }
 }
