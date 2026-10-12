@@ -63,6 +63,8 @@ const MAX_LIVE_OPERATION_SLOT_BYTES: usize =
 const OPERATION_ACK_DIRECTORY: &str = "operation-acks";
 const JOURNAL_MARKER_FILE: &str = "journal.active";
 const JOURNAL_MARKER_BYTES: &[u8] = b"eliot-codex-journal-v1\n";
+const LEGACY_CHECKPOINT_VERSION: u32 = 2;
+const CURRENT_CHECKPOINT_VERSION: u32 = 3;
 const MAX_OPERATION_ACK_BYTES: u64 = 64 * 1024;
 const MAX_PENDING_OUTCOMES_PER_BATCH: usize = 32;
 const MAX_PENDING_NATIVE_EVENT_BYTES: u64 = 1024 * 1024;
@@ -475,7 +477,7 @@ struct Checkpoint {
 impl Checkpoint {
     fn new(boot_id: String) -> Self {
         Self {
-            version: 2,
+            version: CURRENT_CHECKPOINT_VERSION,
             module_artifact_id: ARTIFACT_ID.into(),
             boot_id,
             binding_id: None,
@@ -895,7 +897,7 @@ impl Journal {
             return Err(AdapterError::Owner);
         }
         fs::create_dir_all(&directory).map_err(|_| AdapterError::Checkpoint)?;
-        let mut latest_sequence = 0u64;
+        let mut sequences: Vec<u64> = Vec::new();
         for entry in fs::read_dir(&directory).map_err(|_| AdapterError::Checkpoint)? {
             let entry = entry.map_err(|_| AdapterError::Checkpoint)?;
             let name = entry.file_name();
@@ -905,6 +907,11 @@ impl Journal {
                 .and_then(|value| value.strip_suffix(".json"))
             else {
                 if name.starts_with("checkpoint-") {
+                    // Integrity sidecar files are not checkpoint
+                    // snapshots; they are skipped by the scan.
+                    if name.ends_with(".sha256") {
+                        continue;
+                    }
                     return Err(AdapterError::Checkpoint);
                 }
                 continue;
@@ -932,8 +939,11 @@ impl Journal {
             if sequence == 0 || format!("{sequence:016}") != number {
                 return Err(AdapterError::Checkpoint);
             }
-            latest_sequence = latest_sequence.max(sequence);
+            sequences.push(sequence);
         }
+        sequences.sort_unstable();
+        sequences.reverse();
+        let latest_sequence = sequences.first().copied().unwrap_or(0);
         let marker_path = directory.join(JOURNAL_MARKER_FILE);
         let marker_present = match fs::symlink_metadata(&marker_path) {
             Ok(_) => {
@@ -951,15 +961,37 @@ impl Journal {
             return Err(AdapterError::Checkpoint);
         }
         let (sequence, mut state) = if latest_sequence > 0 {
+            // A torn or digest-mismatched latest record fails closed.
+            // No older snapshot may become authority: replaying an
+            // older state would erase newer Operations, pending
+            // input/feedback/native events, root adoption, or ACK
+            // state that the compacted tombstone index cannot detect.
+            // A separately proven freshness/frontier is required before
+            // any older snapshot can be adopted; none exists here.
             let path = directory.join(format!("checkpoint-{latest_sequence:016}.json"));
             let bytes = read_bounded_file(&path, MAX_CHECKPOINT_BYTES)?;
+            // A missing sidecar is eligible for historical compatibility
+            // only after the decoded checkpoint proves it is v2. Current
+            // v3 snapshots always require a matching digest, including the
+            // publication window after JSON rename and before digest rename.
+            let digest_matches = checkpoint_digest_matches(&directory, latest_sequence, &bytes)?;
+            if digest_matches == Some(false) {
+                return Err(AdapterError::Checkpoint);
+            }
             let state: Checkpoint =
                 serde_json::from_slice(&bytes).map_err(|_| AdapterError::Checkpoint)?;
+            if digest_matches.is_none() && state.version != LEGACY_CHECKPOINT_VERSION {
+                return Err(AdapterError::Checkpoint);
+            }
             (latest_sequence, state)
         } else {
             (0, Checkpoint::new(boot_id.clone()))
         };
-        if state.version != 2 || state.module_artifact_id != ARTIFACT_ID {
+        if !matches!(
+            state.version,
+            LEGACY_CHECKPOINT_VERSION | CURRENT_CHECKPOINT_VERSION
+        ) || state.module_artifact_id != ARTIFACT_ID
+        {
             return Err(AdapterError::Checkpoint);
         }
         state.restore_legacy_root_phase();
@@ -1002,7 +1034,9 @@ impl Journal {
 
     fn save(&mut self) -> Result<(), AdapterError> {
         self.validate_live_bounds()?;
-        let bytes = serde_json::to_vec(&self.state).map_err(|_| AdapterError::Checkpoint)?;
+        let mut published_state = self.state.clone();
+        published_state.version = CURRENT_CHECKPOINT_VERSION;
+        let bytes = serde_json::to_vec(&published_state).map_err(|_| AdapterError::Checkpoint)?;
         if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
             return Err(AdapterError::Checkpoint);
         }
@@ -1037,6 +1071,19 @@ impl Journal {
             let _ = fs::remove_file(&temporary);
             return Err(AdapterError::Checkpoint);
         }
+        // Publish the whole-snapshot integrity digest as a sibling
+        // sidecar so a later open can reject a corrupted or swapped
+        // snapshot instead of adopting it.
+        let digest = digest_hex(&bytes);
+        if publish_checkpoint_digest(&self.directory, next, &digest).is_err() {
+            return Err(AdapterError::Checkpoint);
+        }
+        // Make the checkpoint and digest directory entries durable on
+        // platforms that support a directory sync; on Windows this is a
+        // documented no-op inside sync_parent_directory.
+        swarm_process::sync_parent_directory(&self.directory)
+            .map_err(|_| AdapterError::Checkpoint)?;
+        self.state.version = CURRENT_CHECKPOINT_VERSION;
         self.sequence = next;
         self.prune_old_checkpoints()
     }
@@ -1484,6 +1531,11 @@ impl Journal {
                 .and_then(|value| value.strip_suffix(".json"))
             else {
                 if name.starts_with("checkpoint-") {
+                    // Integrity sidecars are pruned alongside their
+                    // snapshot and are not journal snapshots.
+                    if name.ends_with(".sha256") {
+                        continue;
+                    }
                     return Err(AdapterError::Checkpoint);
                 }
                 continue;
@@ -1505,6 +1557,12 @@ impl Journal {
             }
             if sequence < self.sequence {
                 fs::remove_file(entry.path()).map_err(|_| AdapterError::Checkpoint)?;
+                let digest_path = self
+                    .directory
+                    .join(format!("checkpoint-{sequence:016}.sha256"));
+                if digest_path.exists() {
+                    fs::remove_file(&digest_path).map_err(|_| AdapterError::Checkpoint)?;
+                }
             }
         }
         Ok(())
@@ -2137,6 +2195,61 @@ fn ensure_directory(path: &Path) -> Result<(), AdapterError> {
         }
     }
     if !checked_directory_exists(path)? {
+        return Err(AdapterError::Checkpoint);
+    }
+    Ok(())
+}
+
+fn checkpoint_digest_matches(
+    directory: &Path,
+    sequence: u64,
+    bytes: &[u8],
+) -> Result<Option<bool>, AdapterError> {
+    let path = directory.join(format!("checkpoint-{sequence:016}.sha256"));
+    match fs::symlink_metadata(&path) {
+        // Only a confirmed absence returns None; Journal::open accepts
+        // that state only for a decoded historical v2 checkpoint. Once
+        // present, every metadata or bounded-read failure is corrupt
+        // custody and must fail closed. The bounded read rechecks the
+        // path, so disappearance or replacement after this probe is
+        // still an error rather than legacy absence.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => {}
+        Err(_) => return Err(AdapterError::Checkpoint),
+    };
+    let recorded = read_bounded_file(&path, 64)?;
+    let recorded = String::from_utf8(recorded).map_err(|_| AdapterError::Checkpoint)?;
+    Ok(Some(recorded.trim() == digest_hex(bytes)))
+}
+
+fn publish_checkpoint_digest(
+    directory: &Path,
+    sequence: u64,
+    digest: &str,
+) -> Result<(), AdapterError> {
+    let path = directory.join(format!("checkpoint-{sequence:016}.sha256"));
+    let temporary = directory.join(format!(
+        ".checkpoint-{}-{}.sha256.tmp",
+        sequence,
+        Uuid::new_v4()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| AdapterError::Checkpoint)?;
+    if file.write_all(digest.as_bytes()).is_err() || file.sync_all().is_err() {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(AdapterError::Checkpoint);
+    }
+    drop(file);
+    if path.exists() {
+        let _ = fs::remove_file(&temporary);
+        return Err(AdapterError::Checkpoint);
+    }
+    if fs::rename(&temporary, &path).is_err() {
+        let _ = fs::remove_file(&temporary);
         return Err(AdapterError::Checkpoint);
     }
     Ok(())
@@ -6192,5 +6305,353 @@ mod reg28_tests {
             reconcile_send_outcome(true, unknown.verified),
             EffectOutcome::Unknown
         ));
+    }
+}
+#[cfg(test)]
+mod reg34_reg35_checkpoint_integrity_tests {
+    use super::*;
+
+    const PENDING_SEND_OPERATION_ID: &str = "pending-native-send";
+    const ACKNOWLEDGED_UNKNOWN_OPERATION_ID: &str = "acknowledged-unknown-outcome";
+
+    fn write_checkpoint(
+        directory: &Path,
+        sequence: u64,
+        state: &Checkpoint,
+        with_digest: bool,
+        corrupt_digest: bool,
+    ) {
+        let path = directory.join(format!("checkpoint-{sequence:016}.json"));
+        let bytes = serde_json::to_vec(state).expect("serialize fixture checkpoint");
+        std::fs::write(&path, &bytes).expect("write fixture checkpoint");
+        if with_digest {
+            let digest = digest_hex(&bytes);
+            let recorded = if corrupt_digest {
+                "0".repeat(digest.len())
+            } else {
+                digest
+            };
+            let sidecar = directory.join(format!("checkpoint-{sequence:016}.sha256"));
+            std::fs::write(sidecar, recorded).expect("write fixture digest");
+        }
+    }
+
+    fn marker(directory: &Path) {
+        let marker_path = directory.join(JOURNAL_MARKER_FILE);
+        std::fs::write(marker_path, JOURNAL_MARKER_BYTES).expect("write journal marker");
+    }
+
+    fn fresh_checkpoint(boot_id: &str) -> Checkpoint {
+        Checkpoint::new(boot_id.to_owned())
+    }
+
+    fn effect_bearing_checkpoint(boot_id: &str) -> Checkpoint {
+        let mut state = fresh_checkpoint(boot_id);
+        let mut pending_send = OperationRecord::intent("agent.send", "send");
+        pending_send.input_sha256 = Some("a".repeat(64));
+        state
+            .operations
+            .insert(PENDING_SEND_OPERATION_ID.to_owned(), pending_send);
+
+        let mut acknowledged = OperationRecord::intent("agent.observe", "observe");
+        acknowledged.input_sha256 = Some("b".repeat(64));
+        acknowledged.outcome = Some(
+            serde_json::to_value(outcome(
+                ACKNOWLEDGED_UNKNOWN_OPERATION_ID,
+                EffectOutcome::Unknown,
+                None,
+                None,
+                None,
+                None,
+                json!({"native_replay":false}),
+            ))
+            .expect("serialize acknowledged unknown outcome"),
+        );
+        state
+            .operations
+            .insert(ACKNOWLEDGED_UNKNOWN_OPERATION_ID.to_owned(), acknowledged);
+        state
+            .acknowledged_outcomes
+            .insert(ACKNOWLEDGED_UNKNOWN_OPERATION_ID.to_owned());
+        state.pending_native_events.push(NativeEventRecord {
+            appserver_scope: Some("fixture-scope".to_owned()),
+            event: NativeRpcEvent::NativeNotification {
+                method: "turn/completed".to_owned(),
+                params: json!({"turnId":"turn-retained"}),
+            },
+        });
+        state
+    }
+
+    fn write_effectful_latest_checkpoint(directory: &Path) -> (PathBuf, Vec<u8>) {
+        std::fs::create_dir_all(directory).expect("create fixture journal");
+        write_checkpoint(directory, 1, &fresh_checkpoint("boot-older"), true, false);
+        write_checkpoint(
+            directory,
+            2,
+            &effect_bearing_checkpoint("boot-newer"),
+            false,
+            false,
+        );
+        marker(directory);
+
+        let latest_path = directory.join("checkpoint-0000000000000002.json");
+        let latest_bytes = std::fs::read(&latest_path).expect("read latest fixture checkpoint");
+        let decoded: Checkpoint =
+            serde_json::from_slice(&latest_bytes).expect("latest fixture is parseable");
+        assert_eq!(decoded.version, CURRENT_CHECKPOINT_VERSION);
+        assert!(decoded.operations.contains_key(PENDING_SEND_OPERATION_ID));
+        assert!(
+            decoded
+                .acknowledged_outcomes
+                .contains(ACKNOWLEDGED_UNKNOWN_OPERATION_ID)
+        );
+        assert!(decoded.pending_native_events.iter().any(|record| matches!(
+            &record.event,
+            NativeRpcEvent::NativeNotification { method, params }
+                if method == "turn/completed" && params["turnId"] == "turn-retained"
+        )));
+        (
+            directory.join("checkpoint-0000000000000002.sha256"),
+            latest_bytes,
+        )
+    }
+
+    fn assert_present_sidecar_fails_closed(
+        directory: &Path,
+        sidecar: &Path,
+        expected_latest: &[u8],
+    ) {
+        let latest_path = directory.join("checkpoint-0000000000000002.json");
+        let older_path = directory.join("checkpoint-0000000000000001.json");
+        let result = Journal::open(directory.to_owned(), "boot-restart".to_owned());
+        assert!(matches!(result, Err(AdapterError::Checkpoint)));
+        let latest_after = std::fs::read(&latest_path).expect("latest remains after rejected open");
+        assert_eq!(latest_after.as_slice(), expected_latest,);
+        assert!(older_path.is_file(), "older snapshot remains unadopted");
+        assert!(std::fs::symlink_metadata(sidecar).is_ok());
+    }
+
+    #[test]
+    fn torn_latest_checkpoint_fails_closed() {
+        let directory = std::env::temp_dir().join(format!("codex-reg34-torn-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create fixture journal");
+        let older = fresh_checkpoint("boot-older");
+        write_checkpoint(&directory, 1, &older, true, false);
+        let mut newest = fresh_checkpoint("boot-newer");
+        newest.observe_sequence = 7;
+        write_checkpoint(&directory, 2, &newest, true, false);
+        // Tear the newest snapshot bytes after its digest was
+        // published; startup must fail closed, never replay the
+        // older snapshot as fresh state.
+        let newest_path = directory.join("checkpoint-0000000000000002.json");
+        std::fs::write(&newest_path, b"{truncated").expect("tear newest");
+        marker(&directory);
+
+        let result = Journal::open(directory.clone(), "boot-restart".to_owned());
+        assert!(matches!(result, Err(AdapterError::Checkpoint)));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn digest_mismatch_latest_fails_closed() {
+        let directory = std::env::temp_dir().join(format!("codex-reg34-swap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create fixture journal");
+        let older = fresh_checkpoint("boot-older");
+        write_checkpoint(&directory, 1, &older, true, false);
+        // Digest sidecar does not match the snapshot bytes.
+        let newest = effect_bearing_checkpoint("boot-newer");
+        write_checkpoint(&directory, 2, &newest, true, true);
+        marker(&directory);
+
+        let result = Journal::open(directory.clone(), "boot-restart".to_owned());
+        assert!(matches!(result, Err(AdapterError::Checkpoint)));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn current_generation_missing_digest_fails_closed_at_publication_boundary() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-reg34-current-no-digest-{}", Uuid::new_v4()));
+        // This on-disk state is the real Journal publication boundary:
+        // the parseable current JSON has been renamed into place, but
+        // its digest sidecar has not yet been published.
+        let (sidecar, latest_bytes) = write_effectful_latest_checkpoint(&directory);
+        let latest_path = directory.join("checkpoint-0000000000000002.json");
+        let older_path = directory.join("checkpoint-0000000000000001.json");
+        let older_bytes = std::fs::read(&older_path).expect("read older snapshot");
+        let marker_path = directory.join(JOURNAL_MARKER_FILE);
+        let marker_bytes = std::fs::read(&marker_path).expect("read journal marker");
+
+        assert!(!sidecar.exists(), "digest publication has not happened");
+        assert_eq!(
+            serde_json::from_slice::<Checkpoint>(&latest_bytes)
+                .expect("current snapshot is parseable")
+                .version,
+            CURRENT_CHECKPOINT_VERSION
+        );
+        let result = Journal::open(directory.clone(), "boot-restart".to_owned());
+        assert!(matches!(result, Err(AdapterError::Checkpoint)));
+        assert_eq!(
+            std::fs::read(&latest_path).expect("latest remains after rejected open"),
+            latest_bytes
+        );
+        assert_eq!(
+            std::fs::read(&older_path).expect("older remains after rejected open"),
+            older_bytes
+        );
+        assert!(!sidecar.exists(), "open must not synthesize a digest");
+        assert!(
+            !directory.join("checkpoint-0000000000000003.json").exists(),
+            "rejected open must not publish a boot checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(&marker_path).expect("marker remains after rejected open"),
+            marker_bytes
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn legacy_v2_checkpoint_without_digest_is_decoded_honestly() {
+        let directory = std::env::temp_dir().join(format!("codex-reg34-legacy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create fixture journal");
+        // Historical v2 checkpoint published before the digest
+        // guard: no sidecar exists. Its bytes decode honestly
+        // without inventing a digest or failing closed.
+        let mut state = effect_bearing_checkpoint("boot-legacy");
+        state.version = LEGACY_CHECKPOINT_VERSION;
+        write_checkpoint(&directory, 1, &state, false, false);
+        marker(&directory);
+
+        let journal = Journal::open(directory.clone(), "boot-restart".to_owned())
+            .expect("decodes legacy v2 checkpoint");
+        assert_eq!(journal.sequence, 2);
+        assert_eq!(journal.state.boot_id, "boot-restart");
+        assert_eq!(journal.state.version, CURRENT_CHECKPOINT_VERSION);
+        assert!(
+            journal
+                .state
+                .operations
+                .contains_key(PENDING_SEND_OPERATION_ID)
+        );
+        assert!(
+            journal
+                .state
+                .acknowledged_outcomes
+                .contains(ACKNOWLEDGED_UNKNOWN_OPERATION_ID)
+        );
+        assert!(
+            journal
+                .state
+                .pending_native_events
+                .iter()
+                .any(|record| matches!(
+                    &record.event,
+                    NativeRpcEvent::NativeNotification { method, params }
+                        if method == "turn/completed" && params["turnId"] == "turn-retained"
+                ))
+        );
+        let migrated_path = directory.join("checkpoint-0000000000000002.json");
+        let migrated_bytes =
+            std::fs::read(&migrated_path).expect("read migrated current checkpoint");
+        let migrated_state: Checkpoint = serde_json::from_slice(&migrated_bytes)
+            .expect("migrated current checkpoint is parseable");
+        assert_eq!(migrated_state.version, CURRENT_CHECKPOINT_VERSION);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("checkpoint-0000000000000002.sha256"))
+                .expect("read migrated digest")
+                .trim(),
+            digest_hex(&migrated_bytes)
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn oversized_present_digest_sidecar_fails_closed_for_parseable_latest() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-reg34-oversized-sidecar-{}", Uuid::new_v4()));
+        let (sidecar, latest_bytes) = write_effectful_latest_checkpoint(&directory);
+        std::fs::write(&sidecar, vec![b'0'; 65]).expect("write oversized digest sidecar");
+
+        assert_present_sidecar_fails_closed(&directory, &sidecar, &latest_bytes);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn directory_present_digest_sidecar_fails_closed() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-reg34-directory-sidecar-{}", Uuid::new_v4()));
+        let (sidecar, latest_bytes) = write_effectful_latest_checkpoint(&directory);
+        std::fs::create_dir(&sidecar).expect("create directory digest sidecar");
+
+        assert_present_sidecar_fails_closed(&directory, &sidecar, &latest_bytes);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_present_digest_sidecar_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("codex-reg34-symlink-sidecar-{}", Uuid::new_v4()));
+        let (sidecar, latest_bytes) = write_effectful_latest_checkpoint(&directory);
+        let target = directory.join("digest-target");
+        std::fs::write(&target, "0".repeat(64)).expect("write symlink target");
+        symlink(&target, &sidecar).expect("create digest sidecar symlink");
+
+        assert_present_sidecar_fails_closed(&directory, &sidecar, &latest_bytes);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn save_publishes_matching_digest_sidecar() {
+        let directory = std::env::temp_dir().join(format!("codex-reg35-save-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create fixture journal");
+        let mut journal =
+            Journal::open(directory.clone(), "boot-save".to_owned()).expect("open fresh journal");
+        journal.state.observe_sequence = 3;
+        journal.save().expect("save checkpoint");
+        let sequence = journal.sequence;
+        let path = directory.join(format!("checkpoint-{sequence:016}.json"));
+        let bytes = std::fs::read(&path).expect("read saved snapshot");
+        let sidecar = directory.join(format!("checkpoint-{sequence:016}.sha256"));
+        let recorded = std::fs::read_to_string(sidecar).expect("read digest sidecar");
+        assert_eq!(recorded.trim(), digest_hex(&bytes));
+        // The published snapshot round-trips through the guard.
+        let reopened = Journal::open(directory.clone(), "boot-reopen".to_owned())
+            .expect("reopen published snapshot");
+        assert_eq!(reopened.sequence, sequence + 1);
+        assert_eq!(reopened.state.boot_id, "boot-reopen");
+        assert_eq!(reopened.state.observe_sequence, 3);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn save_does_not_collide_with_existing_newer_checkpoint() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-reg35-collide-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create fixture journal");
+        let state = fresh_checkpoint("boot-first");
+        write_checkpoint(&directory, 1, &state, true, false);
+        marker(&directory);
+        let mut journal = Journal::open(directory.clone(), "boot-save".to_owned())
+            .expect("open journal at sequence 1");
+        assert_eq!(journal.sequence, 2);
+        // A checkpoint already occupies the next sequence; the
+        // publication guard must refuse instead of clobbering it.
+        let existing = fresh_checkpoint("boot-existing-newer");
+        let occupied_sequence = journal.sequence + 1;
+        write_checkpoint(&directory, occupied_sequence, &existing, true, false);
+        journal.state.observe_sequence = 5;
+        let result = journal.save();
+        assert!(matches!(result, Err(AdapterError::Checkpoint)));
+        // The existing newer snapshot is preserved byte-for-byte.
+        let path = directory.join(format!("checkpoint-{occupied_sequence:016}.json"));
+        let preserved = std::fs::read(&path).expect("read existing newer");
+        let expected = serde_json::to_vec(&existing).expect("serialize existing");
+        assert_eq!(preserved, expected);
+        std::fs::remove_dir_all(&directory).ok();
     }
 }

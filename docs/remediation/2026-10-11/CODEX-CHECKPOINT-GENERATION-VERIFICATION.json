@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "status": "BOUNDED_CURRENT_SOURCE_AND_AFFECTED_CONSUMERS_VERIFIED",
+  "recorded_at_utc": "2026-10-12T03:36:25.5146331Z",
+  "candidate_base": "6cb94fb686ee6536ea14f4e8f8c8fe37477f3af1",
+  "source_sha256": {
+    "crates/swarm-adapter-codex/src/lib.rs": "757F5EFA030C0806801DB8EBD4D2A25F074D548B80EB9B31C911A90A86B0C26C"
+  },
+  "scope": "Codex newest-checkpoint sidecar integrity and publication-generation identity; bounded source repair",
+  "changes": [
+    "Current publisher emits version3 and a required matching digest; present malformed/mismatched/oversized/non-regular sidecar fails closed",
+    "Only decoded historical version2 may lack digest; it migrates through existing save preserving effect-bearing state",
+    "Newest torn/current digestless checkpoint cannot fall back to an older snapshot before restore/compaction/save/prune"
+  ],
+  "meaningful_consumers": {
+    "windows": [
+      "current_generation_missing_digest_fails_closed_at_publication_boundary",
+      "digest_mismatch_latest_fails_closed",
+      "directory_present_digest_sidecar_fails_closed",
+      "legacy_v2_checkpoint_without_digest_is_decoded_honestly",
+      "oversized_present_digest_sidecar_fails_closed_for_parseable_latest",
+      "save_does_not_collide_with_existing_newer_checkpoint",
+      "save_publishes_matching_digest_sidecar",
+      "torn_latest_checkpoint_fails_closed"
+    ],
+    "linux": [
+      "current_generation_missing_digest_fails_closed_at_publication_boundary",
+      "digest_mismatch_latest_fails_closed",
+      "directory_present_digest_sidecar_fails_closed",
+      "legacy_v2_checkpoint_without_digest_is_decoded_honestly",
+      "oversized_present_digest_sidecar_fails_closed_for_parseable_latest",
+      "save_does_not_collide_with_existing_newer_checkpoint",
+      "save_publishes_matching_digest_sidecar",
+      "symlink_present_digest_sidecar_fails_closed",
+      "torn_latest_checkpoint_fails_closed"
+    ],
+    "windows_count": 8,
+    "linux_count": 9,
+    "unix_additional": "symlink digest sidecar refusal",
+    "public_boundary": "Real Journal open/save and filesystem checkpoint/digest publications; no synthetic success hook",
+    "retained_case_policy": "Windows six unchanged passed cases fromv4 plus two changed lifecycle cases fromv5; Linux allnine cases first finalv6 run",
+    "fixture_corrections": "Marked-but-empty is damaged state, fresh-open has no marker; opening existing journal publishes new boot sequence; collision fixture occupies actual next sequence; no production change"
+  },
+  "verification": [
+    {
+      "artifact": "journal-final-windows-clippy-v3.json",
+      "artifact_sha256": "86B0477835E94B5D3FF0DDFB4CFFBE00ACB3883BDA73D252DFE534DF6865C220",
+      "platform": "windows",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "B3D1AA4B530039399C90740D57DA53B9F286E1CDE3BE94111B03CEF4EC830CF4",
+      "verified_codex_cases": [],
+      "scope": "Strict two-adapter production Clippy; final Codex production byte-equivalent"
+    },
+    {
+      "artifact": "journal-final-linux-clippy-v3.json",
+      "artifact_sha256": "DD2392F2E63D077D255B63363EE9515E5D3F8885EDE812FA0F405CC139B1D288",
+      "platform": "linux",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "14F6DDB9603C54F5F3193E359AD3D370C88D55BECECF9C1B4A8A97524660A94E",
+      "verified_codex_cases": [],
+      "scope": "Strict two-adapter production Clippy; final Codex production byte-equivalent"
+    },
+    {
+      "artifact": "journal-final-windows-test-v4.json",
+      "artifact_sha256": "7DCE1BC13C7E99A89191C59341989A50B122FF38C4EF2560FE2ADCD4F3F4EBAE",
+      "platform": "windows",
+      "exit_code": 100,
+      "source_stable": true,
+      "log_sha256": "5AAC535D308F3B3FFDE4CC464364E3B9120005B89AA3795B6ECD7FBF962315F1",
+      "verified_codex_cases": [
+        "legacy_v2_checkpoint_without_digest_is_decoded_honestly",
+        "digest_mismatch_latest_fails_closed",
+        "torn_latest_checkpoint_fails_closed",
+        "current_generation_missing_digest_fails_closed_at_publication_boundary",
+        "oversized_present_digest_sidecar_fails_closed_for_parseable_latest",
+        "directory_present_digest_sidecar_fails_closed"
+      ],
+      "scope": "Individual Codex case PASS retained separately; overall mixed gate exit retained honestly"
+    },
+    {
+      "artifact": "journal-final-windows-test-v5.json",
+      "artifact_sha256": "1B5AEC2CE78EB2D717FE5EABE1068D60FF98FB27A3CA477D7D75E2EC16DFB160",
+      "platform": "windows",
+      "exit_code": 100,
+      "source_stable": true,
+      "log_sha256": "E9C96D372FD5D1FAFD63BC13CEB42C848594F849BFC78318F8EA4ACD75AEEBFB",
+      "verified_codex_cases": [
+        "save_does_not_collide_with_existing_newer_checkpoint",
+        "save_publishes_matching_digest_sidecar"
+      ],
+      "scope": "Individual Codex case PASS retained separately; overall mixed gate exit retained honestly"
+    },
+    {
+      "artifact": "journal-final-linux-test-v6.json",
+      "artifact_sha256": "05F13B2A1BE7E2B9E942E1BB8047CFD6E9185853AC706CA020B0A2DB65D33DAB",
+      "platform": "linux",
+      "exit_code": 0,
+      "source_stable": true,
+      "log_sha256": "4F5085F7FA8B2FF84303D9A77A4A29BBC6264869D694E9D405AE010615F00F2D",
+      "verified_codex_cases": [
+        "current_generation_missing_digest_fails_closed_at_publication_boundary",
+        "oversized_present_digest_sidecar_fails_closed_for_parseable_latest",
+        "symlink_present_digest_sidecar_fails_closed",
+        "torn_latest_checkpoint_fails_closed",
+        "digest_mismatch_latest_fails_closed",
+        "directory_present_digest_sidecar_fails_closed",
+        "legacy_v2_checkpoint_without_digest_is_decoded_honestly",
+        "save_does_not_collide_with_existing_newer_checkpoint",
+        "save_publishes_matching_digest_sidecar"
+      ],
+      "scope": "Individual Codex case PASS retained separately; overall mixed gate exit retained honestly"
+    }
+  ],
+  "independent_review": {
+    "artifact": "codex-checkpoint-generation-independent-review-20261012.json",
+    "sha256": "02079739D152C73B0029299DE65720C584AE4A93A7773341E1E36ABF96CC2B9A",
+    "findings": [],
+    "reviewed_source_sha256": "0A31735D57806AA3467FA73269DF503C5EE7F94B08A0D48E6210BC688EEB3E3B",
+    "final_production_unchanged": true,
+    "manager_test_delta_evidence": "journal-final-fixture-setup-repair-v5.json"
+  },
+  "preserved_failures": [
+    "v3 Command fixture compiler error",
+    "v4 mixed6PASS16FAIL, Codex2lifecycle setup failures",
+    "v5 mixed15PASS1FAIL, unrelated Command single fixture setup; Codex2PASS"
+  ],
+  "limitations": [
+    "Adapter-only affected source/consumer qualification; full original459row audit and alltarget warning clearance pending",
+    "Installed native/model Step5free/Gemini3.8 Windows/Linux/fault/crash/load release qualification remains unverified",
+    "Command R47 linked result-page recursive deletion boundary under separate audit; this source proof makes no fullR47 claim"
+  ],
+  "full_v27_qualified": false
+}
