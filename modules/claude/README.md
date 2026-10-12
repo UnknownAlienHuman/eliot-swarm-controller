@@ -70,7 +70,7 @@ The mapper (`stream.mjs`) is pure and shared by the live path and the fixture se
 
 ## Permission behavior
 
-With `permissionMode = 'default'` (the SDK default when the route declares none), tool use reaches the SDK `canUseTool` callback. Because `agent.reply` is unavailable in this artifact, the callback never approves implicitly: it records the request in the observation (`permission_requests`, with tool name/id) and denies it with an explicit message naming this boundary. Auto-denials by the native side remain visible through `system/permission_denied` advisories and the authoritative `result.permission_denials`. A session that needs tool execution therefore needs a route-declared permission mode chosen by the operator — the bridge does not choose one silently.
+When the route omits `permissionMode`, `bridge.mjs` leaves SDK `Options.permissionMode` unset; this is not an explicit `permissionMode = 'default'`. The pinned SDK 0.3.287 selects `permissions.defaultMode` from the settings it loads, or otherwise starts in `'auto'` where that is the default and `'default'` where auto mode is unavailable. `system/init.permissionMode` is the observed session mode. An explicit route value `'default'` selects the SDK's documented manual-approval path through `canUseTool`; this bridge records and denies each request it receives because `agent.reply` is unavailable. With an omitted option, whether requests reach `canUseTool` depends on the resolved mode and native settings; in `'auto'`, the SDK classifier decides calls when it can and uses `canUseTool` when it cannot decide. Native-side denials remain visible through `system/permission_denied` advisories and the authoritative `result.permission_denials`.
 
 ## Recovery boundary
 
