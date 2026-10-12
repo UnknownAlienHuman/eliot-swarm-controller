@@ -323,6 +323,30 @@ async fn subscribe_delivers_committed_transitions_with_frame_identity() {
         .unwrap()
         .to_string();
 
+    // Read the same committed page independently through the public
+    // report_delta tool. Its item cursor and frame revision are the oracle
+    // for the notification below, rather than fields compared to themselves.
+    let report_read = client
+        .call_tool("report_delta", json!({"after": 0, "limit": 50}))
+        .await
+        .unwrap();
+    let report = &report_read["structuredContent"];
+    let committed_facts = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(operation_id) && fact["kind"] == json!("task.create")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(committed_facts.len(), 1, "one committed task.create fact");
+    let committed_cursor = committed_facts[0]["cursor"]
+        .as_i64()
+        .expect("report.delta fact cursor");
+    let committed_projection_revision = report["projection"]["projection_revision"]
+        .as_str()
+        .expect("report.delta projection frame revision");
+
     let mut seen = Vec::new();
     let notification = client
         .until_notification(Duration::from_secs(10), &mut seen, |message| {
@@ -335,13 +359,18 @@ async fn subscribe_delivers_committed_transitions_with_frame_identity() {
     assert_eq!(params["subscription_id"], json!(subscription_id));
     assert_eq!(params["categories"], json!(["reports", "operations"]));
     assert_eq!(params["item"]["operation_id"], json!(operation_id));
-    assert_eq!(params["cursor"], params["item"]["cursor"]);
+    assert_eq!(params["cursor"].as_i64(), Some(committed_cursor));
+    assert_eq!(params["item"]["cursor"].as_i64(), Some(committed_cursor));
     // Frame identity: the S2 frame of the page the entry came from.
     assert_eq!(
         params["frame"]["source_kind"],
         json!("observation_timeline")
     );
-    assert!(params["frame"]["projection_revision"].is_string());
+    assert_eq!(
+        params["frame"]["projection_revision"],
+        json!(committed_projection_revision),
+        "notification frame revision is anchored to the public report.delta page"
+    );
     assert_eq!(params["frame"]["range"]["after"], json!(0));
     assert_eq!(params["frame"]["coverage_complete"], json!(true));
 
@@ -466,8 +495,14 @@ async fn rejected_admission_notifies_one_safe_failure_fact_without_message_data(
         .unwrap();
     let subscription_id = ack["subscription_id"].as_str().unwrap().to_owned();
 
-    // One valid commit proves the subscription is live.
-    stack.create_task().await;
+    // One public task.create commit proves the subscription is live.
+    client
+        .call_tool(
+            "task_create",
+            json!({"project_id": "p", "spec": {"objective": "t", "phase": "p", "requirements": [{"id": "r1", "statement": "s"}]}}),
+        )
+        .await
+        .unwrap();
     let mut seen = Vec::new();
     client
         .until_notification(Duration::from_secs(10), &mut seen, |message| {
@@ -485,22 +520,41 @@ async fn rejected_admission_notifies_one_safe_failure_fact_without_message_data(
         "text": "private-body-sentinel",
     });
     for _ in 0..2 {
-        let rejected = stack
-            .store_call("message.send", request.clone())
+        let rejected = client
+            .call_tool("message_send", request.clone())
             .await
-            .expect_err("unregistered recipient must reject the request");
-        assert_eq!(rejected.code, "NOT_FOUND");
+            .unwrap();
+        assert_eq!(rejected["isError"], json!(true));
+        let error_text = rejected["content"][0]["text"]
+            .as_str()
+            .expect("public tool error content");
+        let error: Value = serde_json::from_str(error_text).expect("public tool error JSON");
+        assert_eq!(error["error"]["code"], json!("NOT_FOUND"));
     }
-    let list = stack
-        .store_call("operation.list", json!({"state": "rejected", "limit": 200}))
+    let list = client
+        .call_tool("operation_list", json!({"state": "rejected", "limit": 200}))
         .await
         .unwrap();
-    let rejected_operation = list["items"]
+    let matching_operations = list["structuredContent"]["items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["method"] == "message.send")
-        .expect("the rejected message Operation row exists");
+        .filter(|entry| {
+            entry["method"] == json!("message.send")
+                && entry["client_request_id"] == request["client_request_id"]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching_operations.len(),
+        1,
+        "exact replay retains one rejected Operation for this request identity"
+    );
+    let rejected_operation = matching_operations[0];
+    assert_eq!(rejected_operation["state"], json!("rejected"));
+    assert_eq!(
+        rejected_operation["client_request_id"],
+        request["client_request_id"]
+    );
     let operation_id = rejected_operation["operation_id"]
         .as_str()
         .expect("rejected message Operation identity")
@@ -540,11 +594,11 @@ async fn rejected_admission_notifies_one_safe_failure_fact_without_message_data(
     assert!(!notification_json.contains("private-body-sentinel"));
     assert!(!notification_json.contains("private-receiver-sentinel"));
 
-    let report = stack
-        .store_call("report.delta", json!({"after":0,"limit":200}))
+    let report = client
+        .call_tool("report_delta", json!({"after": 0, "limit": 50}))
         .await
         .unwrap();
-    let facts = report["items"]
+    let facts = report["structuredContent"]["items"]
         .as_array()
         .unwrap()
         .iter()
