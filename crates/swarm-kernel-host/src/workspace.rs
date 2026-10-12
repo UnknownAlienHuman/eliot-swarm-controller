@@ -7,6 +7,7 @@ use crate::{
     error::{Error, Result},
     forge::{self, ForgeConfig, ForgeProject},
     model,
+    store::ForgeGitRun,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -444,7 +445,8 @@ impl PreparedWorkspace {
 /// Git metadata path admission failure is rejected before any mutating Git
 /// command; all other Git or filesystem failures after reservation remain an
 /// unknown external effect and must reconcile this exact reservation.
-pub fn prepare_lease(
+pub(crate) fn prepare_lease(
+    git: &mut ForgeGitRun,
     forge_config: &ForgeConfig,
     forge_project: &ForgeProject,
     registration: &WorkspaceRegistration,
@@ -454,12 +456,12 @@ pub fn prepare_lease(
     plan.validate()?;
     verify_registration_binding(registration, plan.project_id.as_str())?;
     verify_reservation_binding(registration, reservation, plan)?;
-    verify_trusted_repository(forge_config, forge_project, registration)?;
+    verify_trusted_repository(git, forge_config, forge_project, registration)?;
 
-    let source_head_before = current_head(forge_config, forge_project)?;
-    require_clean_checkout(forge_config, forge_project)?;
+    let source_head_before = current_head(git, forge_config, forge_project)?;
+    require_clean_checkout(git, forge_config, forge_project)?;
     let baseline_commit = if let Some(expected) = &plan.expected_baseline_commit {
-        resolve_exact_commit(forge_config, forge_project, expected)?
+        resolve_exact_commit(git, forge_config, forge_project, expected)?
     } else {
         source_head_before.clone()
     };
@@ -483,6 +485,7 @@ pub fn prepare_lease(
         .strip_prefix("refs/heads/")
         .ok_or_else(|| Error::new("WORKSPACE_BRANCH", "invalid reserved branch ref"))?;
     git_text(
+        git,
         forge_config,
         forge_project,
         &[
@@ -495,6 +498,7 @@ pub fn prepare_lease(
     let workspace_git_path = git_path_argument(workspace_path)?;
     admit_git_metadata_paths(&registration.repository_path, &workspace_git_path)?;
     git_text(
+        git,
         forge_config,
         forge_project,
         &[
@@ -515,9 +519,9 @@ pub fn prepare_lease(
     reject_reparse_components(workspace_path)?;
     validate_directory_security(workspace_path)?;
 
-    verify_trusted_repository(forge_config, forge_project, registration)?;
-    let source_head_after = current_head(forge_config, forge_project)?;
-    require_clean_checkout(forge_config, forge_project)?;
+    verify_trusted_repository(git, forge_config, forge_project, registration)?;
+    let source_head_after = current_head(git, forge_config, forge_project)?;
+    require_clean_checkout(git, forge_config, forge_project)?;
     if source_head_after != source_head_before {
         return Err(Error::new(
             "WORKSPACE_BASELINE_CHANGED",
@@ -525,6 +529,7 @@ pub fn prepare_lease(
         ));
     }
     verify_worktree(
+        git,
         forge_config,
         forge_project,
         registration,
@@ -568,7 +573,8 @@ pub fn prepare_lease(
 
 /// Read-only restart reconciliation for one previously reserved path/ref.
 /// It never creates, repairs, deletes, or substitutes a workspace.
-pub fn reconcile_workspace(
+pub(crate) fn reconcile_workspace(
+    git: &mut ForgeGitRun,
     forge_config: &ForgeConfig,
     forge_project: &ForgeProject,
     registration: &WorkspaceRegistration,
@@ -578,10 +584,11 @@ pub fn reconcile_workspace(
     plan.validate()?;
     verify_registration_binding(registration, plan.project_id.as_str())?;
     verify_reservation_binding(registration, reservation, plan)?;
-    verify_trusted_repository(forge_config, forge_project, registration)?;
-    let source_head_before = current_head(forge_config, forge_project)?;
-    require_clean_checkout(forge_config, forge_project)?;
+    verify_trusted_repository(git, forge_config, forge_project, registration)?;
+    let source_head_before = current_head(git, forge_config, forge_project)?;
+    require_clean_checkout(git, forge_config, forge_project)?;
     let baseline_commit = verify_worktree(
+        git,
         forge_config,
         forge_project,
         registration,
@@ -595,8 +602,8 @@ pub fn reconcile_workspace(
             "trusted checkout no longer matches the interrupted worktree baseline",
         ));
     }
-    require_clean_checkout(forge_config, forge_project)?;
-    let source_head_after = current_head(forge_config, forge_project)?;
+    require_clean_checkout(git, forge_config, forge_project)?;
+    let source_head_after = current_head(git, forge_config, forge_project)?;
     if source_head_before != source_head_after {
         return Err(Error::new(
             "WORKSPACE_BASELINE_CHANGED",
@@ -795,6 +802,7 @@ fn verify_reservation_binding(
 }
 
 fn verify_trusted_repository(
+    git: &mut ForgeGitRun,
     forge_config: &ForgeConfig,
     forge_project: &ForgeProject,
     registration: &WorkspaceRegistration,
@@ -812,6 +820,7 @@ fn verify_trusted_repository(
     reject_reparse_components(&registration.repository_path)?;
     validate_directory_security(&registration.repository_path)?;
     let top = git_text(
+        git,
         forge_config,
         forge_project,
         &["rev-parse".into(), "--show-toplevel".into()],
@@ -829,6 +838,7 @@ fn verify_trusted_repository(
         ));
     }
     let remote = git_text(
+        git,
         forge_config,
         forge_project,
         &[
@@ -846,8 +856,13 @@ fn verify_trusted_repository(
     Ok(())
 }
 
-fn current_head(forge_config: &ForgeConfig, project: &ForgeProject) -> Result<String> {
+fn current_head(
+    git: &mut ForgeGitRun,
+    forge_config: &ForgeConfig,
+    project: &ForgeProject,
+) -> Result<String> {
     let head = git_text(
+        git,
         forge_config,
         project,
         &[
@@ -868,6 +883,7 @@ fn current_head(forge_config: &ForgeConfig, project: &ForgeProject) -> Result<St
 }
 
 fn resolve_exact_commit(
+    git: &mut ForgeGitRun,
     forge_config: &ForgeConfig,
     project: &ForgeProject,
     expected: &str,
@@ -879,6 +895,7 @@ fn resolve_exact_commit(
     }
     let expression = format!("{expected}^{{commit}}");
     let resolved = git_text(
+        git,
         forge_config,
         project,
         &[
@@ -898,8 +915,13 @@ fn resolve_exact_commit(
     Ok(resolved.to_ascii_lowercase())
 }
 
-fn require_clean_checkout(forge_config: &ForgeConfig, project: &ForgeProject) -> Result<()> {
+fn require_clean_checkout(
+    git: &mut ForgeGitRun,
+    forge_config: &ForgeConfig,
+    project: &ForgeProject,
+) -> Result<()> {
     let status = git_text(
+        git,
         forge_config,
         project,
         &[
@@ -919,6 +941,7 @@ fn require_clean_checkout(forge_config: &ForgeConfig, project: &ForgeProject) ->
 }
 
 fn verify_worktree(
+    git: &mut ForgeGitRun,
     forge_config: &ForgeConfig,
     forge_project: &ForgeProject,
     registration: &WorkspaceRegistration,
@@ -945,6 +968,7 @@ fn verify_worktree(
         result
     };
     let head = git_text(
+        git,
         forge_config,
         forge_project,
         &args(&["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]),
@@ -959,6 +983,7 @@ fn verify_worktree(
         ));
     }
     let branch = git_text(
+        git,
         forge_config,
         forge_project,
         &args(&["symbolic-ref", "--quiet", "HEAD"]),
@@ -970,6 +995,7 @@ fn verify_worktree(
         ));
     }
     let status = git_text(
+        git,
         forge_config,
         forge_project,
         &args(&[
@@ -986,6 +1012,7 @@ fn verify_worktree(
         ));
     }
     let worktrees = git_text(
+        git,
         forge_config,
         forge_project,
         &["worktree".into(), "list".into(), "--porcelain".into()],
@@ -1032,8 +1059,13 @@ fn ensure_path_absent(path: &Path) -> Result<()> {
     }
 }
 
-fn git_text(config: &ForgeConfig, project: &ForgeProject, args: &[String]) -> Result<String> {
-    let output = forge::run_git(config, project, args)?;
+fn git_text(
+    git: &mut ForgeGitRun,
+    config: &ForgeConfig,
+    project: &ForgeProject,
+    args: &[String],
+) -> Result<String> {
+    let output = git.run(config, project, args)?;
     if output.timed_out || output.stdout_truncated || !output.status.success() {
         return Err(Error::new(
             "WORKSPACE_GIT_UNKNOWN",
@@ -1292,8 +1324,8 @@ fn reject_reparse_components(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn disabled_forge_registration_passes_trusted_repository_readback() {
+    #[tokio::test]
+    async fn disabled_forge_registration_passes_trusted_repository_readback() {
         let root = std::env::temp_dir().join(format!("swarm-wr-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).expect("fresh test directory");
         struct Cleanup(PathBuf);
@@ -1387,8 +1419,11 @@ mod tests {
             fs::canonicalize(&repository).expect("canonical repository")
         );
         verify_registration_binding(&registration, "fixture").expect("exact registration digest");
-        verify_trusted_repository(&forge, &project, &registration)
-            .expect("actual trusted Git root and remote readback");
+        crate::store::fixture_with_forge_git(|git| {
+            verify_trusted_repository(git, &forge, &project, &registration)
+        })
+        .await
+        .expect("actual trusted Git root and remote readback");
         let mut damaged = registration;
         damaged.registration_digest = "damaged".into();
         assert_eq!(

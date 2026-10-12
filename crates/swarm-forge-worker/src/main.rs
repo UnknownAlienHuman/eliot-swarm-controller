@@ -290,11 +290,7 @@ fn run_forge_plan(paths: &JobPaths, plan_bytes: &[u8]) -> Result<()> {
     validate_plan(&plan)?;
 
     let owner = Group::enter_module(&plan.owner_token)?;
-    let owner_record = json!({
-        "version": 1,
-        "token": plan.owner_token,
-        "process": owner.identity,
-    });
+    let owner_record = worker_owner_record(&owner, &plan.owner_token)?;
     write_private_new(&paths.owner, &serde_json::to_vec(&owner_record)?)?;
 
     let authorization = match wait_for_authorization(&paths.authorization)? {
@@ -380,11 +376,7 @@ fn run_github_plan(paths: &JobPaths, plan_bytes: &[u8]) -> Result<()> {
     validate_job_paths(paths)?;
     validate_github_plan(&plan)?;
     let owner = Group::enter_module(&plan.owner_token)?;
-    let owner_record = json!({
-        "version":1,
-        "token":plan.owner_token,
-        "process":owner.identity,
-    });
+    let owner_record = worker_owner_record(&owner, &plan.owner_token)?;
     write_private_new(&paths.owner, &serde_json::to_vec(&owner_record)?)?;
     let authorization = match wait_for_authorization(&paths.authorization)? {
         Some(bytes) => Some(
@@ -598,7 +590,10 @@ fn run_github_patch_command(plan: &GitHubDescriptionPlan, owner: &Group) -> Resu
             .and_then(|path| path.canonicalize().ok());
         module_child_belongs_to_owner(&owner_record, &identity).unwrap_or(false)
             && image_path == expected_image
-            && identity.get("image_sha256").and_then(Value::as_str)
+            && identity
+                .get("image_sha256")
+                .and_then(Value::as_str)
+                .and_then(|digest| digest.strip_prefix("sha256:"))
                 == Some(plan.gh_executable_sha256.as_str())
     });
     let cap = plan.max_output_bytes;
@@ -1759,6 +1754,14 @@ fn is_truthy(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "true" | "yes" | "on" | "1"
     )
+}
+
+fn worker_owner_record(owner: &Group, token: &str) -> Result<Value> {
+    let image = process_image_identity(std::process::id())?;
+    let mut process = owner.identity.clone();
+    process["image_path"] = image["image_path"].clone();
+    process["image_sha256"] = image["image_sha256"].clone();
+    Ok(json!({"version":1,"token":token,"process":process}))
 }
 
 fn digest(bytes: &[u8]) -> String {

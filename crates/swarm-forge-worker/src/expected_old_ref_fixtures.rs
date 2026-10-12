@@ -14,6 +14,27 @@ use std::{
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn native_owner_receipt_retains_actual_image_for_restart_readback() {
+    let token = "c22161b1-4cab-4dc9-b3bc-18a91c075ae4";
+    let owner = super::Group::enter_module(token).unwrap();
+    let encoded = serde_json::to_vec(&super::worker_owner_record(&owner, token).unwrap()).unwrap();
+    let restored: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let executable = env::current_exe().unwrap().canonicalize().unwrap();
+    let expected_digest = format!("sha256:{}", super::digest(&fs::read(&executable).unwrap()));
+    assert_eq!(restored["version"], 1);
+    assert_eq!(restored["token"], token);
+    assert_eq!(restored["process"]["pid"], std::process::id());
+    assert_eq!(restored["process"]["purpose"], "module");
+    assert_eq!(
+        Path::new(restored["process"]["image_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        executable
+    );
+    assert_eq!(restored["process"]["image_sha256"], expected_digest);
+}
+
+#[test]
 fn lease_rejection_requires_exact_complete_target_porcelain() {
     let rejected = b"To remote\n!\tdeadbeef:refs/heads/main\t[rejected] (stale info)\nDone\n";
     let mut capture = Capture {

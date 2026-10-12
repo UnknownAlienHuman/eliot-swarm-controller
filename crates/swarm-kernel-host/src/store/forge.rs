@@ -9,7 +9,8 @@ use crate::{
     config::Config,
     error::{Error, Result},
     forge::{
-        ForgeConfig, ForgeProject, PublicationIntent, PublishRefRequest, RefReadback, run_git,
+        ForgeConfig, ForgeProject, GitCleanupOwner, GitOutput, GitRunResult, PublicationIntent,
+        PublishRefRequest, RefReadback, run_git,
     },
     model::{self, Principal, Role},
 };
@@ -50,10 +51,8 @@ struct ForgeTargetLane {
     /// `OwnedMutexGuard` keeps same-target operations serialized even while
     /// their short Store transactions yield to the runtime.
     serial: Arc<tokio::sync::Mutex<()>>,
-    /// Captured by each blocking closure.  If its supervisor future is
-    /// dropped while the closure is draining, this permit remains held until
-    /// the closure exits, so the next same-target operation cannot read back
-    /// or start a second effect prematurely.
+    /// Retained by Store through blocking-closure completion and any unresolved
+    /// Git Child/pipe cleanup, including cancellation of the receiving future.
     process: Arc<tokio::sync::Semaphore>,
 }
 
@@ -81,6 +80,271 @@ fn target_lane(key: &ForgeTargetKey) -> Arc<ForgeTargetLane> {
     });
     lanes.insert(key.clone(), Arc::downgrade(&lane));
     lane
+}
+
+/// Physical ownership for Git started by Forge/workspace blocking closures.
+/// As in CheckChildCustody, only the existing Store lifecycle polls cleanup;
+/// the entry also pins the weak coordinator lane and its process permit.
+#[derive(Clone, Default)]
+pub(super) struct ForgeGitCustody {
+    state: Arc<Mutex<ForgeGitCustodyState>>,
+}
+
+#[derive(Default)]
+struct ForgeGitCustodyState {
+    closed: bool,
+    closures: Vec<Arc<Mutex<ForgeGitClosure>>>,
+    native_workers: Vec<Arc<Mutex<NativeWorkerCustody>>>,
+}
+
+struct ForgeGitClosure {
+    active: bool,
+    lane: Arc<ForgeTargetLane>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    cleanup: Option<GitCleanupOwner>,
+}
+
+/// A Store-issued handoff used only within one owned blocking closure. Pure
+/// workspace helpers borrow it; they cannot manufacture a process owner.
+pub(crate) struct ForgeGitRun {
+    closure: Arc<Mutex<ForgeGitClosure>>,
+}
+
+impl ForgeGitCustody {
+    fn begin(
+        &self,
+        lane: Arc<ForgeTargetLane>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<ForgeGitRun> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(Error::new(
+                "STORE_CLOSED",
+                "Git custody admission is closed",
+            ));
+        }
+        let closure = Arc::new(Mutex::new(ForgeGitClosure {
+            active: true,
+            lane,
+            _permit: permit,
+            cleanup: None,
+        }));
+        state.closures.push(Arc::clone(&closure));
+        Ok(ForgeGitRun { closure })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+    }
+
+    fn pending_for_lane(&self, lane: &Arc<ForgeTargetLane>) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closures.iter().any(|entry| {
+            let entry = entry.lock().unwrap_or_else(|error| error.into_inner());
+            Arc::ptr_eq(&entry.lane, lane)
+                && entry
+                    .cleanup
+                    .as_ref()
+                    .is_some_and(GitCleanupOwner::is_pending)
+        }) || state.native_workers.iter().any(|entry| {
+            let entry = entry.lock().unwrap_or_else(|error| error.into_inner());
+            entry
+                .lane
+                .as_ref()
+                .is_some_and(|owned| Arc::ptr_eq(owned, lane))
+                && !entry.active
+                && entry.is_pending()
+        })
+    }
+
+    fn pending_native_artifact_capacity(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.native_workers.iter().any(|entry| {
+            let entry = entry.lock().unwrap_or_else(|error| error.into_inner());
+            entry.lane.is_none() && !entry.active && entry.is_pending()
+        })
+    }
+
+    /// Poll each retained child/capture once. An active closure is retained even
+    /// before it has handed off a Child, and poison recovery keeps exact owners.
+    pub(super) fn poll(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closures.retain(|entry| {
+            let mut entry = entry.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(owner) = entry.cleanup.as_mut() {
+                owner.poll();
+                if !owner.is_pending() {
+                    entry.cleanup = None;
+                }
+            }
+            entry.active || entry.cleanup.is_some()
+        });
+        state.native_workers.retain(|entry| {
+            let mut entry = entry.lock().unwrap_or_else(|error| error.into_inner());
+            if !entry.active {
+                entry.poll();
+            }
+            entry.active || entry.is_pending()
+        });
+        !state.closures.is_empty() || !state.native_workers.is_empty()
+    }
+
+    fn spawn_native(
+        &self,
+        command: &mut TokioCommand,
+        job: NativeWorkerJob,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        lane: Option<Arc<ForgeTargetLane>>,
+    ) -> Result<NativeWorkerRun> {
+        if !cfg!(any(windows, target_os = "linux")) {
+            return Err(Error::new(
+                "FORGE_GIT_PLATFORM_UNSUPPORTED",
+                "exact native worker custody is supported only on Windows and Linux",
+            ));
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(Error::new(
+                "STORE_CLOSED",
+                "Git custody admission is closed",
+            ));
+        }
+        apply_forge_worker_environment(command.as_std_mut());
+        let child = command.spawn().map_err(|_| {
+            Error::new(
+                "FORGE_WORKER_START_FAILED",
+                "the installed native worker could not be started",
+            )
+        })?;
+        // No await or fallible identity/receipt work occurs before registration.
+        let pid = child.id().unwrap_or(0);
+        let custody = Arc::new(Mutex::new(NativeWorkerCustody {
+            active: true,
+            job: job.clone(),
+            child,
+            pid,
+            lane,
+            _process_permit: permit,
+            owner_record: None,
+            status: None,
+            family_departed: false,
+            reported_tree_unconfirmed: false,
+        }));
+        state.native_workers.push(Arc::clone(&custody));
+        Ok(NativeWorkerRun {
+            job,
+            owner_record: Value::Null,
+            custody,
+        })
+    }
+
+    pub(super) fn close_admission(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed = true;
+    }
+
+    /// Foreground Git has a deadline; physical custody has no expiry. Keep the
+    /// Store alive until active closures and exact Child/group/pipe owners drain.
+    pub(super) async fn drain(&self) {
+        self.close_admission();
+        while self.poll() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+fn apply_forge_worker_environment(command: &mut std::process::Command) {
+    swarm_process::module_owner::apply_launch_environment(command);
+    // The shared Windows baseline already preserves OS/home discovery. Linux
+    // Git helpers and native keyrings need these same-user discovery paths and
+    // session endpoints; provider/API/token variables are never copied.
+    #[cfg(target_os = "linux")]
+    for name in [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSH_AUTH_SOCK",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    // Preserve the operator's existing gh configuration location, without
+    // passing ambient GH_TOKEN/GITHUB_TOKEN or changing stored authentication.
+    if let Some(value) = std::env::var_os("GH_CONFIG_DIR") {
+        command.env("GH_CONFIG_DIR", value);
+    }
+    // Executable paths and native ownership context remain in the admitted
+    // plan and argv, not in inherited ELIOT_/SWARM_ environment variables.
+}
+
+impl ForgeGitRun {
+    pub(crate) fn run(
+        &mut self,
+        config: &ForgeConfig,
+        project: &ForgeProject,
+        args: &[String],
+    ) -> Result<GitOutput> {
+        if self
+            .closure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cleanup
+            .is_some()
+        {
+            return Err(Error::new(
+                "FORGE_GIT_TREE_TERMINATION",
+                "the owned Git closure still has unresolved cleanup",
+            ));
+        }
+        self.retain_result(run_git(config, project, args))
+    }
+
+    fn retain_result(&mut self, (result, owner): GitRunResult) -> Result<GitOutput> {
+        // No await or fallible persistence separates the returned Child/pipes
+        // from their Store entry. Receiver cancellation cannot drop this owner.
+        self.closure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cleanup = owner;
+        result
+    }
+}
+
+impl Drop for ForgeGitRun {
+    fn drop(&mut self) {
+        // Covers success, Err, cancellation before spawn_blocking and unwind.
+        // The Store entry, not this scope, owns pending Child/captures/permit.
+        self.closure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active = false;
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn fixture_with_forge_git<T>(f: impl FnOnce(&mut ForgeGitRun) -> T) -> T {
+    let custody = ForgeGitCustody::default();
+    let lane = target_lane(&ForgeTargetKey {
+        canonical_repository: "github.com/fixture/git-custody".into(),
+        target_ref: format!("refs/heads/{}", model::new_id()),
+    });
+    let permit = lane.process.clone().try_acquire_owned().unwrap();
+    let mut git = custody.begin(lane, permit).unwrap();
+    let result = f(&mut git);
+    drop(git);
+    custody.drain().await;
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,9 +461,72 @@ impl ForgeExecutionPreparation {
 
 struct NativeWorkerRun {
     job: NativeWorkerJob,
-    child: TokioChild,
     owner_record: Value,
+    custody: Arc<Mutex<NativeWorkerCustody>>,
+}
+
+/// The installed worker uses null stdout/stderr; its exact Child, validated
+/// family receipt and permit still need a Store owner on startup/wait errors.
+struct NativeWorkerCustody {
+    active: bool,
+    job: NativeWorkerJob,
+    child: TokioChild,
+    pid: u32,
+    lane: Option<Arc<ForgeTargetLane>>,
     _process_permit: tokio::sync::OwnedSemaphorePermit,
+    owner_record: Option<Value>,
+    status: Option<std::process::ExitStatus>,
+    family_departed: bool,
+    reported_tree_unconfirmed: bool,
+}
+
+impl NativeWorkerCustody {
+    fn observe_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        if self.status.is_none() {
+            self.status = self.child.try_wait().map_err(|_| {
+                Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "native worker exit status could not be confirmed",
+                )
+            })?;
+        }
+        Ok(self.status)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.status.is_none() || !self.family_departed || self.reported_tree_unconfirmed
+    }
+
+    fn poll(&mut self) {
+        if self.owner_record.is_none() {
+            // Retry the same receipt against the same retained PID and job.
+            // A missing/invalid receipt never becomes cleanup authority.
+            if let Ok(owner) = read_worker_json(&self.job.owner_path, 65_536)
+                && validate_worker_owner(&self.job, self.pid, &owner).is_ok()
+            {
+                self.owner_record = Some(owner);
+            }
+        }
+        let _ = self.observe_exit();
+        if !self.family_departed
+            && let Some(owner) = self.owner_record.as_ref()
+            && matches!(
+                swarm_process::departed_empty(&owner["process"], &self.job.owner_token),
+                Ok(true)
+            )
+        {
+            self.family_departed = true;
+        }
+    }
+}
+
+impl Drop for NativeWorkerRun {
+    fn drop(&mut self) {
+        self.custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active = false;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1800,11 +2127,27 @@ fn validate_worker_owner(job: &NativeWorkerJob, pid: u32, owner: &Value) -> Resu
         .ok_or_else(|| Error::new("FORGE_WORKER_OWNER_INVALID", "worker image is absent"))?
         .canonicalize()?;
     if image_path != job.executable
-        || image.get("image_sha256").and_then(Value::as_str) != Some(job.executable_sha256.as_str())
+        || image
+            .get("image_sha256")
+            .and_then(Value::as_str)
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            != Some(job.executable_sha256.as_str())
     {
         return Err(Error::new(
             "FORGE_WORKER_OWNER_INVALID",
             "Forge worker image differs from the installed executable",
+        ));
+    }
+    // Persist only the same image claims that restart recovery will consume.
+    // A valid live process does not make an incomplete receipt authoritative.
+    if !owner["process"]["image_path"]
+        .as_str()
+        .is_some_and(|path| retained_path_matches(path, &image_path))
+        || owner["process"]["image_sha256"] != image["image_sha256"]
+    {
+        return Err(Error::new(
+            "FORGE_WORKER_OWNER_INVALID",
+            "Forge worker owner image claims differ from its live process",
         ));
     }
     #[cfg(windows)]
@@ -1854,14 +2197,17 @@ fn retained_path_matches(recorded: &str, retained: &Path) -> bool {
     }
 }
 
-async fn wait_worker_owner(child: &mut TokioChild, job: &NativeWorkerJob) -> Result<Value> {
+async fn wait_worker_owner(run: &NativeWorkerRun) -> Result<Value> {
+    let job = &run.job;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if job.owner_path.try_exists()? {
             let owner = read_worker_json(&job.owner_path, 65_536)?;
-            let pid = child
-                .id()
-                .ok_or_else(|| Error::new("FORGE_WORKER_OWNER_INVALID", "worker PID is absent"))?;
+            let pid = run
+                .custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pid;
             let expected = job.clone();
             let owner = tokio::task::spawn_blocking(move || -> Result<Value> {
                 validate_worker_owner(&expected, pid, &owner)?;
@@ -1876,7 +2222,13 @@ async fn wait_worker_owner(child: &mut TokioChild, job: &NativeWorkerJob) -> Res
             })??;
             return Ok(owner);
         }
-        if child.try_wait()?.is_some() {
+        if run
+            .custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observe_exit()?
+            .is_some()
+        {
             return Err(Error::new(
                 "FORGE_WORKER_START_FAILED",
                 "Forge worker exited before publishing its owner receipt",
@@ -1923,12 +2275,17 @@ fn write_worker_authorization(job: &NativeWorkerJob, authorized: bool) -> Result
 }
 
 async fn wait_worker_exit(
-    child: &mut TokioChild,
+    run: &NativeWorkerRun,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match child.try_wait() {
+        let status = run
+            .custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observe_exit();
+        match status {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1950,18 +2307,13 @@ async fn wait_worker_exit(
 }
 
 async fn wait_forge_worker(run: NativeWorkerRun, expected_authorized: bool) -> Result<Value> {
-    let NativeWorkerRun {
-        job,
-        mut child,
-        owner_record,
-        _process_permit,
-    } = run;
+    let job = &run.job;
     let status = wait_worker_exit(
-        &mut child,
+        &run,
         Duration::from_secs(job.timeout_seconds.saturating_add(60)),
     )
     .await?;
-    let owner_process = owner_record["process"].clone();
+    let owner_process = run.owner_record["process"].clone();
     let token = job.owner_token.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -1981,6 +2333,10 @@ async fn wait_forge_worker(run: NativeWorkerRun, expected_authorized: bool) -> R
             }
         };
         if departed {
+            run.custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .family_departed = true;
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2041,6 +2397,12 @@ async fn wait_forge_worker(run: NativeWorkerRun, expected_authorized: bool) -> R
     if result["process_tree_empty"] != true
         || result["process_tree_unconfirmed"].as_bool() != Some(false)
     {
+        // The worker can have exited while reporting unresolved inner Git
+        // custody. Its outer family receipt alone cannot clear that report.
+        run.custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .reported_tree_unconfirmed = true;
         return Err(Error::new(
             "FORGE_GIT_TREE_TERMINATION",
             "Forge worker reported unconfirmed native process departure",
@@ -2532,19 +2894,25 @@ fn require_success(output: &crate::forge::GitOutput, message: &'static str) -> R
     }
 }
 
-fn command_text(config: &ForgeConfig, project: &ForgeProject, args: &[&str]) -> Result<String> {
+fn command_text(
+    git: &mut ForgeGitRun,
+    config: &ForgeConfig,
+    project: &ForgeProject,
+    args: &[&str],
+) -> Result<String> {
     let owned: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
-    let output = run_git(config, project, &owned)?;
+    let output = git.run(config, project, &owned)?;
     require_success(&output, "configured Git identity check failed")?;
     stdout_text(&output)
 }
 
 fn validate_local_repository(
+    git: &mut ForgeGitRun,
     config: &ForgeConfig,
     project: &ForgeProject,
     intent: &PublicationIntent,
 ) -> Result<()> {
-    let top = command_text(config, project, &["rev-parse", "--show-toplevel"])?;
+    let top = command_text(git, config, project, &["rev-parse", "--show-toplevel"])?;
     let top = Path::new(top.trim()).canonicalize().map_err(|_| {
         Error::new(
             "FORGE_REPOSITORY",
@@ -2559,6 +2927,7 @@ fn validate_local_repository(
     }
     let commit_expr = format!("{}^{{commit}}", intent.commit);
     let commit = command_text(
+        git,
         config,
         project,
         &["rev-parse", "--verify", "--end-of-options", &commit_expr],
@@ -2571,6 +2940,7 @@ fn validate_local_repository(
     }
     let tree_expr = format!("{}^{{tree}}", intent.commit);
     let tree = command_text(
+        git,
         config,
         project,
         &["rev-parse", "--verify", "--end-of-options", &tree_expr],
@@ -2581,14 +2951,14 @@ fn validate_local_repository(
             "accepted commit tree differs from captured source identity",
         ));
     }
-    let output = run_git(
+    let output = git.run(
         config,
         project,
         &["check-ref-format".into(), intent.target_ref.clone()],
     )?;
     require_success(&output, "target ref failed native Git validation")?;
     if let Some(old) = intent.expected_old_ref.as_deref() {
-        let ancestor = run_git(
+        let ancestor = git.run(
             config,
             project,
             &[
@@ -2619,11 +2989,13 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn validate_remote(
+    git: &mut ForgeGitRun,
     config: &ForgeConfig,
     project: &ForgeProject,
     intent: &PublicationIntent,
 ) -> Result<String> {
     let urls = command_text(
+        git,
         config,
         project,
         &["remote", "get-url", "--push", "--all", &intent.remote_name],
@@ -2643,7 +3015,7 @@ fn validate_remote(
     }
     let push_url = urls[0].to_owned();
     let mirror_key = format!("remote.{}.mirror", intent.remote_name);
-    if config_lines(config, project, &mirror_key)?
+    if config_lines(git, config, project, &mirror_key)?
         .iter()
         .any(|value| {
             matches!(
@@ -2658,7 +3030,7 @@ fn validate_remote(
         ));
     }
     for key in ["push.pushOption", "core.sshCommand"] {
-        if !config_lines(config, project, key)?.is_empty() {
+        if !config_lines(git, config, project, key)?.is_empty() {
             return Err(Error::new(
                 "FORGE_REMOTE_UNSAFE",
                 "local push options or custom SSH command are not supported",
@@ -2670,7 +3042,7 @@ fn validate_remote(
         format!("remote.{}.uploadpack", intent.remote_name),
         format!("remote.{}.receivepack", intent.remote_name),
     ] {
-        if !config_lines(config, project, &key)?.is_empty() {
+        if !config_lines(git, config, project, &key)?.is_empty() {
             return Err(Error::new(
                 "FORGE_REMOTE_UNSAFE",
                 "configured remote helpers or custom server commands are not supported",
@@ -2680,9 +3052,14 @@ fn validate_remote(
     Ok(push_url)
 }
 
-fn config_lines(config: &ForgeConfig, project: &ForgeProject, key: &str) -> Result<Vec<String>> {
+fn config_lines(
+    git: &mut ForgeGitRun,
+    config: &ForgeConfig,
+    project: &ForgeProject,
+    key: &str,
+) -> Result<Vec<String>> {
     let args = ["config", "--get-all", key];
-    let output = run_git(config, project, &args.map(str::to_owned))?;
+    let output = git.run(config, project, &args.map(str::to_owned))?;
     if output.status.success() && !output.timed_out && !output.stdout_truncated {
         let text = stdout_text(&output)?;
         Ok(text.lines().map(str::to_owned).collect())
@@ -2698,6 +3075,7 @@ fn config_lines(config: &ForgeConfig, project: &ForgeProject, key: &str) -> Resu
 }
 
 fn remote_ref(
+    git: &mut ForgeGitRun,
     config: &ForgeConfig,
     project: &ForgeProject,
     intent: &PublicationIntent,
@@ -2709,7 +3087,7 @@ fn remote_ref(
             "readback endpoint does not identify the trusted canonical repository",
         ));
     }
-    remote_ref_at(config, project, intent, push_url)
+    remote_ref_at(git, config, project, intent, push_url)
 }
 
 /// Query an already selected endpoint. Production callers pass only the
@@ -2717,6 +3095,7 @@ fn remote_ref(
 /// construction separate also lets the local bare-repository test verify that
 /// a remote alias's fetch URL is never substituted for its push URL.
 fn remote_ref_at(
+    git: &mut ForgeGitRun,
     config: &ForgeConfig,
     project: &ForgeProject,
     intent: &PublicationIntent,
@@ -2729,7 +3108,7 @@ fn remote_ref_at(
         endpoint.to_owned(),
         intent.target_ref.clone(),
     ];
-    let output = run_git(config, project, &args)?;
+    let output = git.run(config, project, &args)?;
     require_success(&output, "exact remote ref readback failed")?;
     let text = stdout_text(&output)?;
     let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
@@ -2758,6 +3137,7 @@ fn remote_ref_at(
 }
 
 fn prepare_candidate(
+    git: &mut ForgeGitRun,
     files: &crate::artifacts::ArtifactFiles,
     config: &ForgeConfig,
     work: &ForgeWork,
@@ -2777,12 +3157,12 @@ fn prepare_candidate(
             "retained source manifest differs from publication intent",
         ));
     }
-    validate_local_repository(config, &work.project, &work.intent)
+    validate_local_repository(git, config, &work.project, &work.intent)
 }
 
-fn prepare_push(config: &ForgeConfig, work: &ForgeWork) -> Result<String> {
-    let push_url = validate_remote(config, &work.project, &work.intent)?;
-    let before = remote_ref(config, &work.project, &work.intent, &push_url)?;
+fn prepare_push(git: &mut ForgeGitRun, config: &ForgeConfig, work: &ForgeWork) -> Result<String> {
+    let push_url = validate_remote(git, config, &work.project, &work.intent)?;
+    let before = remote_ref(git, config, &work.project, &work.intent, &push_url)?;
     if !before.matches_expected(&work.intent) {
         return Err(Error::new(
             "FORGE_EXPECTED_REF_MISMATCH",
@@ -2792,7 +3172,7 @@ fn prepare_push(config: &ForgeConfig, work: &ForgeWork) -> Result<String> {
     // Fail closed if the configured endpoint changed while preflight was in
     // flight. The exact credential-free URL validated above is also carried
     // in memory to the push worker; it is never persisted in the Operation.
-    let current_push_url = validate_remote(config, &work.project, &work.intent)?;
+    let current_push_url = validate_remote(git, config, &work.project, &work.intent)?;
     if current_push_url != push_url {
         return Err(Error::new(
             "FORGE_REMOTE_CHANGED",
@@ -2999,6 +3379,365 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn forge_worker_environment_survives_nested_gh_without_ambient_values() {
+        let fixture_home = std::env::temp_dir();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "store::forge::tests::forge_worker_environment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ELIOT_FORGE_ENV_HOP", "host")
+            .env("ELIOT_FORGE_ENV_SENTINEL", "synthetic-unrelated-value")
+            .env("GH_TOKEN", "synthetic-token")
+            .env("GITHUB_TOKEN", "synthetic-token")
+            .env("UNRELATED_PROVIDER_API_KEY", "synthetic-token")
+            .env("GH_CONFIG_DIR", &fixture_home)
+            .env("ELIOT_FORGE_ENV_PROFILE", &fixture_home);
+        #[cfg(windows)]
+        command.env("USERPROFILE", &fixture_home);
+        #[cfg(target_os = "linux")]
+        command
+            .env("HOME", &fixture_home)
+            .env("XDG_RUNTIME_DIR", "/swarm-forge-env-fixture")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/swarm-forge-env-fixture/bus",
+            )
+            .env("SSH_AUTH_SOCK", "/swarm-forge-env-fixture/ssh-agent");
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FORGE_ENV_BOTH_HOPS_VERIFIED"));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "child entry point exercised by the Forge environment regression"]
+    fn forge_worker_environment_child() {
+        let Ok(hop) = std::env::var("ELIOT_FORGE_ENV_HOP") else {
+            return;
+        };
+        let expected_profile = std::env::var_os("ELIOT_FORGE_ENV_PROFILE").unwrap();
+        if hop != "host" {
+            for name in [
+                "ELIOT_FORGE_ENV_SENTINEL",
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "UNRELATED_PROVIDER_API_KEY",
+            ] {
+                assert!(std::env::var_os(name).is_none());
+            }
+            assert_eq!(
+                std::env::var_os("GH_CONFIG_DIR"),
+                Some(expected_profile.clone())
+            );
+            #[cfg(windows)]
+            assert_eq!(
+                std::env::var_os("USERPROFILE"),
+                Some(expected_profile.clone())
+            );
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(std::env::var_os("HOME"), Some(expected_profile.clone()));
+                assert_eq!(
+                    std::env::var_os("XDG_RUNTIME_DIR"),
+                    Some("/swarm-forge-env-fixture".into())
+                );
+                assert_eq!(
+                    std::env::var_os("DBUS_SESSION_BUS_ADDRESS"),
+                    Some("unix:path=/swarm-forge-env-fixture/bus".into())
+                );
+                assert_eq!(
+                    std::env::var_os("SSH_AUTH_SOCK"),
+                    Some("/swarm-forge-env-fixture/ssh-agent".into())
+                );
+            }
+        }
+        if hop == "gh" {
+            println!("FORGE_ENV_BOTH_HOPS_VERIFIED");
+            return;
+        }
+        assert!(matches!(hop.as_str(), "host" | "helper"));
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        if hop == "host" {
+            apply_forge_worker_environment(&mut child);
+        }
+        // The real nested gh command inherits its helper's bounded environment.
+        // These fixture-only markers are added after that production policy.
+        child
+            .args([
+                "--exact",
+                "store::forge::tests::forge_worker_environment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "ELIOT_FORGE_ENV_HOP",
+                if hop == "host" { "helper" } else { "gh" },
+            )
+            .env("ELIOT_FORGE_ENV_PROFILE", expected_profile);
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FORGE_ENV_BOTH_HOPS_VERIFIED"));
+        println!("FORGE_ENV_BOTH_HOPS_VERIFIED");
+    }
+
+    #[tokio::test]
+    async fn forge_git_closure_outlives_cancelled_receiver_and_shutdown_waits_for_it() {
+        let custody = ForgeGitCustody::default();
+        let key = ForgeTargetKey {
+            canonical_repository: "github.com/fixture/cancelled-closure".into(),
+            target_ref: format!("refs/heads/{}", model::new_id()),
+        };
+        let lane = target_lane(&key);
+        let process = Arc::clone(&lane.process);
+        let weak_lane = Arc::downgrade(&lane);
+        let permit = process.clone().try_acquire_owned().unwrap();
+        let git = custody.begin(Arc::clone(&lane), permit).unwrap();
+        drop(lane);
+        let (started, start_receiver) = tokio::sync::oneshot::channel();
+        let (finish, finish_receiver) = std::sync::mpsc::channel();
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            finish_receiver.recv().unwrap();
+            drop(git);
+            let _ = result.send(Err::<(), _>(Error::new("FORGE_FIXTURE", "closure failed")));
+        });
+        start_receiver.await.unwrap();
+        // The async result consumer is gone while the real blocking closure
+        // still owns its scope; keep the worker handle so the fixture joins it.
+        drop(receiver);
+        let pinned_lane = weak_lane.upgrade().expect("Store pins the weak lane");
+        let same_lane = Arc::ptr_eq(&pinned_lane, &target_lane(&key));
+        let occupied = process.available_permits() == 0;
+        let drain = custody.drain();
+        tokio::pin!(drain);
+        let drained_early = tokio::select! {
+            () = &mut drain => true,
+            () = tokio::time::sleep(Duration::from_millis(40)) => false,
+        };
+        finish.send(()).unwrap();
+        worker.await.unwrap();
+        drain.await;
+        assert!(same_lane && occupied && !drained_early);
+        assert_eq!(process.available_permits(), 1);
+        let next_permit = process.clone().try_acquire_owned().unwrap();
+        assert!(custody.begin(pinned_lane, next_permit).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forge_git_error_handoff_retains_child_pipes_lane_and_permit_until_retry() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let custody = ForgeGitCustody::default();
+        let key = ForgeTargetKey {
+            canonical_repository: "github.com/fixture/failed-observation".into(),
+            target_ref: format!("refs/heads/{}", model::new_id()),
+        };
+        let lane = target_lane(&key);
+        let process = Arc::clone(&lane.process);
+        let permit = process.clone().try_acquire_owned().unwrap();
+        let mut git = custody.begin(Arc::clone(&lane), permit).unwrap();
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let outcome = git.retain_result(crate::forge::fixture_git_observation_failure(child));
+        let entry = Arc::clone(&git.closure);
+        drop(git);
+        let pending = custody.poll();
+        let blocked = custody.pending_for_lane(&lane);
+        let occupied = process.available_permits() == 0;
+        let same_lane = Arc::ptr_eq(&lane, &target_lane(&key));
+        let same_child = {
+            let entry = entry.lock().unwrap();
+            entry.cleanup.as_ref().unwrap().fixture_child_id() == pid
+        };
+        let drain = custody.drain();
+        tokio::pin!(drain);
+        let drained_early = tokio::select! {
+            () = &mut drain => true,
+            () = tokio::time::sleep(Duration::from_millis(40)) => false,
+        };
+        {
+            let mut entry = entry.lock().unwrap();
+            entry.cleanup.as_mut().unwrap().fixture_resume_observation();
+        }
+        // Release the fixture's extra entry reference; only Store may retain
+        // the process permit after this point.
+        drop(entry);
+        drain.await;
+        assert_eq!(outcome.unwrap_err().code, "FORGE_GIT_TREE_TERMINATION");
+        assert!(pending && blocked && occupied && same_lane && same_child && !drained_early);
+        assert_eq!(process.available_permits(), 1);
+        assert!(!custody.poll());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn forge_owner_receipt_requires_exact_live_image_claims() {
+        let token = model::new_id();
+        let group = swarm_process::Group::enter_module(&token).unwrap();
+        let pid = std::process::id();
+        let image = swarm_process::process_image_identity(pid).unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let directory = std::env::temp_dir().join(model::new_id());
+        let job = NativeWorkerJob {
+            kind: "forge",
+            phase_name: "fixture",
+            job_id: model::new_id(),
+            operation_id: model::new_id(),
+            owner_token: token.clone(),
+            plan_sha256: "a".repeat(64),
+            plan_path: directory.join("plan.json"),
+            owner_path: directory.join("owner.json"),
+            authorization_path: directory.join("authorization.json"),
+            result_path: directory.join("result.json"),
+            executable_sha256: hash_bounded_file(
+                &executable,
+                fs::metadata(&executable).unwrap().len(),
+            )
+            .unwrap(),
+            executable,
+            directory,
+            timeout_seconds: 1,
+        };
+        let mut process = group.identity.clone();
+        process["image_path"] = image["image_path"].clone();
+        process["image_sha256"] = image["image_sha256"].clone();
+        let owner = json!({"version":1,"token":token,"process":process});
+        validate_worker_owner(&job, pid, &owner).unwrap();
+
+        for field in ["image_path", "image_sha256"] {
+            let mut missing = owner.clone();
+            missing["process"].as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                validate_worker_owner(&job, pid, &missing).unwrap_err().code,
+                "FORGE_WORKER_OWNER_INVALID",
+                "missing {field} must not authorize publication"
+            );
+        }
+        for (field, claim) in [
+            (
+                "image_path",
+                json!(job.executable.with_file_name("other-worker")),
+            ),
+            ("image_path", json!("relative-worker")),
+            ("image_sha256", json!(job.executable_sha256)),
+            ("image_sha256", json!(format!("sha256:{}", "0".repeat(64)))),
+        ] {
+            let mut changed = owner.clone();
+            changed["process"][field] = claim;
+            assert_eq!(
+                validate_worker_owner(&job, pid, &changed).unwrap_err().code,
+                "FORGE_WORKER_OWNER_INVALID",
+                "changed {field} must not authorize publication"
+            );
+        }
+        // Receipt serialization must preserve the exact restart image claims.
+        let restored: Value = serde_json::from_slice(&serde_json::to_vec(&owner).unwrap()).unwrap();
+        validate_worker_owner(&job, pid, &restored).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forge_native_startup_cancellation_retains_child_and_permit_until_exact_departure() {
+        use std::os::unix::process::CommandExt;
+
+        let directory = std::env::temp_dir().join(format!("swarm-forge-owner-{}", model::new_id()));
+        fs::create_dir(&directory).unwrap();
+        crate::platform::private_permissions(&directory, true).unwrap();
+        let executable = PathBuf::from("/bin/sleep").canonicalize().unwrap();
+        let job = NativeWorkerJob {
+            kind: "forge",
+            phase_name: "fixture",
+            job_id: model::new_id(),
+            operation_id: model::new_id(),
+            owner_token: model::new_id(),
+            plan_sha256: "a".repeat(64),
+            plan_path: directory.join("plan.json"),
+            owner_path: directory.join("owner.json"),
+            authorization_path: directory.join("authorization.json"),
+            result_path: directory.join("result.json"),
+            executable_sha256: hash_bounded_file(&executable, 128 * 1024 * 1024).unwrap(),
+            executable: executable.clone(),
+            directory: directory.clone(),
+            timeout_seconds: 1,
+        };
+        let custody = ForgeGitCustody::default();
+        let lane = target_lane(&ForgeTargetKey {
+            canonical_repository: "github.com/fixture/native-cancel".into(),
+            target_ref: format!("refs/heads/{}", model::new_id()),
+        });
+        let process = Arc::clone(&lane.process);
+        let permit = process.clone().try_acquire_owned().unwrap();
+        let mut command = TokioCommand::new(&executable);
+        command.arg("30").kill_on_drop(false);
+        command.as_std_mut().process_group(0);
+        let run = custody
+            .spawn_native(&mut command, job.clone(), permit, Some(Arc::clone(&lane)))
+            .unwrap();
+        let pid = run.custody.lock().unwrap().pid;
+        let birth = swarm_process::spawned_identity(pid).unwrap();
+        let image = swarm_process::process_image_identity(pid).unwrap();
+        let entry = Arc::clone(&run.custody);
+        // Cancel before the owner-receipt await completes. No receipt yet means
+        // no inferred family authority, even though the Child is still retained.
+        drop(run);
+        let pending_without_receipt = custody.poll() && custody.pending_for_lane(&lane);
+        let occupied_without_receipt = process.available_permits() == 0;
+        let owner = json!({
+            "version":1,
+            "token":job.owner_token,
+            "process":{
+                "pid":pid,
+                "pgid":pid,
+                "scope":"linux_process_group",
+                "purpose":"module",
+                "disposition_source":"proc_group_members",
+                "start_ticks":birth["start_ticks"],
+                "boot_id":birth["boot_id"],
+                "image_path":image["image_path"],
+                "image_sha256":image["image_sha256"]
+            }
+        });
+        crate::platform::write_private_new(&job.owner_path, &serde_json::to_vec(&owner).unwrap())
+            .unwrap();
+        let owner_validation = validate_worker_owner(&job, pid, &owner);
+        custody.poll();
+        let validated_late_receipt = entry.lock().unwrap().owner_record.is_some();
+        entry.lock().unwrap().child.start_kill().unwrap();
+        drop(entry);
+        let drained = tokio::time::timeout(Duration::from_secs(5), custody.drain()).await;
+        assert!(
+            drained.is_ok(),
+            "native custody did not drain; owner validation: {owner_validation:?}"
+        );
+        assert!(pending_without_receipt && occupied_without_receipt && validated_late_receipt);
+        assert_eq!(process.available_permits(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn reconciliation_config() -> ForgeConfig {
         let mut config = ForgeConfig::default();
         config.enabled = true;
@@ -3059,8 +3798,8 @@ mod tests {
         checked_fixture_git(&mut command);
     }
 
-    #[test]
-    fn exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls() {
+    #[tokio::test]
+    async fn exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls() {
         let directory = std::env::temp_dir().join(format!("swarm-forge-split-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
         let git = fixture_git_executable();
@@ -3183,8 +3922,15 @@ mod tests {
         };
 
         assert_ne!(fetch_url, push_url);
-        let fetch_preflight = remote_ref_at(&config, &project, &intent, &fetch_url).unwrap();
-        let push_preflight = remote_ref_at(&config, &project, &intent, &push_url).unwrap();
+        let fetch_preflight = fixture_with_forge_git(|git| {
+            remote_ref_at(git, &config, &project, &intent, &fetch_url)
+        })
+        .await
+        .unwrap();
+        let push_preflight =
+            fixture_with_forge_git(|git| remote_ref_at(git, &config, &project, &intent, &push_url))
+                .await
+                .unwrap();
         assert_eq!(fetch_preflight, RefReadback::At(fetch_base.clone()));
         assert!(fetch_preflight.matches_expected(&intent));
         assert_eq!(push_preflight, RefReadback::At(push_base.clone()));
@@ -3201,8 +3947,15 @@ mod tests {
         // Restart readback must still query the push endpoint and remain
         // unknown, rather than confirming from the fetch-only mirror.
         fixture_fetch_ref(&git, &fetch_repository, &checkout, "refs/heads/candidate");
-        let fetch_readback = remote_ref_at(&config, &project, &intent, &fetch_url).unwrap();
-        let push_readback = remote_ref_at(&config, &project, &intent, &push_url).unwrap();
+        let fetch_readback = fixture_with_forge_git(|git| {
+            remote_ref_at(git, &config, &project, &intent, &fetch_url)
+        })
+        .await
+        .unwrap();
+        let push_readback =
+            fixture_with_forge_git(|git| remote_ref_at(git, &config, &project, &intent, &push_url))
+                .await
+                .unwrap();
         assert!(matches!(
             restart_readback_outcome(&intent, fetch_readback),
             ForgeOutcome::Applied { .. }
@@ -4057,8 +4810,10 @@ impl GitHubDescriptionWorkerRun {
 }
 
 async fn spawn_native_worker(
+    custody: &ForgeGitCustody,
     job: NativeWorkerJob,
     process_permit: tokio::sync::OwnedSemaphorePermit,
+    lane: Option<Arc<ForgeTargetLane>>,
 ) -> Result<NativeWorkerRun> {
     let mut command = TokioCommand::new(&job.executable);
     command
@@ -4080,29 +4835,24 @@ async fn spawn_native_worker(
         use std::os::windows::process::CommandExt;
         command.as_std_mut().creation_flags(0x08000000);
     }
-    let mut child = command.spawn().map_err(|_| {
-        Error::new(
-            "FORGE_WORKER_START_FAILED",
-            "the installed native worker could not be started",
-        )
-    })?;
-    let owner_record = match wait_worker_owner(&mut child, &job).await {
+    let mut run = custody.spawn_native(&mut command, job, process_permit, lane)?;
+    let owner_record = match wait_worker_owner(&run).await {
         Ok(owner) => owner,
         Err(error) => {
-            let _ = wait_worker_exit(
-                &mut child,
-                Duration::from_secs(job.timeout_seconds.saturating_add(60)),
+            let pending = Error::new(
+                "FORGE_GIT_TREE_TERMINATION",
+                "native worker startup identity is unconfirmed; Store retains its Child and permit",
             )
-            .await;
-            return Err(error);
+            .with_secondary_error(error);
+            return Err(pending);
         }
     };
-    Ok(NativeWorkerRun {
-        job,
-        child,
-        owner_record,
-        _process_permit: process_permit,
-    })
+    run.custody
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .owner_record = Some(owner_record.clone());
+    run.owner_record = owner_record;
+    Ok(run)
 }
 
 impl super::Store {
@@ -4114,7 +4864,7 @@ impl super::Store {
             return ForgeExecutionPreparation::Skipped;
         }
         match self
-            .file_io(move |_| Ok(ForgeExecutionPreparation::capture(&config.forge)))
+            .forge_artifact_io(move |_| Ok(ForgeExecutionPreparation::capture(&config.forge)))
             .await
         {
             Ok(preparation) => preparation,
@@ -4203,6 +4953,7 @@ impl super::Store {
     /// existing Tokio executor concurrently; each target remains serialized.
     /// Host shutdown must await this future rather than aborting it.
     pub(crate) async fn supervise_forge_once(&self) -> Result<()> {
+        self.forge_git_custody.poll();
         let page_size = self.config.storage.queue_capacity;
         let pending = self.run(move |db| pending(db, page_size)).await;
         let reconcile_result = match pending {
@@ -4225,16 +4976,11 @@ impl super::Store {
     ) -> Result<GitHubDescriptionWorkerRun> {
         let data_dir = self.data_dir.clone();
         let job = self
-            .file_io(move |_| create_github_description_worker_job(&data_dir, &request))
+            .forge_artifact_io(move |_| create_github_description_worker_job(&data_dir, &request))
             .await?;
-        let process_permit = self
-            .artifact_io
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::new("STORE_CLOSED", "native worker capacity is closed"))?;
+        let process_permit = self.acquire_forge_artifact_capacity().await?;
         Ok(GitHubDescriptionWorkerRun {
-            run: spawn_native_worker(job, process_permit).await?,
+            run: spawn_native_worker(&self.forge_git_custody, job, process_permit, None).await?,
         })
     }
 
@@ -4333,10 +5079,16 @@ impl super::Store {
         if pass == ForgePass::Reconcile {
             // Prove that a prior same-target blocking closure has drained
             // before changing `sending` to unknown or reading the ref.
-            let process_guard =
-                lane.process.clone().acquire_owned().await.map_err(|_| {
-                    Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped")
-                })?;
+            let process_guard = match self.acquire_forge_git_process(&lane).await {
+                Ok(permit) => permit,
+                Err(error) if error.code == "FORGE_GIT_TREE_TERMINATION" => {
+                    // Park this readback without changing its durable unknown
+                    // state. The next Store pass polls the exact retained owner;
+                    // cleanup uncertainty must not stop the whole supervisor.
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             drop(process_guard);
         }
         let id = operation.id;
@@ -4376,8 +5128,8 @@ impl super::Store {
             let config = self.config.forge.clone();
             let prep = work.clone();
             match self
-                .forge_file_io(&work.lane, move |files| {
-                    prepare_candidate(&files, &config, &prep)
+                .forge_file_io(&work.lane, move |files, git| {
+                    prepare_candidate(git, &files, &config, &prep)
                 })
                 .await
             {
@@ -4386,7 +5138,9 @@ impl super::Store {
                     let config = self.config.forge.clone();
                     let preflight_work = work.clone();
                     match self
-                        .forge_file_io(&work.lane, move |_| prepare_push(&config, &preflight_work))
+                        .forge_file_io(&work.lane, move |_, git| {
+                            prepare_push(git, &config, &preflight_work)
+                        })
                         .await
                     {
                         Err(error) => runner_error_outcome(error),
@@ -4407,13 +5161,10 @@ impl super::Store {
         work: &ForgeWork,
         push_endpoint: Option<&str>,
     ) -> ForgeOutcome {
-        let process_permit = match work.lane.process.clone().acquire_owned().await {
+        let process_permit = match self.acquire_forge_git_process(&work.lane).await {
             Ok(permit) => permit,
-            Err(_) => {
-                return runner_error_outcome(Error::new(
-                    "FORGE_PROCESS_CLOSED",
-                    "forge process slot stopped",
-                ));
+            Err(error) => {
+                return runner_error_outcome(error);
             }
         };
         let data_dir = self.data_dir.clone();
@@ -4421,7 +5172,7 @@ impl super::Store {
         let forge_config = self.config.forge.clone();
         let endpoint = push_endpoint.map(str::to_owned);
         let job = match self
-            .file_io(move |_| {
+            .forge_artifact_io(move |_| {
                 create_forge_worker_job(&data_dir, &job_work, &forge_config, endpoint.as_deref())
             })
             .await
@@ -4429,7 +5180,14 @@ impl super::Store {
             Ok(job) => job,
             Err(error) => return runner_error_outcome(error),
         };
-        let run = match spawn_native_worker(job.clone(), process_permit).await {
+        let run = match spawn_native_worker(
+            &self.forge_git_custody,
+            job.clone(),
+            process_permit,
+            Some(Arc::clone(&work.lane)),
+        )
+        .await
+        {
             Ok(run) => run,
             Err(error) => {
                 return runner_error_outcome(error);
@@ -4472,7 +5230,7 @@ impl super::Store {
         };
         let job_for_auth = job.clone();
         let authorization_result = self
-            .file_io(move |_| write_worker_authorization(&job_for_auth, authorized))
+            .forge_artifact_io(move |_| write_worker_authorization(&job_for_auth, authorized))
             .await;
         let result = wait_forge_worker(run, authorized).await;
         if let Some(outcome) = deferred_outcome {
@@ -4605,7 +5363,9 @@ impl super::Store {
             let owner_image_path = owner["process"]["image_path"].as_str();
             if !owner_image_path
                 .is_some_and(|path| retained_path_matches(path, &execution.worker_executable))
-                || owner["process"]["image_sha256"].as_str()
+                || owner["process"]["image_sha256"]
+                    .as_str()
+                    .and_then(|digest| digest.strip_prefix("sha256:"))
                     != Some(execution.worker_executable_sha256.as_str())
             {
                 return Err(Error::new(
@@ -4627,7 +5387,7 @@ impl super::Store {
         let data_dir = self.data_dir.clone();
         let owner_directory = job_id;
         let (plan_bytes, result_file) = self
-            .file_io(move |_| {
+            .forge_artifact_io(move |_| {
                 let data_dir = data_dir.canonicalize().map_err(|_| {
                     Error::new(
                         "FORGE_WORKER_EVIDENCE_UNAVAILABLE",
@@ -4876,27 +5636,126 @@ impl super::Store {
         .await
     }
 
-    async fn forge_file_io<T: Send + 'static>(
+    async fn acquire_forge_artifact_capacity(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        loop {
+            self.forge_git_custody.poll();
+            if self.forge_git_custody.is_closed() {
+                return Err(Error::new(
+                    "STORE_CLOSED",
+                    "Git custody admission is closed",
+                ));
+            }
+            if self.artifact_io.available_permits() == 0
+                && self.forge_git_custody.pending_native_artifact_capacity()
+            {
+                return Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "native worker custody still owns the exhausted artifact capacity",
+                ));
+            }
+            tokio::select! {
+                permit = self.artifact_io.clone().acquire_owned() => {
+                    let permit = permit.map_err(|_| {
+                        Error::new("ARTIFACT_IO_CLOSED", "artifact writer stopped")
+                    })?;
+                    if self.forge_git_custody.is_closed() {
+                        return Err(Error::new("STORE_CLOSED", "Git custody admission is closed"));
+                    }
+                    return Ok(permit);
+                }
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    /// The existing artifact-IO fence with custody polling in its waiting task.
+    /// This prevents a finished native worker's retained permit from stranding
+    /// Forge before its next lifecycle pass. It starts no cleanup task.
+    async fn forge_artifact_io<T: Send + 'static>(
         &self,
-        lane: &Arc<ForgeTargetLane>,
         f: impl FnOnce(crate::artifacts::ArtifactFiles) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let lane = Arc::clone(lane);
-        let permit = lane
-            .process
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped"))?;
-        self.file_io(move |files| {
-            // Keep the lane itself alive with the closure as well as the
-            // keyed process permit.  A cancelled supervisor cannot cause a
-            // later lookup to create a fresh semaphore while this closure is
-            // still draining.
-            let _lane = lane;
+        let permit = self.acquire_forge_artifact_capacity().await?;
+        let files = self.artifacts.clone();
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
             f(files)
         })
         .await
+        .map_err(|error| Error::new("ARTIFACT_IO_ERROR", error.to_string()))?
+    }
+
+    async fn forge_file_io<T: Send + 'static>(
+        &self,
+        lane: &Arc<ForgeTargetLane>,
+        f: impl FnOnce(crate::artifacts::ArtifactFiles, &mut ForgeGitRun) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let permit = self.acquire_forge_git_process(lane).await?;
+        let mut git = self.forge_git_custody.begin(Arc::clone(lane), permit)?;
+        self.forge_artifact_io(move |files| f(files, &mut git))
+            .await
+    }
+
+    async fn acquire_forge_git_process(
+        &self,
+        lane: &Arc<ForgeTargetLane>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        loop {
+            self.forge_git_custody.poll();
+            if self.forge_git_custody.is_closed() {
+                return Err(Error::new(
+                    "STORE_CLOSED",
+                    "Git custody admission is closed",
+                ));
+            }
+            if self.forge_git_custody.pending_for_lane(lane) {
+                return Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "the target lane retains unresolved Git Child or pipe custody",
+                ));
+            }
+            // A prior active closure may finish while this future is waiting.
+            // Poll in this same lifecycle task so its retained permit cannot
+            // deadlock the next supervisor pass or require a cleanup task.
+            tokio::select! {
+                permit = lane.process.clone().acquire_owned() => {
+                    let permit = permit.map_err(|_| {
+                        Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped")
+                    })?;
+                    if self.forge_git_custody.is_closed() {
+                        return Err(Error::new("STORE_CLOSED", "Git custody admission is closed"));
+                    }
+                    return Ok(permit);
+                }
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    pub(super) async fn workspace_git_io<T: Send + 'static>(
+        &self,
+        project_id: &str,
+        branch_ref: &str,
+        f: impl FnOnce(&mut ForgeGitRun) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let project = self.config.forge.projects.get(project_id).ok_or_else(|| {
+            Error::new(
+                "WORKSPACE_UNREGISTERED",
+                "launch project mapping is unavailable",
+            )
+        })?;
+        let lane = target_lane(&ForgeTargetKey {
+            canonical_repository: crate::forge::canonical_repository(
+                &project.canonical_repository,
+            )?,
+            target_ref: branch_ref.to_owned(),
+        });
+        let permit = self.acquire_forge_git_process(&lane).await?;
+        // Register before spawn_blocking; hand off inside the closure before
+        // its result is delivered to a possibly cancelled async receiver.
+        let mut git = self.forge_git_custody.begin(lane, permit)?;
+        tokio::task::spawn_blocking(move || f(&mut git))
+            .await
+            .map_err(|_| Error::new("WORKSPACE_WORKER_FAILED", "workspace worker did not return"))?
     }
 }

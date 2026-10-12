@@ -15,13 +15,18 @@ use std::{
     process::ExitStatus,
 };
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use std::{
-    io::Read,
-    process::{Command, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(all(target_os = "linux", test))]
+use std::io::Read;
+
+#[cfg(target_os = "linux")]
+use swarm_process::capture::{PipeRead, PollableRead};
 
 #[cfg(windows)]
 #[path = "forge/windows.rs"]
@@ -376,6 +381,7 @@ impl RefReadback {
 
 /// Minimal metadata from a native Git command. Raw stderr is never retained;
 /// stdout is held only up to the configured cap and is never persisted.
+#[derive(Debug)]
 pub(crate) struct GitOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
@@ -383,13 +389,13 @@ pub(crate) struct GitOutput {
     pub timed_out: bool,
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", test))]
 struct Captured {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", test))]
 fn drain_bounded<R: Read>(mut reader: R, cap: usize) -> std::io::Result<Captured> {
     let mut retained = Vec::with_capacity(cap.min(8192));
     let mut total = 0u64;
@@ -410,28 +416,35 @@ fn drain_bounded<R: Read>(mut reader: R, cap: usize) -> std::io::Result<Captured
     })
 }
 
+/// The caller must retain and poll any returned cleanup owner. A durable Store
+/// hold is evidence of uncertainty; it does not own the Child or its pipes.
+pub(crate) type GitRunResult = (Result<GitOutput>, Option<GitCleanupOwner>);
+
 /// Run one configured Git command with separate argv/cwd, no inherited Git
-/// repository overrides, bounded output and a finite wall-clock limit.
+/// repository overrides, bounded output and bounded foreground cleanup.
+#[must_use = "retain and poll any returned Git cleanup owner before releasing its repository"]
 pub(crate) fn run_git(
     config: &ForgeConfig,
     project: &ForgeProject,
     args: &[String],
-) -> Result<GitOutput> {
-    config.validate()?;
+) -> GitRunResult {
+    if let Err(error) = config.validate() {
+        return (Err(error), None);
+    }
     #[cfg(windows)]
     {
-        windows::run_git(config, project, args)
+        (windows::run_git(config, project, args), None)
     }
     #[cfg(not(windows))]
     run_git_nonwindows(config, project, args)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), target_os = "linux"))]
 fn run_git_nonwindows(
     config: &ForgeConfig,
     project: &ForgeProject,
     args: &[String],
-) -> Result<GitOutput> {
+) -> GitRunResult {
     let mut command = Command::new(&config.git_executable);
     command
         .args(["--no-optional-locks", "--no-replace-objects"])
@@ -472,80 +485,448 @@ fn run_git_nonwindows(
             command.env_remove(key);
         }
     }
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("FORGE_GIT_START", "configured Git process could not start"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("FORGE_GIT_IO", "Git stdout pipe unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::new("FORGE_GIT_IO", "Git stderr pipe unavailable"))?;
-    let out_cap = config.max_output_bytes;
-    let stdout_reader = thread::spawn(move || drain_bounded(stdout, out_cap));
-    let stderr_reader = thread::spawn(move || drain_bounded(stderr, 0));
-    let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                timed_out = true;
-                terminate_process_tree(&mut child);
-                break child.wait().map_err(|_| {
-                    Error::new("FORGE_GIT_WAIT", "Git process did not report termination")
-                })?;
-            }
-            Err(_) => {
-                terminate_process_tree(&mut child);
-                let _ = child.wait();
-                return Err(Error::new(
-                    "FORGE_GIT_WAIT",
-                    "Git process status could not be observed",
-                ));
-            }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return (
+                Err(Error::new(
+                    "FORGE_GIT_START",
+                    "configured Git process could not start",
+                )),
+                None,
+            );
         }
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stdout reader failed"))?
-        .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stdout could not be read"))?;
-    let _stderr = stderr_reader
-        .join()
-        .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stderr reader failed"))?
-        .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stderr could not be read"))?;
-    Ok(GitOutput {
-        status,
-        stdout: stdout.bytes,
-        stdout_truncated: stdout.truncated,
-        timed_out,
-    })
+    // Establish physical custody before any fallible identity or pipe setup.
+    run_git_foreground(
+        GitCleanupOwner::new(child, config.max_output_bytes),
+        Duration::from_secs(config.timeout_seconds),
+        GIT_PROCESS_GROUP_CLEANUP_TIMEOUT,
+    )
 }
 
-#[cfg(unix)]
-fn terminate_process_tree(child: &mut std::process::Child) {
-    let process_group = -(child.id() as i32);
-    // SAFETY: the child was launched in its own process group by
-    // CommandExt::process_group(0); negative pid addresses that group.
-    unsafe {
-        libc::kill(process_group, libc::SIGTERM);
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn run_git_nonwindows(
+    _config: &ForgeConfig,
+    _project: &ForgeProject,
+    _args: &[String],
+) -> GitRunResult {
+    (
+        Err(Error::new(
+            "FORGE_GIT_PLATFORM_UNSUPPORTED",
+            "exact Git process-family cleanup is supported only on Windows and Linux",
+        )),
+        None,
+    )
+}
+
+/// One directly owned pipe. Each poll reads at most one fixed-size chunk, so a
+/// continuously writing or escaped descendant cannot monopolize process polls.
+#[cfg(target_os = "linux")]
+struct GitPipeCapture<R: PollableRead> {
+    reader: R,
+    bytes: Vec<u8>,
+    cap: usize,
+    observed: u64,
+    configured: bool,
+    eof: bool,
+    failed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<R: PollableRead> GitPipeCapture<R> {
+    fn new(reader: R, cap: usize) -> Self {
+        Self {
+            reader,
+            bytes: Vec::with_capacity(cap.min(8192)),
+            cap,
+            observed: 0,
+            configured: false,
+            eof: false,
+            failed: false,
+        }
     }
-    thread::sleep(Duration::from_millis(100));
-    // SAFETY: same owned process group; escalation bounds termination.
+
+    fn poll(&mut self) {
+        if self.eof {
+            return;
+        }
+        if !self.configured {
+            if self.reader.make_nonblocking().is_err() {
+                self.failed = true;
+                return;
+            }
+            self.configured = true;
+        }
+        let mut buffer = [0u8; 8192];
+        match self.reader.read_available(&mut buffer) {
+            Ok(PipeRead::Eof | PipeRead::Data(0)) => self.eof = true,
+            Ok(PipeRead::Pending) => {}
+            Ok(PipeRead::Data(count)) if count <= buffer.len() => {
+                self.observed = self.observed.saturating_add(count as u64);
+                let keep = count.min(self.cap.saturating_sub(self.bytes.len()));
+                self.bytes.extend_from_slice(&buffer[..keep]);
+            }
+            Ok(PipeRead::Data(_)) | Err(_) => self.failed = true,
+        }
+    }
+}
+
+/// Donor: hooks::git::GitCleanupOwner. This value, rather than a detached reader
+/// or a repository hold bit, owns a started Git command through unresolved
+/// cleanup. It is releasable only after group departure, direct reaping and EOF
+/// on both captured pipes. The Store must retain it while is_pending() is true.
+#[cfg(target_os = "linux")]
+#[must_use = "retain this owner until direct exit, group departure and pipe EOF are confirmed"]
+pub(crate) struct GitCleanupOwner {
+    child: Child,
+    identity: Option<Value>,
+    stdout: Option<GitPipeCapture<ChildStdout>>,
+    stderr: Option<GitPipeCapture<ChildStderr>>,
+    direct_exited: bool,
+    group_departed: bool,
+    status: Option<ExitStatus>,
+    cleanup_started: bool,
+    timed_out: bool,
+    identity_failed: bool,
+    observation_failed: bool,
+    capture_failed: bool,
+    #[cfg(test)]
+    fail_identity: bool,
+    #[cfg(test)]
+    fail_departure: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct GitCleanupOwner;
+
+#[cfg(not(target_os = "linux"))]
+impl GitCleanupOwner {
+    pub(crate) fn poll(&mut self) {}
+
+    pub(crate) fn is_pending(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GitCleanupOwner {
+    fn new(mut child: Child, cap: usize) -> Self {
+        let stdout = child
+            .stdout
+            .take()
+            .map(|pipe| GitPipeCapture::new(pipe, cap));
+        let stderr = child.stderr.take().map(|pipe| GitPipeCapture::new(pipe, 0));
+        let capture_failed = stdout.is_none() || stderr.is_none();
+        Self {
+            child,
+            identity: None,
+            stdout,
+            stderr,
+            direct_exited: false,
+            group_departed: false,
+            status: None,
+            cleanup_started: false,
+            timed_out: false,
+            identity_failed: false,
+            observation_failed: false,
+            capture_failed,
+            #[cfg(test)]
+            fail_identity: false,
+            #[cfg(test)]
+            fail_departure: false,
+        }
+    }
+
+    /// One nonblocking capture/status observation and one exact group query.
+    /// An error leaves the original Child and pipe handles in this owner.
+    pub(crate) fn poll(&mut self) {
+        if !self.is_pending() {
+            return;
+        }
+        if let Some(stdout) = self.stdout.as_mut() {
+            stdout.poll();
+            self.capture_failed |= stdout.failed;
+        }
+        if let Some(stderr) = self.stderr.as_mut() {
+            stderr.poll();
+            self.capture_failed |= stderr.failed;
+        }
+        if self.identity.is_none() {
+            self.identity = self.capture_identity();
+            self.identity_failed |= self.identity.is_none();
+        }
+        if self.status.is_none() && !self.direct_exited {
+            match child_exited_without_reaping(self.child.id()) {
+                Ok(exited) => self.direct_exited = exited,
+                Err(_) => self.observation_failed = true,
+            }
+        }
+        if self.identity_failed || self.observation_failed || self.capture_failed {
+            self.cleanup_started = true;
+        }
+        if self.cleanup_started && !self.group_departed {
+            // The direct Child is still unreaped and pins this dedicated PGID.
+            terminate_remaining_process_group(self.child.id());
+        }
+        if !self.group_departed
+            && (self.direct_exited || self.cleanup_started)
+            && let Some(identity) = self.identity.as_ref()
+        {
+            match self.observe_departure(identity) {
+                Ok(true) => self.group_departed = true,
+                Ok(false) => self.cleanup_started = true,
+                Err(_) => {
+                    self.observation_failed = true;
+                    self.cleanup_started = true;
+                }
+            }
+        }
+        if self.group_departed && self.status.is_none() {
+            // Never call wait or reap while group signals/queries can still run.
+            // try_wait is nonblocking even if the status observation failed.
+            match self.child.try_wait() {
+                Ok(status) => self.status = status,
+                Err(_) => self.observation_failed = true,
+            }
+        }
+        if self.direct_exited && self.is_pending() {
+            // This includes an empty original group with an escaped pipe writer.
+            self.cleanup_started = true;
+        }
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        !self.group_departed
+            || self.status.is_none()
+            || self.stdout.as_ref().is_some_and(|pipe| !pipe.eof)
+            || self.stderr.as_ref().is_some_and(|pipe| !pipe.eof)
+    }
+
+    fn capture_identity(&self) -> Option<Value> {
+        #[cfg(test)]
+        if self.fail_identity {
+            return None;
+        }
+        unix_process_group_identity(self.child.id())
+    }
+
+    fn observe_departure(&self, identity: &Value) -> Result<bool> {
+        #[cfg(test)]
+        if self.fail_departure {
+            return Err(Error::new(
+                "FORGE_FIXTURE_OBSERVATION",
+                "injected departure error",
+            ));
+        }
+        unix_process_group_is_empty(identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_child_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_resume_observation(&mut self) {
+        self.fail_identity = false;
+        self.fail_departure = false;
+    }
+
+    fn into_output(self) -> Result<GitOutput> {
+        // Only run_git_foreground calls this, after is_pending became false.
+        let status = self
+            .status
+            .expect("completed Git custody retains its exit status");
+        if self.identity_failed {
+            return Err(Error::new(
+                "FORGE_GIT_TREE_TERMINATION",
+                "Git launch identity observation failed during cleanup",
+            ));
+        }
+        if self.observation_failed {
+            return Err(Error::new(
+                "FORGE_GIT_WAIT",
+                "Git process observation failed",
+            ));
+        }
+        if self.capture_failed {
+            return Err(Error::new("FORGE_GIT_OUTPUT", "Git pipe capture failed"));
+        }
+        let stdout = self.stdout.expect("successful Git capture retains stdout");
+        Ok(GitOutput {
+            status,
+            stdout_truncated: stdout.observed > stdout.bytes.len() as u64,
+            stdout: stdout.bytes,
+            timed_out: self.timed_out,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_git_foreground(
+    mut owner: GitCleanupOwner,
+    command_timeout: Duration,
+    cleanup_timeout: Duration,
+) -> GitRunResult {
+    let command_deadline = Instant::now() + command_timeout;
+    let mut cleanup_deadline = None;
+    loop {
+        let now = Instant::now();
+        if cleanup_deadline.is_none() && now >= command_deadline {
+            owner.timed_out = true;
+            owner.cleanup_started = true;
+            cleanup_deadline = Some(command_deadline + cleanup_timeout);
+        }
+        if owner.cleanup_started && cleanup_deadline.is_none() {
+            cleanup_deadline = Some(now + cleanup_timeout);
+        }
+        if cleanup_deadline.is_some_and(|deadline| now >= deadline) {
+            return pending_git_cleanup(owner);
+        }
+        owner.poll();
+        let poll_finished = Instant::now();
+        if owner.cleanup_started && cleanup_deadline.is_none() {
+            // Include the observation that started cleanup in its fixed budget;
+            // retrying an observation must never reset or extend this deadline.
+            cleanup_deadline = Some(now + cleanup_timeout);
+        }
+        // Synchronous /proc work may overrun a poll. Do not turn an observation
+        // obtained after the exact cleanup deadline into foreground success.
+        if cleanup_deadline.is_some_and(|deadline| poll_finished >= deadline) {
+            return pending_git_cleanup(owner);
+        }
+        if cleanup_deadline.is_none() && poll_finished >= command_deadline {
+            owner.timed_out = true;
+            owner.cleanup_started = true;
+            cleanup_deadline = Some(command_deadline + cleanup_timeout);
+            if poll_finished >= command_deadline + cleanup_timeout {
+                return pending_git_cleanup(owner);
+            }
+        }
+        if !owner.is_pending() {
+            return (owner.into_output(), None);
+        }
+        let deadline = cleanup_deadline.unwrap_or(command_deadline);
+        thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(poll_finished)),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pending_git_cleanup(owner: GitCleanupOwner) -> GitRunResult {
+    (
+        Err(Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "Git cleanup or natural pipe completion remains unconfirmed; retain the cleanup owner",
+        )),
+        Some(owner),
+    )
+}
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn fixture_git_observation_failure(child: Child) -> GitRunResult {
+    let mut owner = GitCleanupOwner::new(child, 1024);
+    owner.fail_identity = true;
+    run_git_foreground(owner, Duration::from_millis(20), Duration::from_millis(40))
+}
+
+#[cfg(target_os = "linux")]
+fn child_exited_without_reaping(pid: u32) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: `info` is writable storage for waitid, and WNOWAIT leaves
+    // the child waitable so its PID pins the process-group identity.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful waitid initialized the siginfo_t output and
+    // si_pid reads the process ID from that initialized signal info.
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(target_os = "linux")]
+fn unix_process_group_identity(pid: u32) -> Option<Value> {
+    let launch = crate::platform::process_group::spawned_identity(pid).ok();
+    let (recorded_pid, process_group, start_ticks, boot_id) = if let Some(launch) = launch {
+        (
+            launch["pid"].as_u64()?,
+            launch["spawned_pgid"].as_u64()?,
+            launch["start_ticks"].as_str()?.to_owned(),
+            launch["boot_id"].as_str()?.to_owned(),
+        )
+    } else {
+        // WNOWAIT keeps a fast-exiting leader's proc entry available
+        // until its process group is confirmed empty.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields = stat
+            .rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let process_group = fields.get(2)?.parse::<u64>().ok()?;
+        let start_ticks = fields.get(19)?.to_string();
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        (
+            u64::from(pid),
+            process_group,
+            start_ticks,
+            boot_id.trim().to_owned(),
+        )
+    };
+    if recorded_pid != u64::from(pid) || process_group != recorded_pid {
+        return None;
+    }
+    if start_ticks
+        .parse::<u64>()
+        .ok()
+        .is_none_or(|start_ticks| start_ticks == 0)
+        || boot_id.trim().is_empty()
+    {
+        return None;
+    }
+    Some(json!({
+        "pid": recorded_pid,
+        "pgid": process_group,
+        "start_ticks": start_ticks,
+        "boot_id": boot_id,
+        "scope": "linux_process_group",
+        "purpose": "check",
+        "disposition_source": "proc_group_members"
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn unix_process_group_is_empty(identity: &Value) -> Result<bool> {
+    crate::platform::process_group::departed_empty(identity, "forge-git")
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_remaining_process_group(pid: u32) {
+    let process_group = -(pid as libc::pid_t);
+    // SAFETY: CommandExt::process_group(0) makes this child the leader of its
+    // own group. On the normal-exit path its unreaped Child pins this PID.
     unsafe {
         libc::kill(process_group, libc::SIGKILL);
     }
-    let _ = child.kill();
 }
+
+#[cfg(target_os = "linux")]
+const GIT_PROCESS_GROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn has_control(value: &str) -> bool {
     value.chars().any(char::is_control)
@@ -831,7 +1212,7 @@ mod tests {
         let config = ForgeConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
         {
             let output = drain_bounded(&b"abcdef"[..], 3).unwrap();
             assert_eq!(output.bytes, b"abc");
@@ -842,5 +1223,303 @@ mod tests {
     #[test]
     fn helper_project_fixture_has_an_exact_allowlist() {
         assert_eq!(project("C:/work/repo").target_refs, ["refs/heads/main"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_git_runner_terminates_descendant_that_closed_its_pipes() {
+        struct TempDirectory(PathBuf);
+
+        impl Drop for TempDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct ProcessGroupCleanup(libc::pid_t);
+
+        impl Drop for ProcessGroupCleanup {
+            fn drop(&mut self) {
+                // SAFETY: the test records the process-group leader while its
+                // live descendant still pins that group ID.
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                }
+            }
+        }
+
+        let unique = format!(
+            "swarm-forge-git-family-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir(&root).unwrap();
+        let _root = TempDirectory(root.clone());
+        let repository_path = root.join("repository");
+        std::fs::create_dir(&repository_path).unwrap();
+
+        let script = root.join("git-family.sh");
+        std::fs::write(
+            &script,
+            r##"#!/bin/sh
+directory=${0%/*}
+(
+  : > "$directory/child.ready"
+  exec /bin/sleep 30
+) </dev/null >/dev/null 2>&1 &
+child_pid=$!
+printf '%s\n' "$child_pid" > "$directory/child.pid"
+printf '%s\n' "$$" > "$directory/process-group.pid"
+while [ ! -f "$directory/child.ready" ]; do /bin/sleep 0.01; done
+exit 0
+"##,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let project = ForgeProject {
+            canonical_repository: "github.com/example/project".into(),
+            repository_path,
+            remote_name: "origin".into(),
+            policy_revision: "owner-policy-v1".into(),
+            target_refs: vec!["refs/heads/main".into()],
+        };
+        let config = ForgeConfig {
+            enabled: true,
+            git_executable: script,
+            timeout_seconds: 5,
+            max_output_bytes: 1024,
+            projects: BTreeMap::from([("fixture".into(), project.clone())]),
+        };
+
+        let (output, cleanup_owner) = run_git(&config, &project, &[]);
+        let child_pid = std::fs::read_to_string(root.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let descendant_is_live =
+            crate::platform::process_group::spawned_identity(child_pid).is_ok();
+        if descendant_is_live {
+            let process_group = std::fs::read_to_string(root.join("process-group.pid"))
+                .unwrap()
+                .trim()
+                .parse::<libc::pid_t>()
+                .unwrap();
+            let _cleanup = ProcessGroupCleanup(process_group);
+            panic!("Git runner returned while a pipe-closed descendant was still live");
+        }
+        assert!(cleanup_owner.is_none());
+        let output = output.unwrap();
+        assert!(output.status.success());
+        assert!(!output.timed_out);
+        assert!(root.join("child.ready").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    struct GitCustodyFixture {
+        root: PathBuf,
+        config: ForgeConfig,
+        project: ForgeProject,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GitCustodyFixture {
+        fn new(script: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = std::env::temp_dir().join(format!(
+                "swarm-forge-custody-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let repository_path = root.join("repository");
+            std::fs::create_dir(&repository_path).unwrap();
+            let git_executable = root.join("git-custody.sh");
+            std::fs::write(&git_executable, script).unwrap();
+            let mut permissions = std::fs::metadata(&git_executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&git_executable, permissions).unwrap();
+            let project = ForgeProject {
+                canonical_repository: "github.com/example/project".into(),
+                repository_path,
+                remote_name: "origin".into(),
+                policy_revision: "owner-policy-v1".into(),
+                target_refs: vec!["refs/heads/main".into()],
+            };
+            let config = ForgeConfig {
+                enabled: true,
+                git_executable,
+                timeout_seconds: 5,
+                max_output_bytes: 1024,
+                projects: BTreeMap::from([("fixture".into(), project.clone())]),
+            };
+            Self {
+                root,
+                config,
+                project,
+            }
+        }
+
+        fn spawn(&self) -> Child {
+            use std::os::unix::process::CommandExt;
+
+            Command::new(&self.config.git_executable)
+                .current_dir(&self.project.repository_path)
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for GitCustodyFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_fixture_cleanup(owner: &mut GitCleanupOwner) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        owner.cleanup_started = true;
+        while owner.is_pending() && Instant::now() < deadline {
+            owner.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !owner.is_pending(),
+            "fixture retains unresolved Git custody"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_git_identity_and_departure_errors_return_the_same_child_and_pipes() {
+        let fixture = GitCustodyFixture::new("#!/bin/sh\nexec /bin/sleep 30\n");
+        for fail_identity in [true, false] {
+            let child = fixture.spawn();
+            let pid = child.id();
+            let mut owner = GitCleanupOwner::new(child, 1024);
+            owner.fail_identity = fail_identity;
+            owner.fail_departure = !fail_identity;
+            let started = Instant::now();
+            let (outcome, pending) = run_git_foreground(
+                owner,
+                Duration::from_millis(100),
+                Duration::from_millis(150),
+            );
+            let elapsed = started.elapsed();
+            let mut owner = pending.expect("observation failure returns exact physical custody");
+            let same_pid = owner.child.id() == pid;
+            let unreaped = owner.status.is_none();
+            let retained_pipes = owner.stdout.is_some() && owner.stderr.is_some();
+            let pending_before_retry = owner.is_pending();
+            owner.fail_identity = false;
+            owner.fail_departure = false;
+            finish_fixture_cleanup(&mut owner);
+            assert_eq!(outcome.unwrap_err().code, "FORGE_GIT_TREE_TERMINATION");
+            assert!(elapsed < Duration::from_secs(3));
+            assert!(same_pid && unreaped && retained_pipes && pending_before_retry);
+            assert!(owner.group_departed && owner.status.is_some());
+            assert!(owner.stdout.as_ref().unwrap().eof);
+            assert!(owner.stderr.as_ref().unwrap().eof);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_git_escaped_pipe_writer_returns_pending_custody_within_cleanup_bound() {
+        let fixture = GitCustodyFixture::new(
+            r##"#!/bin/sh
+directory=${0%/*}
+/usr/bin/setsid /bin/sh -c '
+  directory=$1
+  printf "%s\n" "$$" > "$directory/escaped.pid"
+  : > "$directory/escaped.ready"
+  exec /bin/sleep 30
+' escaped "$directory" &
+while [ ! -f "$directory/escaped.ready" ]; do /bin/sleep 0.01; done
+exit 0
+"##,
+        );
+        let child = fixture.spawn();
+        let started = Instant::now();
+        let (outcome, pending) = run_git_foreground(
+            GitCleanupOwner::new(child, 1024),
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        let mut owner = pending.expect("escaped inherited pipes retain cleanup custody");
+        let empty_group = owner.group_departed;
+        let direct_reaped = owner.status.is_some();
+        let stdout_pending = !owner.stdout.as_ref().unwrap().eof;
+        let stderr_pending = !owner.stderr.as_ref().unwrap().eof;
+        let escaped_pid = std::fs::read_to_string(fixture.root.join("escaped.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let escaped_identity = unix_process_group_identity(escaped_pid)
+            .expect("fixture escaped process is its own live group leader");
+        let escaped_live = !unix_process_group_is_empty(&escaped_identity).unwrap();
+        // SAFETY: this fixture's still-live escaped leader pins its recorded
+        // group; terminate it explicitly so natural EOF can release custody.
+        unsafe {
+            libc::kill(-(escaped_pid as libc::pid_t), libc::SIGKILL);
+        }
+        finish_fixture_cleanup(&mut owner);
+        assert_eq!(outcome.unwrap_err().code, "FORGE_GIT_TREE_TERMINATION");
+        assert!(elapsed < Duration::from_secs(3));
+        assert!(empty_group && direct_reaped && escaped_live);
+        assert!(stdout_pending && stderr_pending);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_git_capture_poll_reads_one_chunk_even_when_output_is_always_ready() {
+        struct AlwaysReady {
+            reads: usize,
+        }
+
+        impl Read for AlwaysReady {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+
+        impl PollableRead for AlwaysReady {
+            fn make_nonblocking(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<PipeRead> {
+                self.read(buffer).map(PipeRead::Data)
+            }
+        }
+
+        let mut capture = GitPipeCapture::new(AlwaysReady { reads: 0 }, 32);
+        capture.poll();
+        assert_eq!(capture.reader.reads, 1);
+        assert_eq!(capture.bytes, vec![b'x'; 32]);
+        assert_eq!(capture.observed, 8192);
+        assert!(!capture.eof && !capture.failed);
     }
 }

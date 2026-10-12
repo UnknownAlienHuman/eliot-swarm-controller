@@ -1,0 +1,275 @@
+{
+  "schema_version": 2,
+  "candidate_base": "dae42b7adb6b037ba79a7851bae8f136d2ef5248",
+  "recorded_at_utc": "2026-10-12T02:00:05.5424593Z",
+  "scope": "Forge child/capture/family custody, Store lane/permit cancellation ownership and native owner image/pin readback; bounded implementation delivery only",
+  "source_sha256": {
+    "crates/swarm-kernel-host/src/forge.rs": "6308206B34DA31D5B43BE246ED94349B63C6A0F73580C9F9F4178F9838FCC074",
+    "crates/swarm-kernel-host/src/store/forge.rs": "DB67663B87573B0C0400E9F16E8C446A0C6FFE0AC0E9444AB0AE5665133776AB",
+    "crates/swarm-kernel-host/src/workspace.rs": "AA7110AF24A05D9E65C6E0D56A1EFFC601E0BED96AFA107B6CB41170D52EC02D",
+    "crates/swarm-kernel-host/src/store/mod.rs": "508C98B0DC1746B4C839BED3293325B33D020B825A7EAF968F82BC2FEB8BC7CA",
+    "crates/swarm-forge-worker/src/main.rs": "7923FC09F04869FD10C4901DA453EF4B2433F9A2C428DFB87A7B29947886C964",
+    "crates/swarm-forge-worker/src/expected_old_ref_fixtures.rs": "72AA8FC64956CB9B1FDD06B405C567A647B5CF7D942940567648915B8AD6A5E5"
+  },
+  "changes": [
+    "Store registry retains each blocking closure, Git Child/capture owner and native helper through error, receiver cancellation, polling and shutdown drain",
+    "Workspace Git callers use the same Store-issued custody; pending cleanup retains coordinator lane/process permit",
+    "Native helper launch reuses bounded environment baseline and preserves native home/config/keyring discovery",
+    "Qualified process image SHA-256 is decoded only at the exact raw-file pin comparisons; worker owner receipt publishes actual self image path/digest before native authorization",
+    "Native cancellation fixture waits finitely and reports validation failures, retaining the real pre-repair hang as evidence",
+    "Owner receipt image path and exact qualified digest must match the live OS image before authorization; rejected receipt remains without inferred custody authority",
+    "Real OS Group receipt fixture rejects missing/tampered image claims and verifies exact serialized restart readback; debug fixture hash bound uses measured executable size, production128MiB worker bound unchanged"
+  ],
+  "verification": [
+    {
+      "artifact": "forge-custody-windows-clippy-production-v4.json",
+      "sha256": "6DA0DDFBDFFAA38D7130567C3482BBE83F945A5A84948A9844EF64B9DA8336FC",
+      "platform": "windows",
+      "gate": "clippy",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-forge-worker",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "source_sha256": "68B9731F4DF19AC1E9D7103955B997FB1B6A530F47148528798438F2BC2B0D59",
+      "log_sha256": "899074C47C7518F2A3EBE2A866CF9FD80FA3FA84A9ACF674B85EB41B0051434B",
+      "started_at_utc": "2026-10-12T01:49:44.3689913Z",
+      "completed_at_utc": "2026-10-12T01:49:58.0057192Z",
+      "consumer_summary": [],
+      "passed_cases": []
+    },
+    {
+      "artifact": "forge-custody-linux-clippy-production-v4.json",
+      "sha256": "935E29909BECA65A03A6547F86ECC6B00673679E4A2050AA8B4EB61A9A0DECAC",
+      "platform": "linux",
+      "gate": "clippy",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 clippy --locked -p swarm-kernel-host -p swarm-forge-worker --lib --bins --no-deps -- -D warnings",
+      "exit_code": 0,
+      "source_stable": true,
+      "source_sha256": "68B9731F4DF19AC1E9D7103955B997FB1B6A530F47148528798438F2BC2B0D59",
+      "log_sha256": "93384CDDD7704F27F68D4548418D9ED3B25D215C20F071DF4104BAFEB5F2C4BF",
+      "started_at_utc": "2026-10-12T01:49:44.3845287Z",
+      "completed_at_utc": "2026-10-12T01:50:06.2743603Z",
+      "consumer_summary": [],
+      "passed_cases": []
+    },
+    {
+      "artifact": "forge-custody-windows-test-consumers-v4.json",
+      "sha256": "C06687D4984C5E7FF77D6A7DE0943967A33FF6F969E59338C931C87239E3793F",
+      "platform": "windows",
+      "gate": "test",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "-p",
+        "swarm-forge-worker",
+        "--lib",
+        "--bins",
+        "--no-fail-fast",
+        "-E",
+        "(test(/^forge::tests::/) | test(/^store::forge::tests::/) | test(disabled_forge_registration_passes_trusted_repository_readback) | package(swarm-forge-worker)) & !test(forge_worker_environment_child)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "source_sha256": "68B9731F4DF19AC1E9D7103955B997FB1B6A530F47148528798438F2BC2B0D59",
+      "log_sha256": "378B75AFDAE2E2F6AA9EC28E5835B7F85394F4A4EE367C36CD0D24657EAFFC66",
+      "started_at_utc": "2026-10-12T01:50:58.4657450Z",
+      "completed_at_utc": "2026-10-12T01:52:08.8113707Z",
+      "consumer_summary": [
+        "Summary [  15.936s] 28 tests run: 28 passed, 583 skipped"
+      ],
+      "passed_cases": [
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::lease_rejection_requires_exact_complete_target_porcelain",
+        "swarm-kernel-host store::forge::tests::malformed_intent_keeps_its_error_and_does_not_poison_the_next_page",
+        "swarm-kernel-host store::forge::tests::matching_ref_readback_does_not_clear_an_unconfirmed_process_tree_hold",
+        "swarm-kernel-host forge::tests::config_is_disabled_by_default_and_bounds_git_output",
+        "swarm-kernel-host forge::tests::readback_only_can_distinguish_expected_old_from_applied_candidate",
+        "swarm-kernel-host forge::tests::ref_and_remote_names_reject_option_and_refspec_injection",
+        "swarm-kernel-host store::forge::tests::re_promoted_gm_does_not_make_an_old_queued_epoch_current_again",
+        "swarm-kernel-host store::forge::tests::unconfirmed_process_tree_holds_all_publications_to_its_repository",
+        "swarm-kernel-host store::forge::tests::only_unconfirmed_runner_cleanup_creates_a_sticky_process_tree_outcome",
+        "swarm-kernel-host forge::tests::helper_project_fixture_has_an_exact_allowlist",
+        "swarm-kernel-host forge::tests::publication_request_is_closed_and_requires_explicit_create_or_old_oid",
+        "swarm-kernel-host forge::tests::canonical_identity_resolves_supported_remotes_without_exposing_url",
+        "swarm-kernel-host store::forge::tests::finished_clean_unknown_can_reconcile_exact_commit_through_store_state",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::native_owner_receipt_retains_actual_image_for_restart_readback",
+        "swarm-kernel-host store::forge::tests::clean_readback_recovery_remains_available_without_a_process_tree_hold",
+        "swarm-kernel-host store::forge::tests::restart_readback_only_proves_the_exact_candidate_commit",
+        "swarm-kernel-host store::forge::tests::forge_worker_environment_survives_nested_gh_without_ambient_values",
+        "swarm-kernel-host store::forge::tests::exact_worker_ref_failures_do_not_override_lost_response_or_family_custody",
+        "swarm-kernel-host store::forge::tests::forge_git_closure_outlives_cancelled_receiver_and_shutdown_waits_for_it",
+        "swarm-kernel-host store::forge::tests::sending_after_restart_stays_held_even_if_readback_matches",
+        "swarm-kernel-host store::forge::tests::real_pending_selection_rotates_held_targets_and_persists_each_phase_cursor",
+        "swarm-kernel-host workspace::tests::disabled_forge_registration_passes_trusted_repository_readback",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::unchanged_expected_ref_blocks_a_non_ancestor_before_lease_push",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::exact_fast_forward_from_expected_ref_is_accepted",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::create_lease_succeeds_only_for_an_absent_ref",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::intermediate_fast_forward_race_is_rejected_by_the_admitted_lease",
+        "swarm-kernel-host store::forge::tests::exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls",
+        "swarm-kernel-host store::forge::tests::forge_owner_receipt_requires_exact_live_image_claims"
+      ]
+    },
+    {
+      "artifact": "forge-custody-linux-test-consumers-v4.json",
+      "sha256": "631B4A0F942E260171C27C32B0DA08EB72CE96CDAFB8F010243B70D57060B7EC",
+      "platform": "linux",
+      "gate": "test",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host -p swarm-forge-worker --lib --bins --no-fail-fast -E '(test(/^forge::tests::/) | test(/^store::forge::tests::/) | test(disabled_forge_registration_passes_trusted_repository_readback) | package(swarm-forge-worker)) & !test(forge_worker_environment_child)'",
+      "exit_code": 100,
+      "source_stable": true,
+      "source_sha256": "68B9731F4DF19AC1E9D7103955B997FB1B6A530F47148528798438F2BC2B0D59",
+      "log_sha256": "673ACEE4AC34DF63B0D5105BCA8414E67B1825CE79DDEE786976DEF0382D8055",
+      "started_at_utc": "2026-10-12T01:52:31.0893002Z",
+      "completed_at_utc": "2026-10-12T01:53:28.8373291Z",
+      "consumer_summary": [
+        "Summary [   7.181s] 34 tests run: 33 passed, 1 failed, 597 skipped"
+      ],
+      "passed_cases": [
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::lease_rejection_requires_exact_complete_target_porcelain",
+        "swarm-kernel-host forge::tests::unix_git_capture_poll_reads_one_chunk_even_when_output_is_always_ready",
+        "swarm-kernel-host forge::tests::ref_and_remote_names_reject_option_and_refspec_injection",
+        "swarm-kernel-host forge::tests::canonical_identity_resolves_supported_remotes_without_exposing_url",
+        "swarm-kernel-host forge::tests::config_is_disabled_by_default_and_bounds_git_output",
+        "swarm-kernel-host store::forge::tests::clean_readback_recovery_remains_available_without_a_process_tree_hold",
+        "swarm-kernel-host store::forge::tests::matching_ref_readback_does_not_clear_an_unconfirmed_process_tree_hold",
+        "swarm-kernel-host forge::tests::publication_request_is_closed_and_requires_explicit_create_or_old_oid",
+        "swarm-kernel-host forge::tests::readback_only_can_distinguish_expected_old_from_applied_candidate",
+        "swarm-kernel-host store::forge::tests::restart_readback_only_proves_the_exact_candidate_commit",
+        "swarm-kernel-host forge::tests::helper_project_fixture_has_an_exact_allowlist",
+        "swarm-kernel-host store::forge::tests::re_promoted_gm_does_not_make_an_old_queued_epoch_current_again",
+        "swarm-kernel-host store::forge::tests::unconfirmed_process_tree_holds_all_publications_to_its_repository",
+        "swarm-kernel-host store::forge::tests::forge_worker_environment_survives_nested_gh_without_ambient_values",
+        "swarm-kernel-host store::forge::tests::only_unconfirmed_runner_cleanup_creates_a_sticky_process_tree_outcome",
+        "swarm-kernel-host store::forge::tests::exact_worker_ref_failures_do_not_override_lost_response_or_family_custody",
+        "swarm-kernel-host store::forge::tests::finished_clean_unknown_can_reconcile_exact_commit_through_store_state",
+        "swarm-kernel-host store::forge::tests::malformed_intent_keeps_its_error_and_does_not_poison_the_next_page",
+        "swarm-kernel-host forge::tests::unix_git_runner_terminates_descendant_that_closed_its_pipes",
+        "swarm-kernel-host store::forge::tests::forge_git_closure_outlives_cancelled_receiver_and_shutdown_waits_for_it",
+        "swarm-kernel-host store::forge::tests::forge_native_startup_cancellation_retains_child_and_permit_until_exact_departure",
+        "swarm-kernel-host workspace::tests::disabled_forge_registration_passes_trusted_repository_readback",
+        "swarm-kernel-host store::forge::tests::forge_git_error_handoff_retains_child_pipes_lane_and_permit_until_retry",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::unchanged_expected_ref_blocks_a_non_ancestor_before_lease_push",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::exact_fast_forward_from_expected_ref_is_accepted",
+        "swarm-kernel-host store::forge::tests::sending_after_restart_stays_held_even_if_readback_matches",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::create_lease_succeeds_only_for_an_absent_ref",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::intermediate_fast_forward_race_is_rejected_by_the_admitted_lease",
+        "swarm-kernel-host forge::tests::unix_git_escaped_pipe_writer_returns_pending_custody_within_cleanup_bound",
+        "swarm-kernel-host store::forge::tests::exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls",
+        "swarm-kernel-host forge::tests::unix_git_identity_and_departure_errors_return_the_same_child_and_pipes",
+        "swarm-kernel-host store::forge::tests::real_pending_selection_rotates_held_targets_and_persists_each_phase_cursor",
+        "swarm-forge-worker::bin/swarm-forge-worker expected_old_ref_fixtures::native_owner_receipt_retains_actual_image_for_restart_readback"
+      ]
+    },
+    {
+      "artifact": "forge-custody-windows-test-owner-image-fixture-v5.json",
+      "sha256": "ABB7C298C9CFBAC73381820CEF18355324FD86054863248B5600A3A0EE98D55E",
+      "platform": "windows",
+      "gate": "test",
+      "command": [
+        "run",
+        "1.98.1",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--no-fail-fast",
+        "-E",
+        "test(forge_owner_receipt_requires_exact_live_image_claims)"
+      ],
+      "exit_code": 0,
+      "source_stable": true,
+      "source_sha256": "DB67663B87573B0C0400E9F16E8C446A0C6FFE0AC0E9444AB0AE5665133776AB",
+      "log_sha256": "020980227821917501565AB0EC3A522F281D8EA03B6EEA5063C7B1CE52D99CBD",
+      "started_at_utc": "2026-10-12T01:55:01.0683071Z",
+      "completed_at_utc": "2026-10-12T01:56:08.2715482Z",
+      "consumer_summary": [
+        "Summary [  16.187s] 1 test run: 1 passed, 602 skipped"
+      ],
+      "passed_cases": [
+        "swarm-kernel-host store::forge::tests::forge_owner_receipt_requires_exact_live_image_claims"
+      ]
+    },
+    {
+      "artifact": "forge-custody-linux-test-owner-image-fixture-v5.json",
+      "sha256": "00828C3EBDC84956A7B54E5F23F32464BDA6D4B734DDCB1915E946B11BDDFAAC",
+      "platform": "linux",
+      "gate": "test",
+      "command": "export CARGO_TARGET_DIR=/home/kleymor/.cache/eliot/swarm-v27-target CC=/usr/bin/gcc CXX=/usr/bin/g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc; export PATH=/home/kleymor/.local/share/eliot-native-disconnect-nextest-0.9.148/bin:/home/kleymor/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/kleym/.codex/worktrees/swarm-core-main-v27/eliot-swarm-controller; env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo +1.98.1 nextest run --locked -p swarm-kernel-host --lib --no-fail-fast -E 'test(forge_owner_receipt_requires_exact_live_image_claims)'",
+      "exit_code": 0,
+      "source_stable": true,
+      "source_sha256": "DB67663B87573B0C0400E9F16E8C446A0C6FFE0AC0E9444AB0AE5665133776AB",
+      "log_sha256": "AA9F132FB6358DCD227AC684924E23A2921566ED883FC6E5735244A0A2502E31",
+      "started_at_utc": "2026-10-12T01:56:37.1826095Z",
+      "completed_at_utc": "2026-10-12T01:58:40.3618451Z",
+      "consumer_summary": [
+        "Summary [  75.377s] 1 test run: 1 passed (1 slow), 622 skipped"
+      ],
+      "passed_cases": [
+        "swarm-kernel-host store::forge::tests::forge_owner_receipt_requires_exact_live_image_claims"
+      ]
+    }
+  ],
+  "historical_failure": {
+    "artifact": "forge-custody-linux-test-consumers-v2.json",
+    "sha256": "6F4E34528FC1871BFC4E17AC6B95E6A41342EBD6F284AE21E0BD8D78FAB53255",
+    "result": "26 PASS; native cancellation fixture remained live and was terminated with SIGTERM; exit100",
+    "cause": "Live process image returned sha256:HEX but valid owner compared against raw HEX pin",
+    "final_repair_case": "store::forge::tests::forge_native_startup_cancellation_retains_child_and_permit_until_exact_departure PASS Linux v3"
+  },
+  "independent_source_review": {
+    "earlier_v3": {
+      "artifact": "forge-custody-final-v3-source-review-20261012.json",
+      "sha256": "033F842796F3182E962B0DCC4E53428C325F4CD595309AD20A7EFBE53E55C429",
+      "verdict": "P2_FINDING receipt image claims unbound before native authorization"
+    },
+    "repaired_v4": {
+      "artifact": "forge-custody-final-v4-source-review-20261012.json",
+      "sha256": "38EFB1E1ED9A52B85C3A2F0D9D5C962CAFF828B44DDCD8AB82F04AEF41FE5F57",
+      "verdict": "PASS bounded exact-source P2 closure"
+    },
+    "final_v5": {
+      "artifact": "forge-custody-final-v5-fixture-delta-closure.json",
+      "sha256": "A56F53F397D54A5B057225F404CBC079E49D32D8538158C94014AC716C7DF9AD",
+      "verdict": "Manager fixture-only closure; reverse delta reproduces exact independently reviewed v4SHA; all production bytes unchanged"
+    }
+  },
+  "remaining": [
+    "Full original REG38 version/budget/Command environment obligations remain separate",
+    "Installed/native Git/gh/provider/model/platform, fault and load qualification not established by this cohort",
+    "Full owned all-target strict checks and complete V27 audit remain pending"
+  ],
+  "full_v27_complete": false,
+  "verification_scope": "Retained affected-case union: Windows28 passed in v4 plus changed fixture PASS v5; Linux33 unaffected passed in v4, changed fixture alone PASS v5 (34 unique cases). v4 Linux new fixture FAIL retained; no full current-head all-target/model/native qualification claim.",
+  "historical_fixture_failure": {
+    "artifact": "forge-custody-linux-test-consumers-v4.json",
+    "sha256": "631B4A0F942E260171C27C32B0DA08EB72CE96CDAFB8F010243B70D57060B7EC",
+    "result": "33PASS1FAIL",
+    "cause": "Host debug libtest executable exceeds production worker128MiB image size ceiling used incorrectly by fixture",
+    "correction": "Only fixture expected-image file hashing uses measured actual executable size; native worker production bounds unchanged",
+    "v5_fixture": "Windows1/1, Linux1/1 PASS"
+  },
+  "production_clippy_scope": "Strict host+forge-worker v4 Windows/Linux PASS; exact v5 fixture reverse-delta hash proves production unchanged, so production-only Clippy is retained without repeating an unaffected gate"
+}

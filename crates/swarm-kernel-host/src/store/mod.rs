@@ -29,7 +29,9 @@ mod coordination;
 mod coordination_threads;
 mod coordination_watch;
 mod forge;
-pub(crate) use forge::validate_publication_effective_request;
+#[cfg(test)]
+pub(crate) use forge::fixture_with_forge_git;
+pub(crate) use forge::{ForgeGitRun, validate_publication_effective_request};
 mod github;
 #[cfg(test)]
 mod github_effect_tests;
@@ -173,6 +175,7 @@ pub struct Store {
     data_dir: std::path::PathBuf,
     check_child_custody: checks::CheckChildCustody,
     script_child_custody: crate::scripts::runner::ScriptChildCustody,
+    forge_git_custody: forge::ForgeGitCustody,
     automation_scheduler_owner_token: Option<Arc<String>>,
     launch_issuance: Arc<launcher_issuance::IssuanceRuntime>,
     telemetry: swarm_telemetry::Producer,
@@ -448,6 +451,7 @@ impl StoreOwner {
             data_dir: data_dir.clone(),
             check_child_custody: checks::CheckChildCustody::default(),
             script_child_custody: crate::scripts::runner::ScriptChildCustody::default(),
+            forge_git_custody: forge::ForgeGitCustody::default(),
             automation_scheduler_owner_token: scheduler_owner_token.clone().map(Arc::new),
             launch_issuance: Arc::new(launcher_issuance::IssuanceRuntime::new()),
             artifact_io: Arc::new(Semaphore::new(4)),
@@ -529,7 +533,9 @@ impl StoreOwner {
             store,
         } = self;
         kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+        store.forge_git_custody.close_admission();
         let status_shutdown = store.status_reader.shutdown().await;
+        store.forge_git_custody.drain().await;
         drop(store);
         // Join both owners even if the reader already failed. Retained Store
         // handles must not keep an idle reader or writer alive after close.
@@ -555,9 +561,11 @@ impl StoreOwner {
             store,
         } = self;
         kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+        store.forge_git_custody.close_admission();
         let status_shutdown = store.status_reader.shutdown().await;
         let status_join = join_store_thread(status_thread, "status reader").await;
         exit = merge_results(exit, merge_results(status_join, status_shutdown));
+        store.forge_git_custody.drain().await;
         drop(store);
         let kernel_join = join_kernel_host(kernel, "database owner").await;
         let kernel_join_confirmed = !matches!(
@@ -1150,6 +1158,7 @@ impl Store {
         .await
     }
     pub(crate) async fn reconcile_workspace_lifecycle_once(&self) -> Result<Value> {
+        self.forge_git_custody.poll();
         // Exact owned-process departure is observed outside the DB owner
         // transaction. Unknown or live starts remain a separate lease fence.
         let owned_departures = self.reconcile_owned_opencode_departures_once().await?;
@@ -1273,39 +1282,45 @@ impl Store {
             let fs_registration = work.registration.clone();
             let fs_plan = work.plan.clone();
             let readback_only = work.readback_only;
-            let evidence = tokio::task::spawn_blocking(move || {
-                let project = config
-                    .forge
-                    .projects
-                    .get(&fs_plan.project_id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "WORKSPACE_UNREGISTERED",
-                            "launch project mapping is unavailable",
-                        )
-                    })?;
-                if readback_only {
-                    crate::workspace::reconcile_workspace(
-                        &config.forge,
-                        project,
-                        &fs_registration,
-                        &fs_work,
-                        &fs_plan,
-                    )
-                } else {
-                    crate::workspace::prepare_lease(
-                        &config.forge,
-                        project,
-                        &fs_registration,
-                        &fs_work,
-                        &fs_plan,
-                    )
-                    .map(|workspace| workspace.evidence().clone())
-                }
-            })
-            .await
-            .map_err(|_| Error::new("WORKSPACE_WORKER_FAILED", "workspace worker did not return"))
-            .and_then(|result| result);
+            let evidence = self
+                .workspace_git_io(
+                    &work.plan.project_id,
+                    &work.reservation.branch_ref,
+                    move |git| {
+                        let project =
+                            config
+                                .forge
+                                .projects
+                                .get(&fs_plan.project_id)
+                                .ok_or_else(|| {
+                                    Error::new(
+                                        "WORKSPACE_UNREGISTERED",
+                                        "launch project mapping is unavailable",
+                                    )
+                                })?;
+                        if readback_only {
+                            crate::workspace::reconcile_workspace(
+                                git,
+                                &config.forge,
+                                project,
+                                &fs_registration,
+                                &fs_work,
+                                &fs_plan,
+                            )
+                        } else {
+                            crate::workspace::prepare_lease(
+                                git,
+                                &config.forge,
+                                project,
+                                &fs_registration,
+                                &fs_work,
+                                &fs_plan,
+                            )
+                            .map(|workspace| workspace.evidence().clone())
+                        }
+                    },
+                )
+                .await;
             let evidence = match evidence {
                 Ok(evidence) => evidence,
                 Err(error) => {
