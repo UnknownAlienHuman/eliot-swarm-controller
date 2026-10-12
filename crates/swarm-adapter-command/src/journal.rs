@@ -1452,6 +1452,7 @@ fn verify_release_output_pages(
     evidence: &CommandCaptureReleaseEvidence,
 ) -> Result<()> {
     let mut seen_outputs = Vec::new();
+    let mut seen_result_operation_ids = Vec::new();
     for output in &evidence.outputs {
         if !matches!(
             output.native_output.as_str(),
@@ -1498,7 +1499,16 @@ fn verify_release_output_pages(
             ));
         }
         let mut covered = 0u64;
-        for (index, artifact) in output.pages.iter().enumerate() {
+        let mut unique_range_count = 0usize;
+        let mut previous_range: Option<(&CommandCaptureArtifactPage, Vec<u8>)> = None;
+        for artifact in &output.pages {
+            if seen_result_operation_ids.contains(&artifact.result_operation_id) {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_EVIDENCE_INVALID",
+                    "one result Operation appears more than once in release evidence",
+                ));
+            }
+            seen_result_operation_ids.push(artifact.result_operation_id.clone());
             let end = artifact
                 .offset_bytes
                 .checked_add(artifact.byte_length)
@@ -1508,17 +1518,14 @@ fn verify_release_output_pages(
                         "Command result artifact page range overflows",
                     )
                 })?;
-            if artifact.offset_bytes != covered
-                || artifact.total_bytes != total
+            if artifact.total_bytes != total
                 || artifact.artifact_byte_length != artifact.byte_length
                 || artifact.artifact_sha256 != artifact.page_sha256
                 || artifact.eof != (end == total)
-                || (artifact.byte_length == 0
-                    && !(total == 0 && output.pages.len() == 1 && index == 0))
             {
                 return Err(Error::new(
                     "COMMAND_RELEASE_COVERAGE_INVALID",
-                    "Store artifact pages do not form exact contiguous output coverage",
+                    "Store artifact page metadata differs from its exact output range",
                 ));
             }
             let (params, page_hash) = read_release_result_page(store, artifact)?;
@@ -1563,7 +1570,40 @@ fn verify_release_output_pages(
                     "acknowledged Store artifact bytes differ from the retained Command capture",
                 ));
             }
-            covered = end;
+            let duplicate_range = if let Some((previous, previous_bytes)) = &previous_range {
+                if artifact.offset_bytes == previous.offset_bytes {
+                    if artifact.byte_length != previous.byte_length
+                        || artifact.total_bytes != previous.total_bytes
+                        || artifact.page_sha256 != previous.page_sha256
+                        || artifact.artifact_sha256 != previous.artifact_sha256
+                        || artifact.eof != previous.eof
+                        || bytes.as_slice() != previous_bytes.as_slice()
+                    {
+                        return Err(Error::new(
+                            "COMMAND_RELEASE_COVERAGE_INVALID",
+                            "overlapping Command result pages disagree on their exact range",
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !duplicate_range {
+                if artifact.offset_bytes != covered
+                    || (artifact.byte_length == 0 && !(total == 0 && unique_range_count == 0))
+                {
+                    return Err(Error::new(
+                        "COMMAND_RELEASE_COVERAGE_INVALID",
+                        "Store artifact pages do not form exact contiguous output coverage",
+                    ));
+                }
+                covered = end;
+                unique_range_count += 1;
+                previous_range = Some((artifact, bytes));
+            }
         }
         if covered != total {
             return Err(Error::new(
@@ -2860,6 +2900,7 @@ fn finalize_acknowledged_release(
                 )
             })?;
         let mut covered = 0u64;
+        let mut previous_range: Option<&CommandCaptureArtifactPage> = None;
         for artifact in &output.pages {
             if artifact.result_operation_id.is_empty()
                 || artifact.result_operation_id == intent.target_operation_id
@@ -2885,20 +2926,48 @@ fn finalize_acknowledged_release(
                         "release result page range overflows",
                     )
                 })?;
-            if artifact.offset_bytes != covered
-                || artifact.total_bytes != total
+            if artifact.total_bytes != total
+                || end > total
                 || artifact.artifact_byte_length != artifact.byte_length
                 || artifact.artifact_sha256 != artifact.page_sha256
                 || artifact.eof != (end == total)
-                || (artifact.byte_length == 0
-                    && !(total == 0 && output.pages.len() == 1 && covered == 0))
             {
                 return Err(Error::new(
                     "ADAPTER_EVIDENCE_INVALID",
                     "release result pages do not form exact contiguous output coverage",
                 ));
             }
-            covered = end;
+            let duplicate_range = if let Some(previous) = previous_range
+                && artifact.offset_bytes == previous.offset_bytes
+            {
+                if artifact.byte_length != previous.byte_length
+                    || artifact.total_bytes != previous.total_bytes
+                    || artifact.artifact_byte_length != previous.artifact_byte_length
+                    || artifact.page_sha256 != previous.page_sha256
+                    || artifact.artifact_sha256 != previous.artifact_sha256
+                    || artifact.eof != previous.eof
+                {
+                    return Err(Error::new(
+                        "ADAPTER_EVIDENCE_INVALID",
+                        "overlapping release result pages disagree on their exact range",
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            if !duplicate_range {
+                if artifact.offset_bytes != covered
+                    || (artifact.byte_length == 0 && !(total == 0 && previous_range.is_none()))
+                {
+                    return Err(Error::new(
+                        "ADAPTER_EVIDENCE_INVALID",
+                        "release result pages do not form exact contiguous output coverage",
+                    ));
+                }
+                covered = end;
+                previous_range = Some(artifact);
+            }
             if seen_result_operations
                 .iter()
                 .any(|seen| seen == &artifact.result_operation_id)
@@ -4315,6 +4384,142 @@ mod tests {
                 .transpose()?
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_recovers_intentless_tombstone_before_pending_outcome_scan() -> Result<()> {
+        let _state = TempState::new();
+        let store = RunStore::new_for_profile(&_state.0, Profile::BatchV3)?;
+        let fixture = CaptureFixture::new(store, "fixture-target-r47-startup-a", &"a".repeat(64))?;
+        let release_id = "fixture-release-r47-startup-a";
+        let outcome = fixture.release(release_id)?;
+        fixture.acknowledge_release(release_id, &outcome)?;
+
+        let tombstone = tombstone_directory(&fixture.store, &fixture.target_id);
+        fs::remove_file(tombstone.join("release-intent.json"))?;
+        let error = fixture.store.pending_outcomes().unwrap_err();
+        assert_eq!(error.code, "ADAPTER_EVIDENCE_INVALID");
+
+        let pending = crate::adapter::pending_startup_outcomes(&fixture.store)?;
+        assert!(pending.is_empty());
+        assert!(!tombstone.exists());
+        assert!(!operation_directory(&fixture.store, release_id).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_recovers_acknowledged_cleanup_directory_before_pending_outcome_scan() -> Result<()> {
+        let _state = TempState::new();
+        let store = RunStore::new_for_profile(&_state.0, Profile::BatchV3)?;
+        let fixture = CaptureFixture::new(store, "fixture-target-r47-startup-b", &"b".repeat(64))?;
+        let release_id = "fixture-release-r47-startup-b";
+        let (_intent, marker) = stage_acknowledged_release_operation_cleanup(&fixture, release_id)?;
+        assert!(marker.join("outcome.json").exists());
+
+        let error = fixture.store.pending_outcomes().unwrap_err();
+        assert_eq!(error.code, "ADAPTER_EVIDENCE_INVALID");
+
+        let pending = crate::adapter::pending_startup_outcomes(&fixture.store)?;
+        assert!(pending.is_empty());
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn acknowledged_duplicate_result_page_operations_are_all_removed_after_release() -> Result<()> {
+        let _state = TempState::new();
+        let store = RunStore::new_for_profile(&_state.0, Profile::BatchV3)?;
+        let fixture = CaptureFixture::new(store, "fixture-target-r47-duplicate", &"c".repeat(64))?;
+        let mut evidence = fixture.release_evidence()?;
+        let duplicate_operation_id = "fixture-result-stdout-duplicate";
+        let duplicate_input_sha256 = "f".repeat(64);
+        let duplicate_artifact_ref = format!("artifact:{duplicate_operation_id}");
+        let output = &mut evidence.outputs[0];
+        let bytes = fixture.stdout_bytes();
+        let total = bytes.len() as u64;
+        let params = json!({
+            "operation_id":duplicate_operation_id,
+            "page":{
+                "source":{
+                    "kind":"command_output",
+                    "result_operation_id":duplicate_operation_id,
+                    "result_input_sha256":duplicate_input_sha256,
+                    "input_operation_id":fixture.target_id,
+                    "target_input_sha256":fixture.target_input_sha256,
+                    "target_command_output":output.target_command_output
+                },
+                "offset_bytes":0,
+                "byte_length":total,
+                "total_bytes":total,
+                "eof":true,
+                "media_type":"application/x-ndjson",
+                "content_base64":STANDARD.encode(bytes),
+                "page_sha256":digest(bytes)
+            }
+        });
+        fixture.store.admit(
+            duplicate_operation_id,
+            None,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+        )?;
+        let page_sha256 = fixture
+            .store
+            .save_result_page(duplicate_operation_id, &params)?;
+        fixture.store.acknowledge_result_page(
+            duplicate_operation_id,
+            &page_sha256,
+            json!({"recorded":true,"artifact_ref":duplicate_artifact_ref}),
+        )?;
+        output.pages.push(CommandCaptureArtifactPage {
+            result_operation_id: duplicate_operation_id.to_owned(),
+            result_input_sha256: duplicate_input_sha256,
+            artifact_ref: duplicate_artifact_ref,
+            artifact_sha256: digest(bytes),
+            artifact_byte_length: total,
+            offset_bytes: 0,
+            byte_length: total,
+            total_bytes: total,
+            page_sha256: digest(bytes),
+            eof: true,
+        });
+
+        let original_operation_id = output.pages[0].result_operation_id.clone();
+        assert_eq!(output.pages[0].offset_bytes, output.pages[1].offset_bytes);
+        assert_eq!(output.pages[0].byte_length, output.pages[1].byte_length);
+        assert_ne!(original_operation_id, duplicate_operation_id);
+        let release_operation_id = "fixture-release-r47-duplicate";
+        fixture.store.admit(
+            release_operation_id,
+            None,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+        )?;
+        let outcome = fixture.store.release_command_captures(
+            release_operation_id,
+            RELEASE_INPUT_SHA256,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+            &evidence,
+        )?;
+        let outcome_sha256 = fixture.store.save_outcome(&outcome)?;
+        fixture.store.acknowledge(
+            release_operation_id,
+            &outcome_sha256,
+            json!({"recorded":true}),
+        )?;
+        fixture
+            .store
+            .finalize_release_after_outcome_ack(release_operation_id, &outcome_sha256)?;
+
+        assert!(!operation_directory(&fixture.store, &original_operation_id).exists());
+        assert!(!operation_directory(&fixture.store, duplicate_operation_id).exists());
+        assert!(!operation_directory(&fixture.store, release_operation_id).exists());
+        assert!(!tombstone_directory(&fixture.store, &fixture.target_id).exists());
         Ok(())
     }
 

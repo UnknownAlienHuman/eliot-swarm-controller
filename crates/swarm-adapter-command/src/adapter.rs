@@ -59,6 +59,13 @@ struct Link {
     recovery_required: bool,
 }
 
+pub(crate) fn pending_startup_outcomes(store: &RunStore) -> Result<Vec<(RuntimeOutcome, String)>> {
+    // Resume ACK-authorized cleanup namespaces before the broad outcome scan;
+    // cleanup directories and intentless tombstones are not op-* records.
+    store.finalize_acknowledged_releases()?;
+    store.pending_outcomes()
+}
+
 pub async fn run() -> Result<()> {
     let (host_config_path, config_path) = config_arguments()?;
     let owner = load_owner()?;
@@ -142,7 +149,7 @@ pub async fn run() -> Result<()> {
 
         // A saved terminal receipt may have reached Store while its RPC ack
         // was lost. The only retry permitted here is the same bounded outcome.
-        for (outcome, hash) in store.pending_outcomes()? {
+        for (outcome, hash) in pending_startup_outcomes(&store)? {
             module_host::validate_saved_receipt(
                 &outcome,
                 &owner.host.claim,

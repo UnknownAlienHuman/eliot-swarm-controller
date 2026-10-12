@@ -1216,7 +1216,14 @@ pub(super) fn command_output_artifact_read_plan(
             byte_length: 0,
         });
     } else {
+        let mut previous_page_offset = None;
         for page in &output.pages {
+            // Release readback verified every Operation and rejected disagreeing
+            // same-offset ranges. Plan each identical byte range only once.
+            if previous_page_offset == Some(page.offset_bytes) {
+                continue;
+            }
+            previous_page_offset = Some(page.offset_bytes);
             let page_end = page
                 .offset_bytes
                 .checked_add(page.byte_length)

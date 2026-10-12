@@ -1114,19 +1114,22 @@ pub(super) fn command_capture_release_readback(
         artifacts.push(artifact);
     }
     for output in &mut outputs {
-        output.pages.sort_by_key(|page| page.offset_bytes);
-        let mut unique_pages: Vec<CommandCaptureArtifactPage> = Vec::new();
-        for page in output.pages.drain(..) {
-            if let Some(previous) = unique_pages.last() {
+        output
+            .pages
+            .sort_by_key(|page| (page.offset_bytes, page.result_operation_id.clone()));
+        let mut coverage_pages: Vec<&CommandCaptureArtifactPage> = Vec::new();
+        for page in &output.pages {
+            if let Some(previous) = coverage_pages.last() {
                 if previous.offset_bytes == page.offset_bytes {
                     if previous.total_bytes == page.total_bytes
                         && previous.byte_length == page.byte_length
+                        && previous.artifact_byte_length == page.artifact_byte_length
                         && previous.page_sha256 == page.page_sha256
                         && previous.artifact_sha256 == page.artifact_sha256
                         && previous.eof == page.eof
                     {
-                        // Re-reading an already persisted exact range creates
-                        // another immutable artifact, not new stream coverage.
+                        // Keep every Operation and artifact in the release
+                        // proof; an identical range adds no stream coverage.
                         continue;
                     }
                     return Err(Error::new(
@@ -1147,9 +1150,8 @@ pub(super) fn command_capture_release_readback(
                     ));
                 }
             }
-            unique_pages.push(page);
+            coverage_pages.push(page);
         }
-        output.pages = unique_pages;
         let total = output.target_command_output["stored_bytes"]
             .as_u64()
             .ok_or_else(|| {
@@ -1170,7 +1172,7 @@ pub(super) fn command_capture_release_readback(
         }
         let mut covered = 0u64;
         let mut has_gap = false;
-        for (index, page) in output.pages.iter().enumerate() {
+        for (index, page) in coverage_pages.iter().enumerate() {
             let end = page
                 .offset_bytes
                 .checked_add(page.byte_length)
@@ -1182,7 +1184,8 @@ pub(super) fn command_capture_release_readback(
                 || page.artifact_byte_length != page.byte_length
                 || page.artifact_sha256 != page.page_sha256
                 || page.eof != (end == total)
-                || (page.byte_length == 0 && !(total == 0 && output.pages.len() == 1 && index == 0))
+                || (page.byte_length == 0
+                    && !(total == 0 && coverage_pages.len() == 1 && index == 0))
             {
                 return Err(Error::new(
                     "COMMAND_RELEASE_COVERAGE_INVALID",
@@ -1695,6 +1698,7 @@ fn verify_capture_release_artifacts(
             })?;
         let mut covered = 0u64;
         let mut stream = Sha256::new();
+        let mut previous_range: Option<(&CommandCaptureArtifactPage, Vec<u8>)> = None;
         for page in &output.pages {
             let record = artifacts
                 .iter()
@@ -1708,7 +1712,6 @@ fn verify_capture_release_artifacts(
             if record.kind != "native_result_page"
                 || record.byte_length != page.artifact_byte_length
                 || record.content_digest != page.artifact_sha256
-                || page.offset_bytes != covered
                 || page.total_bytes != stored_bytes
             {
                 return Err(Error::new(
@@ -1733,8 +1736,37 @@ fn verify_capture_release_artifacts(
                     "verified result page bytes differ from their exact digest and range",
                 ));
             }
+            if let Some((previous, previous_bytes)) = &previous_range
+                && page.offset_bytes == previous.offset_bytes
+            {
+                if page.byte_length != previous.byte_length
+                    || page.total_bytes != previous.total_bytes
+                    || page.artifact_byte_length != previous.artifact_byte_length
+                    || page.page_sha256 != previous.page_sha256
+                    || page.artifact_sha256 != previous.artifact_sha256
+                    || page.eof != previous.eof
+                    || bytes.as_slice() != previous_bytes.as_slice()
+                {
+                    return Err(Error::new(
+                        "COMMAND_RELEASE_COVERAGE_INVALID",
+                        "overlapping Command result pages disagree on their exact range",
+                    ));
+                }
+                // Each artifact was verified above; identical bytes cover the stream once.
+                continue;
+            }
+            if page.offset_bytes != covered
+                || end > stored_bytes
+                || (page.byte_length == 0 && !(stored_bytes == 0 && previous_range.is_none()))
+            {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_COVERAGE_INVALID",
+                    "Store artifact pages do not form exact contiguous output coverage",
+                ));
+            }
             stream.update(&bytes);
             covered = end;
+            previous_range = Some((page, bytes));
         }
         let stored_sha256 = format!("{:x}", stream.finalize());
         if covered != stored_bytes
@@ -2821,6 +2853,15 @@ mod capture_release_artifact_fixture {
 
     #[tokio::test]
     async fn store_consumer_releases_capture_and_serves_verified_output_pages() -> Result<()> {
+        store_consumer_release_fixture(false).await
+    }
+
+    #[tokio::test]
+    async fn store_consumer_release_proof_retains_duplicate_result_operation_ids() -> Result<()> {
+        store_consumer_release_fixture(true).await
+    }
+
+    async fn store_consumer_release_fixture(include_duplicate_stdout_read: bool) -> Result<()> {
         let temp = TempArtifacts::new();
         let root = DataRoot::acquire(&temp.0).expect("acquire fixture Store root");
         let credential = bootstrap_credential(&root.path).expect("bootstrap fixture operator");
@@ -3076,6 +3117,8 @@ mod capture_release_artifact_fixture {
         };
         let mut result_operation_ids = Vec::new();
         let mut result_artifact_refs = Vec::new();
+        let expected_result_operation_count = if include_duplicate_stdout_read { 5 } else { 4 };
+        let mut duplicate_result_operation: Option<(String, String)> = None;
         for (native_output, bytes) in [
             ("stdout.ndjson", b"partial stdout retained".as_slice()),
             ("stderr.txt", b"partial stderr retained".as_slice()),
@@ -3200,10 +3243,103 @@ mod capture_release_artifact_fixture {
                     })
                     .await
                     .expect("read release admission while partial pages arrive");
-                assert_eq!(release_count, i64::from(result_operation_ids.len() == 4));
+                assert_eq!(
+                    release_count,
+                    i64::from(result_operation_ids.len() == expected_result_operation_count)
+                );
+
+                if include_duplicate_stdout_read && native_output == "stdout.ndjson" && index == 0 {
+                    let duplicate_request = json!({
+                        "client_request_id":"fixture-result-stdout-0-duplicate",
+                        "binding_id":seed.binding_id,
+                        "generation":1,
+                        "selector":{
+                            "kind":"command_output",
+                            "input_operation_id":seed.target_operation_id,
+                            "native_output":"stdout.ndjson"
+                        },
+                        "offset_bytes":0,
+                        "length_bytes":chunk.len()
+                    });
+                    let duplicate_queued = owner
+                        .store
+                        .call(
+                            caller.clone(),
+                            "agent.result".to_owned(),
+                            duplicate_request.clone(),
+                        )
+                        .await
+                        .expect("admit a second exact stdout range through public Store");
+                    let duplicate_operation_id =
+                        model::text(&duplicate_queued, "operation_id")?.to_owned();
+                    let duplicate_delivery = owner
+                        .store
+                        .call(module.clone(), "module.next".to_owned(), json!({}))
+                        .await
+                        .expect("deliver the duplicate result Operation through module.next");
+                    let duplicate_command = duplicate_delivery["command"].clone();
+                    assert_eq!(duplicate_command["operation_id"], duplicate_operation_id);
+                    assert_eq!(duplicate_command["method"], "agent.result");
+                    assert_eq!(
+                        duplicate_command["input"]["selector"],
+                        duplicate_request["selector"]
+                    );
+                    assert_eq!(duplicate_command["input"]["offset_bytes"], 0);
+                    let duplicate_snapshot =
+                        duplicate_command["input"]["target_command_output"].clone();
+                    let duplicate_input_sha256 =
+                        model::text(&duplicate_command, "input_sha256")?.to_owned();
+                    let mut duplicate_module_receipt = seed.target_module_receipt.clone();
+                    duplicate_module_receipt["operation_id"] = json!(duplicate_operation_id);
+                    duplicate_module_receipt["input_sha256"] = json!(duplicate_input_sha256);
+                    let duplicate_page = json!({
+                        "source":{
+                            "kind":"command_output",
+                            "result_operation_id":duplicate_operation_id,
+                            "result_input_sha256":duplicate_input_sha256,
+                            "result_module_receipt":duplicate_module_receipt,
+                            "input_operation_id":seed.target_operation_id,
+                            "target_input_sha256":duplicate_snapshot["input_sha256"],
+                            "target_module_receipt":duplicate_snapshot["module_receipt"],
+                            "target_command_output":duplicate_snapshot,
+                            "native_response_identity":"unavailable",
+                            "execution_complete":false,
+                            "task_completion":"unknown",
+                            "native_replay":false
+                        },
+                        "offset_bytes":0,
+                        "byte_length":chunk.len(),
+                        "total_bytes":bytes.len(),
+                        "eof":chunk.len() == bytes.len(),
+                        "media_type":"application/x-ndjson",
+                        "content_base64":STANDARD.encode(chunk),
+                        "page_sha256":model::digest(chunk)
+                    });
+                    let duplicate_persisted = owner
+                        .store
+                        .call(
+                            module.clone(),
+                            "module.result".to_owned(),
+                            json!({
+                                "operation_id":duplicate_operation_id,
+                                "page":duplicate_page
+                            }),
+                        )
+                        .await
+                        .expect("persist and acknowledge the duplicate immutable page");
+                    assert_eq!(duplicate_persisted["recorded"], true);
+                    let duplicate_artifact_ref =
+                        model::text(&duplicate_persisted, "artifact_ref")?.to_owned();
+                    duplicate_result_operation = Some((
+                        duplicate_operation_id.clone(),
+                        duplicate_artifact_ref.clone(),
+                    ));
+                    result_operation_ids.push(duplicate_operation_id.clone());
+                    result_artifact_refs.push((duplicate_operation_id, duplicate_artifact_ref));
+                }
             }
         }
-        assert_eq!(result_operation_ids.len(), 4);
+        assert_eq!(result_operation_ids.len(), expected_result_operation_count);
 
         let release_delivery = owner
             .store
@@ -3267,7 +3403,13 @@ mod capture_release_artifact_fixture {
                 output.target_command_output["stored_bytes"],
                 expected_bytes.len()
             );
-            assert_eq!(output.pages.len(), 2);
+            let expected_page_count =
+                if include_duplicate_stdout_read && expected_name == "stdout.ndjson" {
+                    3
+                } else {
+                    2
+                };
+            assert_eq!(output.pages.len(), expected_page_count);
             assert!(output.pages.iter().all(|page| {
                 result_operation_ids.contains(&page.result_operation_id)
                     && result_artifact_refs
@@ -3279,6 +3421,32 @@ mod capture_release_artifact_fixture {
                     && page.total_bytes == expected_bytes.len() as u64
                     && page.eof == (page.offset_bytes + page.byte_length == page.total_bytes)
             }));
+        }
+        if let Some((duplicate_operation_id, duplicate_artifact_ref)) =
+            duplicate_result_operation.as_ref()
+        {
+            let stdout = &evidence.outputs[0];
+            let duplicate_pages: Vec<_> = stdout
+                .pages
+                .iter()
+                .filter(|page| page.offset_bytes == 0)
+                .collect();
+            assert_eq!(duplicate_pages.len(), 2);
+            let duplicate_page = duplicate_pages
+                .iter()
+                .find(|page| &page.result_operation_id == duplicate_operation_id)
+                .expect("release proof retains duplicate result Operation");
+            let original_page = duplicate_pages
+                .iter()
+                .find(|page| &page.result_operation_id != duplicate_operation_id)
+                .expect("release proof retains original result Operation");
+            assert_eq!(&duplicate_page.artifact_ref, duplicate_artifact_ref);
+            assert_eq!(duplicate_page.byte_length, original_page.byte_length);
+            assert_eq!(duplicate_page.page_sha256, original_page.page_sha256);
+            assert_eq!(
+                duplicate_page.artifact_sha256,
+                original_page.artifact_sha256
+            );
         }
 
         let release_query_id = release_operation_id.clone();
