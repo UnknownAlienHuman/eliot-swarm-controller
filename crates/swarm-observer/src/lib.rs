@@ -110,12 +110,11 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
             "diagnostic line is not the supported metadata schema",
         )
     })?;
-    if !matches!(record.schema_version, 1..=4) {
-        return Err(Error::new(
-            "OBSERVER_SCHEMA_UNSUPPORTED",
-            "diagnostic schema version is unsupported",
-        ));
-    }
+    validate_record(&record)?;
+    Ok(record)
+}
+
+fn validate_record(record: &DiagnosticRecord) -> Result<()> {
     let has_schema3_identity = record.event_id.is_some()
         || record.component.is_some()
         || record.module_id.is_some()
@@ -124,6 +123,12 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
         || record.build_id.is_some()
         || record.task_id.is_some()
         || record.attempt_id.is_some();
+    if !matches!(record.schema_version, 1..=4) {
+        return Err(Error::new(
+            "OBSERVER_SCHEMA_UNSUPPORTED",
+            "diagnostic schema version is unsupported",
+        ));
+    }
     if record.schema_version == 1 && (record.binding_generation.is_some() || has_schema3_identity) {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
@@ -153,19 +158,6 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
             "schema-4 diagnostic text is missing or exceeds its bound",
         ));
     }
-    validate_record(&record)?;
-    Ok(record)
-}
-
-fn validate_record(record: &DiagnosticRecord) -> Result<()> {
-    let has_schema3_identity = record.event_id.is_some()
-        || record.component.is_some()
-        || record.module_id.is_some()
-        || record.artifact_id.is_some()
-        || record.artifact_version.is_some()
-        || record.build_id.is_some()
-        || record.task_id.is_some()
-        || record.attempt_id.is_some();
     if record.binding_generation.is_some_and(|generation| {
         generation == 0 || generation > i64::MAX as u64 || record.binding_id.is_none()
     }) {
@@ -469,6 +461,13 @@ pub struct Recorder {
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[cfg(test)]
+struct RecorderWorkerGate {
+    started: SyncSender<()>,
+    release: mpsc::Receiver<()>,
+    finished: SyncSender<()>,
+}
+
 impl Recorder {
     pub fn disabled() -> Self {
         Self {
@@ -487,6 +486,36 @@ impl Recorder {
         config: RecorderConfig,
         live_config: Option<LiveConfigSource>,
     ) -> Result<Self> {
+        Self::start_with_worker_hooks(config, live_config, || {}, || {})
+    }
+
+    #[cfg(test)]
+    fn start_with_worker_gate(config: RecorderConfig, gate: RecorderWorkerGate) -> Result<Self> {
+        let RecorderWorkerGate {
+            started,
+            release,
+            finished,
+        } = gate;
+        Self::start_with_worker_hooks(
+            config,
+            None,
+            move || {
+                if started.send(()).is_ok() {
+                    let _release_received = release.recv().is_ok();
+                }
+            },
+            move || {
+                let _finished_sent = finished.send(()).is_ok();
+            },
+        )
+    }
+
+    fn start_with_worker_hooks(
+        config: RecorderConfig,
+        live_config: Option<LiveConfigSource>,
+        before_loop: impl FnOnce() + Send + 'static,
+        after_loop: impl FnOnce() + Send + 'static,
+    ) -> Result<Self> {
         config.validate()?;
         if let Some(source) = &live_config {
             source.validate()?;
@@ -504,7 +533,11 @@ impl Recorder {
         let worker_counters = Arc::clone(&counters);
         let join = thread::Builder::new()
             .name("swarm-observer-recorder".into())
-            .spawn(move || recorder_loop(receiver, worker_config, worker_counters, live_config))
+            .spawn(move || {
+                before_loop();
+                recorder_loop(receiver, worker_config, worker_counters, live_config);
+                after_loop();
+            })
             .map_err(|_| {
                 Error::new(
                     "OBSERVER_START_FAILED",
@@ -779,6 +812,7 @@ impl Recorder {
                 ));
             }
         }
+        let mut worker_completed = self.sender.is_none();
         let join = match self.join.lock() {
             Ok(mut join) => join.take(),
             Err(_) => {
@@ -791,7 +825,7 @@ impl Recorder {
             }
         };
         if let Some(join) = join {
-            let joined = if let Some(deadline) = deadline {
+            let worker_result = if let Some(deadline) = deadline {
                 while !join.is_finished() && Instant::now() < deadline {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -800,30 +834,41 @@ impl Recorder {
                     thread::sleep(remaining.min(Duration::from_millis(2)));
                 }
                 if join.is_finished() {
-                    join.join().is_ok()
+                    Some(join.join())
                 } else {
-                    false
+                    None
                 }
             } else {
-                join.join().is_ok()
+                Some(join.join())
             };
-            if !joined {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            match worker_result {
+                Some(result) => {
+                    worker_completed = true;
+                    if result.is_err() {
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            shutdown_error = Some(Error::new(
+                                "OBSERVER_SHUTDOWN_TIMEOUT",
+                                "recorder worker did not finish before the deadline",
+                            ));
+                        } else {
+                            mark_sink_failed(&self.counters);
+                            record_durability_unknown(
+                                &self.counters,
+                                self.counters.written_records.load(Ordering::Acquire),
+                                self.counters.written_bytes.load(Ordering::Acquire),
+                            );
+                            shutdown_error = Some(Error::new(
+                                "OBSERVER_SHUTDOWN_FAILED",
+                                "recorder worker did not finish cleanly",
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    worker_completed = false;
                     shutdown_error = Some(Error::new(
                         "OBSERVER_SHUTDOWN_TIMEOUT",
                         "recorder worker did not finish before the deadline",
-                    ));
-                } else {
-                    mark_sink_failed(&self.counters);
-                    record_durability_unknown(
-                        &self.counters,
-                        self.counters.written_records.load(Ordering::Acquire),
-                        self.counters.written_bytes.load(Ordering::Acquire),
-                    );
-                    account_abandoned_pending(&self.counters);
-                    shutdown_error = Some(Error::new(
-                        "OBSERVER_SHUTDOWN_FAILED",
-                        "recorder worker did not finish cleanly",
                     ));
                 }
             }
@@ -834,13 +879,15 @@ impl Recorder {
                 "recorder reported a sink failure",
             ));
         }
-        if self.counters.pending_records.load(Ordering::Acquire) > 0 {
+        if worker_completed && self.counters.pending_records.load(Ordering::Acquire) > 0 {
             mark_sink_failed(&self.counters);
             account_abandoned_pending(&self.counters);
-            shutdown_error = Some(Error::new(
-                "OBSERVER_SHUTDOWN_FAILED",
-                "recorder left accepted records pending",
-            ));
+            if shutdown_error.is_none() {
+                shutdown_error = Some(Error::new(
+                    "OBSERVER_SHUTDOWN_FAILED",
+                    "recorder left accepted records pending",
+                ));
+            }
         }
         let stats = self.stats();
         (stats, shutdown_error.map_or(Ok(()), Err))
@@ -2213,6 +2260,125 @@ mod recorder_tail_recovery_tests {
             .lines()
             .map(|line| decode_line(line.as_bytes()).expect("each persisted line is valid"))
             .collect()
+    }
+
+    fn gated_recorder(
+        directory: &Path,
+    ) -> (
+        Recorder,
+        mpsc::Receiver<()>,
+        SyncSender<()>,
+        mpsc::Receiver<()>,
+    ) {
+        let (started, started_rx) = mpsc::sync_channel(0);
+        let (release, release_rx) = mpsc::sync_channel(0);
+        let (finished, finished_rx) = mpsc::sync_channel(0);
+        let recorder = Recorder::start_with_worker_gate(
+            config(directory),
+            RecorderWorkerGate {
+                started,
+                release: release_rx,
+                finished,
+            },
+        )
+        .expect("start real recorder behind worker gate");
+        (recorder, started_rx, release, finished_rx)
+    }
+
+    #[test]
+    fn recorder_append_and_decode_share_schema_gates_before_persistence() {
+        let directory = TestDirectory::new();
+        let recorder = Recorder::start(config(directory.path())).expect("start real recorder");
+
+        let mut unsupported_version = record(91);
+        unsupported_version.schema_version = 5;
+        let mut legacy_with_newer_field = record(92);
+        legacy_with_newer_field.module_id = Some("module-92".into());
+        let mut schema4_without_text = record(93);
+        schema4_without_text.schema_version = 4;
+        let mut schema4_with_oversized_text = record(94);
+        schema4_with_oversized_text.schema_version = 4;
+        schema4_with_oversized_text.redacted_text =
+            Some("x".repeat(swarm_telemetry::MAX_REDACTED_TEXT_BYTES + 1));
+
+        for invalid in [
+            unsupported_version,
+            legacy_with_newer_field,
+            schema4_without_text,
+            schema4_with_oversized_text,
+        ] {
+            let line = serde_json::to_vec(&invalid).expect("serialize typed diagnostic fixture");
+            assert!(decode_line(&line).is_err());
+            assert!(recorder.append(invalid).is_err());
+        }
+
+        let mut unknown_field =
+            serde_json::to_vec(&record(95)).expect("serialize closed-schema fixture");
+        assert_eq!(unknown_field.pop(), Some(b'}'));
+        unknown_field.extend_from_slice(br#","unexpected":true}"#);
+        assert!(decode_line(&unknown_field).is_err());
+        assert!(recorder.append_line(&unknown_field).is_err());
+
+        let valid = record(96);
+        let valid_line = serde_json::to_vec(&valid).expect("serialize valid diagnostic");
+        let decoded = decode_line(&valid_line).expect("decode valid diagnostic");
+        assert_eq!(decoded.sequence, 96);
+        recorder.append(valid).expect("append supported diagnostic");
+
+        let stats = recorder.shutdown().expect("join and sync recorder");
+        assert_eq!(stats.accepted_records, 1);
+        assert_eq!(stats.written_records, 1);
+        assert_eq!(stats.dropped_records, 5);
+        assert_eq!(stats.dropped_bytes, unknown_field.len() as u64);
+
+        let persisted = fs::read(directory.segment_path()).expect("read real recorder output");
+        let records = decoded_lines(&persisted);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence, 96);
+    }
+
+    #[test]
+    fn timed_out_shutdown_keeps_reservation_until_detached_worker_releases_record() {
+        let directory = TestDirectory::new();
+        let (recorder, started_rx, release, finished_rx) = gated_recorder(directory.path());
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker reached the gate before queue admission");
+
+        let expected_pending_bytes = (serde_json::to_vec(&record(97))
+            .expect("serialize accepted fixture")
+            .len()
+            + 1) as u64;
+        recorder.append(record(97)).expect("accept queued record");
+        let counters = Arc::clone(&recorder.counters);
+
+        let (snapshot, shutdown_result) = recorder.shutdown_with_timeout(Duration::from_millis(20));
+        let shutdown_error = shutdown_result.expect_err("timed-out shutdown remains unclean");
+        assert!(
+            shutdown_error.message.contains("deadline"),
+            "pending accounting must not replace the timeout diagnosis"
+        );
+        assert_eq!(snapshot.pending_records, 1);
+        assert_eq!(snapshot.pending_bytes, expected_pending_bytes);
+        assert_eq!(snapshot.written_records, 0);
+        assert_eq!(counters.pending_records.load(Ordering::Acquire), 1);
+        assert_eq!(
+            counters.pending_bytes.load(Ordering::Acquire),
+            expected_pending_bytes
+        );
+
+        release.send(()).expect("release detached recorder worker");
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("detached worker drained its accepted record and exited");
+        assert_eq!(counters.pending_records.load(Ordering::Acquire), 0);
+        assert_eq!(counters.pending_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(counters.written_records.load(Ordering::Acquire), 1);
+
+        let persisted = fs::read(directory.segment_path()).expect("read detached worker output");
+        let records = decoded_lines(&persisted);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence, 97);
     }
 
     #[test]

@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-12T11:27:49.0600007Z",
+  "source_base_main": "72638a77ba75ad4226da7b9280e5e4475cdd8c3a",
+  "obligations": [
+    "APP-370",
+    "APP-371"
+  ],
+  "original_obligations": [
+    {
+      "ledger_id": "APP-370",
+      "source_document": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+      "original_kind": "appendix",
+      "original_number": null,
+      "original_section": "8",
+      "original_section_title": "Приложение: полный реестр доказанных дефектов, не вошедших в §1-§4",
+      "original_lot": "infra-modules",
+      "original_severity": "—",
+      "original_title": null,
+      "original_line_raw": "- [—] Recorder::append bypasses the schema gates decode_line enforces — crates/swarm-observer/src/lib.rs:505-534 vs 118-160 — the recorder persists records its own reader rejects as OBSERVER_SCHEMA_UNSUPPORTED",
+      "original_text": "Recorder::append bypasses the schema gates decode_line enforces — crates/swarm-observer/src/lib.rs:505-534 vs 118-160 — the recorder persists records its own reader rejects as OBSERVER_SCHEMA_UNSUPPORTED",
+      "original_text_anchor": {
+        "file": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+        "line": 510
+      },
+      "original_baseline_sha": "40591a295af94b1541ec2ba30afe8e3247701a71",
+      "evidence_class": "demonstrated",
+      "state": "open",
+      "state_basis": "Appendix demonstrated row with no plan-map row and no later master verdict traced. This is a trace-coverage gap only and does not assert the row is live on current source.",
+      "current_source_anchors": [],
+      "current_source_note": null,
+      "plan_map_row": null,
+      "plan_map_coverage": "no_row",
+      "known_owner": [
+        "R46 / #69 adapter retention (nearest; not scoped to the observer)"
+      ],
+      "known_owner_source": "inferred from execution map wave / nearest neighbour",
+      "known_owner_basis": "file-name inference from the appendix row text",
+      "known_owner_caveat": "No row names swarm-observer. Owner recorded as nearest neighbour only.",
+      "existing_verifier": "none traced",
+      "pending_exact_evidence": [],
+      "partial_resolution_note": null,
+      "suspicion_scope": false,
+      "current_source_status": "unknown",
+      "state_read_guard": "state=open is a TRACE GAP: no plan-map row and no current-main trace. It does NOT assert this row is a live defect on 248c7af. current_source_status=unknown."
+    },
+    {
+      "ledger_id": "APP-371",
+      "source_document": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+      "original_kind": "appendix",
+      "original_number": null,
+      "original_section": "8",
+      "original_section_title": "Приложение: полный реестр доказанных дефектов, не вошедших в §1-§4",
+      "original_lot": "infra-modules",
+      "original_severity": "—",
+      "original_title": null,
+      "original_line_raw": "- [—] Timed-out shutdown: the error code is overwritten TIMEOUT→FAILED and pending counters are zeroed under a still-running detached worker — crates/swarm-observer/src/lib.rs:713-820 — counters can wrap to ~u64::MAX and the corrupted snapshot is cached as permanent final_stats",
+      "original_text": "Timed-out shutdown: the error code is overwritten TIMEOUT→FAILED and pending counters are zeroed under a still-running detached worker — crates/swarm-observer/src/lib.rs:713-820 — counters can wrap to ~u64::MAX and the corrupted snapshot is cached as permanent final_stats",
+      "original_text_anchor": {
+        "file": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md",
+        "line": 511
+      },
+      "original_baseline_sha": "40591a295af94b1541ec2ba30afe8e3247701a71",
+      "evidence_class": "demonstrated",
+      "state": "open",
+      "state_basis": "Appendix demonstrated row with no plan-map row and no later master verdict traced. This is a trace-coverage gap only and does not assert the row is live on current source.",
+      "current_source_anchors": [],
+      "current_source_note": null,
+      "plan_map_row": null,
+      "plan_map_coverage": "no_row",
+      "known_owner": [
+        "R46 / #69 adapter retention (nearest; not scoped to the observer)"
+      ],
+      "known_owner_source": "inferred from execution map wave / nearest neighbour",
+      "known_owner_basis": "file-name inference from the appendix row text",
+      "known_owner_caveat": "No row names swarm-observer. Owner recorded as nearest neighbour only.",
+      "existing_verifier": "none traced",
+      "pending_exact_evidence": [],
+      "partial_resolution_note": null,
+      "suspicion_scope": false,
+      "current_source_status": "unknown",
+      "state_read_guard": "state=open is a TRACE GAP: no plan-map row and no current-main trace. It does NOT assert this row is a live defect on 248c7af. current_source_status=unknown."
+    }
+  ],
+  "behavior": [
+    "Typed append and decode share schema/version validation before queue/persistence",
+    "Shutdown timeout preserves live detached-worker reservations until actual completion and preserves its timeout diagnosis"
+  ],
+  "owned_source_sha256": {
+    "crates/swarm-observer/src/lib.rs": "C06C5D11953FBDA7D6BC763CDC5A711AC559C4A797AEA954136D3819B348A41E"
+  },
+  "source_manifest_sha256": "5CBBEF82523DF0942FE4DA7BA8E808AAE31B23780B924A836FA3AA96C4C569C4",
+  "frozen_input_count": 842,
+  "authority_document_sha256": {
+    "ELIOT-Swarm-Controller-Execution-Map-2026-10-09.md": "399704762B1190BA9E06DB8E2CD1586771B566FDF0DD0518E973C223A7FEABDB",
+    "ELIOT-Swarm-Controller-HIGH-Appendix-Source-2026-10-09.md": "4A997D7910046092FA0EDEE66C775C05A8428FD6A7AF5D50D686503FF6FCC858",
+    "ELIOT-Swarm-Controller-Master-Audit-2026-10-09-v27.md": "3DEE8664DABA6AC3551128ECF005BFA4E2E21B423346D9D0CE039A1F4F9D2CFF",
+    "ELIOT-Swarm-Controller-Original-Unverified-Suspicions.md": "2DADAADD9BC56B7ABF66EE564732928BFFE29ED0D7E08297F1893E1C8B8BADB0",
+    "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md": "AE8406869C2026D0837EEC15EAF0AF68FCB16448008850597F25A44F5933A974"
+  },
+  "verification": {
+    "app370371-windows-clippy-v1": {
+      "status": "PASS",
+      "record_sha256": "3CDEFAE5706BC9F5DBD4FEB5E60AE6EFCE6BE3663174B65D54FF268AA40077DC",
+      "source_stable": true,
+      "log_sha256": "0FB864BF66E5644A23C380FB6B20CB484D0D1C2302E6228D034F99D90FD6C5BF",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-observer",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "app370371-windows-tests-v1": {
+      "status": "PASS",
+      "record_sha256": "E8701D167BEFDEDD32B86B14FCF64F7B1EAD505AD24D5274FDEE3ADEB9EC0EFE",
+      "source_stable": true,
+      "log_sha256": "0672A02C22F06FA125F681543B89695F087A0998DC8524642974F2F5B32A99B0",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-observer",
+        "--lib",
+        "-E",
+        "test(recorder_append_and_decode_share_schema_gates_before_persistence) | test(timed_out_shutdown_keeps_reservation_until_detached_worker_releases_record)"
+      ]
+    },
+    "app370371-linux-clippy-v1": {
+      "status": "PASS",
+      "record_sha256": "A8AFCB2735B9163C5C0CE1170C4D3B0F5F844684AEEC2459B9E78D0D29D73460",
+      "source_stable": true,
+      "log_sha256": "551A31039EF8A8A9EEE059A0ABD45552CF928586212D84B5AFCE982F74AE2E9E",
+      "command": [
+        "+1.98.1",
+        "clippy",
+        "--locked",
+        "-p",
+        "swarm-observer",
+        "-p",
+        "swarm-kernel-host",
+        "--lib",
+        "--bins",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "app370371-linux-tests-v1": {
+      "status": "PASS",
+      "record_sha256": "A57DE2A74DCF286C89A8925F4608CF1A00A97B3CC8E78EDFE587C9D6688AD065",
+      "source_stable": true,
+      "log_sha256": "ABBADE3DF6158086A6F557DBB5F7938683B8B0CEA680B31BBB62EBF69879F6B3",
+      "command": [
+        "+1.98.1",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "swarm-observer",
+        "--lib",
+        "-E",
+        "test(recorder_append_and_decode_share_schema_gates_before_persistence) | test(timed_out_shutdown_keeps_reservation_until_detached_worker_releases_record)"
+      ]
+    }
+  },
+  "actual_consumers": {
+    "windows": [
+      "recorder_tail_recovery_tests::recorder_append_and_decode_share_schema_gates_before_persistence",
+      "recorder_tail_recovery_tests::timed_out_shutdown_keeps_reservation_until_detached_worker_releases_record"
+    ],
+    "linux": [
+      "recorder_tail_recovery_tests::recorder_append_and_decode_share_schema_gates_before_persistence",
+      "recorder_tail_recovery_tests::timed_out_shutdown_keeps_reservation_until_detached_worker_releases_record"
+    ]
+  },
+  "rust_version": "1.98.1",
+  "independent_review": {
+    "p2": 0,
+    "reviewed_payload_sha256": "987166C79D6B6C99EE58C5CE0C69FA746924370836F17018887749923ED826C0",
+    "p1": 0,
+    "sha256": "8AC020176457C62F1126E4290A731F178F0C77DD02E2E56473E2B566EAD61677",
+    "artifact": "app370371-independent-routed-source-review-v1-20261012.json"
+  },
+  "format_transfer": {
+    "derived_source_sha256": "C06C5D11953FBDA7D6BC763CDC5A711AC559C4A797AEA954136D3819B348A41E",
+    "gates_run_on_formatted_candidate": true,
+    "original_payload_sha256": "987166C79D6B6C99EE58C5CE0C69FA746924370836F17018887749923ED826C0",
+    "production_logic_unchanged": true,
+    "source_delta": "Two rustfmt layout hunks in the timeout fixture only"
+  },
+  "owned_root_wip": {
+    "frozen_copy_preserved": true,
+    "only_reviewed_owner_source_admitted": true,
+    "original_sha256": "987166C79D6B6C99EE58C5CE0C69FA746924370836F17018887749923ED826C0"
+  },
+  "boundaries": [
+    "Strict observer+host production Clippy and two real thread/disk consumers each Windows/Linux",
+    "Other four Windows/three Linux observer tests skipped in affected gate",
+    "Source-bound independent review transferred through exact independently derived rustfmt output",
+    "Full connected workspace/native/model/crash/fault/load and V27 audit completion remain pending"
+  ],
+  "full_v27_qualified": false
+}
