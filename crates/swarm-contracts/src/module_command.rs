@@ -7,10 +7,51 @@ use crate::native_mcp::{
     NATIVE_MCP_ARM_METHOD, NATIVE_MCP_INSTALL_METHOD, NATIVE_MCP_OBSERVE_METHOD,
     NATIVE_MCP_READ_METHOD, NativeMcpPhase,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const COMMAND_RELEASE_EVIDENCE_METHOD: &str = "native.command.release_evidence";
+pub const COMMAND_RELEASE_EVIDENCE_FIELD: &str = "capture_release_evidence";
+
+/// Store's immutable readback proof authorizing deletion of one Command run's
+/// native captures. The Operation envelope supplies release-operation identity
+/// and binding authority; these fields bind the proof to the target and every
+/// persisted output page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandCaptureReleaseEvidence {
+    pub schema_version: u8,
+    pub target_operation_id: String,
+    pub target_input_sha256: String,
+    pub target_outcome_sha256: String,
+    pub outputs: Vec<CommandCaptureOutputCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandCaptureOutputCoverage {
+    pub native_output: String,
+    pub target_command_output: Value,
+    pub pages: Vec<CommandCaptureArtifactPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandCaptureArtifactPage {
+    pub result_operation_id: String,
+    pub result_input_sha256: String,
+    pub artifact_ref: String,
+    pub artifact_sha256: String,
+    pub artifact_byte_length: u64,
+    pub offset_bytes: u64,
+    pub byte_length: u64,
+    pub total_bytes: u64,
+    pub page_sha256: String,
+    pub eof: bool,
+}
+
 /// Every command that may require a selected module credential.
-pub const MODULE_COMMAND_METHODS: [&str; 18] = [
+pub const MODULE_COMMAND_METHODS: [&str; 19] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -25,6 +66,7 @@ pub const MODULE_COMMAND_METHODS: [&str; 18] = [
     "native.opencode.loop_step",
     "native.command.cancel_turn",
     "native.command.close_session",
+    COMMAND_RELEASE_EVIDENCE_METHOD,
     NATIVE_MCP_INSTALL_METHOD,
     NATIVE_MCP_OBSERVE_METHOD,
     NATIVE_MCP_ARM_METHOD,
@@ -33,7 +75,7 @@ pub const MODULE_COMMAND_METHODS: [&str; 18] = [
 
 /// Commands selected by the module-demand page. Native-MCP phases reuse an
 /// already-retained native session and do not create a second process demand.
-pub const MODULE_DEMAND_METHODS: [&str; 14] = [
+pub const MODULE_DEMAND_METHODS: [&str; 15] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -48,6 +90,7 @@ pub const MODULE_DEMAND_METHODS: [&str; 14] = [
     "native.opencode.loop_step",
     "native.command.cancel_turn",
     "native.command.close_session",
+    COMMAND_RELEASE_EVIDENCE_METHOD,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +110,7 @@ pub enum RuntimeCommandKind {
     OpenCodeLoopStep,
     CommandCancelTurn,
     CommandCloseSession,
+    CommandReleaseEvidence,
     NativeMcp(NativeMcpPhase),
 }
 
@@ -88,6 +132,7 @@ impl RuntimeCommandKind {
             Self::OpenCodeLoopStep => "native.opencode.loop_step",
             Self::CommandCancelTurn => "native.command.cancel_turn",
             Self::CommandCloseSession => "native.command.close_session",
+            Self::CommandReleaseEvidence => COMMAND_RELEASE_EVIDENCE_METHOD,
             Self::NativeMcp(phase) => phase.method(),
         }
     }
@@ -101,6 +146,7 @@ impl RuntimeCommandKind {
 pub enum RuntimeCommandClassError {
     UnknownMethod,
     InvalidAgentSendDelivery,
+    InvalidCommandReleaseEvidence,
 }
 
 impl RuntimeCommandClassError {
@@ -108,6 +154,7 @@ impl RuntimeCommandClassError {
         match self {
             Self::UnknownMethod => "MODULE_COMMAND_UNMAPPED",
             Self::InvalidAgentSendDelivery => "MODULE_COMMAND_INVALID",
+            Self::InvalidCommandReleaseEvidence => "MODULE_COMMAND_INVALID",
         }
     }
 
@@ -118,6 +165,9 @@ impl RuntimeCommandClassError {
             }
             Self::InvalidAgentSendDelivery => {
                 "agent.send requires exact delivery next_turn or steer"
+            }
+            Self::InvalidCommandReleaseEvidence => {
+                "Command capture release requires its exact target and Store artifact evidence"
             }
         }
     }
@@ -146,6 +196,19 @@ pub fn classify_runtime_command(
         "native.opencode.loop_step" => RuntimeCommandKind::OpenCodeLoopStep,
         "native.command.cancel_turn" => RuntimeCommandKind::CommandCancelTurn,
         "native.command.close_session" => RuntimeCommandKind::CommandCloseSession,
+        COMMAND_RELEASE_EVIDENCE_METHOD => {
+            let evidence = input.get(COMMAND_RELEASE_EVIDENCE_FIELD).and_then(|value| {
+                serde_json::from_value::<CommandCaptureReleaseEvidence>(value.clone()).ok()
+            });
+            if input.get("target_operation_id").and_then(Value::as_str)
+                != evidence
+                    .as_ref()
+                    .map(|value| value.target_operation_id.as_str())
+            {
+                return Err(RuntimeCommandClassError::InvalidCommandReleaseEvidence);
+            }
+            RuntimeCommandKind::CommandReleaseEvidence
+        }
         NATIVE_MCP_INSTALL_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Install),
         NATIVE_MCP_OBSERVE_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Observe),
         NATIVE_MCP_ARM_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Arm),

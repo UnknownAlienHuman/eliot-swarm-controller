@@ -36,10 +36,142 @@ fn descriptor_pre_input_open(
     )
 }
 
+fn codex_goal_contract_complete(
+    identity: &super::module_handshake::RetainedModuleIdentity,
+) -> bool {
+    use swarm_contracts::module_contract;
+
+    ["agent.open", "task.dispatch", "agent.send"]
+        .iter()
+        .all(|required| {
+            identity
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == *required)
+        })
+        && identity
+            .command_schemas
+            .contains(&module_contract::runtime_command_schema())
+        && identity
+            .command_schemas
+            .contains(&module_contract::task_dispatch_context_schema())
+        && identity
+            .event_schemas
+            .contains(&module_contract::task_dispatch_admission_schema())
+        && identity
+            .event_schemas
+            .contains(&module_contract::goal_continuation_admission_schema())
+        && identity
+            .event_schemas
+            .contains(&module_contract::goal_terminal_evidence_schema())
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CodexControllerContract {
+    pub identity: super::module_handshake::RetainedModuleIdentity,
+    /// Manager selection freshness is required only before admitting a new
+    /// Goal continuation Operation. Existing Operations validate against
+    /// their immutable retained descriptor after a later selection change.
+    pub current_for_new_goal: bool,
+}
+
+/// Resolve the only current Codex Goal controller from this binding's exact
+/// retained descriptor. Descriptor fields gate compatibility; they grant no
+/// Store authority. Legacy Python routes remain historical readers only.
+pub(super) fn selected_codex_controller_contract(
+    db: &Connection,
+    binding: &Value,
+) -> Result<Option<CodexControllerContract>> {
+    use swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+
+    if binding["route"]["runtime"] != crate::runtime::codex::RUNTIME {
+        return Ok(None);
+    }
+    let route_artifact = binding["route"]["module_artifact_id"].as_str();
+    let binding_artifact = binding["module_artifact_id"].as_str();
+    if route_artifact != Some(CODEX_RUST_CONTROLLER_ARTIFACT_ID)
+        && binding_artifact != Some(CODEX_RUST_CONTROLLER_ARTIFACT_ID)
+    {
+        return Ok(None);
+    }
+    if route_artifact != Some(CODEX_RUST_CONTROLLER_ARTIFACT_ID)
+        || binding_artifact != Some(CODEX_RUST_CONTROLLER_ARTIFACT_ID)
+    {
+        return Err(Error::new(
+            "MODULE_ROUTE_CORRUPT",
+            "Codex binding route and retained artifact identity disagree",
+        ));
+    }
+    let selector = binding["observation"]
+        .get("module_contract_selector")
+        .filter(|selector| !selector.is_null())
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONTRACT_REQUIRED",
+                "current Codex Goal work requires its exact retained descriptor selector",
+            )
+        })?;
+    let identity = super::module_handshake::retained_contract_identity(
+        db,
+        CODEX_RUST_CONTROLLER_ARTIFACT_ID,
+        Some(selector),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "MODULE_DESCRIPTOR_MISSING",
+            "current Codex binding has no retained module descriptor",
+        )
+    })?;
+    if identity.module_id.as_str() != crate::runtime::codex::RUNTIME
+        || identity.artifact.artifact_id.as_str() != CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        || identity.protocol != swarm_contracts::module_contract::MODULE_PROTOCOL_V1
+    {
+        return Err(Error::new(
+            "MODULE_CONTRACT_INCOMPATIBLE",
+            "selected descriptor identity differs from the current Codex controller",
+        ));
+    }
+    if !codex_goal_contract_complete(&identity) {
+        return Ok(None);
+    }
+    let manager_id = binding["observation"]["module_contract_selection_owner_manager_id"].as_str();
+    let route_alias = binding["route"]["alias"].as_str();
+    let current_for_new_goal = match (manager_id, route_alias) {
+        (Some(manager_id), Some(route_alias)) => {
+            match super::module_handshake::selection_for_new_binding(
+                db,
+                manager_id,
+                route_alias,
+                crate::runtime::codex::RUNTIME,
+                CODEX_RUST_CONTROLLER_ARTIFACT_ID,
+            ) {
+                Ok(current) => current.as_ref() == Some(selector),
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "MODULE_CONTRACT_REQUIRED" | "MODULE_ROUTE_STALE"
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        _ => false,
+    };
+    Ok(Some(CodexControllerContract {
+        identity,
+        current_for_new_goal,
+    }))
+}
+
 /// A descriptor opts into normalized task dispatch only when it advertises
 /// both halves of the additive contract.  Legacy descriptors retain their
 /// existing runtime-specific codec and receipt path.
 fn selected_task_dispatch_admission(db: &Connection, binding: &Value) -> Result<bool> {
+    if selected_codex_controller_contract(db, binding)?.is_some() {
+        return Ok(true);
+    }
     let builtin_opencode = crate::config::is_task_prompt_builtin_route(
         binding["route"]["runtime"].as_str().unwrap_or_default(),
         binding["module_artifact_id"].as_str().unwrap_or_default(),
@@ -123,6 +255,7 @@ fn retained_task_dispatch_context(
 }
 
 fn goal_continuation_admission_context(
+    db: &Connection,
     operation_id: &str,
     binding_id: &str,
     binding_generation: i64,
@@ -133,7 +266,7 @@ fn goal_continuation_admission_context(
     if on_behalf["action"] != "agent.send" || on_behalf["cause"]["kind"] != "goal_progression" {
         return Ok(None);
     }
-    if !crate::runtime::codex::is_controller_route(&binding["route"]) {
+    if selected_codex_controller_contract(db, binding)?.is_none() {
         return Err(Error::new(
             "GOAL_UNSUPPORTED_RUNTIME",
             "only the Codex controller has a closed Goal continuation admission receipt",
@@ -194,6 +327,16 @@ fn validate_task_dispatch_admission(
     outcome: &RuntimeOutcome,
     module_receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
 ) -> Result<swarm_contracts::runtime::TaskDispatchAdmissionReceipt> {
+    if let Some(contract) = selected_codex_controller_contract(db, binding)?
+        && (module_receipt.module_id != contract.identity.module_id
+            || module_receipt.artifact != contract.identity.artifact
+            || module_receipt.protocol != contract.identity.protocol)
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "Codex dispatch receipt differs from the selected controller contract",
+        ));
+    }
     if model::text(operation, "method")? != "task.dispatch"
         || model::text(operation, "operation_id")? != outcome.operation_id
     {
@@ -332,6 +475,7 @@ fn validate_goal_continuation_admission(
         )
     })?;
     let expected_context = goal_continuation_admission_context(
+        db,
         &outcome.operation_id,
         binding_id,
         binding_generation,
@@ -1038,6 +1182,44 @@ fn validate_command_session_control(
     Ok(())
 }
 
+fn validate_command_capture_release_request(
+    db: &Connection,
+    binding: &Value,
+    input: &Value,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let binding_id = model::text(binding, "binding_id")?;
+    let generation = model::positive(binding, "generation")?;
+    let route_alias = model::text(&binding["route"], "alias")?;
+    if !crate::runtime::batch::is_rust_command_route(&binding["route"])
+        || binding["module_artifact_id"] != crate::runtime::batch::COMMAND_RUST_ARTIFACT_ID
+        || !config.routes.iter().any(|route| {
+            route.alias == route_alias
+                && route.runtime == crate::runtime::batch::COMMAND_RUNTIME
+                && route.module_artifact_id == crate::runtime::batch::COMMAND_RUST_ARTIFACT_ID
+        })
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_TARGET_INVALID",
+            "capture release requires the current configured Rust Command binding",
+        ));
+    }
+
+    let target_id = model::text(input, "target_operation_id")?;
+    let target = operations::get_operation(db, target_id)?;
+    if target["method"] != "task.dispatch"
+        || target["binding_id"].as_str() != Some(binding_id)
+        || target["binding_generation"].as_i64() != Some(generation)
+        || target["attempt_id"].as_str() != input.get("attempt_id").and_then(Value::as_str)
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_TARGET_INVALID",
+            "capture release must name the exact dispatch Operation, binding generation, and Attempt",
+        ));
+    }
+    Ok(())
+}
+
 fn next_internal(
     db: &mut Connection,
     p: &Principal,
@@ -1111,8 +1293,8 @@ fn next_internal(
              WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
                AND (?5=0 OR (method='agent.result' AND json_type(candidate.effective_request_json,'$.normalized_result_origin')='object'))
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
-               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
-               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
+               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
+               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
                  OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
                  OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
                  OR NOT EXISTS (SELECT 1 FROM operations AS pending
@@ -1123,7 +1305,7 @@ fn next_internal(
                            WHEN method IN ('agent.reply','agent.background','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session') THEN 1
                            WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
                            WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
-                           WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
+                            WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover','native.command.release_evidence') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
             params![id,generation,model::now_ms()?,model::canonical(&b["observation"])?,admitted_result_only],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let Some((op, method, raw, created)) = row else {
             return Ok(json!({"command":null}));
@@ -1272,15 +1454,39 @@ fn next_internal(
     let normalized_result_admitted =
         method == "agent.result" && effective["normalized_result_origin"].is_object();
     let mut trusted_launch_dispatch_packet: Option<Value> = None;
+    let mut goal_continuation_context = None;
     let mut starts_native_work = false;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
         let repair_context = if method == "agent.send"
             && o["caller_id"] == crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
         {
-            let context = super::automation_repair::context_for_delivery_operation(&tx, &op)?;
-            context.require_current_for_effect(&tx, &op)?;
-            Some(context)
+            if effective["automation_on_behalf"]["cause"]["kind"] == "goal_progression" {
+                super::automation_goal_progression::require_current_for_dispatch(
+                    &tx,
+                    &op,
+                    model::now_ms()?,
+                )?;
+                goal_continuation_context = Some(
+                    goal_continuation_admission_context(
+                        // This Operation was admitted at reservation. The
+                        // dispatch guard above revalidates all current authority
+                        // while preserving its immutable descriptor selection.
+                        &tx, &op, &id, generation, &b, &effective,
+                    )?
+                    .ok_or_else(|| {
+                        Error::new(
+                            "AUTOMATION_LINK_CORRUPT",
+                            "Goal continuation has no validated Codex context",
+                        )
+                    })?,
+                );
+                None
+            } else {
+                let context = super::automation_repair::context_for_delivery_operation(&tx, &op)?;
+                context.require_current_for_effect(&tx, &op)?;
+                Some(context)
+            }
         } else {
             None
         };
@@ -1309,6 +1515,7 @@ fn next_internal(
         }
         let caller = if opening_actor.is_some()
             || repair_context.is_some()
+            || goal_continuation_context.is_some()
             || normalized_result_admitted
             || internal_native_mcp
         {
@@ -1439,6 +1646,7 @@ fn next_internal(
         }
         if method != "agent.open"
             && repair_context.is_none()
+            && goal_continuation_context.is_none()
             && !normalized_result_admitted
             && !internal_native_mcp
             && caller["role"] != "operator"
@@ -1493,6 +1701,7 @@ fn next_internal(
                 let operation_principal = operation_caller_principal(&tx, &o)?;
                 super::gm::require_attempt_control(&tx, &operation_principal, &a)?;
             }
+            task_prompt::validate_snapshot_evidence_plan(&a["task_snapshot"])?;
             trusted_launch_dispatch_packet =
                 super::launcher_dispatch::validate_before_effect(&tx, config, &op, &input, &b)?;
         }
@@ -1574,9 +1783,7 @@ fn next_internal(
     if won != 1 {
         return Err(Error::conflict("dispatch already admitted"));
     }
-    if let Some(context) =
-        goal_continuation_admission_context(&op, &id, generation, &b, &effective)?
-    {
+    if let Some(context) = goal_continuation_context {
         // This is authenticated Store enrichment. It is deliberately outside
         // the immutable request digest and is present only for the exact
         // manager-owned Codex continuation Operation.
@@ -1605,7 +1812,7 @@ fn next_internal(
             )?;
         }
         if !uses_task_prompt
-            && (crate::runtime::codex::is_controller_route(&b["route"])
+            && (crate::runtime::codex::is_historical_python_route(&b["route"])
                 || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
                 || pre_input_open.is_some()
                 || crate::runtime::batch::is_command_route(&b["route"]))
@@ -2311,7 +2518,7 @@ fn codex_goal_terminal_evidence(
     if marker.is_null() {
         return Ok(None);
     }
-    if !crate::runtime::codex::is_controller_route(&binding["route"])
+    if selected_codex_controller_contract(tx, binding)?.is_none()
         || !matches!(
             operation["method"].as_str(),
             Some("task.dispatch" | "agent.send")
@@ -2502,6 +2709,7 @@ pub(super) fn outcome_with_artifacts(
         && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted);
     let module_receipt = if b["observation"].get("module_contract_selector").is_some()
         || builtin_opencode_dispatch
+        || o["method"] == swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
         || (zed::is_current_route(&b["route"])
             && o["method"] == "task.dispatch"
             && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted))
@@ -2590,7 +2798,7 @@ pub(super) fn outcome_with_artifacts(
     let sessionless_batch = crate::runtime::batch::is_sessionless_route(&b["route"]);
     if b["route"]["runtime"] == crate::runtime::codex::RUNTIME
         && b["observation"].get("module_contract_selector").is_none()
-        && !crate::runtime::codex::is_controller_route(&b["route"])
+        && !crate::runtime::codex::is_historical_python_route(&b["route"])
         && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted)
         && matches!(
             o["method"].as_str(),
@@ -2602,8 +2810,15 @@ pub(super) fn outcome_with_artifacts(
             "the standalone Codex observer cannot establish controller input admission",
         ));
     }
+    let command_capture_release =
+        o["method"] == swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD;
+    if command_capture_release {
+        super::command_results::validate_capture_release_outcome(&tx, &b, &o, &r)?;
+    }
     if sessionless_batch {
-        crate::runtime::batch::validate_outcome(&b["route"], model::text(&o, "method")?, &r)?;
+        if !command_capture_release {
+            crate::runtime::batch::validate_outcome(&b["route"], model::text(&o, "method")?, &r)?;
+        }
         if crate::runtime::batch::is_command_route(&b["route"]) && o["method"] == "task.dispatch" {
             validate_command_dispatch_receipt(&tx, &o, &b["route"], &r)?;
         }
@@ -2726,7 +2941,7 @@ pub(super) fn outcome_with_artifacts(
             "outcome names another native root",
         ));
     }
-    if crate::runtime::codex::is_controller_route(&b["route"])
+    if crate::runtime::codex::is_historical_python_route(&b["route"])
         && o["method"] == "agent.send"
         && matches!(r.outcome, EffectOutcome::Applied)
     {
@@ -2741,7 +2956,7 @@ pub(super) fn outcome_with_artifacts(
         } else {
             None
         };
-        crate::runtime::codex::validate_input_receipt(
+        crate::runtime::codex::validate_historical_input_receipt(
             &b,
             &r,
             model::text(&request, "text")?,
@@ -3017,7 +3232,7 @@ pub(super) fn outcome_with_artifacts(
                 let attempt = model::text(&o, "attempt_id")?;
                 let mut producer = json!({"assignment_id":r.operation_id,"native_session_id":b["native_root_id"],"disposition":"admitted"});
                 match (r.turn_id.as_deref(), r.native_input_id.as_deref()) {
-                    _ if crate::runtime::codex::is_controller_route(&b["route"])
+                    _ if crate::runtime::codex::is_historical_python_route(&b["route"])
                         || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
                         || pre_input_open.is_some() =>
                     {
@@ -3044,7 +3259,7 @@ pub(super) fn outcome_with_artifacts(
                                 model::text(&request, "text")?,
                             )?
                         } else {
-                            crate::runtime::codex::dispatch_producer(
+                            crate::runtime::codex::historical_dispatch_producer(
                                 &b,
                                 &r,
                                 &a["task_snapshot"],
@@ -4947,6 +5162,17 @@ fn user_command_with_actor(
     let command_result_route =
         method == "agent.result" && crate::runtime::batch::is_rust_command_route(&b["route"]);
     let strict_command_result = command_result_route && !normalized_result_request;
+    let command_capture_release =
+        method == swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD;
+    let command_capture_release_target = if command_capture_release {
+        validate_command_capture_release_request(tx, &b, v, config)?;
+        Some(operations::get_operation(
+            tx,
+            model::text(v, "target_operation_id")?,
+        )?)
+    } else {
+        None
+    };
     let command_result_target_snapshot = if command_result_route
         && matches!(
             v["selector"]["kind"].as_str(),
@@ -4959,6 +5185,7 @@ fn user_command_with_actor(
     if crate::runtime::batch::is_sessionless_route(&b["route"])
         && !strict_command_result
         && !normalized_result_request
+        && !command_capture_release
     {
         crate::runtime::batch::validate_command(&b["route"], method, v)?;
     }
@@ -5537,6 +5764,16 @@ fn user_command_with_actor(
             ],
         )?;
     }
+    if let Some(target) = command_capture_release_target.as_ref() {
+        tx.execute(
+            "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+            params![
+                op,
+                target["task_id"].as_str(),
+                target["attempt_id"].as_str()
+            ],
+        )?;
+    }
     tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,prerequisite_operation_id=?4,effective_request_json=?5 WHERE operation_id=?1",params![op,id,generation,prerequisite_id,model::canonical(&effective)?])?;
     Ok(
         json!({"operation_id":op,"state":"queued","native_admission":"not_observed","prerequisite_operation_id":prerequisite_id,"prerequisite_state":prerequisite.receipt_state()}),
@@ -5739,5 +5976,383 @@ mod command_receipt_binding_tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "FORBIDDEN");
+    }
+}
+
+#[cfg(test)]
+mod codex_goal_controller_contract_fixtures {
+    use super::*;
+    use std::path::PathBuf;
+    use swarm_contracts::{
+        module_catalog::{
+            ActivationPolicy, ArtifactVersion, LaunchSpec, LifecycleOwnership, RestartPolicy,
+        },
+        module_contract::ModuleContractTemplate,
+    };
+
+    fn selected_codex_binding(version: &str) -> (Connection, Value) {
+        let mut template = if version == "5" {
+            ModuleContractTemplate::codex_rust_controller_v5().unwrap()
+        } else {
+            ModuleContractTemplate::codex_rust_controller_v6().unwrap()
+        };
+        if version != "5" {
+            template.artifact.version = ArtifactVersion::new(version).unwrap();
+        }
+        let descriptor = template
+            .descriptor(
+                LaunchSpec {
+                    executable: if cfg!(windows) {
+                        PathBuf::from(r"C:\modules\codex-rust-controller.exe")
+                    } else {
+                        PathBuf::from("/modules/codex-rust-controller")
+                    },
+                    argv: Vec::new(),
+                    environment: Vec::new(),
+                    credential_ref: None,
+                    working_directory: None,
+                    inherited_environment_allowlist: Default::default(),
+                    executable_sha256: None,
+                },
+                LifecycleOwnership::OwnedService,
+                ActivationPolicy::OnDemand,
+                true,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        let artifact_id = swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+        let manager_id = "codex-fixture-manager";
+        let route = crate::config::Route {
+            alias: "codex-contract-fixture".to_owned(),
+            runtime: "codex".to_owned(),
+            module_artifact_id: artifact_id.to_owned(),
+            enabled: true,
+            native_options: json!({
+                "modelProvider":"fixture",
+                "model":"fixture-model",
+                "workspaceRoot":if cfg!(windows) { r"C:\workspace" } else { "/workspace" }
+            }),
+            workspace_option: Some("workspaceRoot".to_owned()),
+            admission_policy: None,
+            owned_service: None,
+        };
+        let config = crate::config::Config {
+            routes: vec![route.clone()],
+            ..crate::config::Config::default()
+        };
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let registration =
+            super::super::module_handshake::register_trusted_descriptor(&tx, descriptor.clone())
+                .unwrap();
+        let manager = crate::model::Principal {
+            link_id: "codex-fixture-link".to_owned(),
+            client_id: manager_id.to_owned(),
+            role: crate::model::Role::Manager,
+        };
+        super::super::module_handshake::select_route(
+            &tx,
+            &manager,
+            &json!({
+                "route_alias":route.alias,
+                "module_id":descriptor.module_id,
+                "artifact_id":descriptor.artifact.artifact_id,
+                "version":descriptor.artifact.version,
+                "expected_catalog_revision":registration["catalog_revision"]
+            }),
+            &config,
+            "select-codex-fixture",
+        )
+        .unwrap();
+        let selector = super::super::module_handshake::selection_for_new_binding(
+            &tx,
+            manager_id,
+            &route.alias,
+            &route.runtime,
+            &route.module_artifact_id,
+        )
+        .unwrap()
+        .unwrap();
+        tx.commit().unwrap();
+        let binding = json!({
+            "module_artifact_id":artifact_id,
+            "route":route,
+            "observation":{
+                "module_contract_selector":selector,
+                "module_contract_selection_owner_manager_id":manager_id
+            }
+        });
+        (db, binding)
+    }
+
+    #[test]
+    fn partial_codex_contract_blocks_goal_continuation_before_dispatch() {
+        let (db, binding) = selected_codex_binding("5");
+        assert!(selected_task_dispatch_admission(&db, &binding).unwrap());
+        assert!(
+            selected_codex_controller_contract(&db, &binding)
+                .unwrap()
+                .is_none()
+        );
+        let effective = json!({
+            "automation_on_behalf":{
+                "action":"agent.send",
+                "cause":{"kind":"goal_progression"}
+            }
+        });
+        let error = goal_continuation_admission_context(
+            &db,
+            "codex-continuation-fixture",
+            "codex-binding-fixture",
+            1,
+            &binding,
+            &effective,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "GOAL_UNSUPPORTED_RUNTIME");
+
+        let (db, binding) = selected_codex_binding(
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
+        );
+        assert!(selected_task_dispatch_admission(&db, &binding).unwrap());
+        assert!(
+            selected_codex_controller_contract(&db, &binding)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn current_codex_dispatch_rejects_receipt_from_another_protocol() {
+        let (db, binding) = selected_codex_binding(
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
+        );
+        let contract = selected_codex_controller_contract(&db, &binding)
+            .unwrap()
+            .unwrap();
+        let receipt = swarm_contracts::runtime::ModuleReceiptIdentity {
+            schema_version: 1,
+            module_id: contract.identity.module_id,
+            artifact: contract.identity.artifact,
+            protocol: swarm_contracts::module_catalog::ProtocolVersion { major: 1, minor: 1 },
+            binding_id: "codex-binding-fixture".to_owned(),
+            binding_generation: 1,
+            operation_id: "codex-dispatch-fixture".to_owned(),
+            input_sha256: "0".repeat(64),
+        };
+        let outcome = RuntimeOutcome {
+            operation_id: "codex-dispatch-fixture".to_owned(),
+            outcome: EffectOutcome::Applied,
+            native_scope_key: None,
+            native_root_id: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({}),
+        };
+        let error = validate_task_dispatch_admission(
+            &db,
+            "codex-binding-fixture",
+            1,
+            &binding,
+            &json!({}),
+            &outcome,
+            &receipt,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "TASK_DISPATCH_ADMISSION_INVALID");
+    }
+
+    #[test]
+    fn complete_contract_uses_selected_version_and_rejects_superseded_goal_admission() {
+        let (db, binding) = selected_codex_binding("7");
+        let contract = selected_codex_controller_contract(&db, &binding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(contract.identity.artifact.version.as_str(), "7");
+        assert!(contract.current_for_new_goal);
+
+        let (db, mut binding) = selected_codex_binding(
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
+        );
+        let route: crate::config::Route = serde_json::from_value(binding["route"].clone()).unwrap();
+        let config = crate::config::Config {
+            routes: vec![route.clone()],
+            ..crate::config::Config::default()
+        };
+        let mut template = ModuleContractTemplate::codex_rust_controller_v6().unwrap();
+        template.artifact.version = ArtifactVersion::new("7").unwrap();
+        let descriptor = template
+            .descriptor(
+                LaunchSpec {
+                    executable: if cfg!(windows) {
+                        PathBuf::from(r"C:\modules\codex-rust-controller-v7.exe")
+                    } else {
+                        PathBuf::from("/modules/codex-rust-controller-v7")
+                    },
+                    argv: Vec::new(),
+                    environment: Vec::new(),
+                    credential_ref: None,
+                    working_directory: None,
+                    inherited_environment_allowlist: Default::default(),
+                    executable_sha256: None,
+                },
+                LifecycleOwnership::OwnedService,
+                ActivationPolicy::OnDemand,
+                true,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let registration =
+            super::super::module_handshake::register_trusted_descriptor(&tx, descriptor.clone())
+                .unwrap();
+        let manager = crate::model::Principal {
+            link_id: "codex-fixture-link".to_owned(),
+            client_id: "codex-fixture-manager".to_owned(),
+            role: crate::model::Role::Manager,
+        };
+        super::super::module_handshake::select_route(
+            &tx,
+            &manager,
+            &json!({
+                "route_alias":route.alias,
+                "module_id":descriptor.module_id,
+                "artifact_id":descriptor.artifact.artifact_id,
+                "version":descriptor.artifact.version,
+                "expected_catalog_revision":registration["catalog_revision"]
+            }),
+            &config,
+            "supersede-codex-fixture",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let retained = selected_codex_controller_contract(&db, &binding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.identity.artifact.version.as_str(),
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
+        );
+        assert!(!retained.current_for_new_goal);
+
+        binding["observation"]["bridge_boot_id"] = json!("codex-fixture-boot");
+        let continuation = GoalContinuationLink {
+            schema_id: swarm_contracts::module_contract::GOAL_CONTINUATION_SCHEMA_ID.to_owned(),
+            schema_version: GoalContinuationLink::VERSION,
+            method: "agent.send".to_owned(),
+            owner: GoalContinuationLink::OWNER.to_owned(),
+            source_operation_id: "source-operation-fixture".to_owned(),
+            source_observation_id: 1,
+            terminal_event: swarm_contracts::runtime::GoalTerminalEventRef {
+                id: "terminal-event-fixture".to_owned(),
+                seq: 1,
+                sha256: "0".repeat(64),
+            },
+            native_session_id: "native-session-fixture".to_owned(),
+            native_input_id: "native-input-fixture".to_owned(),
+            native_run_id: None,
+            task_id: "task-fixture".to_owned(),
+            task_revision: 1,
+            attempt_id: "attempt-fixture".to_owned(),
+            binding_id: "codex-binding-fixture".to_owned(),
+            binding_generation: 1,
+            goal_id: "goal-fixture".to_owned(),
+            goal_revision: 1,
+            objective_sha256: "0".repeat(64),
+        };
+        let effective = json!({
+            "automation_on_behalf":{
+                "action":"agent.send",
+                "cause":{
+                    "kind":"goal_progression",
+                    "source_operation_id":continuation.source_operation_id.clone(),
+                    "source_observation_id":continuation.source_observation_id,
+                    "terminal_event":continuation.terminal_event.clone(),
+                    "continuation":continuation.clone()
+                }
+            }
+        });
+        let retained_context = goal_continuation_admission_context(
+            &db,
+            "codex-continuation-fixture",
+            "codex-binding-fixture",
+            1,
+            &binding,
+            &effective,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained_context.binding_id, "codex-binding-fixture");
+        assert_eq!(retained_context.continuation, continuation);
+    }
+
+    #[test]
+    fn disabled_retained_codex_descriptor_cannot_authorize_goal_progression() {
+        let (db, binding) = selected_codex_binding(
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
+        );
+        let mut registry: Value = db
+            .query_row(
+                "SELECT value_json FROM meta WHERE key='module_catalog:trusted_descriptors:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .map(|value: String| serde_json::from_str(&value).unwrap())
+            .unwrap();
+        registry["descriptors"][0]["descriptor"]["enabled"] = json!(false);
+        db.execute(
+            "UPDATE meta SET value_json=?1 WHERE key='module_catalog:trusted_descriptors:v1'",
+            [crate::model::canonical(&registry).unwrap()],
+        )
+        .unwrap();
+
+        let error = selected_codex_controller_contract(&db, &binding).unwrap_err();
+        assert_eq!(error.code, "MODULE_DISABLED");
+    }
+
+    #[test]
+    fn partial_codex_descriptor_cannot_authorize_terminal_goal_evidence() {
+        let (db, binding) = selected_codex_binding("5");
+        let tx = db.unchecked_transaction().unwrap();
+        let outcome = RuntimeOutcome {
+            operation_id: "codex-terminal-fixture".to_owned(),
+            outcome: EffectOutcome::Applied,
+            native_scope_key: None,
+            native_root_id: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({"goal_terminal_event":{}}),
+        };
+        assert!(codex_goal_terminal_evidence(&tx, &binding, &json!({}), &outcome).is_err());
+    }
+
+    #[test]
+    fn historical_python_route_cannot_admit_new_goal_continuation() {
+        let db = Connection::open_in_memory().unwrap();
+        let artifact_id = crate::runtime::codex::HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID;
+        let binding = json!({
+            "module_artifact_id":artifact_id,
+            "route":{"runtime":"codex","module_artifact_id":artifact_id},
+            "observation":{}
+        });
+        let effective = json!({
+            "automation_on_behalf":{
+                "action":"agent.send",
+                "cause":{"kind":"goal_progression"}
+            }
+        });
+        let error = goal_continuation_admission_context(
+            &db,
+            "codex-continuation-fixture",
+            "codex-binding-fixture",
+            1,
+            &binding,
+            &effective,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "GOAL_UNSUPPORTED_RUNTIME");
     }
 }

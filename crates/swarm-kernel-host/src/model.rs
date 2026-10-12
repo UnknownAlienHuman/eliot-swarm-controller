@@ -330,6 +330,22 @@ impl Principal {
 pub struct Requirement {
     pub id: String,
     pub statement: String,
+    /// Per-requirement evidence policy. Absent on retained legacy
+    /// V1 Task specs; required on every current V2 Task requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<RequirementVerificationV1>,
+}
+
+/// The frozen evidence policy for one requirement. A requirement
+/// must select independent review evidence, machine CheckRun
+/// evidence, or both. One exact CheckProfileRef may be referenced
+/// by several requirements and is executed once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementVerificationV1 {
+    pub review_required: bool,
+    #[serde(default)]
+    pub check_profiles: Vec<crate::acceptance::CheckProfileRef>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -394,9 +410,11 @@ pub struct TaskBrief {
     pub objective: String,
     pub phase: String,
     pub requirements: Vec<Requirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirement_evidence_plan: Option<Value>,
     pub dependencies: Vec<Dependency>,
     pub scope: Option<Scope>,
-    pub acceptance: Option<crate::acceptance::AcceptancePolicy>,
+    pub acceptance: Option<crate::acceptance::RetainedAcceptancePolicy>,
     pub owner_policy_id: Option<String>,
     pub source_index: Vec<TaskSourceIndexEntry>,
 }
@@ -406,7 +424,7 @@ pub struct TaskBrief {
 pub struct TaskSpec {
     /// Absent policy does not block writing/submitting, but cannot imply acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptance: Option<crate::acceptance::AcceptancePolicy>,
+    pub acceptance: Option<crate::acceptance::RetainedAcceptancePolicy>,
     pub objective: String,
     pub phase: String,
     pub requirements: Vec<Requirement>,
@@ -427,6 +445,11 @@ pub struct TaskSpec {
 }
 impl TaskSpec {
     pub fn brief(&self) -> TaskBrief {
+        self.try_brief()
+            .expect("Task brief requires a valid V2 requirement evidence plan")
+    }
+
+    pub fn try_brief(&self) -> Result<TaskBrief> {
         let mut source_index = self.source_index.clone();
         for entry in &mut source_index {
             if entry.status == SourceIndexStatus::Gap
@@ -445,21 +468,76 @@ impl TaskSpec {
                 source_index.push(TaskSourceIndexEntry::legacy_gap(source_ref));
             }
         }
-        TaskBrief {
+        let requirement_evidence_plan = match self.acceptance.as_ref() {
+            Some(crate::acceptance::RetainedAcceptancePolicy::V2(_)) => {
+                let value = serde_json::to_value(self)?;
+                Some(
+                    swarm_kernel::acceptance::requirement_evidence_plan_value(&value)
+                        .map_err(requirement_evidence_error)?,
+                )
+            }
+            Some(crate::acceptance::RetainedAcceptancePolicy::LegacyV1(_)) | None => None,
+        };
+        Ok(TaskBrief {
             objective: self.objective.clone(),
             phase: self.phase.clone(),
             requirements: self.requirements.clone(),
+            requirement_evidence_plan,
             dependencies: self.dependencies.clone(),
             scope: self.scope.clone(),
             acceptance: self.acceptance.clone(),
             owner_policy_id: self.owner_policy_id.clone(),
             source_index,
-        }
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_retained()
+    }
+
+    /// Validate a retained Task spec: either a valid legacy
+    /// V1 spec or a valid current V2 spec. Used for frozen
+    /// historical Task/Attempt readback, never for new writes.
+    pub fn validate_retained(&self) -> Result<()> {
         if let Some(policy) = &self.acceptance {
-            policy.validate()?;
+            policy.validate_retained()?;
+        }
+        let value = serde_json::to_value(self)?;
+        swarm_kernel::tasks::validate_spec(&value).map_err(task_validation_error)
+    }
+
+    /// Validate a current admission spec: the exact V2
+    /// acceptance marker with a complete per-requirement
+    /// verification policy, or no acceptance policy at
+    /// all. New legacy V1 writes and mixed/partial markers
+    /// reject. A V2 Task without acceptance forbids
+    /// verification fields so they are not silently ignored.
+    pub fn validate_current_admission(&self) -> Result<()> {
+        match &self.acceptance {
+            None => {
+                if self
+                    .requirements
+                    .iter()
+                    .any(|requirement| requirement.verification.is_some())
+                {
+                    return Err(Error::new(
+                        "ACCEPTANCE_POLICY_REQUIRED",
+                        "verification fields require the exact V2 acceptance policy",
+                    ));
+                }
+            }
+            Some(crate::acceptance::RetainedAcceptancePolicy::V2(policy)) => {
+                policy.validate()?;
+                let value = serde_json::to_value(self)?;
+                swarm_kernel::acceptance::requirement_evidence_plan(&value)
+                    .map_err(requirement_evidence_error)?;
+            }
+            Some(crate::acceptance::RetainedAcceptancePolicy::LegacyV1(_)) => {
+                return Err(Error::new(
+                    "ACCEPTANCE_POLICY_VERSION",
+                    "current Task admission accepts only the exact V2 acceptance policy marker",
+                ));
+            }
         }
         let value = serde_json::to_value(self)?;
         swarm_kernel::tasks::validate_spec(&value).map_err(task_validation_error)
@@ -467,6 +545,10 @@ impl TaskSpec {
 }
 
 fn task_validation_error(error: swarm_kernel::tasks::ValidationError) -> Error {
+    Error::new(error.code(), error.message())
+}
+
+fn requirement_evidence_error(error: swarm_kernel::acceptance::ValidationError) -> Error {
     Error::new(error.code(), error.message())
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -811,6 +893,38 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             positive(params, "generation")?;
             text(params, "session_id")?;
             text(params, "target_operation_id")?;
+            return Ok(());
+        }
+        "native.command.release_evidence" => {
+            fields(
+                params,
+                &[
+                    "client_request_id",
+                    "binding_id",
+                    "generation",
+                    "target_operation_id",
+                    "attempt_id",
+                    swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD,
+                ],
+            )?;
+            text(params, "client_request_id")?;
+            text(params, "binding_id")?;
+            positive(params, "generation")?;
+            let target_operation_id = text(params, "target_operation_id")?;
+            if params.get("attempt_id").is_some() {
+                text(params, "attempt_id")?;
+            }
+            let evidence: swarm_contracts::module_command::CommandCaptureReleaseEvidence =
+                serde_json::from_value(
+                    params[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD].clone(),
+                )
+                .map_err(|_| Error::invalid("Command capture release evidence is malformed"))?;
+            if evidence.target_operation_id != target_operation_id {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_EVIDENCE_INVALID",
+                    "release envelope target differs from its typed artifact evidence",
+                ));
+            }
             return Ok(());
         }
         "agent.configure" => &[

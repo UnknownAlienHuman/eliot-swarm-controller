@@ -10,7 +10,7 @@ use super::operation_lifecycle::{
 };
 use super::{capacity, operations, results, submissions, tasks};
 use crate::{
-    acceptance::{AcceptRequest, AcceptancePolicy, RequirementReview},
+    acceptance::{AcceptRequest, RequirementReview, RetainedAcceptancePolicy},
     automation::{
         acceptance::{AcceptanceContext, AcceptanceReviewEvidence, assignment_sponsor_authorized},
         actions::AutomationStep,
@@ -268,7 +268,7 @@ pub(super) fn consume_review_result_for_entry(
     }
 
     let spec: TaskSpec = serde_json::from_value(attempt["task_snapshot"]["spec"].clone())?;
-    spec.validate()?;
+    spec.validate_retained()?;
     if review.identity.review_policy_generation != review_policy_generation(&spec)? {
         return Ok(skipped(
             &review,
@@ -283,14 +283,48 @@ pub(super) fn consume_review_result_for_entry(
             "the exact Task revision has no explicit acceptance policy",
         ));
     };
-    policy.validate()?;
+    policy.validate_retained()?;
+
+    // V2 authority comes from the exact plan frozen with this Attempt. The
+    // retained V1 branch keeps its historical Task-global profile semantics
+    // only for already-frozen attempts.
+    let v2_plan = match policy {
+        RetainedAcceptancePolicy::LegacyV1(_) => None,
+        RetainedAcceptancePolicy::V2(_) => Some(
+            swarm_kernel::acceptance::validate_frozen_requirement_evidence_plan(
+                &attempt["task_snapshot"]["spec"],
+                &attempt["task_snapshot"]["requirement_evidence_plan"],
+            )
+            .map_err(|error| Error::new(error.code(), error.message()))?,
+        ),
+    };
+    let required_profiles = match policy {
+        RetainedAcceptancePolicy::LegacyV1(legacy) => legacy
+            .required_check_profiles
+            .iter()
+            .map(|profile| swarm_kernel::acceptance::CheckProfileIdentity {
+                profile_id: profile.profile_id.clone(),
+                profile_revision: profile.profile_revision.clone(),
+            })
+            .collect::<Vec<_>>(),
+        RetainedAcceptancePolicy::V2(_) => v2_plan
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "REQUIREMENT_EVIDENCE_PLAN_STALE",
+                    "V2 acceptance has no validated frozen evidence plan",
+                )
+            })?
+            .required_profiles
+            .clone(),
+    };
 
     let check_ids = match exact_required_check_ids(
         tx,
         &review.identity.task_id,
         &review.identity.attempt_id,
         &review.identity.candidate_ref,
-        policy,
+        &required_profiles,
     )? {
         CheckSelection::Ready(check_ids) => check_ids,
         CheckSelection::Incomplete(missing) => {
@@ -344,11 +378,18 @@ pub(super) fn consume_review_result_for_entry(
                 )
             })?
         }
+        Some(Value::Array(_)) | None
+            if v2_plan
+                .as_ref()
+                .is_some_and(|plan| plan.review_requirement_ids.is_empty()) =>
+        {
+            Vec::new()
+        }
         _ => {
             return Ok(capability_gap(
                 &review,
                 "requirement_level_acceptance_evidence_unavailable",
-                "the assigned pass has no structured rationale and evidence for each frozen Task requirement",
+                "the assigned pass has no structured rationale and evidence for a frozen review-required requirement",
             ));
         }
     };
@@ -425,7 +466,21 @@ pub(super) fn consume_review_result_for_entry(
     value["technical_requester_id"] = json!(context.technical_requester_id());
     value["semantic_request_id"] = json!(request.client_request_id);
     value["review_evidence_refs"] = json!(evidence_refs);
-    value["required_check_profiles"] = json!(policy.required_check_profiles);
+    value["required_check_profiles"] = json!(
+        required_profiles
+            .iter()
+            .map(|profile| json!({
+                "profile_id":profile.profile_id,
+                "profile_revision":profile.profile_revision,
+            }))
+            .collect::<Vec<_>>()
+    );
+    if v2_plan.is_some() {
+        // Retain the exact profile-to-requirement relation used by this
+        // automatic decision; the plan was validated against this Attempt.
+        value["requirement_evidence_plan"] =
+            attempt["task_snapshot"]["requirement_evidence_plan"].clone();
+    }
     Ok(value)
 }
 /// Classify one retained `task.accept` Operation truthfully.
@@ -876,11 +931,11 @@ fn exact_required_check_ids(
     task_id: &str,
     attempt_id: &str,
     candidate_ref: &str,
-    policy: &AcceptancePolicy,
+    required_profiles: &[swarm_kernel::acceptance::CheckProfileIdentity],
 ) -> Result<CheckSelection> {
-    let mut selected = Vec::with_capacity(policy.required_check_profiles.len());
+    let mut selected = Vec::with_capacity(required_profiles.len());
     let mut missing = Vec::new();
-    for required in &policy.required_check_profiles {
+    for required in required_profiles {
         let mut statement = db.prepare(
             "SELECT check_id,operation_id,state,exit_code,resource_released_at_ms, \
                     cached_from_check_id,result_ref,coverage_json \

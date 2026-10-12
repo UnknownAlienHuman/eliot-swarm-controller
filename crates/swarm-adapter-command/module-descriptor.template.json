@@ -46,6 +46,7 @@
     "agent.reconcile",
     "agent.refresh",
     "agent.result",
+    "native.command.release_evidence",
     "task.dispatch"
   ],
   "lifecycle": "owned_service",

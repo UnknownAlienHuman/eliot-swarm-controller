@@ -106,6 +106,25 @@ pub fn validate_spec(spec: &Value) -> Result<()> {
                 "requirement IDs must be nonempty and unique; statements cannot be empty",
             ));
         }
+        if requirement.get("verification").is_some()
+            && requirement
+                .get("verification")
+                .and_then(Value::as_object)
+                .is_none_or(|verification| {
+                    verification
+                        .get("review_required")
+                        .and_then(Value::as_bool)
+                        .is_none()
+                        || verification
+                            .get("check_profiles")
+                            .and_then(Value::as_array)
+                            .is_none()
+                })
+        {
+            return Err(ValidationError::invalid(
+                "requirement verification needs review_required and check_profiles",
+            ));
+        }
     }
 
     let dependencies = object

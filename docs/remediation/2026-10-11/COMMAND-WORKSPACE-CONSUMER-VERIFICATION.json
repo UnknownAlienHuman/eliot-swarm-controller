@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-10-11T23:48:51.0237820Z",
+  "status": "AFFECTED_CONNECTED_SOURCE_CONSUMERS_VERIFIED",
+  "scope": "Command immutable capture/release/output reread and HIGH0320 revoked Workspace filesystem readback; frozen connected WIP assembly only",
+  "root_head": "e4f0cf4e0689d3acb94a88cbc4640676cf99a8df",
+  "verification_checkout_base": "420558c91af07edd8b872e5b94f758b50543103a",
+  "assembly": ".local/manager-audit/core-connected-assembly-v28.json",
+  "source_sha256": {
+    "crates/swarm-kernel-host/src/store/command_results.rs": "3BCB13526CE9E2543BC57D2F2FDB4AC4DE5DF00D9A950AEF1AECEE04DBBE478D",
+    "crates/swarm-kernel-host/src/store/workspace.rs": "505917F20C4F6A3137C3C615D9E2D850CB15755D76AF96B7F8E7827CE6C600C5",
+    "crates/swarm-kernel-host/src/store/c34_workspace_start_diagnosis_fixture.rs": "C2BE93993992053EABD0170502A1EE1B4365BC0FB85CCF070404986C7461E852"
+  },
+  "production_checks": [
+    {
+      "platform": "Windows",
+      "evidence": ".local/manager-audit/core-connected-windows-clippy-workspace-cas-v16.json",
+      "result": "PASS source_stable"
+    },
+    {
+      "platform": "Linux",
+      "evidence": ".local/manager-audit/core-connected-linux-clippy-workspace-cas-v16.json",
+      "result": "PASS source_stable"
+    }
+  ],
+  "consumer_checks": [
+    {
+      "platform": "Windows",
+      "evidence": ".local/manager-audit/core-connected-windows-tests-command-workspace-v22.json",
+      "cases": [
+        "store_consumer_releases_capture_and_serves_verified_output_pages",
+        "revoked_legacy_unknown_workspace_lease_stays_fenced_in_store_lifecycle"
+      ],
+      "result": "2 named cases PASS stable; overall cohort FAIL from later corrected positive fixture"
+    },
+    {
+      "platform": "Linux",
+      "evidence": ".local/manager-audit/core-connected-linux-tests-command-workspace-negative-v22.json",
+      "result": "2/2 PASS stable"
+    },
+    {
+      "platform": "Windows",
+      "evidence": ".local/manager-audit/core-connected-windows-tests-workspace-positive-v23.json",
+      "result": "1/1 actual positive PASS stable"
+    },
+    {
+      "platform": "Linux",
+      "evidence": ".local/manager-audit/core-connected-linux-tests-workspace-positive-v23.json",
+      "result": "1/1 actual positive PASS stable"
+    }
+  ],
+  "proven_behavior": [
+    "No release before full immutable output coverage including out-of-order pages",
+    "Exact private release ACK binds original input, target outcome, coverage and ordered artifact references",
+    "Forged ACKs and absent module receipt cannot settle release",
+    "Store serves retained artifact subrange after the exact release ACK without native replay; fixture does not execute adapter unlink",
+    "Unknown dispatch never becomes Task completion",
+    "Revoked unknown workspace resolves resource custody only after exact filesystem readback; Operation outcome remains unknown",
+    "Raw JSON CAS preserves every ownership/state/generation fence",
+    "Missing workspace proof retains resource fence"
+  ],
+  "source_review": {
+    "report": ".local/manager-audit/command-capture-normalized-independent-review-20261011.json",
+    "result": "10 checks, 0 P1, 0 P2; bounded release ACK/normalization source only"
+  },
+  "limits": [
+    "Not clean-main or installed qualification",
+    "Protected R22/Goal/Command WIP connected assembly retained",
+    "Full public/native Step5free/Gemini3.8/crash/load qualification pending",
+    "Broader V27 audit remains incomplete",
+    "Latest Goal context changes v30 have separate pending gates",
+    "Command fixture uses the real Store and artifact files with typed adapter-shaped ACK; actual adapter capture unlink is separate unexecuted native qualification"
+  ]
+}

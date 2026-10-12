@@ -3,15 +3,15 @@
 use crate::model::TaskSpec;
 use serde_json::{Value, json};
 
-pub(super) fn brief(spec: &TaskSpec) -> Value {
-    json!(spec.brief())
+pub(super) fn brief(spec: &TaskSpec) -> crate::error::Result<Value> {
+    Ok(json!(spec.try_brief()?))
 }
 
 pub(in crate::store) fn project_brief(raw_spec: &Value) -> Value {
     let Ok(spec) = serde_json::from_value::<TaskSpec>(raw_spec.clone()) else {
         return unavailable_brief();
     };
-    brief(&spec)
+    brief(&spec).unwrap_or_else(|_| unavailable_brief())
 }
 
 fn unavailable_brief() -> Value {

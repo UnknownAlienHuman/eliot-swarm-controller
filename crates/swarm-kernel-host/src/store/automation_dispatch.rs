@@ -2083,11 +2083,11 @@ pub(crate) fn validate_retained_script_event_cause(
         ));
     }
 
-    let task_id = cause["task_id"].as_str().map(str::to_owned);
-    let task_revision = cause["task_revision"].as_i64();
-    let attempt_id = cause["attempt_id"].as_str().map(str::to_owned);
+    let cause_task_id = cause["task_id"].as_str().map(str::to_owned);
+    let cause_task_revision = cause["task_revision"].as_i64();
+    let cause_attempt_id = cause["attempt_id"].as_str().map(str::to_owned);
     if !matches!(
-        (&task_id, task_revision, &attempt_id),
+        (&cause_task_id, cause_task_revision, &cause_attempt_id),
         (None, None, None) | (Some(_), Some(_), Some(_))
     ) {
         return Err(Error::new(
@@ -2142,21 +2142,31 @@ pub(crate) fn validate_retained_script_event_cause(
     } else {
         None
     };
+    let mut task_id = cause_task_id.clone();
+    let mut task_revision = cause_task_revision;
+    let mut attempt_id = cause_attempt_id.clone();
     if let Some(proof) = retained_concilium_proof.as_ref() {
         // Bind the retained cause to the exact immutable source proof. This is
         // historical identity only; current Task/Attempt and GM liveness are
         // deliberately not rechecked during operation-link readback.
+        let cause_scope_omitted = ["task_id", "task_revision", "attempt_id"]
+            .into_iter()
+            .all(|field| cause.get(field).is_none_or(Value::is_null));
+        let cause_scope_matches = cause_task_id.as_deref() == Some(proof.task_id.as_str())
+            && cause_task_revision == Some(proof.task_revision)
+            && cause_attempt_id.as_deref() == Some(proof.attempt_id.as_str());
         if event.operation_id.as_deref() != Some(proof.operation_id.as_str())
             || cause["operation_id"].as_str() != Some(proof.operation_id.as_str())
-            || task_id.as_deref() != Some(proof.task_id.as_str())
-            || task_revision != Some(proof.task_revision)
-            || attempt_id.as_deref() != Some(proof.attempt_id.as_str())
+            || (!cause_scope_omitted && !cause_scope_matches)
         {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "retained Concilium cause Task/Attempt/Operation differs from its immutable source proof",
             ));
         }
+        task_id = Some(proof.task_id.clone());
+        task_revision = Some(proof.task_revision);
+        attempt_id = Some(proof.attempt_id.clone());
     } else if let Some(operation_id) = event.operation_id.as_deref() {
         let operation_scope: Option<RetainedOperationScope> = db
             .query_row(

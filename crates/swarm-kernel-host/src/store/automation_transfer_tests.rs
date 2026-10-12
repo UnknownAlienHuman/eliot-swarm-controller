@@ -2,17 +2,26 @@
 //! exact entry while retiring its former owner.
 use super::{Store, StoreOwner};
 use crate::{
+    artifacts::ArtifactRecord,
     automation::config,
     config::{Config, McpProfileConfig, McpToolProfile, Route},
     error::{Error, Result},
     model::{self, Credential, Principal},
     platform::{DataRoot, bootstrap_credential},
 };
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 const PROJECT: &str = "automation-transfer-project";
 const AUTOMATION_ID: &str = "transfer-preserves-cursors";
+const PROJECTION_SOURCE_ID: &str = "transfer-projection-source";
+const PROJECTION_SOURCE_REVISION: &str = "transfer-source-revision-1";
+const PROJECTION_LABEL: &str = "eliot-transfer-ready";
+const PROJECTION_REPOSITORY_ID: i64 = 4401;
+const PROJECTION_ISSUE_ID: i64 = 7701;
+const PROJECTION_ISSUE_NUMBER: i64 = 7;
+const SCRIPT_ID: &str = "transfer-script-journal";
 
 async fn start_store() -> (StoreOwner, PathBuf, Principal) {
     let directory =
@@ -74,6 +83,121 @@ async fn register_manager(store: &Store, operator: &Principal, client_id: &str) 
         .authenticate(Credential {
             client_id: client_id.to_owned(),
             token,
+        })
+        .await
+        .unwrap()
+}
+
+async fn register_projection_source_fixture(store: &Store, task_id: &str, created_by: &str) {
+    let task_id = task_id.to_owned();
+    let created_by = created_by.to_owned();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let now_ms = model::now_ms()?;
+            // Match the existing connected GitHub-projection Store fixture:
+            // retain a local source/Issue mapping without contacting GitHub.
+            tx.execute(
+                "INSERT INTO github_sources(source_id,project_id,host,owner,repository_name,repository_id,next_page,poll_generation,last_poll_status,last_coverage_json,created_by,created_at_ms,updated_at_ms) \
+                 VALUES(?1,?2,'github.com','transfer-owner','transfer-repository',?3,1,0,'never','{}',?4,?5,?5)",
+                params![PROJECTION_SOURCE_ID, PROJECT, PROJECTION_REPOSITORY_ID, created_by, now_ms],
+            )?;
+            tx.execute(
+                "INSERT INTO github_issue_items(source_id,issue_id,issue_number,current_fact_digest,current_event_key,source_revision,payload_json,task_id,mapping_status,observed_generation,last_seen_at_ms) \
+                 VALUES(?1,?2,?3,'fixture-fact','fixture-event',?4,'{\"state\":\"open\"}',?5,'mapped',1,?6)",
+                params![
+                    PROJECTION_SOURCE_ID,
+                    PROJECTION_ISSUE_ID,
+                    PROJECTION_ISSUE_NUMBER,
+                    PROJECTION_SOURCE_REVISION,
+                    task_id,
+                    now_ms
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO github_work_pool_members(source_id,task_id,issue_id,selected,selection_order,discovered_at_ms,updated_at_ms) \
+                 VALUES(?1,?2,?3,1,0,?4,?4)",
+                params![
+                    PROJECTION_SOURCE_ID,
+                    task_id,
+                    PROJECTION_ISSUE_ID,
+                    now_ms
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn register_source_candidate(store: &Store, task_id: &str, attempt_id: &str) -> String {
+    let source = "Store transfer fixture candidate; no native execution is required.";
+    let manifest = json!({
+        "schema_version":1,
+        "files":[{
+            "path":"src/lib.rs",
+            "content":source,
+            "content_sha256":model::digest(source.as_bytes()),
+            "byte_length":source.len(),
+        }],
+    });
+    let bytes = model::canonical(&manifest).unwrap().into_bytes();
+    let artifact_id = format!("source-{}", model::digest(&bytes));
+    let metadata = json!({
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "task_revision":1,
+        "coverage":"complete",
+    });
+    let record = ArtifactRecord {
+        kind: "source_snapshot".to_owned(),
+        artifact_id: artifact_id.clone(),
+        relative_path: format!("artifacts/{artifact_id}.bin"),
+        byte_length: u64::try_from(bytes.len()).unwrap(),
+        content_digest: model::digest(&bytes),
+        metadata: metadata.clone(),
+    };
+    let publish_record = record.clone();
+    let publish_bytes = bytes.clone();
+    store
+        .file_io(move |files| files.publish(&publish_record, &publish_bytes))
+        .await
+        .unwrap();
+
+    let db_id = record.artifact_id;
+    let db_path = record.relative_path;
+    let db_length = i64::try_from(record.byte_length).unwrap();
+    let db_digest = record.content_digest;
+    let db_metadata = model::canonical(&metadata).unwrap();
+    let created_at = model::now_ms().unwrap();
+    store
+        .run(move |db| {
+            db.execute(
+                "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) \
+                 VALUES(?1,?2,'source_snapshot',?3,?4,?5,?6)",
+                params![db_id, db_path, db_length, db_digest, created_at, db_metadata],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    artifact_id
+}
+
+async fn reconcile_dispatch_once(store: &Store) -> Value {
+    store
+        .run(|db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let result = super::automation_dispatch::reconcile(
+                &tx,
+                &Config::default(),
+                16,
+                16,
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(result)
         })
         .await
         .unwrap()
@@ -274,6 +398,88 @@ async fn read_state_records(
         .unwrap()
 }
 
+async fn read_projection_and_script_records(
+    store: &Store,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> (Option<Value>, Option<Value>) {
+    let owner = owner.to_owned();
+    let project = project.to_owned();
+    let automation_id = automation_id.to_owned();
+    store
+        .run(move |db| {
+            let entry =
+                config::load_entry(db, &owner, &project, &automation_id)?.ok_or_else(|| {
+                    Error::new(
+                        "TEST_AUTOMATION_ENTRY_MISSING",
+                        "automation entry is missing",
+                    )
+                })?;
+
+            // Exercise each production decoder before reading its complete
+            // persisted record for identity, cursor, pending, and provenance
+            // comparisons below. The projection state key is private to its
+            // owning module, so this test mirrors its current key derivation.
+            let projection_readback = super::automation_github_projection::state(db, &entry)?;
+            let script_readback = super::automation_dispatch::script_trigger_state(db, &entry)?;
+            let projection_key = format!(
+                "automation:v1:github-projection:state:{}:{}",
+                config::scope_digest(&entry.owner_manager_id, &entry.project_id)?,
+                entry.automation_id
+            );
+            let script_key = config::script_dispatch_state_key(
+                &entry.owner_manager_id,
+                &entry.project_id,
+                &entry.automation_id,
+            )?;
+            let projection =
+                config::read_record(db, &projection_key, "GitHub projection transfer state")?;
+            let script = config::read_record(db, &script_key, "ScriptRun transfer state")?;
+            if projection.is_some() && projection_readback["status"] == "uninitialized" {
+                return Err(Error::new(
+                    "TEST_AUTOMATION_STATE_MISSING",
+                    "GitHub projection decoder did not read its retained record",
+                ));
+            }
+            if script.is_some() && script_readback.is_null() {
+                return Err(Error::new(
+                    "TEST_AUTOMATION_STATE_MISSING",
+                    "ScriptRun decoder did not read its retained record",
+                ));
+            }
+            Ok((projection, script))
+        })
+        .await
+        .unwrap()
+}
+
+async fn read_script_consumer_context(
+    store: &Store,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Value {
+    let owner = owner.to_owned();
+    let project = project.to_owned();
+    let automation_id = automation_id.to_owned();
+    store
+        .run(move |db| {
+            let entry =
+                config::load_entry(db, &owner, &project, &automation_id)?.ok_or_else(|| {
+                    Error::new(
+                        "TEST_AUTOMATION_ENTRY_MISSING",
+                        "automation entry is missing",
+                    )
+                })?;
+            let context = super::automation_dispatch::script_trigger_authority::
+                ScriptRunConsumerContext::from_entry(&entry)?;
+            Ok(serde_json::to_value(context)?)
+        })
+        .await
+        .unwrap()
+}
+
 async fn operation_snapshot(
     store: &Store,
     operation_id: &str,
@@ -309,7 +515,7 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
 
     // Establish a real observation before activation so each consumer retains
     // an exact, nonzero source watermark without dispatching native work.
-    write(
+    let created_task = write(
         &owner.store,
         &operator,
         "task.create",
@@ -325,6 +531,8 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         }),
     )
     .await;
+    let task_id = created_task["task_id"].as_str().unwrap().to_owned();
+    register_projection_source_fixture(&owner.store, &task_id, &operator.client_id).await;
 
     let work_dispatch = json!({
         "route":"transfer-regression-route",
@@ -355,12 +563,14 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         "patch":{
             "enabled":true,
             "scope":{"work_pool_id":null},
-            "steps":[
+                "steps":[
                 "review_dispatch",
                 "review_disposition",
                 "work_dispatch",
                 "publication",
-                "check_run"
+                    "check_run",
+                    "github_projection",
+                    "script_run"
             ],
             "review":{"profile":"transfer-auditor","required_reviewers":1},
             "work_dispatch":work_dispatch,
@@ -369,6 +579,19 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
                 "expected_old_ref":null,
                 "expected_create":true
             },
+                "github_projection":{
+                    "source_id":PROJECTION_SOURCE_ID,
+                    "label":PROJECTION_LABEL,
+                    "present":true
+                },
+                "script_run":{"script_id":SCRIPT_ID},
+                "event_rules":[
+                    {
+                        "source":"task.submission",
+                        "predicate":"applied",
+                        "action":"script_run"
+                    }
+                ],
             "cron":{
                 "calendar":cron_calendar.clone(),
                 "action":{
@@ -409,6 +632,84 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
     assert_eq!(applied["applied"], true);
     let config_operation_id = applied["operation_id"].as_str().unwrap().to_owned();
     let old_operation_snapshot = operation_snapshot(&owner.store, &config_operation_id).await;
+
+    // Produce one real applied TaskSubmission through Store so ScriptRun has a
+    // retained pending cause to move. The trigger is admitted only as a
+    // durable intent; this fixture has no ScriptRun/native executor.
+    owner
+        .store
+        .run(|db| super::set_meta(db, "execution_mode", &json!({"new_work":"enabled"})))
+        .await
+        .unwrap();
+    let claimed = owner
+        .store
+        .call(
+            former.clone(),
+            "task.claim".to_owned(),
+            json!({
+                "client_request_id":"claim-transfer-script-trigger",
+                "task_id":task_id,
+                "expected_revision":1,
+                "owner_id":former.client_id
+            }),
+        )
+        .await
+        .unwrap();
+    let attempt_id = claimed["attempt_id"].as_str().unwrap().to_owned();
+    let candidate_ref = register_source_candidate(&owner.store, &task_id, &attempt_id).await;
+    let submission = owner
+        .store
+        .call(
+            former.clone(),
+            "task.submit".to_owned(),
+            json!({
+                "client_request_id":"submit-transfer-script-trigger",
+                "attempt_id":attempt_id,
+                "expected_revision":1,
+                "expected_submission_ref":null,
+                "candidate_ref":candidate_ref,
+                "summary":"Retain one applied TaskSubmission for transfer coverage.",
+                "claims":[]
+            }),
+        )
+        .await
+        .unwrap();
+    let submission_operation_id = submission["operation_id"].as_str().unwrap().to_owned();
+    let submission_readback = owner
+        .store
+        .call(
+            former.clone(),
+            "operation.get".to_owned(),
+            json!({"operation_id":submission_operation_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submission_readback["method"], "task.submit");
+    assert_eq!(submission_readback["state"], "settled");
+    assert_eq!(submission_readback["result"]["outcome"], "applied");
+    let submission_operation_snapshot =
+        operation_snapshot(&owner.store, &submission_operation_id).await;
+    let dispatch_pass = reconcile_dispatch_once(&owner.store).await;
+    assert_eq!(dispatch_pass["entries"].as_array().unwrap().len(), 1);
+    let script_pass = &dispatch_pass["entries"][0]["script_run"];
+    assert!(script_pass["processed"].as_u64().unwrap_or_default() > 0);
+    let (_, source_script_after_dispatch) =
+        read_projection_and_script_records(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID)
+            .await;
+    let source_script_after_dispatch = source_script_after_dispatch
+        .expect("real TaskSubmission reconciliation retains ScriptRun state");
+    assert_eq!(
+        source_script_after_dispatch["pending"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        source_script_after_dispatch["pending"][0]["cause"]["operation_id"],
+        submission_operation_id
+    );
+
     let old_journals =
         seed_pending_journals(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID).await;
     assert_eq!(old_journals.len(), 4);
@@ -488,6 +789,53 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         .unwrap();
     assert_eq!(source_before_transfer["revision"], 1);
     assert_eq!(source_before_transfer["enabled"], true);
+    assert_eq!(
+        source_before_transfer["github_projection"]["source_id"],
+        PROJECTION_SOURCE_ID
+    );
+    assert_eq!(source_before_transfer["script_run"]["script_id"], SCRIPT_ID);
+    let (source_projection_record, source_script_record) =
+        read_projection_and_script_records(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID)
+            .await;
+    let source_projection_record =
+        source_projection_record.expect("config apply creates GitHub projection activation state");
+    let source_script_record =
+        source_script_record.expect("configured ScriptRun action retains its cursor state");
+    assert_eq!(
+        source_projection_record["owner_manager_id"],
+        former.client_id
+    );
+    assert_eq!(source_projection_record["project_id"], PROJECT);
+    assert_eq!(source_projection_record["automation_id"], AUTOMATION_ID);
+    assert_eq!(source_projection_record["configured_revision"], 1);
+    assert_eq!(
+        source_projection_record["cursor"],
+        source_projection_record["activation_cut"]
+    );
+    assert_eq!(
+        source_projection_record["recent"][0]["status"],
+        "activation_updated"
+    );
+    assert_eq!(source_script_record["schema_version"], 1);
+    assert_eq!(source_script_record["owner_manager_id"], former.client_id);
+    assert_eq!(source_script_record["project_id"], PROJECT);
+    assert_eq!(source_script_record["automation_id"], AUTOMATION_ID);
+    assert!(
+        source_script_record["cursor"].as_i64().unwrap()
+            > source_script_record["activation_cut"].as_i64().unwrap()
+    );
+    assert_eq!(source_script_record["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        source_script_record["pending"][0]["cause"]["operation_id"],
+        submission_operation_id
+    );
+    assert_eq!(source_script_record["pending"][0]["script_id"], SCRIPT_ID);
+    assert_eq!(source_script_record["pending"][0]["held"], false);
+    assert_eq!(source_script_record["pending"][0]["automation_revision"], 1);
+    assert_eq!(
+        source_script_record["pending"][0]["consumer_context"]["owner_manager_id"],
+        former.client_id
+    );
 
     let transfer = owner
         .store
@@ -505,7 +853,7 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         .await
         .unwrap();
     assert_eq!(transfer["status"], "transferred");
-    assert_eq!(transfer["state_ledgers_relocated"], 6);
+    assert_eq!(transfer["state_ledgers_relocated"], 7);
     assert_eq!(transfer["new_owner_manager_id"], successor.client_id);
     let transfer_operation_id = transfer["transfer_operation_id"].as_str().unwrap();
 
@@ -524,9 +872,54 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         assert_eq!(record["cursor"], cursor, "{kind} cursor changed");
         assert_eq!(record["pending"], pending, "{kind} pending refs changed");
     }
+    let (target_projection_record, target_script_record) = read_projection_and_script_records(
+        &owner.store,
+        &successor.client_id,
+        PROJECT,
+        AUTOMATION_ID,
+    )
+    .await;
+    let target_projection_record =
+        target_projection_record.expect("GitHub projection state follows the configured entry");
+    let target_script_record =
+        target_script_record.expect("ScriptRun cursor follows the configured entry");
+    let mut expected_projection_record = source_projection_record.clone();
+    expected_projection_record["owner_manager_id"] = json!(successor.client_id);
+    expected_projection_record["configured_revision"] = json!(2);
+    assert_eq!(
+        target_projection_record, expected_projection_record,
+        "GitHub projection transfer changed identity, cursor, activation, or retained provenance"
+    );
+    let mut expected_script_record = source_script_record.clone();
+    expected_script_record["owner_manager_id"] = json!(successor.client_id);
+    expected_script_record["pending"][0]["held"] = json!(true);
+    expected_script_record["pending"][0]["held_reason"] =
+        json!("held_on_transfer_current_actor_revalidation_required");
+    expected_script_record["pending"][0]["automation_revision"] = json!(2);
+    expected_script_record["pending"][0]["consumer_context"] =
+        read_script_consumer_context(&owner.store, &successor.client_id, PROJECT, AUTOMATION_ID)
+            .await;
+    assert_eq!(
+        target_script_record, expected_script_record,
+        "ScriptRun transfer changed identity, cursor, pending causes, or retained provenance"
+    );
+    assert_eq!(
+        target_script_record["pending"][0]["cause"], source_script_record["pending"][0]["cause"],
+        "transfer must keep the immutable producer cause"
+    );
     let retired_journals =
         read_state_records(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID).await;
     assert!(retired_journals.iter().all(|(_, value)| value.is_none()));
+    let (retired_projection_record, retired_script_record) =
+        read_projection_and_script_records(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID)
+            .await;
+    assert!(retired_projection_record.is_none());
+    assert!(retired_script_record.is_none());
+    assert_eq!(
+        operation_snapshot(&owner.store, &submission_operation_id).await,
+        submission_operation_snapshot,
+        "transfer rewrote the original TaskSubmission Operation"
+    );
 
     let (target_cron_state, target_cron_due, target_cron_due_count) = read_cron_ledger(
         &owner.store,

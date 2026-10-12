@@ -360,8 +360,9 @@ impl ReviewSubmitRequest {
     pub(crate) fn validate_requirement_reviews(
         &self,
         requirement_ids: &BTreeSet<String>,
+        require_exact_coverage: bool,
     ) -> Result<()> {
-        if self.requirement_reviews.is_empty() {
+        if self.requirement_reviews.is_empty() && !require_exact_coverage {
             return Ok(());
         }
         let reviews = serde_json::to_value(&self.requirement_reviews)?;
@@ -369,7 +370,7 @@ impl ReviewSubmitRequest {
             match error {
                 review_contract::ReviewValidationError::RequirementCoverage => Error::new(
                     "REVIEW_INCOMPLETE",
-                    "structured review must address exactly the frozen Task requirements",
+                    "structured review must address exactly the review-required Task requirements",
                 ),
                 _ => Error::new("REVIEW_RESULT_DAMAGED", error.to_string()),
             }

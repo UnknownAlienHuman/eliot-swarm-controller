@@ -374,6 +374,15 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
             "delivery_created",
             "cancelled",
         ],
+        "source.capture" => &[
+            "operation_id",
+            "outcome",
+            "candidate_ref",
+            "commit",
+            "tree",
+            "file_count",
+            "task_accepted",
+        ],
         "check.run" | "check.cancel" => &[
             "operation_id",
             "check_id",
@@ -884,13 +893,13 @@ pub(super) fn exact_module_recovery_contract<'a>(
             "saved command run artifacts; missing or inconsistent evidence remains unknown",
         ));
     }
-    if crate::runtime::codex::is_controller_route(route)
+    if crate::runtime::codex::is_historical_python_route(route)
         && matches!(target_method, "agent.open" | "task.dispatch" | "agent.send")
     {
         return Some((
             crate::runtime::codex::RUNTIME,
-            crate::runtime::codex::ARTIFACT_ID,
-            "saved controller checkpoint and exact native-history readback; gaps remain unknown",
+            crate::runtime::codex::HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID,
+            "historical Python bridge checkpoint and exact native-history readback; gaps remain unknown",
         ));
     }
     if crate::runtime::warm_stream::is_route(route)
@@ -2948,6 +2957,12 @@ fn reserve_open_route(
     });
     if let Some(selector) = module_contract_selector {
         binding_state["module_contract_selector"] = selector;
+        if route.runtime == crate::runtime::codex::RUNTIME
+            && route.module_artifact_id
+                == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        {
+            binding_state["module_contract_selection_owner_manager_id"] = json!(owner_manager_id);
+        }
     }
     tx.execute("INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) VALUES(?1,1,?2,?3,?4,'opening',?5,?6,?7)",params![binding,lane,instance,route.module_artifact_id,model::canonical(&json!(route))?,model::canonical(&binding_state)?,now])?;
     tx.execute("UPDATE operations SET binding_id=?2,binding_generation=1,effective_request_json=?3 WHERE operation_id=?1",params![id,binding,model::canonical(&json!({"route":route,"module_instance_id":instance}))?])?;
@@ -3190,6 +3205,7 @@ pub(super) fn dispatch(
     let body = model::text(v, "text")?;
     let a = tasks::get_attempt(tx, attempt)?;
     super::gm::require_attempt_control(tx, p, &a)?;
+    super::task_prompt::validate_snapshot_evidence_plan(&a["task_snapshot"])?;
     if a["start_owner"] != "controller" {
         return Err(Error::new(
             "START_OWNED_BY_MANAGER",

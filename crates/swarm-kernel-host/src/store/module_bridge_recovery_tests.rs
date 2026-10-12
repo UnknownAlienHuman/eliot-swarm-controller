@@ -688,7 +688,7 @@ fn verified_bridge_boot_change_projects_readback_to_current_and_successor_manage
         },
         RouteCase {
             runtime: crate::runtime::codex::RUNTIME,
-            artifact: crate::runtime::codex::ARTIFACT_ID,
+            artifact: crate::runtime::codex::HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID,
             target_method: "agent.send",
         },
         RouteCase {

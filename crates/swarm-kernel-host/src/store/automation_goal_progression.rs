@@ -11,6 +11,7 @@ use super::automation_reconcile::{
     DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
     SubjectErrorDisposition,
 };
+use super::operation_lifecycle::OperationLifecycleState;
 use super::{automation_reconcile, operations, tasks};
 use crate::{
     automation::{
@@ -203,7 +204,7 @@ impl GoalProgressionAdmission {
     /// Task/Attempt, manager scope, binding and terminal source immediately
     /// before the normal Operation is admitted.
     pub(crate) fn require_current_for_admission(&self, db: &Connection, now_ms: i64) -> Result<()> {
-        require_current_admission(db, self, now_ms, None)
+        require_current_admission(db, self, now_ms, None, GoalAuthorityStage::Admission)
     }
 
     /// Recheck the same immutable request after its Operation row has been
@@ -215,7 +216,13 @@ impl GoalProgressionAdmission {
         operation_id: &str,
         now_ms: i64,
     ) -> Result<()> {
-        require_current_admission(db, self, now_ms, Some(operation_id))
+        require_current_admission(
+            db,
+            self,
+            now_ms,
+            Some(operation_id),
+            GoalAuthorityStage::Admission,
+        )
     }
 }
 
@@ -1167,22 +1174,30 @@ fn verified_terminal(
     // Only an unsettled lifecycle can still acquire the synchronized native
     // receipt. Rejected/cancelled operations are terminal non-continuable
     // facts; an unknown state is malformed evidence, not a retry condition.
-    match operation["state"].as_str() {
-        Some("settled") => {}
-        Some("queued" | "sending" | "native_accepted" | "outcome_unknown") => {
+    // The persisted state string is decoded through the one generic Operation
+    // lifecycle parser so an unrecognized string is corruption rather than an
+    // independent allowlist in this domain.
+    let operation_state = operation["state"]
+        .as_str()
+        .ok_or_else(|| invalid_source("source Operation state is not a persisted string"))
+        .and_then(|state| {
+            OperationLifecycleState::parse(state)
+                .map_err(|_| invalid_source("source Operation has an unknown lifecycle state"))
+        })?;
+    match operation_state {
+        OperationLifecycleState::Settled => {}
+        OperationLifecycleState::Queued
+        | OperationLifecycleState::Sending
+        | OperationLifecycleState::NativeAccepted
+        | OperationLifecycleState::OutcomeUnknown => {
             return Err(Error::new(
                 "AUTOMATION_GOAL_SOURCE_GAP",
                 "source Operation is not settled and may still acquire synchronized execution evidence",
             ));
         }
-        Some("rejected" | "cancelled") => {
+        OperationLifecycleState::Rejected | OperationLifecycleState::Cancelled => {
             return Err(invalid_source(
                 "source Operation has a terminal non-continuable disposition",
-            ));
-        }
-        Some(_) | None => {
-            return Err(invalid_source(
-                "source Operation has an unknown or malformed state",
             ));
         }
     }
@@ -1309,10 +1324,25 @@ fn native_goal_predecessor(
     let Some((operation_id, state, raw_result)) = row else {
         return Ok((None, 0));
     };
-    if state != "settled" {
+    // The predecessor's native Goal state is decoded through the shared
+    // Operation lifecycle parser so a retained state string that is not one
+    // of the seven known lifecycle states is corruption rather than silently
+    // treated as unresolved-and-retryable.
+    let predecessor_state = OperationLifecycleState::parse(&state).map_err(|_| {
+        Error::new(
+            "GOAL_NATIVE_STATE_CORRUPT",
+            format!(
+                "native Goal predecessor Operation {operation_id} has an unknown lifecycle state: {state}"
+            ),
+        )
+    })?;
+    if predecessor_state != OperationLifecycleState::Settled {
         return Err(Error::new(
             "GOAL_NATIVE_STATE_UNRESOLVED",
-            format!("native Goal predecessor Operation {operation_id} is {state}"),
+            format!(
+                "native Goal predecessor Operation {operation_id} is {}",
+                predecessor_state.as_str()
+            ),
         ));
     }
     let result: Value = serde_json::from_str(&raw_result.ok_or_else(|| {
@@ -1438,7 +1468,9 @@ fn prepare(
         .filter(|generation| *generation > 0)
         .ok_or_else(|| invalid_source("Goal Attempt has no immutable binding generation"))?;
     let binding = operations::get_binding(db, binding_id, binding_generation)?;
-    let continuation_method = if crate::runtime::codex::is_controller_route(&binding["route"]) {
+    let continuation_method = if super::runtime::selected_codex_controller_contract(db, &binding)?
+        .is_some_and(|contract| contract.current_for_new_goal)
+    {
         "agent.send"
     } else if binding["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
         "agent.goal"
@@ -1618,11 +1650,66 @@ fn prepare(
     })
 }
 
+/// Revalidate an unsent continuation from its durable attribution before the
+/// runtime authorizes another native effect. Historical reads keep their
+/// original attribution even after the current Goal or Manager changes.
+pub(crate) fn require_current_for_dispatch(
+    db: &Connection,
+    operation_id: &str,
+    now_ms: i64,
+) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "Goal continuation has no exact retained admission authority",
+        )
+    };
+    let link = crate::automation::authorization::operation_link(db, operation_id)?
+        .filter(|link| link.action == "agent.send" && link.cause["kind"] == "goal_progression")
+        .ok_or_else(corrupt)?;
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let request = serde_json::from_str(&raw).map_err(|_| corrupt())?;
+    let mut linkage = link.cause.clone();
+    linkage["effective_manager_id"] = json!(link.effective_manager_id);
+    linkage["project_id"] = json!(link.project_id);
+    linkage["automation_id"] = json!(link.automation_id);
+    linkage["automation_revision"] = json!(link.automation_revision);
+    let admission = GoalProgressionAdmission {
+        request,
+        continuation_method: link.action,
+        semantic_slot_id: model::text(&linkage, "id")?.to_owned(),
+        effective_manager_id: model::text(&linkage, "effective_manager_id")?.to_owned(),
+        task_id: model::text(&linkage, "task_id")?.to_owned(),
+        task_revision: linkage["task_revision"].as_i64().ok_or_else(corrupt)?,
+        attempt_id: model::text(&linkage, "attempt_id")?.to_owned(),
+        binding_id: model::text(&linkage, "binding_id")?.to_owned(),
+        binding_generation: linkage["binding_generation"].as_i64().ok_or_else(corrupt)?,
+        linkage,
+    };
+    require_current_admission(
+        db,
+        &admission,
+        now_ms,
+        Some(operation_id),
+        GoalAuthorityStage::Dispatch,
+    )
+}
+
+enum GoalAuthorityStage {
+    Admission,
+    Dispatch,
+}
+
 fn require_current_admission(
     db: &Connection,
     admission: &GoalProgressionAdmission,
     now_ms: i64,
     before_operation_id: Option<&str>,
+    stage: GoalAuthorityStage,
 ) -> Result<()> {
     let linkage = &admission.linkage;
     let stale = || {
@@ -1682,7 +1769,12 @@ fn require_current_admission(
         operations::get_binding(db, admission.binding_id(), admission.binding_generation())?;
     let supported_binding = match admission.continuation_method() {
         "agent.goal" => binding["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME,
-        "agent.send" => crate::runtime::codex::is_controller_route(&binding["route"]),
+        "agent.send" => super::runtime::selected_codex_controller_contract(db, &binding)?
+            .is_some_and(|contract| {
+                // Route reselection fences new Goal admissions. An already
+                // admitted Operation still uses its exact retained contract.
+                contract.current_for_new_goal || matches!(stage, GoalAuthorityStage::Dispatch)
+            }),
         _ => false,
     };
     if !supported_binding
@@ -2907,5 +2999,176 @@ mod tests {
 
         assert_eq!(predecessor.as_deref(), Some("goal-revision-7"));
         assert_eq!(revision, 7);
+    }
+
+    fn operation_row(operation_id: &str, state: &str, result: Option<Value>) -> Value {
+        json!({
+            "operation_id":operation_id,
+            "state":state,
+            "result":result,
+        })
+    }
+
+    #[test]
+    fn native_goal_predecessor_decodes_every_known_lifecycle_state_through_the_typed_parser() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE operations(
+                operation_id TEXT PRIMARY KEY,
+                binding_id TEXT,
+                binding_generation INTEGER,
+                method TEXT NOT NULL,
+                state TEXT NOT NULL,
+                result_json TEXT
+            );",
+        )
+        .unwrap();
+
+        // An unknown retained state string is corruption, not an unresolved
+        // predecessor, so it can never be mistaken for a retryable gap.
+        insert_operation(
+            &db,
+            "corrupt-goal",
+            "binding-a",
+            3,
+            "agent.goal",
+            "half_applied",
+            None,
+        );
+        let corrupt = native_goal_predecessor(&db, "binding-a", 3, None, "shared objective")
+            .expect_err("an unknown lifecycle state is corruption, not a gap");
+        assert_eq!(corrupt.code, "GOAL_NATIVE_STATE_CORRUPT");
+
+        // Every known unsettled state is unresolved rather than a settled
+        // receipt; the message names the canonical persisted state string.
+        for state in ["queued", "sending", "native_accepted", "outcome_unknown"] {
+            let operation_id = format!("goal-{state}");
+            insert_operation(
+                &db,
+                &operation_id,
+                "binding-b",
+                3,
+                "agent.goal",
+                state,
+                None,
+            );
+            let error = native_goal_predecessor(&db, "binding-b", 3, None, "shared objective")
+                .expect_err("an unsettled predecessor has no native Goal revision");
+            assert_eq!(error.code, "GOAL_NATIVE_STATE_UNRESOLVED");
+            assert!(
+                error.message.contains(state),
+                "the unresolved reason must name the exact retained state {state}"
+            );
+        }
+
+        // Rejected and cancelled predecessors are terminal non-continuable
+        // facts, reported through the same unresolved path with their own
+        // canonical state name.
+        for state in ["rejected", "cancelled"] {
+            let operation_id = format!("goal-{state}");
+            insert_operation(
+                &db,
+                &operation_id,
+                "binding-c",
+                3,
+                "agent.goal",
+                state,
+                None,
+            );
+            let error = native_goal_predecessor(&db, "binding-c", 3, None, "shared objective")
+                .expect_err("a rejected or cancelled predecessor has no native Goal revision");
+            assert_eq!(error.code, "GOAL_NATIVE_STATE_UNRESOLVED");
+            assert!(
+                error.message.contains(state),
+                "the unresolved reason must name the exact retained state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_operation_lifecycle_classification_uses_the_typed_state_machine() {
+        // Decode through the one generic parser so an unrecognized persisted
+        // string is corruption rather than an independent string allowlist.
+        for state in [
+            "queued",
+            "sending",
+            "native_accepted",
+            "outcome_unknown",
+            "settled",
+            "rejected",
+            "cancelled",
+        ] {
+            let decoded = OperationLifecycleState::parse(state)
+                .expect("every known persisted state decodes exactly once");
+            assert_eq!(decoded.as_str(), state, "the round trip is exact");
+        }
+        assert!(OperationLifecycleState::parse("partially_applied").is_err());
+    }
+
+    fn full_schema_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE operations(
+                operation_id TEXT PRIMARY KEY,
+                caller_id TEXT NOT NULL,
+                method TEXT NOT NULL,
+                state TEXT NOT NULL,
+                task_id TEXT,
+                attempt_id TEXT,
+                binding_id TEXT,
+                binding_generation INTEGER,
+                native_refs_json TEXT NOT NULL,
+                result_json TEXT,
+                effective_request_json TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        db
+    }
+
+    fn insert_full_operation(db: &Connection, operation_id: &str, method: &str, state: &str) {
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,method,state,native_refs_json,result_json,effective_request_json) +             VALUES(?1,'fixture',?2,?3,'{}',NULL,'{}')",
+            params![operation_id, method, state],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verified_terminal_rejects_unknown_source_lifecycle_as_invalid() {
+        let db = full_schema_db();
+        insert_full_operation(
+            &db,
+            "unknown-state-source",
+            "agent.goal",
+            "partially_applied",
+        );
+        let error = verified_terminal(&db, 1, "unknown-state-source", "{}")
+            .expect_err("an unknown source lifecycle state is malformed evidence");
+        assert_eq!(error.code, "AUTOMATION_GOAL_SOURCE_INVALID");
+    }
+
+    #[test]
+    fn verified_terminal_holds_unsettled_source_as_retryable_gap() {
+        for state in ["queued", "sending", "native_accepted", "outcome_unknown"] {
+            let db = full_schema_db();
+            let operation_id = format!("{state}-source");
+            insert_full_operation(&db, &operation_id, "agent.goal", state);
+            let error = verified_terminal(&db, 1, &operation_id, "{}")
+                .expect_err("an unsettled source may still acquire native evidence");
+            assert_eq!(error.code, "AUTOMATION_GOAL_SOURCE_GAP");
+        }
+    }
+
+    #[test]
+    fn verified_terminal_quarantines_terminal_non_continuable_source() {
+        for state in ["rejected", "cancelled"] {
+            let db = full_schema_db();
+            let operation_id = format!("{state}-source");
+            insert_full_operation(&db, &operation_id, "agent.goal", state);
+            let error = verified_terminal(&db, 1, &operation_id, "{}")
+                .expect_err("a rejected or cancelled source is terminal evidence");
+            assert_eq!(error.code, "AUTOMATION_GOAL_SOURCE_INVALID");
+        }
     }
 }

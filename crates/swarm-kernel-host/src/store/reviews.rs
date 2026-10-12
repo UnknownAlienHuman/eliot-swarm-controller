@@ -964,7 +964,26 @@ pub(crate) fn reserve_submit(
         .map(|requirement| requirement.id.clone())
         .collect::<BTreeSet<_>>();
     request.validate_findings(&requirement_ids)?;
-    request.validate_requirement_reviews(&requirement_ids)?;
+    retained.spec.validate_retained()?;
+    let attempt = tasks::get_attempt(tx, &identity.attempt_id)?;
+    let (review_requirement_ids, require_exact_coverage) = match retained.spec.acceptance.as_ref() {
+        Some(crate::acceptance::RetainedAcceptancePolicy::V2(_)) => {
+            let spec_value = serde_json::to_value(&retained.spec)?;
+            let plan = swarm_kernel::acceptance::validate_frozen_requirement_evidence_plan(
+                &spec_value,
+                &attempt["task_snapshot"]["requirement_evidence_plan"],
+            )
+            .map_err(|error| Error::new(error.code(), error.message()))?;
+            (
+                plan.review_requirement_ids.into_iter().collect(),
+                request.verdict == crate::review::ReviewVerdict::Pass,
+            )
+        }
+        Some(crate::acceptance::RetainedAcceptancePolicy::LegacyV1(_)) | None => {
+            (requirement_ids.clone(), false)
+        }
+    };
+    request.validate_requirement_reviews(&review_requirement_ids, require_exact_coverage)?;
     validate_requirement_review_evidence(request, &retained.identity)?;
     let semantic_input = semantic_result_input(request);
     if let Some(existing) = result_observation(tx, assignment_id)? {

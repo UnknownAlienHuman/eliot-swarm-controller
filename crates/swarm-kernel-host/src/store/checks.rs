@@ -3,6 +3,7 @@ use super::{Store, acceptance, current_principal, meta, operations, results, tas
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     automation::authorization,
+    checks::inputs::ProbeCleanupOwner,
     checks::{
         inputs,
         model::{CaptureRequest, CheckRequest},
@@ -11,7 +12,6 @@ use crate::{
     },
     config::Config,
     error::{Error, Result},
-    checks::inputs::ProbeCleanupOwner,
     hooks::git::GitCleanupOwner,
     model::{self, Principal, Role},
     workspace::LeaseAuthorityRef,
@@ -285,11 +285,8 @@ impl Store {
                     (snapshot.baseline.is_some() && baseline.is_none())
                         .then(|| "baseline_source_unverified".to_owned())
                 });
-                let (resolved, cleanup_owner) = inputs::resolve_with_cleanup(
-                    &snapshot.profile,
-                    &candidate,
-                    baseline.as_ref(),
-                );
+                let (resolved, cleanup_owner) =
+                    inputs::resolve_with_cleanup(&snapshot.profile, &candidate, baseline.as_ref());
                 let prepared = resolved.and_then(|mut resolved| {
                     if let Some(reason) = baseline_reason {
                         resolved.add_widening_reason(&reason)?;
@@ -1998,11 +1995,7 @@ impl Store {
         }
 
         let operation_name = request.operation.name();
-        let _operation_guard = self
-            .check_child_custody
-            .git_cleanup_operation
-            .lock()
-            .await;
+        let _operation_guard = self.check_child_custody.git_cleanup_operation.lock().await;
         self.check_child_custody.reap_git_cleanup_owners().await;
         if !self
             .check_child_custody
@@ -2040,12 +2033,10 @@ impl Store {
             self.check_child_custody.retain_git_cleanup(owner).await;
             if pending {
                 let cause_code = operation_result.err().map(|error| error.code);
-                return serde_json::to_value(
-                    crate::hooks::git::HookLocalResult::CleanupPending {
-                        operation: operation_name.to_owned(),
-                        cause_code,
-                    },
-                )
+                return serde_json::to_value(crate::hooks::git::HookLocalResult::CleanupPending {
+                    operation: operation_name.to_owned(),
+                    cause_code,
+                })
                 .map_err(Into::into);
             }
         }

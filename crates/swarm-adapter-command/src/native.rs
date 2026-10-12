@@ -9,6 +9,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use swarm_contracts::{
@@ -54,13 +55,31 @@ pub struct InvocationResult {
     pub stop_bridge: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct StreamCapture {
     prefix: Vec<u8>,
     total_bytes: u64,
-    sha256: String,
+    hasher: Sha256,
     truncated: bool,
     read_error: bool,
+}
+
+impl StreamCapture {
+    fn sha256(&self) -> String {
+        format!("{:x}", self.hasher.clone().finalize())
+    }
+}
+
+type SharedStreamCapture = Arc<Mutex<StreamCapture>>;
+
+fn snapshot_stream_capture(capture: &SharedStreamCapture, incomplete: bool) -> StreamCapture {
+    let mut capture = capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if incomplete {
+        capture.read_error = true;
+    }
+    capture.clone()
 }
 
 #[derive(Debug, Default)]
@@ -220,8 +239,18 @@ pub async fn invoke(
         .stderr
         .take()
         .ok_or_else(|| Error::new("NATIVE_STREAM_UNAVAILABLE", "stderr pipe was not created"))?;
-    let stdout_reader = tokio::spawn(read_stream(stdout, MAX_STDOUT_BYTES));
-    let stderr_reader = tokio::spawn(read_stream(stderr, MAX_STDERR_BYTES));
+    let stdout_state = Arc::new(Mutex::new(StreamCapture::default()));
+    let stderr_state = Arc::new(Mutex::new(StreamCapture::default()));
+    let stdout_reader = tokio::spawn(read_stream(
+        stdout,
+        MAX_STDOUT_BYTES,
+        Arc::clone(&stdout_state),
+    ));
+    let stderr_reader = tokio::spawn(read_stream(
+        stderr,
+        MAX_STDERR_BYTES,
+        Arc::clone(&stderr_state),
+    ));
     let stdout_abort = stdout_reader.abort_handle();
     let stderr_abort = stderr_reader.abort_handle();
     let status = match time::timeout(config.run_timeout, child.wait()).await {
@@ -232,6 +261,9 @@ pub async fn invoke(
                 stderr_reader,
                 &stdout_abort,
                 &stderr_abort,
+                &stdout_state,
+                &stderr_state,
+                STREAM_DRAIN_GRACE,
             )
             .await;
             let mut outcome = unknown_outcome(
@@ -244,8 +276,8 @@ pub async fn invoke(
                     "timed_out":false,
                     "prompt_transport":"argv",
                     "native_stream_capture_status":format!("wait_error:{capture_status}"),
-                    "stdout":capture_metadata(stdout_capture.as_ref()),
-                    "stderr":capture_metadata(stderr_capture.as_ref()),
+                    "stdout":capture_metadata(Some(&stdout_capture)),
+                    "stderr":capture_metadata(Some(&stderr_capture)),
                     "spawn_error_observed":false,
                     "direct_child":direct_child_facts(direct_pid, &birth_value, false, Value::Null),
                     "native_session_state":"possibly_started"
@@ -255,16 +287,12 @@ pub async fn invoke(
                 json!(digest(config.owner_token.as_bytes()));
             store.save_native_evidence(
                 &command.operation_id,
-                stdout_capture
-                    .as_ref()
-                    .map_or(&[][..], |capture| capture.prefix.as_slice()),
-                stderr_capture
-                    .as_ref()
-                    .map_or(&[][..], |capture| capture.prefix.as_slice()),
+                &stdout_capture.prefix,
+                &stderr_capture.prefix,
                 &json!({
                     "native_stream_capture_status":format!("wait_error:{capture_status}"),
-                    "stdout":capture_metadata(stdout_capture.as_ref()),
-                    "stderr":capture_metadata(stderr_capture.as_ref()),
+                    "stdout":capture_metadata(Some(&stdout_capture)),
+                    "stderr":capture_metadata(Some(&stderr_capture)),
                     "native_child":direct_child_facts(direct_pid, &birth_value, false, Value::Null)
                 }),
             )?;
@@ -282,6 +310,9 @@ pub async fn invoke(
                 stderr_reader,
                 &stdout_abort,
                 &stderr_abort,
+                &stdout_state,
+                &stderr_state,
+                STREAM_DRAIN_GRACE,
             )
             .await;
             let mut outcome = unknown_outcome(
@@ -294,8 +325,8 @@ pub async fn invoke(
                     "timed_out":true,
                     "prompt_transport":"argv",
                     "native_stream_capture_status":format!("deadline:{capture_status}"),
-                    "stdout":capture_metadata(stdout_capture.as_ref()),
-                    "stderr":capture_metadata(stderr_capture.as_ref()),
+                    "stdout":capture_metadata(Some(&stdout_capture)),
+                    "stderr":capture_metadata(Some(&stderr_capture)),
                     "spawn_error_observed":false,
                     "direct_child":direct_child_facts(direct_pid, &birth_value, false, Value::Null),
                     "native_session_state":"possibly_started",
@@ -307,17 +338,13 @@ pub async fn invoke(
                 json!(digest(config.owner_token.as_bytes()));
             store.save_native_evidence(
                 &command.operation_id,
-                stdout_capture
-                    .as_ref()
-                    .map_or(&[][..], |capture| capture.prefix.as_slice()),
-                stderr_capture
-                    .as_ref()
-                    .map_or(&[][..], |capture| capture.prefix.as_slice()),
+                &stdout_capture.prefix,
+                &stderr_capture.prefix,
                 &json!({
                     "timed_out":true,
                     "native_stream_capture_status":format!("deadline:{capture_status}"),
-                    "stdout":capture_metadata(stdout_capture.as_ref()),
-                    "stderr":capture_metadata(stderr_capture.as_ref()),
+                    "stdout":capture_metadata(Some(&stdout_capture)),
+                    "stderr":capture_metadata(Some(&stderr_capture)),
                     "native_child":direct_child_facts(direct_pid, &birth_value, false, Value::Null),
                     "family_departure_claimed":false,
                     "manager_group_drain_required":true
@@ -344,8 +371,10 @@ pub async fn invoke(
         Ok((stdout_result, stderr_result)) => {
             let stdout_joined = stdout_result.is_ok();
             let stderr_joined = stderr_result.is_ok();
-            let stdout_capture = stdout_result.ok();
-            let stderr_capture = stderr_result.ok();
+            let stdout_capture =
+                stdout_result.unwrap_or_else(|_| snapshot_stream_capture(&stdout_state, true));
+            let stderr_capture =
+                stderr_result.unwrap_or_else(|_| snapshot_stream_capture(&stderr_state, true));
             let mut outcome = unknown_outcome(
                 command,
                 identity,
@@ -357,8 +386,8 @@ pub async fn invoke(
                     "prompt_transport":"argv",
                     "stdout_reader_joined":stdout_joined,
                     "stderr_reader_joined":stderr_joined,
-                    "stdout_read_error":stdout_capture.as_ref().map(|capture| capture.read_error),
-                    "stderr_read_error":stderr_capture.as_ref().map(|capture| capture.read_error),
+                    "stdout":capture_metadata(Some(&stdout_capture)),
+                    "stderr":capture_metadata(Some(&stderr_capture)),
                     "spawn_error_observed":false,
                     "direct_child":direct_child_facts(direct_pid, &birth_value, true, status_json(&status)),
                     "family_departure_claimed":false,
@@ -369,20 +398,14 @@ pub async fn invoke(
                 json!(digest(config.owner_token.as_bytes()));
             store.save_native_evidence(
                     &command.operation_id,
-                    stdout_capture.as_ref().map_or(&[][..], |capture| capture.prefix.as_slice()),
-                    stderr_capture.as_ref().map_or(&[][..], |capture| capture.prefix.as_slice()),
+                    &stdout_capture.prefix,
+                    &stderr_capture.prefix,
                     &json!({
                         "prompt_transport":"argv",
                         "stdout_reader_joined":stdout_joined,
                         "stderr_reader_joined":stderr_joined,
-                        "stdout_bytes":stdout_capture.as_ref().map(|capture| capture.total_bytes),
-                        "stdout_sha256":stdout_capture.as_ref().map(|capture| capture.sha256.as_str()),
-                        "stdout_truncated":stdout_capture.as_ref().map(|capture| capture.truncated),
-                        "stdout_read_error":stdout_capture.as_ref().map(|capture| capture.read_error),
-                        "stderr_bytes":stderr_capture.as_ref().map(|capture| capture.total_bytes),
-                        "stderr_sha256":stderr_capture.as_ref().map(|capture| capture.sha256.as_str()),
-                        "stderr_truncated":stderr_capture.as_ref().map(|capture| capture.truncated),
-                        "stderr_read_error":stderr_capture.as_ref().map(|capture| capture.read_error),
+                        "stdout":capture_metadata(Some(&stdout_capture)),
+                        "stderr":capture_metadata(Some(&stderr_capture)),
                         "native_child":direct_child_facts(direct_pid, &birth_value, true, status_json(&status))
                     }),
                 )?;
@@ -394,6 +417,8 @@ pub async fn invoke(
         Err(_) => {
             stdout_abort.abort();
             stderr_abort.abort();
+            let stdout_capture = snapshot_stream_capture(&stdout_state, true);
+            let stderr_capture = snapshot_stream_capture(&stderr_state, true);
             let mut outcome = unknown_outcome(
                 command,
                 identity,
@@ -405,6 +430,8 @@ pub async fn invoke(
                     "stream_drain_timed_out":true,
                     "prompt_transport":"argv",
                     "native_stream_capture_status":"drain_deadline_exceeded",
+                    "stdout":capture_metadata(Some(&stdout_capture)),
+                    "stderr":capture_metadata(Some(&stderr_capture)),
                     "spawn_error_observed":false,
                     "direct_child":direct_child_facts(direct_pid, &birth_value, true, status_json(&status)),
                     "family_departure_claimed":false,
@@ -415,11 +442,13 @@ pub async fn invoke(
                 json!(digest(config.owner_token.as_bytes()));
             store.save_native_evidence(
                     &command.operation_id,
-                    b"",
-                    b"",
+                    &stdout_capture.prefix,
+                    &stderr_capture.prefix,
                     &json!({
                         "stream_drain_timed_out":true,
                         "native_stream_capture_status":"drain_deadline_exceeded",
+                        "stdout":capture_metadata(Some(&stdout_capture)),
+                        "stderr":capture_metadata(Some(&stderr_capture)),
                         "native_child":direct_child_facts(direct_pid, &birth_value, true, status_json(&status))
                     }),
                 )?;
@@ -476,13 +505,13 @@ pub async fn invoke(
         "prompt_bytes":identity.prompt_bytes,
         "stdout_bytes":stdout_capture.total_bytes,
         "stdout_stored_bytes":stdout_capture.prefix.len(),
-        "stdout_sha256":stdout_capture.sha256,
+        "stdout_sha256":stdout_capture.sha256(),
         "stdout_stored_sha256":digest(&stdout_capture.prefix),
         "stdout_truncated":stdout_capture.truncated,
         "stdout_read_error":stdout_capture.read_error,
         "stderr_bytes":stderr_capture.total_bytes,
         "stderr_stored_bytes":stderr_capture.prefix.len(),
-        "stderr_sha256":stderr_capture.sha256,
+        "stderr_sha256":stderr_capture.sha256(),
         "stderr_stored_sha256":digest(&stderr_capture.prefix),
         "stderr_truncated":stderr_capture.truncated,
         "stderr_read_error":stderr_capture.read_error,
@@ -610,13 +639,13 @@ fn disposition(
         "native_protocol_gap_count":summary.gap_count,
         "stdout_bytes":stdout.total_bytes,
         "stdout_stored_bytes":stdout.prefix.len(),
-        "stdout_sha256":stdout.sha256,
+        "stdout_sha256":stdout.sha256(),
         "stdout_stored_sha256":digest(&stdout.prefix),
         "stdout_truncated":stdout.truncated,
         "stdout_read_error":stdout.read_error,
         "stderr_bytes":stderr.total_bytes,
         "stderr_stored_bytes":stderr.prefix.len(),
-        "stderr_sha256":stderr.sha256,
+        "stderr_sha256":stderr.sha256(),
         "stderr_stored_sha256":digest(&stderr.prefix),
         "stderr_truncated":stderr.truncated,
         "stderr_read_error":stderr.read_error,
@@ -929,16 +958,21 @@ fn bounded_field_status(value: Option<&Value>, included: bool) -> &'static str {
     }
 }
 
-async fn read_stream<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> StreamCapture {
-    let mut capture = StreamCapture::default();
-    let mut hash = Sha256::new();
+async fn read_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    capture: SharedStreamCapture,
+) -> StreamCapture {
     let mut chunk = [0_u8; 16 * 1024];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(count) => {
+                let mut capture = capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 capture.total_bytes = capture.total_bytes.saturating_add(count as u64);
-                hash.update(&chunk[..count]);
+                capture.hasher.update(&chunk[..count]);
                 let remaining = limit.saturating_sub(capture.prefix.len());
                 let stored = remaining.min(count);
                 capture.prefix.extend_from_slice(&chunk[..stored]);
@@ -947,13 +981,15 @@ async fn read_stream<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> Strea
                 }
             }
             Err(_) => {
+                let mut capture = capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 capture.read_error = true;
                 break;
             }
         }
     }
-    capture.sha256 = format!("{:x}", hash.finalize());
-    capture
+    snapshot_stream_capture(&capture, false)
 }
 
 async fn join_capture(task: JoinHandle<StreamCapture>) -> Result<StreamCapture> {
@@ -970,8 +1006,11 @@ async fn drain_captures_after_stop(
     stderr_task: JoinHandle<StreamCapture>,
     stdout_abort: &AbortHandle,
     stderr_abort: &AbortHandle,
-) -> (Option<StreamCapture>, Option<StreamCapture>, &'static str) {
-    match time::timeout(STREAM_DRAIN_GRACE, async {
+    stdout_state: &SharedStreamCapture,
+    stderr_state: &SharedStreamCapture,
+    grace: Duration,
+) -> (StreamCapture, StreamCapture, &'static str) {
+    match time::timeout(grace, async {
         (
             join_capture(stdout_task).await,
             join_capture(stderr_task).await,
@@ -986,8 +1025,8 @@ async fn drain_captures_after_stop(
                 stderr_abort.abort();
             }
             (
-                stdout.ok(),
-                stderr.ok(),
+                stdout.unwrap_or_else(|_| snapshot_stream_capture(stdout_state, true)),
+                stderr.unwrap_or_else(|_| snapshot_stream_capture(stderr_state, true)),
                 if joined {
                     "drained_to_eof"
                 } else {
@@ -998,7 +1037,11 @@ async fn drain_captures_after_stop(
         Err(_) => {
             stdout_abort.abort();
             stderr_abort.abort();
-            (None, None, "drain_deadline_exceeded")
+            (
+                snapshot_stream_capture(stdout_state, true),
+                snapshot_stream_capture(stderr_state, true),
+                "drain_deadline_exceeded",
+            )
         }
     }
 }
@@ -1097,7 +1140,7 @@ fn capture_metadata(capture: Option<&StreamCapture>) -> Value {
         json!({
             "bytes":capture.total_bytes,
             "stored_bytes":capture.prefix.len(),
-            "sha256":capture.sha256,
+            "sha256":capture.sha256(),
             "stored_sha256":digest(&capture.prefix),
             "truncated":capture.truncated,
             "read_error":capture.read_error
@@ -1410,5 +1453,300 @@ pub fn open_preflight_outcome(
             "diagnostic_code":code,
             "task_acceptance_claimed":false
         }),
+    }
+}
+
+#[cfg(test)]
+mod capture_release_fixture {
+    use super::*;
+    use crate::journal::RunStore;
+    use serde_json::json;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use swarm_contracts::{
+        module_catalog::{
+            ArtifactId, ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleId, ProtocolVersion,
+        },
+        module_contract::ModuleContractClaim,
+        runtime::ModuleReceiptIdentity,
+    };
+    use tokio::{io::ReadBuf, sync::oneshot};
+
+    struct TempState(PathBuf);
+
+    impl TempState {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("command-r47-capture-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).expect("create fixture state directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PrefixThenPending {
+        prefix: Option<Vec<u8>>,
+        ready: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for PrefixThenPending {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(prefix) = this.prefix.take() {
+                buffer.put_slice(&prefix);
+                if let Some(ready) = this.ready.take() {
+                    let _ = ready.send(());
+                }
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn target_output(
+        operation_id: &str,
+        input_sha256: &str,
+        module_receipt: &Value,
+        native_output: &str,
+        capture: &StreamCapture,
+        native_child: &Value,
+    ) -> Value {
+        json!({
+            "schema_version":1,
+            "operation_id":operation_id,
+            "method":"task.dispatch",
+            "operation_state":"outcome_unknown",
+            "operation_outcome":"unknown",
+            "completion_condition":"native_result_unconfirmed",
+            "input_sha256":input_sha256,
+            "module_receipt":module_receipt,
+            "task_dispatch_context":Value::Null,
+            "dispatch_admission":Value::Null,
+            "native_output":native_output,
+            "stream_bytes":capture.total_bytes,
+            "stored_bytes":capture.prefix.len(),
+            "stream_sha256":capture.sha256(),
+            "stored_sha256":digest(&capture.prefix),
+            "truncated":capture.truncated,
+            "read_error":capture.read_error,
+            "native_child":native_child,
+            "native_response_identity":"unavailable",
+            "execution_complete":false,
+            "task_completion":"unknown",
+            "native_replay":false
+        })
+    }
+
+    #[tokio::test]
+    async fn timed_out_partial_captures_reach_artifact_ack_and_remain_readable() -> Result<()> {
+        let state = TempState::new();
+        let store = RunStore::new_for_profile(&state.0, crate::Profile::BatchV3)?;
+        let binding_id = "fixture-binding";
+        let generation = 1;
+        let route = json!({
+            "runtime":crate::RUNTIME,
+            "module_artifact_id":crate::ARTIFACT_ID,
+            "native_options":{"modelId":"fixture-model"}
+        });
+        let operation_id = "fixture-command-dispatch";
+        let input_sha256 = "a".repeat(64);
+        let identity = DispatchIdentity {
+            operation_id: operation_id.to_owned(),
+            input_sha256: input_sha256.clone(),
+            batch_run_id: "fixture-batch".to_owned(),
+            requested_model: "fixture-model".to_owned(),
+            prompt_sha256: "b".repeat(64),
+            prompt_bytes: 12,
+            task_snapshot_sha256: "c".repeat(64),
+        };
+        store.admit(
+            operation_id,
+            Some(&identity),
+            binding_id,
+            generation,
+            &route,
+        )?;
+
+        let stdout_state = Arc::new(Mutex::new(StreamCapture::default()));
+        let stderr_state = Arc::new(Mutex::new(StreamCapture::default()));
+        let stdout_bytes = b"partial stdout before drain timeout\n".to_vec();
+        let stderr_bytes = b"partial stderr before drain timeout\n".to_vec();
+        let (stdout_ready_tx, stdout_ready_rx) = oneshot::channel();
+        let (stderr_ready_tx, stderr_ready_rx) = oneshot::channel();
+        let stdout_task = tokio::spawn(read_stream(
+            PrefixThenPending {
+                prefix: Some(stdout_bytes.clone()),
+                ready: Some(stdout_ready_tx),
+            },
+            MAX_STDOUT_BYTES,
+            Arc::clone(&stdout_state),
+        ));
+        let stderr_task = tokio::spawn(read_stream(
+            PrefixThenPending {
+                prefix: Some(stderr_bytes.clone()),
+                ready: Some(stderr_ready_tx),
+            },
+            MAX_STDERR_BYTES,
+            Arc::clone(&stderr_state),
+        ));
+        stdout_ready_rx
+            .await
+            .map_err(|_| Error::new("FIXTURE_CAPTURE_FAILED", "stdout prefix was not read"))?;
+        stderr_ready_rx
+            .await
+            .map_err(|_| Error::new("FIXTURE_CAPTURE_FAILED", "stderr prefix was not read"))?;
+        let stdout_abort = stdout_task.abort_handle();
+        let stderr_abort = stderr_task.abort_handle();
+        let (stdout_capture, stderr_capture, capture_status) = drain_captures_after_stop(
+            stdout_task,
+            stderr_task,
+            &stdout_abort,
+            &stderr_abort,
+            &stdout_state,
+            &stderr_state,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(capture_status, "drain_deadline_exceeded");
+        assert!(stdout_capture.read_error && stderr_capture.read_error);
+        assert_eq!(stdout_capture.prefix, stdout_bytes);
+        assert_eq!(stderr_capture.prefix, stderr_bytes);
+
+        let module_id = ModuleId::new("runtime.command").expect("valid module id");
+        let artifact_id = ArtifactId::new(crate::ARTIFACT_ID).expect("valid artifact id");
+        let artifact_version = ArtifactVersion::new("3").expect("valid artifact version");
+        let claim = ModuleContractClaim {
+            schema_version: 1,
+            module_id,
+            artifact: ArtifactIdentity {
+                artifact_id,
+                version: artifact_version,
+                build_id: None,
+            },
+            protocol: ProtocolVersion { major: 1, minor: 0 },
+            capabilities: vec![CapabilityId::new("agent.result").expect("valid capability")],
+            config_schema: None,
+            pre_input_open: None,
+            command_schemas: Vec::new(),
+            event_schemas: Vec::new(),
+        };
+        let module_receipt = ModuleReceiptIdentity {
+            schema_version: 1,
+            module_id: claim.module_id.clone(),
+            artifact: claim.artifact.clone(),
+            protocol: claim.protocol,
+            binding_id: binding_id.to_owned(),
+            binding_generation: generation,
+            operation_id: operation_id.to_owned(),
+            input_sha256: input_sha256.clone(),
+        };
+        let module_receipt_value = serde_json::to_value(&module_receipt)?;
+        let native_child = json!({
+            "spawn_returned_pid":17,
+            "birth_identity":Value::Null,
+            "exit_observed_through_child_handle":true,
+            "exit":{"code":0,"signal":Value::Null},
+            "family_departure_claimed":false,
+            "manager_group_drain_required":true
+        });
+        store.save_native_evidence(
+            operation_id,
+            &stdout_capture.prefix,
+            &stderr_capture.prefix,
+            &json!({
+                "timed_out":true,
+                "native_stream_capture_status":"deadline:drain_deadline_exceeded",
+                "stdout":capture_metadata(Some(&stdout_capture)),
+                "stderr":capture_metadata(Some(&stderr_capture)),
+                "native_child":native_child
+            }),
+        )?;
+
+        for (result_operation_id, result_input_sha256, native_output, capture) in [
+            (
+                "fixture-command-stdout-result",
+                "d".repeat(64),
+                "stdout.ndjson",
+                &stdout_capture,
+            ),
+            (
+                "fixture-command-stderr-result",
+                "e".repeat(64),
+                "stderr.txt",
+                &stderr_capture,
+            ),
+        ] {
+            let target = target_output(
+                operation_id,
+                &input_sha256,
+                &module_receipt_value,
+                native_output,
+                capture,
+                &native_child,
+            );
+            let command = RuntimeCommand {
+                operation_id: result_operation_id.to_owned(),
+                method: "agent.result".to_owned(),
+                created_at_ms: 1,
+                binding_id: binding_id.to_owned(),
+                generation,
+                native_root_id: None,
+                route: route.clone(),
+                input: json!({
+                    "selector":{
+                        "kind":"command_output",
+                        "input_operation_id":operation_id,
+                        "native_output":native_output
+                    },
+                    "target_command_output":target,
+                    "offset_bytes":0
+                }),
+                input_sha256: Some(result_input_sha256),
+                target_input_sha256: Some(input_sha256.clone()),
+            };
+            store.admit(result_operation_id, None, binding_id, generation, &route)?;
+            let params = crate::result_page::build_output(&command, &claim, &store)?;
+            let hash = store.save_result_page(result_operation_id, &params)?;
+            let (saved, saved_hash) =
+                store
+                    .read_result_page(result_operation_id)?
+                    .ok_or_else(|| {
+                        Error::new("FIXTURE_PAGE_MISSING", "saved result page disappeared")
+                    })?;
+            assert_eq!(saved_hash, hash);
+            crate::result_page::validate_saved(&saved, &claim, binding_id, generation)?;
+            store.acknowledge_result_page(
+                result_operation_id,
+                &hash,
+                json!({"recorded":true,"artifact_ref":format!("artifact:{result_operation_id}")}),
+            )?;
+            assert!(!store.result_page_pending(result_operation_id, &hash)?);
+
+            let saved_target = &saved["page"]["source"]["target_command_output"];
+            let recovered = store.read_native_output(
+                operation_id,
+                &input_sha256,
+                binding_id,
+                generation,
+                &route,
+                saved_target,
+            )?;
+            assert_eq!(recovered, capture.prefix);
+        }
+
+        Ok(())
     }
 }

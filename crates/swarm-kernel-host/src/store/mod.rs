@@ -114,6 +114,7 @@ use crate::{
     model::{self, Credential, Principal, Role},
     platform::DataRoot,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
 };
@@ -1763,6 +1764,16 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
+            || params
+                .get(swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD)
+                .is_some()
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "Command capture release evidence is derived and admitted only by Store",
+            ));
+        }
         if principal.client_id == automation_scheduler::SERVICE_ID {
             if !matches!(
                 method.as_str(),
@@ -1957,7 +1968,29 @@ impl Store {
                 let result = self
                     .run(move |db| runtime::next_with_config(db, &p, &config))
                     .await?;
-                if !result["command"].is_null() || result.get("rejected_operation_id").is_some() {
+                if !result["command"].is_null() {
+                    match self
+                        .serve_released_command_output(principal.clone(), &result["command"])
+                        .await
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(result),
+                        Err(error) => {
+                            if let Some(rejected) = self
+                                .reject_unreturned_result_command(
+                                    principal.clone(),
+                                    &result["command"],
+                                    error.clone(),
+                                )
+                                .await?
+                            {
+                                return Ok(rejected);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                if result.get("rejected_operation_id").is_some() {
                     return Ok(result);
                 }
                 tokio::select! {
@@ -1986,6 +2019,7 @@ impl Store {
                 | "agent.reconcile"
                 | "agent.result"
                 | "agent.recover"
+                | "native.command.release_evidence"
                 | "host.mode"
                 | "module.outcome"
                 | "module.observe"
@@ -2502,6 +2536,7 @@ impl Store {
     async fn persist_result(&self, principal: Principal, params: Value) -> Result<Value> {
         model::fields(&params, &["operation_id", "page"])?;
         let op = model::text(&params, "operation_id")?.to_string();
+        let op_for_prepare = op.clone();
         let page: ResultPage = serde_json::from_value(params["page"].clone())?;
         let p = principal.clone();
         let source = page.source.clone();
@@ -2515,9 +2550,9 @@ impl Store {
         let mut metadata = self
             .run(move |db| {
                 if command_result_page {
-                    command_results::prepare(db, &p, &op, &source)
+                    command_results::prepare(db, &p, &op_for_prepare, &source)
                 } else {
-                    results::prepare(db, &p, &op, &source)
+                    results::prepare(db, &p, &op_for_prepare, &source)
                 }
             })
             .await?;
@@ -2625,8 +2660,343 @@ impl Store {
                 }
             })
             .await?;
+        if command_result_page {
+            self.admit_command_capture_release_for_result(&op).await?;
+        }
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(result)
+    }
+
+    async fn serve_released_command_output(
+        &self,
+        principal: Principal,
+        command: &Value,
+    ) -> Result<bool> {
+        if command["method"] != "agent.result"
+            || command["input"]["selector"]["kind"] != "command_output"
+        {
+            return Ok(false);
+        }
+
+        let command = command.clone();
+        let operation_id = model::text(&command, "operation_id")?.to_owned();
+        let principal_for_read = principal.clone();
+        let operation_for_read = operation_id.clone();
+        let prepared = self
+            .run(move |db| {
+                let principal = current_principal(db, principal_for_read)?;
+                let (binding_id, generation, _) = runtime::scope(db, &principal, true)?;
+                let operation = operations::get_operation(db, &operation_for_read)?;
+                if principal.role != Role::Module
+                    || operation["method"] != "agent.result"
+                    || operation["state"] != "sending"
+                    || operation["binding_id"] != binding_id
+                    || operation["binding_generation"] != generation
+                    || command["binding_id"] != binding_id
+                    || command["generation"] != generation
+                {
+                    return Err(Error::new(
+                        "RESULT_TARGET_SCOPE_INVALID",
+                        "post-release result command is outside its authenticated module binding",
+                    ));
+                }
+                let (original_raw, effective_raw): (String, String) = db.query_row(
+                    "SELECT original_request_json,effective_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3 AND method='agent.result'",
+                    params![operation_for_read, binding_id, generation],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let request: Value = serde_json::from_str(&original_raw)?;
+                let effective: Value = serde_json::from_str(&effective_raw)?;
+                let mut expected_request = request.clone();
+                if effective["normalized_result_origin"].is_object() {
+                    normalized_result::validate_admitted_operation(
+                        db,
+                        &operation_for_read,
+                        &effective["normalized_result_origin"],
+                    )?;
+                    // Match the exact private enrichment produced by module.next,
+                    // while retaining the original user request's input digest.
+                    expected_request["normalized_result_origin"] =
+                        effective["normalized_result_origin"].clone();
+                    if effective["normalized_result_payload_identity"].is_object() {
+                        expected_request["normalized_result_payload_identity"] =
+                            effective["normalized_result_payload_identity"].clone();
+                    }
+                }
+                let mut dispatched_request = command["input"].clone();
+                let dispatched_fields = dispatched_request.as_object_mut().ok_or_else(|| {
+                    Error::new(
+                        "RESULT_PROVENANCE_INVALID",
+                        "module result command input is not an object",
+                    )
+                })?;
+                dispatched_fields.remove("target_command_output");
+                let result_input_sha256 =
+                    model::digest(model::canonical(&request)?.as_bytes());
+                if dispatched_request != expected_request
+                    || command["input_sha256"] != result_input_sha256
+                    || request["binding_id"] != binding_id
+                    || request["generation"] != generation
+                {
+                    return Err(Error::new(
+                        "RESULT_PROVENANCE_INVALID",
+                        "module result command differs from its exact retained request",
+                    ));
+                }
+
+                let target_operation_id =
+                    model::text(&request["selector"], "input_operation_id")?;
+                let native_output = model::text(&request["selector"], "native_output")?;
+                let released: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND method=?3 AND json_extract(original_request_json,'$.target_operation_id')=?4 AND json_extract(original_request_json,'$.capture_release_evidence.target_operation_id')=?4)",
+                    params![
+                        binding_id,
+                        generation,
+                        swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD,
+                        target_operation_id
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !released {
+                    return Ok(None);
+                }
+                let offset_bytes = request["offset_bytes"].as_u64().unwrap_or(0);
+                let length_bytes = request["length_bytes"]
+                    .as_u64()
+                    .unwrap_or(MAX_PAGE_BYTES as u64);
+                let plan = results::command_output_artifact_read_plan(
+                    db,
+                    &binding_id,
+                    generation,
+                    target_operation_id,
+                    native_output,
+                    offset_bytes,
+                    length_bytes,
+                )?;
+                if command["target_input_sha256"]
+                    != plan.target_command_output["input_sha256"]
+                    || command["input"]["target_command_output"]
+                        != plan.target_command_output
+                {
+                    return Err(Error::new(
+                        "RESULT_PROVENANCE_INVALID",
+                        "released result plan differs from its authenticated module command",
+                    ));
+                }
+                Ok(Some((request, plan, result_input_sha256)))
+            })
+            .await?;
+        let Some((request, plan, result_input_sha256)) = prepared else {
+            return Ok(false);
+        };
+
+        let page_source = {
+            let target = &plan.target_command_output;
+            let mut result_module_receipt = target["module_receipt"].clone();
+            if !result_module_receipt.is_object() {
+                return Err(Error::new(
+                    "MODULE_RECEIPT_INVALID",
+                    "retained Command output has no module receipt for its result page",
+                ));
+            }
+            result_module_receipt["operation_id"] = json!(operation_id);
+            result_module_receipt["input_sha256"] = json!(result_input_sha256);
+            let source = json!({
+                "kind":"command_output",
+                "result_operation_id":operation_id,
+                "result_input_sha256":result_input_sha256,
+                "result_module_receipt":result_module_receipt,
+                "input_operation_id":request["selector"]["input_operation_id"],
+                "target_input_sha256":target["input_sha256"],
+                "target_module_receipt":target["module_receipt"],
+                "target_command_output":target,
+                "native_response_identity":"unavailable",
+                "execution_complete":false,
+                "task_completion":"unknown",
+                "native_replay":false
+            });
+            if model::canonical(&source)?.len() > 8192 {
+                return Err(Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "Command output provenance exceeds its storage bound",
+                ));
+            }
+            source
+        };
+
+        let read_plan = plan.clone();
+        let bytes = self
+            .file_io(move |files| {
+                let capacity = usize::try_from(read_plan.byte_length)
+                    .map_err(|_| Error::invalid("Command result page is too large"))?;
+                if capacity > MAX_PAGE_BYTES {
+                    return Err(Error::invalid("Command result page exceeds its size bound"));
+                }
+                let mut bytes = Vec::with_capacity(capacity);
+                let mut result_offset = 0u64;
+                for slice in &read_plan.slices {
+                    if slice.result_offset_bytes != result_offset {
+                        return Err(Error::new(
+                            "COMMAND_RELEASE_COVERAGE_INVALID",
+                            "retained Command result slices are not contiguous",
+                        ));
+                    }
+                    if slice.byte_length == 0 {
+                        files.verify(&slice.artifact)?;
+                    } else {
+                        let length = usize::try_from(slice.byte_length)
+                            .map_err(|_| Error::invalid("Command artifact slice is too large"))?;
+                        if length > MAX_PAGE_BYTES {
+                            return Err(Error::invalid(
+                                "Command artifact slice exceeds its size bound",
+                            ));
+                        }
+                        let stored = files.read(
+                            &slice.artifact,
+                            slice.artifact_offset_bytes,
+                            length,
+                        )?;
+                        if stored["artifact_id"] != slice.artifact.artifact_id
+                            || stored["artifact_sha256"] != slice.artifact.content_digest
+                            || stored["offset_bytes"].as_u64()
+                                != Some(slice.artifact_offset_bytes)
+                            || stored["byte_length"].as_u64() != Some(slice.byte_length)
+                            || stored["metadata"]["page_sha256"]
+                                != slice.artifact.content_digest
+                        {
+                            return Err(Error::new(
+                                "COMMAND_RELEASE_ARTIFACT_INVALID",
+                                "verified Command artifact read differs from its immutable page receipt",
+                            ));
+                        }
+                        let content = model::text(&stored, "content")?;
+                        let chunk = match model::text(&stored, "encoding")? {
+                            "utf8" => content.as_bytes().to_vec(),
+                            "base64" => STANDARD.decode(content).map_err(|_| {
+                                Error::new(
+                                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                                    "verified Command artifact has invalid base64 content",
+                                )
+                            })?,
+                            _ => {
+                                return Err(Error::new(
+                                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                                    "verified Command artifact has an unsupported encoding",
+                                ));
+                            }
+                        };
+                        if chunk.len() != length {
+                            return Err(Error::new(
+                                "COMMAND_RELEASE_ARTIFACT_INVALID",
+                                "verified Command artifact slice has the wrong byte length",
+                            ));
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    result_offset = result_offset
+                        .checked_add(slice.byte_length)
+                        .ok_or_else(|| {
+                            Error::new(
+                                "COMMAND_RELEASE_COVERAGE_INVALID",
+                                "Command result page slice range overflow",
+                            )
+                        })?;
+                }
+                if result_offset != read_plan.byte_length || bytes.len() != capacity {
+                    return Err(Error::new(
+                        "COMMAND_RELEASE_COVERAGE_INVALID",
+                        "verified Command artifacts do not match the exact requested range",
+                    ));
+                }
+                if read_plan.offset_bytes == 0
+                    && read_plan.byte_length == read_plan.total_bytes
+                    && read_plan.target_command_output["stored_sha256"].as_str()
+                        != Some(model::digest(&bytes).as_str())
+                {
+                    return Err(Error::new(
+                        "COMMAND_RELEASE_ARTIFACT_INVALID",
+                        "complete Command output differs from its retained stream digest",
+                    ));
+                }
+                Ok(bytes)
+            })
+            .await?;
+
+        let media_type = if plan.target_command_output["native_output"] == "stdout.ndjson" {
+            "application/x-ndjson"
+        } else {
+            "text/plain; charset=utf-8"
+        };
+        let page = json!({
+            "source":page_source,
+            "offset_bytes":plan.offset_bytes,
+            "byte_length":bytes.len(),
+            "total_bytes":plan.total_bytes,
+            "eof":plan.eof,
+            "media_type":media_type,
+            "content_base64":STANDARD.encode(&bytes),
+            "page_sha256":model::digest(&bytes)
+        });
+        self.persist_result(principal, json!({"operation_id":operation_id,"page":page}))
+            .await?;
+        Ok(true)
+    }
+
+    async fn reject_unreturned_result_command(
+        &self,
+        principal: Principal,
+        command: &Value,
+        error: Error,
+    ) -> Result<Option<Value>> {
+        let operation_id = model::text(command, "operation_id")?.to_owned();
+        let binding_id = model::text(command, "binding_id")?.to_owned();
+        let generation = model::positive(command, "generation")?;
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let principal = current_principal(&tx, principal)?;
+            if principal.role != Role::Module {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "only the exact module binding may reject its undispatched result command",
+                ));
+            }
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            if operation["method"] != "agent.result"
+                || operation["binding_id"] != binding_id
+                || operation["binding_generation"] != generation
+            {
+                return Err(Error::new(
+                    "RESULT_TARGET_SCOPE_INVALID",
+                    "undispatched result failure no longer matches its exact Operation binding",
+                ));
+            }
+            if operation["state"] != "sending" {
+                return Ok(None);
+            }
+            let now = model::now_ms()?;
+            let changed = tx.execute(
+                "UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND method='agent.result' AND binding_id=?4 AND binding_generation=?5 AND state='sending'",
+                params![
+                    operation_id,
+                    model::canonical(&json!(error))?,
+                    now,
+                    binding_id,
+                    generation
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "undispatched result command changed before its read failure was recorded",
+                ));
+            }
+            tx.commit()?;
+            Ok(Some(json!({
+                "command":null,
+                "rejected_operation_id":operation_id,
+                "error":error
+            })))
+        })
+        .await
     }
     async fn submit_task(&self, principal: Principal, params: Value) -> Result<Value> {
         let p = principal.clone();
@@ -6437,7 +6807,8 @@ fn apply(
         | "agent.recover"
         | "native.opencode.loop_step"
         | "native.command.cancel_turn"
-        | "native.command.close_session" => {
+        | "native.command.close_session"
+        | swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD => {
             runtime::user_command(tx, p, method, v, id, config).map(|v| (v, true))
         }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),

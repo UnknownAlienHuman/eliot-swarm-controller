@@ -1085,6 +1085,188 @@ pub(super) fn record(
     Ok(json!({"recorded":true,"artifact_ref":artifact.artifact_id}))
 }
 
+/// Read back one settled Command result-page Operation and its immutable
+/// ArtifactRecord. The caller still verifies the artifact file through
+/// ArtifactFiles before treating this database projection as byte evidence.
+pub(super) fn command_result_page_readback(
+    db: &Connection,
+    operation_id: &str,
+    artifact_ref: &str,
+) -> Result<ArtifactRecord> {
+    let operation = operations::get_operation(db, operation_id)?;
+    if operation["method"] != "agent.result"
+        || operation["state"] != "settled"
+        || operation["result"]["outcome"] != "applied"
+        || operation["result"]["details"]["completion_condition"] != "result_page_persisted"
+        || operation["result"]["details"]["artifact_ref"] != artifact_ref
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_UNACKNOWLEDGED",
+            "Command result page Operation has no exact persisted artifact receipt",
+        ));
+    }
+    let artifact = get(db, artifact_ref)?;
+    let details = &operation["result"]["details"];
+    if artifact.kind != "native_result_page"
+        || artifact.metadata["operation_id"] != operation_id
+        || artifact.content_digest != details["page_sha256"].as_str().unwrap_or_default()
+        || artifact.byte_length != details["byte_length"].as_u64().unwrap_or(u64::MAX)
+        || artifact.metadata["offset_bytes"] != details["offset_bytes"]
+        || artifact.metadata["total_bytes"] != details["total_bytes"]
+        || artifact.metadata["eof"] != details["eof"]
+        || artifact.metadata["page_sha256"] != details["page_sha256"]
+        || !valid_sha256(&artifact.content_digest)
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "Command result artifact differs from its immutable Operation receipt",
+        ));
+    }
+    Ok(artifact)
+}
+
+/// Exact byte slice of a previously persisted Command result artifact. Store's
+/// post-release dispatcher uses these slices to serve result pages without
+/// reopening the retired Command run directory.
+#[derive(Debug, Clone)]
+pub(super) struct CommandOutputArtifactSlice {
+    pub(super) artifact: ArtifactRecord,
+    pub(super) artifact_offset_bytes: u64,
+    pub(super) result_offset_bytes: u64,
+    pub(super) byte_length: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CommandOutputArtifactReadPlan {
+    pub(super) target_command_output: Value,
+    pub(super) offset_bytes: u64,
+    pub(super) byte_length: u64,
+    pub(super) total_bytes: u64,
+    pub(super) eof: bool,
+    pub(super) slices: Vec<CommandOutputArtifactSlice>,
+}
+
+/// Plan an exact requested range from the immutable pages that already cover
+/// a released Command stream. This reads only Store Operation/artifact
+/// projections; it has no native-capture fallback.
+pub(super) fn command_output_artifact_read_plan(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    target_operation_id: &str,
+    native_output: &str,
+    offset_bytes: u64,
+    length_bytes: u64,
+) -> Result<CommandOutputArtifactReadPlan> {
+    if length_bytes == 0 || length_bytes > crate::artifacts::MAX_PAGE_BYTES as u64 {
+        return Err(Error::invalid("Command artifact page length is invalid"));
+    }
+    let (evidence, artifacts) = super::command_results::command_capture_release_readback(
+        db,
+        binding_id,
+        generation,
+        target_operation_id,
+    )?;
+    let output = evidence
+        .outputs
+        .iter()
+        .find(|output| output.native_output == native_output)
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_SELECTOR_UNSUPPORTED",
+                "retained Command artifact stream is not available",
+            )
+        })?;
+    let total_bytes = output.target_command_output["stored_bytes"]
+        .as_u64()
+        .ok_or_else(|| Error::new("RESULT_PROVENANCE_INVALID", "stored size is malformed"))?;
+    if offset_bytes > total_bytes {
+        return Err(Error::new(
+            "RESULT_RANGE_INVALID",
+            "Command artifact offset exceeds the retained stream",
+        ));
+    }
+    let requested_end = offset_bytes
+        .checked_add(length_bytes)
+        .ok_or_else(|| Error::invalid("Command artifact page range overflow"))?
+        .min(total_bytes);
+    let byte_length = requested_end - offset_bytes;
+    let mut slices = Vec::new();
+    if total_bytes == 0 {
+        let page = output.pages.first().ok_or_else(|| {
+            Error::new(
+                "COMMAND_RELEASE_RESULT_MISSING",
+                "empty Command stream has no persisted result artifact",
+            )
+        })?;
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == page.artifact_ref)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                    "empty Command result artifact is absent from Store readback",
+                )
+            })?;
+        slices.push(CommandOutputArtifactSlice {
+            artifact,
+            artifact_offset_bytes: 0,
+            result_offset_bytes: 0,
+            byte_length: 0,
+        });
+    } else {
+        for page in &output.pages {
+            let page_end = page
+                .offset_bytes
+                .checked_add(page.byte_length)
+                .ok_or_else(|| {
+                    Error::new("COMMAND_RELEASE_COVERAGE_INVALID", "page range overflow")
+                })?;
+            let overlap_start = offset_bytes.max(page.offset_bytes);
+            let overlap_end = requested_end.min(page_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let artifact = artifacts
+                .iter()
+                .find(|artifact| artifact.artifact_id == page.artifact_ref)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        "COMMAND_RELEASE_ARTIFACT_INVALID",
+                        "Command result page is absent from Store readback",
+                    )
+                })?;
+            slices.push(CommandOutputArtifactSlice {
+                artifact,
+                artifact_offset_bytes: overlap_start - page.offset_bytes,
+                result_offset_bytes: overlap_start - offset_bytes,
+                byte_length: overlap_end - overlap_start,
+            });
+        }
+        let planned_bytes = slices.iter().try_fold(0u64, |total, slice| {
+            total
+                .checked_add(slice.byte_length)
+                .ok_or_else(|| Error::new("COMMAND_RELEASE_COVERAGE_INVALID", "read plan overflow"))
+        })?;
+        if planned_bytes != byte_length {
+            return Err(Error::new(
+                "COMMAND_RELEASE_COVERAGE_INVALID",
+                "persisted Command artifacts do not cover the requested retained range",
+            ));
+        }
+    }
+    Ok(CommandOutputArtifactReadPlan {
+        target_command_output: output.target_command_output.clone(),
+        offset_bytes,
+        byte_length,
+        total_bytes,
+        eof: requested_end == total_bytes,
+        slices,
+    })
+}
+
 pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
     let row: Option<(String,String,i64,String,String)> = db.query_row(
         "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission','source_snapshot','check_result','check_output','script_bundle','script_result','script_output')",

@@ -10,8 +10,6 @@ use std::{
 pub use swarm_contracts::mcp_frontend::{McpConfig, McpProfileConfig, McpToolProfile};
 
 const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
-// Stable route ID; Store selection pins the concrete descriptor version for new bindings.
-const CODEX_RUST_ARTIFACT_ID: &str = "codex-rust-controller.1";
 pub(crate) const OPENCODE_RUST_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
 const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const COMMAND_ACP_ARTIFACT_ID: &str = "eliot-command.acp-rust.1";
@@ -301,7 +299,9 @@ impl Route {
         }
 
         let (runtime, workspace_field) = match self.module_artifact_id.as_str() {
-            CODEX_RUST_ARTIFACT_ID => ("codex", "workspaceRoot"),
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID => {
+                ("codex", "workspaceRoot")
+            }
             OPENCODE_RUST_ARTIFACT_ID => ("module", "directory"),
             COMMAND_RUST_ARTIFACT_ID | COMMAND_ACP_ARTIFACT_ID => ("command", "workspaceRoot"),
             ANTIGRAVITY_RUST_ARTIFACT_ID => ("antigravity", "workspaceRoot"),
@@ -324,7 +324,9 @@ impl Route {
         }
 
         match self.module_artifact_id.as_str() {
-            CODEX_RUST_ARTIFACT_ID => validate_codex_rust_options(&self.native_options),
+            swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID => {
+                validate_codex_rust_options(&self.native_options)
+            }
             OPENCODE_RUST_ARTIFACT_ID => {
                 if self.runtime == "module" && self.owned_service.is_some() {
                     validate_owned_opencode_rust_options(&self.native_options)
@@ -991,12 +993,12 @@ impl Config {
             r.validate_activation_contract()?;
             if r.enabled
                 && r.runtime == crate::runtime::codex::RUNTIME
-                && r.module_artifact_id != crate::runtime::codex::ARTIFACT_ID
-                && r.module_artifact_id != CODEX_RUST_ARTIFACT_ID
+                && r.module_artifact_id
+                    != swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
             {
                 return Err(Error::new(
                     "CONFIG_ERROR",
-                    "Codex routes require the pinned bridge.3 controller or standalone Rust adapter artifact",
+                    "enabled Codex routes require the standalone Rust controller artifact",
                 ));
             }
         }

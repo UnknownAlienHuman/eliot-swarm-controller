@@ -1051,6 +1051,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "native.command.release_evidence",
+        class: MethodClass::Internal,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "module.observe",
         class: MethodClass::Internal,
         mcp: false,

@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "5",
+    "version": "6",
     "build_id": null
   },
   "launch": {
@@ -60,6 +60,16 @@
     },
     {
       "schema_id": "swarm.normalized_result_page",
+      "version": "1",
+      "sha256": null
+    },
+    {
+      "schema_id": "swarm.goal_continuation_admission",
+      "version": "1",
+      "sha256": null
+    },
+    {
+      "schema_id": "swarm.goal_terminal_evidence",
       "version": "1",
       "sha256": null
     }

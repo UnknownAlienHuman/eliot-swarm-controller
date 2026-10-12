@@ -3,12 +3,13 @@
 //! This module never inspects or removes a worktree. Attempt release is an
 //! owner attestation, not proof that a native process stopped, so a lease is
 //! released only when its exact terminal Attempt is released and no linked
-//! operation, producer, or native binding remains active or unresolved, or its
-//! unbound launch closed with positive evidence that execution never began.
+//! operation, producer, or native binding remains active or unresolved, or an
+//! unbound launch has exact closed-effect or post-revocation readback proof.
 
 use crate::{
     error::{Error, Result},
     model,
+    workspace::LeaseAuthorityRef,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,8 @@ struct LeaseCandidate {
     clean_state_json: String,
     plan_digest: String,
     baseline_commit: String,
+    branch_ref: String,
+    worktree_handle: String,
     updated_at_ms: i64,
 }
 
@@ -78,6 +81,9 @@ enum Transition {
         native_effect: &'static str,
     },
     Released {
+        reason: &'static str,
+    },
+    ReleasedAfterWorkspaceReadback {
         reason: &'static str,
     },
 }
@@ -128,7 +134,9 @@ pub(crate) fn reconcile(
         };
         let state = match transition {
             Transition::Stale { .. } => "stale",
-            Transition::Released { .. } => "released",
+            Transition::Released { .. } | Transition::ReleasedAfterWorkspaceReadback { .. } => {
+                "released"
+            }
         };
         let clean_state_json = lifecycle_facts(&lease, transition, now)?;
         let changed = tx.execute(
@@ -137,7 +145,8 @@ pub(crate) fn reconcile(
              WHERE lease_id=?4 AND registration_id=?5 AND registration_generation=?6
                AND project_id=?7 AND task_id=?8 AND task_revision=?9 AND operation_id=?10
                AND owner_client_id=?11 AND attempt_id IS ?12 AND generation=?13
-               AND binding_digest=?14 AND state=?15 AND plan_digest=?16 AND baseline_commit=?17",
+               AND binding_digest=?14 AND state=?15 AND plan_digest=?16 AND baseline_commit=?17
+               AND branch_ref=?18 AND worktree_handle=?19",
             params![
                 state,
                 clean_state_json,
@@ -156,6 +165,8 @@ pub(crate) fn reconcile(
                 lease.state,
                 lease.plan_digest,
                 lease.baseline_commit,
+                lease.branch_ref,
+                lease.worktree_handle,
             ],
         )?;
         if changed != 1 {
@@ -177,7 +188,8 @@ fn candidates(
     let mut statement = tx.prepare(
         "SELECT l.lease_id,l.registration_id,l.registration_generation,l.project_id,
                 l.task_id,l.task_revision,l.operation_id,l.owner_client_id,l.attempt_id,
-                l.generation,l.binding_digest,l.state,l.clean_state_json,l.plan_digest,l.baseline_commit,l.updated_at_ms
+                l.generation,l.binding_digest,l.state,l.clean_state_json,l.plan_digest,
+                l.baseline_commit,l.branch_ref,l.worktree_handle,l.updated_at_ms
          FROM workspace_leases l
          WHERE (
            (l.state IN ('preparing','held','outcome_unknown')
@@ -209,6 +221,27 @@ fn candidates(
                  json_extract(o.result_json,'$.native_effect')='not_attempted'
                  ELSE 0 END
            ))
+           OR (l.state='stale' AND l.attempt_id IS NULL
+             AND CASE WHEN json_valid(l.clean_state_json) THEN
+               json_extract(l.clean_state_json,'$.status')='registration_revoked'
+               AND json_extract(l.clean_state_json,'$.prior_lease_state')='outcome_unknown'
+               AND json_extract(l.clean_state_json,'$.post_revocation_readback.status')='verified'
+               AND json_extract(l.clean_state_json,'$.post_revocation_readback.version')=1
+               AND json_extract(l.clean_state_json,'$.post_revocation_readback.kind')=
+                 'post_revocation_workspace_filesystem_readback'
+             ELSE 0 END
+             AND EXISTS (
+               SELECT 1 FROM workspace_registrations r
+               WHERE r.registration_id=l.registration_id AND r.project_id=l.project_id
+                 AND r.state='revoked' AND r.generation=l.registration_generation+1
+             )
+             AND EXISTS (
+               SELECT 1 FROM operations o WHERE o.operation_id=l.operation_id
+                 AND o.method='swarm.launch' AND o.state='outcome_unknown'
+                 AND o.task_id=l.task_id AND o.attempt_id IS NULL
+                 AND o.binding_id IS NULL AND o.binding_generation IS NULL
+             )
+           )
            OR (l.state='stale' AND l.attempt_id IS NOT NULL
              AND COALESCE(
                json_extract(l.clean_state_json,'$.prior_lease_state'),
@@ -249,7 +282,9 @@ fn candidates(
                 clean_state_json: row.get(12)?,
                 plan_digest: row.get(13)?,
                 baseline_commit: row.get(14)?,
-                updated_at_ms: row.get(15)?,
+                branch_ref: row.get(15)?,
+                worktree_handle: row.get(16)?,
+                updated_at_ms: row.get(17)?,
             })
         },
     )?;
@@ -267,6 +302,11 @@ fn transition_for(tx: &Transaction<'_>, lease: &LeaseCandidate) -> Result<Option
     };
 
     let Some(attempt_id) = lease.attempt_id.as_deref() else {
+        if revoked_unknown_workspace_readback_is_releasable(tx, lease)? {
+            return Ok(Some(Transition::ReleasedAfterWorkspaceReadback {
+                reason: "revoked_unknown_workspace_readback_verified",
+            }));
+        }
         if closed_launch_has_no_native_effect(tx, lease)? {
             return Ok(Some(Transition::Released {
                 reason: "unbound_launch_closed_before_native_effect",
@@ -342,6 +382,67 @@ fn transition_for(tx: &Transaction<'_>, lease: &LeaseCandidate) -> Result<Option
         reason,
         native_effect: effect_status_for_lease(tx, lease)?,
     }))
+}
+
+fn revoked_unknown_workspace_readback_is_releasable(
+    tx: &Transaction<'_>,
+    lease: &LeaseCandidate,
+) -> Result<bool> {
+    if lease.state != "stale"
+        || lease.attempt_id.is_some()
+        || lease.clean_state_json.len() > 1_048_576
+    {
+        return Ok(false);
+    }
+    let reference = LeaseAuthorityRef {
+        lease_id: lease.lease_id.clone(),
+        registration_id: lease.registration_id.clone(),
+        registration_generation: lease.registration_generation,
+        project_id: lease.project_id.clone(),
+        task_id: lease.task_id.clone(),
+        task_revision: lease.task_revision,
+        operation_id: lease.operation_id.clone(),
+        plan_digest: lease.plan_digest.clone(),
+        owner_client_id: lease.owner_client_id.clone(),
+        attempt_id: None,
+        generation: lease.generation,
+        baseline_commit: lease.baseline_commit.clone(),
+        branch_ref: lease.branch_ref.clone(),
+        worktree_handle: lease.worktree_handle.clone(),
+        binding_digest: lease.binding_digest.clone(),
+        state: lease.state.clone(),
+    };
+    if !super::workspace::post_revocation_unknown_workspace_readback_matches(tx, &reference)? {
+        return Ok(false);
+    }
+    let unresolved_linked_work: bool = tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM operations o
+           LEFT JOIN bindings b ON b.binding_id=o.binding_id AND b.generation=o.binding_generation
+           WHERE o.operation_id<>?4
+             AND (o.prerequisite_operation_id=?4 OR CASE WHEN json_valid(o.effective_request_json) THEN
+               json_extract(o.effective_request_json,'$.workspace_lease.lease_id')=?1
+               AND json_extract(o.effective_request_json,'$.workspace_lease.generation')=?2
+               AND json_extract(o.effective_request_json,'$.workspace_lease.binding_digest')=?3
+             ELSE 0 END)
+             AND (o.state IN ('queued','sending','native_accepted','outcome_unknown')
+                  OR (b.binding_id IS NOT NULL AND b.released_at_ms IS NULL)
+                  OR NOT json_valid(o.effective_request_json)))
+         OR EXISTS(SELECT 1 FROM owned_service_starts
+           WHERE lease_id=?1 AND lease_generation=?2
+             AND state IN ('reserved','outcome_unknown','service_observed'))
+         OR EXISTS(SELECT 1 FROM attempts
+           WHERE start_operation_id=?4 AND task_id=?5)",
+        params![
+            lease.lease_id,
+            lease.generation,
+            lease.binding_digest,
+            lease.operation_id,
+            lease.task_id,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(!unresolved_linked_work)
 }
 
 struct UnadmittedLaunch {
@@ -734,14 +835,23 @@ fn lifecycle_facts(lease: &LeaseCandidate, transition: Transition, now: i64) -> 
     } else {
         lease.state.clone()
     };
-    let (state, reason, native_effect) = match transition {
+    let (state, reason, native_effect, workspace_readback) = match transition {
         Transition::Stale {
             reason,
             native_effect,
-        } => ("stale", reason, native_effect),
-        Transition::Released { reason } => {
-            ("released", reason, "no_active_or_unknown_native_records")
-        }
+        } => ("stale", reason, native_effect, "not_performed"),
+        Transition::Released { reason } => (
+            "released",
+            reason,
+            "no_active_or_unknown_native_records",
+            "not_performed",
+        ),
+        Transition::ReleasedAfterWorkspaceReadback { reason } => (
+            "released",
+            reason,
+            "workspace_readback_verified_operation_outcome_unknown_retained",
+            "verified",
+        ),
     };
     let event = json!({
         "state": state,
@@ -750,6 +860,7 @@ fn lifecycle_facts(lease: &LeaseCandidate, transition: Transition, now: i64) -> 
         "at_ms": now,
         "native_effect_status": native_effect,
         "runtime_observation": "not_performed",
+        "workspace_readback": workspace_readback,
         "native_process_stop_action": "none",
         "filesystem_cleanup": "not_attempted",
     });

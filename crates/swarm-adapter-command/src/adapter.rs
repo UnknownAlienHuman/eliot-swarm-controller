@@ -3,7 +3,7 @@ use crate::acp_prompt::{self, PreparedAcpDispatch};
 use crate::module_host::{self, ModuleHostIdentity};
 use crate::{ARTIFACT_ID, EXECUTION_SHAPE, RUNTIME};
 use crate::{
-    journal::{DispatchIdentity, RunStore, digest},
+    journal::{DispatchIdentity, NativeCaptureEvidence, NativeStreamFacts, RunStore, digest},
     native, result_page,
 };
 use serde::Deserialize;
@@ -18,6 +18,7 @@ use swarm_client::{HostConnectionConfig, ModuleLink};
 use swarm_contracts::{
     Credential, EffectOutcome, RuntimeCommand, RuntimeOutcome,
     error::{Error, Result},
+    module_command::CommandCaptureReleaseEvidence,
     runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext},
 };
 use tokio::time;
@@ -178,6 +179,7 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
+        store.finalize_acknowledged_releases()?;
         for (params, hash) in store.pending_result_pages()? {
             result_page::validate_saved(
                 &params,
@@ -487,6 +489,85 @@ fn validate_dispatch_outcome(
     Ok(())
 }
 
+fn retry_admitted_dispatch_outcome(
+    store: &RunStore,
+    identity: &DispatchIdentity,
+    binding_id: &str,
+    generation: i64,
+    route: &Value,
+    dispatch_admission: Option<&TaskDispatchAdmissionReceipt>,
+) -> Result<RuntimeOutcome> {
+    if let Some((saved, _)) = store.read_outcome(&identity.operation_id)? {
+        if !native::result_identity_matches(&serde_json::to_value(&saved)?, identity) {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_CONFLICT",
+                "saved terminal receipt differs from the core-frozen Operation",
+            ));
+        }
+        validate_dispatch_outcome(&saved, dispatch_admission)?;
+        return Ok(saved);
+    }
+
+    let mut unknown = native::core_bound_unknown(
+        &identity.operation_id,
+        identity,
+        "native_result_missing_after_admission",
+    );
+    unknown.details["native_replay"] = json!(false);
+    match store.read_native_evidence(identity, binding_id, generation, route, dispatch_admission) {
+        Ok(Some(evidence)) => {
+            apply_retained_capture_facts(&mut unknown, &evidence);
+            unknown.details["diagnostic_code"] =
+                json!("native_outcome_missing_after_capture_persisted");
+            unknown.details["native_capture_recovery_status"] = json!("validated");
+            unknown.details["local_evidence_available"] = json!(true);
+        }
+        Ok(None) => mark_capture_recovery_unavailable(
+            &mut unknown,
+            "not_retained",
+            "native_result_missing_after_admission",
+        ),
+        Err(_) => mark_capture_recovery_unavailable(
+            &mut unknown,
+            "proof_unavailable",
+            "native_capture_proof_unavailable",
+        ),
+    }
+    validate_dispatch_outcome(&unknown, dispatch_admission)?;
+    Ok(unknown)
+}
+
+fn apply_retained_capture_facts(outcome: &mut RuntimeOutcome, evidence: &NativeCaptureEvidence) {
+    set_native_stream_facts(&mut outcome.details, "stdout", &evidence.stdout_facts);
+    set_native_stream_facts(&mut outcome.details, "stderr", &evidence.stderr_facts);
+    outcome.details["native_child"] = evidence.native_child.clone();
+    if let Some(module_receipt) = &evidence.module_receipt {
+        outcome.details["module_receipt"] = module_receipt.clone();
+    }
+}
+
+fn set_native_stream_facts(details: &mut Value, stream: &str, facts: &NativeStreamFacts) {
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    details.insert(format!("{stream}_bytes"), json!(facts.bytes));
+    details.insert(format!("{stream}_stored_bytes"), json!(facts.stored_bytes));
+    details.insert(format!("{stream}_sha256"), json!(facts.sha256));
+    details.insert(
+        format!("{stream}_stored_sha256"),
+        json!(facts.stored_sha256),
+    );
+    details.insert(format!("{stream}_truncated"), json!(facts.truncated));
+    details.insert(format!("{stream}_read_error"), json!(facts.read_error));
+}
+
+fn mark_capture_recovery_unavailable(outcome: &mut RuntimeOutcome, status: &str, diagnostic: &str) {
+    outcome.details["diagnostic_code"] = json!(diagnostic);
+    outcome.details["native_capture_recovery_status"] = json!(status);
+    outcome.details["local_evidence_available"] = json!(false);
+    outcome.details["native_replay"] = json!(false);
+}
+
 async fn process_command(
     config: &Config,
     owner: &Owner,
@@ -597,22 +678,14 @@ async fn process_command(
                         "saved dispatch admission differs from the current Store context",
                     ));
                 }
-                let outcome = if let Some((saved, _)) = store.read_outcome(&command.operation_id)? {
-                    if !native::result_identity_matches(&serde_json::to_value(&saved)?, &identity) {
-                        return Err(Error::new(
-                            "ADAPTER_EVIDENCE_CONFLICT",
-                            "saved terminal receipt differs from the core-frozen Operation",
-                        ));
-                    }
-                    saved
-                } else {
-                    native::core_bound_unknown(
-                        &command.operation_id,
-                        &identity,
-                        "native_result_missing_after_admission",
-                    )
-                };
-                validate_dispatch_outcome(&outcome, dispatch_admission.as_ref())?;
+                let outcome = retry_admitted_dispatch_outcome(
+                    store,
+                    &identity,
+                    &command.binding_id,
+                    command.generation,
+                    &command.route,
+                    dispatch_admission.as_ref(),
+                )?;
                 return Ok((vec![outcome], false));
             }
             if let Some(admission) = dispatch_admission.as_ref() {
@@ -737,6 +810,55 @@ async fn process_command(
             )?;
             deliver_result_page(link, config, credential, owner, store, params, hash).await?;
             Ok((Vec::new(), false))
+        }
+        "native.command.release_evidence" => {
+            let (_, _) = store.admit(
+                &command.operation_id,
+                None,
+                &command.binding_id,
+                command.generation,
+                &command.route,
+            )?;
+            let evidence_value = command
+                .input
+                .get(swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        "COMMAND_RELEASE_EVIDENCE_INVALID",
+                        "Store release Operation omitted its artifact coverage proof",
+                    )
+                })?;
+            let evidence: CommandCaptureReleaseEvidence = serde_json::from_value(evidence_value)
+                .map_err(|_| {
+                    Error::new(
+                        "COMMAND_RELEASE_EVIDENCE_INVALID",
+                        "Store release Operation has an invalid artifact coverage proof",
+                    )
+                })?;
+            if command.input["target_operation_id"].as_str()
+                != Some(evidence.target_operation_id.as_str())
+            {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_EVIDENCE_INVALID",
+                    "Store release Operation target differs from its artifact coverage proof",
+                ));
+            }
+            let release_input_sha256 = command.input_sha256.as_deref().ok_or_else(|| {
+                Error::new(
+                    "COMMAND_RELEASE_EVIDENCE_INVALID",
+                    "Store release Operation omitted its exact input digest",
+                )
+            })?;
+            let outcome = store.release_command_captures(
+                &command.operation_id,
+                release_input_sha256,
+                &command.binding_id,
+                command.generation,
+                &command.route,
+                &evidence,
+            )?;
+            Ok((vec![outcome], false))
         }
         _ => Err(Error::new(
             "CAPABILITY_UNAVAILABLE",
@@ -979,6 +1101,7 @@ async fn deliver_outcome(
     match client.outcome(payload.clone()).await {
         Ok(ack) => {
             store.acknowledge(&outcome.operation_id, &hash, ack)?;
+            store.finalize_release_after_outcome_ack(&outcome.operation_id, &hash)?;
             Ok(client)
         }
         Err(error) if is_transport_uncertain(&error) => {
@@ -998,6 +1121,7 @@ async fn deliver_outcome(
             let mut replacement = replacement_link.client;
             let ack = replacement.outcome(payload).await?;
             store.acknowledge(&outcome.operation_id, &hash, ack)?;
+            store.finalize_release_after_outcome_ack(&outcome.operation_id, &hash)?;
             Ok(replacement)
         }
         Err(error) => Err(error),
@@ -1232,7 +1356,12 @@ fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
     } else {
         matches!(
             command.method.as_str(),
-            "agent.open" | "task.dispatch" | "agent.refresh" | "agent.reconcile" | "agent.result"
+            "agent.open"
+                | "task.dispatch"
+                | "agent.refresh"
+                | "agent.reconcile"
+                | "agent.result"
+                | "native.command.release_evidence"
         )
     };
     if !supported {
@@ -1701,4 +1830,630 @@ fn receipts_completion(store: &RunStore, operation_id: &str) -> Option<Value> {
             .cloned()
             .unwrap_or(Value::Null),
     )
+}
+
+#[cfg(test)]
+mod capture_release_fixture {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use swarm_contracts::module_command::{
+        CommandCaptureArtifactPage, CommandCaptureOutputCoverage, CommandCaptureReleaseEvidence,
+    };
+
+    struct TempState(PathBuf);
+
+    impl TempState {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("command-release-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).expect("create fixture state directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct AdmittedCaptureFixture {
+        _state: TempState,
+        store: RunStore,
+        identity: DispatchIdentity,
+        binding_id: String,
+        generation: i64,
+        route: Value,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        native_child: Value,
+    }
+
+    impl AdmittedCaptureFixture {
+        fn new() -> Result<Self> {
+            let state = TempState::new();
+            let store = RunStore::new_for_profile(&state.0, crate::Profile::BatchV3)?;
+            let binding_id = "fixture-binding".to_owned();
+            let generation = 3;
+            let route = json!({
+                "runtime":crate::RUNTIME,
+                "module_artifact_id":crate::ARTIFACT_ID,
+                "native_options":{"modelId":"fixture-model"}
+            });
+            let identity = DispatchIdentity {
+                operation_id: "fixture-crash-window".to_owned(),
+                input_sha256: "a".repeat(64),
+                batch_run_id: "fixture-batch".to_owned(),
+                requested_model: "fixture-model".to_owned(),
+                prompt_sha256: "b".repeat(64),
+                prompt_bytes: 19,
+                task_snapshot_sha256: "c".repeat(64),
+            };
+            store.admit(
+                &identity.operation_id,
+                Some(&identity),
+                &binding_id,
+                generation,
+                &route,
+            )?;
+            let stdout = b"partial stdout retained\n".to_vec();
+            let stderr = b"partial stderr retained\n".to_vec();
+            let native_child = json!({
+                "spawn_returned_pid":17,
+                "birth_identity":Value::Null,
+                "exit_observed_through_child_handle":false,
+                "exit":Value::Null,
+                "family_departure_claimed":false,
+                "manager_group_drain_required":true
+            });
+            store.save_native_evidence(
+                &identity.operation_id,
+                &stdout,
+                &stderr,
+                &json!({
+                    "stream_drain_timed_out":true,
+                    "native_stream_capture_status":"drain_deadline_exceeded",
+                    "stdout":{
+                        "bytes":stdout.len(),
+                        "stored_bytes":stdout.len(),
+                        "sha256":digest(&stdout),
+                        "stored_sha256":digest(&stdout),
+                        "truncated":false,
+                        "read_error":true
+                    },
+                    "stderr":{
+                        "bytes":stderr.len(),
+                        "stored_bytes":stderr.len(),
+                        "sha256":digest(&stderr),
+                        "stored_sha256":digest(&stderr),
+                        "truncated":false,
+                        "read_error":true
+                    },
+                    "native_child":native_child
+                }),
+            )?;
+            Ok(Self {
+                _state: state,
+                store,
+                identity,
+                binding_id,
+                generation,
+                route,
+                stdout,
+                stderr,
+                native_child,
+            })
+        }
+    }
+
+    #[test]
+    fn adapter_release_persists_intent_and_repeat_readback() -> Result<()> {
+        let state = TempState::new();
+        let store = RunStore::new_for_profile(&state.0, crate::Profile::BatchV3)?;
+        let binding_id = "fixture-binding";
+        let generation = 1;
+        let route = json!({
+            "runtime":crate::RUNTIME,
+            "module_artifact_id":crate::ARTIFACT_ID,
+            "native_options":{"modelId":"fixture-model"}
+        });
+        let target_id = "fixture-command-dispatch";
+        let target_input_sha256 = "a".repeat(64);
+        let stdout = b"partial stdout retained after timeout\n";
+        let stderr = b"partial stderr retained after timeout\n";
+        let native_child = json!({
+            "spawn_returned_pid":17,
+            "birth_identity":Value::Null,
+            "exit_observed_through_child_handle":false,
+            "exit":Value::Null,
+            "family_departure_claimed":false,
+            "manager_group_drain_required":true
+        });
+        let identity = DispatchIdentity {
+            operation_id: target_id.to_owned(),
+            input_sha256: target_input_sha256.clone(),
+            batch_run_id: "fixture-batch".to_owned(),
+            requested_model: "fixture-model".to_owned(),
+            prompt_sha256: "b".repeat(64),
+            prompt_bytes: 12,
+            task_snapshot_sha256: "c".repeat(64),
+        };
+        store.admit(target_id, Some(&identity), binding_id, generation, &route)?;
+        let target_outcome = RuntimeOutcome {
+            operation_id: target_id.to_owned(),
+            outcome: EffectOutcome::Unknown,
+            native_scope_key: None,
+            native_root_id: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({
+                "completion_condition":"native_result_unconfirmed",
+                "native_replay":false
+            }),
+        };
+        let target_outcome_sha256 = store.save_outcome(&target_outcome)?;
+        store.acknowledge(target_id, &target_outcome_sha256, json!({"recorded":true}))?;
+        store.save_native_evidence(
+            target_id,
+            stdout,
+            stderr,
+            &json!({
+                "stdout":{
+                    "bytes":(stdout.len() + 9) as u64,
+                    "stored_bytes":stdout.len() as u64,
+                    "sha256":digest(b"partial stdout retained after timeout\nlate"),
+                    "stored_sha256":digest(stdout),
+                    "truncated":false,
+                    "read_error":true
+                },
+                "stderr":{
+                    "bytes":(stderr.len() + 9) as u64,
+                    "stored_bytes":stderr.len() as u64,
+                    "sha256":digest(b"partial stderr retained after timeout\nlate"),
+                    "stored_sha256":digest(stderr),
+                    "truncated":false,
+                    "read_error":true
+                },
+                "native_child":native_child
+            }),
+        )?;
+
+        let mut outputs = Vec::new();
+        for (native_output, bytes, result_input_sha256) in [
+            ("stdout.ndjson", stdout.as_slice(), "d".repeat(64)),
+            ("stderr.txt", stderr.as_slice(), "e".repeat(64)),
+        ] {
+            let stream_sha256 = if native_output == "stdout.ndjson" {
+                digest(b"partial stdout retained after timeout\nlate")
+            } else {
+                digest(b"partial stderr retained after timeout\nlate")
+            };
+            let snapshot = json!({
+                "schema_version":1,
+                "operation_id":target_id,
+                "method":"task.dispatch",
+                "operation_state":"outcome_unknown",
+                "operation_outcome":"unknown",
+                "completion_condition":"native_result_unconfirmed",
+                "input_sha256":target_input_sha256,
+                "module_receipt":Value::Null,
+                "task_dispatch_context":Value::Null,
+                "dispatch_admission":Value::Null,
+                "native_output":native_output,
+                "stream_bytes":(bytes.len() + 9) as u64,
+                "stored_bytes":bytes.len() as u64,
+                "stream_sha256":stream_sha256,
+                "stored_sha256":digest(bytes),
+                "truncated":false,
+                "read_error":true,
+                "native_child":native_child,
+                "native_response_identity":"unavailable",
+                "execution_complete":false,
+                "task_completion":"unknown",
+                "native_replay":false
+            });
+            assert_eq!(
+                store.read_native_output(
+                    target_id,
+                    &target_input_sha256,
+                    binding_id,
+                    generation,
+                    &route,
+                    &snapshot,
+                )?,
+                bytes
+            );
+            let result_operation_id = format!("fixture-result-{native_output}");
+            let artifact_ref = format!("artifact:{result_operation_id}");
+            let params = json!({
+                "operation_id":result_operation_id,
+                "page":{
+                    "source":{
+                        "kind":"command_output",
+                        "result_operation_id":result_operation_id,
+                        "result_input_sha256":result_input_sha256,
+                        "input_operation_id":target_id,
+                        "target_input_sha256":target_input_sha256,
+                        "target_command_output":snapshot
+                    },
+                    "offset_bytes":0,
+                    "byte_length":bytes.len(),
+                    "total_bytes":bytes.len(),
+                    "eof":true,
+                    "media_type":if native_output == "stdout.ndjson" {
+                        "application/x-ndjson"
+                    } else {
+                        "text/plain; charset=utf-8"
+                    },
+                    "content_base64":STANDARD.encode(bytes),
+                    "page_sha256":digest(bytes)
+                }
+            });
+            store.admit(&result_operation_id, None, binding_id, generation, &route)?;
+            let result_page_sha256 = store.save_result_page(&result_operation_id, &params)?;
+            store.acknowledge_result_page(
+                &result_operation_id,
+                &result_page_sha256,
+                json!({"recorded":true,"artifact_ref":artifact_ref}),
+            )?;
+            outputs.push(CommandCaptureOutputCoverage {
+                native_output: native_output.to_owned(),
+                target_command_output: snapshot,
+                pages: vec![CommandCaptureArtifactPage {
+                    result_operation_id,
+                    result_input_sha256,
+                    artifact_ref,
+                    artifact_sha256: digest(bytes),
+                    artifact_byte_length: bytes.len() as u64,
+                    offset_bytes: 0,
+                    byte_length: bytes.len() as u64,
+                    total_bytes: bytes.len() as u64,
+                    page_sha256: digest(bytes),
+                    eof: true,
+                }],
+            });
+        }
+        let evidence = CommandCaptureReleaseEvidence {
+            schema_version: 1,
+            target_operation_id: target_id.to_owned(),
+            target_input_sha256,
+            target_outcome_sha256,
+            outputs,
+        };
+        let release_input = json!({
+            "target_operation_id":target_id,
+            "capture_release_evidence":evidence
+        });
+        assert_eq!(
+            swarm_contracts::module_command::classify_runtime_command(
+                swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD,
+                &release_input,
+            ),
+            Ok(swarm_contracts::module_command::RuntimeCommandKind::CommandReleaseEvidence)
+        );
+        let evidence: CommandCaptureReleaseEvidence = serde_json::from_value(
+            release_input[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD].clone(),
+        )?;
+        let release_operation_id = "fixture-command-release";
+        let release_input_sha256 = "f".repeat(64);
+        store.admit(release_operation_id, None, binding_id, generation, &route)?;
+        let (_, saved_target_hash) = store
+            .read_outcome(target_id)?
+            .ok_or_else(|| Error::new("FIXTURE_FAILED", "target outcome readback missing"))?;
+        assert_eq!(saved_target_hash, evidence.target_outcome_sha256);
+        let release_outcome = store.release_command_captures(
+            release_operation_id,
+            &release_input_sha256,
+            binding_id,
+            generation,
+            &route,
+            &evidence,
+        )?;
+        assert_eq!(
+            release_outcome.details["completion_condition"],
+            "command_capture_release_recorded"
+        );
+        let release_outcome_sha256 = store.save_outcome(&release_outcome)?;
+        store.acknowledge(
+            release_operation_id,
+            &release_outcome_sha256,
+            json!({"recorded":true}),
+        )?;
+        store.finalize_release_after_outcome_ack(release_operation_id, &release_outcome_sha256)?;
+        store.finalize_acknowledged_releases()?;
+
+        let (first_readback, first_hash) = store
+            .read_outcome(release_operation_id)?
+            .ok_or_else(|| Error::new("FIXTURE_FAILED", "release outcome missing"))?;
+        let (repeat_readback, repeat_hash) = store
+            .read_outcome(release_operation_id)?
+            .ok_or_else(|| Error::new("FIXTURE_FAILED", "repeat release readback missing"))?;
+        assert_eq!(
+            first_readback.details["target_outcome_sha256"],
+            evidence.target_outcome_sha256,
+        );
+        assert_eq!(
+            first_readback.details["target_input_sha256"],
+            evidence.target_input_sha256,
+        );
+        assert_eq!(
+            serde_json::to_value(first_readback)?,
+            serde_json::to_value(repeat_readback)?,
+        );
+        assert_eq!(first_hash, repeat_hash);
+        assert!(!first_hash.is_empty());
+        assert!(
+            store
+                .read_native_output(
+                    target_id,
+                    &evidence.target_input_sha256,
+                    binding_id,
+                    generation,
+                    &route,
+                    &evidence.outputs[0].target_command_output,
+                )
+                .is_err()
+        );
+        assert!(
+            !state
+                .0
+                .join("command-adapter-runs-v3")
+                .join(format!("op-{}", digest(target_id.as_bytes())))
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_retry_recovers_validated_capture_as_unknown_without_replay() -> Result<()> {
+        let fixture = AdmittedCaptureFixture::new()?;
+        let retry_store = RunStore::new_for_profile(&fixture._state.0, crate::Profile::BatchV3)?;
+        assert!(
+            retry_store
+                .read_outcome(&fixture.identity.operation_id)?
+                .is_none(),
+            "reopened crash-window journal must have no persisted outcome"
+        );
+
+        let outcome = retry_admitted_dispatch_outcome(
+            &retry_store,
+            &fixture.identity,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+            None,
+        )?;
+        assert_eq!(outcome.outcome, EffectOutcome::Unknown);
+        assert_eq!(outcome.operation_id, fixture.identity.operation_id);
+        assert_eq!(
+            outcome.details["input_sha256"],
+            fixture.identity.input_sha256
+        );
+        assert_eq!(
+            outcome.details["prompt_sha256"],
+            fixture.identity.prompt_sha256
+        );
+        assert_eq!(
+            outcome.details["task_snapshot_sha256"],
+            fixture.identity.task_snapshot_sha256
+        );
+        assert_eq!(
+            outcome.details["completion_condition"],
+            "native_result_unconfirmed"
+        );
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "native_outcome_missing_after_capture_persisted"
+        );
+        assert_eq!(
+            outcome.details["native_capture_recovery_status"],
+            "validated"
+        );
+        assert_eq!(outcome.details["local_evidence_available"], true);
+        assert_eq!(outcome.details["native_replay"], false);
+        assert_eq!(outcome.details["task_acceptance_claimed"], false);
+        assert_eq!(outcome.details["native_result"], Value::Null);
+        assert_eq!(outcome.details["result_subtype"], Value::Null);
+        assert_eq!(outcome.details["stdout_bytes"], fixture.stdout.len() as u64);
+        assert_eq!(
+            outcome.details["stdout_stored_bytes"],
+            fixture.stdout.len() as u64
+        );
+        assert_eq!(outcome.details["stdout_sha256"], digest(&fixture.stdout));
+        assert_eq!(
+            outcome.details["stdout_stored_sha256"],
+            digest(&fixture.stdout)
+        );
+        assert_eq!(outcome.details["stdout_read_error"], true);
+        assert_eq!(outcome.details["stderr_bytes"], fixture.stderr.len() as u64);
+        assert_eq!(outcome.details["stderr_sha256"], digest(&fixture.stderr));
+        assert_eq!(
+            outcome.details["stderr_stored_sha256"],
+            digest(&fixture.stderr)
+        );
+        assert_eq!(outcome.details["stderr_read_error"], true);
+        assert_eq!(outcome.details["native_child"], fixture.native_child);
+
+        let stdout_expected = json!({
+            "task_dispatch_context":Value::Null,
+            "module_receipt":Value::Null,
+            "dispatch_admission":Value::Null,
+            "native_output":"stdout.ndjson",
+            "stream_bytes":outcome.details["stdout_bytes"],
+            "stored_bytes":outcome.details["stdout_stored_bytes"],
+            "stream_sha256":outcome.details["stdout_sha256"],
+            "stored_sha256":outcome.details["stdout_stored_sha256"],
+            "truncated":outcome.details["stdout_truncated"],
+            "read_error":outcome.details["stdout_read_error"],
+            "native_child":outcome.details["native_child"]
+        });
+        let stderr_expected = json!({
+            "task_dispatch_context":Value::Null,
+            "module_receipt":Value::Null,
+            "dispatch_admission":Value::Null,
+            "native_output":"stderr.txt",
+            "stream_bytes":outcome.details["stderr_bytes"],
+            "stored_bytes":outcome.details["stderr_stored_bytes"],
+            "stream_sha256":outcome.details["stderr_sha256"],
+            "stored_sha256":outcome.details["stderr_stored_sha256"],
+            "truncated":outcome.details["stderr_truncated"],
+            "read_error":outcome.details["stderr_read_error"],
+            "native_child":outcome.details["native_child"]
+        });
+        assert_eq!(
+            retry_store.read_native_output(
+                &fixture.identity.operation_id,
+                &fixture.identity.input_sha256,
+                &fixture.binding_id,
+                fixture.generation,
+                &fixture.route,
+                &stdout_expected,
+            )?,
+            fixture.stdout
+        );
+        assert_eq!(
+            retry_store.read_native_output(
+                &fixture.identity.operation_id,
+                &fixture.identity.input_sha256,
+                &fixture.binding_id,
+                fixture.generation,
+                &fixture.route,
+                &stderr_expected,
+            )?,
+            fixture.stderr
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_retry_wrong_identity_and_corrupt_capture_stay_fenced() -> Result<()> {
+        let fixture = AdmittedCaptureFixture::new()?;
+        let mut wrong_identity = fixture.identity.clone();
+        wrong_identity.input_sha256 = "d".repeat(64);
+        assert_eq!(
+            fixture
+                .store
+                .admit(
+                    &wrong_identity.operation_id,
+                    Some(&wrong_identity),
+                    &fixture.binding_id,
+                    fixture.generation,
+                    &fixture.route,
+                )
+                .expect_err("changed request digest must not reuse admitted evidence")
+                .code,
+            "ADAPTER_EVIDENCE_CONFLICT"
+        );
+
+        let directory = fixture.store.directory(&fixture.identity.operation_id)?;
+        fs::write(directory.join("stdout.ndjson"), b"corrupt capture")?;
+        let outcome = retry_admitted_dispatch_outcome(
+            &fixture.store,
+            &fixture.identity,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+            None,
+        )?;
+        assert_eq!(outcome.outcome, EffectOutcome::Unknown);
+        assert_eq!(
+            outcome.details["input_sha256"],
+            fixture.identity.input_sha256
+        );
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "native_capture_proof_unavailable"
+        );
+        assert_eq!(
+            outcome.details["native_capture_recovery_status"],
+            "proof_unavailable"
+        );
+        assert_eq!(outcome.details["local_evidence_available"], false);
+        assert_eq!(outcome.details["native_replay"], false);
+        assert_eq!(outcome.details["task_acceptance_claimed"], false);
+        assert!(outcome.details["stdout_bytes"].is_null());
+        assert!(
+            fixture
+                .store
+                .read_outcome(&fixture.identity.operation_id)?
+                .is_none(),
+            "retry resolution must not fabricate a saved outcome before the caller persists it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_retry_inconsistent_capture_receipt_stays_fenced() -> Result<()> {
+        let fixture = AdmittedCaptureFixture::new()?;
+        let directory = fixture.store.directory(&fixture.identity.operation_id)?;
+        let receipt_path = directory.join("run.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+        receipt["stdout"]["sha256"] = json!(digest(b"different whole stream"));
+        fs::write(&receipt_path, serde_json::to_vec(&receipt)?)?;
+
+        let outcome = retry_admitted_dispatch_outcome(
+            &fixture.store,
+            &fixture.identity,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+            None,
+        )?;
+        assert_eq!(outcome.outcome, EffectOutcome::Unknown);
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "native_capture_proof_unavailable"
+        );
+        assert_eq!(
+            outcome.details["native_capture_recovery_status"],
+            "proof_unavailable"
+        );
+        assert_eq!(outcome.details["local_evidence_available"], false);
+        assert_eq!(outcome.details["native_replay"], false);
+        assert_eq!(outcome.details["task_acceptance_claimed"], false);
+        assert!(
+            fixture
+                .store
+                .read_outcome(&fixture.identity.operation_id)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_retry_missing_capture_stays_truthfully_unknown() -> Result<()> {
+        let fixture = AdmittedCaptureFixture::new()?;
+        let directory = fixture.store.directory(&fixture.identity.operation_id)?;
+        for name in ["run.json", "stdout.ndjson", "stderr.txt"] {
+            fs::remove_file(directory.join(name))?;
+        }
+        let retry_store = RunStore::new_for_profile(&fixture._state.0, crate::Profile::BatchV3)?;
+
+        let outcome = retry_admitted_dispatch_outcome(
+            &retry_store,
+            &fixture.identity,
+            &fixture.binding_id,
+            fixture.generation,
+            &fixture.route,
+            None,
+        )?;
+        assert_eq!(outcome.outcome, EffectOutcome::Unknown);
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "native_result_missing_after_admission"
+        );
+        assert_eq!(
+            outcome.details["native_capture_recovery_status"],
+            "not_retained"
+        );
+        assert_eq!(outcome.details["local_evidence_available"], false);
+        assert_eq!(outcome.details["native_replay"], false);
+        assert_eq!(outcome.details["task_acceptance_claimed"], false);
+        assert!(
+            retry_store
+                .read_outcome(&fixture.identity.operation_id)?
+                .is_none()
+        );
+        Ok(())
+    }
 }

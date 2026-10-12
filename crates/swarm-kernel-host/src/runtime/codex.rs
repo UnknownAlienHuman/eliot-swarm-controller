@@ -1,4 +1,4 @@
-//! Identity checks for the pinned shared Codex app-server module.
+//! Versioned historical receipt decoder for the Python Codex bridge.
 use crate::{
     error::{Error, Result},
     model,
@@ -7,10 +7,11 @@ use crate::{
 use serde_json::{Value, json};
 
 pub const RUNTIME: &str = "codex";
-pub const ARTIFACT_ID: &str = "codex-sdk-18194bf-bridge.3";
+pub const HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID: &str = "codex-sdk-18194bf-bridge.3";
 
-pub fn is_controller_route(route: &Value) -> bool {
-    route["runtime"] == RUNTIME && route["module_artifact_id"] == ARTIFACT_ID
+pub fn is_historical_python_route(route: &Value) -> bool {
+    route["runtime"] == RUNTIME
+        && route["module_artifact_id"] == HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID
 }
 
 /// The controller supplies these canonical bytes to the Python SDK bridge;
@@ -29,14 +30,14 @@ pub fn dispatch_instruction(task_snapshot: &Value, text: &str) -> Result<String>
 
 /// A user item and a turn are distinct native identities. Both must be bound
 /// to this exact dispatch by the module's native history readback.
-pub fn dispatch_producer(
+pub fn historical_dispatch_producer(
     binding: &Value,
     outcome: &RuntimeOutcome,
     task_snapshot: &Value,
     text: &str,
 ) -> Result<Value> {
     let instruction = dispatch_instruction(task_snapshot, text)?;
-    validate_input_receipt(binding, outcome, &instruction, None)?;
+    validate_historical_input_receipt(binding, outcome, &instruction, None)?;
     Ok(json!({
         "assignment_id":outcome.operation_id,
         "native_session_id":outcome.native_root_id,
@@ -48,7 +49,7 @@ pub fn dispatch_producer(
     }))
 }
 
-pub fn validate_input_receipt(
+pub fn validate_historical_input_receipt(
     binding: &Value,
     outcome: &RuntimeOutcome,
     instruction: &str,
@@ -61,7 +62,8 @@ pub fn validate_input_receipt(
         .native_scope_key
         .as_deref()
         .filter(|v| !v.is_empty());
-    if !is_controller_route(&binding["route"])
+    if !is_historical_python_route(&binding["route"])
+        || binding["module_artifact_id"] != HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID
         || turn.is_none()
         || input.is_none()
         || root.is_none()
@@ -69,6 +71,7 @@ pub fn validate_input_receipt(
         || expected_turn.is_some_and(|expected| Some(expected) != turn)
         || binding["native_root_id"].as_str() != root
         || binding["native_scope_key"].as_str() != scope
+        || outcome.details["module_artifact_id"] != HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID
         || outcome.details["completion_condition"] != "native_input_admitted"
         || outcome.details["native_input_readback"] != "verified"
         || outcome.details["client_user_message_id"] != outcome.operation_id
@@ -77,7 +80,7 @@ pub fn validate_input_receipt(
     {
         return Err(Error::new(
             "NATIVE_IDENTITY_MISMATCH",
-            "Codex dispatch requires exact thread, turn, user item and prompt readback",
+            "historical Codex receipt requires exact artifact, thread, turn, user item and prompt readback",
         ));
     }
     Ok(())
@@ -93,7 +96,8 @@ mod tests {
         let snapshot = json!({"title":"Unicode 🐇", "metadata":{"ratio":1.0}});
         let text = "return a marker";
         let prompt = dispatch_instruction(&snapshot, text).unwrap();
-        let binding = json!({"route":{"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID},
+        let binding = json!({"module_artifact_id":HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID,
+            "route":{"runtime":RUNTIME,"module_artifact_id":HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID},
             "native_root_id":"thread", "native_scope_key":"shared-server"});
         let mut outcome = RuntimeOutcome {
             operation_id: "operation".into(),
@@ -102,30 +106,60 @@ mod tests {
             native_root_id: Some("thread".into()),
             turn_id: Some("turn".into()),
             native_input_id: Some("native-user-item".into()),
-            details: json!({"completion_condition":"native_input_admitted",
+            details: json!({"module_artifact_id":HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID,
+                "completion_condition":"native_input_admitted",
                 "native_input_readback":"verified", "client_user_message_id":"operation",
                 "prompt_sha256":model::digest(prompt.as_bytes()), "prompt_bytes":prompt.len()}),
         };
-        let producer = dispatch_producer(&binding, &outcome, &snapshot, text).unwrap();
+        let producer = historical_dispatch_producer(&binding, &outcome, &snapshot, text).unwrap();
         assert_eq!(producer["native_run_id"], "turn");
         assert_eq!(producer["native_input_id"], "native-user-item");
         assert_eq!(producer["disposition"], "admitted");
-        assert!(validate_input_receipt(&binding, &outcome, &prompt, Some("turn")).is_ok());
-        assert!(validate_input_receipt(&binding, &outcome, &prompt, Some("another-turn")).is_err());
-        assert!(dispatch_producer(&binding, &outcome, &snapshot, "different text").is_err());
-        assert!(dispatch_producer(&binding, &outcome, &json!({"title":"changed"}), text).is_err());
+        assert!(
+            validate_historical_input_receipt(&binding, &outcome, &prompt, Some("turn")).is_ok()
+        );
+        let mut mismatched_binding = binding.clone();
+        mismatched_binding["module_artifact_id"] =
+            json!(swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID);
+        assert!(
+            validate_historical_input_receipt(&mismatched_binding, &outcome, &prompt, Some("turn"))
+                .is_err()
+        );
+        outcome.details["module_artifact_id"] =
+            json!(swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID);
+        assert!(
+            validate_historical_input_receipt(&binding, &outcome, &prompt, Some("turn")).is_err()
+        );
+        outcome.details["module_artifact_id"] = json!(HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID);
+        assert!(
+            validate_historical_input_receipt(&binding, &outcome, &prompt, Some("another-turn"))
+                .is_err()
+        );
+        assert!(
+            historical_dispatch_producer(&binding, &outcome, &snapshot, "different text").is_err()
+        );
+        assert!(
+            historical_dispatch_producer(&binding, &outcome, &json!({"title":"changed"}), text)
+                .is_err()
+        );
         outcome.details["client_user_message_id"] = json!("another-operation");
-        assert!(dispatch_producer(&binding, &outcome, &snapshot, text).is_err());
+        assert!(historical_dispatch_producer(&binding, &outcome, &snapshot, text).is_err());
         outcome.details["client_user_message_id"] = json!("operation");
         outcome.native_input_id = None;
-        assert!(dispatch_producer(&binding, &outcome, &snapshot, text).is_err());
+        assert!(historical_dispatch_producer(&binding, &outcome, &snapshot, text).is_err());
     }
 
     #[test]
-    fn older_observer_artifact_cannot_report_controller_admission() {
-        assert!(!is_controller_route(&json!({"runtime":RUNTIME,
+    fn historical_python_decoder_requires_its_exact_versioned_route() {
+        assert!(is_historical_python_route(&json!({"runtime":RUNTIME,
+            "module_artifact_id":HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID})));
+        assert!(!is_historical_python_route(&json!({"runtime":RUNTIME,
             "module_artifact_id":"codex-sdk-18194bf-bridge.1"})));
-        assert!(!is_controller_route(&json!({"runtime":"another-runtime",
-            "module_artifact_id":ARTIFACT_ID})));
+        assert!(!is_historical_python_route(&json!({"runtime":RUNTIME,
+            "module_artifact_id":swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID})));
+        assert!(!is_historical_python_route(
+            &json!({"runtime":"another-runtime",
+            "module_artifact_id":HISTORICAL_PYTHON_BRIDGE_ARTIFACT_ID})
+        ));
     }
 }

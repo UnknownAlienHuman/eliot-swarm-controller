@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const MODULE_PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const CODEX_RUST_CONTROLLER_ARTIFACT_ID: &str = "codex-rust-controller.1";
+pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "6";
 pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
@@ -226,7 +228,7 @@ impl ModuleContractTemplate {
     pub fn codex_rust_controller_v1() -> Result<Self, CatalogError> {
         let module_id = ModuleId::new("codex")?;
         let artifact = ArtifactIdentity {
-            artifact_id: ArtifactId::new("codex-rust-controller.1")?,
+            artifact_id: ArtifactId::new(CODEX_RUST_CONTROLLER_ARTIFACT_ID)?,
             version: ArtifactVersion::new("1")?,
             // The package has not yet been built/installed on this baseline.
             // Installer evidence may add a build ID and executable digest.
@@ -307,6 +309,19 @@ impl ModuleContractTemplate {
         let mut template = Self::codex_rust_controller_v4()?;
         template.artifact.version = ArtifactVersion::new("5")?;
         template.command_schemas.insert(task_prompt_schema());
+        Ok(template)
+    }
+
+    /// Current Codex controller contract with Store-authenticated Goal
+    /// continuation admission and terminal evidence receipts.
+    pub fn codex_rust_controller_v6() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v5()?;
+        template.artifact.version =
+            ArtifactVersion::new(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)?;
+        template.event_schemas.extend([
+            goal_continuation_admission_schema(),
+            goal_terminal_evidence_schema(),
+        ]);
         Ok(template)
     }
 
@@ -450,7 +465,10 @@ mod tests {
         let claim = ModuleContractClaim::from_descriptor(&descriptor, MODULE_PROTOCOL_V1).unwrap();
         let value = serde_json::to_value(&claim).unwrap();
         assert_eq!(value["module_id"], "codex");
-        assert_eq!(value["artifact"]["artifact_id"], "codex-rust-controller.1");
+        assert_eq!(
+            value["artifact"]["artifact_id"],
+            CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        );
         assert_eq!(value["artifact"]["version"], "1");
         assert_eq!(value["protocol"], json!({"major":1,"minor":0}));
         assert_eq!(
@@ -474,5 +492,26 @@ mod tests {
         assert!(value["command_schemas"][0].get("sha256").is_none());
         assert_eq!(descriptor.enabled, false);
         assert!(descriptor.launch.executable_sha256.is_none());
+    }
+
+    #[test]
+    fn codex_goal_receipt_schemas_are_additive_in_current_descriptor_v6() {
+        let v5 = ModuleContractTemplate::codex_rust_controller_v5().unwrap();
+        let v6 = ModuleContractTemplate::codex_rust_controller_v6().unwrap();
+        let continuation = goal_continuation_admission_schema();
+        let terminal = goal_terminal_evidence_schema();
+
+        assert_eq!(
+            v6.artifact.artifact_id.as_str(),
+            CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        );
+        assert_eq!(
+            v6.artifact.version.as_str(),
+            CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
+        );
+        assert!(!v5.event_schemas.contains(&continuation));
+        assert!(!v5.event_schemas.contains(&terminal));
+        assert!(v6.event_schemas.contains(&continuation));
+        assert!(v6.event_schemas.contains(&terminal));
     }
 }

@@ -6,14 +6,21 @@
 
 use super::{meta, operations, results, runtime, tasks};
 use crate::{
-    artifacts::ArtifactRecord,
+    artifacts::{ArtifactFiles, ArtifactRecord},
     error::{Error, Result},
     model::{self, Principal, Role},
     runtime::{EffectOutcome, RuntimeOutcome},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use swarm_contracts::runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext};
+use sha2::{Digest, Sha256};
+use swarm_contracts::{
+    module_command::{
+        CommandCaptureArtifactPage, CommandCaptureOutputCoverage, CommandCaptureReleaseEvidence,
+    },
+    runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext},
+};
 
 const COMMAND_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const COMMAND_ARTIFACT_VERSION: &str = "3";
@@ -886,6 +893,945 @@ pub(super) fn admitted_output_snapshot(
     Ok(snapshot)
 }
 
+/// Build the closed release proof from settled result Operations and their
+/// immutable Store artifact receipts. The caller must verify every returned
+/// ArtifactRecord against its file and re-run this projection in the same
+/// transaction that admits the release Operation.
+pub(super) fn command_capture_release_readback(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    target_operation_id: &str,
+) -> Result<(CommandCaptureReleaseEvidence, Vec<ArtifactRecord>)> {
+    let target = operations::get_operation(db, target_operation_id)?;
+    if target["method"] != "task.dispatch"
+        || target["binding_id"] != binding_id
+        || target["binding_generation"] != generation
+        || !matches!(
+            target["state"].as_str(),
+            Some("settled" | "rejected" | "outcome_unknown")
+        )
+        || !target["result"].is_object()
+        || target["result"]["operation_id"] != target_operation_id
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_TARGET_UNRESOLVED",
+            "Command capture release requires the exact recorded dispatch outcome",
+        ));
+    }
+    let target_input_sha256 = request_digest(db, target_operation_id, binding_id, generation)?;
+    let target_outcome_sha256 = model::digest(model::canonical(&target["result"])?.as_bytes());
+    let retained_evidence = retained_command_release_evidence(
+        db,
+        binding_id,
+        generation,
+        target_operation_id,
+        &target,
+        &target_input_sha256,
+        &target_outcome_sha256,
+    )?;
+    let mut outputs = [
+        CommandCaptureOutputCoverage {
+            native_output: "stdout.ndjson".to_owned(),
+            target_command_output: Value::Null,
+            pages: Vec::new(),
+        },
+        CommandCaptureOutputCoverage {
+            native_output: "stderr.txt".to_owned(),
+            target_command_output: Value::Null,
+            pages: Vec::new(),
+        },
+    ];
+    let mut artifacts = Vec::new();
+    let mut statement = db.prepare(
+        "SELECT operation_id,original_request_json,state,result_json FROM operations \
+         WHERE binding_id=?1 AND binding_generation=?2 AND method='agent.result' \
+         ORDER BY created_at_ms,operation_id",
+    )?;
+    let rows = statement
+        .query_map(params![binding_id, generation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (result_operation_id, original_raw, state, result_raw) in rows {
+        if let Some(retained) = &retained_evidence
+            && !retained.outputs.iter().any(|output| {
+                output
+                    .pages
+                    .iter()
+                    .any(|page| page.result_operation_id == result_operation_id)
+            })
+        {
+            // Once Store has admitted the immutable release Operation, later
+            // artifact-backed reads are served from its retained proof. They
+            // must not widen or overlap the coverage that authorized release.
+            continue;
+        }
+        let original: Value = serde_json::from_str(&original_raw)?;
+        let selector = &original["selector"];
+        if selector["input_operation_id"] != target_operation_id {
+            continue;
+        }
+        // A terminally rejected read published no successful artifact and is
+        // no longer a competing read. Later result Operations may retry it;
+        // full immutable coverage below still gates release.
+        if state == "rejected" {
+            continue;
+        }
+        if state != "settled" {
+            return Err(Error::new(
+                "COMMAND_RELEASE_RESULT_UNRESOLVED",
+                "Command capture release is blocked by an unresolved result read",
+            ));
+        }
+        let result: Value = serde_json::from_str(result_raw.as_deref().ok_or_else(|| {
+            Error::new(
+                "COMMAND_RELEASE_RESULT_UNRESOLVED",
+                "settled Command result Operation has no stored receipt",
+            )
+        })?)?;
+        if result["outcome"] != "applied" {
+            return Err(Error::new(
+                "COMMAND_RELEASE_RESULT_UNRESOLVED",
+                "Command result Operation has no successful artifact receipt",
+            ));
+        }
+        match selector["kind"].as_str() {
+            Some("command_status") => continue,
+            Some("command_output") => {}
+            _ => {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_RESULT_INVALID",
+                    "result read for the Command dispatch has an unsupported selector",
+                ));
+            }
+        }
+        let native_output = selector["native_output"].as_str().ok_or_else(|| {
+            Error::new(
+                "COMMAND_RELEASE_RESULT_INVALID",
+                "Command output result has no exact stream selector",
+            )
+        })?;
+        validate_native_output_name(native_output)?;
+        let output_index = match native_output {
+            "stdout.ndjson" => 0,
+            "stderr.txt" => 1,
+            _ => {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_RESULT_INVALID",
+                    "Command output result names an unsupported stream",
+                ));
+            }
+        };
+        let snapshot = admitted_output_snapshot(
+            db,
+            &result_operation_id,
+            binding_id,
+            generation,
+            target_operation_id,
+            native_output,
+        )?;
+        if outputs[output_index].target_command_output.is_null() {
+            outputs[output_index].target_command_output = snapshot.clone();
+        } else if outputs[output_index].target_command_output != snapshot {
+            return Err(Error::new(
+                "COMMAND_RELEASE_RESULT_CONFLICT",
+                "result pages do not share one immutable Command capture snapshot",
+            ));
+        }
+        let artifact_ref = result["details"]["artifact_ref"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "COMMAND_RELEASE_ARTIFACT_UNACKNOWLEDGED",
+                    "settled Command output result has no artifact reference",
+                )
+            })?;
+        let artifact =
+            results::command_result_page_readback(db, &result_operation_id, artifact_ref)?;
+        let source = &artifact.metadata["source"];
+        let result_input_sha256 = model::digest(model::canonical(&original)?.as_bytes());
+        let standard_source_matches = source["kind"] == "command_output"
+            && source["result_operation_id"] == result_operation_id
+            && source["result_input_sha256"] == result_input_sha256
+            && source["input_operation_id"] == target_operation_id
+            && source["target_input_sha256"] == target_input_sha256
+            && source["target_command_output"] == snapshot;
+        let normalized_source_matches = source["schema_id"]
+            == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
+            && source["result_operation_id"] == result_operation_id
+            && source["result_input_sha256"] == result_input_sha256
+            && source["origin"]["binding_id"] == binding_id
+            && source["origin"]["binding_generation"] == generation
+            && source["origin"]["target_operation_id"] == target_operation_id
+            && source["origin"]["target_input_sha256"] == target_input_sha256
+            && source["payload_sha256"] == snapshot["stored_sha256"]
+            && source["payload_bytes"] == snapshot["stored_bytes"];
+        let details = &result["details"];
+        let offset_bytes = artifact.metadata["offset_bytes"].as_u64();
+        let byte_length = artifact.metadata["byte_length"].as_u64();
+        let total_bytes = artifact.metadata["total_bytes"].as_u64();
+        let page_sha256 = artifact.metadata["page_sha256"].as_str();
+        let eof = artifact.metadata["eof"].as_bool();
+        if artifact.metadata["selector"] != selector.clone()
+            || artifact.metadata["operation_id"] != result_operation_id
+            || artifact.metadata["target_command_output"]
+                .as_object()
+                .is_some_and(|saved| Value::Object(saved.clone()) != snapshot)
+            || (!standard_source_matches && !normalized_source_matches)
+            || offset_bytes != details["offset_bytes"].as_u64()
+            || byte_length != Some(artifact.byte_length)
+            || total_bytes != details["total_bytes"].as_u64()
+            || eof != details["eof"].as_bool()
+            || page_sha256 != Some(artifact.content_digest.as_str())
+            || details["page_sha256"] != artifact.content_digest
+        {
+            return Err(Error::new(
+                "COMMAND_RELEASE_ARTIFACT_INVALID",
+                "Command output artifact metadata differs from its exact result Operation",
+            ));
+        }
+        let artifact_page = CommandCaptureArtifactPage {
+            result_operation_id,
+            result_input_sha256,
+            artifact_ref: artifact_ref.to_owned(),
+            artifact_sha256: artifact.content_digest.clone(),
+            artifact_byte_length: artifact.byte_length,
+            offset_bytes: offset_bytes.unwrap_or(u64::MAX),
+            byte_length: byte_length.unwrap_or(u64::MAX),
+            total_bytes: total_bytes.unwrap_or(u64::MAX),
+            page_sha256: page_sha256.unwrap_or_default().to_owned(),
+            eof: eof.unwrap_or(false),
+        };
+        outputs[output_index].pages.push(artifact_page);
+        artifacts.push(artifact);
+    }
+    for output in &mut outputs {
+        output.pages.sort_by_key(|page| page.offset_bytes);
+        let mut unique_pages: Vec<CommandCaptureArtifactPage> = Vec::new();
+        for page in output.pages.drain(..) {
+            if let Some(previous) = unique_pages.last() {
+                if previous.offset_bytes == page.offset_bytes {
+                    if previous.total_bytes == page.total_bytes
+                        && previous.byte_length == page.byte_length
+                        && previous.page_sha256 == page.page_sha256
+                        && previous.artifact_sha256 == page.artifact_sha256
+                        && previous.eof == page.eof
+                    {
+                        // Re-reading an already persisted exact range creates
+                        // another immutable artifact, not new stream coverage.
+                        continue;
+                    }
+                    return Err(Error::new(
+                        "COMMAND_RELEASE_COVERAGE_INVALID",
+                        "overlapping Command result pages disagree on their exact range",
+                    ));
+                }
+                let previous_end = previous
+                    .offset_bytes
+                    .checked_add(previous.byte_length)
+                    .ok_or_else(|| {
+                        Error::new("COMMAND_RELEASE_COVERAGE_INVALID", "page range overflow")
+                    })?;
+                if page.offset_bytes < previous_end {
+                    return Err(Error::new(
+                        "COMMAND_RELEASE_COVERAGE_INVALID",
+                        "overlapping Command result pages do not identify one exact range",
+                    ));
+                }
+            }
+            unique_pages.push(page);
+        }
+        output.pages = unique_pages;
+        let total = output.target_command_output["stored_bytes"]
+            .as_u64()
+            .ok_or_else(|| {
+                Error::new(
+                    "COMMAND_RELEASE_RESULT_MISSING",
+                    "capture snapshot is missing",
+                )
+            })?;
+        if output.target_command_output["operation_id"] != target_operation_id
+            || output.target_command_output["input_sha256"] != target_input_sha256
+            || output.target_command_output["native_output"] != output.native_output
+            || output.pages.is_empty()
+        {
+            return Err(Error::new(
+                "COMMAND_RELEASE_RESULT_MISSING",
+                "both exact Command output streams require persisted result pages",
+            ));
+        }
+        let mut covered = 0u64;
+        let mut has_gap = false;
+        for (index, page) in output.pages.iter().enumerate() {
+            let end = page
+                .offset_bytes
+                .checked_add(page.byte_length)
+                .ok_or_else(|| {
+                    Error::new("COMMAND_RELEASE_COVERAGE_INVALID", "page range overflow")
+                })?;
+            if end > total
+                || page.total_bytes != total
+                || page.artifact_byte_length != page.byte_length
+                || page.artifact_sha256 != page.page_sha256
+                || page.eof != (end == total)
+                || (page.byte_length == 0 && !(total == 0 && output.pages.len() == 1 && index == 0))
+            {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_COVERAGE_INVALID",
+                    "immutable Command result artifacts do not form exact output coverage",
+                ));
+            }
+            has_gap |= page.offset_bytes != covered;
+            covered = end;
+        }
+        if has_gap || covered != total {
+            return Err(Error::new(
+                if retained_evidence.is_some() {
+                    "COMMAND_RELEASE_COVERAGE_INVALID"
+                } else {
+                    "COMMAND_RELEASE_RESULT_MISSING"
+                },
+                "immutable Command result artifacts leave captured bytes uncovered",
+            ));
+        }
+    }
+    let evidence = CommandCaptureReleaseEvidence {
+        schema_version: 1,
+        target_operation_id: target_operation_id.to_owned(),
+        target_input_sha256,
+        target_outcome_sha256,
+        outputs: outputs.into(),
+    };
+    if retained_evidence
+        .as_ref()
+        .is_some_and(|retained| retained != &evidence)
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "retained release Operation differs from its exact result artifact readback",
+        ));
+    }
+    Ok((evidence, artifacts))
+}
+
+/// Validate the adapter's release ACK against the same immutable coverage that
+/// authorized the release. Its typed module receipt is checked by the caller.
+pub(super) fn validate_capture_release_outcome(
+    db: &Connection,
+    binding: &Value,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+) -> Result<()> {
+    let binding_id = model::text(binding, "binding_id")?;
+    let generation = model::positive(binding, "generation")?;
+    if !crate::runtime::batch::is_rust_command_route(&binding["route"])
+        || binding["module_artifact_id"] != crate::runtime::batch::COMMAND_RUST_ARTIFACT_ID
+        || operation["method"] != swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
+        || operation["binding_id"] != binding_id
+        || operation["binding_generation"] != generation
+        || operation["operation_id"] != outcome.operation_id
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "release ACK is outside its exact Rust Command operation",
+        ));
+    }
+    let original_raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [&outcome.operation_id],
+        |row| row.get(0),
+    )?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    let target_id = model::text(&original, "target_operation_id")?;
+    let target = operations::get_operation(db, target_id)?;
+    let (evidence, _) = command_capture_release_readback(db, binding_id, generation, target_id)?;
+    if original["client_request_id"] != capture_release_client_request_id(target_id)
+        || operation["caller_id"] != target["caller_id"]
+        || operation["attempt_id"] != target["attempt_id"]
+        || original[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD]
+            != serde_json::to_value(&evidence)?
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "release ACK does not bind its retained Store artifact authority",
+        ));
+    }
+    let artifact_refs: Vec<&str> = evidence
+        .outputs
+        .iter()
+        .flat_map(|output| output.pages.iter().map(|page| page.artifact_ref.as_str()))
+        .collect();
+    let expected = json!({
+        "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
+        "completion_condition":"command_capture_release_recorded",
+        "release_input_sha256":model::digest(model::canonical(&original)?.as_bytes()),
+        "target_operation_id":target_id,
+        "target_input_sha256":evidence.target_input_sha256,
+        "target_outcome_sha256":evidence.target_outcome_sha256,
+        "coverage_sha256":model::digest(model::canonical(&serde_json::to_value(&evidence)?)?.as_bytes()),
+        "artifact_refs":artifact_refs,
+        "native_capture_released":true,
+        "native_replay":false
+    });
+    let mut details = outcome.details.clone();
+    if let Some(object) = details.as_object_mut() {
+        object.remove("module_receipt");
+    }
+    if !matches!(outcome.outcome, EffectOutcome::Applied)
+        || outcome.native_scope_key.is_some()
+        || outcome.native_root_id.is_some()
+        || outcome.turn_id.is_some()
+        || outcome.native_input_id.is_some()
+        || details != expected
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "release ACK differs from its exact retained proof or claims native execution",
+        ));
+    }
+    Ok(())
+}
+
+fn retained_command_release_evidence(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    target_operation_id: &str,
+    target: &Value,
+    target_input_sha256: &str,
+    target_outcome_sha256: &str,
+) -> Result<Option<CommandCaptureReleaseEvidence>> {
+    let caller_id = model::text(target, "caller_id")?;
+    let client_request_id = capture_release_client_request_id(target_operation_id);
+    let retained: Option<(String, String)> = db
+        .query_row(
+            "SELECT operation_id,original_request_json FROM operations \
+             WHERE caller_id=?1 AND client_request_id=?2 AND method=?3",
+            params![
+                caller_id,
+                client_request_id,
+                swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((release_operation_id, original_raw)) = retained else {
+        return Ok(None);
+    };
+    let release_operation = operations::get_operation(db, &release_operation_id)?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    model::fields(
+        &original,
+        &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "target_operation_id",
+            "attempt_id",
+            swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD,
+        ],
+    )?;
+    let expected_attempt = target["attempt_id"].as_str();
+    if release_operation["method"]
+        != swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
+        || release_operation["binding_id"] != binding_id
+        || release_operation["binding_generation"] != generation
+        || release_operation["attempt_id"].as_str() != expected_attempt
+        || original["client_request_id"] != client_request_id
+        || original["binding_id"] != binding_id
+        || original["generation"] != generation
+        || original["target_operation_id"] != target_operation_id
+        || original.get("attempt_id").and_then(Value::as_str) != expected_attempt
+        || (expected_attempt.is_none() && original.get("attempt_id").is_some())
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "retained release Operation does not match its exact Command dispatch authority",
+        ));
+    }
+    let evidence: CommandCaptureReleaseEvidence = serde_json::from_value(
+        original[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD].clone(),
+    )
+    .map_err(|_| {
+        Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "retained release Operation has malformed artifact coverage evidence",
+        )
+    })?;
+    if evidence.schema_version != 1
+        || evidence.target_operation_id != target_operation_id
+        || evidence.target_input_sha256 != target_input_sha256
+        || evidence.target_outcome_sha256 != target_outcome_sha256
+        || evidence.outputs.len() != 2
+        || evidence.outputs[0].native_output != "stdout.ndjson"
+        || evidence.outputs[1].native_output != "stderr.txt"
+        || evidence
+            .outputs
+            .iter()
+            .any(|output| output.pages.is_empty())
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "retained release proof does not bind both exact Command output streams",
+        ));
+    }
+    let mut page_operations: Vec<String> = Vec::new();
+    for page in evidence.outputs.iter().flat_map(|output| &output.pages) {
+        if page_operations.contains(&page.result_operation_id) {
+            return Err(Error::new(
+                "COMMAND_RELEASE_EVIDENCE_INVALID",
+                "retained release proof reuses a result Operation across output pages",
+            ));
+        }
+        page_operations.push(page.result_operation_id.clone());
+    }
+    Ok(Some(evidence))
+}
+
+#[derive(Clone)]
+struct CaptureReleaseProjection {
+    principal: Principal,
+    caller_id: String,
+    target_operation_id: String,
+    binding_id: String,
+    generation: i64,
+    attempt_id: Option<String>,
+    route: Value,
+    evidence: CommandCaptureReleaseEvidence,
+    artifacts: Vec<ArtifactRecord>,
+}
+
+/// Admit the one Store-created release Operation after immutable Command
+/// output pages cover both saved streams. The caller supplies only the exact
+/// target Operation ID; evidence and binding authority are read from Store.
+impl super::Store {
+    /// Manager's post-`module.result` hook. It resolves the target only from
+    /// the settled Store result Operation, then delegates to the closed
+    /// target-only admission path below.
+    pub(super) async fn admit_command_capture_release_for_result(
+        &self,
+        result_operation_id: &str,
+    ) -> Result<Option<Value>> {
+        if result_operation_id.is_empty() {
+            return Err(Error::invalid("result Operation ID is required"));
+        }
+        let result_operation_id = result_operation_id.to_owned();
+        let target_operation_id = self
+            .run(move |db| capture_release_target_for_result_operation(db, &result_operation_id))
+            .await?;
+        let Some(target_operation_id) = target_operation_id else {
+            return Ok(None);
+        };
+        self.admit_command_capture_release_for_target(&target_operation_id)
+            .await
+    }
+
+    pub(super) async fn admit_command_capture_release_for_target(
+        &self,
+        target_operation_id: &str,
+    ) -> Result<Option<Value>> {
+        if target_operation_id.is_empty() {
+            return Err(Error::invalid("Command target Operation ID is required"));
+        }
+        let target_operation_id = target_operation_id.to_owned();
+        let first_target = target_operation_id.clone();
+        let config = self.config.clone();
+        let first_config = config.clone();
+        let first = match self
+            .run(move |db| capture_release_projection(db, &first_config, &first_target))
+            .await
+        {
+            Ok(projection) => projection,
+            Err(error) if capture_release_is_pending(&error.code) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+
+        let evidence = first.evidence.clone();
+        let artifacts = first.artifacts.clone();
+        self.file_io(move |files| verify_capture_release_artifacts(&files, &evidence, &artifacts))
+            .await?;
+
+        let expected = first.clone();
+        let target_for_recheck = target_operation_id.clone();
+        let recheck_config = config.clone();
+        let admission = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let current =
+                    capture_release_projection(&tx, &recheck_config, &target_for_recheck)?;
+                if !same_capture_release_projection(&expected, &current) {
+                    return Err(Error::conflict(
+                        "Command result coverage changed while release artifacts were verified",
+                    ));
+                }
+                let request = capture_release_operation_input(&current)?;
+                let admission = super::mutate_in_transaction_with_check_plan(
+                    &tx,
+                    &current.principal,
+                    swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD,
+                    &request,
+                    &config,
+                    model::now_ms()?,
+                    None,
+                )?;
+                tx.commit()?;
+                admission
+            })
+            .await;
+        let admission = match admission {
+            Err(error) if capture_release_is_pending(&error.code) => return Ok(None),
+            result => result,
+        };
+        if let Ok(receipt) = &admission
+            && receipt
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        admission.map(Some)
+    }
+}
+
+fn capture_release_target_for_result_operation(
+    db: &Connection,
+    result_operation_id: &str,
+) -> Result<Option<String>> {
+    let result = operations::get_operation(db, result_operation_id)?;
+    if result["method"] != "agent.result"
+        || result["state"] != "settled"
+        || result["result"]["outcome"] != "applied"
+        || result["result"]["details"]["completion_condition"] != "result_page_persisted"
+    {
+        return Ok(None);
+    }
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND method='agent.result'",
+        [result_operation_id],
+        |row| row.get(0),
+    )?;
+    let original: Value = serde_json::from_str(&raw)?;
+    if original["selector"]["kind"] != "command_output" {
+        return Ok(None);
+    }
+    let target_operation_id = model::text(&original["selector"], "input_operation_id")?;
+    let artifact_ref = model::text(&result["result"]["details"], "artifact_ref")?;
+    let artifact = results::command_result_page_readback(db, result_operation_id, artifact_ref)?;
+    if artifact.metadata["selector"] != original["selector"] {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "settled result page selector differs from its retained Operation",
+        ));
+    }
+    Ok(Some(target_operation_id.to_owned()))
+}
+
+fn capture_release_projection(
+    db: &Connection,
+    config: &crate::config::Config,
+    target_operation_id: &str,
+) -> Result<CaptureReleaseProjection> {
+    let target = operations::get_operation(db, target_operation_id)?;
+    let binding_id = model::text(&target, "binding_id")?.to_owned();
+    let generation = model::positive(&target, "binding_generation")?;
+    let binding = operations::get_binding(db, &binding_id, generation)?;
+    let route_alias = model::text(&binding["route"], "alias")?;
+    let configured_command_route = config.routes.iter().any(|route| {
+        route.alias == route_alias
+            && route.runtime == "command"
+            && route.module_artifact_id == COMMAND_ARTIFACT_ID
+    });
+    if target["method"] != "task.dispatch"
+        || !crate::runtime::batch::is_rust_command_route(&binding["route"])
+        || binding["module_artifact_id"] != COMMAND_ARTIFACT_ID
+        || !configured_command_route
+        || !binding["released_at_ms"].is_null()
+        || binding["state"] != "ready"
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_TARGET_INVALID",
+            "capture release requires the current exact Rust Command binding and dispatch",
+        ));
+    }
+    let (caller_id, original_raw): (String, String) = db.query_row(
+        "SELECT caller_id,original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3 AND method='task.dispatch'",
+        params![target_operation_id, binding_id, generation],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    super::module_handshake::require_selected_native_command(
+        db,
+        &binding_id,
+        (
+            model::text(&binding["route"], "runtime")?,
+            model::text(&binding, "module_artifact_id")?,
+        ),
+        binding["observation"].get("module_contract_selector"),
+        "task.dispatch",
+        &original,
+    )?;
+    let principal = operation_caller_principal(db, &caller_id)?;
+    let (evidence, artifacts) =
+        command_capture_release_readback(db, &binding_id, generation, target_operation_id)?;
+    Ok(CaptureReleaseProjection {
+        principal,
+        caller_id,
+        target_operation_id: target_operation_id.to_owned(),
+        binding_id,
+        generation,
+        attempt_id: target["attempt_id"].as_str().map(str::to_owned),
+        route: binding["route"].clone(),
+        evidence,
+        artifacts,
+    })
+}
+
+fn operation_caller_principal(db: &Connection, caller_id: &str) -> Result<Principal> {
+    let registration = meta(db, &format!("client:{caller_id}"))?.ok_or_else(|| {
+        Error::new(
+            "UNAUTHORIZED",
+            "original Command caller is no longer registered",
+        )
+    })?;
+    let role: Role = serde_json::from_value(registration["role"].clone())?;
+    super::current_principal(
+        db,
+        Principal {
+            link_id: String::new(),
+            client_id: caller_id.to_owned(),
+            role,
+        },
+    )
+}
+
+fn capture_release_operation_input(projection: &CaptureReleaseProjection) -> Result<Value> {
+    let mut request = json!({
+        "client_request_id":capture_release_client_request_id(&projection.target_operation_id),
+        "binding_id":projection.binding_id,
+        "generation":projection.generation,
+        "target_operation_id":projection.target_operation_id,
+    });
+    request[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD] =
+        serde_json::to_value(&projection.evidence)?;
+    if let Some(attempt_id) = &projection.attempt_id {
+        request["attempt_id"] = json!(attempt_id);
+    }
+    if request["target_operation_id"]
+        != request[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD]["target_operation_id"]
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_EVIDENCE_INVALID",
+            "Store release request target differs from its derived artifact proof",
+        ));
+    }
+    Ok(request)
+}
+
+fn capture_release_client_request_id(target_operation_id: &str) -> String {
+    format!(
+        "command-capture-release-{}",
+        model::digest(target_operation_id.as_bytes())
+    )
+}
+
+fn capture_release_is_pending(code: &str) -> bool {
+    matches!(
+        code,
+        "COMMAND_RELEASE_RESULT_UNRESOLVED"
+            | "COMMAND_RELEASE_RESULT_MISSING"
+            | "COMMAND_RELEASE_ARTIFACT_UNACKNOWLEDGED"
+    )
+}
+
+fn same_capture_release_projection(
+    first: &CaptureReleaseProjection,
+    second: &CaptureReleaseProjection,
+) -> bool {
+    first.caller_id == second.caller_id
+        && first.target_operation_id == second.target_operation_id
+        && first.binding_id == second.binding_id
+        && first.generation == second.generation
+        && first.attempt_id == second.attempt_id
+        && first.route == second.route
+        && first.evidence == second.evidence
+        && same_artifact_records(&first.artifacts, &second.artifacts)
+}
+
+fn same_artifact_records(first: &[ArtifactRecord], second: &[ArtifactRecord]) -> bool {
+    first.len() == second.len()
+        && first.iter().zip(second).all(|(left, right)| {
+            left.kind == right.kind
+                && left.artifact_id == right.artifact_id
+                && left.relative_path == right.relative_path
+                && left.byte_length == right.byte_length
+                && left.content_digest == right.content_digest
+                && left.metadata == right.metadata
+        })
+}
+
+fn verify_capture_release_artifacts(
+    files: &ArtifactFiles,
+    evidence: &CommandCaptureReleaseEvidence,
+    artifacts: &[ArtifactRecord],
+) -> Result<()> {
+    for output in &evidence.outputs {
+        let stored_bytes = output.target_command_output["stored_bytes"]
+            .as_u64()
+            .ok_or_else(|| {
+                Error::new(
+                    "COMMAND_RELEASE_COVERAGE_INVALID",
+                    "stored byte count is absent",
+                )
+            })?;
+        let mut covered = 0u64;
+        let mut stream = Sha256::new();
+        for page in &output.pages {
+            let record = artifacts
+                .iter()
+                .find(|record| record.artifact_id == page.artifact_ref)
+                .ok_or_else(|| {
+                    Error::new(
+                        "COMMAND_RELEASE_ARTIFACT_INVALID",
+                        "Store artifact projection omitted a referenced page",
+                    )
+                })?;
+            if record.kind != "native_result_page"
+                || record.byte_length != page.artifact_byte_length
+                || record.content_digest != page.artifact_sha256
+                || page.offset_bytes != covered
+                || page.total_bytes != stored_bytes
+            {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                    "Store artifact record differs from its ordered release coverage entry",
+                ));
+            }
+            let bytes = read_verified_result_page(files, record)?;
+            let end = page
+                .offset_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| {
+                    Error::new("COMMAND_RELEASE_COVERAGE_INVALID", "page range overflow")
+                })?;
+            if bytes.len() as u64 != page.byte_length
+                || model::digest(&bytes) != page.page_sha256
+                || page.artifact_sha256 != page.page_sha256
+                || page.eof != (end == stored_bytes)
+            {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                    "verified result page bytes differ from their exact digest and range",
+                ));
+            }
+            stream.update(&bytes);
+            covered = end;
+        }
+        let stored_sha256 = format!("{:x}", stream.finalize());
+        if covered != stored_bytes
+            || output.target_command_output["stored_sha256"].as_str()
+                != Some(stored_sha256.as_str())
+        {
+            return Err(Error::new(
+                "COMMAND_RELEASE_ARTIFACT_INVALID",
+                "ordered Store artifact bytes do not reproduce the whole retained capture digest",
+            ));
+        }
+        let complete = output.target_command_output["truncated"] == false
+            && output.target_command_output["read_error"] == false
+            && output.target_command_output["stream_bytes"] == json!(stored_bytes);
+        if complete && output.target_command_output["stream_sha256"] != stored_sha256 {
+            return Err(Error::new(
+                "COMMAND_RELEASE_ARTIFACT_INVALID",
+                "complete Command stream digest differs from its persisted artifact bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_verified_result_page(files: &ArtifactFiles, record: &ArtifactRecord) -> Result<Vec<u8>> {
+    if record.byte_length > MAX_PAGE_BYTES as u64 {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "persisted result page exceeds the Store artifact read bound",
+        ));
+    }
+    if !files.verify_existing(record)? {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_MISSING",
+            "acknowledged Command result artifact file is absent",
+        ));
+    }
+    if record.byte_length == 0 {
+        return Ok(Vec::new());
+    }
+    let length = usize::try_from(record.byte_length).map_err(|_| {
+        Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "persisted result page length exceeds the address space",
+        )
+    })?;
+    let readback = files.read(record, 0, length)?;
+    if readback["artifact_id"] != record.artifact_id
+        || readback["offset_bytes"] != 0
+        || readback["byte_length"].as_u64() != Some(record.byte_length)
+        || readback["eof"] != true
+        || readback["artifact_sha256"] != record.content_digest
+    {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "Store artifact reader returned a different page identity or range",
+        ));
+    }
+    let encoded = readback["content"].as_str().ok_or_else(|| {
+        Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "Store artifact reader omitted the verified page body",
+        )
+    })?;
+    let bytes = match readback["encoding"].as_str() {
+        Some("utf8") => encoded.as_bytes().to_vec(),
+        Some("base64") => {
+            let bytes = STANDARD.decode(encoded).map_err(|_| {
+                Error::new(
+                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                    "Store artifact reader returned invalid base64 page bytes",
+                )
+            })?;
+            if STANDARD.encode(&bytes) != encoded {
+                return Err(Error::new(
+                    "COMMAND_RELEASE_ARTIFACT_INVALID",
+                    "Store artifact reader returned noncanonical base64 page bytes",
+                ));
+            }
+            bytes
+        }
+        _ => {
+            return Err(Error::new(
+                "COMMAND_RELEASE_ARTIFACT_INVALID",
+                "Store artifact reader returned an unknown page encoding",
+            ));
+        }
+    };
+    if bytes.len() as u64 != record.byte_length || model::digest(&bytes) != record.content_digest {
+        return Err(Error::new(
+            "COMMAND_RELEASE_ARTIFACT_INVALID",
+            "Store artifact reader body differs from its immutable record digest",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn validate_frozen_snapshot(
     db: &Connection,
     binding_id: &str,
@@ -1712,4 +2658,905 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod capture_release_artifact_fixture {
+    use super::*;
+    use crate::{
+        config::{Config, Route},
+        error::Result,
+        platform::{DataRoot, bootstrap_credential},
+    };
+    use std::sync::Arc;
+
+    struct StoreSeed {
+        module_client_id: String,
+        module_link_id: String,
+        binding_id: String,
+        target_operation_id: String,
+        attempt_id: String,
+        target_input_sha256: String,
+        target_outcome_sha256: String,
+        target_module_receipt: Value,
+    }
+
+    struct TempArtifacts(std::path::PathBuf);
+
+    impl TempArtifacts {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("command-store-release-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("create isolated artifact fixture");
+            Self(
+                root.canonicalize()
+                    .expect("canonicalize artifact fixture root"),
+            )
+        }
+    }
+
+    impl Drop for TempArtifacts {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn verified_partial_store_pages_build_the_adapter_classified_envelope() {
+        let temp = TempArtifacts::new();
+        let files = ArtifactFiles::new(&temp.0).expect("open artifact fixture");
+        let target_operation_id = "command-dispatch-partial-fixture";
+        let target_input_sha256 = "a".repeat(64);
+        let mut artifacts = Vec::new();
+        let mut outputs = Vec::new();
+
+        for (native_output, bytes, suffix) in [
+            (
+                "stdout.ndjson",
+                b"partial stdout retained".as_slice(),
+                "stdout",
+            ),
+            (
+                "stderr.txt",
+                b"partial stderr retained".as_slice(),
+                "stderr",
+            ),
+        ] {
+            let unretained = [bytes, b" late bytes".as_slice()].concat();
+            let snapshot = json!({
+                "schema_version":1,
+                "operation_id":target_operation_id,
+                "method":"task.dispatch",
+                "operation_state":"outcome_unknown",
+                "operation_outcome":"unknown",
+                "completion_condition":"native_result_unconfirmed",
+                "input_sha256":target_input_sha256,
+                "native_output":native_output,
+                "stream_bytes":unretained.len() as u64,
+                "stored_bytes":bytes.len() as u64,
+                "stream_sha256":model::digest(&unretained),
+                "stored_sha256":model::digest(bytes),
+                "truncated":true,
+                "read_error":true,
+                "native_response_identity":"unavailable",
+                "execution_complete":false,
+                "task_completion":"unknown",
+                "native_replay":false
+            });
+            let split = bytes.len() / 2;
+            let mut pages = Vec::new();
+            let mut offset = 0u64;
+            for (index, chunk) in [&bytes[..split], &bytes[split..]].into_iter().enumerate() {
+                let result_operation_id = format!("result-{suffix}-{index}");
+                let record = ArtifactFiles::record(
+                    &result_operation_id,
+                    chunk,
+                    json!({"fixture":"Store command result page"}),
+                );
+                files
+                    .publish(&record, chunk)
+                    .expect("persist immutable result page");
+                let end = offset + chunk.len() as u64;
+                pages.push(CommandCaptureArtifactPage {
+                    result_operation_id,
+                    result_input_sha256: "b".repeat(64),
+                    artifact_ref: record.artifact_id.clone(),
+                    artifact_sha256: record.content_digest.clone(),
+                    artifact_byte_length: record.byte_length,
+                    offset_bytes: offset,
+                    byte_length: chunk.len() as u64,
+                    total_bytes: bytes.len() as u64,
+                    page_sha256: model::digest(chunk),
+                    eof: end == bytes.len() as u64,
+                });
+                offset = end;
+                artifacts.push(record);
+            }
+            outputs.push(CommandCaptureOutputCoverage {
+                native_output: native_output.to_owned(),
+                target_command_output: snapshot,
+                pages,
+            });
+        }
+
+        let evidence = CommandCaptureReleaseEvidence {
+            schema_version: 1,
+            target_operation_id: target_operation_id.to_owned(),
+            target_input_sha256,
+            target_outcome_sha256: "c".repeat(64),
+            outputs,
+        };
+        verify_capture_release_artifacts(&files, &evidence, &artifacts)
+            .expect("Store verifies page and whole retained-stream digests");
+
+        let projection = CaptureReleaseProjection {
+            principal: Principal {
+                link_id: String::new(),
+                client_id: "fixture-caller".to_owned(),
+                role: Role::Manager,
+            },
+            caller_id: "fixture-caller".to_owned(),
+            target_operation_id: target_operation_id.to_owned(),
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            attempt_id: Some("fixture-attempt".to_owned()),
+            route: json!({"runtime":"command","module_artifact_id":COMMAND_ARTIFACT_ID}),
+            evidence,
+            artifacts,
+        };
+        let input = capture_release_operation_input(&projection)
+            .expect("build server-owned release Operation envelope");
+        assert_eq!(
+            swarm_contracts::module_command::classify_runtime_command(
+                swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD,
+                &input,
+            ),
+            Ok(swarm_contracts::module_command::RuntimeCommandKind::CommandReleaseEvidence)
+        );
+        assert_eq!(
+            input["target_operation_id"],
+            input[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD]["target_operation_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_consumer_releases_capture_and_serves_verified_output_pages() -> Result<()> {
+        let temp = TempArtifacts::new();
+        let root = DataRoot::acquire(&temp.0).expect("acquire fixture Store root");
+        let credential = bootstrap_credential(&root.path).expect("bootstrap fixture operator");
+        let workspace = std::env::current_dir()
+            .expect("read fixture workspace")
+            .to_string_lossy()
+            .into_owned();
+        let route = Route {
+            alias: "command-release-fixture".to_owned(),
+            runtime: "command".to_owned(),
+            module_artifact_id: COMMAND_ARTIFACT_ID.to_owned(),
+            enabled: true,
+            native_options: json!({"modelId":"fixture-model","workspaceRoot":workspace}),
+            workspace_option: Some("workspaceRoot".to_owned()),
+            owned_service: None,
+            admission_policy: None,
+        };
+        let mut config = Config::default();
+        config.storage.data_dir = temp.0.clone();
+        config.routes.push(route.clone());
+        let owner =
+            super::super::StoreOwner::start(root, Arc::new(config.clone()), credential.clone())
+                .await
+                .expect("start fixture Store");
+        let caller = owner
+            .store
+            .authenticate(credential)
+            .await
+            .expect("authenticate fixture operator");
+        let fixture_route = route.clone();
+        let fixture_config = config.clone();
+        let caller_id = caller.client_id.clone();
+        let fixture_caller = caller.clone();
+        let seed = owner
+            .store
+            .run_fixture(move |db| {
+                let module_client_id = "fixture-command-module";
+                let module_link_id = "fixture-command-module-link";
+                let attempt_id = "fixture-command-attempt";
+                let tx = db.transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let mut descriptor_value: Value = serde_json::from_str(include_str!(
+                    "../../../swarm-adapter-command/module-descriptor.template.json"
+                ))?;
+                descriptor_value["enabled"] = json!(true);
+                descriptor_value["launch"]["executable"] = json!(
+                    std::env::current_exe()
+                        .map_err(|error| Error::new("FIXTURE_EXE_UNAVAILABLE", error.to_string()))?
+                        .to_string_lossy()
+                        .into_owned()
+                );
+                descriptor_value["artifact"]["version"] = json!(COMMAND_ARTIFACT_VERSION);
+                let descriptor: swarm_contracts::module_catalog::ModuleDescriptor =
+                    serde_json::from_value(descriptor_value).map_err(|_| {
+                        Error::new(
+                            "MODULE_DESCRIPTOR_INVALID",
+                            "fixture Command descriptor is malformed",
+                        )
+                    })?;
+                let registered = super::super::module_handshake::register_trusted_descriptor(
+                    &tx,
+                    descriptor,
+                )?;
+                let selection = super::super::module_handshake::select_route(
+                    &tx,
+                    &fixture_caller,
+                    &json!({
+                        "route_alias":fixture_route.alias,
+                        "module_id":"runtime.command",
+                        "artifact_id":COMMAND_ARTIFACT_ID,
+                        "version":COMMAND_ARTIFACT_VERSION,
+                        "expected_catalog_revision":registered["catalog_revision"]
+                    }),
+                    &fixture_config,
+                    "fixture-route-selection",
+                )?;
+                let binding_id = "fixture-command-binding";
+                let target_operation_id = "fixture-command-dispatch";
+                let route_json = model::canonical(&json!(fixture_route))?;
+                let state_json = model::canonical(&json!({
+                    "module_contract_selector":selection["selection"],
+                    "module_client_id":module_client_id,
+                    "module_link_id":module_link_id,
+                    "bridge_boot_id":"fixture-command-boot",
+                    "connection":"connected"
+                }))?;
+                tx.execute(
+                    "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
+                     VALUES(?1,1,'fixture-command-lane','fixture-command-instance',?2,'ready',?3,?4,1)",
+                    params![binding_id, COMMAND_ARTIFACT_ID, route_json, state_json],
+                )?;
+                super::super::set_meta(
+                    &tx,
+                    &format!("client:{module_client_id}"),
+                    &json!({
+                        "role":"module",
+                        "disabled":false,
+                        "internal_only":false,
+                        "binding_id":binding_id,
+                        "binding_generation":1
+                    }),
+                )?;
+
+                let task_id = "fixture-command-task";
+                let spec = json!({
+                    "objective":"Retain partial Command capture without claiming Task completion.",
+                    "phase":"verification",
+                    "requirements":[],
+                });
+                let task_snapshot = json!({
+                    "task_id":task_id,
+                    "revision":1,
+                    "spec":spec
+                });
+                let task_snapshot_sha256 =
+                    model::digest(model::canonical(&task_snapshot)?.as_bytes());
+                tx.execute(
+                    "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) \
+                     VALUES(?1,'fixture-command-project',1,'open',?2,1,1)",
+                    params![task_id, model::canonical(&spec)?],
+                )?;
+                tx.execute(
+                    "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,producers_json,created_at_ms,updated_at_ms) \
+                     VALUES(?1,?2,1,?3,?4,'controller',?5,1,'running','[]',1,1)",
+                    params![
+                        attempt_id,
+                        task_id,
+                        model::canonical(&task_snapshot)?,
+                        caller_id,
+                        binding_id,
+                    ],
+                )?;
+                let original_dispatch = json!({
+                    "client_request_id":"fixture-dispatch-request",
+                    "attempt_id":attempt_id,
+                    "text":"partial capture fixture"
+                });
+                let target_input_sha256 =
+                    model::digest(model::canonical(&original_dispatch)?.as_bytes());
+                let module_receipt = json!({
+                    "schema_version":1,
+                    "module_id":"runtime.command",
+                    "artifact":{"artifact_id":COMMAND_ARTIFACT_ID,"version":COMMAND_ARTIFACT_VERSION,"build_id":null},
+                    "protocol":{"major":1,"minor":0},
+                    "binding_id":binding_id,
+                    "binding_generation":1,
+                    "operation_id":target_operation_id,
+                    "input_sha256":target_input_sha256
+                });
+                let stream_facts = |bytes: &[u8]| {
+                    let observed = [bytes, b" bytes after read failure".as_slice()].concat();
+                    json!({
+                        "bytes":observed.len() as u64,
+                        "stored_bytes":bytes.len() as u64,
+                        "sha256":model::digest(&observed),
+                        "stored_sha256":model::digest(bytes),
+                        "truncated":true,
+                        "read_error":true
+                    })
+                };
+                let outcome = RuntimeOutcome {
+                    operation_id: target_operation_id.to_owned(),
+                    outcome: EffectOutcome::Unknown,
+                    native_scope_key: None,
+                    native_root_id: None,
+                    turn_id: None,
+                    native_input_id: None,
+                    details: json!({
+                        "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
+                        "task_acceptance_claimed":false,
+                        "result_page_available":false,
+                        "completion_condition":"native_result_unconfirmed",
+                        "input_sha256":target_input_sha256,
+                        "module_receipt":module_receipt.clone(),
+                        "native_child":{
+                            "spawn_returned_pid":true,
+                            "birth_identity":null,
+                            "exit_observed_through_child_handle":false,
+                            "exit":null,
+                            "family_departure_claimed":false,
+                            "manager_group_drain_required":true
+                        },
+                        "stdout":stream_facts(b"partial stdout retained"),
+                        "stderr":stream_facts(b"partial stderr retained"),
+                        "timed_out":true
+                    }),
+                };
+                let target_outcome = serde_json::to_value(&outcome)?;
+                let target_outcome_sha256 =
+                    model::digest(model::canonical(&target_outcome)?.as_bytes());
+                let producer = json!({
+                    "assignment_id":target_operation_id,
+                    "dispatch_operation_id":target_operation_id,
+                    "attempt_id":attempt_id,
+                    "task_id":task_id,
+                    "task_revision":1,
+                    "task_snapshot_sha256":task_snapshot_sha256,
+                    "source_text_sha256":model::digest(model::text(&original_dispatch,"text")?.as_bytes()),
+                    "source_text_bytes":model::text(&original_dispatch,"text")?.len() as u64,
+                    "native_session_id":null,
+                    "native_input_id":null,
+                    "native_payload_sha256":task_snapshot_sha256,
+                    "native_payload_bytes":model::canonical(&task_snapshot)?.len() as u64,
+                    "module_receipt":module_receipt.clone(),
+                    "admission_kind":"normalized_task_dispatch",
+                    "completion_condition":"native_input_admitted",
+                    "execution_complete":false,
+                    "task_completion":"unknown",
+                    "disposition":"admitted"
+                });
+                let producers = json!([producer]);
+                tx.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,result_json,due_at_ms,created_at_ms,updated_at_ms) \
+                     VALUES(?1,?2,'fixture-dispatch-request','task.dispatch',?3,'{}',?4,?5,?6,1,'outcome_unknown',?7,1,1,1)",
+                    params![
+                        target_operation_id,
+                        caller_id,
+                        model::canonical(&original_dispatch)?,
+                        task_id,
+                        attempt_id,
+                        binding_id,
+                        model::canonical(&target_outcome)?
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE attempts SET start_operation_id=?2 WHERE attempt_id=?1",
+                    params![attempt_id, target_operation_id],
+                )?;
+                tx.execute(
+                    "UPDATE attempts SET producers_json=?2 WHERE attempt_id=?1",
+                    params![attempt_id, model::canonical(&producers)?],
+                )?;
+                tx.commit()?;
+                Ok(StoreSeed {
+                    module_client_id:module_client_id.to_owned(),
+                    module_link_id:module_link_id.to_owned(),
+                    binding_id: binding_id.to_owned(),
+                    target_operation_id: target_operation_id.to_owned(),
+                    attempt_id:attempt_id.to_owned(),
+                    target_input_sha256,
+                    target_outcome_sha256,
+                    target_module_receipt:module_receipt,
+                })
+            })
+            .await
+            .expect("seed exact Command Operation and selected descriptor");
+
+        let module = Principal {
+            link_id: seed.module_link_id.clone(),
+            client_id: seed.module_client_id.clone(),
+            role: Role::Module,
+        };
+        let mut result_operation_ids = Vec::new();
+        let mut result_artifact_refs = Vec::new();
+        for (native_output, bytes) in [
+            ("stdout.ndjson", b"partial stdout retained".as_slice()),
+            ("stderr.txt", b"partial stderr retained".as_slice()),
+        ] {
+            let split = bytes.len() / 2;
+            let chunks = [&bytes[..split], &bytes[split..]];
+            let page_order = if native_output == "stderr.txt" {
+                [1, 0]
+            } else {
+                [0, 1]
+            };
+            for index in page_order {
+                let chunk = chunks[index];
+                let offset_bytes = if index == 0 { 0 } else { split as u64 };
+                let request = json!({
+                    "client_request_id":format!("fixture-result-{native_output}-{index}"),
+                    "binding_id":seed.binding_id,
+                    "generation":1,
+                    "selector":{
+                        "kind":"command_output",
+                        "input_operation_id":seed.target_operation_id,
+                        "native_output":native_output
+                    },
+                    "offset_bytes":offset_bytes,
+                    "length_bytes":chunk.len()
+                });
+                let queued = owner
+                    .store
+                    .call(caller.clone(), "agent.result".to_owned(), request.clone())
+                    .await
+                    .expect("admit exact Command result page through Store");
+                let result_operation_id = model::text(&queued, "operation_id")?.to_owned();
+                let delivered = owner
+                    .store
+                    .call(module.clone(), "module.next".to_owned(), json!({}))
+                    .await
+                    .expect("deliver result page through authenticated module.next");
+                assert!(
+                    delivered["command"].is_object(),
+                    "exact result page must be dispatched: {delivered}"
+                );
+                let command = delivered["command"].clone();
+                assert_eq!(command["operation_id"], result_operation_id);
+                assert_eq!(command["method"], "agent.result");
+                assert_eq!(command["binding_id"], seed.binding_id);
+                assert_eq!(command["generation"], 1);
+                assert_eq!(command["input"]["selector"], request["selector"]);
+                assert!(command["input"]["normalized_result_origin"].is_object());
+                for field in [
+                    "normalized_result_origin",
+                    "normalized_result_payload_identity",
+                ] {
+                    let mut forged = command.clone();
+                    forged["input"][field] = json!({"forged":true});
+                    let error = owner
+                        .store
+                        .serve_released_command_output(module.clone(), &forged)
+                        .await
+                        .expect_err("private result enrichment must match the sealed admission");
+                    assert_eq!(error.code, "RESULT_PROVENANCE_INVALID");
+                }
+                let snapshot = command["input"]["target_command_output"].clone();
+                assert_eq!(snapshot["operation_id"], seed.target_operation_id);
+                assert_eq!(snapshot["native_output"], native_output);
+                let result_input_sha256 = model::text(&command, "input_sha256")?.to_owned();
+                assert_eq!(
+                    result_input_sha256,
+                    model::digest(model::canonical(&request)?.as_bytes())
+                );
+                let mut result_module_receipt = seed.target_module_receipt.clone();
+                result_module_receipt["operation_id"] = json!(result_operation_id);
+                result_module_receipt["input_sha256"] = json!(result_input_sha256);
+                let source = json!({
+                    "kind":"command_output",
+                    "result_operation_id":result_operation_id,
+                    "result_input_sha256":result_input_sha256,
+                    "result_module_receipt":result_module_receipt,
+                    "input_operation_id":seed.target_operation_id,
+                    "target_input_sha256":snapshot["input_sha256"],
+                    "target_module_receipt":snapshot["module_receipt"],
+                    "target_command_output":snapshot,
+                    "native_response_identity":"unavailable",
+                    "execution_complete":false,
+                    "task_completion":"unknown",
+                    "native_replay":false
+                });
+                let page = json!({
+                    "source":source,
+                    "offset_bytes":offset_bytes,
+                    "byte_length":chunk.len(),
+                    "total_bytes":bytes.len(),
+                    "eof":offset_bytes + chunk.len() as u64 == bytes.len() as u64,
+                    "media_type":if native_output == "stdout.ndjson" {
+                        "application/x-ndjson"
+                    } else {
+                        "text/plain; charset=utf-8"
+                    },
+                    "content_base64":STANDARD.encode(chunk),
+                    "page_sha256":model::digest(chunk)
+                });
+                let persisted = owner
+                    .store
+                    .call(
+                        module.clone(),
+                        "module.result".to_owned(),
+                        json!({"operation_id":result_operation_id,"page":page}),
+                    )
+                    .await
+                    .expect("persist immutable result page through Store module.result");
+                assert_eq!(persisted["recorded"], true);
+                let artifact_ref = model::text(&persisted, "artifact_ref")?.to_owned();
+                result_operation_ids.push(result_operation_id.clone());
+                result_artifact_refs.push((result_operation_id, artifact_ref));
+                let release_count = owner
+                    .store
+                    .run(|db| {
+                        Ok(db.query_row(
+                            "SELECT COUNT(*) FROM operations WHERE method=?1",
+                            [swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD],
+                            |row| row.get::<_, i64>(0),
+                        )?)
+                    })
+                    .await
+                    .expect("read release admission while partial pages arrive");
+                assert_eq!(release_count, i64::from(result_operation_ids.len() == 4));
+            }
+        }
+        assert_eq!(result_operation_ids.len(), 4);
+
+        let release_delivery = owner
+            .store
+            .call(module.clone(), "module.next".to_owned(), json!({}))
+            .await
+            .expect("deliver Store-derived release through module.next");
+        let release_command = release_delivery["command"].clone();
+        let release_method = model::text(&release_command, "method")?.to_owned();
+        assert_eq!(
+            release_method,
+            swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
+        );
+        assert_eq!(
+            swarm_contracts::module_command::classify_runtime_command(
+                &release_method,
+                &release_command["input"]
+            ),
+            Ok(swarm_contracts::module_command::RuntimeCommandKind::CommandReleaseEvidence)
+        );
+        assert_eq!(release_command["binding_id"], seed.binding_id);
+        assert_eq!(release_command["generation"], 1);
+        assert_eq!(release_command["input"]["attempt_id"], seed.attempt_id);
+        let release_operation_id = model::text(&release_command, "operation_id")?.to_owned();
+        let release_input_sha256 = model::text(&release_command, "input_sha256")?.to_owned();
+        assert_eq!(
+            release_input_sha256,
+            model::digest(model::canonical(&release_command["input"])?.as_bytes())
+        );
+        assert_eq!(
+            release_command["input"]["client_request_id"],
+            capture_release_client_request_id(&seed.target_operation_id)
+        );
+        let evidence: CommandCaptureReleaseEvidence = serde_json::from_value(
+            release_command["input"]
+                [swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD]
+                .clone(),
+        )
+        .expect("decode exact Store-derived release evidence");
+        assert_eq!(evidence.target_operation_id, seed.target_operation_id);
+        assert_eq!(evidence.target_input_sha256, seed.target_input_sha256);
+        assert_eq!(evidence.target_outcome_sha256, seed.target_outcome_sha256);
+        assert_eq!(evidence.outputs.len(), 2);
+        for (output, expected_name, expected_bytes) in [
+            (
+                &evidence.outputs[0],
+                "stdout.ndjson",
+                b"partial stdout retained".as_slice(),
+            ),
+            (
+                &evidence.outputs[1],
+                "stderr.txt",
+                b"partial stderr retained".as_slice(),
+            ),
+        ] {
+            assert_eq!(output.native_output, expected_name);
+            assert_eq!(
+                output.target_command_output["stored_sha256"],
+                model::digest(expected_bytes)
+            );
+            assert_eq!(
+                output.target_command_output["stored_bytes"],
+                expected_bytes.len()
+            );
+            assert_eq!(output.pages.len(), 2);
+            assert!(output.pages.iter().all(|page| {
+                result_operation_ids.contains(&page.result_operation_id)
+                    && result_artifact_refs
+                        .iter()
+                        .any(|(operation_id, artifact_ref)| {
+                            operation_id == &page.result_operation_id
+                                && artifact_ref == &page.artifact_ref
+                        })
+                    && page.total_bytes == expected_bytes.len() as u64
+                    && page.eof == (page.offset_bytes + page.byte_length == page.total_bytes)
+            }));
+        }
+
+        let release_query_id = release_operation_id.clone();
+        let release_target_id = seed.target_operation_id.clone();
+        let (release_operation, release_count) = owner
+            .store
+            .run_fixture(move |db| {
+                let operation = operations::get_operation(db, &release_query_id)?;
+                let count: i64 = db.query_row(
+                    "SELECT count(*) FROM operations WHERE method=?1 AND json_extract(original_request_json,'$.target_operation_id')=?2",
+                    params![
+                        swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD,
+                        release_target_id
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok((operation, count))
+            })
+            .await
+            .expect("read exact release Operation and uniqueness count");
+        assert_eq!(release_count, 1);
+        assert_eq!(release_operation["method"], release_method);
+        assert_eq!(release_operation["binding_id"], seed.binding_id);
+        assert_eq!(release_operation["binding_generation"], 1);
+        assert_eq!(release_operation["attempt_id"], seed.attempt_id);
+
+        let mut artifact_refs = Vec::new();
+        for output in &evidence.outputs {
+            artifact_refs.extend(output.pages.iter().map(|page| page.artifact_ref.clone()));
+        }
+        let mut release_module_receipt = seed.target_module_receipt.clone();
+        release_module_receipt["operation_id"] = json!(release_operation_id);
+        release_module_receipt["input_sha256"] = json!(release_input_sha256);
+        let release_outcome = RuntimeOutcome {
+            operation_id: release_operation_id.clone(),
+            outcome: EffectOutcome::Applied,
+            native_scope_key: None,
+            native_root_id: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({
+                "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
+                "module_receipt":release_module_receipt,
+                "completion_condition":"command_capture_release_recorded",
+                "release_input_sha256":release_input_sha256,
+                "target_operation_id":seed.target_operation_id,
+                "target_input_sha256":evidence.target_input_sha256,
+                "target_outcome_sha256":evidence.target_outcome_sha256,
+                "coverage_sha256":model::digest(
+                    model::canonical(&serde_json::to_value(&evidence)?)?.as_bytes()
+                ),
+                "artifact_refs":artifact_refs,
+                "native_capture_released":true,
+                "native_replay":false
+            }),
+        };
+        let release_value = serde_json::to_value(release_outcome)?;
+        for (field, replacement) in [
+            ("release_input_sha256", json!("0".repeat(64))),
+            ("target_operation_id", json!("another-dispatch")),
+            ("target_input_sha256", json!("0".repeat(64))),
+            ("target_outcome_sha256", json!("0".repeat(64))),
+            ("coverage_sha256", json!("0".repeat(64))),
+            ("artifact_refs", json!([])),
+            ("native_capture_released", json!(false)),
+            ("native_replay", json!(true)),
+            ("task_completion", json!("accepted")),
+        ] {
+            let mut forged = release_value.clone();
+            forged["details"][field] = replacement;
+            let error = owner
+                .store
+                .call(module.clone(), "module.outcome".to_owned(), forged)
+                .await
+                .expect_err("forged release ACK must not settle the operation");
+            assert_eq!(error.code, "COMMAND_RELEASE_EVIDENCE_INVALID", "{field}");
+        }
+        let mut missing_receipt = release_value.clone();
+        missing_receipt["details"]
+            .as_object_mut()
+            .expect("release details")
+            .remove("module_receipt");
+        let error = owner
+            .store
+            .call(module.clone(), "module.outcome".to_owned(), missing_receipt)
+            .await
+            .expect_err("release ACK requires its exact selected module receipt");
+        assert_eq!(error.code, "MODULE_RECEIPT_INVALID");
+        owner
+            .store
+            .call(module.clone(), "module.outcome".to_owned(), release_value)
+            .await
+            .expect("record exact release ACK through module.outcome");
+
+        let mut manager = caller.clone();
+        manager.role = Role::Manager;
+        let direct_release = owner
+            .store
+            .call(
+                manager,
+                release_method.clone(),
+                release_command["input"].clone(),
+            )
+            .await
+            .expect_err("external Manager cannot replay the acknowledged release proof");
+        assert_eq!(direct_release.code, "FORBIDDEN");
+        let mut injected_request = json!({
+            "client_request_id":"fixture-forged-release-proof",
+            "binding_id":seed.binding_id,
+            "generation":1,
+            "selector":{
+                "kind":"command_output",
+                "input_operation_id":seed.target_operation_id,
+                "native_output":"stdout.ndjson"
+            }
+        });
+        injected_request[swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD] =
+            release_command["input"]
+                [swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_FIELD]
+                .clone();
+        let injected_release = owner
+            .store
+            .call(caller.clone(), "agent.result".to_owned(), injected_request)
+            .await
+            .expect_err("ordinary Manager result request cannot smuggle release proof");
+        assert_eq!(injected_release.code, "FORBIDDEN");
+
+        let future_request = json!({
+            "client_request_id":"fixture-post-release-stdout-subrange",
+            "binding_id":seed.binding_id,
+            "generation":1,
+            "selector":{
+                "kind":"command_output",
+                "input_operation_id":seed.target_operation_id,
+                "native_output":"stdout.ndjson"
+            },
+            "offset_bytes":2,
+            "length_bytes":7
+        });
+        let future_queued = owner
+            .store
+            .call(
+                caller.clone(),
+                "agent.result".to_owned(),
+                future_request.clone(),
+            )
+            .await
+            .expect("queue future command_output read through Store");
+        let future_operation_id = model::text(&future_queued, "operation_id")?.to_owned();
+        let sentinel_request = json!({
+            "client_request_id":"fixture-post-release-next-command",
+            "binding_id":seed.binding_id,
+            "generation":1
+        });
+        let sentinel_queued = owner
+            .store
+            .call(caller.clone(), "agent.refresh".to_owned(), sentinel_request)
+            .await
+            .expect("queue a following module command to observe Store interception");
+        let sentinel_operation_id = model::text(&sentinel_queued, "operation_id")?.to_owned();
+        let next = owner
+            .store
+            .call(module.clone(), "module.next".to_owned(), json!({}))
+            .await
+            .expect("serve released output internally before returning the next module command");
+        let sentinel_command = next["command"].clone();
+        assert_eq!(sentinel_command["operation_id"], sentinel_operation_id);
+        assert_eq!(sentinel_command["method"], "agent.refresh");
+        assert_ne!(sentinel_command["operation_id"], future_operation_id);
+
+        let future_query_id = future_operation_id.clone();
+        let (future_operation, saved_request) = owner
+            .store
+            .run_fixture(move |db| {
+                let operation = operations::get_operation(db, &future_query_id)?;
+                let raw: String = db.query_row(
+                    "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                    [&future_query_id],
+                    |row| row.get(0),
+                )?;
+                Ok((operation, serde_json::from_str::<Value>(&raw)?))
+            })
+            .await
+            .expect("read Store-persisted post-release result Operation");
+        assert_eq!(future_operation["state"], "settled");
+        assert_eq!(future_operation["result"]["outcome"], "applied");
+        assert_eq!(future_operation["binding_id"], seed.binding_id);
+        assert_eq!(future_operation["binding_generation"], 1);
+        assert_eq!(saved_request, future_request);
+        assert_eq!(
+            future_operation["result"]["details"]["source"]["result_module_receipt"]["operation_id"],
+            future_operation_id
+        );
+        assert_eq!(
+            future_operation["result"]["details"]["source"]["native_response_identity"],
+            "unavailable"
+        );
+        let artifact_ref =
+            model::text(&future_operation["result"]["details"], "artifact_ref")?.to_owned();
+        let future_page_id = future_operation_id.clone();
+        let future_artifact_ref = artifact_ref.clone();
+        let artifact = owner
+            .store
+            .run_fixture(move |db| {
+                results::command_result_page_readback(db, &future_page_id, &future_artifact_ref)
+            })
+            .await
+            .expect("verify immutable Store artifact receipt");
+        let expected_slice = b"partial stdout retained"[2..9].to_vec();
+        let verified_page = owner
+            .store
+            .file_io(move |files| files.read(&artifact, 0, MAX_PAGE_BYTES))
+            .await
+            .expect("read verified published artifact bytes");
+        assert_eq!(
+            verified_page["content"],
+            String::from_utf8(expected_slice.clone()).unwrap()
+        );
+        assert_eq!(
+            verified_page["artifact_sha256"],
+            future_operation["result"]["details"]["page_sha256"]
+        );
+        assert_eq!(
+            future_operation["result"]["details"]["byte_length"],
+            expected_slice.len()
+        );
+        assert_eq!(future_operation["result"]["details"]["offset_bytes"], 2);
+
+        let mut sentinel_module_receipt = seed.target_module_receipt.clone();
+        sentinel_module_receipt["operation_id"] = json!(sentinel_operation_id);
+        sentinel_module_receipt["input_sha256"] = sentinel_command["input_sha256"].clone();
+        let sentinel_outcome = RuntimeOutcome {
+            operation_id: sentinel_operation_id,
+            outcome: EffectOutcome::Rejected,
+            native_scope_key: None,
+            native_root_id: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({
+                "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
+                "completion_condition":"fixture_consumer_sentinel_rejected",
+                "module_receipt":sentinel_module_receipt
+            }),
+        };
+        owner
+            .store
+            .call(
+                module,
+                "module.outcome".to_owned(),
+                serde_json::to_value(sentinel_outcome)?,
+            )
+            .await
+            .expect("close fixture sentinel Operation without a success receipt");
+
+        let release_query_id = release_operation_id.clone();
+        let (settled_release, release_count) = owner
+            .store
+            .run_fixture(move |db| {
+                let operation = operations::get_operation(db, &release_query_id)?;
+                let release_target_operation_id =
+                    model::text(&operation["result"]["details"], "target_operation_id")?;
+                let count: i64 = db.query_row(
+                    "SELECT count(*) FROM operations WHERE method=?1 AND json_extract(original_request_json,'$.target_operation_id')=?2",
+                    params![
+                        swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD,
+                        release_target_operation_id
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok((operation, count))
+            })
+            .await
+            .expect("confirm one retained release Operation after ACK");
+        assert_eq!(release_count, 1);
+        assert_eq!(settled_release["state"], "settled");
+        assert_eq!(settled_release["result"]["outcome"], "applied");
+        assert_eq!(settled_release["attempt_id"], seed.attempt_id);
+        owner.close().await.expect("close fixture Store");
+        Ok(())
+    }
 }

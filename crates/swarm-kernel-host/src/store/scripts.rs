@@ -6014,6 +6014,22 @@ mod script_trigger_admission_isolation_tests {
         assert_eq!(intent.cause["task_id"], "concilium-source-task");
         assert_eq!(intent.cause["task_revision"], 1);
         assert_eq!(intent.cause["attempt_id"], "concilium-source-attempt");
+        let mut exact_cause = intent.cause.clone();
+        exact_cause["script_revision"] = json!(1);
+        let exact_input = owner
+            .store
+            .run(move |db| {
+                crate::store::automation_dispatch::validate_retained_script_event_cause(
+                    db,
+                    PROJECT_ID,
+                    &exact_cause,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(exact_input["task_id"], "concilium-source-task");
+        assert_eq!(exact_input["task_revision"], 1);
+        assert_eq!(exact_input["attempt_id"], "concilium-source-attempt");
         for (field, changed) in [
             ("operation_id", json!("foreign-operation")),
             ("task_id", json!("foreign-task")),
@@ -6037,6 +6053,9 @@ mod script_trigger_admission_isolation_tests {
                 "{field}: {}",
                 failure.error.code
             );
+            if field != "operation_id" {
+                assert_eq!(failure.error.code, "AUTOMATION_LINK_CORRUPT", "{field}");
+            }
             let count = owner
                 .store
                 .run(|db| {
@@ -6048,19 +6067,100 @@ mod script_trigger_admission_isolation_tests {
                 .unwrap();
             assert_eq!(count, 0, "altered {field} cannot create a ScriptRun");
         }
+        let mut partial_scope = intent.clone();
+        partial_scope.cause["attempt_id"] = Value::Null;
+        let failure = owner
+            .store
+            .admit_script_trigger(partial_scope)
+            .await
+            .expect_err("partial Concilium scope");
+        assert_eq!(failure.error.code, "AUTOMATION_LINK_CORRUPT");
+        let count = owner
+            .store
+            .run(|db| {
+                Ok(db.query_row("SELECT COUNT(*) FROM script_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "partial scope cannot create a ScriptRun");
+
+        let mut historical_intent = intent.clone();
+        for field in ["task_id", "task_revision", "attempt_id"] {
+            historical_intent.cause[field] = Value::Null;
+        }
+        let mut historical_cause = historical_intent.cause.clone();
+        historical_cause["script_revision"] = json!(1);
+        let historical_input = owner
+            .store
+            .run(move |db| {
+                crate::store::automation_dispatch::validate_retained_script_event_cause(
+                    db,
+                    PROJECT_ID,
+                    &historical_cause,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(historical_input["task_id"], "concilium-source-task");
+        assert_eq!(historical_input["task_revision"], 1);
+        assert_eq!(historical_input["attempt_id"], "concilium-source-attempt");
         let admitted = owner
             .store
-            .admit_script_trigger(intent.clone())
+            .admit_script_trigger(historical_intent.clone())
             .await
-            .unwrap_or_else(|failure| panic!("exact source: {}", failure.error.code));
-        let original_cause = intent.cause.clone();
+            .unwrap_or_else(|failure| panic!("historical all-null source: {}", failure.error.code));
+        let original_cause = historical_intent.cause.clone();
         let retry = owner
             .store
-            .admit_script_trigger(intent)
+            .admit_script_trigger(historical_intent)
             .await
-            .unwrap_or_else(|failure| panic!("exact retry: {}", failure.error.code));
+            .unwrap_or_else(|failure| panic!("historical all-null retry: {}", failure.error.code));
         assert_eq!(admitted["operation_id"], retry["operation_id"]);
         let admitted_id = admitted["operation_id"].as_str().unwrap().to_owned();
+        let inspect_operation_id = admitted_id.clone();
+        let (request_json, run_scope) = owner
+            .store
+            .run(move |db| {
+                let request_json: String = db.query_row(
+                    "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                    [&inspect_operation_id],
+                    |row| row.get(0),
+                )?;
+                let run_scope = db.query_row(
+                    "SELECT task_id,task_revision,attempt_id FROM script_runs WHERE operation_id=?1",
+                    [&inspect_operation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )?;
+                Ok((request_json, run_scope))
+            })
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_str(&request_json).unwrap();
+        assert_eq!(request["attempt_id"], "concilium-source-attempt");
+        assert_eq!(request["expected_task_revision"], 1);
+        assert_eq!(
+            request["input"]["operation_id"],
+            "concilium-source-operation"
+        );
+        assert_eq!(request["input"]["task_id"], "concilium-source-task");
+        assert_eq!(request["input"]["task_revision"], 1);
+        assert_eq!(request["input"]["attempt_id"], "concilium-source-attempt");
+        assert_eq!(
+            run_scope,
+            (
+                Some("concilium-source-task".to_owned()),
+                Some(1),
+                Some("concilium-source-attempt".to_owned()),
+            )
+        );
         let saved_link = owner
             .store
             .run(move |db| {

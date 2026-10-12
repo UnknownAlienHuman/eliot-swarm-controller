@@ -874,9 +874,13 @@ async fn same_attempt_return_repair_fresh_review_and_acceptance_bind_to_candidat
                 "spec":{
                     "objective":"Correct one reviewed candidate and accept only its successor.",
                     "phase":"implementation",
-                    "requirements":[{"id":"R1","statement":"Candidate B contains the retained implementation evidence."}],
+                    "requirements":[{
+                        "id":"R1",
+                        "statement":"Candidate B contains the retained implementation evidence.",
+                        "verification":{"review_required":true,"check_profiles":[]},
+                    }],
                     "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
-                    "acceptance":{"required_check_profiles":[]},
+                    "acceptance":{"schema_id":"swarm.acceptance_policy","schema_version":2},
                 },
             }),
         )
@@ -927,13 +931,16 @@ async fn same_attempt_return_repair_fresh_review_and_acceptance_bind_to_candidat
         "o7-candidate-a-reviewer-token",
     )
     .await;
+    let mut result_a_request =
+        review_result_request(&submission_a, &assignment_a, "review-o7-candidate-a");
+    result_a_request["requirement_reviews"] = json!([{
+        "requirement_id":"R1",
+        "rationale":"Candidate A omits the retained implementation evidence for R1.",
+        "evidence":[candidate_a],
+    }]);
     let result_a = owner
         .store
-        .call(
-            reviewer_a,
-            "review.submit".into(),
-            review_result_request(&submission_a, &assignment_a, "review-o7-candidate-a"),
-        )
+        .call(reviewer_a, "review.submit".into(), result_a_request)
         .await
         .unwrap();
     assert_eq!(result_a["verdict"], "changes_requested");

@@ -4250,6 +4250,13 @@ fn retain_unknown_workspace_readback(
 ) -> Result<Value> {
     actor.require_workspace_readback_authority(tx, operation_id)?;
     let result = &operation["result"];
+    if lease.state == "stale"
+        && super::workspace::post_revocation_unknown_workspace_readback_matches(tx, lease)?
+    {
+        // The Store has persisted a real post-revocation filesystem readback.
+        // Keep the historical Operation unknown and do not re-admit a launch.
+        return Ok(result.clone());
+    }
     let task_id = model::text(&manifest["task"], "task_id")?.to_owned();
     let task_revision = model::positive(&manifest["task"], "observed_revision")?;
     let project_id = model::text(&manifest["task"], "project_id")?;

@@ -44,8 +44,9 @@ use tokio_tungstenite::{
 use url::Url;
 use uuid::Uuid;
 
-pub const ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const ARTIFACT_VERSION: &str = "5";
+pub const ARTIFACT_ID: &str = swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+pub const ARTIFACT_VERSION: &str =
+    swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION;
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
@@ -3277,12 +3278,21 @@ fn normalize_path(value: &str) -> Option<String> {
     if !path.is_absolute() {
         return None;
     }
-    Some(
-        path.to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase(),
-    )
+    if cfg!(windows) {
+        Some(
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase(),
+        )
+    } else {
+        let normalized = value.trim_end_matches('/');
+        Some(if normalized.is_empty() {
+            "/".to_owned()
+        } else {
+            normalized.to_owned()
+        })
+    }
 }
 
 fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), &'static str> {
@@ -3851,6 +3861,9 @@ fn unknown_send(
         "prompt_contract_revision": record.prompt_contract_revision,
         "requested_model_provider": record.requested_model_provider,
         "requested_model": record.requested_model,
+        "effective_model_provider": null,
+        "effective_model": null,
+        "effective_model_status": "unknown",
         "served_model": null,
         "served_model_status": "unknown",
         "billing_status": "unknown",
@@ -3899,6 +3912,118 @@ fn accepted_after_exact_input(
         accepted.details["goal_continuation_admission"] = value;
     }
     accepted
+}
+
+// thread/read exposes thread configuration, not per-turn model telemetry.
+// Promote effective values only after the exact thread and requested context match.
+#[derive(Debug, PartialEq, Eq)]
+struct ThreadConfigurationReadback {
+    native_thread_readback: &'static str,
+    effective_model_provider: Option<String>,
+    effective_model: Option<String>,
+    observed_model_provider: Option<String>,
+    observed_model: Option<String>,
+    effective_model_status: &'static str,
+    diagnostic_code: Option<&'static str>,
+    verified: bool,
+}
+
+impl ThreadConfigurationReadback {
+    fn unavailable(diagnostic_code: &'static str) -> Self {
+        Self {
+            native_thread_readback: "unavailable",
+            effective_model_provider: None,
+            effective_model: None,
+            observed_model_provider: None,
+            observed_model: None,
+            effective_model_status: "unknown",
+            diagnostic_code: Some(diagnostic_code),
+            verified: false,
+        }
+    }
+
+    fn from_response(
+        response: &Value,
+        root: &str,
+        requested_provider: Option<&str>,
+        requested_model: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Self {
+        let Some(thread) = response.get("thread") else {
+            return Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE");
+        };
+        if thread.get("id").and_then(Value::as_str) != Some(root) {
+            return Self {
+                native_thread_readback: "mismatch",
+                ..Self::unavailable("NATIVE_THREAD_IDENTITY_MISMATCH")
+            };
+        }
+
+        let observed_model_provider = thread
+            .get("modelProvider")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let observed_model = thread
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let workspace_matches = match (thread.get("cwd").and_then(Value::as_str), workspace) {
+            (Some(observed), Some(expected)) => {
+                match (normalize_path(observed), normalize_path(expected)) {
+                    (Some(observed), Some(expected)) => observed == expected,
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+
+        let (Some(provider), Some(model), Some(requested_provider), Some(requested_model)) = (
+            observed_model_provider.as_deref(),
+            observed_model.as_deref(),
+            requested_provider,
+            requested_model,
+        ) else {
+            return Self {
+                observed_model_provider,
+                observed_model,
+                ..Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
+            };
+        };
+        if provider != requested_provider || model != requested_model || !workspace_matches {
+            return Self {
+                native_thread_readback: "mismatch",
+                observed_model_provider,
+                observed_model,
+                ..Self::unavailable("THREAD_CONFIGURATION_MISMATCH")
+            };
+        }
+
+        Self {
+            native_thread_readback: "verified",
+            effective_model_provider: Some(provider.to_owned()),
+            effective_model: Some(model.to_owned()),
+            observed_model_provider,
+            observed_model,
+            effective_model_status: "thread_configuration_verified",
+            diagnostic_code: None,
+            verified: true,
+        }
+    }
+}
+
+fn reconcile_send_outcome(
+    turn_completed: bool,
+    thread_configuration_verified: bool,
+) -> EffectOutcome {
+    if !thread_configuration_verified {
+        EffectOutcome::Unknown
+    } else if turn_completed {
+        EffectOutcome::Applied
+    } else {
+        EffectOutcome::Accepted
+    }
 }
 
 async fn reconcile_send(
@@ -4079,6 +4204,21 @@ async fn reconcile_send(
             "contradictory",
         );
     }
+    let mut thread_read_error = None;
+    let thread_configuration = match native.read_thread(root).await {
+        Ok(response) => ThreadConfigurationReadback::from_response(
+            &response,
+            root,
+            record.requested_model_provider.as_deref(),
+            record.requested_model.as_deref(),
+            record.workspace_root.as_deref(),
+        ),
+        Err(error) => {
+            let diagnostic_code = error.diagnostic_code();
+            thread_read_error = Some(error);
+            ThreadConfigurationReadback::unavailable(diagnostic_code)
+        }
+    };
     let mut details = json!({
         "module_artifact_id": ARTIFACT_ID,
         "completion_condition": if status_is_completed {
@@ -4109,14 +4249,20 @@ async fn reconcile_send(
         "native_rpc_error_code": record.native_rpc_error_code,
         "requested_model_provider": record.requested_model_provider.as_deref(),
         "requested_model": record.requested_model.as_deref(),
-        "effective_model_provider": record.requested_model_provider.as_deref(),
-        "effective_model": record.requested_model.as_deref(),
-        "effective_model_status": "thread_configuration_verified",
+        "native_thread_readback": thread_configuration.native_thread_readback,
+        "observed_thread_model_provider": thread_configuration.observed_model_provider.as_deref(),
+        "observed_thread_model": thread_configuration.observed_model.as_deref(),
+        "effective_model_provider": thread_configuration.effective_model_provider.as_deref(),
+        "effective_model": thread_configuration.effective_model.as_deref(),
+        "effective_model_status": thread_configuration.effective_model_status,
         "served_model": null,
         "served_model_status": "unknown",
         "billing_status": "unknown",
         "fallback_used": false,
     });
+    if let Some(error) = thread_read_error.as_ref() {
+        with_native_failure_details(&mut details, error, "thread_configuration_readback");
+    }
     if !status_is_failed && let Some(admission) = dispatch_admission.as_ref() {
         details["dispatch_admission"] = match serde_json::to_value(admission) {
             Ok(value) => value,
@@ -4162,13 +4308,12 @@ async fn reconcile_send(
             details,
         );
     }
+    if let Some(code) = thread_configuration.diagnostic_code {
+        details["diagnostic_code"] = json!(code);
+    }
     outcome(
         operation_id,
-        if status_is_completed {
-            EffectOutcome::Applied
-        } else {
-            EffectOutcome::Accepted
-        },
+        reconcile_send_outcome(status_is_completed, thread_configuration.verified),
         Some(root),
         record.native_scope_key.as_deref(),
         Some(&matched.turn_id),
@@ -5918,5 +6063,134 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
             }
         }
         tokio::time::sleep(HOST_RETRY_DELAY).await;
+    }
+}
+
+#[cfg(test)]
+mod reg28_tests {
+    use super::*;
+
+    #[test]
+    fn send_reconciliation_requires_matching_thread_readback_for_effective_model() {
+        let requested_provider = "provider-requested";
+        let requested_model = "model-requested";
+        let workspace_path = std::env::current_dir().expect("fixture workspace");
+        let workspace = workspace_path.to_str().expect("UTF-8 fixture workspace");
+
+        let mismatched = serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "modelProvider": "provider-effective",
+                "model": "model-effective",
+                "cwd": workspace
+            }
+        });
+        let mismatch = ThreadConfigurationReadback::from_response(
+            &mismatched,
+            "thread-1",
+            Some(requested_provider),
+            Some(requested_model),
+            Some(workspace),
+        );
+        assert_eq!(mismatch.effective_model_status, "unknown");
+        assert_eq!(mismatch.native_thread_readback, "mismatch");
+        assert_eq!(mismatch.effective_model_provider, None);
+        assert_eq!(mismatch.effective_model, None);
+        assert_eq!(
+            mismatch.observed_model_provider.as_deref(),
+            Some("provider-effective")
+        );
+        assert_eq!(mismatch.observed_model.as_deref(), Some("model-effective"));
+        assert_eq!(
+            mismatch.diagnostic_code,
+            Some("THREAD_CONFIGURATION_MISMATCH")
+        );
+        assert!(matches!(
+            reconcile_send_outcome(true, mismatch.verified),
+            EffectOutcome::Unknown
+        ));
+
+        let matching = serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "modelProvider": requested_provider,
+                "model": requested_model,
+                "cwd": workspace
+            }
+        });
+        let exact = ThreadConfigurationReadback::from_response(
+            &matching,
+            "thread-1",
+            Some(requested_provider),
+            Some(requested_model),
+            Some(workspace),
+        );
+        assert_eq!(
+            exact.effective_model_status,
+            "thread_configuration_verified"
+        );
+        assert_eq!(exact.native_thread_readback, "verified");
+        assert_eq!(
+            exact.effective_model_provider.as_deref(),
+            Some(requested_provider)
+        );
+        assert_eq!(exact.effective_model.as_deref(), Some(requested_model));
+        assert!(matches!(
+            reconcile_send_outcome(true, exact.verified),
+            EffectOutcome::Applied
+        ));
+
+        #[cfg(unix)]
+        {
+            let distinct_workspace = serde_json::json!({
+                "thread": {
+                    "id": "thread-1",
+                    "modelProvider": requested_provider,
+                    "model": requested_model,
+                    "cwd": "/workspace/Project"
+                }
+            });
+            let different_case = ThreadConfigurationReadback::from_response(
+                &distinct_workspace,
+                "thread-1",
+                Some(requested_provider),
+                Some(requested_model),
+                Some("/workspace/project"),
+            );
+            assert!(!different_case.verified);
+            assert_eq!(different_case.effective_model, None);
+            assert_eq!(
+                different_case.diagnostic_code,
+                Some("THREAD_CONFIGURATION_MISMATCH")
+            );
+        }
+
+        let unavailable = serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "modelProvider": requested_provider,
+                "model": null,
+                "cwd": workspace
+            }
+        });
+        let unknown = ThreadConfigurationReadback::from_response(
+            &unavailable,
+            "thread-1",
+            Some(requested_provider),
+            Some(requested_model),
+            Some(workspace),
+        );
+        assert_eq!(unknown.effective_model_status, "unknown");
+        assert_eq!(unknown.native_thread_readback, "unavailable");
+        assert_eq!(unknown.effective_model_provider, None);
+        assert_eq!(unknown.effective_model, None);
+        assert_eq!(
+            unknown.diagnostic_code,
+            Some("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
+        );
+        assert!(matches!(
+            reconcile_send_outcome(true, unknown.verified),
+            EffectOutcome::Unknown
+        ));
     }
 }

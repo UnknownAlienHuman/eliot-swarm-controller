@@ -458,6 +458,23 @@ pub(crate) fn reconcile_lease_for_launch(
         actor.effective_manager_id(),
         true,
     )?;
+    let row = lease_row(tx, &reservation.lease_id)?;
+    if row.state == "stale"
+        && row.attempt_id.is_none()
+        && row.clean_state["status"] == "registration_revoked"
+        && row.clean_state["prior_lease_state"] == "outcome_unknown"
+        && registration_snapshot_matches(tx, registration)?
+    {
+        return persist_revoked_unknown_readback(
+            tx,
+            registration,
+            reservation,
+            plan,
+            evidence,
+            row,
+            now,
+        );
+    }
     persist_verified_evidence(
         tx,
         actor.effective_manager_id(),
@@ -1050,7 +1067,13 @@ pub(crate) fn pending_lease_for_operation(
     let ids = {
         let mut statement = db.prepare(
             "SELECT lease_id FROM workspace_leases
-             WHERE operation_id=?1 AND state IN ('preparing','outcome_unknown')
+             WHERE operation_id=?1 AND (
+               state IN ('preparing','outcome_unknown')
+               OR (state='stale' AND CASE WHEN json_valid(clean_state_json) THEN
+                 json_extract(clean_state_json,'$.status')='registration_revoked'
+                 AND json_extract(clean_state_json,'$.prior_lease_state')='outcome_unknown'
+               ELSE 0 END)
+             )
              ORDER BY generation,lease_id LIMIT 2",
         )?;
         statement
@@ -1067,6 +1090,9 @@ pub(crate) fn pending_lease_for_operation(
         return Ok(None);
     };
     let row = lease_row(db, lease_id)?;
+    if row.state == "stale" {
+        return revoked_unknown_ticket(db, config, row);
+    }
     if !config.workspace.projects.contains_key(&row.project_id)
         || !config.forge.projects.contains_key(&row.project_id)
     {
@@ -1086,6 +1112,619 @@ pub(crate) fn pending_lease_for_operation(
         return Ok(None);
     }
     Ok(Some(ticket_from_row(row, registration)?))
+}
+
+fn revoked_unknown_ticket(
+    db: &Connection,
+    config: &Config,
+    row: LeaseRow,
+) -> Result<Option<WorkspaceLeaseTicket>> {
+    if row.attempt_id.is_some()
+        || row.state != "stale"
+        || row.clean_state["status"] != "registration_revoked"
+        || row.clean_state["reason_code"] != "registration_revoked"
+        || row.clean_state["prior_lease_state"] != "outcome_unknown"
+        || row.clean_state["native_effect_status"] != "possible_or_unknown"
+        || !config.forge.projects.contains_key(&row.project_id)
+        || unknown_workspace_operation_snapshot(db, &row)?.is_none()
+    {
+        return Ok(None);
+    }
+    let Some(registration) = revoked_registration_from_store(db, config, &row)? else {
+        return Ok(None);
+    };
+    let plan = plan_from_row(&row)?;
+    let registration_facts = RegistrationRow {
+        registration_id: registration.registration_id.clone(),
+        allowed_roots: registration.allowed_roots.clone(),
+        registration_digest: registration.registration_digest.clone(),
+        generation: registration.generation,
+        state: "active".to_owned(),
+    };
+    if lease_intent_digest(
+        &row.lease_id,
+        &registration_facts,
+        row.generation,
+        &plan,
+        &row.branch_ref,
+        &row.worktree_handle,
+        &path_text(&row.workspace_path)?,
+    )? != row.binding_digest
+    {
+        return Ok(None);
+    }
+    Ok(Some(ticket_from_row(row, registration)?))
+}
+
+fn revoked_registration_from_store(
+    db: &Connection,
+    config: &Config,
+    lease: &LeaseRow,
+) -> Result<Option<WorkspaceRegistration>> {
+    let raw: Option<(String, String, String, String, String, i64, String)> = db
+        .query_row(
+            "SELECT registration_id,trusted_repository,repository_path,allowed_roots_json,
+                    registration_digest,generation,state
+             FROM workspace_registrations WHERE project_id=?1",
+            [&lease.project_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        registration_id,
+        trusted_repository,
+        repository_path,
+        roots_json,
+        registration_digest,
+        revoked_generation,
+        state,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    let Some(expected_revoked_generation) = lease.registration_generation.checked_add(1) else {
+        return Ok(None);
+    };
+    if state != "revoked"
+        || registration_id != lease.registration_id
+        || revoked_generation != expected_revoked_generation
+    {
+        return Ok(None);
+    }
+    let roots: Vec<String> = match serde_json::from_str::<Vec<String>>(&roots_json) {
+        Ok(roots) if !roots.is_empty() && roots.len() <= 16 => roots,
+        _ => return Ok(None),
+    };
+    let Some(forge_project) = config.forge.projects.get(&lease.project_id) else {
+        return Ok(None);
+    };
+    let Ok(current_trusted_repository) =
+        crate::forge::canonical_repository(&forge_project.canonical_repository)
+    else {
+        return Ok(None);
+    };
+    let repository_path = PathBuf::from(repository_path);
+    let allowed_roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    if current_trusted_repository != trusted_repository
+        || !repository_path.is_absolute()
+        || allowed_roots.iter().any(|root| !root.is_absolute())
+        || retained_registration_digest(
+            &lease.project_id,
+            &trusted_repository,
+            &repository_path,
+            &forge_project.remote_name,
+            &allowed_roots,
+        )? != registration_digest
+    {
+        return Ok(None);
+    }
+    Ok(Some(WorkspaceRegistration {
+        registration_id,
+        project_id: lease.project_id.clone(),
+        trusted_repository,
+        repository_path,
+        remote_name: forge_project.remote_name.clone(),
+        allowed_roots,
+        registration_digest,
+        generation: lease.registration_generation,
+    }))
+}
+
+fn registration_snapshot_matches(
+    db: &Connection,
+    registration: &WorkspaceRegistration,
+) -> Result<bool> {
+    let raw: Option<(String, String, String, String, String, i64, String)> = db
+        .query_row(
+            "SELECT registration_id,trusted_repository,repository_path,allowed_roots_json,
+                    registration_digest,generation,state
+             FROM workspace_registrations WHERE project_id=?1",
+            [&registration.project_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, trusted, repository, roots_json, digest, generation, state)) = raw else {
+        return Ok(false);
+    };
+    let Ok(roots) = serde_json::from_str::<Vec<String>>(&roots_json) else {
+        return Ok(false);
+    };
+    let expected_roots = registration
+        .allowed_roots
+        .iter()
+        .map(|path| path_text(path))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(revoked_generation) = registration.generation.checked_add(1) else {
+        return Ok(false);
+    };
+    Ok(id == registration.registration_id
+        && trusted == registration.trusted_repository
+        && repository == path_text(&registration.repository_path)?
+        && roots == expected_roots
+        && digest == registration.registration_digest
+        && generation == revoked_generation
+        && state == "revoked")
+}
+
+fn retained_registration_digest(
+    project_id: &str,
+    trusted_repository: &str,
+    repository_path: &Path,
+    remote_name: &str,
+    allowed_roots: &[PathBuf],
+) -> Result<String> {
+    let canonical = model::canonical(&json!({
+        "version":1,
+        "project_id":project_id,
+        "trusted_repository":trusted_repository,
+        "repository_path":path_text(repository_path)?,
+        "remote_name":remote_name,
+        "allowed_roots":allowed_roots.iter().map(|path| path_text(path)).collect::<Result<Vec<_>>>()?,
+    }))?;
+    Ok(model::digest(canonical.as_bytes()))
+}
+
+fn unknown_workspace_operation_snapshot(
+    db: &Connection,
+    lease: &LeaseRow,
+) -> Result<Option<Value>> {
+    type OperationRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+        String,
+    );
+    let operation: Option<OperationRow> = db
+        .query_row(
+            "SELECT caller_id,client_request_id,method,task_id,state,attempt_id,binding_id,
+                    binding_generation,original_request_json,effective_request_json,result_json
+             FROM operations WHERE operation_id=?1",
+            [&lease.operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller_id,
+        client_request_id,
+        method,
+        task_id,
+        state,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        original_raw,
+        effective_raw,
+        result_raw,
+    )) = operation
+    else {
+        return Ok(None);
+    };
+    if method != "swarm.launch"
+        || state != "outcome_unknown"
+        || task_id.as_deref() != Some(lease.task_id.as_str())
+        || attempt_id.is_some()
+        || binding_id.is_some()
+        || binding_generation.is_some()
+        || original_raw.len() > 1_048_576
+        || effective_raw.len() > 1_048_576
+        || result_raw.len() > 1_048_576
+    {
+        return Ok(None);
+    }
+    let (Ok(original), Ok(effective), Ok(result)) = (
+        serde_json::from_str::<Value>(&original_raw),
+        serde_json::from_str::<Value>(&effective_raw),
+        serde_json::from_str::<Value>(&result_raw),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(request) = crate::launcher::LaunchRequest::parse(&original) else {
+        return Ok(None);
+    };
+    let manifest = &effective["launch_manifest"];
+    let actor = &manifest["actor"];
+    let owner = match actor["kind"].as_str() {
+        Some("direct") => actor["client_id"].as_str(),
+        Some("work_dispatch") => actor["effective_manager_id"].as_str(),
+        _ => None,
+    };
+    if request.client_request_id != client_request_id
+        || request.plan_digest != lease.plan_digest
+        || request.preview.task_id != lease.task_id
+        || request.preview.expected_task_revision != lease.task_revision
+        || manifest["state"] != "outcome_unknown"
+        || manifest["plan_digest"] != lease.plan_digest
+        || manifest["task"]["task_id"] != lease.task_id
+        || manifest["task"]["project_id"] != lease.project_id
+        || manifest["task"]["expected_revision"] != lease.task_revision
+        || manifest["task"]["observed_revision"] != lease.task_revision
+        || !manifest["task"]["attempt_id"].is_null()
+        || actor["client_id"] != caller_id
+        || owner != Some(lease.owner_client_id.as_str())
+        || manifest["failure"]["code"] != "workspace_effect_unknown"
+        || manifest["runtime"]["native_effect"] != "unknown"
+        || result["operation_id"] != lease.operation_id
+        || result["launch_state"] != "outcome_unknown"
+        || result["state"] != "outcome_unknown"
+        || result["plan_digest"] != lease.plan_digest
+        || result["task_id"] != lease.task_id
+        || result["task_revision"] != lease.task_revision
+        || !result["attempt_id"].is_null()
+        || result["native_effect"] != "unknown"
+        || result["failure"]["code"] != "workspace_effect_unknown"
+    {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "operation_id":lease.operation_id,
+        "method":method,
+        "state":state,
+        "caller_id":caller_id,
+        "client_request_id":client_request_id,
+        "plan_digest":lease.plan_digest,
+        "task_id":lease.task_id,
+        "task_revision":lease.task_revision,
+        "attempt_id":Value::Null,
+        "binding_id":Value::Null,
+        "binding_generation":Value::Null,
+        "failure_code":"workspace_effect_unknown",
+        "original_request_digest":model::digest(original_raw.as_bytes()),
+        "effective_request_digest":model::digest(effective_raw.as_bytes()),
+        "result_digest":model::digest(result_raw.as_bytes()),
+    })))
+}
+
+fn persist_revoked_unknown_readback(
+    tx: &Transaction<'_>,
+    registration: &WorkspaceRegistration,
+    reservation: &LeaseReservation,
+    plan: &WorkspaceLeasePlan,
+    evidence: &LeaseEvidence,
+    row: LeaseRow,
+    now: i64,
+) -> Result<LeaseAuthorityRef> {
+    workspace::evidence_matches_reservation(evidence, reservation, plan, registration)?;
+    if !registration_snapshot_matches(tx, registration)?
+        || row.state != "stale"
+        || row.registration_id != registration.registration_id
+        || row.registration_generation != registration.generation
+        || row.generation != reservation.generation
+        || row.binding_digest != reservation.intent_digest
+        || row.workspace_path != *reservation.workspace_path()
+        || row.project_id != plan.project_id
+        || row.task_id != plan.task_id
+        || row.task_revision != plan.task_revision
+        || row.operation_id != plan.operation_id
+        || row.plan_digest != plan.plan_digest
+        || row.owner_client_id != plan.owner_client_id
+        || row.attempt_id.is_some()
+        || row.allowed_paths != plan.allowed_paths
+        || row.allowed_symbols != plan.allowed_symbols
+        || row.branch_ref != reservation.branch_ref
+        || row.worktree_handle != reservation.worktree_handle
+        || row.clean_state["status"] != "registration_revoked"
+        || row.clean_state["reason_code"] != "registration_revoked"
+        || row.clean_state["prior_lease_state"] != "outcome_unknown"
+    {
+        return Err(Error::conflict(
+            "revoked workspace readback no longer matches the retained lease generation",
+        ));
+    }
+    verify_task_authority(tx, plan)?;
+    let Some(operation) = unknown_workspace_operation_snapshot(tx, &row)? else {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "revoked workspace readback does not match the exact unknown launch Operation",
+        ));
+    };
+    let baseline = evidence.baseline_commit.as_str();
+    if !reconciled_clean_evidence(&evidence.clean_state, baseline) {
+        return Err(Error::new(
+            "WORKSPACE_EVIDENCE_MISMATCH",
+            "revoked workspace readback did not verify the exact clean worktree baseline",
+        ));
+    }
+    let revoked_generation = registration
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("WORKSPACE_GENERATION", "generation overflow"))?;
+    let proof = json!({
+        "status":"verified",
+        "version":1,
+        "kind":"post_revocation_workspace_filesystem_readback",
+        "verified_at_ms":now,
+        "registration":{
+            "registration_id":registration.registration_id,
+            "registration_generation":registration.generation,
+            "revoked_generation":revoked_generation,
+            "registration_digest":registration.registration_digest,
+            "remote_name":registration.remote_name,
+        },
+        "lease":{
+            "lease_id":row.lease_id,
+            "generation":row.generation,
+            "binding_digest":row.binding_digest,
+            "project_id":row.project_id,
+            "task_id":row.task_id,
+            "task_revision":row.task_revision,
+            "operation_id":row.operation_id,
+            "plan_digest":row.plan_digest,
+            "owner_client_id":row.owner_client_id,
+            "attempt_id":row.attempt_id,
+            "baseline_commit":baseline,
+            "branch_ref":row.branch_ref,
+            "worktree_handle":row.worktree_handle,
+        },
+        "operation":operation,
+        "filesystem_readback":evidence.clean_state,
+    });
+    let mut clean_state = row.clean_state.clone();
+    clean_state
+        .as_object_mut()
+        .ok_or_else(|| {
+            Error::new(
+                "WORKSPACE_LEASE_INVALID",
+                "retained lease facts are not an object",
+            )
+        })?
+        .insert("post_revocation_readback".to_owned(), proof);
+    // Revocation's json_set may retain a noncanonical key order. The CAS
+    // must bind the complete stored bytes from this same transaction, not
+    // a reserialization of the already validated clean-state snapshot.
+    let prior_json: String = tx
+        .query_row(
+            "SELECT clean_state_json FROM workspace_leases
+             WHERE lease_id=?1 AND registration_id=?2 AND registration_generation=?3
+               AND generation=?4 AND binding_digest=?5 AND operation_id=?6
+               AND state='stale'",
+            params![
+                row.lease_id,
+                registration.registration_id,
+                registration.generation,
+                row.generation,
+                reservation.intent_digest,
+                plan.operation_id,
+            ],
+            |stored| stored.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::conflict("revoked workspace readback persistence CAS failed"))?;
+    if serde_json::from_str::<Value>(&prior_json)? != row.clean_state {
+        return Err(Error::conflict(
+            "revoked workspace readback clean state changed before persistence",
+        ));
+    }
+    let clean_json = model::canonical(&clean_state)?;
+    let changed = tx.execute(
+        "UPDATE workspace_leases SET clean_state_json=?8,updated_at_ms=MAX(updated_at_ms,?9)
+         WHERE lease_id=?1 AND registration_id=?2 AND registration_generation=?3
+           AND generation=?4 AND binding_digest=?5 AND operation_id=?6
+           AND state='stale' AND clean_state_json=?7",
+        params![
+            row.lease_id,
+            registration.registration_id,
+            registration.generation,
+            row.generation,
+            reservation.intent_digest,
+            plan.operation_id,
+            prior_json,
+            clean_json,
+            now,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "revoked workspace readback persistence CAS failed",
+        ));
+    }
+    let retained = lease_row(tx, &reservation.lease_id)?;
+    let reference = lease_readback_reference(&retained);
+    if !post_revocation_unknown_workspace_readback_matches(tx, &reference)? {
+        return Err(Error::conflict(
+            "persisted revoked workspace readback failed exact verification",
+        ));
+    }
+    Ok(reference)
+}
+
+fn reconciled_clean_evidence(evidence: &Value, baseline: &str) -> bool {
+    evidence["status"] == "reconciled_clean"
+        && evidence["tracked_and_untracked"] == true
+        && evidence["source_head_rechecked"] == true
+        && evidence["source_head_before"] == baseline
+        && evidence["source_head_after"] == baseline
+        && evidence["worktree_head"] == baseline
+        && crate::forge::valid_object_id(baseline)
+}
+
+fn lease_readback_reference(row: &LeaseRow) -> LeaseAuthorityRef {
+    LeaseAuthorityRef {
+        lease_id: row.lease_id.clone(),
+        registration_id: row.registration_id.clone(),
+        registration_generation: row.registration_generation,
+        project_id: row.project_id.clone(),
+        task_id: row.task_id.clone(),
+        task_revision: row.task_revision,
+        operation_id: row.operation_id.clone(),
+        plan_digest: row.plan_digest.clone(),
+        owner_client_id: row.owner_client_id.clone(),
+        attempt_id: row.attempt_id.clone(),
+        generation: row.generation,
+        baseline_commit: row.baseline_commit.clone(),
+        branch_ref: row.branch_ref.clone(),
+        worktree_handle: row.worktree_handle.clone(),
+        binding_digest: row.binding_digest.clone(),
+        state: row.state.clone(),
+    }
+}
+
+pub(crate) fn post_revocation_unknown_workspace_readback_matches(
+    db: &Connection,
+    reference: &LeaseAuthorityRef,
+) -> Result<bool> {
+    if reference.state != "stale" {
+        return Ok(false);
+    }
+    let row = lease_row(db, &reference.lease_id)?;
+    if row.state != "stale"
+        || row.registration_id != reference.registration_id
+        || row.registration_generation != reference.registration_generation
+        || row.project_id != reference.project_id
+        || row.task_id != reference.task_id
+        || row.task_revision != reference.task_revision
+        || row.operation_id != reference.operation_id
+        || row.plan_digest != reference.plan_digest
+        || row.owner_client_id != reference.owner_client_id
+        || row.attempt_id != reference.attempt_id
+        || row.generation != reference.generation
+        || row.baseline_commit != reference.baseline_commit
+        || row.branch_ref != reference.branch_ref
+        || row.worktree_handle != reference.worktree_handle
+        || row.binding_digest != reference.binding_digest
+        || row.attempt_id.is_some()
+        || row.clean_state["status"] != "registration_revoked"
+        || row.clean_state["reason_code"] != "registration_revoked"
+        || row.clean_state["prior_lease_state"] != "outcome_unknown"
+    {
+        return Ok(false);
+    }
+    let Some(proof) = row.clean_state.get("post_revocation_readback") else {
+        return Ok(false);
+    };
+    let registration = registration_row(db, &row.project_id)?;
+    let registration_snapshot: Option<(String, String, String)> = db
+        .query_row(
+            "SELECT trusted_repository,repository_path,allowed_roots_json
+             FROM workspace_registrations WHERE project_id=?1",
+            [&row.project_id],
+            |db_row| Ok((db_row.get(0)?, db_row.get(1)?, db_row.get(2)?)),
+        )
+        .optional()?;
+    let Some((trusted_repository, repository_path, allowed_roots_json)) = registration_snapshot
+    else {
+        return Ok(false);
+    };
+    let Ok(allowed_root_strings) = serde_json::from_str::<Vec<String>>(&allowed_roots_json) else {
+        return Ok(false);
+    };
+    let allowed_roots = allowed_root_strings
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let remote_name = proof["registration"]["remote_name"].as_str().unwrap_or("");
+    if remote_name.is_empty()
+        || retained_registration_digest(
+            &row.project_id,
+            &trusted_repository,
+            Path::new(&repository_path),
+            remote_name,
+            &allowed_roots,
+        )? != registration.registration_digest
+    {
+        return Ok(false);
+    }
+    let Some(revoked_generation) = row.registration_generation.checked_add(1) else {
+        return Ok(false);
+    };
+    if registration.state != "revoked"
+        || registration.registration_id != row.registration_id
+        || registration.generation != revoked_generation
+        || proof["status"] != "verified"
+        || proof["version"] != 1
+        || proof["kind"] != "post_revocation_workspace_filesystem_readback"
+        || proof["verified_at_ms"]
+            .as_i64()
+            .is_none_or(|value| value < 0)
+        || proof["registration"]["registration_id"] != row.registration_id
+        || proof["registration"]["registration_generation"] != row.registration_generation
+        || proof["registration"]["revoked_generation"] != registration.generation
+        || proof["registration"]["registration_digest"] != registration.registration_digest
+        || proof["lease"]["lease_id"] != row.lease_id
+        || proof["lease"]["generation"] != row.generation
+        || proof["lease"]["binding_digest"] != row.binding_digest
+        || proof["lease"]["project_id"] != row.project_id
+        || proof["lease"]["task_id"] != row.task_id
+        || proof["lease"]["task_revision"] != row.task_revision
+        || proof["lease"]["operation_id"] != row.operation_id
+        || proof["lease"]["plan_digest"] != row.plan_digest
+        || proof["lease"]["owner_client_id"] != row.owner_client_id
+        || !proof["lease"]["attempt_id"].is_null()
+        || proof["lease"]["branch_ref"] != row.branch_ref
+        || proof["lease"]["worktree_handle"] != row.worktree_handle
+    {
+        return Ok(false);
+    }
+    let Some(baseline) = proof["lease"]["baseline_commit"].as_str() else {
+        return Ok(false);
+    };
+    if !reconciled_clean_evidence(&proof["filesystem_readback"], baseline) {
+        return Ok(false);
+    }
+    let Some(operation) = unknown_workspace_operation_snapshot(db, &row)? else {
+        return Ok(false);
+    };
+    Ok(model::canonical(&proof["operation"])? == model::canonical(&operation)?)
 }
 
 fn ticket_from_row(

@@ -145,11 +145,12 @@ fn optional_env(name: &str) -> Result<Option<String>> {
 }
 
 fn command_capabilities_match(claim: &ModuleContractClaim, profile: Profile) -> bool {
-    const V3: [&str; 5] = [
+    const V3: [&str; 6] = [
         "agent.open",
         "agent.reconcile",
         "agent.refresh",
         "agent.result",
+        "native.command.release_evidence",
         "task.dispatch",
     ];
     const ACP_V1: [&str; 9] = [

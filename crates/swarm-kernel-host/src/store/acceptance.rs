@@ -11,7 +11,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn acceptance_validation_error(error: swarm_kernel::acceptance::ValidationError) -> Error {
     Error::new(error.code(), error.message())
@@ -296,6 +296,7 @@ fn evidence(
         ));
     }
     let spec: TaskSpec = serde_json::from_value(a["task_snapshot"]["spec"].clone())?;
+    spec.validate_retained()?;
     let spec_value = serde_json::to_value(&spec)?;
     swarm_kernel::acceptance::validate_acceptance_required(&spec_value)
         .map_err(acceptance_validation_error)?;
@@ -305,6 +306,36 @@ fn evidence(
             "Task has no explicit acceptance policy; assignment and submission remain available",
         )
     })?;
+    let plan = match policy {
+        crate::acceptance::RetainedAcceptancePolicy::V2(_) => Some(
+            swarm_kernel::acceptance::validate_frozen_requirement_evidence_plan(
+                &spec_value,
+                &a["task_snapshot"]["requirement_evidence_plan"],
+            )
+            .map_err(acceptance_validation_error)?,
+        ),
+        crate::acceptance::RetainedAcceptancePolicy::LegacyV1(_) => None,
+    };
+    let required_profiles: Vec<swarm_kernel::acceptance::CheckProfileIdentity> = match policy {
+        crate::acceptance::RetainedAcceptancePolicy::V2(_) => plan
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "REQUIREMENT_EVIDENCE_PLAN_STALE",
+                    "V2 acceptance has no validated frozen evidence plan",
+                )
+            })?
+            .required_profiles
+            .clone(),
+        crate::acceptance::RetainedAcceptancePolicy::LegacyV1(legacy) => legacy
+            .required_check_profiles
+            .iter()
+            .map(|profile| swarm_kernel::acceptance::CheckProfileIdentity {
+                profile_id: profile.profile_id.clone(),
+                profile_revision: profile.profile_revision.clone(),
+            })
+            .collect(),
+    };
     input.validate_coverage(&spec)?;
     validate_dependencies(db, &a, &spec)?;
     let candidate = results::get(db, &input.candidate_ref)?;
@@ -316,9 +347,14 @@ fn evidence(
     )
     .map_err(acceptance_validation_error)?;
     let mut files = vec![results::get(db, &input.submission_ref)?, candidate];
-    let policy_value = serde_json::to_value(policy)?;
-    let mut profiles = BTreeSet::new();
+    let mut profiles: BTreeSet<swarm_kernel::acceptance::CheckProfileIdentity> = BTreeSet::new();
     let mut checks = Vec::new();
+    // Resolve every supplied CheckRun to the exact profile identity
+    // it produced. A profile ID with a different revision is a
+    // mismatch, not a substitute; one exact CheckRun may satisfy
+    // several requirements through the frozen plan mapping.
+    let mut check_profiles: BTreeMap<swarm_kernel::acceptance::CheckProfileIdentity, String> =
+        BTreeMap::new();
     for id in &input.check_ids {
         let raw: Option<String> = db.query_row(
             "SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'state',state,'exit_code',exit_code,'released_at_ms',resource_released_at_ms,'cached_from',cached_from_check_id,'result_ref',result_ref,'spec',json(spec_json),'coverage',json(coverage_json)) FROM check_runs WHERE check_id=?1",
@@ -327,14 +363,15 @@ fn evidence(
         let c: Value =
             serde_json::from_str(&raw.ok_or_else(|| Error::new("CHECK_NOT_READY", id))?)?;
         let profile = swarm_kernel::acceptance::validate_check(
-            &policy_value,
+            &required_profiles,
             &c,
             &input.attempt_id,
             &input.candidate_ref,
             &profiles,
         )
         .map_err(acceptance_validation_error)?;
-        profiles.insert(profile);
+        profiles.insert(profile.clone());
+        check_profiles.insert(profile, id.clone());
         let check_profile: CheckProfile = serde_json::from_value(c["spec"]["profile"].clone())
             .map_err(|_| Error::new("CHECK_EVIDENCE_MISSING", "check profile is malformed"))?;
         let expected_targets: Vec<String> =
@@ -471,17 +508,62 @@ fn evidence(
         }
         checks.push(c);
     }
-    swarm_kernel::acceptance::validate_checks_complete(
-        profiles.len(),
-        policy.required_check_profiles.len(),
-    )
-    .map_err(acceptance_validation_error)?;
+    // Every exact required profile identity must have exactly one
+    // accepted CheckRun, and no extra profile may be supplied.
+    let required_identities: BTreeSet<_> = required_profiles.iter().cloned().collect();
+    swarm_kernel::acceptance::validate_checks_complete(&profiles, &required_identities)
+        .map_err(acceptance_validation_error)?;
+    // V2 acceptance records a deterministic per-requirement manifest.
+    // Retained V1 Tasks keep their historical global-check semantics and
+    // do not receive fabricated requirement/profile associations.
+    let requirement_evidence = plan.as_ref().map(|_| {
+        let mut reviews_by_id: BTreeMap<&str, &crate::acceptance::RequirementReview> =
+            BTreeMap::new();
+        for review in &input.reviews {
+            reviews_by_id.insert(review.requirement_id.as_str(), review);
+        }
+        spec.requirements
+            .iter()
+            .map(|requirement| {
+                let review = requirement
+                    .verification
+                    .as_ref()
+                    .filter(|verification| verification.review_required)
+                    .and_then(|_| reviews_by_id.get(requirement.id.as_str()))
+                    .map(|review| json!({"rationale":review.rationale,"evidence":review.evidence}));
+                let checks = requirement
+                    .verification
+                    .as_ref()
+                    .map(|verification| {
+                        verification
+                            .check_profiles
+                            .iter()
+                            .filter_map(|required| {
+                                let identity = swarm_kernel::acceptance::CheckProfileIdentity {
+                                    profile_id: required.profile_id.clone(),
+                                    profile_revision: required.profile_revision.clone(),
+                                };
+                                let check_id = check_profiles.get(&identity)?;
+                                Some(json!({
+                                    "profile_id": required.profile_id,
+                                    "profile_revision": required.profile_revision,
+                                    "check_id": check_id,
+                                }))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                json!({"requirement_id":requirement.id,"review":review,"checks":checks})
+            })
+            .collect::<Vec<_>>()
+    });
     let manifest: Vec<_> = files.iter().map(|f| json!({"artifact_id":f.artifact_id,"sha256":f.content_digest,"length":f.byte_length,"path":f.relative_path})).collect();
-    Ok((
-        json!({"task_id":a["task_id"],"phase":spec.phase,"policy":policy,"artifacts":manifest,"checks":checks,
-        "dependency_acceptances":a["task_snapshot"]["dependency_acceptances"]}),
-        files,
-    ))
+    let mut evidence = json!({"task_id":a["task_id"],"phase":spec.phase,"policy":policy,"artifacts":manifest,"checks":checks,
+        "dependency_acceptances":a["task_snapshot"]["dependency_acceptances"]});
+    if let Some(requirement_evidence) = requirement_evidence {
+        evidence["requirement_evidence"] = json!(requirement_evidence);
+    }
+    Ok((evidence, files))
 }
 
 fn reserve_with_actor(
@@ -802,12 +884,16 @@ fn settle_acceptance(
                 "UPDATE attempts SET state='accepted',updated_at_ms=?2 WHERE attempt_id=?1",
                 params![input.attempt_id, now],
             )?;
-            json!({"operation_id":id,"acceptance_operation_id":id,"outcome":"applied","task_id":e["task_id"],
+            let mut accepted = json!({"operation_id":id,"acceptance_operation_id":id,"outcome":"applied","task_id":e["task_id"],
                 "attempt_id":input.attempt_id,"task_revision":input.expected_revision,"phase":e["phase"],
                 "submission_ref":input.submission_ref,"candidate_ref":input.candidate_ref,"reviewer_id":reviewer_id,
                 "reason":input.reason,"reviews":input.reviews,"check_ids":input.check_ids,
                 "feedback_observation_id":input.expected_feedback_observation_id,"evidence_level":evidence_level,
-                "source_checkout_verified":!input.check_ids.is_empty(),"task_accepted":true,"ownership_released":false})
+                "source_checkout_verified":!input.check_ids.is_empty(),"task_accepted":true,"ownership_released":false});
+            if let Some(requirement_evidence) = e.get("requirement_evidence") {
+                accepted["requirement_evidence"] = requirement_evidence.clone();
+            }
+            accepted
         }
         Err(error) => {
             json!({"operation_id":id,"outcome":"failed","error":error,"task_accepted":false})

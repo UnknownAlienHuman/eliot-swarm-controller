@@ -147,11 +147,13 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
                 schema("swarm.runtime_outcome"),
                 schema("swarm.task_dispatch_admission"),
                 schema("swarm.normalized_result_page"),
+                swarm_contracts::module_contract::goal_continuation_admission_schema(),
+                swarm_contracts::module_contract::goal_terminal_evidence_schema(),
             ],
         )
 }
 
-/// A v5 executable never accepts an unselected or unknown prompt schema.
+/// A v6 executable never accepts an unselected or unknown prompt schema.
 pub(crate) fn task_prompt_selected(claim: &ModuleContractClaim) -> Result<bool, AdapterError> {
     swarm_contracts::module_contract::task_prompt_selected(
         claim.command_schemas.iter(),
@@ -205,7 +207,13 @@ pub(crate) fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
         ],
     ) && exact_schemas(
         &claim.event_schemas,
-        &[runtime_outcome, dispatch_admission, result_page],
+        &[
+            runtime_outcome,
+            dispatch_admission,
+            result_page,
+            swarm_contracts::module_contract::goal_continuation_admission_schema(),
+            swarm_contracts::module_contract::goal_terminal_evidence_schema(),
+        ],
     )
 }
 

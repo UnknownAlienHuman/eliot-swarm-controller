@@ -47,23 +47,55 @@ fn task_snapshot(
     dependency_acceptances: Vec<Value>,
     owner_policy: policy::OwnerPolicyEdition,
     baseline_candidate: Value,
-) -> Value {
-    json!({
+) -> Result<Value> {
+    let brief = task_sources::brief(spec)?;
+    let mut snapshot = json!({
         "spec": spec,
         "revision": revision,
         "dependency_acceptances": dependency_acceptances,
         "baseline_candidate": baseline_candidate,
         "owner_policy": owner_policy,
-        "brief": task_sources::brief(spec),
-    })
+        "brief": brief,
+    });
+    if matches!(
+        spec.acceptance.as_ref(),
+        Some(crate::acceptance::RetainedAcceptancePolicy::V2(_))
+    ) {
+        snapshot["requirement_evidence_plan"] =
+            snapshot["brief"]["requirement_evidence_plan"].clone();
+        if snapshot["requirement_evidence_plan"].is_null() {
+            return Err(Error::new(
+                "REQUIREMENT_EVIDENCE_PLAN_STALE",
+                "V2 Task brief omitted its derived evidence plan",
+            ));
+        }
+    }
+    Ok(snapshot)
 }
-fn spec(v: &Value) -> Result<TaskSpec> {
+
+/// Decode a retained Task spec for frozen historical readback.
+/// Accepts a valid legacy V1 spec or a valid current V2 spec.
+fn retained_spec(v: &Value) -> Result<TaskSpec> {
     let s: TaskSpec = serde_json::from_value(
         v.get("spec")
             .cloned()
             .ok_or_else(|| Error::invalid("spec required"))?,
     )?;
-    s.validate()?;
+    s.validate_retained()?;
+    Ok(s)
+}
+
+/// Decode the current admission spec for task.create/task.revise.
+/// Accepts the exact V2 acceptance marker with a complete
+/// per-requirement verification policy, or no acceptance policy.
+/// New legacy V1 writes and mixed/partial markers reject.
+fn admission_spec(v: &Value) -> Result<TaskSpec> {
+    let s: TaskSpec = serde_json::from_value(
+        v.get("spec")
+            .cloned()
+            .ok_or_else(|| Error::invalid("spec required"))?,
+    )?;
+    s.validate_current_admission()?;
     Ok(s)
 }
 
@@ -184,7 +216,7 @@ pub(super) fn create(
         &["client_request_id", "project_id", "origin_key", "spec"],
     )?;
     let project = model::text(v, "project_id")?;
-    let s = spec(v)?;
+    let s = admission_spec(v)?;
     let origin = if v.get("origin_key").is_some() {
         Some(model::text(v, "origin_key")?)
     } else {
@@ -212,7 +244,7 @@ pub(super) fn create_for_script_effect(
             "script task_create is limited to its retained automation project",
         ));
     }
-    let s = spec(v)?;
+    let s = admission_spec(v)?;
     create_validated(tx, project, &s, None, id, now)
 }
 
@@ -258,7 +290,7 @@ pub(super) fn revise(
     )?;
     let task_id = model::text(v, "task_id")?;
     let expected = model::positive(v, "expected_revision")?;
-    let s = spec(v)?;
+    let s = admission_spec(v)?;
     let previous = get_task(tx, task_id)?;
     swarm_kernel::tasks::validate_revision_state(
         expected,
@@ -402,6 +434,23 @@ fn claim_with_authority(
         task["state"].as_str().unwrap_or_default(),
     )
     .map_err(task_validation_error)?;
+    // Claim gate: a legacy V1 Task with no existing unreleased
+    // Attempt cannot be claimed; its owner must make an explicit
+    // task.revise to the exact V2 marker. A Task with no
+    // acceptance policy claims normally but still cannot be
+    // accepted. A frozen V1 Attempt is unaffected by this gate.
+    let spec = retained_spec(&task)?;
+    if task["current_attempt_id"].is_null()
+        && matches!(
+            &spec.acceptance,
+            Some(crate::acceptance::RetainedAcceptancePolicy::LegacyV1(_))
+        )
+    {
+        return Err(Error::new(
+            "TASK_ACCEPTANCE_POLICY_UPGRADE_REQUIRED",
+            "legacy V1 Task acceptance requires an explicit task.revise to the exact V2 marker",
+        ));
+    }
     if let Some(existing) = task["current_attempt_id"].as_str() {
         let a = get_attempt(tx, existing)?;
         let binding_matches = match &requested_binding {
@@ -429,8 +478,6 @@ fn claim_with_authority(
     if meta(tx, "execution_mode")?.unwrap_or(Value::Null)["new_work"] != "enabled" {
         return Err(Error::new("ADMISSION_DISABLED", "new work is disabled"));
     }
-    let spec: TaskSpec = serde_json::from_value(task["spec"].clone())?;
-    spec.validate()?;
     let owner_policy = policy::accepted_edition(spec.owner_policy_id.as_deref())?;
     let baseline_candidate = acceptance::freeze_baseline_candidate(
         tx,
@@ -462,7 +509,7 @@ fn claim_with_authority(
         dependency_receipts,
         owner_policy,
         baseline_candidate,
-    );
+    )?;
     tx.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'reserved',?9,?9)",params![attempt,task_id,revision,model::canonical(&snapshot)?,owner,start.as_str(),binding,generation,now])?;
     attach_operation_scope(tx, id, task_id, Some(&attempt))?;
     Ok(
@@ -570,6 +617,7 @@ mod tests {
             requirements: vec![Requirement {
                 id: "R1".to_owned(),
                 statement: "Keep unknown source comments visible".to_owned(),
+                verification: None,
             }],
             dependencies: Vec::new(),
             scope: None,
@@ -605,7 +653,8 @@ mod tests {
             Vec::new(),
             policy::accepted_edition(spec.owner_policy_id.as_deref()).unwrap(),
             json!({"status":"wide","reason":"baseline_not_configured"}),
-        );
+        )
+        .unwrap();
 
         assert_eq!(snapshot["owner_policy"]["status"], "accepted");
         assert_eq!(snapshot["owner_policy"]["edition"], 1);

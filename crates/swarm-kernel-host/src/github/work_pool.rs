@@ -107,6 +107,7 @@ pub fn task_spec(host: &str, repository_id: i64, issue: &IssueReadback) -> Resul
         requirements: vec![Requirement {
             id: "github_issue_title".to_owned(),
             statement: issue.title.clone(),
+            verification: None,
         }],
         dependencies: Vec::new(),
         scope: None,

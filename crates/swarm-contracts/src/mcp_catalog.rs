@@ -2239,6 +2239,213 @@ fn build_input_schema(
     }
 }
 
+fn check_profile_ref_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "profile_id":{"type":"string","minLength":1},
+            "profile_revision":{"type":"string","minLength":1}
+        },
+        "required":["profile_id","profile_revision"],
+        "additionalProperties":false
+    })
+}
+
+fn acceptance_policy_v2_schema() -> Value {
+    json!({
+        "type":"object",
+        "description":"Current writes use this exact V2 marker; check profiles are frozen per requirement, not globally.",
+        "properties":{
+            "schema_id":{"type":"string","const":"swarm.acceptance_policy"},
+            "schema_version":{"type":"integer","const":2}
+        },
+        "required":["schema_id","schema_version"],
+        "additionalProperties":false
+    })
+}
+
+fn requirement_verification_schema() -> Value {
+    json!({
+        "type":"object",
+        "description":"At least one evidence source is required for each requirement: independent review, one or more exact CheckRunner profiles, or both.",
+        "properties":{
+            "review_required":{"type":"boolean"},
+            "check_profiles":{
+                "type":"array",
+                "uniqueItems":true,
+                "description":"Exact configured profile ID/revision pairs; omitted input defaults to an empty array. Revisions for one profile ID must agree throughout the Task.",
+                "items":check_profile_ref_schema()
+            }
+        },
+        "required":["review_required"],
+        "additionalProperties":false,
+        "anyOf":[
+            {"properties":{"review_required":{"const":true}}},
+            {"required":["check_profiles"],"properties":{"check_profiles":{"minItems":1}}}
+        ]
+    })
+}
+
+fn task_spec_schema() -> Value {
+    json!({
+        "type":"object",
+        "description":"Current TaskSpec shape. A write may omit acceptance only when no requirement supplies verification. With acceptance, use the exact V2 marker and provide a valid verification policy for every requirement; legacy V1 policies are retained for historical reads only.",
+        "properties":{
+            "acceptance":{
+                "oneOf":[acceptance_policy_v2_schema(),{"type":"null"}]
+            },
+            "objective":{"type":"string","minLength":1},
+            "phase":{"type":"string","minLength":1},
+            "requirements":{
+                "type":"array",
+                "minItems":1,
+                "description":"Requirement IDs must be unique; admission also rejects conflicting revisions for one profile ID.",
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "id":{"type":"string","minLength":1},
+                        "statement":{"type":"string","minLength":1},
+                        "verification":{
+                            "oneOf":[requirement_verification_schema(),{"type":"null"}]
+                        }
+                    },
+                    "required":["id","statement"],
+                    "additionalProperties":false
+                }
+            },
+            "dependencies":{
+                "type":"array",
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "task_id":{"type":"string","minLength":1},
+                        "required_revision":{"type":"integer","minimum":1},
+                        "required_phase":{"type":"string","minLength":1}
+                    },
+                    "required":["task_id","required_revision","required_phase"],
+                    "additionalProperties":false
+                }
+            },
+            "scope":{
+                "oneOf":[
+                    {
+                        "type":"object",
+                        "properties":{
+                            "initial_paths":{"type":"array","items":{"type":"string"}},
+                            "forbidden_paths":{"type":"array","items":{"type":"string"}},
+                            "prerequisite_policy":{"oneOf":[{"type":"string"},{"type":"null"}]}
+                        },
+                        "additionalProperties":false
+                    },
+                    {"type":"null"}
+                ]
+            },
+            "source_refs":{"type":"array","uniqueItems":true,"items":{"type":"string","minLength":1}},
+            "owner_policy_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
+            "source_index":{
+                "type":"array",
+                "description":"Source refs are unique; selected entries require a pinned revision, exact text and matching digest.",
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "source_ref":{"type":"string","minLength":1},
+                        "revision":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
+                        "content_sha256":{"oneOf":[{"type":"string","pattern":"^[0-9a-f]{64}$"},{"type":"null"}]},
+                        "text":{"oneOf":[{"type":"string"},{"type":"null"}]},
+                        "status":{"type":"string","enum":["selected","gap"]},
+                        "gap_reason":{"oneOf":[{"type":"string"},{"type":"null"}]}
+                    },
+                    "required":["source_ref","status"],
+                    "additionalProperties":false
+                }
+            },
+            "baseline_candidate_ref":{
+                "oneOf":[
+                    {"type":"string","minLength":1,"maxLength":512,"description":"The runtime enforces the 512-byte UTF-8 bound."},
+                    {"type":"null"}
+                ]
+            }
+        },
+        "required":["objective","phase","requirements"],
+        "additionalProperties":false,
+        "allOf":[
+            {
+                "if":{
+                    "required":["acceptance"],
+                    "properties":{"acceptance":{"type":"object"}}
+                },
+                "then":{
+                    "properties":{
+                        "acceptance":acceptance_policy_v2_schema(),
+                        "requirements":{
+                            "items":{
+                                "required":["verification"],
+                                "properties":{"verification":requirement_verification_schema()}
+                            }
+                        }
+                    }
+                },
+                "else":{
+                    "properties":{
+                        "requirements":{
+                            "items":{
+                                "not":{
+                                    "required":["verification"],
+                                    "properties":{"verification":{"type":"object"}}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn requirement_review_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "requirement_id":{"type":"string","minLength":1},
+            "rationale":{"type":"string","minLength":1},
+            "evidence":{
+                "type":"array",
+                "minItems":1,
+                "items":{"type":"string","minLength":1,"description":"Nonempty evidence note or reference supporting this requirement review."}
+            }
+        },
+        "required":["requirement_id","rationale","evidence"],
+        "additionalProperties":false
+    })
+}
+
+fn requirement_claim_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "requirement_id":{"type":"string","minLength":1,"pattern":"\\S"},
+            "status":{"type":"string","enum":["met","not_met","deferred","unreported"]},
+            "evidence":{
+                "type":"array",
+                "items":{"type":"string","minLength":1,"pattern":"\\S"}
+            },
+            "note":{"type":"string"}
+        },
+        "required":["requirement_id","status"],
+        "additionalProperties":false,
+        "allOf":[
+            {
+                "if":{"required":["status"],"properties":{"status":{"const":"met"}}},
+                "then":{"required":["evidence"],"properties":{"evidence":{"minItems":1}}}
+            },
+            {
+                "if":{"required":["status"],"properties":{"status":{"enum":["not_met","deferred"]}}},
+                "then":{"required":["note"],"properties":{"note":{"minLength":1,"pattern":"\\S"}}}
+            }
+        ]
+    })
+}
+
 fn refine_input_schema(method: &str, schema: &mut Value) {
     if matches!(method, "script.register" | "script.revise") {
         schema["$defs"] = json!({"ScriptValueSchema":script_value_schema_definition()});
@@ -2257,6 +2464,29 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         properties["changes"] = automation_config_changes_schema();
     }
     match method {
+        "task.create" | "task.revise" => {
+            properties["spec"] = task_spec_schema();
+        }
+        "task.submit" => {
+            properties["claims"] = json!({
+                "type":"array",
+                "description":"Optional submitter assertions per requirement. The parser requires unique requirement IDs, rejects blank evidence references, requires evidence for met claims, and requires a note for not_met or deferred claims.",
+                "items":requirement_claim_schema()
+            });
+        }
+        "task.accept" => {
+            properties["reviews"] = json!({
+                "type":"array",
+                "description":"For V2 Tasks, must contain exactly one review for each frozen requirement whose verification has review_required=true; check-only requirements are omitted, and an empty array is valid when none require review. Retained V1 Tasks keep historical all-requirement review coverage.",
+                "items":requirement_review_schema()
+            });
+            properties["check_ids"] = json!({
+                "type":"array",
+                "uniqueItems":true,
+                "description":"Actual CheckRun IDs, not caller-supplied verdicts. V2 Tasks require the exact profile/revision union frozen by the requirement evidence plan; retained V1 Tasks use their frozen global required profiles.",
+                "items":{"type":"string","minLength":1}
+            });
+        }
         "concilium.propose" => {
             properties["client_request_id"] = json!({
                 "type":"string","minLength":1,"maxLength":limits::MAX_CLIENT_REQUEST_ID_BYTES,"pattern":"^\\S+$",
@@ -2515,7 +2745,7 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         "review.submit" => {
             properties["requirement_reviews"] = json!({
                 "type":"array",
-                "description":"Optional structured evidence for acceptance; when supplied it must cover every frozen Task requirement on a complete pass with no findings.",
+                "description":"Optional structured evidence for acceptance; when supplied it must cover exactly the frozen Task requirements marked review_required on a complete pass with no findings. Check-only requirements are excluded.",
                 "items":{
                     "type":"object",
                     "properties":{
@@ -7272,4 +7502,279 @@ pub fn launch_profile_surface(
         "deferred_groups": suggested.deferred_groups,
         "manual_tools": suggested.exact_manual_methods,
     }))
+}
+
+#[cfg(test)]
+mod task_mcp_schema_tests {
+    use super::{find_tool_spec, input_schema};
+    use serde_json::{Value, json};
+
+    fn tool_schema(method: &str) -> Value {
+        let (read_only, spec) = find_tool_spec(method).expect("canonical task tool exists");
+        serde_json::to_value(input_schema(spec, *read_only, true).as_ref())
+            .expect("published input schema serializes")
+    }
+
+    fn has_required(schema: &Value, field: &str) -> bool {
+        schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|entry| entry == field))
+    }
+
+    fn parse_example(contents: &str) -> Value {
+        serde_json::from_str(contents).expect("checked-in MCP example is valid JSON")
+    }
+
+    #[test]
+    fn task_create_and_revise_publish_v2_per_requirement_contract() {
+        let create = tool_schema("task.create");
+        let revise = tool_schema("task.revise");
+        assert!(has_required(&create, "client_request_id"));
+        for field in ["project_id", "spec"] {
+            assert!(has_required(&create, field), "task.create {field}");
+        }
+        assert!(!has_required(&create, "origin_key"));
+        assert!(has_required(&revise, "client_request_id"));
+        for field in ["task_id", "expected_revision", "spec"] {
+            assert!(has_required(&revise, field), "task.revise {field}");
+        }
+
+        let spec = &create["properties"]["spec"];
+        assert_eq!(spec, &revise["properties"]["spec"]);
+        assert_eq!(spec["additionalProperties"], json!(false));
+        assert_eq!(
+            spec["required"],
+            json!(["objective", "phase", "requirements"])
+        );
+        assert!(!has_required(spec, "acceptance"));
+
+        let acceptance = &spec["properties"]["acceptance"]["oneOf"];
+        assert_eq!(acceptance.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            acceptance[0]["properties"]["schema_id"]["const"],
+            json!("swarm.acceptance_policy")
+        );
+        assert_eq!(
+            acceptance[0]["properties"]["schema_version"]["const"],
+            json!(2)
+        );
+        assert_eq!(
+            acceptance[0]["required"],
+            json!(["schema_id", "schema_version"])
+        );
+        assert_eq!(acceptance[0]["additionalProperties"], json!(false));
+        assert!(
+            acceptance[0]["properties"]
+                .get("required_check_profiles")
+                .is_none()
+        );
+        assert_eq!(acceptance[1]["type"], "null");
+
+        let requirements = &spec["properties"]["requirements"];
+        assert_eq!(
+            requirements["items"]["required"],
+            json!(["id", "statement"])
+        );
+        assert_eq!(requirements["items"]["additionalProperties"], json!(false));
+        let verification_schema = &requirements["items"]["properties"]["verification"]["oneOf"];
+        assert_eq!(verification_schema[1]["type"], "null");
+        let verification = &verification_schema[0];
+        assert_eq!(verification["additionalProperties"], json!(false));
+        assert_eq!(verification["required"], json!(["review_required"]));
+        assert_eq!(
+            verification["properties"]["review_required"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            verification["properties"]["check_profiles"]["uniqueItems"],
+            json!(true)
+        );
+        assert_eq!(
+            verification["properties"]["check_profiles"]["items"]["required"],
+            json!(["profile_id", "profile_revision"])
+        );
+        assert_eq!(
+            verification["properties"]["check_profiles"]["items"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            verification["anyOf"][1]["properties"]["check_profiles"]["minItems"],
+            json!(1)
+        );
+
+        let conditional = &spec["allOf"][0];
+        assert!(has_required(&conditional["if"], "acceptance"));
+        assert_eq!(
+            conditional["if"]["properties"]["acceptance"]["type"],
+            "object"
+        );
+        assert_eq!(
+            conditional["then"]["properties"]["acceptance"],
+            acceptance[0]
+        );
+        assert!(has_required(
+            &conditional["then"]["properties"]["requirements"]["items"],
+            "verification"
+        ));
+        let no_acceptance_items = &conditional["else"]["properties"]["requirements"]["items"];
+        let forbidden_verification = &no_acceptance_items["not"]["properties"]["verification"];
+        assert_eq!(forbidden_verification["type"], "object");
+
+        for contents in [
+            include_str!("../../../config/task-checked.example.json"),
+            include_str!("../../../config/task-review.example.json"),
+        ] {
+            let example = parse_example(contents);
+            assert_eq!(
+                example["acceptance"]["schema_id"],
+                "swarm.acceptance_policy"
+            );
+            assert_eq!(example["acceptance"]["schema_version"], json!(2));
+            let task_requirements = example["requirements"]
+                .as_array()
+                .expect("TaskSpec examples have requirements");
+            assert!(!task_requirements.is_empty());
+            for requirement in task_requirements {
+                let policy = &requirement["verification"];
+                assert!(policy["review_required"].is_boolean());
+                let profiles = policy["check_profiles"].as_array();
+                assert!(
+                    policy["review_required"] == true
+                        || profiles.is_some_and(|profiles| !profiles.is_empty()),
+                    "each current requirement needs review or a CheckRunner profile"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_submit_claim_schema_matches_submit_request_dto() {
+        let schema = tool_schema("task.submit");
+        for field in [
+            "client_request_id",
+            "attempt_id",
+            "expected_revision",
+            "expected_submission_ref",
+            "candidate_ref",
+            "summary",
+        ] {
+            assert!(has_required(&schema, field), "task.submit {field}");
+        }
+        assert!(
+            !has_required(&schema, "claims"),
+            "claims defaults to an empty vector"
+        );
+        assert_eq!(schema["properties"]["claims"]["type"], "array");
+
+        let claim = &schema["properties"]["claims"]["items"];
+        assert_eq!(claim["type"], "object");
+        assert_eq!(claim["additionalProperties"], json!(false));
+        assert_eq!(claim["required"], json!(["requirement_id", "status"]));
+        assert_eq!(claim["properties"]["requirement_id"]["type"], "string");
+        assert_eq!(claim["properties"]["requirement_id"]["minLength"], json!(1));
+        assert_eq!(
+            claim["properties"]["requirement_id"]["pattern"],
+            json!("\\S")
+        );
+        assert_eq!(claim["properties"]["status"]["type"], "string");
+        assert_eq!(
+            claim["properties"]["status"]["enum"],
+            json!(["met", "not_met", "deferred", "unreported"])
+        );
+        assert_eq!(claim["properties"]["evidence"]["type"], "array");
+        assert_eq!(claim["properties"]["evidence"]["items"]["type"], "string");
+        assert_eq!(
+            claim["properties"]["evidence"]["items"]["minLength"],
+            json!(1)
+        );
+        assert_eq!(
+            claim["properties"]["evidence"]["items"]["pattern"],
+            json!("\\S")
+        );
+        assert_eq!(claim["properties"]["note"]["type"], "string");
+        assert!(!has_required(claim, "evidence"));
+        assert!(!has_required(claim, "note"));
+
+        let conditions = claim["allOf"]
+            .as_array()
+            .expect("status-specific claim rules");
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0]["if"]["properties"]["status"]["const"], "met");
+        assert_eq!(conditions[0]["then"]["required"], json!(["evidence"]));
+        assert_eq!(
+            conditions[0]["then"]["properties"]["evidence"]["minItems"],
+            json!(1)
+        );
+        assert_eq!(
+            conditions[1]["if"]["properties"]["status"]["enum"],
+            json!(["not_met", "deferred"])
+        );
+        assert_eq!(conditions[1]["then"]["required"], json!(["note"]));
+        assert_eq!(
+            conditions[1]["then"]["properties"]["note"]["minLength"],
+            json!(1)
+        );
+        assert_eq!(
+            conditions[1]["then"]["properties"]["note"]["pattern"],
+            json!("\\S")
+        );
+
+        let example = parse_example(include_str!("../../../config/submission.example.json"));
+        let claims = example["claims"]
+            .as_array()
+            .expect("submission example has claims");
+        assert!(claims.iter().all(|claim| {
+            claim["requirement_id"].is_string()
+                && claim["status"].is_string()
+                && claim["evidence"].is_array()
+        }));
+    }
+
+    #[test]
+    fn task_accept_schema_matches_accept_request_and_review_dto() {
+        let schema = tool_schema("task.accept");
+        for field in [
+            "client_request_id",
+            "attempt_id",
+            "expected_revision",
+            "submission_ref",
+            "candidate_ref",
+            "expected_feedback_observation_id",
+            "reason",
+            "reviews",
+        ] {
+            assert!(has_required(&schema, field), "task.accept {field}");
+        }
+        assert!(
+            !has_required(&schema, "check_ids"),
+            "check_ids defaults to an empty vector"
+        );
+
+        let reviews = &schema["properties"]["reviews"];
+        assert_eq!(reviews["type"], "array");
+        assert!(reviews.get("minItems").is_none());
+        let review = &reviews["items"];
+        assert_eq!(review["additionalProperties"], json!(false));
+        assert_eq!(
+            review["required"],
+            json!(["requirement_id", "rationale", "evidence"])
+        );
+        assert_eq!(review["properties"]["requirement_id"]["type"], "string");
+        assert_eq!(review["properties"]["rationale"]["minLength"], json!(1));
+        assert_eq!(review["properties"]["evidence"]["minItems"], json!(1));
+        assert_eq!(
+            review["properties"]["evidence"]["items"]["minLength"],
+            json!(1)
+        );
+
+        let check_ids = &schema["properties"]["check_ids"];
+        assert_eq!(check_ids["type"], "array");
+        assert_eq!(check_ids["uniqueItems"], json!(true));
+        assert_eq!(check_ids["items"]["type"], "string");
+        assert_eq!(check_ids["items"]["minLength"], json!(1));
+
+        let example = parse_example(include_str!("../../../config/acceptance.example.json"));
+        assert!(example["reviews"].as_array().is_some());
+        assert!(example["check_ids"].as_array().is_some());
+    }
 }

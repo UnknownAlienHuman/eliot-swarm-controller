@@ -248,9 +248,7 @@ async fn configure_acceptance_fixture(store: &Store, manager_id: &str, subjects:
                     |row| row.get(0),
                 )?;
                 let mut spec: Value = serde_json::from_str(&task_spec_raw)?;
-                spec["acceptance"] = json!({"required_check_profiles":[]});
-                let validated: crate::model::TaskSpec = serde_json::from_value(spec.clone())?;
-                validated.validate()?;
+                let (requirement_evidence_plan, brief) = review_only_v2_fixture_spec(&mut spec)?;
                 tx.execute(
                     "UPDATE tasks SET spec_json=?2 WHERE task_id=?1",
                     params![task_id, model::canonical(&spec)?],
@@ -263,6 +261,8 @@ async fn configure_acceptance_fixture(store: &Store, manager_id: &str, subjects:
                 )?;
                 let mut snapshot: Value = serde_json::from_str(&snapshot_raw)?;
                 snapshot["spec"] = spec;
+                snapshot["requirement_evidence_plan"] = requirement_evidence_plan;
+                snapshot["brief"] = brief;
                 tx.execute(
                     "UPDATE attempts SET task_snapshot_json=?2 WHERE attempt_id=?1",
                     params![attempt_id, model::canonical(&snapshot)?],
@@ -1912,9 +1912,7 @@ async fn configure_subject_acceptance_policy(store: &Store, subject: &ReviewSubj
                 |row| row.get(0),
             )?;
             let mut spec: Value = serde_json::from_str(&task_spec_raw)?;
-            spec["acceptance"] = json!({"required_check_profiles":[]});
-            let validated: crate::model::TaskSpec = serde_json::from_value(spec.clone())?;
-            validated.validate()?;
+            let (requirement_evidence_plan, brief) = review_only_v2_fixture_spec(&mut spec)?;
             tx.execute(
                 "UPDATE tasks SET spec_json=?2 WHERE task_id=?1",
                 params![task_id, model::canonical(&spec)?],
@@ -1926,6 +1924,8 @@ async fn configure_subject_acceptance_policy(store: &Store, subject: &ReviewSubj
             )?;
             let mut snapshot: Value = serde_json::from_str(&snapshot_raw)?;
             snapshot["spec"] = spec;
+            snapshot["requirement_evidence_plan"] = requirement_evidence_plan;
+            snapshot["brief"] = brief;
             tx.execute(
                 "UPDATE attempts SET task_snapshot_json=?2 WHERE attempt_id=?1",
                 params![attempt_id, model::canonical(&snapshot)?],
@@ -1935,6 +1935,28 @@ async fn configure_subject_acceptance_policy(store: &Store, subject: &ReviewSubj
         })
         .await
         .unwrap();
+}
+
+fn review_only_v2_fixture_spec(spec: &mut Value) -> crate::error::Result<(Value, Value)> {
+    spec["acceptance"] = json!({"schema_id":"swarm.acceptance_policy","schema_version":2});
+    let requirements = spec["requirements"]
+        .as_array_mut()
+        .ok_or_else(|| crate::error::Error::new("TEST_FIXTURE", "Task requirements are missing"))?;
+    for requirement in requirements {
+        requirement["verification"] = json!({"review_required":true,"check_profiles":[]});
+    }
+
+    let validated: crate::model::TaskSpec = serde_json::from_value(spec.clone())?;
+    validated.validate_current_admission()?;
+    let brief = serde_json::to_value(validated.try_brief()?)?;
+    let plan = brief["requirement_evidence_plan"].clone();
+    if !plan.is_object() {
+        return Err(crate::error::Error::new(
+            "TEST_FIXTURE",
+            "V2 Task brief omitted its derived requirement evidence plan",
+        ));
+    }
+    Ok((plan, brief))
 }
 
 #[tokio::test]
@@ -4108,8 +4130,13 @@ async fn hook_emit_replay_is_one_durable_source_observation_with_exact_registrat
 #[cfg(test)]
 mod o9_goal_progression_transfer_regression;
 
+#[cfg(test)]
 #[path = "program_tests/automatic_acceptance_operation_lifecycle_tests.rs"]
 mod automatic_acceptance_operation_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "program_tests/requirement_evidence_plan_tests.rs"]
+mod requirement_evidence_plan_tests;
 
 #[cfg(test)]
 #[path = "program_tests/automatic_github_projection_lifecycle_tests.rs"]

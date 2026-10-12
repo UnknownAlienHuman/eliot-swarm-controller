@@ -155,6 +155,33 @@ pub(super) fn load(
     Ok(envelope)
 }
 
+/// Verify the retained V2 plan at each dispatch boundary without changing it.
+/// Historical V1 and policy-free snapshots retain their original read contract.
+pub(super) fn validate_snapshot_evidence_plan(snapshot: &Value) -> Result<()> {
+    let spec = &snapshot["spec"];
+    let Some(policy) = spec.get("acceptance").filter(|policy| !policy.is_null()) else {
+        return Ok(());
+    };
+    if !matches!(
+        crate::acceptance::RetainedAcceptancePolicy::parse(policy)?,
+        crate::acceptance::RetainedAcceptancePolicy::V2(_)
+    ) {
+        return Ok(());
+    }
+    swarm_kernel::acceptance::validate_frozen_requirement_evidence_plan(
+        spec,
+        &snapshot["requirement_evidence_plan"],
+    )
+    .map_err(|error| Error::new(error.code(), error.message()))?;
+    if snapshot["brief"]["requirement_evidence_plan"] != snapshot["requirement_evidence_plan"] {
+        return Err(Error::new(
+            "REQUIREMENT_EVIDENCE_PLAN_STALE",
+            "frozen Task brief differs from its verified Attempt evidence plan",
+        ));
+    }
+    Ok(())
+}
+
 /// Build the one immutable prompt envelope for a newly admitted Task dispatch.
 /// `launch_dispatch` must be the exact admission produced in the same Store
 /// transaction; no request-supplied packet or Task snapshot is accepted here.
@@ -179,6 +206,7 @@ pub(super) fn build(
             "frozen Attempt revision differs from its snapshot",
         ));
     }
+    validate_snapshot_evidence_plan(snapshot)?;
     let brief = snapshot
         .get("brief")
         .filter(|brief| brief.is_object())
@@ -291,6 +319,7 @@ mod tests {
             requirements: vec![Requirement {
                 id: "R1".to_owned(),
                 statement: "Preserve the selected source text and Task identity".to_owned(),
+                verification: None,
             }],
             dependencies: Vec::new(),
             scope: None,
