@@ -228,6 +228,8 @@ struct WorkDispatchState {
     project_id: String,
     automation_id: String,
     cursor: i64,
+    #[serde(default)]
+    recheck_cursor: usize,
     activation_cut: i64,
     catch_up_until: Option<i64>,
     pending: Vec<PendingSubject>,
@@ -1119,17 +1121,26 @@ where
     let admit = &mut *invocation.admit;
     let quarantined = &mut *invocation.quarantined;
     let mut checked = 0usize;
-    let mut index = 0usize;
-    while index < state.pending.len() && checked < limit {
+    let pending_at_start = state.pending.len();
+    let mut visited = 0usize;
+    let mut index = if pending_at_start == 0 {
+        0
+    } else {
+        state.recheck_cursor % pending_at_start
+    };
+    while visited < pending_at_start && checked < limit && !state.pending.is_empty() {
+        if index >= state.pending.len() {
+            index = 0;
+        }
         if state.pending[index].held {
-            index += 1;
+            index = (index + 1) % state.pending.len();
+            visited += 1;
             continue;
         }
         // Keep the cause in the durable vector until this exact item reaches
         // a disposition. Any fallible read, admission, or bounded projection
         // below therefore leaves the current item and untouched tail intact.
         let mut pending = state.pending[index].clone();
-        checked += 1;
         let evidence = pending_work_quarantine_evidence(tx, entry, &pending)?;
         let phase = Cell::new(WorkSubjectPhase::Prepare);
         let mut pending_wake_when = None;
@@ -1175,7 +1186,7 @@ where
             |error| classify_work_subject_error(error, phase.get(), &evidence),
         )?;
 
-        match disposition {
+        let removed = match disposition {
             SubjectDisposition::Applied(applied) => {
                 remember_recent(
                     state,
@@ -1190,6 +1201,7 @@ where
                     }),
                 );
                 state.pending.remove(index);
+                true
             }
             SubjectDisposition::Pending { code, reason } => {
                 pending.reason = bounded_reason(&reason)?;
@@ -1200,7 +1212,7 @@ where
                 )?;
                 pending.last_checked_at_ms = now_ms;
                 state.pending[index] = pending;
-                index += 1;
+                false
             }
             SubjectDisposition::Skipped { code, reason } => {
                 remember_recent(
@@ -1215,6 +1227,7 @@ where
                     }),
                 );
                 state.pending.remove(index);
+                true
             }
             SubjectDisposition::Quarantined { code, evidence } => {
                 persist_work_quarantine(tx, &code, evidence, now_ms)?;
@@ -1231,9 +1244,24 @@ where
                 );
                 *quarantined = (*quarantined).saturating_add(1);
                 state.pending.remove(index);
+                true
             }
+        };
+        checked += 1;
+        visited += 1;
+        if state.pending.is_empty() {
+            index = 0;
+        } else if removed {
+            index %= state.pending.len();
+        } else {
+            index = (index + 1) % state.pending.len();
         }
     }
+    state.recheck_cursor = if state.pending.is_empty() {
+        0
+    } else {
+        index % state.pending.len()
+    };
     Ok(checked)
 }
 
@@ -1248,6 +1276,7 @@ fn empty_state(entry: &AutomationEntry, cut: i64, now_ms: i64) -> WorkDispatchSt
         project_id: entry.project_id.clone(),
         automation_id: entry.automation_id.clone(),
         cursor: cut,
+        recheck_cursor: 0,
         activation_cut: cut,
         catch_up_until: None,
         pending: Vec::new(),
@@ -1334,6 +1363,7 @@ fn validate_state(state: &WorkDispatchState, entry: &AutomationEntry) -> Result<
         || state.activation_cut < 0
         || state.catch_up_until.is_some_and(|cut| cut < state.cursor)
         || state.pending.len() > MAX_PENDING_SUBJECTS
+        || state.recheck_cursor >= state.pending.len().max(1)
         || state.updated_at_ms < 0
         || state.pending.iter().any(|item| {
             item.observation_id <= 0

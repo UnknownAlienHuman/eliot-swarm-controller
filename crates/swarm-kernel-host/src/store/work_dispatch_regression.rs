@@ -23,16 +23,9 @@ use swarm_contracts::{
     module_contract::ModuleContractTemplate,
 };
 
-async fn start_store() -> (StoreOwner, PathBuf, Principal) {
-    let directory = std::env::temp_dir().join(format!(
-        "swarm-work-dispatch-regression-{}",
-        model::new_id()
-    ));
-    std::fs::create_dir_all(&directory).unwrap();
-    let root = DataRoot::acquire(&directory).unwrap();
-    let credential = bootstrap_credential(&root.path).unwrap();
+fn regression_config(directory: &Path) -> Config {
     let mut config = Config::default();
-    config.storage.data_dir = directory.clone();
+    config.storage.data_dir = directory.to_path_buf();
     config.routes.push(Route {
         admission_policy: Default::default(),
         workspace_option: None,
@@ -53,11 +46,35 @@ async fn start_store() -> (StoreOwner, PathBuf, Principal) {
             manual_tools: Vec::new(),
         },
     );
-    let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
-        .await
-        .unwrap();
+    config
+}
+
+async fn start_store_with_root(
+    root: DataRoot,
+    directory: &Path,
+    credential: Credential,
+) -> (StoreOwner, Principal) {
+    let owner = StoreOwner::start(
+        root,
+        Arc::new(regression_config(directory)),
+        credential.clone(),
+    )
+    .await
+    .unwrap();
     let operator = owner.store.authenticate(credential).await.unwrap();
-    (owner, directory, operator)
+    (owner, operator)
+}
+
+async fn start_store() -> (StoreOwner, PathBuf, Principal, Credential) {
+    let directory = std::env::temp_dir().join(format!(
+        "swarm-work-dispatch-regression-{}",
+        model::new_id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let root = DataRoot::acquire(&directory).unwrap();
+    let credential = bootstrap_credential(&root.path).unwrap();
+    let (owner, operator) = start_store_with_root(root, &directory, credential.clone()).await;
+    (owner, directory, operator, credential)
 }
 
 async fn write(store: &Store, principal: &Principal, method: &str, mut value: Value) -> Value {
@@ -68,8 +85,79 @@ async fn write(store: &Store, principal: &Principal, method: &str, mut value: Va
         .unwrap()
 }
 
+async fn reconcile_pending_fixture<F>(
+    store: &Store,
+    owner_manager_id: String,
+    state_key: String,
+    budget: usize,
+    admit: F,
+) -> (Value, Value)
+where
+    F: for<'db> FnMut(
+            &rusqlite::Transaction<'db>,
+            &super::automation_work_dispatch::PreparedWorkDispatch,
+        )
+            -> crate::error::Result<super::automation_work_dispatch::WorkDispatchOutcome>
+        + Send
+        + 'static,
+{
+    store
+        .run(move |db| {
+            let tx = db.unchecked_transaction()?;
+            let entry = crate::automation::config::load_entry(
+                &tx,
+                &owner_manager_id,
+                "work-dispatch-fairness-project",
+                "work-dispatch-fairness",
+            )?
+            .ok_or_else(|| {
+                crate::error::Error::new(
+                    "AUTOMATION_WORK_CURSOR_MISSING",
+                    "fairness fixture automation entry disappeared",
+                )
+            })?;
+            let result = super::automation_work_dispatch::reconcile_entry(
+                &tx,
+                &entry,
+                entry.work_dispatch.as_ref(),
+                budget,
+                model::now_ms()?,
+                admit,
+            )?;
+            let state = crate::automation::config::read_record(
+                &tx,
+                &state_key,
+                "work-dispatch fairness fixture state",
+            )?
+            .ok_or_else(|| {
+                crate::error::Error::new(
+                    "AUTOMATION_WORK_CURSOR_MISSING",
+                    "fairness fixture state disappeared after reconciliation",
+                )
+            })?;
+            tx.commit()?;
+            Ok((result, state))
+        })
+        .await
+        .unwrap()
+}
+
 async fn register_manager(store: &Store, operator: &Principal, client_id: &str) -> Principal {
+    register_manager_with_credential(store, operator, client_id)
+        .await
+        .0
+}
+
+async fn register_manager_with_credential(
+    store: &Store,
+    operator: &Principal,
+    client_id: &str,
+) -> (Principal, Credential) {
     let token = format!("work-dispatch-test-{client_id}-{}", model::new_id());
+    let credential = Credential {
+        client_id: client_id.to_owned(),
+        token,
+    };
     write(
         store,
         operator,
@@ -77,17 +165,18 @@ async fn register_manager(store: &Store, operator: &Principal, client_id: &str) 
         json!({
             "client_id":client_id,
             "role":"manager",
-            "token_hash":model::digest(token.as_bytes()),
+            "token_hash":model::digest(credential.token.as_bytes()),
         }),
     )
     .await;
-    store
+    let principal = store
         .authenticate(Credential {
-            client_id: client_id.to_owned(),
-            token,
+            client_id: credential.client_id.clone(),
+            token: credential.token.clone(),
         })
         .await
-        .unwrap()
+        .unwrap();
+    (principal, credential)
 }
 
 async fn select_regression_descriptor(store: &Store, manager: &Principal) {
@@ -142,7 +231,7 @@ async fn select_regression_descriptor(store: &Store, manager: &Principal) {
 
 #[tokio::test]
 async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot() {
-    let (owner, directory, operator) = start_store().await;
+    let (owner, directory, operator, _credential) = start_store().await;
     let manager = register_manager(&owner.store, &operator, "work-manager").await;
     let outsider = register_manager(&owner.store, &operator, "other-manager").await;
 
@@ -801,4 +890,272 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture_root).unwrap();
+}
+
+#[tokio::test]
+async fn work_dispatch_pending_rechecks_rotate_across_restart_and_reject_changed_assignment() {
+    const PROJECT_ID: &str = "work-dispatch-fairness-project";
+    const AUTOMATION_ID: &str = "work-dispatch-fairness";
+
+    let (owner, directory, operator, operator_credential) = start_store().await;
+    let (manager, manager_credential) =
+        register_manager_with_credential(&owner.store, &operator, "fairness-manager").await;
+    select_regression_descriptor(&owner.store, &manager).await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id":manager.client_id}),
+    )
+    .await;
+
+    let mut subjects = Vec::new();
+    for index in 0..9 {
+        let task = write(
+            &owner.store,
+            &operator,
+            "task.create",
+            json!({
+                "project_id":PROJECT_ID,
+                "spec":{
+                    "objective":format!("Retain WorkDispatch fairness subject {index}"),
+                    "phase":"implementation",
+                    "requirements":[{"id":"R1","statement":"Preserve exact pending subject authority"}],
+                    "scope":{"initial_paths":[format!("src/fairness-{index}.rs")]},
+                    "owner_policy_id":OWNER_POLICY_V1_ID,
+                }
+            }),
+        )
+        .await;
+        subjects.push((
+            task["task_id"].as_str().unwrap().to_owned(),
+            task["operation_id"].as_str().unwrap().to_owned(),
+        ));
+    }
+
+    let settings = json!({
+        "route":"regression-route",
+        "agent_profile":"regression-agent",
+        "mcp_profile":"work-participant",
+        "mcp_surface":"participant-core",
+        "workspace_policy":"manager_owned_worktree",
+        "requested_model":null,
+        "requested_effort":null,
+        "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+        "stop_conditions":[],
+        "purpose":"implementation",
+    });
+    let changes = json!([{
+        "automation_id":AUTOMATION_ID,
+        "expected_revision":0,
+        "include_existing":false,
+        "patch":{
+            "enabled":true,
+            "steps":["work_dispatch"],
+            "work_dispatch":settings,
+        }
+    }]);
+    let preview = owner
+        .store
+        .call(
+            manager.clone(),
+            "automation.config.preview".to_owned(),
+            json!({"project_id":PROJECT_ID,"changes":changes}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["valid"], true);
+    write(
+        &owner.store,
+        &manager,
+        "automation.config.apply",
+        json!({
+            "project_id":PROJECT_ID,
+            "changes":changes,
+            "preview_digest":preview["plan_sha256"],
+        }),
+    )
+    .await;
+
+    let state_subjects = subjects.clone();
+    let owner_manager_id = manager.client_id.clone();
+    let state_key = owner
+        .store
+        .run(move |db| {
+            let tx = db.unchecked_transaction()?;
+            let state_key: String = tx.query_row(
+                "SELECT key FROM meta \
+                 WHERE key LIKE 'automation:v1:work-dispatch:state:%' \
+                 ORDER BY key LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut state = crate::automation::config::read_record(
+                &tx,
+                &state_key,
+                "work-dispatch fairness fixture state",
+            )?
+            .unwrap();
+            let mut pending = Vec::with_capacity(state_subjects.len());
+            for (task_id, source_operation_id) in state_subjects {
+                let observation_id: i64 = tx.query_row(
+                    "SELECT observation_id FROM observations \
+                     WHERE operation_id=?1 AND source_stream_id='controller' \
+                       AND kind='task.create'",
+                    [&source_operation_id],
+                    |row| row.get(0),
+                )?;
+                pending.push(json!({
+                    "observation_id":observation_id,
+                    "source_kind":"task.create",
+                    "source_operation_id":source_operation_id,
+                    "task_id":task_id,
+                    "task_revision":1,
+                    "attempt_id":null,
+                    "reason":"fixture_initial_pending",
+                    "wake_when":["fixture_prerequisite_changed"],
+                    "first_seen_at_ms":0,
+                    "last_checked_at_ms":0,
+                    "held":false,
+                }));
+            }
+            state["pending"] = json!(pending);
+            state.as_object_mut().unwrap().remove("recheck_cursor");
+            crate::automation::config::write_record(&tx, &state_key, &state)?;
+            tx.commit()?;
+            Ok((state_key, owner_manager_id))
+        })
+        .await
+        .unwrap();
+    let (state_key, owner_manager_id) = state_key;
+
+    let (first_pass, first_state) = reconcile_pending_fixture(
+        &owner.store,
+        owner_manager_id.clone(),
+        state_key.clone(),
+        8,
+        |_, _| {
+            Ok(
+                super::automation_work_dispatch::WorkDispatchOutcome::Pending {
+                    reason: "fixture_prerequisite_still_pending".to_owned(),
+                    wake_when: vec!["fixture_prerequisite_changed".to_owned()],
+                },
+            )
+        },
+    )
+    .await;
+    assert_eq!(first_pass["processed"], 8);
+    assert_eq!(first_state["pending"].as_array().unwrap().len(), 9);
+    assert_eq!(first_state["recheck_cursor"], 8);
+    for pending in &first_state["pending"].as_array().unwrap()[..8] {
+        assert!(pending["last_checked_at_ms"].as_i64().unwrap() > 0);
+    }
+    assert_eq!(first_state["pending"][8]["last_checked_at_ms"], 0);
+
+    owner.close().await.unwrap();
+    let root = DataRoot::acquire(&directory).unwrap();
+    let (owner, _operator_after_restart) =
+        start_store_with_root(root, &directory, operator_credential).await;
+    let manager = owner.store.authenticate(manager_credential).await.unwrap();
+
+    let tail_task_id = subjects[8].0.clone();
+    let (second_pass, second_state) = reconcile_pending_fixture(
+        &owner.store,
+        owner_manager_id.clone(),
+        state_key.clone(),
+        8,
+        move |_, prepared| {
+            if prepared.context().subject().task_id() == tail_task_id.as_str() {
+                Ok(
+                    super::automation_work_dispatch::WorkDispatchOutcome::Admitted {
+                        operation_id: "fixture-eligible-tail".to_owned(),
+                    },
+                )
+            } else {
+                Ok(
+                    super::automation_work_dispatch::WorkDispatchOutcome::Pending {
+                        reason: "fixture_prerequisite_still_pending".to_owned(),
+                        wake_when: vec!["fixture_prerequisite_changed".to_owned()],
+                    },
+                )
+            }
+        },
+    )
+    .await;
+    assert_eq!(second_pass["processed"], 8);
+    assert_eq!(second_state["recheck_cursor"], 7);
+    assert!(
+        second_state["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["task_id"] == subjects[8].0 && item["disposition"] == "admitted" })
+    );
+    assert_eq!(second_state["pending"].as_array().unwrap().len(), 8);
+    for (task_id, _) in subjects.iter().take(8) {
+        assert!(
+            second_state["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pending| pending["task_id"] == *task_id)
+        );
+    }
+
+    let changed_task_id = subjects[7].0.clone();
+    let claim = write(
+        &owner.store,
+        &manager,
+        "task.claim",
+        json!({"task_id":changed_task_id.clone(),"expected_revision":1}),
+    )
+    .await;
+    assert_eq!(claim["task_id"].as_str(), Some(changed_task_id.as_str()));
+    let (authority_pass, authority_state) = reconcile_pending_fixture(
+        &owner.store,
+        owner_manager_id,
+        state_key,
+        1,
+        |_, prepared| {
+            Ok(
+                super::automation_work_dispatch::WorkDispatchOutcome::Admitted {
+                    operation_id: format!(
+                        "unexpected-stale-admission-{}",
+                        prepared.context().subject().task_id()
+                    ),
+                },
+            )
+        },
+    )
+    .await;
+    assert_eq!(authority_pass["processed"], 1);
+    assert!(
+        authority_state["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["task_id"] == changed_task_id && item["disposition"] == "skipped" })
+    );
+    assert!(
+        !authority_state["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["task_id"] == changed_task_id && item["disposition"] == "admitted"
+            })
+    );
+    assert_eq!(authority_state["pending"].as_array().unwrap().len(), 7);
+    for (task_id, _) in subjects.iter().take(7) {
+        assert!(
+            authority_state["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pending| pending["task_id"] == *task_id)
+        );
+    }
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
