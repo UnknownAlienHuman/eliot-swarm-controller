@@ -4153,3 +4153,15 @@ mod concilium_current_consumers;
 #[cfg(test)]
 #[path = "program_tests/submission_disposition_current_consumers.rs"]
 mod submission_disposition_current_consumers;
+
+#[cfg(test)]
+#[path = "program_tests/host_lifecycle_optional_current_consumers.rs"]
+mod host_lifecycle_optional_current_consumers;
+
+#[cfg(test)]
+#[path = "program_tests/logging_exact_operation_current_consumers.rs"]
+mod logging_exact_operation_current_consumers;
+
+#[cfg(test)]
+#[path = "program_tests/producer_terminal_metadata_current_consumers.rs"]
+mod producer_terminal_metadata_current_consumers;

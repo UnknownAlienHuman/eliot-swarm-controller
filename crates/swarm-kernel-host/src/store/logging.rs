@@ -94,6 +94,13 @@ struct OwnedBinding {
     task: Option<TaskFacts>,
 }
 
+#[derive(Clone, Debug)]
+struct SelectedOperationOwnership {
+    operation_id: String,
+    binding_id: String,
+    binding_generation: u64,
+}
+
 pub(super) fn get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
     let scope = resolve_scope(db, principal, value)?;
     let key = policy_key(&scope)?;
@@ -522,6 +529,7 @@ fn resolve_scope(db: &Connection, principal: &Principal, value: &Value) -> Resul
     };
     let mut binding_id = requested_binding_id;
     let mut binding_generation = requested_binding_generation;
+    let mut selected_operation_ownership = None;
 
     if let Some(operation_id) = requested_operation_id.as_deref() {
         let operation = operations::get_operation(db, operation_id)?;
@@ -601,6 +609,11 @@ fn resolve_scope(db: &Connection, principal: &Principal, value: &Value) -> Resul
                 binding_id = Some(operation_binding_id.to_owned());
                 binding_generation = Some(generation);
             }
+            selected_operation_ownership = Some(SelectedOperationOwnership {
+                operation_id: operation_id.to_owned(),
+                binding_id: operation_binding_id.to_owned(),
+                binding_generation: generation,
+            });
         }
     }
 
@@ -620,6 +633,7 @@ fn resolve_scope(db: &Connection, principal: &Principal, value: &Value) -> Resul
             binding_id,
             generation,
             requested_module_id.as_deref(),
+            selected_operation_ownership.as_ref(),
         )?;
         if task.is_none() && !module_binding_proof {
             task = owned.task;
@@ -644,7 +658,8 @@ fn resolve_scope(db: &Connection, principal: &Principal, value: &Value) -> Resul
                     "Task module logging scope requires its retained binding generation",
                 )
             })?;
-            let owned = owned_binding(db, principal, binding_id, generation, Some(module_id))?;
+            let owned =
+                owned_binding(db, principal, binding_id, generation, Some(module_id), None)?;
             let inherited = owned.task.as_ref().ok_or_else(|| {
                 Error::new(
                     "LOGGING_MODULE_UNPROVEN",
@@ -764,6 +779,7 @@ fn owned_binding(
     binding_id: &str,
     generation: u64,
     module_id: Option<&str>,
+    selected_operation_ownership: Option<&SelectedOperationOwnership>,
 ) -> Result<OwnedBinding> {
     let generation_i64 = i64::try_from(generation)
         .map_err(|_| Error::invalid("binding_generation is outside the supported range"))?;
@@ -793,6 +809,18 @@ fn owned_binding(
                 "module identity is not the exact trusted descriptor retained by this binding",
             ));
         }
+    }
+    if let Some(ownership) = selected_operation_ownership {
+        if ownership.binding_id != binding_id || ownership.binding_generation != generation {
+            return Err(Error::new(
+                "LOGGING_SCOPE_MISMATCH",
+                format!(
+                    "selected Operation {} does not prove this binding generation",
+                    ownership.operation_id
+                ),
+            ));
+        }
+        return Ok(OwnedBinding { task: None });
     }
     let mut statement = db.prepare(
         "SELECT operation_id FROM operations
@@ -852,7 +880,15 @@ fn owned_module_binding(db: &Connection, principal: &Principal, module_id: &str)
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (binding_id, generation) in rows {
         if let Ok(generation) = u64::try_from(generation)
-            && owned_binding(db, principal, &binding_id, generation, Some(module_id)).is_ok()
+            && owned_binding(
+                db,
+                principal,
+                &binding_id,
+                generation,
+                Some(module_id),
+                None,
+            )
+            .is_ok()
         {
             return Ok(());
         }

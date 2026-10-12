@@ -713,10 +713,19 @@ pub(super) fn module_supervisor_health_readback(
     Ok(readback)
 }
 
-fn optional_worker_health(db: &Connection) -> Result<Value> {
-    let Some(value) = meta(db, OPTIONAL_WORKER_HEALTH)? else {
-        return Ok(json!({"schema_version":1,"workers":{}}));
-    };
+fn optional_worker_health_record(db: &Connection) -> Result<Value> {
+    Ok(meta(db, OPTIONAL_WORKER_HEALTH)?
+        .unwrap_or_else(|| json!({"schema_version":1,"workers":{}})))
+}
+
+fn optional_worker_health_map(db: &Connection) -> Result<Value> {
+    let value = optional_worker_health_record(db)?;
+    let envelope = value.as_object().ok_or_else(|| {
+        Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "optional worker health envelope is invalid",
+        )
+    })?;
     let workers = value
         .get("workers")
         .and_then(Value::as_object)
@@ -732,35 +741,96 @@ fn optional_worker_health(db: &Connection) -> Result<Value> {
             "optional worker health version or capacity is invalid",
         ));
     }
+    if envelope
+        .keys()
+        .any(|key| !matches!(key.as_str(), "schema_version" | "workers"))
+    {
+        return Err(Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "optional worker health envelope contains unknown fields",
+        ));
+    }
+    Ok(value)
+}
+
+fn valid_optional_worker_health_entry(name: &str, receipt: &Value) -> bool {
+    if !OPTIONAL_WORKERS.contains(&name) {
+        return false;
+    }
+    let Some(fields) = receipt.as_object() else {
+        return false;
+    };
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "state"
+                | "consecutive_failures"
+                | "last_error_code"
+                | "retry_after_ms"
+                | "updated_at_ms"
+                | "last_failure"
+                | "restart_count"
+                | "child"
+        )
+    }) {
+        return false;
+    }
+
+    let state = receipt["state"].as_str().unwrap_or_default();
+    let failures = receipt["consecutive_failures"].as_u64();
+    let updated_at_ms = receipt["updated_at_ms"].as_i64();
+    let retry_after_ms = receipt["retry_after_ms"].as_i64();
+    let code = receipt["last_error_code"].as_str();
+    let code_field_valid = receipt.get("last_error_code").is_none_or(|value| {
+        value.is_null() || value.as_str().is_some_and(valid_optional_worker_code)
+    });
+    let retry_field_valid = receipt
+        .get("retry_after_ms")
+        .is_none_or(|value| value.is_null() || value.as_i64().is_some());
+    let restart_count_valid = receipt
+        .get("restart_count")
+        .is_none_or(|value| value.as_u64().is_some_and(|count| count <= 32));
+    let last_failure_valid = receipt
+        .get("last_failure")
+        .is_none_or(|value| value.is_null() || bounded_last_failure(value).is_some());
+    let child_valid = receipt.get("child").is_none_or(|value| {
+        value.is_null()
+            || bounded_child_health(value)
+                .as_ref()
+                .is_some_and(|bounded| bounded == value)
+    });
+
+    code_field_valid
+        && retry_field_valid
+        && restart_count_valid
+        && last_failure_valid
+        && child_valid
+        && matches!(state, "dormant" | "running" | "retry_wait" | "isolated")
+        && failures.is_some_and(|value| value <= 32)
+        && updated_at_ms.is_some_and(|value| value >= 0)
+        && !retry_after_ms.is_some_and(|value| {
+            let updated_at_ms = updated_at_ms.unwrap_or(0);
+            value < updated_at_ms || value.saturating_sub(updated_at_ms) > 60_000
+        })
+        && (!matches!(state, "retry_wait" | "isolated")
+            || (code.is_some() && retry_after_ms.is_some()))
+}
+
+/// Keep mutation and supervisor-control reads strict. They must not rewrite or
+/// make authority decisions from a map containing any malformed worker.
+fn optional_worker_health(db: &Connection) -> Result<Value> {
+    let value = optional_worker_health_map(db)?;
+    let workers = value
+        .get("workers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "optional worker health map is invalid",
+            )
+        })?;
     for (name, receipt) in workers {
-        let state = receipt["state"].as_str().unwrap_or_default();
-        let failures = receipt["consecutive_failures"].as_u64();
-        let updated_at_ms = receipt["updated_at_ms"].as_i64();
-        let retry_after_ms = receipt["retry_after_ms"].as_i64();
-        let code = receipt["last_error_code"].as_str();
-        if !OPTIONAL_WORKERS.contains(&name.as_str())
-            || !matches!(state, "dormant" | "running" | "retry_wait" | "isolated")
-            || failures.is_none_or(|value| value > 32)
-            || updated_at_ms.is_none_or(|value| value < 0)
-            || retry_after_ms.is_some_and(|value| {
-                let updated_at_ms = updated_at_ms.unwrap_or(0);
-                value < updated_at_ms || value.saturating_sub(updated_at_ms) > 60_000
-            })
-            || code.is_some_and(|value| !valid_optional_worker_code(value))
-            || (matches!(state, "retry_wait" | "isolated")
-                && (code.is_none() || retry_after_ms.is_none()))
-            || receipt["restart_count"]
-                .as_u64()
-                .is_some_and(|value| value > 32)
-            || (receipt.get("restart_count").is_some()
-                && receipt["restart_count"].as_u64().is_none())
-            || (receipt
-                .get("last_failure")
-                .is_some_and(|value| !value.is_null() && bounded_last_failure(value).is_none()))
-            || receipt
-                .get("child")
-                .is_some_and(|value| !value.is_null() && bounded_child_health(value).is_none())
-        {
+        if !valid_optional_worker_health_entry(name, receipt) {
             return Err(Error::new(
                 "HOST_LIFECYCLE_INVALID",
                 "optional worker health entry is invalid",
@@ -768,6 +838,63 @@ fn optional_worker_health(db: &Connection) -> Result<Value> {
         }
     }
     Ok(value)
+}
+
+fn invalid_optional_worker_health_projection() -> Value {
+    json!({
+        "state":"unknown",
+        "status":"invalid",
+        "error_code":"HOST_LIFECYCLE_INVALID",
+        "manager_action_required":true,
+        "retry_authorized":false
+    })
+}
+
+/// Public status is tolerant only of optional-worker projection corruption.
+/// It preserves valid named peers, replaces bad entries with a fixed bounded
+/// diagnostic, and never reflects unknown worker names or raw malformed data.
+fn optional_worker_health_status_projection(db: &Connection) -> Result<Value> {
+    let value = optional_worker_health_record(db)?;
+    let Some(envelope) = value.as_object() else {
+        return Ok(json!({
+            "schema_version":1,
+            "workers":{"_invalid":invalid_optional_worker_health_projection()}
+        }));
+    };
+    let Some(workers) = value.get("workers").and_then(Value::as_object) else {
+        return Ok(json!({
+            "schema_version":1,
+            "workers":{"_invalid":invalid_optional_worker_health_projection()}
+        }));
+    };
+
+    let schema_valid = value["schema_version"] == 1;
+    let unexpected_envelope_field = envelope
+        .keys()
+        .any(|key| !matches!(key.as_str(), "schema_version" | "workers"));
+    let mut projected = serde_json::Map::new();
+    let mut projection_invalid =
+        !schema_valid || unexpected_envelope_field || workers.len() > OPTIONAL_WORKERS.len();
+
+    for (name, receipt) in workers {
+        if !OPTIONAL_WORKERS.contains(&name.as_str()) {
+            projection_invalid = true;
+            continue;
+        }
+        let projection = if schema_valid && valid_optional_worker_health_entry(name, receipt) {
+            receipt.clone()
+        } else {
+            invalid_optional_worker_health_projection()
+        };
+        projected.insert(name.clone(), projection);
+    }
+    if projection_invalid {
+        projected.insert(
+            "_invalid".to_owned(),
+            invalid_optional_worker_health_projection(),
+        );
+    }
+    Ok(json!({"schema_version":1,"workers":projected}))
 }
 
 pub(super) fn finish(
@@ -937,7 +1064,7 @@ pub(super) fn status(db: &Connection) -> Result<Value> {
     let current = status_value(load(db).map(|value| value.map(|record| json!(record))))?;
     let last_exit = status_value(exit_receipt(db, LAST_EXIT))?;
     let latest_failure = status_value(exit_receipt(db, LATEST_FAILURE))?;
-    let mut optional_workers = optional_worker_health(db)?;
+    let mut optional_workers = optional_worker_health_status_projection(db)?;
     let supervisor_running =
         optional_workers["workers"]["automation-scheduler"]["state"] == "running";
     let running_host_epoch = (current["state"] == "running")

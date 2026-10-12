@@ -178,7 +178,9 @@ mod receipt_ambiguity_tests {
     #[test]
     fn identical_run_copies_settle_once_but_conflicts_remain_unresolved() {
         let terminal = json!({"sessionId":"session","turnId":"turn",
-            "terminal":"completed","event":"turn.completed","viewCursor":"cursor"});
+            "terminal":"completed",
+            "event":{"id":"evt_session_turn","seq":1,"sha256":model::digest(b"session turn")},
+            "viewCursor":1});
         let producer =
             json!({"native_session_id":"session","native_run_id":"turn","disposition":"admitted"});
         let mut consistent = producer.clone();
@@ -215,8 +217,8 @@ mod receipt_ambiguity_tests {
             "sessionId":"ses_child",
             "turnId":"run_child",
             "terminal":"failed",
-            "event":"evt_child_failed",
-            "viewCursor":3,
+            "event":{"id":"evt_child_failed","seq":4,"sha256":model::digest(b"child failed")},
+            "viewCursor":4,
             "stage":"execution_failed",
             "error_code":"NATIVE_CHILD_FAILED"
         });
@@ -238,6 +240,8 @@ mod receipt_ambiguity_tests {
             valid["terminal_evidence"]["error_code"],
             "NATIVE_CHILD_FAILED"
         );
+        assert_eq!(valid["terminal_evidence"]["event"]["seq"], 4);
+        assert_eq!(valid["terminal_evidence"]["view_cursor"], 4);
 
         for (field, value) in [
             ("stage", json!("raw stage text")),
@@ -310,6 +314,40 @@ fn bounded_terminal_error_code(value: &Value) -> Value {
     json!(code)
 }
 
+/// The native terminal reference is a closed, bounded identity; retain its
+/// cursor only when it is the exact sequence named by that reference.
+fn bounded_terminal_event_ref(
+    value: &Value,
+) -> Option<swarm_contracts::runtime::GoalTerminalEventRef> {
+    let fields = value.as_object()?;
+    if fields.len() != 3
+        || !["id", "seq", "sha256"]
+            .into_iter()
+            .all(|field| fields.contains_key(field))
+    {
+        return None;
+    }
+    let id = fields.get("id")?.as_str()?;
+    if id.len() > 512 {
+        return None;
+    }
+    let sequence = fields
+        .get("seq")?
+        .as_i64()
+        .filter(|sequence| *sequence > 0)?;
+    let sha256 = fields.get("sha256")?.as_str()?;
+    if sha256.len() != 64 {
+        return None;
+    }
+    let event_ref = swarm_contracts::runtime::GoalTerminalEventRef {
+        id: id.to_owned(),
+        seq: u64::try_from(sequence).ok()?,
+        sha256: sha256.to_owned(),
+    };
+    event_ref.validate().ok()?;
+    Some(event_ref)
+}
+
 /// Terminal facts address an exact run; missing IDs never compare equal as null.
 /// A terminal fact does not accept a Task or release a native session.
 pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id: Option<i64>) {
@@ -339,10 +377,25 @@ pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id
         return;
     }
     producer["disposition"] = json!(terminal);
+    let terminal_event_ref = bounded_terminal_event_ref(&event["event"]);
+    let terminal_event = terminal_event_ref
+        .as_ref()
+        .map(|event_ref| {
+            json!({"id":event_ref.id.as_str(),"seq":event_ref.seq,"sha256":event_ref.sha256.as_str()})
+        })
+        .unwrap_or(Value::Null);
+    let terminal_view_cursor = terminal_event_ref
+        .as_ref()
+        .and_then(|event_ref| {
+            let cursor = event["viewCursor"].as_i64().filter(|cursor| *cursor > 0)?;
+            (u64::try_from(cursor).ok() == Some(event_ref.seq)).then_some(cursor)
+        })
+        .map(|cursor| json!(cursor))
+        .unwrap_or(Value::Null);
     producer["terminal_evidence"] = json!({
         "observation_id":observation_id,
-        "event":event["event"],
-        "view_cursor":event["viewCursor"],
+        "event":terminal_event,
+        "view_cursor":terminal_view_cursor,
         "stage":bounded_terminal_stage(&event["stage"]),
         "error_code":bounded_terminal_error_code(&event["error_code"])
     });
