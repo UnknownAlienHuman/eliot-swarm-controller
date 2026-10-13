@@ -311,14 +311,16 @@ fn store_start_decision_reads_legacy_receipts_and_rejects_ambiguity() {
 #[test]
 #[cfg(any(unix, windows))]
 fn store_allow_rejects_a_reparse_decision_path_without_changing_its_target() {
-    let root =
+    let fixture_root =
         std::env::temp_dir().join(format!("script-reparse-decision-{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let root = fs::canonicalize(&root).unwrap();
+    fs::create_dir_all(&fixture_root).unwrap();
+    let root = fs::canonicalize(&fixture_root).unwrap();
     let _cleanup = FixtureDirectory(root.clone());
     let work = fixture_work(&root, None);
     let dir = directory(&root, &work.run_id).unwrap();
-    let target_dir = root.join("retained-target");
+    #[cfg(windows)]
+    let junction_dir = directory(&fixture_root, &work.run_id).unwrap();
+    let target_dir = fixture_root.join("retained-target");
     fs::create_dir_all(&target_dir).unwrap();
     let target = target_dir.join("start-decision.json");
     let retained = b"owner bytes";
@@ -332,15 +334,47 @@ fn store_allow_rejects_a_reparse_decision_path_without_changing_its_target() {
     }
     #[cfg(windows)]
     {
-        fs::create_dir_all(dir.parent().expect("script run directory has a parent")).unwrap();
-        create_directory_junction(&target_dir, &dir).unwrap();
+        assert!(
+            !junction_dir.exists(),
+            "run directory must not exist before junction creation"
+        );
+        let junction_parent = junction_dir
+            .parent()
+            .expect("script run directory has a parent");
+        fs::create_dir_all(junction_parent).unwrap();
+        let canonical_parent = fs::canonicalize(junction_parent).unwrap();
+        assert!(
+            canonical_parent.starts_with(&root),
+            "junction parent must remain inside the canonical temp root"
+        );
+        let canonical_target_dir = fs::canonicalize(&target_dir).unwrap();
+        assert!(
+            canonical_target_dir.starts_with(&root),
+            "junction target must remain inside the canonical temp root"
+        );
+        create_directory_junction(&target_dir, &junction_dir).unwrap();
+
+        use std::os::windows::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&junction_dir).unwrap();
+        assert_ne!(
+            metadata.file_attributes() & 0x400,
+            0,
+            "PowerShell created a reparse point at the run directory"
+        );
+        let resolved_junction = fs::canonicalize(&junction_dir).unwrap_or_else(|error| {
+            panic!("created junction does not resolve to its retained target: {error}")
+        });
+        assert_eq!(
+            resolved_junction, canonical_target_dir,
+            "junction resolves to the exact retained target directory"
+        );
     }
 
     let error = allow(&work).unwrap_err();
     #[cfg(unix)]
-    assert_eq!(error.code, "PRIVATE_FILE_INVALID");
+    assert_eq!(error.code, "PRIVATE_FILE_INVALID", "allow error: {error:?}");
     #[cfg(windows)]
-    assert_eq!(error.code, "PRIVATE_PATH_INVALID");
+    assert_eq!(error.code, "PRIVATE_PATH_INVALID", "allow error: {error:?}");
     assert_eq!(fs::read(&target).unwrap(), retained);
 
     #[cfg(unix)]
