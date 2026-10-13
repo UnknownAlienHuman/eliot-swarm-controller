@@ -300,7 +300,13 @@ pub(crate) fn watch_creator_authorized_for_subject(
                     {
                         return Ok(false);
                     }
-                    match verify_review_assignment(db, creator_id, &registration, scope) {
+                    match verify_review_assignment(
+                        db,
+                        creator_id,
+                        &registration,
+                        scope,
+                        ReviewAssignmentVerification::Current,
+                    ) {
                         Ok(()) => Ok(true),
                         Err(error) if is_stale_watch_authority(&error) => Ok(false),
                         Err(error) => Err(error),
@@ -581,6 +587,7 @@ pub(crate) fn require_review_scope(
         principal.client_id.as_str(),
         &current.registration,
         &scope,
+        ReviewAssignmentVerification::Current,
     )
 }
 
@@ -615,7 +622,13 @@ pub(crate) fn require_historical_review_result_scope(
         ));
     }
     validate_retained_review_tuple(db, &scope)?;
-    verify_review_assignment(db, &principal.client_id, &registration, &scope)
+    verify_review_assignment(
+        db,
+        &principal.client_id,
+        &registration,
+        &scope,
+        ReviewAssignmentVerification::HistoricalFirstResult,
+    )
 }
 
 /// Canonical typed message request -> existing raw mailbox request. The caller
@@ -1022,7 +1035,13 @@ fn validate_participation_basis(
             if historical_review {
                 validate_retained_review_tuple(db, &scope)?;
             } else {
-                verify_review_assignment(db, client_id, registration, &scope)?;
+                verify_review_assignment(
+                    db,
+                    client_id,
+                    registration,
+                    &scope,
+                    ReviewAssignmentVerification::Current,
+                )?;
             }
         }
         _ => {
@@ -1998,11 +2017,24 @@ fn validate_retained_review_tuple(db: &Connection, scope: &Value) -> Result<()> 
     Ok(())
 }
 
+/// Exact purpose of one review-assignment verification.
+///
+/// `Current` is the strict live authority used by packet/context, ordinary
+/// review actions, watch authority and participation-basis checks: the live
+/// review:slot pointer must name this exact assignment.
+/// `HistoricalFirstResult` is reserved for the retained-assignment result
+/// path, where an exact immutable assignment may already have been retired
+/// by a replacement before its first result was written.
+pub(crate) enum ReviewAssignmentVerification {
+    Current,
+    HistoricalFirstResult,
+}
+
 fn verify_review_assignment(
     db: &Connection,
     reviewer_client_id: &str,
     registration: &Value,
-    scope: &Value,
+    scope: &Value, purpose: ReviewAssignmentVerification,
 ) -> Result<()> {
     let assignment_id = model::text(scope, "review_assignment_id")?;
     let event_key = format!("assignment:{assignment_id}");
@@ -2039,16 +2071,14 @@ fn verify_review_assignment(
     let current_slot = meta(db, &format!("review:slot:{}", identity.digest()?))?;
     let lives_current_slot =
         current_slot.is_some_and(|slot| slot["review_assignment_id"] == assignment_id);
-    // Purpose-specific retained-assignment relaxation. The O11 table requires
-    // "Trusted old evidence retained historically" for a late result, so the first
-    // result of an unanswered assignment that a replacement has already retired
-    // must be retained as historical evidence instead of being refused. Only that
-    // exact case skips the live-slot condition; a second, differing result still
-    // meets the immutable one-result-per-assignment rule, and a replacement that
-    // already changed a current-slot assignment keeps the strict refusal.
-    let retained_first_result_only =
-        !lives_current_slot && !retained_review_result_exists(db, assignment_id)?;
-    if !lives_current_slot && !retained_first_result_only {
+    // Purpose-gated retained-assignment exception. Only the exact
+    // HistoricalFirstResult caller may let an already-retired assignment pass,
+    // and only while that assignment has no retained result yet. Every Current
+    // caller keeps the strict live-slot requirement.
+    let historical_first_result_allowed = !lives_current_slot
+        && !retained_review_result_exists(db, assignment_id)?
+        && purpose == ReviewAssignmentVerification::HistoricalFirstResult;
+    if !lives_current_slot && !historical_first_result_allowed {
         return Err(Error::new(
             "STALE_REVIEW_ASSIGNMENT",
             "reviewer assignment has been replaced for this exact slot",
