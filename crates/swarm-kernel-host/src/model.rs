@@ -739,6 +739,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             return Ok(());
         }
         "check.cancel" => &["client_request_id", "check_id", "reason"],
+        "check.acknowledge_held" => &["client_request_id", "check_id", "expected_source_digest"],
 
         "logging.set" => &[
             "client_request_id",

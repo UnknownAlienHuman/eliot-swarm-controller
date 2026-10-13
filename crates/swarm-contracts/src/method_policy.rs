@@ -667,6 +667,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "check.acknowledge_held",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "task.create",
         class: MethodClass::Mutation,
         mcp: true,

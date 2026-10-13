@@ -1403,6 +1403,12 @@ static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
         &["check_id", "reason"],
     ),
     mutation(
+        "check.acknowledge_held",
+        "Acknowledge one quarantined check run into the held inventory; the run stays nonterminal and no work is repaired, released or executed.",
+        &[f("check_id", S), f("expected_source_digest", S)],
+        &["check_id", "expected_source_digest"],
+    ),
+    mutation(
         "task.create",
         "Create a task from a specification; no native effects.",
         &[f("project_id", S), f("spec", O), f("origin_key", S)],
@@ -5104,6 +5110,17 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["check", "cancel", "stop"],
         &["check_id", "reason"],
         "Durable cancellation request; not proof of termination."
+    ),
+    entry!(
+        "check.acknowledge_held",
+        AcceptanceEffects,
+        FULL_AUDIENCE,
+        ManualOnly,
+        "Acknowledge one quarantined check run into the held inventory.",
+        "Use only for an explicit acknowledgement against the exact check ID and its retained quarantine digest.",
+        &["check", "acknowledge", "held", "quarantine"],
+        &["check_id", "expected_source_digest"],
+        "Durable held acknowledgement; the run stays nonterminal with no repair, release or execution."
     ),
     entry!(
         "task.create",

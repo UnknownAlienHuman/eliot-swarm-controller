@@ -122,6 +122,14 @@ pub(super) fn current_operation(
         operation["native_dispatch_capability_readback"] =
             super::launcher_dispatch::current_dispatch_capability_readback(db, config, id);
     }
+    // A check.run operation whose CheckRun carries retained quarantine
+    // evidence reports its bounded held disposition; the grant above
+    // already bounds who may see it.
+    if operation["method"] == "check.run" {
+        if let Some(reconciliation) = super::checks::operation_quarantine_view(db, id)? {
+            operation["reconciliation"] = reconciliation;
+        }
+    }
     Ok(operation)
 }
 
@@ -194,13 +202,23 @@ pub(super) fn acceptance(db: &Connection, p: &Principal, v: &Value) -> Result<Va
 }
 
 pub(super) fn check(db: &Connection, p: &Principal, v: &Value) -> Result<Value> {
-    let receipt = super::checks::describe(db, v)?;
-    let identity = object_scope::identity_for_attempt(db, model::text(&receipt, "attempt_id")?)?
-        .ok_or_else(missing)?;
-    let operation_id = model::text(&receipt, "operation_id")?;
-    let operation = operations::get_operation(db, operation_id)?;
+    model::fields(v, &["check_id"])?;
+    let id = model::text(v, "check_id")?;
+    // Plain-column scope resolution first: identity and linkage must never
+    // parse a damaged spec, and unknown IDs stay NOT_FOUND as before.
+    let (attempt_id, operation_id): (String, String) = db
+        .query_row(
+            "SELECT attempt_id, operation_id FROM check_runs WHERE check_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::new("NOT_FOUND", "unknown CheckRun"))?;
+    let identity =
+        object_scope::identity_for_attempt(db, &attempt_id)?.ok_or_else(missing)?;
+    let operation = operations::get_operation(db, &operation_id)?;
     if operation["method"] != "check.run"
-        || operation["attempt_id"] != receipt["attempt_id"]
+        || operation["attempt_id"].as_str() != Some(attempt_id.as_str())
         || operation["task_id"] != identity.task_id
     {
         return Err(Error::new(
@@ -208,7 +226,13 @@ pub(super) fn check(db: &Connection, p: &Principal, v: &Value) -> Result<Value> 
             "CheckRun does not match its retained producing Operation",
         ));
     }
-    require_evidence(db, p, &identity, operation_id)?;
+    require_evidence(db, p, &identity, &operation_id)?;
+    // Quarantine-first: retained quarantine evidence projects a bounded
+    // sanitized view without parsing the damaged spec.
+    if let Some(held) = super::checks::held_projection(db, id, &operation_id, &attempt_id)? {
+        return Ok(held);
+    }
+    let receipt = super::checks::describe(db, v)?;
     Ok(select(
         &receipt,
         &[

@@ -403,6 +403,46 @@ impl Store {
         }
         result
     }
+    /// Async acknowledgement gate for one quarantined CheckRun. A possibly
+    /// live owned child rejects with uncertainty before any admission, so
+    /// acknowledgement can never authorize against an unobserved process
+    /// family. Genuine terminal evidence stays with the reap and finish
+    /// gates and is never inferred here; the synchronous admission below
+    /// keeps the run nonterminal and the quarantine evidence immutable.
+    pub(super) async fn acknowledge_held_check(&self, principal: Principal, params: Value) -> Result<Value> {
+        model::validate_mutation("check.acknowledge_held", &params)?;
+        let check = model::text(&params, "check_id")?.to_owned();
+        {
+            let owners = self.check_child_custody.lock().await;
+            if owners.get(&check).is_some_and(|owner| owner.exit.is_none()) {
+                return Err(Error::new(
+                    "CHECK_HELD_LIVE_UNCERTAIN",
+                    "an owned CheckRun child may still be live; acknowledgement waits for exact reap evidence",
+                ));
+            }
+        }
+        let p = principal.clone();
+        let v = params.clone();
+        let config = self.config.clone();
+        let result = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let p = current_principal(&tx, p)?;
+                let result = super::mutate_in_transaction_with_check_plan(
+                    &tx,
+                    &p,
+                    "check.acknowledge_held",
+                    &v,
+                    &config,
+                    model::now_ms()?,
+                    None,
+                )?;
+                tx.commit()?;
+                result
+            })
+            .await;
+        result
+    }
 }
 
 pub(super) fn valid_process_receipt(receipt: &Value, spec: &Value) -> bool {
@@ -1452,6 +1492,156 @@ pub(super) fn cancel(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -
         json!({"operation_id":id,"check_id":check,"cancellation_operation_id":id,"cancellation_requested":true,"admission":"durable_request","process_killed":false}),
     )
 }
+/// Load and shape-validate the retained quarantine record without parsing
+/// the damaged spec. Returns None when this CheckRun was never quarantined.
+fn load_quarantine_record(
+    db: &Connection,
+    check_id: &str,
+) -> Result<Option<PendingQuarantineEvidence>> {
+    let Some(value) = meta(db, &quarantine_key(check_id))? else {
+        return Ok(None);
+    };
+    if model::canonical(&value)?.len() > MAX_PENDING_QUARANTINE_BYTES {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_CORRUPT",
+            "retained pending quarantine evidence exceeds its bounded size",
+        ));
+    }
+    let record: PendingQuarantineEvidence = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "CHECK_PENDING_QUARANTINE_CORRUPT",
+            "retained pending quarantine evidence cannot be decoded",
+        )
+    })?;
+    validate_pending_quarantine(&record, check_id)?;
+    Ok(Some(record))
+}
+/// Prove the retained quarantine record still names this exact CheckRun
+/// lineage, comparing only digests and plain identifiers. A changed source
+/// stays a hard identity conflict; it never resumes under old quarantine.
+fn read_quarantine_for_held(
+    tx: &Transaction<'_>,
+    check_id: &str,
+    operation_id: &str,
+    attempt_id: &str,
+    spec_json: &str,
+) -> Result<PendingQuarantineEvidence> {
+    let Some(record) = load_quarantine_record(tx, check_id)? else {
+        return Err(Error::new(
+            "CHECK_HELD_NOT_QUARANTINED",
+            "CheckRun has no retained quarantine evidence",
+        ));
+    };
+    if record.identity.check_attempt_id != check_id
+        || record.identity.operation_id != operation_id
+        || record.identity.attempt_id != attempt_id
+        || record.identity.check_spec_sha256 != model::digest(spec_json.as_bytes())
+    {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
+            "retained quarantine identity no longer matches the CheckRun source",
+        ));
+    }
+    Ok(record)
+}
+fn write_held_acknowledged(
+    tx: &Transaction<'_>,
+    held: &HeldRecord,
+    acknowledged_by: &str,
+    acknowledged_at_ms: i64,
+    operation_id: &str,
+) -> Result<()> {
+    let mut next = held.clone();
+    next.acknowledged = true;
+    next.acknowledged_by = Some(acknowledged_by.to_owned());
+    next.acknowledged_at_ms = Some(acknowledged_at_ms);
+    next.ack_operation_id = Some(operation_id.to_owned());
+    validate_held_record(&next, &next.check_id)?;
+    set_meta(tx, &held_key(&next.check_id), &json!(&next))?;
+    Ok(())
+}
+/// Explicit exact acknowledgement of a quarantined CheckRun into the held
+/// inventory. The run stays nonterminal: no repair, release, terminal state
+/// or worker is produced, and the quarantine evidence itself is never
+/// rewritten. Only the held inventory record flips to acknowledged under
+/// the exact retained source digest.
+pub(super) fn acknowledge_held(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
+    model::fields(v, &["client_request_id", "check_id", "expected_source_digest"])?;
+    let check = model::text(v, "check_id")?;
+    let expected = model::text(v, "expected_source_digest")?;
+    if !valid_held_digest(expected) {
+        return Err(Error::invalid("expected_source_digest must be SHA-256 hex"));
+    }
+    let row: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT state, operation_id, attempt_id, spec_json FROM check_runs WHERE check_id=?1",
+            [check],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((state, operation_id, attempt_id, spec_json)) = row else {
+        return Err(Error::new("NOT_FOUND", "unknown CheckRun"));
+    };
+    let attempt = tasks::get_attempt(tx, &attempt_id)?;
+    super::gm::require_attempt_control(tx, p, &attempt)?;
+    if !matches!(state.as_str(), "queued" | "running" | "reconciling") {
+        return Ok(
+            json!({"operation_id":id,"check_id":check,"acknowledged":false,"state":state,"disposition":"already_terminal"}),
+        );
+    }
+    let record = read_quarantine_for_held(tx, check, &operation_id, &attempt_id, &spec_json)?;
+    let source_digest = model::digest(spec_json.as_bytes());
+    if expected != source_digest {
+        return Err(Error::new(
+            "CHECK_HELD_DIGEST_MISMATCH",
+            "expected source digest does not match the retained quarantine identity",
+        ));
+    }
+    let now = model::now_ms()?;
+    match meta(tx, &held_key(check))? {
+        Some(existing) => {
+            let held: HeldRecord = serde_json::from_value(existing).map_err(|_| {
+                Error::new(
+                    "CHECK_HELD_RECORD_CORRUPT",
+                    "retained held inventory record cannot be decoded",
+                )
+            })?;
+            validate_held_record(&held, check)?;
+            if held.source_digest != source_digest {
+                return Err(Error::new(
+                    "CHECK_HELD_RECORD_CORRUPT",
+                    "retained held inventory no longer matches the quarantine identity",
+                ));
+            }
+            if held.acknowledged {
+                return Ok(json!({"operation_id":id,"check_id":check,"acknowledged":true,"coalesced":true,"held":true,"state":state,"source_digest":source_digest,"ack_operation_id":held.ack_operation_id}));
+            }
+            write_held_acknowledged(tx, &held, &p.client_id, now, id)?;
+        }
+        None => {
+            let held = HeldRecord {
+                schema_version: HELD_SCHEMA,
+                check_id: check.to_owned(),
+                quarantine_code: record.code.clone(),
+                quarantine_field: record.field.clone(),
+                quarantine_reason: record.reason.clone(),
+                source_digest: source_digest.clone(),
+                acknowledged: false,
+                acknowledged_by: None,
+                acknowledged_at_ms: None,
+                ack_operation_id: None,
+            };
+            validate_held_record(&held, check)?;
+            set_meta(tx, &held_key(check), &json!(&held))?;
+            write_held_acknowledged(tx, &held, &p.client_id, now, id)?;
+        }
+    }
+    tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+        params![id, attempt["task_id"].as_str(), attempt["attempt_id"].as_str()],
+    )?;
+    Ok(json!({"operation_id":id,"check_id":check,"acknowledged":true,"held":true,"state":state,"source_digest":source_digest}))
+}
 pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     model::fields(v, &["check_id"])?;
     let id = model::text(v, "check_id")?;
@@ -1459,6 +1649,132 @@ pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", "unknown CheckRun")
     })?)?)
+}
+/// Bounded sanitized projection of a quarantined CheckRun. It reads only
+/// plain columns plus the retained quarantine evidence and never parses the
+/// damaged spec, so `check.get` succeeds exactly where `describe` cannot.
+/// Returns None when this CheckRun was never quarantined.
+pub(super) fn held_projection(
+    db: &Connection,
+    check_id: &str,
+    operation_id: &str,
+    attempt_id: &str,
+) -> Result<Option<Value>> {
+    let Some(record) = load_quarantine_record(db, check_id)? else {
+        return Ok(None);
+    };
+    let row: Option<(String, String, String)> = db
+        .query_row(
+            "SELECT state, candidate_ref, spec_json FROM check_runs WHERE check_id=?1",
+            [check_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((state, candidate_ref, spec_json)) = row else {
+        return Err(Error::new("NOT_FOUND", "unknown CheckRun"));
+    };
+    if record.identity.check_attempt_id != check_id
+        || record.identity.operation_id != operation_id
+        || record.identity.attempt_id != attempt_id
+        || record.identity.check_spec_sha256 != model::digest(spec_json.as_bytes())
+    {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
+            "retained quarantine identity no longer matches the CheckRun source",
+        ));
+    }
+    let held = match meta(db, &held_key(check_id))? {
+        None => false,
+        Some(value) => {
+            let held: HeldRecord = serde_json::from_value(value).map_err(|_| {
+                Error::new(
+                    "CHECK_HELD_RECORD_CORRUPT",
+                    "retained held inventory record cannot be decoded",
+                )
+            })?;
+            validate_held_record(&held, check_id)?;
+            held.acknowledged
+        }
+    };
+    Ok(Some(json!({
+        "check_id": check_id,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "candidate_ref": candidate_ref,
+        "state": state,
+        "reconciliation": {
+            "disposition": "quarantined",
+            "code": record.code,
+            "field": record.field,
+            "reason": record.reason,
+            "source_digest": record.identity.check_spec_sha256,
+            "held": held,
+        },
+    })))
+}
+/// Bounded quarantine evidence for an operation projection. Attached only
+/// when the operation produced a CheckRun with retained quarantine
+/// evidence; a changed source reports its conflict instead of guessing.
+pub(super) fn operation_quarantine_view(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let check_id: Option<String> = db
+        .query_row(
+            "SELECT check_id FROM check_runs WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(check_id) = check_id else {
+        return Ok(None);
+    };
+    let Some(record) = load_quarantine_record(db, &check_id)? else {
+        return Ok(None);
+    };
+    let spec_json: Option<String> = db
+        .query_row(
+            "SELECT spec_json FROM check_runs WHERE check_id=?1",
+            [&check_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let unchanged = spec_json
+        .as_deref()
+        .is_some_and(|spec| model::digest(spec.as_bytes()) == record.identity.check_spec_sha256);
+    let held = match meta(db, &held_key(&check_id))? {
+        None => false,
+        Some(value) => {
+            let held: HeldRecord = serde_json::from_value(value).map_err(|_| {
+                Error::new(
+                    "CHECK_HELD_RECORD_CORRUPT",
+                    "retained held inventory record cannot be decoded",
+                )
+            })?;
+            validate_held_record(&held, &check_id)?;
+            held.acknowledged
+        }
+    };
+    if unchanged {
+        return Ok(Some(json!({
+            "disposition": "quarantined",
+            "code": record.code,
+            "field": record.field,
+            "reason": record.reason,
+            "source_digest": record.identity.check_spec_sha256,
+            "held": held,
+            "identity_conflict": false,
+        })));
+    }
+    Ok(Some(json!({
+        "disposition": "quarantined",
+        "code": "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
+        "field": record.field,
+        "reason": record.reason,
+        "source_digest": record.identity.check_spec_sha256,
+        "held": held,
+        "identity_conflict": true,
+    })))
 }
 fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value) -> Result<bool> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2041,7 +2357,7 @@ fn max_pending_id(tx: &Transaction<'_>) -> Result<Option<String>> {
 
 fn pending_subject_count(tx: &Transaction<'_>) -> Result<i64> {
     Ok(tx.query_row(
-        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')))",
+        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id)",
         [],
         |row| row.get(0),
     )?)
@@ -2159,7 +2475,7 @@ fn pending_ids_after(
     limit: usize,
 ) -> Result<Vec<String>> {
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND (?1 IS NULL OR c.check_id>?1) AND (?2 IS NULL OR c.check_id<=?2) ORDER BY c.check_id LIMIT ?3",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND (?1 IS NULL OR c.check_id>?1) AND (?2 IS NULL OR c.check_id<=?2) AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?3",
     )?;
     let ids = statement
         .query_map(params![cursor, cut, limit as i64], |row| {
@@ -2171,7 +2487,7 @@ fn pending_ids_after(
 
 fn pending_ids_through(tx: &Transaction<'_>, cursor: &str, limit: usize) -> Result<Vec<String>> {
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND c.check_id<=?1 ORDER BY c.check_id LIMIT ?2",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND c.check_id<=?1 AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?2",
     )?;
     let ids = statement
         .query_map(params![cursor, limit as i64], |row| row.get::<_, String>(0))?
@@ -2323,6 +2639,46 @@ fn quarantine_key(check_id: &str) -> String {
         "{PENDING_QUARANTINE_PREFIX}{}",
         model::digest(check_id.as_bytes())
     )
+}
+const HELD_PREFIX: &str = "checks:held:v1:";
+const HELD_SCHEMA: u32 = 1;
+fn held_key(check_id: &str) -> String {
+    format!("{HELD_PREFIX}{check_id}")
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldRecord {
+    schema_version: u32,
+    check_id: String,
+    quarantine_code: String,
+    quarantine_field: String,
+    quarantine_reason: String,
+    source_digest: String,
+    acknowledged: bool,
+    acknowledged_by: Option<String>,
+    acknowledged_at_ms: Option<i64>,
+    ack_operation_id: Option<String>,
+}
+fn valid_held_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn validate_held_record(record: &HeldRecord, check_id: &str) -> Result<()> {
+    let acknowledged_context = record.acknowledged_by.is_some()
+        && record.acknowledged_at_ms.is_some_and(|at| at >= 0)
+        && record.ack_operation_id.is_some();
+    if record.schema_version != HELD_SCHEMA
+        || record.check_id != check_id
+        || record.quarantine_code != "CHECK_SPEC_SUBJECT_CORRUPT"
+        || !valid_pending_damage(&record.quarantine_field, &record.quarantine_reason)
+        || !valid_held_digest(&record.source_digest)
+        || record.acknowledged != acknowledged_context
+    {
+        return Err(Error::new(
+            "CHECK_HELD_RECORD_CORRUPT",
+            "retained held inventory record has an invalid identity or shape",
+        ));
+    }
+    Ok(())
 }
 
 fn valid_pending_damage(field: &str, reason: &str) -> bool {
@@ -2512,6 +2868,24 @@ fn retain_pending_quarantine(
         ));
     }
     set_meta(tx, &quarantine_key(&record.identity.check_id), &value)?;
+    // The held inventory index is derived from the same immutable evidence
+    // so the unchanged poison leaves the generic active page without a
+    // second scheduler or queue table. It starts unacknowledged; only the
+    // explicit acknowledgement flips it, never the quarantine itself.
+    let held = HeldRecord {
+        schema_version: HELD_SCHEMA,
+        check_id: record.identity.check_id.clone(),
+        quarantine_code: record.code.clone(),
+        quarantine_field: record.field.clone(),
+        quarantine_reason: record.reason.clone(),
+        source_digest: record.identity.check_spec_sha256.clone(),
+        acknowledged: false,
+        acknowledged_by: None,
+        acknowledged_at_ms: None,
+        ack_operation_id: None,
+    };
+    validate_held_record(&held, &record.identity.check_id)?;
+    set_meta(tx, &held_key(&record.identity.check_id), &json!(&held))?;
     Ok(())
 }
 
@@ -2873,6 +3247,25 @@ impl CheckChildCustody {
             owner.poll();
             owner.is_pending()
         });
+    }
+    #[cfg(test)]
+    pub(super) async fn retain_test_live_child(&self, work: Work, child: Child) {
+        let replaced = self.lock().await.insert(
+            work.check_id.clone(),
+            CheckChildOwner {
+                work,
+                child,
+                launch: None,
+                launch_error: None,
+                launch_persistence_pending: false,
+                exit: None,
+                terminal_retained: false,
+            },
+        );
+        assert!(
+            replaced.is_none(),
+            "test custody already owns this CheckRun"
+        );
     }
 }
 
@@ -4185,6 +4578,8 @@ mod tests {
     mod check_launch_unknown_durable_tests;
     #[path = "reg23_pending_isolation_tests.rs"]
     mod reg23_pending_isolation_tests;
+    #[path = "check_held_tests.rs"]
+    mod check_held_tests;
     use crate::{
         artifacts::ArtifactFiles,
         checks::{

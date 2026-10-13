@@ -1929,6 +1929,9 @@ impl Store {
         if method == "check.run" {
             return self.check_run(principal, params).await;
         }
+        if method == "check.acknowledge_held" {
+            return self.acknowledge_held_check(principal, params).await;
+        }
         if method == "schedule.run_now" {
             return self.schedule_run_now(principal, params).await;
         }
@@ -6791,6 +6794,7 @@ fn apply(
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
         "check.run" => checks::reserve(tx, p, v, id, config, plan.check_plan),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),
+        "check.acknowledge_held" => checks::acknowledge_held(tx, p, v, id).map(|v| (v, false)),
 
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),
         "task.submit" => submissions::reserve(tx, p, v, id).map(|v| (v, true)),
