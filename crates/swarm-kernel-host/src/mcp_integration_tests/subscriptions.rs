@@ -1028,7 +1028,7 @@ async fn concilium_and_coordination_subscriptions_fan_out_authorized_facts() {
         .iter()
         .filter(|fact| {
             fact["operation_id"] == json!(thread_operation_id)
-                && fact["kind"] == json!("coordination.thread_opened")
+                && fact["kind"] == json!("coordination.thread.open")
         })
         .collect::<Vec<_>>();
     let concilium_facts = items
@@ -1133,7 +1133,7 @@ async fn concilium_and_coordination_subscriptions_fan_out_authorized_facts() {
     );
     assert_eq!(
         thread_notification["params"]["item"]["kind"],
-        json!("coordination.thread_opened")
+        json!("coordination.thread.open")
     );
     assert_eq!(
         thread_notification["params"]["item"]["thread_id"],

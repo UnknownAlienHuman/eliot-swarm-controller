@@ -222,8 +222,34 @@ fn is_concilium_fact(item: &Value) -> bool {
         .is_some_and(|kind| kind.starts_with("concilium."))
 }
 
+fn is_coordination_contract_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "coordination.contract.propose"
+            | "coordination.contract.respond"
+            | "coordination.contract.ratify"
+            | "coordination.contract.reject"
+            | "coordination.contract_proposed"
+            | "coordination.contract_response"
+            | "coordination.contract_ratified"
+            | "coordination.contract_rejected"
+    )
+}
+
 fn is_coordination_fact(item: &Value) -> bool {
-    const KINDS: [&str; 7] = [
+    // Store commits the executable method as the observation kind. Keep
+    // historical fact names readable without treating arbitrary prefix
+    // matches as Thread facts.
+    const KINDS: [&str; 16] = [
+        "coordination.thread.open",
+        "coordination.message.send",
+        "coordination.thread.resolve",
+        "coordination.thread.withdraw",
+        "coordination.thread.supersede",
+        "coordination.contract.propose",
+        "coordination.contract.respond",
+        "coordination.contract.ratify",
+        "coordination.contract.reject",
         "coordination.thread_opened",
         "coordination.message",
         "coordination.thread_closed",
@@ -240,14 +266,9 @@ fn is_coordination_fact(item: &Value) -> bool {
             .as_str()
             .is_some_and(|id| !id.is_empty())
         && KINDS.contains(&kind)
-        && (!matches!(
-            kind,
-            "coordination.contract_proposed"
-                | "coordination.contract_response"
-                | "coordination.contract_ratified"
-                | "coordination.contract_rejected"
-        ) || (item["payload"]["proposal_id"].as_str().is_some()
-            && item["payload"]["proposal_revision_id"].as_str().is_some()))
+        && (!is_coordination_contract_kind(kind)
+            || (item["payload"]["proposal_id"].as_str().is_some()
+                && item["payload"]["proposal_revision_id"].as_str().is_some()))
 }
 
 fn notification_item(item: &Value) -> Value {
@@ -266,15 +287,7 @@ fn notification_item(item: &Value) -> Value {
             "operation_id": item["operation_id"],
             "thread_id": item["payload"]["thread_id"]
         });
-        if matches!(
-            item["kind"].as_str(),
-            Some(
-                "coordination.contract_proposed"
-                    | "coordination.contract_response"
-                    | "coordination.contract_ratified"
-                    | "coordination.contract_rejected"
-            )
-        ) {
+        if is_coordination_contract_kind(item["kind"].as_str().unwrap_or_default()) {
             projected["proposal_id"] = item["payload"]["proposal_id"].clone();
             projected["proposal_revision_id"] = item["payload"]["proposal_revision_id"].clone();
         }

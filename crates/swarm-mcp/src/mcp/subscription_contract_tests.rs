@@ -111,6 +111,79 @@ fn subscribe_params_are_strict() {
 }
 
 #[test]
+fn coordination_current_producers_keep_exact_relations_and_private_text_out_of_notifications() {
+    let categories = [Category::Coordination];
+    for kind in [
+        "coordination.thread.open",
+        "coordination.message.send",
+        "coordination.thread_opened",
+    ] {
+        let entry = item(
+            kind,
+            Some("op-thread"),
+            json!({
+                "thread_id":"coord-thread", "text":"PRIVATE_MESSAGE", "subject":"PRIVATE_SUBJECT",
+            }),
+        );
+        assert_eq!(
+            matched_categories(&categories, &entry, "reader"),
+            categories
+        );
+        let params = committed_notification("sub-thread", &categories, &entry, &json!({}))
+            .params
+            .unwrap();
+        assert_eq!(
+            params["item"],
+            json!({
+                "cursor":7, "kind":kind, "operation_id":"op-thread", "thread_id":"coord-thread",
+            })
+        );
+    }
+    let proposal = item(
+        "coordination.contract.propose",
+        Some("op-contract"),
+        json!({
+            "thread_id":"coord-thread", "proposal_id":"proposal", "proposal_revision_id":"revision",
+            "statement":"PRIVATE_CONTRACT", "reason":"PRIVATE_REASON",
+        }),
+    );
+    assert_eq!(
+        matched_categories(&categories, &proposal, "reader"),
+        categories
+    );
+    let params = committed_notification("sub-thread", &categories, &proposal, &json!({}))
+        .params
+        .unwrap();
+    assert_eq!(
+        params["item"],
+        json!({
+            "cursor":7, "kind":"coordination.contract.propose", "operation_id":"op-contract",
+            "thread_id":"coord-thread", "proposal_id":"proposal", "proposal_revision_id":"revision",
+        })
+    );
+    for entry in [
+        item(
+            "coordination.thread.unknown",
+            Some("op-thread"),
+            json!({"thread_id":"coord-thread"}),
+        ),
+        item(
+            "coordination.thread.open",
+            None,
+            json!({"thread_id":"coord-thread"}),
+        ),
+        item("coordination.thread.open", Some("op-thread"), json!({})),
+        item(
+            "coordination.contract.propose",
+            Some("op-contract"),
+            json!({"thread_id":"coord-thread"}),
+        ),
+    ] {
+        assert!(matched_categories(&categories, &entry, "reader").is_empty());
+    }
+}
+
+#[test]
 fn notification_shapes_carry_frame_identity_and_resync() {
     let frame = json!({
         "source_kind": "observation_timeline",

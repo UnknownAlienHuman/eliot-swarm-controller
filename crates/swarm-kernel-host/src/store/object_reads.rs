@@ -1212,6 +1212,8 @@ fn project_scoped_observation(
             "sender",
             "recipient",
             "task_id",
+            "thread_id",
+            "attempt_id",
             "text",
             "finding",
             "delivery_id",
