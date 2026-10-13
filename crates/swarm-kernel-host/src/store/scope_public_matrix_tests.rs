@@ -2319,7 +2319,7 @@ mod connected_store {
                     "candidate_ref":candidate_ref,
                 });
                 db.execute(
-                    "INSERT INTO operations(operation_id,caller_id,client_request_json,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.submit',?4,?5,?6,?7,'settled',?8,1,1,1,1)",
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.submit',?4,?5,?6,?7,'settled',?8,1,1,1,1)",
                     params![
                         submission_operation_id,
                         owner,
