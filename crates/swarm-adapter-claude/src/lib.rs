@@ -2805,6 +2805,235 @@ fn unknown_outcome_from_saved(
     })
 }
 
+fn rejected_outcome_from_saved(
+    operation_id: &str,
+    saved: &journal::OperationState,
+    code: &str,
+    config: &AdapterConfig,
+) -> Result<RuntimeOutcome> {
+    let mut outcome = unknown_outcome_from_saved(operation_id, saved, code, config)?;
+    outcome.outcome = EffectOutcome::Rejected;
+    outcome.details["completion_condition"] = json!("rejected_before_native_admission");
+    Ok(outcome)
+}
+
+fn queue_rejected(
+    config: &AdapterConfig,
+    _claim: &ModuleContractClaim,
+    journal: &OperationJournal,
+    command: &RuntimeCommand,
+    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    code: &str,
+    native_root: Option<&str>,
+) -> Result<bool> {
+    let intent = intent_for(
+        command,
+        receipt,
+        None,
+        "preflight",
+        &config.native_options.scope_key(),
+    )?;
+    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
+    let mut details = json!({"diagnostic_code":code,"completion_condition":"rejected_before_native_admission","replay_permitted":false});
+    receipt::insert(&mut details, receipt)?;
+    let outcome = RuntimeOutcome {
+        operation_id: command.operation_id.clone(),
+        outcome: EffectOutcome::Rejected,
+        native_scope_key: Some(config.native_options.scope_key()),
+        native_root_id: native_root.map(ToOwned::to_owned),
+        turn_id: None,
+        native_input_id: None,
+        details,
+    };
+    journal.save_outcome(&command.operation_id, &outcome)?;
+    Ok(false)
+}
+
+fn handle_reconcile(
+    config: &AdapterConfig,
+    journal: &OperationJournal,
+    command: &RuntimeCommand,
+    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    latest_state: &Value,
+    harness_alive: bool,
+) -> Result<bool> {
+    let target_id = command.input["operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::invalid("reconcile target operation ID is missing"))?;
+    let target = journal.get(target_id)?;
+    let target_receipt = target.as_ref().and_then(|state| state.receipt.as_ref());
+    if let Some(target_receipt) = target_receipt {
+        if command.target_input_sha256.as_deref() != Some(target_receipt.input_sha256.as_str())
+            || target_receipt.binding_id != command.binding_id
+            || target_receipt.binding_generation != command.generation
+        {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "reconcile target receipt differs from the exact original Operation",
+            ));
+        }
+    } else if !command
+        .target_input_sha256
+        .as_deref()
+        .is_some_and(receipt::is_sha256)
+    {
+        return Err(Error::new(
+            "HOST_COMMAND_IDENTITY",
+            "reconcile target lacks its canonical Operation digest",
+        ));
+    }
+    let intent = intent_for(
+        command,
+        receipt,
+        Some(
+            json!({"reconcile_target_operation_id":target_id,"native_scope_key":config.native_options.scope_key()}),
+        ),
+        latest_state["bridge_boot_id"].as_str().unwrap_or("unknown"),
+        &config.native_options.scope_key(),
+    )?;
+    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
+
+    let mut native_result = None;
+    if harness_alive
+        && let Some(target) = target.as_ref()
+        && let (Some(target_intent), Some(state)) =
+            (target.intent.as_ref(), latest_state["state"].as_object())
+    {
+        let native = &target_intent["native"];
+        let expected_input = native["user_message_uuid"].as_str();
+        let expected_boot = target_intent["bridge_boot_id"].as_str();
+        let expected_root = target
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome["native_root_id"].as_str());
+        let scope_ok = latest_state["native_scope_key"] == config.native_options.scope_key();
+        if scope_ok
+            && expected_boot == latest_state["bridge_boot_id"].as_str()
+            && let (Some(input_id), Some(root), Some(executions)) = (
+                expected_input,
+                expected_root,
+                state.get("input_executions").and_then(Value::as_array),
+            )
+            && latest_state["root_id"] == root
+            && latest_state["state"]["init_session_id"] == root
+        {
+            native_result = executions
+                .iter()
+                .find(|event| {
+                    event["native_input_id"] == input_id
+                        && event["user_message_uuid"] == input_id
+                        && event["correlation"] == "unique"
+                        && event["native_session_id"] == root
+                        && event["result_frame_uuid"]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty())
+                })
+                .cloned();
+        }
+    }
+    let target_outcome = target.as_ref().and_then(|state| state.outcome.as_ref());
+    let rejected_before_admission =
+        target_outcome.is_some_and(|outcome| outcome["outcome"] == "rejected");
+    let resolved = native_result.is_some() || rejected_before_admission;
+    let mut details = json!({
+        "completion_condition":"adapter_readback_recorded",
+        "target_operation_id":target_id,
+        "target_module_receipt":target_receipt,
+        "target_outcome":target_outcome,
+        "native_result_evidence":native_result,
+        "resolved":resolved,
+        "native_readback":"current_sdk_observation_only",
+        "native_replay":false
+    });
+    receipt::insert(&mut details, receipt)?;
+    let outcome = RuntimeOutcome {
+        operation_id: command.operation_id.clone(),
+        outcome: EffectOutcome::Applied,
+        native_scope_key: Some(config.native_options.scope_key()),
+        native_root_id: command.native_root_id.clone(),
+        turn_id: None,
+        native_input_id: None,
+        details,
+    };
+    journal.save_outcome(&command.operation_id, &outcome)?;
+    Ok(false)
+}
+
+async fn flush_outbox(
+    link: &mut ModuleLink,
+    journal: &OperationJournal,
+    interactions: &InteractionJournal,
+) -> Result<()> {
+    for item in journal.pending_outcomes()? {
+        let outcome = item
+            .outcome
+            .as_ref()
+            .ok_or_else(|| Error::new("ADAPTER_OUTBOX", "pending outcome is missing"))?;
+        if outcome["outcome"] == "applied"
+            && outcome["details"]["completion_condition"] == "result_page_persisted"
+            && outcome["details"]["artifact_ref"]
+                .as_str()
+                .is_some_and(|artifact| !artifact.trim().is_empty())
+        {
+            // module.result already durably published and acknowledged this
+            // page; sending module.outcome would re-submit an Applied
+            // agent.result after Store settled it through the page path.
+            journal.acknowledge(&item.operation_id, outcome)?;
+            interactions.reclaim_acknowledged_operation(&item.operation_id, journal)?;
+            continue;
+        }
+        let response = link.outcome(outcome.clone()).await?;
+        if response["recorded"] != true {
+            return Err(Error::new(
+                "HOST_ACK_SCHEMA",
+                "Store did not record the exact adapter outcome",
+            ));
+        }
+        journal.acknowledge(&item.operation_id, outcome)?;
+        interactions.reclaim_acknowledged_operation(&item.operation_id, journal)?;
+    }
+    Ok(())
+}
+
+fn required_message_text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "SDK_HARNESS_SCHEMA",
+                "SDK harness message is missing an identity field",
+            )
+        })
+}
+
+fn harness_exit_diagnostic_code(code: Option<i32>) -> String {
+    match code {
+        Some(code) if code < 0 => {
+            format!("SDK_HARNESS_EXITED_CODE_NEG_{}", code.unsigned_abs())
+        }
+        Some(code) => format!("SDK_HARNESS_EXITED_CODE_{code}"),
+        None => "SDK_HARNESS_EXIT_STATUS_UNAVAILABLE".to_owned(),
+    }
+}
+
+fn safe_diagnostic(value: &Value, fallback: &'static str) -> String {
+    value
+        .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code.as_bytes()[0].is_ascii_uppercase()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 #[cfg(test)]
 mod failed_prepare_lifecycle_fixture {
     use super::*;
@@ -3097,233 +3326,4 @@ mod failed_prepare_lifecycle_fixture {
             "unknown"
         );
     }
-}
-
-fn rejected_outcome_from_saved(
-    operation_id: &str,
-    saved: &journal::OperationState,
-    code: &str,
-    config: &AdapterConfig,
-) -> Result<RuntimeOutcome> {
-    let mut outcome = unknown_outcome_from_saved(operation_id, saved, code, config)?;
-    outcome.outcome = EffectOutcome::Rejected;
-    outcome.details["completion_condition"] = json!("rejected_before_native_admission");
-    Ok(outcome)
-}
-
-fn queue_rejected(
-    config: &AdapterConfig,
-    _claim: &ModuleContractClaim,
-    journal: &OperationJournal,
-    command: &RuntimeCommand,
-    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
-    code: &str,
-    native_root: Option<&str>,
-) -> Result<bool> {
-    let intent = intent_for(
-        command,
-        receipt,
-        None,
-        "preflight",
-        &config.native_options.scope_key(),
-    )?;
-    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
-    let mut details = json!({"diagnostic_code":code,"completion_condition":"rejected_before_native_admission","replay_permitted":false});
-    receipt::insert(&mut details, receipt)?;
-    let outcome = RuntimeOutcome {
-        operation_id: command.operation_id.clone(),
-        outcome: EffectOutcome::Rejected,
-        native_scope_key: Some(config.native_options.scope_key()),
-        native_root_id: native_root.map(ToOwned::to_owned),
-        turn_id: None,
-        native_input_id: None,
-        details,
-    };
-    journal.save_outcome(&command.operation_id, &outcome)?;
-    Ok(false)
-}
-
-fn handle_reconcile(
-    config: &AdapterConfig,
-    journal: &OperationJournal,
-    command: &RuntimeCommand,
-    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
-    latest_state: &Value,
-    harness_alive: bool,
-) -> Result<bool> {
-    let target_id = command.input["operation_id"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::invalid("reconcile target operation ID is missing"))?;
-    let target = journal.get(target_id)?;
-    let target_receipt = target.as_ref().and_then(|state| state.receipt.as_ref());
-    if let Some(target_receipt) = target_receipt {
-        if command.target_input_sha256.as_deref() != Some(target_receipt.input_sha256.as_str())
-            || target_receipt.binding_id != command.binding_id
-            || target_receipt.binding_generation != command.generation
-        {
-            return Err(Error::new(
-                "NATIVE_IDENTITY_MISMATCH",
-                "reconcile target receipt differs from the exact original Operation",
-            ));
-        }
-    } else if !command
-        .target_input_sha256
-        .as_deref()
-        .is_some_and(receipt::is_sha256)
-    {
-        return Err(Error::new(
-            "HOST_COMMAND_IDENTITY",
-            "reconcile target lacks its canonical Operation digest",
-        ));
-    }
-    let intent = intent_for(
-        command,
-        receipt,
-        Some(
-            json!({"reconcile_target_operation_id":target_id,"native_scope_key":config.native_options.scope_key()}),
-        ),
-        latest_state["bridge_boot_id"].as_str().unwrap_or("unknown"),
-        &config.native_options.scope_key(),
-    )?;
-    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
-
-    let mut native_result = None;
-    if harness_alive
-        && let Some(target) = target.as_ref()
-        && let (Some(target_intent), Some(state)) =
-            (target.intent.as_ref(), latest_state["state"].as_object())
-    {
-        let native = &target_intent["native"];
-        let expected_input = native["user_message_uuid"].as_str();
-        let expected_boot = target_intent["bridge_boot_id"].as_str();
-        let expected_root = target
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome["native_root_id"].as_str());
-        let scope_ok = latest_state["native_scope_key"] == config.native_options.scope_key();
-        if scope_ok
-            && expected_boot == latest_state["bridge_boot_id"].as_str()
-            && let (Some(input_id), Some(root), Some(executions)) = (
-                expected_input,
-                expected_root,
-                state.get("input_executions").and_then(Value::as_array),
-            )
-            && latest_state["root_id"] == root
-            && latest_state["state"]["init_session_id"] == root
-        {
-            native_result = executions
-                .iter()
-                .find(|event| {
-                    event["native_input_id"] == input_id
-                        && event["user_message_uuid"] == input_id
-                        && event["correlation"] == "unique"
-                        && event["native_session_id"] == root
-                        && event["result_frame_uuid"]
-                            .as_str()
-                            .is_some_and(|value| !value.is_empty())
-                })
-                .cloned();
-        }
-    }
-    let target_outcome = target.as_ref().and_then(|state| state.outcome.as_ref());
-    let rejected_before_admission =
-        target_outcome.is_some_and(|outcome| outcome["outcome"] == "rejected");
-    let resolved = native_result.is_some() || rejected_before_admission;
-    let mut details = json!({
-        "completion_condition":"adapter_readback_recorded",
-        "target_operation_id":target_id,
-        "target_module_receipt":target_receipt,
-        "target_outcome":target_outcome,
-        "native_result_evidence":native_result,
-        "resolved":resolved,
-        "native_readback":"current_sdk_observation_only",
-        "native_replay":false
-    });
-    receipt::insert(&mut details, receipt)?;
-    let outcome = RuntimeOutcome {
-        operation_id: command.operation_id.clone(),
-        outcome: EffectOutcome::Applied,
-        native_scope_key: Some(config.native_options.scope_key()),
-        native_root_id: command.native_root_id.clone(),
-        turn_id: None,
-        native_input_id: None,
-        details,
-    };
-    journal.save_outcome(&command.operation_id, &outcome)?;
-    Ok(false)
-}
-
-async fn flush_outbox(
-    link: &mut ModuleLink,
-    journal: &OperationJournal,
-    interactions: &InteractionJournal,
-) -> Result<()> {
-    for item in journal.pending_outcomes()? {
-        let outcome = item
-            .outcome
-            .as_ref()
-            .ok_or_else(|| Error::new("ADAPTER_OUTBOX", "pending outcome is missing"))?;
-        if outcome["outcome"] == "applied"
-            && outcome["details"]["completion_condition"] == "result_page_persisted"
-            && outcome["details"]["artifact_ref"]
-                .as_str()
-                .is_some_and(|artifact| !artifact.trim().is_empty())
-        {
-            // module.result already durably published and acknowledged this
-            // page; sending module.outcome would re-submit an Applied
-            // agent.result after Store settled it through the page path.
-            journal.acknowledge(&item.operation_id, outcome)?;
-            interactions.reclaim_acknowledged_operation(&item.operation_id, journal)?;
-            continue;
-        }
-        let response = link.outcome(outcome.clone()).await?;
-        if response["recorded"] != true {
-            return Err(Error::new(
-                "HOST_ACK_SCHEMA",
-                "Store did not record the exact adapter outcome",
-            ));
-        }
-        journal.acknowledge(&item.operation_id, outcome)?;
-        interactions.reclaim_acknowledged_operation(&item.operation_id, journal)?;
-    }
-    Ok(())
-}
-
-fn required_message_text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| {
-            Error::new(
-                "SDK_HARNESS_SCHEMA",
-                "SDK harness message is missing an identity field",
-            )
-        })
-}
-
-fn harness_exit_diagnostic_code(code: Option<i32>) -> String {
-    match code {
-        Some(code) if code < 0 => {
-            format!("SDK_HARNESS_EXITED_CODE_NEG_{}", code.unsigned_abs())
-        }
-        Some(code) => format!("SDK_HARNESS_EXITED_CODE_{code}"),
-        None => "SDK_HARNESS_EXIT_STATUS_UNAVAILABLE".to_owned(),
-    }
-}
-
-fn safe_diagnostic(value: &Value, fallback: &'static str) -> String {
-    value
-        .as_str()
-        .filter(|code| {
-            !code.is_empty()
-                && code.len() <= 64
-                && code.as_bytes()[0].is_ascii_uppercase()
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-        })
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.to_owned())
 }

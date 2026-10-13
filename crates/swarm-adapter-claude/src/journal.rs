@@ -2929,6 +2929,25 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
     hex_digest(bytes)
 }
 
+fn hex_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn safe_diagnostic_code(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_uppercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        value
+    } else {
+        "ADAPTER_UNCERTAIN_AFTER_EFFECT_MARKER"
+    }
+}
+
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
@@ -3158,24 +3177,5 @@ mod recovery_tests {
 
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn safe_diagnostic_code(value: &str) -> &str {
-    if !value.is_empty()
-        && value.len() <= 64
-        && value.as_bytes()[0].is_ascii_uppercase()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        value
-    } else {
-        "ADAPTER_UNCERTAIN_AFTER_EFFECT_MARKER"
     }
 }
