@@ -314,34 +314,52 @@ fn store_allow_rejects_a_reparse_decision_path_without_changing_its_target() {
     let root =
         std::env::temp_dir().join(format!("script-reparse-decision-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
     let _cleanup = FixtureDirectory(root.clone());
     let work = fixture_work(&root, None);
     let dir = directory(&root, &work.run_id).unwrap();
-    fs::create_dir_all(&dir).unwrap();
-    let target = root.join("retained-target.json");
+    let target_dir = root.join("retained-target");
+    fs::create_dir_all(&target_dir).unwrap();
+    let target = target_dir.join("start-decision.json");
     let retained = b"owner bytes";
     fs::write(&target, retained).unwrap();
-    let decision = dir.join("start-decision.json");
-    if let Err(error) = create_reparse_link(&target, &decision) {
-        if cfg!(windows)
-            && matches!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-            )
-        {
-            return;
-        }
-        panic!("could not create supported reparse fixture: {error}");
+
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(&dir).unwrap();
+        let decision = dir.join("start-decision.json");
+        create_reparse_link(&target, &decision).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        fs::create_dir_all(dir.parent().expect("script run directory has a parent")).unwrap();
+        create_directory_junction(&target_dir, &dir).unwrap();
     }
 
-    assert!(allow(&work).is_err());
+    let error = allow(&work).unwrap_err();
+    #[cfg(unix)]
+    assert_eq!(error.code, "PRIVATE_FILE_INVALID");
+    #[cfg(windows)]
+    assert_eq!(error.code, "PRIVATE_PATH_INVALID");
     assert_eq!(fs::read(&target).unwrap(), retained);
+
+    #[cfg(unix)]
     assert!(
-        fs::symlink_metadata(&decision)
+        fs::symlink_metadata(&dir.join("start-decision.json"))
             .unwrap()
             .file_type()
             .is_symlink()
     );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&dir).unwrap();
+        assert_ne!(
+            metadata.file_attributes() & 0x400,
+            0,
+            "run directory remains a reparse point after rejected Allow"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -350,8 +368,41 @@ fn create_reparse_link(target: &Path, link: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn create_reparse_link(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(target, link)
+fn create_directory_junction(target: &Path, junction: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    New-Item -ItemType Junction -Path $env:ELIOT_SWARM_TEST_JUNCTION_LINK -Target $env:ELIOT_SWARM_TEST_JUNCTION_TARGET | Out-Null
+    exit 0
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+"#;
+
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .env("ELIOT_SWARM_TEST_JUNCTION_LINK", junction)
+        .env("ELIOT_SWARM_TEST_JUNCTION_TARGET", target)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "PowerShell New-Item -ItemType Junction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
