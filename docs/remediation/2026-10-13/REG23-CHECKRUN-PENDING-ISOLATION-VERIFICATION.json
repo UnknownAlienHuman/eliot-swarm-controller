@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "title": "Pending CheckRun subject isolation with atomic bounded observations",
+  "native_child_qualification": "NOT_RUN",
+  "normative_documents": [
+    {
+      "sha256": "3DEE8664DABA6AC3551128ECF005BFA4E2E21B423346D9D0CE039A1F4F9D2CFF",
+      "file": "ELIOT-Swarm-Controller-Master-Audit-2026-10-09-v27.md"
+    },
+    {
+      "sha256": "399704762B1190BA9E06DB8E2CD1586771B566FDF0DD0518E973C223A7FEABDB",
+      "file": "ELIOT-Swarm-Controller-Execution-Map-2026-10-09.md"
+    },
+    {
+      "sha256": "4A997D7910046092FA0EDEE66C775C05A8428FD6A7AF5D50D686503FF6FCC858",
+      "file": "ELIOT-Swarm-Controller-HIGH-Appendix-Source-2026-10-09.md"
+    },
+    {
+      "sha256": "2DADAADD9BC56B7ABF66EE564732928BFFE29ED0D7E08297F1893E1C8B8BADB0",
+      "file": "ELIOT-Swarm-Controller-Original-Unverified-Suspicions.md"
+    },
+    {
+      "sha256": "AE8406869C2026D0837EEC15EAF0AF68FCB16448008850597F25A44F5933A974",
+      "file": "ELIOT-Swarm-Controller-Original-What-To-Fix-Registry.md"
+    }
+  ],
+  "installed_native_provider_model_qualification": "NOT_RUN",
+  "verification": [
+    {
+      "receipt_sha256": "B3738F692C811F4CA551B285DC89BBD4C4C0C3838B4B97FB6696D3BACA09354F",
+      "command": "cargo +1.98.1 clippy --offline --locked -p swarm-kernel-host --lib --tests --no-deps -- -D warnings",
+      "log_sha256": "64A12282C44A199064F867AC4AB14C347C324F529272F617542EDCACB4E61917",
+      "exit_code": 0,
+      "scope": "Strict scoped Clippy",
+      "receipt": "reg23-check-pending-windows-clippy-v7-20261013.json",
+      "platform": "windows"
+    },
+    {
+      "receipt_sha256": "1E30A58E40571E79A443CFF8B6283EFE7A865C5AACA7B1FED4140B10BC167CAC",
+      "command": "cargo +1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib --no-tests=fail --retries0 -E test(store::checks::tests::reg23_pending_isolation_tests::) --success-output immediate",
+      "log_sha256": "7C3A8EB5BF9D2CEA89E496140D7C2CBDB47BACF1EA460B02013648DA4B530CC9",
+      "exit_code": 0,
+      "scope": "Nine real Store consumers",
+      "receipt": "reg23-check-pending-windows-consumers-v3-20261013.json",
+      "platform": "windows"
+    },
+    {
+      "receipt_sha256": "1A9BEEEA54D324665441534F95E7FA4078FA4E271D35EDBCD08CC95B32CB190B",
+      "command": "env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo +1.98.1 clippy --offline --locked -p swarm-kernel-host --lib --tests --no-deps -- -D warnings",
+      "log_sha256": "BC0DA4D20FF921EF11B65A473AB3170BE15D1D8C905CCCD3D064F1D0B91DEB65",
+      "exit_code": 0,
+      "scope": "Strict scoped Clippy",
+      "receipt": "reg23-check-pending-linux-clippy-libtests-v2-20261013.json",
+      "platform": "linux"
+    },
+    {
+      "receipt_sha256": "BA0346108A80932DE615CCDBF060D0A0F81B4E25C4A5632A42BFC75EEC1141B4",
+      "command": "env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo +1.98.1 clippy --offline --locked -p swarm-kernel-host --lib --bins --no-deps -- -D warnings",
+      "log_sha256": "7A2401C692DCE2373EFB5BC939814306FDB72793386E2D5D111FB6E3318120C8",
+      "exit_code": 0,
+      "scope": "Strict scoped Clippy",
+      "receipt": "reg23-check-pending-linux-clippy-libbins-v2-20261013.json",
+      "platform": "linux"
+    },
+    {
+      "receipt_sha256": "0F4BAF5A47B11A5336A102C7CB7A26BB2EA70714C727D40B246B76E472C60604",
+      "command": "env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo +1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib --no-tests=fail --retries 0 -E 'test(store::checks::tests::reg23_pending_isolation_tests::)' --success-output immediate",
+      "log_sha256": "7C7DCA81A4EB55B064C19CBE39CD59DF5C05458D74D2CAC765C9206F21CB5E6A",
+      "exit_code": 0,
+      "scope": "Nine real Store consumers",
+      "receipt": "reg23-check-pending-linux-consumers-v2-20261013.json",
+      "platform": "linux"
+    }
+  ],
+  "ledger_ids": [
+    "REG-23"
+  ],
+  "normative_anchors": [
+    "Master V27 R34 0.3 lines917/924: bounded identity/code/digest/timestamps/count and occurrence updates",
+    "Master V27 R34 0.4 line945: global/SQLite failure leaves the domain transaction unchanged"
+  ],
+  "behavior": [
+    "A typed malformed selected CheckRun spec retains immutable identity/code/digest evidence while a healthy neighbor progresses",
+    "Required nullable identity keys must be present; explicit JSON null remains valid",
+    "Repeat matching quarantine increments a saturating u32 count and a monotonic last-seen timestamp without altering its immutable origin",
+    "Known subject disposition and pending cursor commit in one domain transaction; malformed global state, storage/read/write/savepoint/commit errors remain hard and roll back the page",
+    "Pending page membership does not prune native child custody"
+  ],
+  "linux_source_manifest_sha256": "73FF7A6EF362C4A3BC8B3E396CC7556D6C5157F5D0617D3E2C39EFF0047D040E",
+  "windows_consumers": 9,
+  "source_bindings": [
+    {
+      "qualified_sha256": "73D7932CA74AA47087747D23D35B53DB5402432098101A728977CDAD99A65D8B",
+      "canonical_git_object": "788d6b695896058b08f67aa02d91af35836387e8",
+      "path": "crates/swarm-kernel-host/src/store/checks.rs",
+      "preimage_sha256": "D90298111726DD2A04654DF390E126BBCC09CDB5FD7AEB82F730DC374111AF49",
+      "candidate_sha256": "73D7932CA74AA47087747D23D35B53DB5402432098101A728977CDAD99A65D8B"
+    },
+    {
+      "qualified_sha256": "B757BAD40D0077C19BCAAD78A0B42AC40D82F82298B3936E75E114CC1A9D555D",
+      "canonical_git_object": "76586f6733ba82b039b222b5839e0b2262b204fd",
+      "path": "crates/swarm-kernel-host/src/store/checks/tests/reg23_pending_isolation_tests.rs",
+      "preimage_sha256": null,
+      "candidate_sha256": "B757BAD40D0077C19BCAAD78A0B42AC40D82F82298B3936E75E114CC1A9D555D"
+    }
+  ],
+  "linux_consumers": 9,
+  "exact_linux_source_inputs": 1050,
+  "scope": "Pending CheckRun reader/disposition only, including R34 required immutable origin and bounded repeat statistics",
+  "source_verification": "Manager exact source/path/caller review and genuine Store mutation consumers",
+  "independent_source_review": "Nous Step5 High review of frozen pre-format v7 snapshot running; no completed independent verdict claimed",
+  "base_main": "4112f5bca88bc9f2b6bd5650f933dcc5d8efaf50",
+  "full_v27_qualified": false,
+  "whole_REG23_complete": false
+}

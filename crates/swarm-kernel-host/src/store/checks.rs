@@ -1,5 +1,5 @@
 //! CheckRun transactions and one host scheduler, using the existing nine tables.
-use super::{Store, acceptance, current_principal, meta, operations, results, tasks};
+use super::{Store, acceptance, current_principal, meta, operations, results, set_meta, tasks};
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     automation::authorization,
@@ -17,6 +17,7 @@ use crate::{
     workspace::LeaseAuthorityRef,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -1588,51 +1589,205 @@ fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value
 }
 
 fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
-    let (op, raw, identity): (String, String, Option<String>) = db.query_row(
-        "SELECT operation_id,spec_json,process_identity_json FROM check_runs WHERE check_id=?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    match materialize_subject(db, id, root)? {
+        SubjectMaterialization::Decoded(work) => Ok(*work),
+        SubjectMaterialization::Damaged { field, reason } => Err(Error::new(
+            "CHECK_SPEC_SUBJECT_CORRUPT",
+            format!(
+                "retained CheckRun spec is damaged at {field}: {}",
+                reason.name()
+            ),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectDamageReason {
+    MissingRequiredField,
+    InvalidSubjectShape,
+}
+
+impl SubjectDamageReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MissingRequiredField => "missing_required_field",
+            Self::InvalidSubjectShape => "invalid_subject_shape",
+        }
+    }
+}
+
+enum SubjectMaterialization {
+    Decoded(Box<Work>),
+    Damaged {
+        field: &'static str,
+        reason: SubjectDamageReason,
+    },
+}
+
+struct WorkRow {
+    operation_id: String,
+    spec_json: String,
+    process_identity_json: Option<String>,
+}
+
+fn read_work_row(db: &Connection, id: &str) -> Result<Option<WorkRow>> {
+    Ok(db
+        .query_row(
+            "SELECT operation_id,spec_json,process_identity_json FROM check_runs WHERE check_id=?1",
+            [id],
+            |row| {
+                Ok(WorkRow {
+                    operation_id: row.get(0)?,
+                    spec_json: row.get(1)?,
+                    process_identity_json: row.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn decode_subject_fields(
+    id: &str,
+    operation_id: String,
+    raw: String,
+    identity: Option<String>,
+    root: PathBuf,
+) -> Result<SubjectMaterialization> {
     let spec: Value = serde_json::from_str(&raw)?;
-    Ok(Work {
+    let Some(fields) = spec.as_object() else {
+        return Ok(SubjectMaterialization::Damaged {
+            field: "spec",
+            reason: SubjectDamageReason::InvalidSubjectShape,
+        });
+    };
+
+    let token = match fields.get("token") {
+        None => {
+            return Ok(SubjectMaterialization::Damaged {
+                field: "token",
+                reason: SubjectDamageReason::MissingRequiredField,
+            });
+        }
+        Some(Value::String(token)) if !token.trim().is_empty() => token.clone(),
+        Some(_) => {
+            return Ok(SubjectMaterialization::Damaged {
+                field: "token",
+                reason: SubjectDamageReason::InvalidSubjectShape,
+            });
+        }
+    };
+    let candidate = match fields.get("candidate") {
+        None => {
+            return Ok(SubjectMaterialization::Damaged {
+                field: "candidate",
+                reason: SubjectDamageReason::MissingRequiredField,
+            });
+        }
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(candidate) => candidate,
+            Err(_) => {
+                return Ok(SubjectMaterialization::Damaged {
+                    field: "candidate",
+                    reason: SubjectDamageReason::InvalidSubjectShape,
+                });
+            }
+        },
+    };
+    let profile = match fields.get("profile") {
+        None => {
+            return Ok(SubjectMaterialization::Damaged {
+                field: "profile",
+                reason: SubjectDamageReason::MissingRequiredField,
+            });
+        }
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(profile) => profile,
+            Err(_) => {
+                return Ok(SubjectMaterialization::Damaged {
+                    field: "profile",
+                    reason: SubjectDamageReason::InvalidSubjectShape,
+                });
+            }
+        },
+    };
+    let executor = match fields.get("executor").filter(|value| !value.is_null()) {
+        None => None,
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(executor) => Some(executor),
+            Err(_) => {
+                return Ok(SubjectMaterialization::Damaged {
+                    field: "executor",
+                    reason: SubjectDamageReason::InvalidSubjectShape,
+                });
+            }
+        },
+    };
+    let cancel_request = match fields
+        .get("cancel_request")
+        .filter(|value| !value.is_null())
+    {
+        None => None,
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(request) => Some(request),
+            Err(_) => {
+                return Ok(SubjectMaterialization::Damaged {
+                    field: "cancel_request",
+                    reason: SubjectDamageReason::InvalidSubjectShape,
+                });
+            }
+        },
+    };
+    let expected_worker = identity.map(|raw| serde_json::from_str(&raw)).transpose()?;
+
+    Ok(SubjectMaterialization::Decoded(Box::new(Work {
         check_id: id.into(),
-        operation_id: op,
-        token: model::text(&spec, "token")?.into(),
-        preflight_error: spec
+        operation_id,
+        token,
+        preflight_error: fields
             .get("preflight_error")
-            .filter(|v| !v.is_null())
+            .filter(|value| !value.is_null())
             .cloned(),
         data_dir: root,
-        candidate: serde_json::from_value(spec["candidate"].clone())?,
-        profile: serde_json::from_value(spec["profile"].clone())?,
-        resolved_inputs: spec
+        candidate,
+        profile,
+        resolved_inputs: fields
             .get("resolved_inputs")
             .filter(|value| !value.is_null())
             .cloned(),
-        scope_plan: spec
+        scope_plan: fields
             .get("scope_plan")
             .filter(|value| !value.is_null())
             .cloned(),
-        input_fingerprint: spec
+        input_fingerprint: fields
             .get("input_fingerprint")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        executor: spec
-            .get("executor")
+        executor,
+        cancel_request,
+        expected_worker,
+        launch: fields
+            .get("launch")
             .filter(|value| !value.is_null())
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?,
-        cancel_request: spec
-            .get("cancel_request")
-            .filter(|v| !v.is_null())
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?,
-        expected_worker: identity.map(|raw| serde_json::from_str(&raw)).transpose()?,
-        launch: spec.get("launch").filter(|v| !v.is_null()).cloned(),
-    })
+            .cloned(),
+    })))
 }
+
+fn materialize_subject(db: &Connection, id: &str, root: PathBuf) -> Result<SubjectMaterialization> {
+    let row = read_work_row(db, id)?.ok_or_else(|| {
+        Error::new(
+            "CHECK_PENDING_SUBJECT_MISSING",
+            "selected CheckRun disappeared before materialization",
+        )
+    })?;
+    decode_subject_fields(
+        id,
+        row.operation_id,
+        row.spec_json,
+        row.process_identity_json,
+        root,
+    )
+}
+
 fn next(db: &mut Connection, config: &Config, root: PathBuf) -> Result<Option<Work>> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let enabled = config.checks.enabled
@@ -1721,14 +1876,506 @@ fn retain_pre_spawn_failure(db: &mut Connection, w: &Work, error: Value) -> Resu
     Ok(retry)
 }
 
-fn pending(db: &Connection, root: PathBuf) -> Result<Vec<Work>> {
-    let mut s =
-        db.prepare("SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))")?;
-    let ids = s
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    ids.iter().map(|id| work(db, id, root.clone())).collect()
+/// Retain nullable identity values without allowing serde's missing-`Option`
+/// default to make a truncated disposition look complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct PresentOption<T>(Option<T>);
+
+/// Decode a nullable value only after serde has confirmed the map key exists.
+/// The transparent wrapper otherwise makes an absent key deserialize as None.
+fn deserialize_required_present_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<PresentOption<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(PresentOption)
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSubjectIdentity {
+    check_id: String,
+    operation_id: String,
+    check_attempt_id: String,
+    candidate_ref: String,
+    cache_key: String,
+    resource_key: String,
+    check_created_at_ms: i64,
+    check_spec_sha256: String,
+    operation_caller_id: String,
+    operation_client_request_id: String,
+    operation_method: String,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    operation_task_id: PresentOption<String>,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    operation_attempt_id: PresentOption<String>,
+    operation_original_request_sha256: String,
+    operation_effective_request_sha256: String,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    operation_binding_id: PresentOption<String>,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    operation_binding_generation: PresentOption<i64>,
+    attempt_id: String,
+    attempt_task_id: String,
+    attempt_task_revision: i64,
+    attempt_task_snapshot_sha256: String,
+    attempt_owner_id: String,
+    attempt_start_owner: String,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    attempt_start_operation_id: PresentOption<String>,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    attempt_binding_id: PresentOption<String>,
+    #[serde(deserialize_with = "deserialize_required_present_option")]
+    attempt_binding_generation: PresentOption<i64>,
+    task_id: String,
+    task_project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingQuarantineEvidence {
+    schema_version: u32,
+    identity: PendingSubjectIdentity,
+    code: String,
+    field: String,
+    reason: String,
+    first_seen_at_ms: i64,
+    last_seen_at_ms: i64,
+    occurrences: u32,
+}
+
+const MAX_PENDING_PAGE: usize = 16;
+const MAX_PENDING_TEXT_BYTES: usize = 4096;
+const MAX_PENDING_QUARANTINE_BYTES: usize = 16 * 1024;
+const PENDING_CURSOR_KEY: &str = "checks:pending:v1:cursor";
+const PENDING_QUARANTINE_PREFIX: &str = "checks:pending:v1:quarantine:";
+const PENDING_QUARANTINE_SCHEMA: u32 = 1;
+const PENDING_SUBJECT_SAVEPOINT: &str = "checks_pending_subject";
+
+enum PendingSubjectOutcome {
+    Applied(Work),
+    AlreadyQuarantined,
+    Quarantined {
+        identity: PendingSubjectIdentity,
+        field: &'static str,
+        reason: SubjectDamageReason,
+    },
+}
+
+fn valid_pending_text(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_PENDING_TEXT_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_pending_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_pending_binding(id: &Option<String>, generation: Option<i64>) -> bool {
+    match (id.as_deref(), generation) {
+        (None, None) => true,
+        (Some(id), Some(generation)) => valid_pending_text(id) && generation > 0,
+        _ => false,
+    }
+}
+
+fn valid_pending_identity(identity: &PendingSubjectIdentity) -> bool {
+    let has_valid_start_operation = identity
+        .attempt_start_operation_id
+        .0
+        .as_ref()
+        .is_none_or(|value| valid_pending_text(value));
+    valid_pending_text(&identity.check_id)
+        && valid_pending_text(&identity.operation_id)
+        && valid_pending_text(&identity.check_attempt_id)
+        && identity.check_attempt_id == identity.attempt_id
+        && valid_pending_text(&identity.candidate_ref)
+        && valid_pending_text(&identity.cache_key)
+        && valid_pending_text(&identity.resource_key)
+        && identity.check_created_at_ms >= 0
+        && valid_pending_digest(&identity.check_spec_sha256)
+        && valid_pending_text(&identity.operation_caller_id)
+        && valid_pending_text(&identity.operation_client_request_id)
+        && identity.operation_method == "check.run"
+        && identity.operation_task_id.0.as_deref() == Some(identity.task_id.as_str())
+        && identity.operation_attempt_id.0.as_deref() == Some(identity.attempt_id.as_str())
+        && valid_pending_digest(&identity.operation_original_request_sha256)
+        && valid_pending_digest(&identity.operation_effective_request_sha256)
+        && valid_pending_binding(
+            &identity.operation_binding_id.0,
+            identity.operation_binding_generation.0,
+        )
+        && valid_pending_text(&identity.attempt_id)
+        && valid_pending_text(&identity.attempt_task_id)
+        && identity.attempt_task_id == identity.task_id
+        && identity.attempt_task_revision > 0
+        && valid_pending_digest(&identity.attempt_task_snapshot_sha256)
+        && valid_pending_text(&identity.attempt_owner_id)
+        && matches!(
+            identity.attempt_start_owner.as_str(),
+            "controller" | "native_manager"
+        )
+        && has_valid_start_operation
+        && valid_pending_binding(
+            &identity.attempt_binding_id.0,
+            identity.attempt_binding_generation.0,
+        )
+        && valid_pending_text(&identity.task_id)
+        && valid_pending_text(&identity.task_project_id)
+}
+
+fn read_pending_cursor(db: &Connection) -> Result<Option<String>> {
+    let Some(value) = meta(db, PENDING_CURSOR_KEY)? else {
+        return Ok(None);
+    };
+    let Some(cursor) = value.as_str() else {
+        return Err(Error::new(
+            "CHECK_PENDING_CURSOR_CORRUPT",
+            "checks pending cursor is not a subject key",
+        ));
+    };
+    if !valid_pending_text(cursor) || cursor.len() > 512 {
+        return Err(Error::new(
+            "CHECK_PENDING_CURSOR_CORRUPT",
+            "checks pending cursor identity is invalid",
+        ));
+    }
+    Ok(Some(cursor.to_owned()))
+}
+
+fn pending_ids_after(
+    tx: &Transaction<'_>,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND (?1 IS NULL OR c.check_id>?1) ORDER BY c.check_id LIMIT ?2",
+    )?;
+    let ids = statement
+        .query_map(params![cursor, limit as i64], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+fn pending_ids_through(tx: &Transaction<'_>, cursor: &str, limit: usize) -> Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND c.check_id<=?1 ORDER BY c.check_id LIMIT ?2",
+    )?;
+    let ids = statement
+        .query_map(params![cursor, limit as i64], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+fn pending_page(tx: &Transaction<'_>, cursor: Option<&str>) -> Result<Vec<String>> {
+    let mut ids = pending_ids_after(tx, cursor, MAX_PENDING_PAGE)?;
+    if ids.len() < MAX_PENDING_PAGE
+        && let Some(cursor) = cursor
+    {
+        let remaining = MAX_PENDING_PAGE - ids.len();
+        ids.extend(pending_ids_through(tx, cursor, remaining)?);
+    }
+    Ok(ids)
+}
+
+fn read_subject_identity(tx: &Transaction<'_>, check_id: &str) -> Result<PendingSubjectIdentity> {
+    let identity: Option<PendingSubjectIdentity> = tx
+        .query_row(
+            "SELECT c.check_id,c.operation_id,c.attempt_id,c.candidate_ref,c.cache_key,c.resource_key,c.created_at_ms,c.spec_json,o.caller_id,o.client_request_id,o.method,o.original_request_json,o.effective_request_json,o.task_id,o.attempt_id,o.binding_id,o.binding_generation,a.attempt_id,a.task_id,a.task_revision,a.task_snapshot_json,a.owner_id,a.start_owner,a.start_operation_id,a.binding_id,a.binding_generation,t.task_id,t.project_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id JOIN attempts a ON a.attempt_id=c.attempt_id JOIN tasks t ON t.task_id=a.task_id WHERE c.check_id=?1",
+            [check_id],
+            |row| {
+                let check_spec: String = row.get(7)?;
+                let operation_request: String = row.get(11)?;
+                let operation_effective_request: String = row.get(12)?;
+                let attempt_snapshot: String = row.get(20)?;
+                Ok(PendingSubjectIdentity {
+                    check_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    check_attempt_id: row.get(2)?,
+                    candidate_ref: row.get(3)?,
+                    cache_key: row.get(4)?,
+                    resource_key: row.get(5)?,
+                    check_created_at_ms: row.get(6)?,
+                    check_spec_sha256: model::digest(check_spec.as_bytes()),
+                    operation_caller_id: row.get(8)?,
+                    operation_client_request_id: row.get(9)?,
+                    operation_method: row.get(10)?,
+                    operation_original_request_sha256: model::digest(operation_request.as_bytes()),
+                    operation_effective_request_sha256: model::digest(
+                        operation_effective_request.as_bytes(),
+                    ),
+                    operation_task_id: PresentOption(row.get(13)?),
+                    operation_attempt_id: PresentOption(row.get(14)?),
+                    operation_binding_id: PresentOption(row.get(15)?),
+                    operation_binding_generation: PresentOption(row.get(16)?),
+                    attempt_id: row.get(17)?,
+                    attempt_task_id: row.get(18)?,
+                    attempt_task_revision: row.get(19)?,
+                    attempt_task_snapshot_sha256: model::digest(attempt_snapshot.as_bytes()),
+                    attempt_owner_id: row.get(21)?,
+                    attempt_start_owner: row.get(22)?,
+                    attempt_start_operation_id: PresentOption(row.get(23)?),
+                    attempt_binding_id: PresentOption(row.get(24)?),
+                    attempt_binding_generation: PresentOption(row.get(25)?),
+                    task_id: row.get(26)?,
+                    task_project_id: row.get(27)?,
+                })
+            },
+        )
+        .optional()?;
+    let identity = identity.ok_or_else(|| {
+        Error::new(
+            "CHECK_PENDING_SUBJECT_MISSING",
+            "selected CheckRun has no complete Operation, Attempt, and Task lineage",
+        )
+    })?;
+    if !valid_pending_identity(&identity) {
+        return Err(Error::new(
+            "CHECK_PENDING_LINEAGE_CORRUPT",
+            "retained CheckRun, Operation, Attempt, or Task lineage is inconsistent",
+        ));
+    }
+    Ok(identity)
+}
+
+fn quarantine_key(check_id: &str) -> String {
+    format!(
+        "{PENDING_QUARANTINE_PREFIX}{}",
+        model::digest(check_id.as_bytes())
+    )
+}
+
+fn valid_pending_damage(field: &str, reason: &str) -> bool {
+    matches!(
+        (field, reason),
+        ("token" | "candidate" | "profile", "missing_required_field")
+            | (
+                "spec" | "token" | "candidate" | "profile" | "executor" | "cancel_request",
+                "invalid_subject_shape",
+            )
+    )
+}
+
+fn validate_pending_quarantine(record: &PendingQuarantineEvidence, check_id: &str) -> Result<()> {
+    if record.schema_version != PENDING_QUARANTINE_SCHEMA
+        || record.identity.check_id != check_id
+        || !valid_pending_identity(&record.identity)
+        || record.code != "CHECK_SPEC_SUBJECT_CORRUPT"
+        || !valid_pending_damage(&record.field, &record.reason)
+        || record.first_seen_at_ms < 0
+        || record.last_seen_at_ms < record.first_seen_at_ms
+        || record.occurrences == 0
+    {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_CORRUPT",
+            "retained pending quarantine evidence has an invalid identity or shape",
+        ));
+    }
+    Ok(())
+}
+
+fn read_pending_quarantine(
+    tx: &Transaction<'_>,
+    check_id: &str,
+    identity: &PendingSubjectIdentity,
+) -> Result<Option<PendingQuarantineEvidence>> {
+    let Some(value) = meta(tx, &quarantine_key(check_id))? else {
+        return Ok(None);
+    };
+    if model::canonical(&value)?.len() > MAX_PENDING_QUARANTINE_BYTES {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_CORRUPT",
+            "retained pending quarantine evidence exceeds its bounded size",
+        ));
+    }
+    let record: PendingQuarantineEvidence = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "CHECK_PENDING_QUARANTINE_CORRUPT",
+            "retained pending quarantine evidence cannot be decoded",
+        )
+    })?;
+    validate_pending_quarantine(&record, check_id)?;
+    if &record.identity != identity {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
+            "quarantine metadata no longer matches the exact retained lineage",
+        ));
+    }
+    Ok(Some(record))
+}
+
+fn decode_pending_row(
+    identity: &PendingSubjectIdentity,
+    row: WorkRow,
+    root: PathBuf,
+) -> Result<SubjectMaterialization> {
+    if row.operation_id != identity.operation_id
+        || model::digest(row.spec_json.as_bytes()) != identity.check_spec_sha256
+    {
+        return Err(Error::new(
+            "CHECK_PENDING_LINEAGE_CHANGED",
+            "CheckRun identity changed during one pending transaction",
+        ));
+    }
+    decode_subject_fields(
+        &identity.check_id,
+        row.operation_id,
+        row.spec_json,
+        row.process_identity_json,
+        root,
+    )
+}
+
+fn rollback_pending_subject(tx: &Transaction<'_>) -> Result<()> {
+    if let Err(rollback_error) = tx.execute_batch(&format!(
+        "ROLLBACK TO SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}; RELEASE SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}"
+    )) {
+        let error = Error::new(
+            "CHECK_PENDING_SUBJECT_SAVEPOINT_UNCERTAIN",
+            "pending subject savepoint could not be rolled back and released",
+        )
+        .with_secondary_error(rollback_error.into());
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn materialize_pending_subject(
+    tx: &Transaction<'_>,
+    check_id: &str,
+    root: PathBuf,
+) -> Result<PendingSubjectOutcome> {
+    tx.execute_batch(&format!("SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}"))?;
+    let outcome = (|| -> Result<PendingSubjectOutcome> {
+        let identity = read_subject_identity(tx, check_id)?;
+        let row = read_work_row(tx, check_id)?.ok_or_else(|| {
+            Error::new(
+                "CHECK_PENDING_SUBJECT_MISSING",
+                "selected CheckRun disappeared before its typed read",
+            )
+        })?;
+        let materialized = decode_pending_row(&identity, row, root)?;
+        if let Some(mut record) = read_pending_quarantine(tx, check_id, &identity)? {
+            match materialized {
+                SubjectMaterialization::Damaged { field, reason }
+                    if record.field == field && record.reason == reason.name() =>
+                {
+                    record.occurrences = record.occurrences.saturating_add(1);
+                    record.last_seen_at_ms = record.last_seen_at_ms.max(model::now_ms()?);
+                    validate_pending_quarantine(&record, check_id)?;
+                    let value = json!(&record);
+                    if model::canonical(&value)?.len() > MAX_PENDING_QUARANTINE_BYTES {
+                        return Err(Error::new(
+                            "CHECK_PENDING_QUARANTINE_INVALID",
+                            "pending quarantine observation exceeds its bounded size",
+                        ));
+                    }
+                    set_meta(tx, &quarantine_key(check_id), &value)?;
+                    return Ok(PendingSubjectOutcome::AlreadyQuarantined);
+                }
+                SubjectMaterialization::Decoded(_) | SubjectMaterialization::Damaged { .. } => {
+                    return Err(Error::new(
+                        "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
+                        "retained quarantine classification no longer matches the CheckRun spec",
+                    ));
+                }
+            }
+        }
+        match materialized {
+            SubjectMaterialization::Decoded(work) => Ok(PendingSubjectOutcome::Applied(*work)),
+            SubjectMaterialization::Damaged { field, reason } => {
+                Ok(PendingSubjectOutcome::Quarantined {
+                    identity,
+                    field,
+                    reason,
+                })
+            }
+        }
+    })();
+
+    match outcome {
+        Ok(PendingSubjectOutcome::Applied(work)) => {
+            tx.execute_batch(&format!("RELEASE SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}"))?;
+            Ok(PendingSubjectOutcome::Applied(work))
+        }
+        Ok(PendingSubjectOutcome::AlreadyQuarantined) => {
+            tx.execute_batch(&format!("RELEASE SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}"))?;
+            Ok(PendingSubjectOutcome::AlreadyQuarantined)
+        }
+        Ok(quarantined @ PendingSubjectOutcome::Quarantined { .. }) => {
+            rollback_pending_subject(tx)?;
+            Ok(quarantined)
+        }
+        Err(primary) => match rollback_pending_subject(tx) {
+            Ok(()) => Err(primary),
+            Err(rollback) => Err(rollback.with_secondary_error(primary)),
+        },
+    }
+}
+
+fn retain_pending_quarantine(
+    tx: &Transaction<'_>,
+    identity: PendingSubjectIdentity,
+    field: &'static str,
+    reason: SubjectDamageReason,
+    now_ms: i64,
+) -> Result<()> {
+    let record = PendingQuarantineEvidence {
+        schema_version: PENDING_QUARANTINE_SCHEMA,
+        identity,
+        code: "CHECK_SPEC_SUBJECT_CORRUPT".to_owned(),
+        field: field.to_owned(),
+        reason: reason.name().to_owned(),
+        first_seen_at_ms: now_ms,
+        last_seen_at_ms: now_ms,
+        occurrences: 1,
+    };
+    validate_pending_quarantine(&record, &record.identity.check_id)?;
+    let value = json!(&record);
+    if model::canonical(&value)?.len() > MAX_PENDING_QUARANTINE_BYTES {
+        return Err(Error::new(
+            "CHECK_PENDING_QUARANTINE_INVALID",
+            "pending quarantine evidence exceeds its bounded size",
+        ));
+    }
+    set_meta(tx, &quarantine_key(&record.identity.check_id), &value)?;
+    Ok(())
+}
+
+fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let cursor = read_pending_cursor(&tx)?;
+    let ids = pending_page(&tx, cursor.as_deref())?;
+    let mut work = Vec::with_capacity(ids.len());
+    let mut last_id = None;
+    for check_id in ids {
+        last_id = Some(check_id.clone());
+        match materialize_pending_subject(&tx, &check_id, root.clone())? {
+            PendingSubjectOutcome::Applied(item) => work.push(item),
+            PendingSubjectOutcome::AlreadyQuarantined => {}
+            PendingSubjectOutcome::Quarantined {
+                identity,
+                field,
+                reason,
+            } => retain_pending_quarantine(&tx, identity, field, reason, model::now_ms()?)?,
+        }
+    }
+    if let Some(check_id) = last_id {
+        set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
+    } else {
+        tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CURSOR_KEY])?;
+    }
+    tx.commit()?;
+    Ok(work)
+}
+
 fn ready(db: &mut Connection, w: &Work, identity: Value) -> Result<bool> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let status = describe(&tx, &json!({"check_id":w.check_id}))?;
@@ -3231,6 +3878,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[path = "reg23_pending_isolation_tests.rs"]
+    mod reg23_pending_isolation_tests;
     use crate::{
         artifacts::ArtifactFiles,
         checks::{
