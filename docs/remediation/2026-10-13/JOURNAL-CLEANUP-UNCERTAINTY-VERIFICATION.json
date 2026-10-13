@@ -1,0 +1,86 @@
+{
+  "schema": "swarm.journal_cleanup_uncertainty.verification@1",
+  "recorded_utc": "2026-10-13T23:41:22.0941554+00:00",
+  "accepted_source_head": "db330a8f4fb0bf2ab76c21ab438a4899ae0391be",
+  "base_head": "8e628ce1f8a67485d7c05be0acac9af86587807e",
+  "author_head": "bfc7ce1e3c6e076e141b1194535b9874f1708c78",
+  "qualifier_head": "e8db63347b95a433f3a009175a39068a558ea26e",
+  "status": "SCOPED_VERIFIED",
+  "pr65_complete": false,
+  "original459_complete": false,
+  "problem": "Old remove helper reported successful Windows deletion as durable absence; first strictcandidate60alwaysunsupported broke ordinaryACK",
+  "first_rejected": {
+    "head": "60a075e72a619ac75be1bd0f6c931424df1f31ad",
+    "result": "0/1 FAIL ADAPTER_OUTBOX",
+    "windows_log": "pr65-windows-existing-ack-caller-first-v1.log"
+  },
+  "behavior": [
+    "Shared RemovalOutcome distinguishes namespaceRemoved from durableConfirmed",
+    "Unix parentbarrier required, includingalreadyabsent path; barrierfailure staysUnknown/error",
+    "WindowsreportsUnknown afternamespace operation; no Unix directory-fsync equivalence",
+    "Exact durable outcome/resultACK preserved beforecleanup; OpenCodedeferredpaths preventscleanupuncertainty aborting independentboundeddrain",
+    "Claude/Command preserveACK/releaseintent and exposecleanupUnknown",
+    "Retentiondoesnotcountabsenceasreclamation/release anddoesnotclaimcompleteunderUnknown"
+  ],
+  "primitive_and_existing_retention": {
+    "passed_each_os": 2,
+    "primitive_names": [
+      "acknowledged_removal_reports_unknown_after_windows_namespace_delete",
+      "acknowledged_removal_reports_parent_barrier_failure_and_is_idempotent"
+    ],
+    "linux_log": "pr65-linux-primitive-and-existing-ack-v1.log",
+    "existing": "retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_target",
+    "fixture_correction": "Exact module receipt,target/completion evidence added to malformedreconcilefixture; unresolved-target assertions retained",
+    "windows_log": "pr65-windows-primitive-and-existing-ack-v2.log"
+  },
+  "consumer_matrix": {
+    "tests": [
+      "outbox_recovery_tests::consumer_recovers_result_page_ack_without_outcome_and_drains_past_corruption",
+      "outbox_recovery_tests::consumer_resends_recovered_outcome_without_native_replay_and_drains_past_corruption",
+      "journal::recovery_tests::lost_result_ack_recovery_retains_exact_intent_and_never_allows_native_replay",
+      "journal::tests::acknowledged_release_leaves_no_per_run_adapter_state"
+    ],
+    "windows_log": "pr65-three-adapter-consumers-windows-first-v1.log",
+    "passed_each_os": 4,
+    "linux_log": "pr65-three-adapter-consumers-linux-first-v1.log"
+  },
+  "source_review": {
+    "reviewer": "Peirce01a13647 Musego3/xhigh",
+    "range": "3442f9d..bfc7ce1",
+    "head": "bfc7ce1",
+    "runtime_by_reviewer": false,
+    "verdict": "boundedNO_P1_P2"
+  },
+  "mechanical_delta": {
+    "scoped_hook": "db330a8 Option::replace preservesprevious-restoringRAII behavior; devfeatureonly",
+    "tests_moved": "cfg(test) recoverymodules toEOF in2Claude files; byte-preserved ASTrange relocation, no assertionorproductionbodychanges",
+    "proof": "pr65-test-module-move-proof-v1.json"
+  },
+  "final_gates": {
+    "scope": "scoped rustfmt/productionClippy andprocess+threeadapters+hostlib/tests warningsdenied",
+    "linux": {
+      "log": "journal-next-combined-strict-linux-v2.log",
+      "exit_code": 0
+    },
+    "windows": {
+      "log": "journal-next-combined-strict-windows-v2.log",
+      "exit_code": 0
+    }
+  },
+  "boundaries": [
+    "Windowsdurableunlink unavailable/notqualified; Unknown remains explicit",
+    "PR65full framing complete/torn/interiorinvalid/oversized/zero-byte repair/load/path/boot parity stillpending",
+    "PR69retentionremainder separate",
+    "No new journal engine/processregistry/model/native/live/crash/load/release/full459 qualification"
+  ],
+  "evidence_sha256": {
+    "pr65-windows-primitive-and-existing-ack-v2.log": "e2133f8464c9a14a830fa531abfc50f479c0a54a51aeba413e73e1f1a75d0b50",
+    "pr65-three-adapter-consumers-linux-first-v1.log": "a76e692c18ada2e571613f2d82add7b83cd25c458124482d3539964f1a751bc8",
+    "pr65-three-adapter-consumers-windows-first-v1.log": "821959df7ff3318345ee422d4b4585c49ef9c5010fcc9377a20ef784ee97a9c5",
+    "pr65-windows-existing-ack-caller-first-v1.log": "f2c3dc067915f9dde933c876ced45166ef7874a5351ef8d4d1e553a779b0f7b3",
+    "journal-next-combined-strict-windows-v2.log": "7042797b2cb26bb7c484c136749acbccc70ae4318bd6e131bfea5d70cba55738",
+    "journal-next-combined-strict-linux-v2.log": "3be391acf87edc087e29d0f1c5c0d517e77fbba5ab4a8094427c2a4ac9c794e6",
+    "pr65-linux-primitive-and-existing-ack-v1.log": "14c7e18c83f2e780e215dcf3cea6f410358470554a52fd507a3ef8db5d6819e6",
+    "pr65-test-module-move-proof-v1.json": "1a83b4d67a2d5f0ed0641491986706199871ec7d8ab35ed822d5064c40d2285c"
+  }
+}
