@@ -1045,7 +1045,15 @@ async fn r35_retired_unanswered_reviewer_has_no_current_grants_before_its_late_r
     let (f2_id, f2_token) = (reviewer_id(16), reviewer_token(16));
     register(store, s, &f1_id, &f1_token).await;
     register(store, s, &f2_id, &f2_token).await;
-    let (f1, a1) = assign(store, s, &f1_id, &f1_token, "r35-late-window-assign-1", None).await;
+    let (f1, a1) = assign(
+        store,
+        s,
+        &f1_id,
+        &f1_token,
+        "r35-late-window-assign-1",
+        None,
+    )
+    .await;
     let (_f2, a2) = assign(
         store,
         s,
@@ -1072,10 +1080,7 @@ async fn r35_retired_unanswered_reviewer_has_no_current_grants_before_its_late_r
     // Current-scope grants must deny the retired reviewer. The manager stays the
     // contrast: the same calls from the manager succeed.
     for (name, call) in [
-        (
-            "review.get",
-            json!({"review_assignment_id":a1}),
-        ),
+        ("review.get", json!({"review_assignment_id":a1})),
         ("review.list", json!({})),
     ] {
         let denied = store.call(f1.clone(), name.into(), call).await;
@@ -1089,11 +1094,7 @@ async fn r35_retired_unanswered_reviewer_has_no_current_grants_before_its_late_r
     }
     // The retired reviewer cannot read the current task submission either.
     let denied_submission = store
-        .call(
-            f1.clone(),
-            "task.get".into(),
-            json!({"task_id":s.0}),
-        )
+        .call(f1.clone(), "task.get".into(), json!({"task_id":s.0}))
         .await;
     match denied_submission {
         Err(error) => assert_eq!(
@@ -1115,10 +1116,7 @@ async fn r35_retired_unanswered_reviewer_has_no_current_grants_before_its_late_r
     .await;
     let late_view = review_get(store, manager(), &a1).await;
     assert_eq!(late_view["result"]["verdict"], "pass");
-    assert_eq!(
-        late_view["result"]["applicability"],
-        "historical_candidate"
-    );
+    assert_eq!(late_view["result"]["applicability"], "historical_candidate");
     assert_eq!(late_view["current_slot"], false);
     assert_eq!(late_view["current_candidate"], false);
     // After the result exists the window is closed: even the historical path no

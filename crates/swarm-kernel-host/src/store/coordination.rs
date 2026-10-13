@@ -2025,7 +2025,8 @@ fn validate_retained_review_tuple(db: &Connection, scope: &Value) -> Result<()> 
 /// `HistoricalFirstResult` is reserved for the retained-assignment result
 /// path, where an exact immutable assignment may already have been retired
 /// by a replacement before its first result was written.
-pub(crate) enum ReviewAssignmentVerification {
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum ReviewAssignmentVerification {
     Current,
     HistoricalFirstResult,
 }
@@ -2034,7 +2035,8 @@ fn verify_review_assignment(
     db: &Connection,
     reviewer_client_id: &str,
     registration: &Value,
-    scope: &Value, purpose: ReviewAssignmentVerification,
+    scope: &Value,
+    purpose: ReviewAssignmentVerification,
 ) -> Result<()> {
     let assignment_id = model::text(scope, "review_assignment_id")?;
     let event_key = format!("assignment:{assignment_id}");
