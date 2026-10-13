@@ -1989,8 +1989,7 @@ async fn claim_legacy_v1_task_requires_explicit_revise_to_v2() {
         start_store_with_config("pr40-v2-claim-gate", Config::default()).await;
     let store = owner.store.clone();
     seed_clients(&store).await;
-    let (task_id, _attempt_id) =
-        seed_retained_v1_attempt(&store, "pr40-v2-claim-gate", None).await;
+    let (task_id, _attempt_id) = seed_retained_v1_attempt(&store, "pr40-v2-claim-gate", None).await;
     let gm = principal("review-gm", Role::Manager);
     let err = store
         .call(

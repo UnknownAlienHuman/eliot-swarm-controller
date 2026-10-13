@@ -914,7 +914,9 @@ fn at_limit_root_claims_hold_with_limit_reached_before_any_new_effect() {
             if code == "ROUTE_ROOT_LIMIT_REACHED"
     ));
     assert_eq!(
-        launcher::require_route_admission(&at_limit).unwrap_err().code,
+        launcher::require_route_admission(&at_limit)
+            .unwrap_err()
+            .code,
         "ROUTE_ADMISSION_HELD"
     );
 }
