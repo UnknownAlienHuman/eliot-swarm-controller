@@ -81,12 +81,11 @@ fn insert_operation(
     operation_id: &str,
     caller_id: &str,
     method: &str,
-    task_id: Option<&str>,
-    attempt_id: Option<&str>,
+    scope_and_state: (Option<&str>, Option<&str>, &str),
     effective: &Value,
     result: &Value,
-    state: &str,
 ) {
+    let (task_id, attempt_id, state) = scope_and_state;
     let effective_raw = model::canonical(effective).unwrap();
     let result_raw = model::canonical(result).unwrap();
     db.execute(
@@ -147,11 +146,9 @@ fn scope_public_operator_diagnostic_vs_observer_filtered() {
         "matrix-op-op",
         "matrix-owner",
         "task.submit",
-        Some("matrix-task-op"),
-        Some("matrix-attempt-op"),
+        (Some("matrix-task-op"), Some("matrix-attempt-op"), "settled"),
         &json!({}),
         &json!({"outcome":"applied"}),
-        "settled",
     );
     let operator = test_principal("matrix-operator", Role::Operator);
     let observer = test_principal("matrix-observer", Role::Observer);
@@ -199,11 +196,13 @@ fn scope_public_exact_caller_receipt_does_not_grant_objects() {
         "matrix-op-caller",
         "matrix-caller",
         "task.dispatch",
-        Some("matrix-task-caller"),
-        Some("matrix-attempt-caller"),
+        (
+            Some("matrix-task-caller"),
+            Some("matrix-attempt-caller"),
+            "settled",
+        ),
         &json!({}),
         &json!({"outcome":"applied"}),
-        "settled",
     );
     let caller = test_principal("matrix-caller", Role::Participant);
     let unrelated = test_principal("matrix-unrelated", Role::Participant);
@@ -289,11 +288,13 @@ fn scope_public_current_manager_vs_unrelated_stale_released_denied() {
         "matrix-op-mgr",
         "matrix-other-caller",
         "task.submit",
-        Some("matrix-task-mgr"),
-        Some("matrix-attempt-current"),
+        (
+            Some("matrix-task-mgr"),
+            Some("matrix-attempt-current"),
+            "settled",
+        ),
         &json!({}),
         &json!({"outcome":"applied"}),
-        "settled",
     );
     let op_grant = resolve_operation_read(&db, &manager, "matrix-op-mgr")
         .unwrap()
@@ -318,11 +319,9 @@ fn scope_public_operation_list_filters_without_skipping_later_visible() {
             operation_id,
             caller,
             "task.dispatch",
-            None,
-            None,
+            (None, None, "rejected"),
             &json!({}),
             &json!({"ok":false}),
-            "rejected",
         );
     }
     insert_operation_position(&db, "matrix-list-a1", 1);
@@ -374,11 +373,13 @@ fn scope_public_queue_visibility_does_not_grant_exact_objects() {
         "matrix-op-queue",
         "matrix-queue-owner",
         "task.submit",
-        Some("matrix-task-queue"),
-        Some("matrix-attempt-queue"),
+        (
+            Some("matrix-task-queue"),
+            Some("matrix-attempt-queue"),
+            "settled",
+        ),
         &json!({}),
         &json!({"outcome":"applied"}),
-        "settled",
     );
     let viewer = test_principal("matrix-queue-viewer", Role::Manager);
     let owner = test_principal("matrix-queue-owner", Role::Manager);
@@ -452,8 +453,11 @@ fn scope_public_task_submission_artifact_inherits_narrowest_grant() {
         submit_operation_id,
         "matrix-art-submitter",
         "task.submit",
-        Some("matrix-task-art"),
-        Some("matrix-attempt-art"),
+        (
+            Some("matrix-task-art"),
+            Some("matrix-attempt-art"),
+            "settled",
+        ),
         &json!({"submission_document": document}),
         &json!({
             "outcome": "applied",
@@ -461,7 +465,6 @@ fn scope_public_task_submission_artifact_inherits_narrowest_grant() {
             "attempt_id": "matrix-attempt-art",
             "candidate_ref": candidate_id,
         }),
-        "settled",
     );
     db.execute(
         "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'task_submission',?3,?4,1,?5)",
@@ -525,11 +528,9 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
         "matrix-op-binding-without-attempt",
         "matrix-owner",
         "task.dispatch",
-        Some("matrix-task-bad"),
-        None,
+        (Some("matrix-task-bad"), None, "settled"),
         &json!({}),
         &json!({"outcome":"applied"}),
-        "settled",
     );
     db.execute(
         "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,created_at_ms) VALUES('matrix-binding',1,'matrix-bad-lane','matrix-bad-module','matrix-bad-artifact','ready','{}',1)",
@@ -549,11 +550,9 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
         "matrix-op-attempt-without-task",
         "matrix-owner",
         "task.dispatch",
-        None,
-        Some("matrix-attempt-bad"),
+        (None, Some("matrix-attempt-bad"), "settled"),
         &json!({}),
         &json!({"outcome":"applied"}),
-        "settled",
     );
     let err =
         resolve_operation_read(&db, &unrelated, "matrix-op-attempt-without-task").unwrap_err();
@@ -1782,28 +1781,28 @@ mod connected_store {
             }
         }
         denied_assembly_has_no_output(
-            &f,
+            f,
             &f.manager_b,
             &[first.clone(), second.clone()],
             "FORBIDDEN",
         )
         .await;
         denied_assembly_has_no_output(
-            &f,
+            f,
             &f.manager_a,
             &[first.clone(), first.clone()],
             "INVALID_PARAMS",
         )
         .await;
         denied_assembly_has_no_output(
-            &f,
+            f,
             &f.manager_a,
             &[second.clone(), first.clone()],
             "OBJECT_SCOPE_DAMAGED",
         )
         .await;
         denied_assembly_has_no_output(
-            &f,
+            f,
             &f.manager_a,
             std::slice::from_ref(&first),
             "OBJECT_SCOPE_DAMAGED",
@@ -1830,7 +1829,7 @@ mod connected_store {
         )
         .await;
         denied_assembly_has_no_output(
-            &f,
+            f,
             &f.manager_a,
             &[first.clone(), foreign_page],
             "ARTIFACT_SCOPE",
@@ -2049,7 +2048,7 @@ mod connected_store {
             Ok(())
         }).await.unwrap();
         denied_assembly_has_no_output(
-            &f,
+            f,
             &f.manager_a,
             &[first.clone(), second.clone()],
             "OBJECT_SCOPE_DAMAGED",
@@ -2199,7 +2198,7 @@ mod connected_store {
             "OBJECT_SCOPE_DAMAGED",
         )
         .await;
-        denied_assembly_has_no_output(&f, &f.operator, &[first, second], "OBJECT_SCOPE_DAMAGED")
+        denied_assembly_has_no_output(f, &f.operator, &[first, second], "OBJECT_SCOPE_DAMAGED")
             .await;
         setup.fixture.close().await;
     }

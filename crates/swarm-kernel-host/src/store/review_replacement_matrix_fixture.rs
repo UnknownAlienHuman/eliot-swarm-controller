@@ -286,10 +286,10 @@ async fn submit(
     subject: &(String, String, String, String),
     assignment_id: &str,
     request_id: &str,
-    verdict: &str,
-    coverage: &str,
+    verdict_and_coverage: (&str, &str),
     findings: &[serde_json::Value],
 ) -> String {
+    let (verdict, coverage) = verdict_and_coverage;
     let result = store
         .call(
             reviewer.clone(),
@@ -501,8 +501,7 @@ async fn r35_inconclusive_result_replaced_once() {
         s,
         &a1,
         "r35-inconclusive-submit-1",
-        "inconclusive",
-        "partial",
+        ("inconclusive", "partial"),
         &[],
     )
     .await;
@@ -546,8 +545,7 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
         c,
         &a1,
         "r35-chain-submit-1",
-        "changes_requested",
-        "complete",
+        ("changes_requested", "complete"),
         &findings_one(),
     )
     .await;
@@ -593,8 +591,7 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
         p,
         &pa1,
         "r35-pass-submit-1",
-        "pass",
-        "complete",
+        ("pass", "complete"),
         &[],
     )
     .await;
@@ -631,8 +628,7 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
         u,
         &ua1,
         "r35-undisposed-submit-1",
-        "changes_requested",
-        "complete",
+        ("changes_requested", "complete"),
         &findings_one(),
     )
     .await;
@@ -764,8 +760,7 @@ async fn r35_late_predecessor_excluded_from_consumers() {
         s,
         &a1,
         "r35-late-submit-1",
-        "changes_requested",
-        "complete",
+        ("changes_requested", "complete"),
         &findings_one(),
     )
     .await;
