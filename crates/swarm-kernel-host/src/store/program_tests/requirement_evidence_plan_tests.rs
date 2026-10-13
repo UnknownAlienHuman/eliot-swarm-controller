@@ -2054,7 +2054,7 @@ async fn claim_legacy_v1_task_requires_explicit_revise_to_v2() {
         .unwrap();
     let claimed = store
         .call(
-            gm,
+            gm.clone(),
             "task.claim".into(),
             json!({
                 "client_request_id":model::new_id(),
@@ -2065,7 +2065,16 @@ async fn claim_legacy_v1_task_requires_explicit_revise_to_v2() {
         )
         .await
         .unwrap();
-    assert_eq!(claimed["task_revision"], 2);
+    assert_eq!(claimed["created"], true);
+    let attempt = store
+        .call(
+            gm,
+            "attempt.get".into(),
+            json!({"attempt_id":claimed["attempt_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attempt["task_revision"], 2);
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
