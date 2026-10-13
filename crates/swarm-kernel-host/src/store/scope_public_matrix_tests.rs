@@ -2203,4 +2203,305 @@ mod connected_store {
             .await;
         setup.fixture.close().await;
     }
+
+    struct ReviewEvidenceSubject {
+        submission_ref: String,
+        candidate_ref: String,
+    }
+
+    // SQL-seeded review subject mirroring program_tests::seed_subject: an open
+    // Task with a submitted Attempt, candidate bytes, submission document and
+    // settled submit Operation. Every review row below is admitted through
+    // public Store calls; no review assignment, result or disposition is seeded.
+    async fn seed_review_subject(
+        store: &Store,
+        owner_id: &str,
+        suffix: &str,
+    ) -> ReviewEvidenceSubject {
+        let owner = owner_id.to_owned();
+        let suffix = suffix.to_owned();
+        store
+            .run(move |db| {
+                let task_id = format!("task-review-{suffix}");
+                let attempt_id = format!("attempt-review-{suffix}");
+                let candidate_ref = format!(
+                    "source-{}",
+                    model::digest(format!("candidate-{suffix}").as_bytes())
+                );
+                let submission_ref = format!(
+                    "submission-{}",
+                    model::digest(format!("submission-{suffix}").as_bytes())
+                );
+                let submission_operation_id = format!("submit-op-{suffix}");
+                let candidate_bytes = b"review evidence candidate fixture";
+                let candidate_digest = model::digest(candidate_bytes);
+                let spec_json = json!({
+                    "objective":format!("Review evidence fixture {suffix}"),
+                    "phase":"implementation",
+                    "requirements":[{"id":"R1","statement":"Preserve the exact review finding scope"}],
+                    "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
+                });
+                let spec: crate::model::TaskSpec =
+                    serde_json::from_value(spec_json.clone())?;
+                let edition =
+                    crate::policy::accepted_edition(Some(crate::policy::OWNER_POLICY_V2_ID))?;
+                let owner_policy = serde_json::to_value(edition)?;
+                let snapshot = json!({
+                    "spec":spec_json,
+                    "revision":1,
+                    "dependency_acceptances":[],
+                    "baseline_candidate":null,
+                    "owner_policy":owner_policy,
+                    "brief":spec.brief(),
+                });
+                db.execute(
+                    "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,'fixture',1,'open',?2,1,1)",
+                    params![task_id, model::canonical(&spec_json)?],
+                )?;
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'source_snapshot',?3,?4,1,?5)",
+                    params![
+                        candidate_ref,
+                        format!("artifacts/{candidate_ref}.bin"),
+                        i64::try_from(candidate_bytes.len()).unwrap(),
+                        candidate_digest,
+                        model::canonical(&json!({"attempt_id":attempt_id,"task_revision":1}))?,
+                    ],
+                )?;
+                let submission_document = json!({
+                    "schema_version":1,
+                    "operation_id":submission_operation_id,
+                    "task_id":task_id,
+                    "attempt_id":attempt_id,
+                    "task_revision":1,
+                    "phase":"implementation",
+                    "owner_id":owner,
+                    "submitted_by":owner,
+                    "previous_submission_ref":null,
+                    "candidate_ref":candidate_ref,
+                    "candidate_sha256":candidate_digest,
+                    "candidate_kind":"source_snapshot",
+                    "candidate_byte_length":candidate_bytes.len(),
+                    "summary":"fixture submission",
+                    "claims":[],
+                    "claim_counts":{"total":0,"met":0,"not_met":0,"deferred":0,"unreported":0},
+                    "evidence_level":"submitter_report",
+                    "source_checkout_verified":false,
+                });
+                let submission_digest =
+                    model::digest(model::canonical(&submission_document)?.as_bytes());
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'task_submission',?3,?4,1,?5)",
+                    params![
+                        submission_ref,
+                        format!("artifacts/{submission_ref}.bin"),
+                        i64::try_from(model::canonical(&submission_document)?.len()).unwrap(),
+                        submission_digest,
+                        model::canonical(&json!({"operation_id":submission_operation_id}))?,
+                    ],
+                )?;
+                db.execute(
+                    "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,state,producers_json,submission_ref,candidate_ref,created_at_ms,updated_at_ms) VALUES(?1,?2,1,?3,?4,'controller','submitted','[]',?5,?6,1,1)",
+                    params![
+                        attempt_id,
+                        task_id,
+                        model::canonical(&snapshot)?,
+                        owner,
+                        submission_ref,
+                        candidate_ref,
+                    ],
+                )?;
+                let submit_request = json!({
+                    "client_request_id":format!("submit-request-{suffix}"),
+                    "attempt_id":attempt_id,
+                    "expected_revision":1,
+                    "expected_submission_ref":null,
+                    "candidate_ref":candidate_ref,
+                });
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_json,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.submit',?4,?5,?6,?7,'settled',?8,1,1,1,1)",
+                    params![
+                        submission_operation_id,
+                        owner,
+                        format!("submit-request-{suffix}"),
+                        model::canonical(&submit_request)?,
+                        model::canonical(&json!({"submission_document":submission_document}))?,
+                        task_id,
+                        attempt_id,
+                        model::canonical(&json!({
+                            "operation_id":submission_operation_id,
+                            "outcome":"applied",
+                            "attempt_id":attempt_id,
+                            "submission_ref":submission_ref,
+                            "candidate_ref":candidate_ref,
+                            "task_accepted":false,
+                        }))?,
+                    ],
+                )?;
+                Ok(ReviewEvidenceSubject {
+                    submission_ref,
+                    candidate_ref,
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    // PR51 row 4 / PR52 evidence rows: a sponsored reviewer reads only the
+    // exact assigned submission and review evidence through public calls and
+    // gains nothing else of the Task graph. Live CheckRun admission needs a
+    // configured check profile and stays an unmet row after this fixture.
+    #[tokio::test]
+    async fn store_authenticated_reviewer_submission_evidence_is_exact() {
+        let f = start().await;
+        let store = &f.owner.store;
+        let owner_id = f.manager_a.client_id.clone();
+        let subject = seed_review_subject(store, &owner_id, "evidence-a").await;
+        let foreign = seed_review_subject(store, &owner_id, "evidence-b").await;
+
+        let reviewer_id = "scope-sponsored-reviewer";
+        let reviewer_token = "scope-sponsored-reviewer-token".to_owned();
+        let pending_scope = json!({
+            "review_assignment_id":null,
+            "task_id":format!("task-review-evidence-a"),
+            "attempt_id":format!("attempt-review-evidence-a"),
+            "task_revision":1,
+            "submission_ref":subject.submission_ref,
+            "candidate_ref":subject.candidate_ref,
+        });
+        write(
+            store,
+            &f.manager_a,
+            "coordination.participant.register",
+            json!({
+                "client_request_id":format!("register-{reviewer_id}"),
+                "client_id":reviewer_id,
+                "token_hash":model::digest(reviewer_token.as_bytes()),
+                "task_id":format!("task-review-evidence-a"),
+                "task_revision":1,
+                "attempt_id":format!("attempt-review-evidence-a"),
+                "participation_basis":{"kind":"sponsored_reviewer","review_scope":pending_scope},
+            }),
+        )
+        .await;
+        let assignment = write(
+            store,
+            &f.manager_a,
+            "review.assign",
+            json!({
+                "client_request_id":format!("assign-{reviewer_id}"),
+                "attempt_id":format!("attempt-review-evidence-a"),
+                "expected_revision":1,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "reviewer_client_id":reviewer_id,
+            }),
+        )
+        .await;
+        let assignment_id = assignment["review_assignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let reviewer = store
+            .authenticate(crate::model::Credential {
+                client_id: reviewer_id.into(),
+                token: reviewer_token,
+            })
+            .await
+            .unwrap();
+        let result = write(
+            store,
+            &reviewer,
+            "review.submit",
+            json!({
+                "client_request_id":format!("submit-{assignment_id}"),
+                "review_assignment_id":assignment_id,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "verdict":"pass",
+                "coverage":"complete",
+                "findings":[],
+                "evidence_refs":["evidence://review/r1"],
+            }),
+        )
+        .await;
+        assert_eq!(result["verdict"], "pass");
+
+        let view = call(
+            store,
+            &reviewer,
+            "review.get",
+            json!({"review_assignment_id":assignment_id}),
+        )
+        .await;
+        assert_eq!(view["current_slot"], true);
+        assert_eq!(view["assignment"]["reviewer_client_id"], reviewer_id);
+        assert_eq!(view["result"]["verdict"], "pass");
+        let context = call(
+            store,
+            &reviewer,
+            "swarm.review.context",
+            json!({"review_assignment_id":assignment_id}),
+        )
+        .await;
+        assert_eq!(
+            context["context"]["submission"]["candidate_ref"],
+            subject.candidate_ref
+        );
+        assert_eq!(
+            context["context"]["candidate"]["artifact_id"],
+            subject.candidate_ref
+        );
+
+        let evidence = call(
+            store,
+            &reviewer,
+            "task.submission",
+            json!({"submission_ref":subject.submission_ref,"after":0,"limit":10}),
+        )
+        .await;
+        let evidence_json = model::canonical(&evidence).unwrap();
+        assert!(
+            evidence_json.contains(&subject.submission_ref),
+            "exact submission missing: {evidence_json}"
+        );
+        assert!(
+            !evidence_json.contains(&foreign.submission_ref),
+            "foreign submission leaked: {evidence_json}"
+        );
+
+        denied(
+            store,
+            &reviewer,
+            "task.submission",
+            json!({"submission_ref":foreign.submission_ref,"after":0,"limit":10}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "review.get",
+            json!({"review_assignment_id":assignment_id}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "review.get",
+            json!({"review_assignment_id":assignment_id}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &reviewer,
+            "review.get",
+            json!({"review_assignment_id":"review-assignment-unknown"}),
+            "REVIEW_ASSIGNMENT_NOT_FOUND",
+        )
+        .await;
+        f.close().await;
+    }
 }
