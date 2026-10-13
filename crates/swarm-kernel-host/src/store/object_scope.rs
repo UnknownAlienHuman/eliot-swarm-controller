@@ -446,16 +446,20 @@ fn current_participant_scope(
         Err(error) if known_scope_denial(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
-    if bounded_text(&scope, "task_id").as_deref() != Some(identity.task_id.as_str()) {
+    // The verified projection nests Task/Attempt facts; flat top-level reads
+    // never match and silently denied every current Participant grant.
+    let scoped_task = &scope["task"];
+    let scoped_attempt = &scope["attempt"];
+    if bounded_text(scoped_task, "task_id").as_deref() != Some(identity.task_id.as_str()) {
         return Ok(false);
     }
     if let Some(expected) = identity.task_revision
-        && scope.get("task_revision").and_then(Value::as_i64) != Some(expected)
+        && scoped_task.get("revision").and_then(Value::as_i64) != Some(expected)
     {
         return Ok(false);
     }
     if let Some(attempt_id) = identity.attempt_id.as_deref()
-        && bounded_text(&scope, "attempt_id").as_deref() != Some(attempt_id)
+        && bounded_text(scoped_attempt, "attempt_id").as_deref() != Some(attempt_id)
     {
         return Ok(false);
     }
