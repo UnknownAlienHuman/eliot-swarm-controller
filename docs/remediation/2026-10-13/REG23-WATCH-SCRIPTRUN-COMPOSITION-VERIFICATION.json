@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "problem": "A damaged coordination watch blocked healthy subjects; pending ScriptRun paging could starve later admitted runs; queued cancellation used an incompatible terminal projection",
+  "behavior": "Quarantine damaged watch subjects and advance the cursor atomically, keep Store/global faults hard, persist pending-run page fairness, cancel queued runs through the schema terminal without leaking private reason through public operation readback",
+  "base_main": "d81df280eb50ca94a53afbe18e11e5d1b1002eea",
+  "source_bindings": [
+    {
+      "path": "crates/swarm-kernel-host/src/store/scripts_pending_run_fairness_tests.rs",
+      "sha256": "2DC94E026E95C5FC9D0104A7CD798271BEAEF7C0576805F230CF718FEB8179E1"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/scripts.rs",
+      "sha256": "2EEDF18C7130860A374E3F95EEC9C07DF7D6D8A49C6D4CE869F5E2F55CD3C33A"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/coordination_watch_quarantine_tests.rs",
+      "sha256": "848FF4741D6853F2D15CA532EA5311889686A553FCC44BEC90259FC2C998FFE3"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/automation_intake.rs",
+      "sha256": "4CB11348A66299D07699A3D596030EA150872A5DC6806A52ADE6F5DC505160B0"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/coordination_watch.rs",
+      "sha256": "6F51B734AABD51CDA4E6FF661149889027DC581E41A7768C04D9D1E4732C5C4C"
+    }
+  ],
+  "coherent_composition_manifest_sha256": "E59404FDA52E6952868975B07F7C371F0217A11EA1F8DC55BDF1FF5CE8122936",
+  "code_understanding_proof_sha256": "C7CDC7837578C2D295481837295FB32309237A7A3D361CEDF38F67E349E632AC",
+  "strict_clippy": [
+    {
+      "receipt": "reg23-watch-script-main-windows-clippy-v1-20261013.json",
+      "receipt_sha256": "58B672DB674BF1A43DFC0ACC2CA54E4DAFBD9FD0CAA5CC4FEA61F1F6BD802C46",
+      "command": "cargo +1.98.1 clippy --offline --locked -p swarm-kernel-host --lib --tests --no-deps -- -D warnings",
+      "exit_code": 0,
+      "log_sha256": "834617DA79B06E35C9F8AB4C43FD6EAC9AAC58E7952A0B001C345406A5B65B37",
+      "source_manifest_sha256": "E59404FDA52E6952868975B07F7C371F0217A11EA1F8DC55BDF1FF5CE8122936"
+    },
+    {
+      "receipt": "reg23-watch-script-main-linux-clippy-v1-20261013.json",
+      "receipt_sha256": "3F10BBFC2C0C1F47B1654EA664DAB2A424641C55AF22A662BD33D78034550150",
+      "command": "env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo +1.98.1 clippy --offline --locked -p swarm-kernel-host --lib --tests --no-deps -- -D warnings",
+      "exit_code": 0,
+      "log_sha256": "5884C7D6577FF678218D679A80F2E915D2C7390708E0243F395437AA80291CEB",
+      "source_manifest_sha256": "E59404FDA52E6952868975B07F7C371F0217A11EA1F8DC55BDF1FF5CE8122936"
+    }
+  ],
+  "retained_individual_consumer_results": [
+    {
+      "receipt": "reg23-watch-script-manager-windows-consumers-v1-20261013.json",
+      "receipt_sha256": "0EA576D182F2FCCA75141D1910986B2D34892DF20DA782ACEBA821D139DC11C5",
+      "command": "cargo +1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib -E test(reg23_watch_) | test(reg23_pending_run_cursor_) --success-output immediate",
+      "overall_exit_code": 100,
+      "log_sha256": "BB371E7421B00D56E1EBB88D7E2D7031642C9BBFEA5F3F822831A7D4F15584CF",
+      "individual_passed_cases": [
+        "        PASS [ 122.146s] (3/3) swarm-kernel-host store::scripts::scripts_pending_run_fairness_tests::reg23_pending_run_cursor_reaches_the_65th_public_admission_after_reopen"
+      ],
+      "source_stable": true,
+      "scope": "Three actual public Store producer/consumer cases: damaged watch+healthy neighbor, cursor-write rollback/retry,65th public ScriptRun admission/durable page/reopen. No host supervisor or native child/model custody qualification.",
+      "execution_source_copy": "C:/Development/Rust/qualification-copies/swarm-v27-20261012/watch-script-repaired-manager-v3"
+    },
+    {
+      "receipt": "reg23-script-cancellation-windows-consumers-v2-20261013.json",
+      "receipt_sha256": "3CB6D3EEC6831E1BD2FD655753532E9E1A73391DC8B5EB30B2957423ABDA4416",
+      "command": "cargo +1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib -E test(reg23_public_queued_script_cancellation_uses_schema_terminal_and_survives_reopen) | test(reg23_watch_cursor_write_failure_rolls_back_subject_and_retry_matches) | test(reg23_watch_quarantines_invalid_retained_scope_and_matches_healthy_neighbor) --success-output immediate",
+      "overall_exit_code": 100,
+      "log_sha256": "29929FFF5426CB7B810DB1ECB547B89876B20324785BCF34752D948CE012F64D",
+      "individual_passed_cases": [
+        "        PASS [   4.359s] (1/3) swarm-kernel-host store::coordination_watch::coordination_watch_quarantine_tests::reg23_watch_cursor_write_failure_rolls_back_subject_and_retry_matches",
+        "        PASS [   6.295s] (3/3) swarm-kernel-host store::coordination_watch::coordination_watch_quarantine_tests::reg23_watch_quarantines_invalid_retained_scope_and_matches_healthy_neighbor"
+      ],
+      "source_stable": true,
+      "scope": "New genuine public queued ScriptRun cancellation producer/replay/reopen plus two blocked watch consumers; completed65th admission fairness gate retained without repeat",
+      "execution_source_copy": "C:/Development/Rust/qualification-copies/swarm-v27-20261012/watch-script-repaired-manager-v4"
+    },
+    {
+      "receipt": "reg23-script-cancellation-windows-consumers-v4-20261013.json",
+      "receipt_sha256": "03C395C46891EE5A905C2F659CB62154B18E2FFCD9B96F8DABF4B30DCE7B3EBB",
+      "command": "cargo +1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib --no-tests=fail --retries0 -E test(=store::scripts::script_trigger_admission_isolation_tests::reg23_public_queued_script_cancellation_uses_schema_terminal_and_survives_reopen) --success-output immediate",
+      "overall_exit_code": 0,
+      "log_sha256": "64F4BA3303F2BB1E016FF3D83EEEFA6D1672105130F7BB00C809CC9763C99C67",
+      "individual_passed_cases": [
+        "        PASS [   4.816s] (1/1) swarm-kernel-host store::scripts::script_trigger_admission_isolation_tests::reg23_public_queued_script_cancellation_uses_schema_terminal_and_survives_reopen"
+      ],
+      "source_stable": true,
+      "scope": "Only changed-condition genuine public queued cancellation producer/replay/reopen regression with exact retained private reason and safe public not_projected result; prior two watch and65th admission fairness PASS retained without repeat",
+      "execution_source_copy": "C:/Development/Rust/qualification-copies/swarm-v27-20261012/watch-script-repaired-manager-v5"
+    },
+    {
+      "receipt": "reg23-script-cancellation-linux-consumer-v1-20261013.json",
+      "receipt_sha256": "037FAECF05122F5B4ABD458F1DA81EC84ED6E68951B30E2D20D25BDDCD5653C2",
+      "command": "env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo +1.98.1 nextest run --offline --locked -p swarm-kernel-host --lib --no-tests=fail --retries 0 -E 'test(=store::scripts::script_trigger_admission_isolation_tests::reg23_public_queued_script_cancellation_uses_schema_terminal_and_survives_reopen)' --success-output immediate",
+      "overall_exit_code": 0,
+      "log_sha256": "01DC8F78D75544F829EC2E29835A319DE141F3F93EB15D7BB89233B3D4794032",
+      "individual_passed_cases": [
+        "        PASS [  19.983s] (1/1) swarm-kernel-host store::scripts::script_trigger_admission_isolation_tests::reg23_public_queued_script_cancellation_uses_schema_terminal_and_survives_reopen"
+      ],
+      "source_stable": true,
+      "scope": "Changed queued ScriptRun cancellation retained reason and safe public projection regression only; previous watch/fairness results retained",
+      "execution_source_copy": "C:/Development/Rust/qualification-copies/swarm-v27-20261012/watch-script-repaired-manager-linux-v5"
+    }
+  ],
+  "carry_reason": "Current-main composition adds only disjoint delivered CheckRun files to the already guarded watch/fairness/cancellation source. Two historical cohorts have failed overall results; only listed individual PASS cases are retained, corrected cancellation is separately PASS.",
+  "consumer_cohort_reexecuted_on_composition": false,
+  "linux_changed_cancellation_consumer": "PASS",
+  "whole_REG23_complete": false,
+  "full_v27_qualified": false,
+  "installed_native_provider_model_qualified": false,
+  "remaining": "OpenCode isolation, ScriptTriggerState, remaining REG23 and all V27 qualification obligations",
+  "prepared_at_utc": "2026-10-13T09:56:14.2807153+00:00",
+  "preformat_source_bindings": [
+    {
+      "path": "crates/swarm-kernel-host/src/store/scripts_pending_run_fairness_tests.rs",
+      "sha256": "9C293105864690D3A86C45734E4A4C4F6099A2D408D8DD61DEC989D04A846610"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/scripts.rs",
+      "sha256": "2EEDF18C7130860A374E3F95EEC9C07DF7D6D8A49C6D4CE869F5E2F55CD3C33A"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/coordination_watch_quarantine_tests.rs",
+      "sha256": "140F50BE4C3A5D096134AE79842AD020102F6DA54C9B0BED0A515030CC9609FE"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/automation_intake.rs",
+      "sha256": "4CB11348A66299D07699A3D596030EA150872A5DC6806A52ADE6F5DC505160B0"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/coordination_watch.rs",
+      "sha256": "6F51B734AABD51CDA4E6FF661149889027DC581E41A7768C04D9D1E4732C5C4C"
+    }
+  ],
+  "format_admission": {
+    "tool": "rustfmt1.98.1",
+    "command": "rustfmt +1.98.1 --edition 2024 --config skip_children=true two owned test files",
+    "owned_files": [
+      "crates/swarm-kernel-host/src/store/coordination_watch_quarantine_tests.rs",
+      "crates/swarm-kernel-host/src/store/scripts_pending_run_fairness_tests.rs"
+    ],
+    "diff_sha256": "C0B741F662649DC6216F01E398407F9EB06D1F31602F22FE75B376CD992F6FB2",
+    "changed_behavior": false,
+    "verifier": "Actual repository just verify on amended source",
+    "historical_compiler_and_consumer_receipts": "Preformat source; retained as such. Final exact production lint is separately recorded."
+  }
+}

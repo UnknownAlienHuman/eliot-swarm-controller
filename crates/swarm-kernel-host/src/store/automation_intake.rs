@@ -609,7 +609,7 @@ fn script_run_lifecycle_event_projection(
                    AND o.source_event_key='operation:' || op.operation_id || ':operation_cancelled' \
                    AND op.method='script.run' AND op.state='cancelled' \
                    AND op.settled_at_ms=o.recorded_at_ms \
-                   AND r.state='cancelled' AND r.finished_at_ms=o.recorded_at_ms \
+                   AND r.state='failed' AND r.finished_at_ms=o.recorded_at_ms \
                    AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id \
                    AND ((r.task_id IS NULL AND r.task_revision IS NULL AND r.attempt_id IS NULL) \
                      OR (r.task_id IS NOT NULL AND r.task_revision>0 AND r.attempt_id IS NOT NULL)) \
@@ -1195,7 +1195,7 @@ pub(crate) fn safe_event_projection(
             "SELECT r.run_id FROM operations AS op \
              JOIN script_runs AS r ON r.operation_id=op.operation_id \
              WHERE op.operation_id=?1 AND op.method='script.run' AND op.state='cancelled' \
-               AND op.settled_at_ms=?2 AND r.state='cancelled' AND r.finished_at_ms=?2 \
+               AND op.settled_at_ms=?2 AND r.state='failed' AND r.finished_at_ms=?2 \
                AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id",
             params![operation_id, event.recorded_at_ms],
             |row| row.get(0),

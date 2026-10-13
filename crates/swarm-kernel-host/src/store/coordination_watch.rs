@@ -3,7 +3,7 @@
 //! Watch notifications are metadata headers. They never become peer messages,
 //! Operations that start work, or runtime/model wake requests.
 
-use super::{coordination, meta, operations, set_meta, submissions, tasks};
+use super::{automation_reconcile, coordination, meta, operations, set_meta, submissions, tasks};
 use crate::{
     coordination::{self as keys, watch},
     error::{Error, Result},
@@ -21,6 +21,7 @@ const SUBJECT_PREFIX: &str = "coordination:watch:v1:subject:";
 const NOTICE_PREFIX: &str = "coordination:watch:v1:notice:";
 const OWNER_NOTICE_PREFIX: &str = "coordination:watch:v1:owner-notice:";
 const RECONCILE_CURSOR_KEY: &str = "coordination:watch:v1:reconcile_cursor";
+const QUARANTINE_PREFIX: &str = "coordination:watch:v1:quarantine:";
 const MAX_RECONCILE_LIMIT: i64 = 256;
 const DEFAULT_NOTICE_LIMIT: i64 = 20;
 
@@ -317,9 +318,272 @@ fn watch_list_entry_is_damaged(error: &Error) -> bool {
     )
 }
 
+#[cfg(test)]
+#[path = "coordination_watch_quarantine_tests.rs"]
+mod coordination_watch_quarantine_tests;
 /// Process one bounded page of current watches from the shared Store tick.
 /// The durable cursor, one-shot receipt, and mailbox header update commit with
 /// the caller's transaction.
+/// Store-private subject vocabulary for one watch row. The domain maps
+/// only its own known semantic errors; anything unrecognized stays hard.
+enum WatchSubjectDisposition {
+    Applied(WatchSubjectKind),
+    Skipped,
+    Quarantined {
+        code: String,
+        evidence: automation_reconcile::QuarantineEvidence,
+    },
+}
+
+enum WatchSubjectKind {
+    Matched,
+    Expired,
+    Stale,
+}
+
+/// Bounded quarantine identity for one retained watch subject. Only digests
+/// and the retained key pointer are written; the damaged record itself is
+/// never rewritten or removed by this path.
+fn watch_subject_evidence(
+    active_key: &str,
+    raw_index: &str,
+) -> automation_reconcile::QuarantineEvidence {
+    automation_reconcile::QuarantineEvidence {
+        subject_identity: format!(
+            "watch-active-key-sha256:{}",
+            model::digest(active_key.as_bytes())
+        ),
+        source_pointer: Some(format!(
+            "meta/key-sha256:{}",
+            model::digest(active_key.as_bytes())
+        )),
+        source_digest: Some(model::digest(raw_index.as_bytes())),
+    }
+}
+
+/// Domain-specific classifier for retained watch rows. Only a semantically
+/// damaged retained record produces bounded quarantine evidence. SQLite,
+/// read, write, commit and savepoint failures return None and stay fatal.
+fn classify_watch_subject(
+    error: &Error,
+    active_key: &str,
+    raw_index: &str,
+) -> Option<automation_reconcile::SubjectErrorDisposition> {
+    match error.code.as_str() {
+        "WATCH_RECORD_DAMAGED" => {
+            Some(automation_reconcile::SubjectErrorDisposition::Quarantined {
+                code: error.code.clone(),
+                evidence: watch_subject_evidence(active_key, raw_index),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Remove an already-quarantined subject from the durable active index and
+/// advance the reconcile cursor in the same transaction as its evidence, so
+/// the cursor only ever moves past a disposed subject.
+fn retire_quarantined_watch(
+    tx: &Transaction<'_>,
+    active_key: &str,
+    evidence: &automation_reconcile::QuarantineEvidence,
+    code: &str,
+    now: i64,
+) -> Result<()> {
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, evidence)?;
+    match automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            automation_reconcile::persist_quarantine(tx, &record_key, code, evidence.clone(), now)?;
+            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+            Ok(automation_reconcile::SubjectDisposition::Applied(()))
+        },
+        |_| None,
+    )? {
+        automation_reconcile::SubjectDisposition::Applied(()) => Ok(()),
+        _ => Err(Error::new(
+            "WATCH_QUARANTINE_INVALID",
+            "quarantined watch subject did not produce durable evidence",
+        )),
+    }
+}
+
+/// One bounded subject behind the shared subject savepoint. Global row scans,
+/// the reconcile cursor and their writes stay outside this boundary, so a
+/// broken index or cursor still fails the whole domain transaction.
+fn reconcile_watch_subject(
+    tx: &Transaction<'_>,
+    active_key: &str,
+    raw_index: &str,
+    now: i64,
+) -> Result<WatchSubjectDisposition> {
+    // The subject runs inside the shared savepoint helper, whose own
+    // vocabulary is Applied / Pending / Skipped / Quarantined. The watch
+    // domain maps its outcome into that vocabulary here and records the
+    // matched / expired / stale ledger in the Applied payload.
+    let disposition = automation_reconcile::with_subject_savepoint(
+        tx,
+        || {
+            let index: Value = serde_json::from_str(raw_index)?;
+            let watch_id = model::text(&index, "watch_id")?;
+            let Some(mut record) = meta(tx, &record_key(watch_id))? else {
+                tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+                return Ok(automation_reconcile::SubjectDisposition::Skipped {
+                    code: "WATCH_ACTIVE_WITHOUT_RECORD".to_owned(),
+                    reason: "active index row has no retained watch record".to_owned(),
+                });
+            };
+            // A damaged retained record is classified by the domain below;
+            // the classifier decides whether it becomes bounded quarantine.
+            verify_reconcile_record(&record, watch_id)?;
+            if record["state"] != "active" {
+                tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+                return Ok(automation_reconcile::SubjectDisposition::Skipped {
+                    code: "WATCH_NOT_ACTIVE".to_owned(),
+                    reason: "retained watch is not active".to_owned(),
+                });
+            }
+            let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
+            let deadline_boundary = record["watch_kind"] == "exact_deadline_reached"
+                && record["address"]["expected_deadline_ms"]
+                    .as_i64()
+                    .is_some_and(|deadline| expires_at_ms >= deadline);
+            if !deadline_boundary && expires_at_ms <= now {
+                settle_record(tx, &mut record, "expired", now)?;
+                return Ok(automation_reconcile::SubjectDisposition::Applied(
+                    WatchSubjectKind::Expired,
+                ));
+            }
+            let creator_is_current = if record["watch_kind"] == "operation_terminal" {
+                stored_creator_scope_is_current(tx, &record)?
+            } else {
+                event_creator_is_current(tx, &record)?
+            };
+            if !creator_is_current {
+                settle_record(tx, &mut record, "stale_scope", now)?;
+                return Ok(automation_reconcile::SubjectDisposition::Applied(
+                    WatchSubjectKind::Stale,
+                ));
+            }
+            match event_cursor(tx, &record, now)? {
+                EventCursor::Pending => {
+                    if expires_at_ms <= now {
+                        settle_record(tx, &mut record, "expired", now)?;
+                        return Ok(automation_reconcile::SubjectDisposition::Applied(
+                            WatchSubjectKind::Expired,
+                        ));
+                    }
+                    Ok(automation_reconcile::SubjectDisposition::Skipped {
+                        code: "WATCH_EVENT_PENDING".to_owned(),
+                        reason: "watch event cursor is still pending".to_owned(),
+                    })
+                }
+                EventCursor::StaleSubject => {
+                    // Exact historical subjects are readable only as bounded
+                    // transition facts. Missing or mismatched identities settle
+                    // visibly without projecting their retained context.
+                    settle_record(tx, &mut record, "stale_subject", now)?;
+                    Ok(automation_reconcile::SubjectDisposition::Applied(
+                        WatchSubjectKind::Stale,
+                    ))
+                }
+                EventCursor::Matched(cursor) => {
+                    let scope = scope_from_record(&record)?;
+                    let creator_id = model::text(&record["creator"], "client_id")?;
+                    let creator_role = model::text(&record["creator"], "role")?;
+                    let watch_kind = model::text(&record, "watch_kind")?;
+                    let notification = if watch_kind == "operation_terminal" {
+                        // Preserve the original O1 notification envelope for
+                        // existing inbox consumers while the event-kind
+                        // envelopes stay fact-only.
+                        json!({
+                            "schema":NOTICE_SCHEMA,
+                            "notification_id":watch_id,
+                            "watch_id":watch_id,
+                            "watch_kind":watch_kind,
+                            "operation_id":record["address"]["operation_id"],
+                            "state":cursor["state"],
+                            "matched_at_ms":now,
+                        })
+                    } else {
+                        json!({
+                            "schema":NOTICE_SCHEMA,
+                            "notification_id":watch_id,
+                            "watch_id":watch_id,
+                            "watch_kind":watch_kind,
+                            "address":record["address"],
+                            "facts":notification_facts(watch_kind, &record["address"], &cursor),
+                            "matched_at_ms":now,
+                        })
+                    };
+                    let notice_index_key = match creator_role {
+                        "participant" => {
+                            let notice_key = notice_key(&scope.id, creator_id, now, watch_id);
+                            set_meta(
+                                tx,
+                                &notice_key,
+                                &json!({"watch_id":watch_id,"notification_id":watch_id}),
+                            )?;
+                            set_meta(
+                                tx,
+                                &owner_notice_key(creator_id, now, watch_id),
+                                &json!({
+                                    "watch_id":watch_id,
+                                    "scope_id":scope.id,
+                                    "notice_index_key":notice_key,
+                                }),
+                            )?;
+                            json!(notice_key)
+                        }
+                        "manager" | "operator" => Value::Null,
+                        _ => return Err(damaged("watch creator role is unsupported")),
+                    };
+                    record["cursor"] = cursor;
+                    record["notification"] = notification;
+                    record["state"] = json!("matched");
+                    record["updated_at_ms"] = json!(now);
+                    record["settled_at_ms"] = json!(now);
+                    record["notice_index_key"] = notice_index_key;
+                    set_meta(tx, &record_key(watch_id), &record)?;
+                    tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+                    Ok(automation_reconcile::SubjectDisposition::Applied(
+                        WatchSubjectKind::Matched,
+                    ))
+                }
+            }
+        },
+        |error| classify_watch_subject(error, active_key, raw_index),
+    )?;
+    // Translate the shared vocabulary into this domain’s ledger value.
+    Ok(match disposition {
+        automation_reconcile::SubjectDisposition::Applied(kind) => {
+            WatchSubjectDisposition::Applied(kind)
+        }
+        automation_reconcile::SubjectDisposition::Skipped { .. } => {
+            WatchSubjectDisposition::Skipped
+        }
+        automation_reconcile::SubjectDisposition::Quarantined { code, evidence } => {
+            WatchSubjectDisposition::Quarantined { code, evidence }
+        }
+        // The watch domain never produces Pending itself, so an unexpected
+        // Pending is a hard contract violation rather than a silent skip.
+        automation_reconcile::SubjectDisposition::Pending { code, .. } => {
+            return Err(Error::new(
+                "WATCH_SUBJECT_PENDING_UNEXPECTED",
+                "watch subject isolation reported an unsupported pending disposition",
+            )
+            .with_secondary_code(code));
+        }
+    })
+}
+
+/// Process one bounded page of current watches from the shared Store tick.
+/// The durable cursor, one-shot receipt, and mailbox header update commit with
+/// the caller's transaction. A semantically damaged retained subject is
+/// quarantined with its evidence and removed from the active index in the same
+/// transaction that advances the cursor, so one poison row cannot starve the
+/// subjects behind it. A broken global active index or reconcile cursor fails
+/// the whole domain transaction without partial subject writes.
 pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Value> {
     let limit = limit.clamp(1, MAX_RECONCILE_LIMIT);
     let cursor = meta(tx, RECONCILE_CURSOR_KEY)?
@@ -329,118 +593,24 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
     let mut matched = 0usize;
     let mut expired = 0usize;
     let mut stale = 0usize;
+    let mut quarantined = 0usize;
     let mut last_key = None;
     for (active_key, raw_index) in &rows {
         last_key = Some(active_key.clone());
-        let index: Value = serde_json::from_str(raw_index)?;
-        let watch_id = model::text(&index, "watch_id")?;
-        let Some(mut record) = meta(tx, &record_key(watch_id))? else {
-            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-            stale += 1;
-            continue;
-        };
-        verify_record(&record, watch_id)?;
-        if record["state"] != "active" {
-            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-            stale += 1;
-            continue;
-        }
-        let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
-        let deadline_boundary = record["watch_kind"] == "exact_deadline_reached"
-            && record["address"]["expected_deadline_ms"]
-                .as_i64()
-                .is_some_and(|deadline| expires_at_ms >= deadline);
-        if !deadline_boundary && expires_at_ms <= now {
-            settle_record(tx, &mut record, "expired", now)?;
-            expired += 1;
-            continue;
-        }
-        let creator_is_current = if record["watch_kind"] == "operation_terminal" {
-            stored_creator_scope_is_current(tx, &record)?
-        } else {
-            event_creator_is_current(tx, &record)?
-        };
-        if !creator_is_current {
-            settle_record(tx, &mut record, "stale_scope", now)?;
-            stale += 1;
-            continue;
-        }
-        let cursor = match event_cursor(tx, &record, now)? {
-            EventCursor::Pending => {
-                if expires_at_ms <= now {
-                    settle_record(tx, &mut record, "expired", now)?;
-                    expired += 1;
-                }
-                continue;
+        match reconcile_watch_subject(tx, active_key, raw_index, now)? {
+            WatchSubjectDisposition::Applied(kind) => match kind {
+                WatchSubjectKind::Matched => matched += 1,
+                WatchSubjectKind::Expired => expired += 1,
+                WatchSubjectKind::Stale => stale += 1,
+            },
+            WatchSubjectDisposition::Skipped => stale += 1,
+            WatchSubjectDisposition::Quarantined { code, evidence } => {
+                // The active-index row is removed with its durable evidence, so
+                // the cursor only advances past a disposed subject.
+                retire_quarantined_watch(tx, active_key, &evidence, &code, now)?;
+                quarantined += 1;
             }
-            EventCursor::StaleSubject => {
-                // Exact historical subjects are readable only as bounded
-                // transition facts. Missing or mismatched identities settle
-                // visibly without projecting their retained context.
-                settle_record(tx, &mut record, "stale_subject", now)?;
-                stale += 1;
-                continue;
-            }
-            EventCursor::Matched(cursor) => cursor,
-        };
-        let scope = scope_from_record(&record)?;
-        let creator_id = model::text(&record["creator"], "client_id")?;
-        let creator_role = model::text(&record["creator"], "role")?;
-        let watch_kind = model::text(&record, "watch_kind")?;
-        let notification = if watch_kind == "operation_terminal" {
-            // Preserve the original O1 notification envelope for existing
-            // inbox consumers while the event-kind envelopes stay fact-only.
-            json!({
-                "schema":NOTICE_SCHEMA,
-                "notification_id":watch_id,
-                "watch_id":watch_id,
-                "watch_kind":watch_kind,
-                "operation_id":record["address"]["operation_id"],
-                "state":cursor["state"],
-                "matched_at_ms":now,
-            })
-        } else {
-            json!({
-                "schema":NOTICE_SCHEMA,
-                "notification_id":watch_id,
-                "watch_id":watch_id,
-                "watch_kind":watch_kind,
-                "address":record["address"],
-                "facts":notification_facts(watch_kind, &record["address"], &cursor),
-                "matched_at_ms":now,
-            })
-        };
-        let notice_index_key = match creator_role {
-            "participant" => {
-                let notice_key = notice_key(&scope.id, creator_id, now, watch_id);
-                set_meta(
-                    tx,
-                    &notice_key,
-                    &json!({"watch_id":watch_id,"notification_id":watch_id}),
-                )?;
-                set_meta(
-                    tx,
-                    &owner_notice_key(creator_id, now, watch_id),
-                    &json!({
-                        "watch_id":watch_id,
-                        "scope_id":scope.id,
-                        "notice_index_key":notice_key,
-                    }),
-                )?;
-                json!(notice_key)
-            }
-            "manager" | "operator" => Value::Null,
-            _ => return Err(damaged("watch creator role is unsupported")),
-        };
-        record["cursor"] = cursor;
-        record["notification"] = notification;
-        record["state"] = json!("matched");
-        record["updated_at_ms"] = json!(now);
-        record["settled_at_ms"] = json!(now);
-        record["notice_index_key"] = notice_index_key;
-        set_meta(tx, &record_key(watch_id), &record)?;
-        tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-        matched += 1;
+        }
     }
     let cursor_receipt = last_key.clone();
     if let Some(last_key) = last_key {
@@ -453,6 +623,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
         "matched":matched,
         "expired":expired,
         "stale":stale,
+        "quarantined":quarantined,
         "cursor":cursor_receipt,
         "model_wake":false,
         "native_work_queued":false,
@@ -1516,6 +1687,19 @@ fn verify_record(record: &Value, expected_id: &str) -> Result<()> {
     validate_address_scope(watch_kind, &record["address"], &scope)
         .map_err(|_| damaged("watch address does not match its retained exact scope"))?;
     Ok(())
+}
+
+/// At this call site `verify_record` only decodes fields from the retained
+/// watch value; INVALID_PARAMS therefore identifies semantic record damage.
+/// Keep every other error unchanged so storage and transaction failures stay
+/// outside the watch quarantine classifier.
+fn verify_reconcile_record(record: &Value, expected_id: &str) -> Result<()> {
+    match verify_record(record, expected_id) {
+        Err(error) if error.code.as_str() == "INVALID_PARAMS" => {
+            Err(damaged("retained watch record has invalid typed fields"))
+        }
+        result => result,
+    }
 }
 
 fn settle_record(tx: &Transaction<'_>, record: &mut Value, state: &str, now: i64) -> Result<()> {

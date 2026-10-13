@@ -4,7 +4,9 @@
 //! Store handle, Manager credential, or controller API capability. Filesystem
 //! work runs outside SQLite; the database records the immutable admitted
 //! bundle, Task/Attempt, work receipt digest and Operation lifecycle.
-use super::{Store, automation_dispatch, current_principal, gm, meta, results, submissions, tasks};
+use super::{
+    Store, automation_dispatch, current_principal, gm, meta, results, set_meta, submissions, tasks,
+};
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     automation::{authorization, config as automation_config},
@@ -1804,6 +1806,20 @@ impl Store {
     pub(crate) async fn reconcile_scripts_once(&self) -> Result<()> {
         self.poll_script_children(false).await?;
         let rows = self.run(|db| pending_runs(db)).await?;
+        // Advance the durable fairness cursor only after this whole pass
+        // selected its subjects. A Store failure stays fatal and preserves the
+        // previous cursor, so an unexamined run is never reported as visited.
+        let last_run_id = rows.last().map(|row| row.run_id.clone());
+        self.run(move |db| {
+            if let Some(run_id) = last_run_id.as_deref() {
+                let key = selected_pending_run_key(db, run_id)?;
+                if let Some(key) = key {
+                    advance_pending_run_cursor(db, &key)?;
+                }
+            }
+            Ok(())
+        })
+        .await?;
         for pending in rows {
             let run_id = pending.run_id.clone();
             let digest = pending.work_digest.clone();
@@ -2793,27 +2809,180 @@ fn require_optional_run_scope(
     }
 }
 
-fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
-    let mut statement = db.prepare(
-        "SELECT r.run_id,r.operation_id,o.state,r.work_digest,o.sent_at_ms,r.started_at_ms,r.process_identity_json \
-         FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id \
-         WHERE r.state IN ('queued','sending','running','reconciling','outcome_unknown') \
-         ORDER BY r.created_at_ms,r.run_id LIMIT 64",
-    )?;
-    statement
-        .query_map([], |row| {
-            Ok(PendingRun {
+/// Durable continuation cursor for the bounded pending-run page. Older
+/// unresolved runs stay under their existing per-row custody rules; the cursor
+/// only decides which subjects a pass examines, so a later queued healthy run
+/// is never starved by 64 older unresolved rows.
+const PENDING_RUN_CURSOR_KEY: &str = "coordination:script:v1:pending_run_cursor";
+const MAX_PENDING_RUN_PAGE: usize = 64;
+
+/// One selected pending subject plus the ordering key the durable cursor
+/// needs. The projection the caller consumes stays `PendingRun` unchanged.
+struct PendingRunRow {
+    run_id: String,
+    created_at_ms: i64,
+    operation_id: String,
+    operation_state: String,
+    work_digest: String,
+    sent_at_ms: Option<i64>,
+    started_at_ms: Option<i64>,
+    worker_identity_json: Option<String>,
+}
+
+impl PendingRunRow {
+    fn projection(&self) -> PendingRun {
+        PendingRun {
+            run_id: self.run_id.clone(),
+            operation_id: self.operation_id.clone(),
+            operation_state: self.operation_state.clone(),
+            work_digest: self.work_digest.clone(),
+            sent_at_ms: self.sent_at_ms,
+            started_at_ms: self.started_at_ms,
+            worker_identity_json: self.worker_identity_json.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRunCursor {
+    created_at_ms: i64,
+    run_id: String,
+}
+
+fn decode_pending_run_cursor(value: Option<Value>) -> Result<Option<PendingRunCursor>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let created_at_ms = value
+        .get("created_at_ms")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| Error::invalid("script pending-run cursor has no valid timestamp"))?;
+    let run_id = model::text(&value, "run_id")?.to_owned();
+    if run_id.is_empty() || run_id.len() > 128 {
+        return Err(Error::invalid(
+            "script pending-run cursor has an invalid run identifier",
+        ));
+    }
+    Ok(Some(PendingRunCursor {
+        created_at_ms,
+        run_id,
+    }))
+}
+
+fn load_pending_run_cursor(db: &Connection) -> Result<Option<PendingRunCursor>> {
+    decode_pending_run_cursor(meta(db, PENDING_RUN_CURSOR_KEY)?)
+}
+
+fn save_pending_run_cursor(db: &Connection, cursor: &PendingRunCursor) -> Result<()> {
+    set_meta(
+        db,
+        PENDING_RUN_CURSOR_KEY,
+        &json!({
+            "created_at_ms":cursor.created_at_ms,
+            "run_id":cursor.run_id,
+        }),
+    )
+}
+
+fn pending_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingRunRow> {
+    Ok(PendingRunRow {
+        run_id: row.get(0)?,
+        created_at_ms: row.get(1)?,
+        operation_id: row.get(2)?,
+        operation_state: row.get(3)?,
+        work_digest: row.get(4)?,
+        sent_at_ms: row.get(5)?,
+        started_at_ms: row.get(6)?,
+        worker_identity_json: row.get(7)?,
+    })
+}
+
+const PENDING_RUN_QUERY: &str = "
+        SELECT r.run_id,r.created_at_ms,r.operation_id,o.state,
+               r.work_digest,o.sent_at_ms,r.started_at_ms,r.process_identity_json
+          FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id
+         WHERE r.state IN ('queued','sending','running','reconciling','outcome_unknown')
+           AND (?1 IS NULL OR r.created_at_ms>?2 OR (r.created_at_ms=?2 AND r.run_id>?3))
+         ORDER BY r.created_at_ms,r.run_id LIMIT ?4";
+
+/// Select the pending subjects for one bounded pass, strictly after the
+/// durable cursor and then wrapped to the earliest rows that this pass has
+/// not examined. Nothing here starts, settles, reaps or releases a run: the
+/// caller's existing custody and unknown-departure handling still decides.
+/// Re-read the exact ordering key for a selected run. The cursor is only
+/// advanced from a key observed in this same pass, never from caller input.
+fn selected_pending_run_key(db: &Connection, run_id: &str) -> Result<Option<PendingRunRow>> {
+    let mut statement =
+        db.prepare("SELECT run_id,created_at_ms FROM script_runs WHERE run_id=?1")?;
+    let row = statement
+        .query_row([run_id], |row| {
+            Ok(PendingRunRow {
                 run_id: row.get(0)?,
-                operation_id: row.get(1)?,
-                operation_state: row.get(2)?,
-                work_digest: row.get(3)?,
-                sent_at_ms: row.get(4)?,
-                started_at_ms: row.get(5)?,
-                worker_identity_json: row.get(6)?,
+                created_at_ms: row.get(1)?,
+                operation_id: String::new(),
+                operation_state: String::new(),
+                work_digest: String::new(),
+                sent_at_ms: None,
+                started_at_ms: None,
+                worker_identity_json: None,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+        })
+        .optional()?;
+    Ok(row)
+}
+
+fn pending_run_page(
+    db: &Connection,
+    after: Option<&PendingRunCursor>,
+) -> Result<Vec<PendingRunRow>> {
+    let mut statement = db.prepare(PENDING_RUN_QUERY)?;
+    let limit = MAX_PENDING_RUN_PAGE as i64;
+    let rows = match after {
+        Some(cursor) => statement
+            .query_map(
+                params![true, cursor.created_at_ms, cursor.run_id, limit],
+                pending_run_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => statement
+            .query_map(params![false, 0_i64, "", limit], pending_run_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    Ok(rows)
+}
+
+fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
+    let cursor = load_pending_run_cursor(db)?;
+    let mut rows = pending_run_page(db, cursor.as_ref())?;
+    if rows.len() < MAX_PENDING_RUN_PAGE
+        && let Some(cursor) = cursor.as_ref()
+    {
+        // Wrap to the earliest rows this pass has not examined, so a cursor
+        // sitting past every live row cannot strand a later queued subject.
+        let mut wrapped = pending_run_page(db, None)?;
+        let key = (cursor.created_at_ms, cursor.run_id.clone());
+        wrapped.retain(|row| (row.created_at_ms, row.run_id.clone()) < key);
+        rows.extend(wrapped);
+    }
+    rows.truncate(MAX_PENDING_RUN_PAGE);
+    Ok(rows.into_iter().map(|row| row.projection()).collect())
+}
+
+/// Advance the durable cursor to the last examined subject. A Store-level
+/// failure stays fatal and leaves the cursor unchanged, so an unexamined
+/// subject is never reported as visited.
+fn advance_pending_run_cursor(db: &Connection, last: &PendingRunRow) -> Result<()> {
+    save_pending_run_cursor(
+        db,
+        &PendingRunCursor {
+            created_at_ms: last.created_at_ms,
+            run_id: last.run_id.clone(),
+        },
+    )
 }
 
 fn script_worker_observation_expired(pending: &PendingRun) -> bool {
@@ -3523,7 +3692,9 @@ fn acknowledge_worker(
 /// Record the exact queued ScriptRun cancellation in the transaction that
 /// cancels its Operation. The general Operation cancellation fact remains the
 /// source-wide view; this alias adds the retained run identity without copying
-/// cancellation text or granting a second execution path.
+/// cancellation text or granting a second execution path. A run cancelled
+/// before start uses the existing failed terminal state; cancelled belongs to
+/// its Operation and lifecycle event, not the ScriptRun schema.
 pub(super) fn record_operation_cancelled_tx(
     tx: &Transaction<'_>,
     operation_id: &str,
@@ -3550,7 +3721,7 @@ pub(super) fn record_operation_cancelled_tx(
         ));
     }
     let changed = tx.execute(
-        "UPDATE script_runs SET state='cancelled',finished_at_ms=?3 \
+        "UPDATE script_runs SET state='failed',finished_at_ms=?3 \
          WHERE operation_id=?1 AND run_id=?2 AND state='queued'",
         params![operation_id, run_id, now],
     )?;
@@ -3691,10 +3862,7 @@ fn settle_incomplete(
         tx.commit()?;
         return Ok(());
     };
-    if matches!(
-        run_state.as_str(),
-        "completed" | "failed" | "incomplete" | "cancelled"
-    ) {
+    if matches!(run_state.as_str(), "completed" | "failed" | "incomplete") {
         tx.commit()?;
         return Ok(());
     }
@@ -3883,7 +4051,7 @@ fn finish(
             "script completion identifies another Operation",
         ));
     }
-    if run_state == "cancelled" && operation_state == "cancelled" {
+    if run_state == "failed" && operation_state == "cancelled" {
         tx.commit()?;
         return Ok(());
     }
@@ -6203,6 +6371,413 @@ mod script_trigger_admission_isolation_tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    async fn public_cancellation_snapshot(store: &Store, run_id: &str) -> Value {
+        let run_id = run_id.to_owned();
+        store
+                .run(move |db| {
+                    let raw: String = db.query_row(
+                        "SELECT json_object(\
+                         'run_id',r.run_id,'operation_id',r.operation_id,\
+                         'run_state',r.state,'operation_state',o.state,\
+                         'task_id',r.task_id,'task_revision',r.task_revision,\
+                         'attempt_id',r.attempt_id,'operation_task_id',o.task_id,\
+                         'operation_attempt_id',o.attempt_id,\
+                         'work_digest',r.work_digest,'spec_json',r.spec_json,\
+                         'original_request_json',o.original_request_json,\
+                         'effective_request_json',o.effective_request_json,\
+                         'started_at_ms',r.started_at_ms,\
+                         'process_identity_json',r.process_identity_json,\
+                         'result_ref',r.result_ref,'exit_code',r.exit_code,\
+                         'finished_at_ms',r.finished_at_ms,\
+                         'sent_at_ms',o.sent_at_ms,'settled_at_ms',o.settled_at_ms) \
+                         FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id \
+                         WHERE r.run_id=?1 AND o.method='script.run'",
+                        [&run_id],
+                        |row| row.get(0),
+                    )?;
+                    let run: Value = serde_json::from_str(&raw)?;
+                    let operation_id = model::text(&run, "operation_id")?;
+                    let operation_state = model::text(&run, "operation_state")?;
+                    let private_result_raw: Option<String> = db.query_row(
+                        "SELECT result_json FROM operations \
+                         WHERE operation_id=?1 AND method='script.run' AND state=?2",
+                        rusqlite::params![operation_id, operation_state],
+                        |row| row.get(0),
+                    )?;
+                    let private_operation_result: Option<Value> = private_result_raw
+                        .as_deref()
+                        .map(serde_json::from_str::<Value>)
+                        .transpose()?;
+                    let mut statement = db.prepare(
+                        "SELECT json_object(\
+                         'observation_id',observation_id,'source_id',source_stream_id,\
+                         'source_event_key',source_event_key,'kind',kind,\
+                         'operation_id',operation_id,'payload',json(payload_json),\
+                         'recorded_at_ms',recorded_at_ms) \
+                         FROM observations WHERE operation_id=?1 \
+                         AND ((source_stream_id='controller:scripts' AND kind='script.cancelled') \
+                           OR (source_stream_id='controller:operations' AND kind='operation.cancelled')) \
+                         ORDER BY observation_id",
+                    )?;
+                    let raw_events = statement
+                        .query_map([operation_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let events = raw_events
+                        .iter()
+                        .map(|raw| serde_json::from_str::<Value>(raw))
+                        .collect::<serde_json::Result<Vec<_>>>()?;
+                    let schema: String = db.query_row(
+                        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='script_runs'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    Ok(json!({"run":run,"private_operation_result":private_operation_result,"events":events,"schema":schema}))
+                })
+                .await
+                .expect("read exact publicly produced ScriptRun and cancellation facts")
+    }
+
+    #[tokio::test]
+    async fn reg23_public_queued_script_cancellation_uses_schema_terminal_and_survives_reopen() {
+        use crate::automation::event_rules::EventStatus;
+
+        // Every authority and positive lifecycle row comes from public Store
+        // producers. The Store-only pin is never launched as a worker.
+        let (owner, directory, operator) = start_store(true).await;
+        let manager = register_manager(&owner.store, &operator).await;
+        let unrelated = register_named_manager(
+            &owner.store,
+            &operator,
+            "reg23-script-cancel-unrelated-manager",
+        )
+        .await;
+        let script_id = "reg23_public_queued_cancel";
+        register_active_script(&owner.store, &manager, script_id).await;
+        let task = owner
+            .store
+            .call(
+                manager.clone(),
+                "task.create".into(),
+                json!({
+                    "client_request_id":"reg23-script-cancel-task",
+                    "project_id":PROJECT_ID,
+                    "spec":{
+                        "objective":"Cancel a genuinely queued ScriptRun without starting it",
+                        "phase":"implementation",
+                        "requirements":[{"id":"R1","statement":"Retain exact cancellation identity"}],
+                        "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
+                    },
+                }),
+            )
+            .await
+            .expect("create Task through public Store producer");
+        let task_id = model::text(&task, "task_id").unwrap().to_owned();
+        let claim = owner
+            .store
+            .call(
+                manager.clone(),
+                "task.claim".into(),
+                json!({
+                    "client_request_id":"reg23-script-cancel-claim",
+                    "task_id":task_id,"expected_revision":1,"owner_id":manager.client_id,
+                }),
+            )
+            .await
+            .expect("claim the exact Task through public Store producer");
+        let attempt_id = model::text(&claim, "attempt_id").unwrap().to_owned();
+        let current_task = owner
+            .store
+            .call(
+                manager.clone(),
+                "task.get".into(),
+                json!({"task_id":task_id}),
+            )
+            .await
+            .expect("validate the current Task and Attempt before ScriptRun admission");
+        assert_eq!(current_task["revision"], 1);
+        assert_eq!(current_task["current_attempt_id"], attempt_id);
+        let request = json!({
+            "client_request_id":"reg23-script-cancel-run",
+            "script_id":script_id,"expected_script_revision":1,
+            "attempt_id":attempt_id,"expected_task_revision":1,"input":{},
+        });
+        let admission = owner
+            .store
+            .call(manager.clone(), "script.run".into(), request.clone())
+            .await
+            .expect("admit the real queued ScriptRun through Store");
+        let run_id = model::text(&admission, "run_id").unwrap().to_owned();
+        let operation_id = model::text(&admission, "operation_id").unwrap().to_owned();
+        assert_ne!(run_id, operation_id);
+        assert_eq!(admission["state"], "queued");
+        let queued = public_cancellation_snapshot(&owner.store, &run_id).await;
+        assert_eq!(queued["run"]["run_state"], "queued");
+        assert_eq!(queued["run"]["operation_state"], "queued");
+        assert_eq!(queued["run"]["task_id"], task_id);
+        assert_eq!(queued["run"]["task_revision"], 1);
+        assert_eq!(queued["run"]["attempt_id"], attempt_id);
+        assert_eq!(queued["run"]["operation_task_id"], task_id);
+        assert_eq!(queued["run"]["operation_attempt_id"], attempt_id);
+        assert!(queued["events"].as_array().unwrap().is_empty());
+        assert!(!queued["schema"].as_str().unwrap().contains("'cancelled'"));
+
+        let cancellation = json!({
+            "client_request_id":"reg23-script-cancel-owner",
+            "operation_id":operation_id,
+            "reason":"private queued cancellation reason",
+        });
+        let denied = owner
+            .store
+            .call(
+                unrelated,
+                "operation.cancel".into(),
+                json!({
+                    "client_request_id":"reg23-script-cancel-unrelated",
+                    "operation_id":operation_id,"reason":"unrelated caller",
+                }),
+            )
+            .await
+            .expect_err("an unrelated Manager cannot cancel the retained owner invocation");
+        assert_eq!(denied.code, "FORBIDDEN");
+        assert_eq!(
+            public_cancellation_snapshot(&owner.store, &run_id).await,
+            queued
+        );
+        let cancelled = owner
+            .store
+            .call(
+                manager.clone(),
+                "operation.cancel".into(),
+                cancellation.clone(),
+            )
+            .await
+            .expect("owner cancels genuinely queued ScriptRun without a schema error");
+        assert_eq!(cancelled["cancelled_operation_id"], operation_id);
+        assert_eq!(cancelled["native_cancel_sent"], false);
+        let terminal = public_cancellation_snapshot(&owner.store, &run_id).await;
+        assert_eq!(terminal["run"]["run_state"], "failed");
+        assert_eq!(terminal["run"]["operation_state"], "cancelled");
+        assert!(terminal["run"]["finished_at_ms"].as_i64().is_some());
+        assert_eq!(
+            terminal["run"]["finished_at_ms"],
+            terminal["run"]["settled_at_ms"]
+        );
+        assert_eq!(
+            terminal["private_operation_result"]["reason"],
+            "private queued cancellation reason"
+        );
+        assert_eq!(
+            terminal["private_operation_result"]["cancelled_by"],
+            cancelled["operation_id"]
+        );
+        for key in [
+            "run_id",
+            "operation_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "operation_task_id",
+            "operation_attempt_id",
+            "work_digest",
+            "spec_json",
+            "original_request_json",
+            "effective_request_json",
+        ] {
+            assert_eq!(terminal["run"][key], queued["run"][key], "{key}");
+        }
+        for key in [
+            "sent_at_ms",
+            "started_at_ms",
+            "process_identity_json",
+            "result_ref",
+            "exit_code",
+        ] {
+            assert!(terminal["run"][key].is_null(), "{key}");
+        }
+        assert_eq!(terminal["events"].as_array().unwrap().len(), 2);
+        let occurrence = format!("operation:{operation_id}:operation_cancelled");
+        let script_event = terminal["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["source_id"] == "controller:scripts")
+            .expect("exact ScriptRun cancellation alias exists");
+        assert_eq!(script_event["operation_id"], operation_id);
+        assert_eq!(script_event["source_event_key"], occurrence);
+        assert_eq!(
+            script_event["recorded_at_ms"],
+            terminal["run"]["finished_at_ms"]
+        );
+        assert_eq!(
+            script_event["payload"],
+            json!({
+                "schema_version":1,"phase":"operation_cancelled","occurrence_id":occurrence,
+                "status":"cancelled","error_code":"OPERATION_CANCELLED",
+                "operation_id":operation_id,"run_id":run_id,
+            })
+        );
+        assert!(
+            !terminal["events"]
+                .to_string()
+                .contains("private queued cancellation reason")
+        );
+        let event_ids = terminal["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["observation_id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let projections = owner
+            .store
+            .run(move |db| {
+                event_ids
+                    .into_iter()
+                    .map(|id| {
+                        let event = crate::store::automation_intake::observed_event_by_id(db, id)?
+                            .expect("read actual public cancellation Observation");
+                        let projection =
+                            crate::store::automation_intake::safe_event_projection(db, &event)?;
+                        Ok((event.source_id, projection))
+                    })
+                    .collect::<crate::error::Result<Vec<_>>>()
+            })
+            .await
+            .expect("project both actual cancellation facts through production intake");
+        for (source, projection) in projections {
+            assert_eq!(projection.status, Some(EventStatus::Cancelled));
+            assert_eq!(
+                projection.error_code.as_deref(),
+                Some("OPERATION_CANCELLED")
+            );
+            assert_eq!(
+                projection.occurrence_phase.as_deref(),
+                Some("operation_cancelled")
+            );
+            assert_eq!(
+                projection.occurrence_id.as_deref(),
+                Some(occurrence.as_str())
+            );
+            if source == "controller:scripts" {
+                assert_eq!(projection.script_run_id.as_deref(), Some(run_id.as_str()));
+            }
+        }
+        let readback = owner
+            .store
+            .call(
+                manager.clone(),
+                "operation.get".into(),
+                json!({"operation_id":operation_id}),
+            )
+            .await
+            .expect("owner reads the exact terminal Operation");
+        assert_eq!(readback["state"], "cancelled");
+        assert_eq!(
+            readback["operation_id"].as_str(),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(readback["method"].as_str(), Some("script.run"));
+        assert_eq!(readback["result_status"], "not_projected");
+        assert!(readback.get("result").is_none());
+        assert!(readback.get("cancelled_by").is_none());
+        assert!(
+            !readback
+                .to_string()
+                .contains("private queued cancellation reason")
+        );
+        assert_eq!(
+            owner
+                .store
+                .call(
+                    manager.clone(),
+                    "operation.cancel".into(),
+                    cancellation.clone()
+                )
+                .await
+                .expect("exact cancellation retry reuses its receipt"),
+            cancelled
+        );
+        assert_eq!(
+            owner
+                .store
+                .call(manager.clone(), "script.run".into(), request.clone())
+                .await
+                .expect("original admission replay retains the same Run and Operation"),
+            admission
+        );
+        let repeated = owner
+            .store
+            .call(
+                manager.clone(),
+                "operation.cancel".into(),
+                json!({
+                    "client_request_id":"reg23-script-cancel-again",
+                    "operation_id":operation_id,"reason":"already terminal",
+                }),
+            )
+            .await
+            .expect_err("a new cancellation command cannot cancel a terminal Operation");
+        assert_eq!(repeated.code, "NOT_QUEUED");
+        assert_eq!(
+            public_cancellation_snapshot(&owner.store, &run_id).await,
+            terminal
+        );
+        let config = owner.store.config.clone();
+        let gate_run = run_id.clone();
+        let gate_operation = operation_id.clone();
+        assert!(
+            !owner
+                .store
+                .run(move |db| { super::begin_run(db, &gate_run, &gate_operation, &config) })
+                .await
+                .expect("real pre-spawn gate refuses the cancelled invocation")
+        );
+        assert!(
+            owner
+                .store
+                .run(|db| super::pending_runs(db))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        owner
+            .close()
+            .await
+            .expect("close Store before reopening retained cancellation");
+        let root = DataRoot::acquire(&directory).expect("reacquire the retained Store root");
+        let credential =
+            bootstrap_credential(&root.path).expect("read retained Operator credential");
+        let mut config = Config::default();
+        config.storage.data_dir = directory.clone();
+        config.scripts.executor =
+            Some(crate::store::o6_taskless_path_fixture::store_only_script_executor_pin());
+        let reopened = StoreOwner::start(root, Arc::new(config), credential)
+            .await
+            .expect("reopen with unchanged digest-pinned ScriptRun schema");
+        assert_eq!(
+            public_cancellation_snapshot(&reopened.store, &run_id).await,
+            terminal
+        );
+        assert!(
+            reopened
+                .store
+                .run(|db| super::pending_runs(db))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let config = reopened.store.config.clone();
+        assert!(
+            !reopened
+                .store
+                .run(move |db| { super::begin_run(db, &run_id, &operation_id, &config) })
+                .await
+                .expect("restart cannot admit the cancelled command to the native start path")
+        );
+        reopened.close().await.expect("close reopened Store");
+        std::fs::remove_dir_all(&directory).expect("remove temporary Store directory");
+    }
+
     #[tokio::test]
     async fn ordinary_manager_script_api_is_owner_scoped_without_gm() {
         let (owner, directory, operator) = start_store(false).await;
@@ -6808,3 +7383,7 @@ mod script_trigger_admission_isolation_tests {
 #[cfg(test)]
 #[path = "scripts_current_concilium_consumers.rs"]
 mod scripts_current_concilium_consumers;
+
+#[cfg(test)]
+#[path = "scripts_pending_run_fairness_tests.rs"]
+mod scripts_pending_run_fairness_tests;
