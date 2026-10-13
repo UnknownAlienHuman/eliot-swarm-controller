@@ -2196,19 +2196,19 @@ fn select_pending_page(
 ) -> Result<(Vec<String>, Option<PendingCycle>)> {
     let retained = read_pending_cycle(tx)?;
     let mut cycle = retained;
-    if cycle.is_none() {
-        if let Some(max) = max_pending_id(tx)? {
-            if !valid_pending_cursor_id(&max) {
-                return Err(Error::new(
-                    "CHECK_PENDING_CYCLE_CORRUPT",
-                    "live pending CheckRun ordering identity is not canonical",
-                ));
-            }
-            cycle = Some(PendingCycle {
-                schema_version: PENDING_CYCLE_SCHEMA,
-                cut: max,
-            });
+    if cycle.is_none()
+        && let Some(max) = max_pending_id(tx)?
+    {
+        if !valid_pending_cursor_id(&max) {
+            return Err(Error::new(
+                "CHECK_PENDING_CYCLE_CORRUPT",
+                "live pending CheckRun ordering identity is not canonical",
+            ));
         }
+        cycle = Some(PendingCycle {
+            schema_version: PENDING_CYCLE_SCHEMA,
+            cut: max,
+        });
     }
     let Some(active) = cycle.clone() else {
         return Ok((Vec::new(), None));
@@ -2605,6 +2605,7 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
     Ok(selection)
 }
 
+#[cfg(test)]
 fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
     pending_selection(db, root).map(|selection| selection.work)
 }
@@ -2628,15 +2629,14 @@ fn retain_pending_progress(
             "completed CheckRun ordering identity is not canonical",
         ));
     }
-    if let Some(snapshot) = cycle {
-        if snapshot.schema_version != PENDING_CYCLE_SCHEMA
-            || !valid_pending_cursor_id(&snapshot.cut)
-        {
-            return Err(Error::new(
-                "CHECK_PENDING_CYCLE_CORRUPT",
-                "pending cycle snapshot is not a canonical CheckRun ordering identity",
-            ));
-        }
+    if let Some(snapshot) = cycle
+        && (snapshot.schema_version != PENDING_CYCLE_SCHEMA
+            || !valid_pending_cursor_id(&snapshot.cut))
+    {
+        return Err(Error::new(
+            "CHECK_PENDING_CYCLE_CORRUPT",
+            "pending cycle snapshot is not a canonical CheckRun ordering identity",
+        ));
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;

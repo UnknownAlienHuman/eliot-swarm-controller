@@ -3048,6 +3048,7 @@ fn pending_run_rows(db: &Connection) -> Result<Vec<PendingRunRow>> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
     Ok(pending_run_rows(db)?
         .into_iter()
