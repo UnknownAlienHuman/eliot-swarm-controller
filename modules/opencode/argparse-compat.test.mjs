@@ -57,8 +57,8 @@ if (hcs.version !== '4.2.0') fail('http-cache-semantics version', hcs.version, '
 // 5. Live API exercise using the exact js-yaml@3.15.2 bin/js-yaml.js call shapes:
 // ArgumentParser({version, addHelp}), addArgument x4 (storeTrue x3,
 // Const.SUPPRESS, defaultValue), parseArgs. Valid invocations must parse to
-// identical namespaces; an empty invocation is rejected with exit status 2 in
-// both argparse generations (message text differs and is not asserted).
+// identical namespaces, including the optional stdin file default. Unknown
+// options retain exit-2 rejection (message text differs and is not asserted).
 function loadArgparse() {
   const i = process.argv.indexOf('--argparse');
   const req = createRequire(import.meta.url);
@@ -77,24 +77,25 @@ try {
 if (argparse) {
   const cli = new argparse.ArgumentParser({ version: '3.15.2', addHelp: true });
   cli.addArgument(['-c', '--compact'], { action: 'storeTrue' });
-  cli.addArgument(['-j', '--to-json'], { help: argparse.Const.SUPPRESS, action: 'storeTrue' });
+  cli.addArgument(['-j', '--to-json'], { help: argparse.Const.SUPPRESS, dest: 'json', action: 'storeTrue' });
   cli.addArgument(['-t', '--trace'], { action: 'storeTrue' });
-  cli.addArgument(['file'], { defaultValue: '-' });
+  cli.addArgument(['file'], { nargs: '?', defaultValue: '-' });
   const one = cli.parseArgs(['-c', 'input.yaml']);
   assert.equal(one.compact, true);
   assert.equal(one.file, 'input.yaml');
-  assert.equal(one.to_json, false);
+  assert.equal(one.json, false);
   assert.equal(one.trace, false);
   const three = cli.parseArgs(['--to-json', '--trace', 'doc.yaml']);
-  assert.equal(three.to_json, true);
+  assert.equal(three.json, true);
   assert.equal(three.trace, true);
   assert.equal(three.file, 'doc.yaml');
   assert.equal(three.compact, false);
+  assert.equal(cli.parseArgs([]).file, '-');
   const realExit = process.exit;
   let seen = null;
   process.exit = function (code) { seen = code; throw new Error('__exit__' + code); };
   try {
-    cli.parseArgs([]);
+    cli.parseArgs(['--unknown-option']);
   } catch (e) {
     if (String((e && e.message) || e).indexOf('__exit__') !== 0) throw e;
   } finally {

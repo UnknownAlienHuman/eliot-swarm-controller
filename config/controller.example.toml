@@ -25,11 +25,12 @@ reasoningEffort = 'max'
 approvalMode = 'allowAll'
 
 # Disabled by default. See modules/claude/README.md for the explicit bridge setup.
+# Bridge.5 uses the retained module descriptor and exact Store TaskPrompt bytes.
 # Open prepares rootlessly; first exact Task input adopts the observed session.
 [[routes]]
 alias = 'claude-manager'
-runtime = 'claude'
-module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.4'
+runtime = 'module'
+module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.5'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'

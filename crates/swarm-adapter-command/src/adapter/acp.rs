@@ -2888,6 +2888,9 @@ async fn cancel_pending_permissions(
     Ok(())
 }
 
+// This private seam retains the exact native correlation tuple without
+// introducing a second permission request or journal authority.
+#[allow(clippy::too_many_arguments)]
 fn record_permission_reply_intent(
     journal: &AcpJournal,
     command: &RuntimeCommand,

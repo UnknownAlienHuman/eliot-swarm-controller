@@ -1,28 +1,28 @@
 # Claude Agent SDK bridge — native integration (first slice)
 
-Uses the complete locked `@anthropic-ai/claude-agent-sdk` **0.3.287** and its matching bundled native binary packages (`@anthropic-ai/claude-agent-sdk-<platform>` **0.3.287**). New bindings use **`claude-agent-sdk-0.3.287-bridge.4`**. The SDK is under Anthropic's Commercial Terms (see [third-party notices](../../THIRD_PARTY_NOTICES.md)); it is not a permissive open-source donor. A direct CLI canary does not qualify this SDK bridge or its host route.
-Existing bridge.3 bindings remain recognized for their retained lifecycle, while bridge.3 is retired for new bindings.
+Uses the complete locked `@anthropic-ai/claude-agent-sdk` **0.3.287** and its matching bundled native binary packages (`@anthropic-ai/claude-agent-sdk-<platform>` **0.3.287**). The current source candidate for new bindings is **`claude-agent-sdk-0.3.287-bridge.5`**, selected through a retained module descriptor. The SDK is under Anthropic's Commercial Terms (see [third-party notices](../../THIRD_PARTY_NOTICES.md)); it is not a permissive open-source donor. A direct CLI canary does not qualify this SDK bridge or its host route.
+Existing bridge.3 and bridge.4 bindings retain their original raw-snapshot lifecycle and bytes; both are retired for new bindings. Bridge.5 consumes the exact Store `swarm.task_prompt@1` envelope and dispatch context. Its current installed/native qualification remains pending.
 
 ## Ownership and setup
 
 The bridge owns one Claude session through the SDK's streaming-input `startup()`/one-shot `WarmQuery.query()`. Host IPC exposes `module.hello/next/outcome/observe`; its credential is scoped to the reserved binding/generation and cannot accept Tasks or become GM. Native subscription/auth, tools and the model loop remain in Claude Code. The bridge is a separate process from the host; losing the host connection never closes the query or repeats input.
 
 1. Run `npm ci --ignore-scripts` here for the locked local SDK, not global packages or a model login.
-2. Enable a private controller route with the actual workspace and explicit model. The shipped route stays disabled. `workspaceRoot` and `modelId` are required; `modelId = 'sonnet'` is passed verbatim as the SDK's `Options.model` at open. The bridge never accepts the SDK/CLI default as a selected route model. `permissionMode` is optional, validated against the SDK enum, and frozen at open. A route `permissionMode = 'bypassPermissions'` additionally requires `allowDangerouslySkipPermissions = true` in the same route options, or open is rejected.
+2. Materialize and retain the exact [module descriptor](module-descriptor.template.json) through the documented module catalog procedure, then enable a private `runtime = 'module'` route with the actual workspace and explicit model. The shipped route stays disabled. `workspaceRoot` and `modelId` are required; `modelId = 'sonnet'` is passed verbatim as the SDK's `Options.model` at open. The bridge never accepts the SDK/CLI default as a selected route model. `permissionMode` is optional, validated against the SDK enum, and frozen at open. A route `permissionMode = 'bypassPermissions'` additionally requires `allowDangerouslySkipPermissions = true` in the same route options, or open is rejected. The descriptor template is a qualification candidate: replace its placeholders deliberately and select fault controls only for the addressed qualification run.
 3. Run the host and reserve `agent.open` with lane_id/route; retain binding_id/generation.
 4. Register the scoped module credential: `swarm client-create claude-MC --role module --binding-id BINDING --generation 1 --out PRIVATE_FILE`. Use normal host/data-dir arguments and preserve request IDs.
 5. Copy `module.example.json` outside Git; set the actual host endpoint and credential file. An optional `command` field names an explicitly selected installed native executable (absolute path, real `.exe` on Windows, not `.cmd`/`.bat`) for `pathToClaudeCodeExecutable`; when omitted, the SDK launches its own pinned bundled binary from the locked optional package.
 6. Start the module independently with the guarded launcher below, in a dedicated initially empty module-state directory separate from host data:
 
 ```powershell
-swarm module-run --state-dir C:\SwarmModules\CC --command 'C:\Program Files\nodejs\node.exe' -- C:\SwarmCode\modules\claude\bridge.mjs --config C:\SwarmConfig\claude.json
+swarm module-run --state-dir C:\SwarmModules\CC --command 'C:\Program Files\nodejs\node.exe' -- C:\SwarmCode\modules\claude\bridge-v5.mjs --config C:\SwarmConfig\claude.json
 ```
 
 ```toml
 [[routes]]
 alias = 'claude-manager'
-runtime = 'claude'
-module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.4'
+runtime = 'module'
+module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.5'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -39,7 +39,7 @@ Readiness words follow the module contract: `implemented`, `documented`, `observ
 | --- | --- | --- |
 | describe | implemented | Entrypoint, SDK version, executor version/permission mode, route-requested model, and separately the model observed in native `system/init` |
 | open | implemented | `startup()` prepares a rootless native executor without submitting a model prompt; the observed SDK session id is adopted only with the first Task input echo |
-| send (`next_turn`) / task.dispatch | implemented | Exact Task text/snapshot and echoed user UUID bind admission to the actual session; the UUID is not a native turn ID or execution completion |
+| send (`next_turn`) / task.dispatch | implemented | Exact Store TaskPrompt text and echoed user UUID bind admission to the actual session; the UUID is not a native turn ID or execution completion |
 | snapshot (`agent.state`, `agent.refresh`) | implemented | Compact stream and uniquely correlated terminal-input projection (below); refresh is a read, never a native call |
 | reconcile | implemented | Bridge-local journal readback only; never resends native input |
 | attach | unavailable | No second control owner is created for an existing session |
