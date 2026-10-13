@@ -927,8 +927,7 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
         .await
         .unwrap();
     assert_eq!(first.len(), 16);
-    let first_ids: BTreeSet<String> =
-        first.iter().map(|work| work.check_id.clone()).collect();
+    let first_ids: BTreeSet<String> = first.iter().map(|work| work.check_id.clone()).collect();
     // Bare re-selection without any stable disposition returns the same
     // page and leaves the cursor untouched.
     assert_eq!(
@@ -969,12 +968,7 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
     for check_id in expected.difference(&first_ids) {
         mark_preflight_terminal(&fixture.owner.store, check_id).await;
     }
-    fixture
-        .owner
-        .store
-        .reconcile_checks_once()
-        .await
-        .unwrap();
+    fixture.owner.store.reconcile_checks_once().await.unwrap();
     let completed: BTreeSet<String> = first_ids.clone();
     for check_id in &completed {
         assert_eq!(
@@ -996,22 +990,11 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
     .await;
     let new_id = new_admission["check_id"].as_str().unwrap().to_owned();
     mark_preflight_terminal(&fixture.owner.store, &new_id).await;
-    fixture
-        .owner
-        .store
-        .reconcile_checks_once()
-        .await
-        .unwrap();
-    assert_eq!(
+    fixture.owner.store.reconcile_checks_once().await.unwrap();
     // A late admission either joins the open cycle (visited immediately)
     // or waits exactly one turnover (post-cut); both converge on the next
     // pass, so the row is terminal after at most two more passes.
-    fixture
-        .owner
-        .store
-        .reconcile_checks_once()
-        .await
-        .unwrap();
+    fixture.owner.store.reconcile_checks_once().await.unwrap();
     assert_eq!(
         check_state(&fixture.owner.store, &new_id).await["state"],
         "error",
@@ -1029,7 +1012,10 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
         })
         .await
         .unwrap();
-    assert_eq!(terminal, 19, "every admitted row reaches terminal exactly once");
+    assert_eq!(
+        terminal, 19,
+        "every admitted row reaches terminal exactly once"
+    );
 
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
@@ -1360,9 +1346,7 @@ async fn retained_cursor(store: &Store) -> Option<Value> {
 
 async fn retained_cycle_cut(store: &Store) -> Option<String> {
     store
-        .run(|db| {
-            Ok(read_pending_cycle(db)?.map(|cycle| cycle.cut))
-        })
+        .run(|db| Ok(read_pending_cycle(db)?.map(|cycle| cycle.cut)))
         .await
         .unwrap()
 }
@@ -1384,11 +1368,7 @@ async fn pending_cursor_advances_only_through_completed_subjects() {
         admitted.push(admit_pending(&fixture, &project_id, content.as_bytes(), "v1").await);
     }
     for receipt in &admitted {
-        mark_preflight_terminal(
-            &fixture.owner.store,
-            receipt["check_id"].as_str().unwrap(),
-        )
-        .await;
+        mark_preflight_terminal(&fixture.owner.store, receipt["check_id"].as_str().unwrap()).await;
     }
     let root = fixture.directory.clone();
     let first = fixture
@@ -1413,7 +1393,11 @@ async fn pending_cursor_advances_only_through_completed_subjects() {
         .map(|receipt| receipt["check_id"].as_str().unwrap().to_owned())
         .filter(|id| *id != row1 && ordered.iter().all(|seen| seen != id))
         .collect();
-    assert_eq!(late.len(), 1, "one admitted row stays outside the first page");
+    assert_eq!(
+        late.len(),
+        1,
+        "one admitted row stays outside the first page"
+    );
     let row17 = late[0].clone();
     assert_eq!(
         retained_cycle_cut(&fixture.owner.store).await,
@@ -1524,12 +1508,7 @@ async fn pending_cursor_advances_only_through_completed_subjects() {
         "row 2 stays next eligible after recovery"
     );
     for _ in 0..3 {
-        fixture
-            .owner
-            .store
-            .reconcile_checks_once()
-            .await
-            .unwrap();
+        fixture.owner.store.reconcile_checks_once().await.unwrap();
     }
     for receipt in &admitted {
         let check_id = receipt["check_id"].as_str().unwrap();
@@ -1648,12 +1627,7 @@ async fn completed_cursor_and_cycle_survive_reopen_after_hard_failure() {
     for id in &done_ids {
         mark_preflight_terminal(&fixture.owner.store, id).await;
     }
-    fixture
-        .owner
-        .store
-        .reconcile_checks_once()
-        .await
-        .unwrap();
+    fixture.owner.store.reconcile_checks_once().await.unwrap();
     let mut done_lexical = done_ids.clone();
     done_lexical.sort();
     assert_eq!(
@@ -1775,18 +1749,13 @@ async fn pending_cycle_revisits_failed_subject_under_continuous_admissions() {
         initial.push(admit_pending(&fixture, &project_id, content.as_bytes(), "v1").await);
     }
     for receipt in &initial {
-        mark_preflight_terminal(
-            &fixture.owner.store,
-            receipt["check_id"].as_str().unwrap(),
-        )
-        .await;
+        mark_preflight_terminal(&fixture.owner.store, receipt["check_id"].as_str().unwrap()).await;
     }
     let head = pending_page(&fixture.owner.store, fixture.directory.clone())
         .await
         .unwrap();
     assert_eq!(head.len(), 8);
-    let mut ordered: Vec<String> =
-        head.iter().map(|work| work.check_id.clone()).collect();
+    let mut ordered: Vec<String> = head.iter().map(|work| work.check_id.clone()).collect();
     ordered.sort();
     let failed = ordered[2].clone();
     let failed_trigger = failed.clone();
@@ -1847,12 +1816,7 @@ async fn pending_cycle_revisits_failed_subject_under_continuous_admissions() {
         .await
         .unwrap();
     for _ in 0..4 {
-        fixture
-            .owner
-            .store
-            .reconcile_checks_once()
-            .await
-            .unwrap();
+        fixture.owner.store.reconcile_checks_once().await.unwrap();
     }
     assert_eq!(
         check_state(&fixture.owner.store, &failed).await["state"],
@@ -1861,11 +1825,7 @@ async fn pending_cycle_revisits_failed_subject_under_continuous_admissions() {
     );
     for receipt in &initial {
         assert_eq!(
-            check_state(
-                &fixture.owner.store,
-                receipt["check_id"].as_str().unwrap()
-            )
-            .await["state"],
+            check_state(&fixture.owner.store, receipt["check_id"].as_str().unwrap()).await["state"],
             "error"
         );
     }
@@ -2030,8 +1990,10 @@ async fn supervisor_hard_failure_keeps_last_completed_cursor_and_converges_on_re
 #[tokio::test]
 async fn pending_cursor_write_failure_preserves_truth_and_converges_on_retry() {
     let fixture = fixture().await;
-    let admitted_a = admit_pending(&fixture, "reg23-cursor-a", b"cursor write source a", "v1").await;
-    let admitted_b = admit_pending(&fixture, "reg23-cursor-b", b"cursor write source b", "v1").await;
+    let admitted_a =
+        admit_pending(&fixture, "reg23-cursor-a", b"cursor write source a", "v1").await;
+    let admitted_b =
+        admit_pending(&fixture, "reg23-cursor-b", b"cursor write source b", "v1").await;
     let row_a = admitted_a["check_id"].as_str().unwrap().to_owned();
     let row_b = admitted_b["check_id"].as_str().unwrap().to_owned();
     mark_preflight_terminal(&fixture.owner.store, &row_a).await;
@@ -2073,17 +2035,14 @@ async fn pending_cursor_write_failure_preserves_truth_and_converges_on_retry() {
         .owner
         .store
         .run(|db| {
-            db.execute_batch("DROP TRIGGER reg23_fail_cursor_insert; DROP TRIGGER reg23_fail_cursor_update;")?;
+            db.execute_batch(
+                "DROP TRIGGER reg23_fail_cursor_insert; DROP TRIGGER reg23_fail_cursor_update;",
+            )?;
             Ok(())
         })
         .await
         .unwrap();
-    fixture
-        .owner
-        .store
-        .reconcile_checks_once()
-        .await
-        .unwrap();
+    fixture.owner.store.reconcile_checks_once().await.unwrap();
     assert_eq!(
         std::fs::read(dir_a.join("completion.json")).unwrap(),
         completion_before,

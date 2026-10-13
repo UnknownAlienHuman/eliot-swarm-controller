@@ -3240,10 +3240,6 @@ impl Store {
         Ok(())
     }
 
-    /// Startup readback of retained CheckRun evidence before schedule catch-up.
-    /// It never launches a worker or repeats a command. Live workers remain
-    /// under the normal supervisor, which owns their acknowledged go-ahead.
-    pub(crate) async fn reconcile_checks_once(&self) -> Result<()> {
     /// Advance the pending subject cursor after one subject reached a stable,
     /// truthfully retained disposition. The disposition is already durable;
     /// a cursor-write failure propagates as a hard error without erasing
@@ -3272,8 +3268,9 @@ impl Store {
         // cursor at the last completed subject; the failed subject stays
         // eligible and converges on retry by exact readback.
         for work in items {
+            let check_id = work.check_id.clone();
             if self.terminalize_unstarted_check(&work).await? {
-                self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                self.advance_pending_cursor(&check_id, &cycle).await?;
                 continue;
             }
             self.record_check_process_diagnostic(&work).await?;
@@ -3292,7 +3289,7 @@ impl Store {
                 self.run(move |db| finish(db, &work, completion)).await?;
                 self.changed
                     .send_modify(|revision| *revision = revision.wrapping_add(1));
-                self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                self.advance_pending_cursor(&check_id, &cycle).await?;
                 continue;
             }
             let scan = work.clone();
@@ -3303,17 +3300,17 @@ impl Store {
                 self.run(move |db| finish(db, &work, completion)).await?;
                 self.changed
                     .send_modify(|revision| *revision = revision.wrapping_add(1));
-                self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                self.advance_pending_cursor(&check_id, &cycle).await?;
                 continue;
             }
             let scan = work.clone();
             match self.file_io(move |_| worker::ready(&scan)).await {
                 Ok(Some(identity)) => {
                     self.run(move |db| ready(db, &work, identity)).await?;
-                    self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                    self.advance_pending_cursor(&check_id, &cycle).await?;
                 }
                 Ok(None) => {
-                    self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                    self.advance_pending_cursor(&check_id, &cycle).await?;
                 }
                 Err(error) if error.code == "CHECK_WORKER_LOST" => {
                     let id = work.check_id.clone();
@@ -3331,7 +3328,7 @@ impl Store {
                         self.changed
                             .send_modify(|revision| *revision = revision.wrapping_add(1));
                     }
-                    self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                    self.advance_pending_cursor(&check_id, &cycle).await?;
                 }
                 Err(error) => return Err(error),
             }
