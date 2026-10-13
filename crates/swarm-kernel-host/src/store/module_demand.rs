@@ -644,8 +644,7 @@ pub(super) fn pending(
             Ok(true) => {}
             Ok(false) => missing_intent = true,
             Err(error) if owned_intent_error_is_subject_local(&error.code) => {
-                probe_preparation_errors
-                    .insert((binding_id.clone(), *generation), error.code);
+                probe_preparation_errors.insert((binding_id.clone(), *generation), error.code);
             }
             Err(error) => return Err(error),
         }
