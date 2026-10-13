@@ -3346,12 +3346,8 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
     // A bounded pass alone does not establish order: unexamined legacy rows
     // can belong before any converted v2 delivery. Keep the caller's delivery
     // cut unchanged while the independent normalization checkpoint advances.
-    let normalization = normalize_legacy_mailbox_indexes(
-        db,
-        &scope,
-        &principal.client_id,
-        INBOX_NORMALIZE_BOUND,
-    )?;
+    let normalization =
+        normalize_legacy_mailbox_indexes(db, &scope, &principal.client_id, INBOX_NORMALIZE_BOUND)?;
     // A legacy recovery locator precedes all valid v2 deliveries and may be
     // retired in this pass. Restart its unread delivery phase at the canonical
     // beginning; converting that raw cut into an Operation cut could skip mail.
@@ -3599,7 +3595,9 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
         gaps.push(json!({"kind":"damaged_mailbox_indexes","count":damaged}));
     }
     if legacy_damage_outside_cut {
-        gaps.push(json!({"kind":"legacy_mailbox_normalization_damage","count":normalization.damaged}));
+        gaps.push(
+            json!({"kind":"legacy_mailbox_normalization_damage","count":normalization.damaged}),
+        );
     }
     if stale > 0 {
         gaps.push(json!({"kind":"stale_mailbox_records","count":stale}));
@@ -3848,7 +3846,10 @@ fn normalize_legacy_mailbox_indexes(
             .as_u64()
             .and_then(|count| usize::try_from(count).ok())
             .ok_or_else(|| {
-                Error::new("INBOX_INDEX_DAMAGED", "mailbox normalization damage count is invalid")
+                Error::new(
+                    "INBOX_INDEX_DAMAGED",
+                    "mailbox normalization damage count is invalid",
+                )
             })?,
     };
     let after = match checkpoint.as_ref() {
@@ -3887,8 +3888,7 @@ fn normalize_legacy_mailbox_indexes(
         let Some(operation_id) = inbox_operation_id_from_key(&prefix, key) else {
             continue;
         };
-        let Some((position, indexed_at_ms)) = operation_read_position(&tx, &operation_id)?
-        else {
+        let Some((position, indexed_at_ms)) = operation_read_position(&tx, &operation_id)? else {
             continue;
         };
         if position <= 0 {
@@ -3977,10 +3977,18 @@ fn normalize_legacy_mailbox_indexes(
     }
     let next = if rows.len() > bound as usize {
         let key = rows[bound as usize - 1].0.clone();
-        set_meta(&tx, &checkpoint_key, &json!({"prefix":prefix,"state":"pending", "after_key":key,"damaged_count":damaged}))?;
+        set_meta(
+            &tx,
+            &checkpoint_key,
+            &json!({"prefix":prefix,"state":"pending", "after_key":key,"damaged_count":damaged}),
+        )?;
         Some(key)
     } else {
-        set_meta(&tx, &checkpoint_key, &json!({"prefix":prefix,"state":"complete","after_key":null,"damaged_count":damaged}))?;
+        set_meta(
+            &tx,
+            &checkpoint_key,
+            &json!({"prefix":prefix,"state":"complete","after_key":null,"damaged_count":damaged}),
+        )?;
         None
     };
     tx.commit()?;

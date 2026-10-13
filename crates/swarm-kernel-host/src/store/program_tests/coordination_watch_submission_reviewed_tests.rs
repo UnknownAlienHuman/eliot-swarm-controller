@@ -2120,45 +2120,112 @@ async fn retain_reversed_legacy_inbox(
 async fn coordination_inbox_withholds_items_until_more_than_64_legacy_rows_are_normalized() {
     let (owner, directory, subject, sender, recipient) =
         start_inbox_participants("inbox-normalization-bound").await;
-    let (ids, _) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 66).await;
+    let (ids, _) =
+        retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 66).await;
     let prefix = crate::coordination::mailbox_prefix(
         &crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap(),
         &recipient.client_id,
     );
-    let checkpoint_key = format!("coordination:mailbox-normalization:{}", crate::coordination::key_component(&prefix));
-    let pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    let checkpoint_key = format!(
+        "coordination:mailbox-normalization:{}",
+        crate::coordination::key_component(&prefix)
+    );
+    let pending = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(pending["items"], json!([]));
     assert_eq!(pending["coverage"], "partial");
-    assert_eq!(pending["availability"], "legacy_order_normalization_pending");
+    assert_eq!(
+        pending["availability"],
+        "legacy_order_normalization_pending"
+    );
     assert_eq!(pending["gaps"][0]["kind"], "inbox_normalization_pending");
     assert_eq!(pending["next_after"], Value::Null);
     assert_eq!(pending["next_after_key"], Value::Null);
-    owner.store.run({
-        let prefix = prefix.clone();
-        let checkpoint_key = checkpoint_key.clone();
-        move |db| {
-            let count: i64 = db.query_row("SELECT count(*) FROM meta WHERE key>=?1 AND key<?2", params![prefix,format!("{prefix}v")], |row| row.get(0))?;
-            assert_eq!(count, 2);
-            assert!(meta(db, &checkpoint_key)?.is_some());
-            Ok(())
-        }
-    }).await.unwrap();
-    let first = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    owner
+        .store
+        .run({
+            let prefix = prefix.clone();
+            let checkpoint_key = checkpoint_key.clone();
+            move |db| {
+                let count: i64 = db.query_row(
+                    "SELECT count(*) FROM meta WHERE key>=?1 AND key<?2",
+                    params![prefix, format!("{prefix}v")],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(count, 2);
+                assert!(meta(db, &checkpoint_key)?.is_some());
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let first = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(first["items"][0]["operation_id"], ids[0]);
     assert_eq!(first["next_after"], ids[0]);
-    let rest = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":50,"after_operation_id":ids[0]})).await.unwrap();
-    let got: Vec<_> = rest["items"].as_array().unwrap().iter().map(|item| item["operation_id"].as_str().unwrap()).collect();
-    assert_eq!(got, ids[1..51].iter().map(String::as_str).collect::<Vec<_>>());
-    let tail = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":50,"after_operation_id":rest["next_after"]})).await.unwrap();
-    let got: Vec<_> = tail["items"].as_array().unwrap().iter().map(|item| item["operation_id"].as_str().unwrap()).collect();
-    assert_eq!(got, ids[51..].iter().map(String::as_str).collect::<Vec<_>>());
+    let rest = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":50,"after_operation_id":ids[0]}),
+        )
+        .await
+        .unwrap();
+    let got: Vec<_> = rest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["operation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        ids[1..51].iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let tail = owner
+        .store
+        .call(
+            recipient,
+            "coordination.inbox".into(),
+            json!({"limit":50,"after_operation_id":rest["next_after"]}),
+        )
+        .await
+        .unwrap();
+    let got: Vec<_> = tail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["operation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        ids[51..].iter().map(String::as_str).collect::<Vec<_>>()
+    );
     assert_eq!(tail["coverage"], "complete");
-    owner.store.run(move |db| {
-        let complete = meta(db, &checkpoint_key)?.unwrap();
-        assert_eq!(complete["state"], "complete");
-        assert_eq!(complete["damaged_count"], 0);
-        Ok(())
-    }).await.unwrap();
+    owner
+        .store
+        .run(move |db| {
+            let complete = meta(db, &checkpoint_key)?.unwrap();
+            assert_eq!(complete["state"], "complete");
+            assert_eq!(complete["damaged_count"], 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -2167,90 +2234,214 @@ async fn coordination_inbox_withholds_items_until_more_than_64_legacy_rows_are_n
 async fn coordination_inbox_normalization_advances_past_damaged_legacy_prefix() {
     let (owner, directory, subject, sender, recipient) =
         start_inbox_participants("inbox-normalization-damage").await;
-    let (ids, _) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 6).await;
+    let (ids, _) =
+        retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 6).await;
     let prefix = crate::coordination::mailbox_prefix(
         &crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap(),
         &recipient.client_id,
     );
-    let damaged: Vec<_> = (0..70).map(|index| format!("{prefix}!damage:{index:03}")).collect();
-    owner.store.run({
-        let damaged = damaged.clone();
-        move |db| {
-            for key in &damaged { set_meta(db, key, &json!({"damaged":true}))?; }
-            Ok(())
-        }
-    }).await.unwrap();
-    let pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    let damaged: Vec<_> = (0..70)
+        .map(|index| format!("{prefix}!damage:{index:03}"))
+        .collect();
+    owner
+        .store
+        .run({
+            let damaged = damaged.clone();
+            move |db| {
+                for key in &damaged {
+                    set_meta(db, key, &json!({"damaged":true}))?;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let pending = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(pending["items"], json!([]));
     assert_eq!(pending["gaps"][0]["after_index_key"], damaged[63]);
-    let gap = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    let gap = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(gap["items"], json!([]));
     assert_eq!(gap["next_after_key"], damaged[35]);
-    assert!(gap["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "damaged_mailbox_indexes" && entry["count"] == 36));
-    let checkpoint_key = format!("coordination:mailbox-normalization:{}", crate::coordination::key_component(&prefix));
-    let completed: (String, i64) = owner.store.run({
-        let checkpoint_key = checkpoint_key.clone();
-        move |db| {
-            let raw: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&checkpoint_key], |row| row.get(0))?;
-            let record: Value = serde_json::from_str(&raw)?;
-            assert_eq!(record["state"], "complete");
-            assert_eq!(record["damaged_count"], 70);
-            let changes = db.query_row("SELECT total_changes()", [], |row| row.get(0))?;
-            Ok((raw, changes))
-        }
-    }).await.unwrap();
+    assert!(
+        gap["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "damaged_mailbox_indexes" && entry["count"] == 36)
+    );
+    let checkpoint_key = format!(
+        "coordination:mailbox-normalization:{}",
+        crate::coordination::key_component(&prefix)
+    );
+    let completed: (String, i64) = owner
+        .store
+        .run({
+            let checkpoint_key = checkpoint_key.clone();
+            move |db| {
+                let raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&checkpoint_key],
+                    |row| row.get(0),
+                )?;
+                let record: Value = serde_json::from_str(&raw)?;
+                assert_eq!(record["state"], "complete");
+                assert_eq!(record["damaged_count"], 70);
+                let changes = db.query_row("SELECT total_changes()", [], |row| row.get(0))?;
+                Ok((raw, changes))
+            }
+        })
+        .await
+        .unwrap();
     // Retained poison stays a source gap, never a reason to restart the sweep.
-    let first = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_key":gap["next_after_key"]})).await.unwrap();
+    let first = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1,"after_key":gap["next_after_key"]}),
+        )
+        .await
+        .unwrap();
     assert_eq!(first["items"][0]["operation_id"], ids[0]);
     let mut after = first["next_after"].clone();
     for expected in ids.iter().skip(1) {
-        let page = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":after})).await.unwrap();
+        let page = owner
+            .store
+            .call(
+                recipient.clone(),
+                "coordination.inbox".into(),
+                json!({"limit":1,"after_operation_id":after}),
+            )
+            .await
+            .unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
-        assert_eq!(page["items"][0]["operation_id"].as_str(), Some(expected.as_str()));
+        assert_eq!(
+            page["items"][0]["operation_id"].as_str(),
+            Some(expected.as_str())
+        );
         assert_eq!(page["coverage"], "partial");
-        assert!(page["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "legacy_mailbox_normalization_damage" && entry["count"] == 70));
-        assert!(!page["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "inbox_normalization_pending"));
+        assert!(
+            page["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |entry| entry["kind"] == "legacy_mailbox_normalization_damage"
+                        && entry["count"] == 70
+                )
+        );
+        assert!(
+            !page["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["kind"] == "inbox_normalization_pending")
+        );
         after = page["next_after"].clone();
     }
-    let empty = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":after})).await.unwrap();
+    let empty = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1,"after_operation_id":after}),
+        )
+        .await
+        .unwrap();
     assert_eq!(empty["items"], json!([]));
     assert_eq!(empty["coverage"], "partial");
-    owner.store.run({
-        let checkpoint_key = checkpoint_key.clone();
-        move |db| {
-            let raw: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&checkpoint_key], |row| row.get(0))?;
-            let changes: i64 = db.query_row("SELECT total_changes()", [], |row| row.get(0))?;
-            assert_eq!((raw, changes), completed);
-            Ok(())
-        }
-    }).await.unwrap();
+    owner
+        .store
+        .run({
+            let checkpoint_key = checkpoint_key.clone();
+            move |db| {
+                let raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&checkpoint_key],
+                    |row| row.get(0),
+                )?;
+                let changes: i64 = db.query_row("SELECT total_changes()", [], |row| row.get(0))?;
+                assert_eq!((raw, changes), completed);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
     // Neither same-byte legacy updates nor new ordinary v2 deliveries rearm.
-    owner.store.run({
-        let key = damaged[0].clone();
-        let checkpoint_key = checkpoint_key.clone();
-        move |db| {
-            db.execute("UPDATE meta SET value_json=value_json WHERE key=?1", [&key])?;
-            assert_eq!(meta(db, &checkpoint_key)?.unwrap()["state"], "complete");
-            Ok(())
-        }
-    }).await.unwrap();
+    owner
+        .store
+        .run({
+            let key = damaged[0].clone();
+            let checkpoint_key = checkpoint_key.clone();
+            move |db| {
+                db.execute("UPDATE meta SET value_json=value_json WHERE key=?1", [&key])?;
+                assert_eq!(meta(db, &checkpoint_key)?.unwrap()["state"], "complete");
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
     let sent = owner.store.call(sender, "coordination.send".into(), json!({"client_request_id":"v2-after-poison-completion","recipient":recipient.client_id,"body":{"fresh":true}})).await.unwrap();
-    let fresh = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":ids.last().unwrap()})).await.unwrap();
+    let fresh = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1,"after_operation_id":ids.last().unwrap()}),
+        )
+        .await
+        .unwrap();
     assert_eq!(fresh["items"][0]["operation_id"], sent["operation_id"]);
     // A meaningful scoped legacy change does rearm exactly once.
-    owner.store.run({
-        let key = damaged[0].clone();
-        let checkpoint_key = checkpoint_key.clone();
-        move |db| {
-            set_meta(db, &key, &json!({"damaged":"changed"}))?;
-            assert!(meta(db, &checkpoint_key)?.is_none());
-            Ok(())
-        }
-    }).await.unwrap();
-    let rearmed = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":ids[0]})).await.unwrap();
+    owner
+        .store
+        .run({
+            let key = damaged[0].clone();
+            let checkpoint_key = checkpoint_key.clone();
+            move |db| {
+                set_meta(db, &key, &json!({"damaged":"changed"}))?;
+                assert!(meta(db, &checkpoint_key)?.is_none());
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let rearmed = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1,"after_operation_id":ids[0]}),
+        )
+        .await
+        .unwrap();
     assert_eq!(rearmed["items"], json!([]));
     assert_eq!(rearmed["gaps"][0]["kind"], "inbox_normalization_pending");
-    let complete = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":1,"after_operation_id":ids[0]})).await.unwrap();
+    let complete = owner
+        .store
+        .call(
+            recipient,
+            "coordination.inbox".into(),
+            json!({"limit":1,"after_operation_id":ids[0]}),
+        )
+        .await
+        .unwrap();
     assert_eq!(complete["items"][0]["operation_id"], ids[1]);
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
@@ -2260,21 +2451,41 @@ async fn coordination_inbox_normalization_advances_past_damaged_legacy_prefix() 
 async fn coordination_inbox_normalization_delete_failure_rolls_back_locator_batch() {
     let (owner, directory, subject, sender, recipient) =
         start_inbox_participants("inbox-normalization-rollback").await;
-    let (ids, legacy) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 66).await;
+    let (ids, legacy) =
+        retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 66).await;
     // Reverse timestamp order visits index 65 first and fails deleting 64:
     // both the preceding successful replacement and the failing one roll back.
-    owner.store.run({
-        let fail_key = legacy[64].0.clone();
-        move |db| {
-            db.execute_batch("CREATE TEMP TABLE normalization_delete_fault(key TEXT PRIMARY KEY);
+    owner
+        .store
+        .run({
+            let fail_key = legacy[64].0.clone();
+            move |db| {
+                db.execute_batch(
+                    "CREATE TEMP TABLE normalization_delete_fault(key TEXT PRIMARY KEY);
                 CREATE TEMP TRIGGER abort_mailbox_legacy_delete BEFORE DELETE ON main.meta
                 WHEN OLD.key IN (SELECT key FROM normalization_delete_fault)
-                BEGIN SELECT RAISE(ABORT,'injected legacy delete failure'); END;")?;
-            db.execute("INSERT INTO normalization_delete_fault(key) VALUES(?1)", [&fail_key])?;
-            Ok(())
-        }
-    }).await.unwrap();
-    assert!(owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.is_err());
+                BEGIN SELECT RAISE(ABORT,'injected legacy delete failure'); END;",
+                )?;
+                db.execute(
+                    "INSERT INTO normalization_delete_fault(key) VALUES(?1)",
+                    [&fail_key],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    assert!(
+        owner
+            .store
+            .call(
+                recipient.clone(),
+                "coordination.inbox".into(),
+                json!({"limit":1})
+            )
+            .await
+            .is_err()
+    );
     owner.store.run(move |db| {
         for (key, raw) in legacy {
             let retained: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| row.get(0))?;
@@ -2291,9 +2502,21 @@ async fn coordination_inbox_normalization_delete_failure_rolls_back_locator_batc
         db.execute_batch("DROP TRIGGER temp.abort_mailbox_legacy_delete; DROP TABLE temp.normalization_delete_fault;")?;
         Ok(())
     }).await.unwrap();
-    let pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    let pending = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":1}),
+        )
+        .await
+        .unwrap();
     assert_eq!(pending["items"], json!([]));
-    let recovered = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    let recovered = owner
+        .store
+        .call(recipient, "coordination.inbox".into(), json!({"limit":1}))
+        .await
+        .unwrap();
     assert_eq!(recovered["items"][0]["body"]["seq"], 0);
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
@@ -2334,8 +2557,7 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
         operation_ids.push(sent["operation_id"].as_str().unwrap().to_owned());
     }
 
-    let scope_id =
-        crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap();
+    let scope_id = crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap();
     let prefix = crate::coordination::mailbox_prefix(&scope_id, &recipient_id);
     let legacy_upper = format!("{prefix}v");
     let v2_lower = format!("{prefix}v2:");
@@ -2565,9 +2787,8 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
             let prefix = prefix.clone();
             let legacy_upper = legacy_upper.clone();
             move |db| {
-                let mut statement = db.prepare(
-                    "SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key",
-                )?;
+                let mut statement =
+                    db.prepare("SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key")?;
                 let rows: Vec<String> = statement
                     .query_map(rusqlite::params![prefix, legacy_upper], |row| row.get(0))?
                     .collect::<std::result::Result<_, _>>()?;
@@ -2633,7 +2854,10 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
         .unwrap();
     assert!(resumed["items"].as_array().unwrap().is_empty());
     assert_eq!(resumed["coverage"], "partial");
-    assert_eq!(resumed["gaps"][0]["kind"], "legacy_mailbox_normalization_damage");
+    assert_eq!(
+        resumed["gaps"][0]["kind"],
+        "legacy_mailbox_normalization_damage"
+    );
     assert_eq!(resumed["gaps"][0]["count"], 2);
     // requirement 8: repeated bounded migration/page calls are idempotent.
     let again = owner
@@ -2687,12 +2911,8 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
                     [&target],
                     |row| row.get(0),
                 )?;
-                let twin = crate::coordination::mailbox_key(
-                    &scope_id,
-                    &recipient_id,
-                    stamp,
-                    &target,
-                );
+                let twin =
+                    crate::coordination::mailbox_key(&scope_id, &recipient_id, stamp, &target);
                 let damaged = model::canonical(&json!({"damaged": true}))?;
                 db.execute(
                     "UPDATE meta SET value_json=?1 WHERE key=?2",
@@ -2727,9 +2947,11 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
         .unwrap();
     let conflicted_items = conflicted["items"].as_array().unwrap();
     assert_eq!(conflicted_items.len(), MESSAGE_COUNT - 2);
-    assert!(!conflicted_items
-        .iter()
-        .any(|item| item["operation_id"] == target));
+    assert!(
+        !conflicted_items
+            .iter()
+            .any(|item| item["operation_id"] == target)
+    );
     assert_eq!(conflicted["coverage"], "partial");
     // ... and resolves onto the repaired twin without duplicating.
     owner
@@ -2745,7 +2967,10 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
                 // scheduling hint; it does not rewrite Operation authority.
                 db.execute(
                     "DELETE FROM meta WHERE key=?1",
-                    [format!("coordination:mailbox-normalization:{}", crate::coordination::key_component(&prefix))],
+                    [format!(
+                        "coordination:mailbox-normalization:{}",
+                        crate::coordination::key_component(&prefix)
+                    )],
                 )?;
                 Ok(())
             }
@@ -2772,9 +2997,8 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
         .store
         .run({
             move |db| {
-                let mut statement = db.prepare(
-                    "SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key",
-                )?;
+                let mut statement =
+                    db.prepare("SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key")?;
                 let rows: Vec<String> = statement
                     .query_map(rusqlite::params![prefix, legacy_upper], |row| row.get(0))?
                     .collect::<std::result::Result<_, _>>()?;
