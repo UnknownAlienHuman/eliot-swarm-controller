@@ -1137,13 +1137,29 @@ fn capture_supervisor_child_identity(
     child: &Child,
     executable: &Path,
 ) -> Result<SupervisorChildIdentity> {
+    capture_supervisor_child_identity_with_readers(
+        child,
+        executable,
+        process_birth_identity,
+        process_image_identity,
+    )
+}
+
+// Keep fault selection local to the private caller; production always supplies
+// the real OS readers above and retains the same birth/image/birth validation.
+fn capture_supervisor_child_identity_with_readers(
+    child: &Child,
+    executable: &Path,
+    mut read_birth: impl FnMut(u32) -> swarm_contracts::error::Result<Option<Value>>,
+    read_image: impl FnOnce(u32) -> swarm_contracts::error::Result<Value>,
+) -> Result<SupervisorChildIdentity> {
     let pid = child.id().ok_or_else(|| {
         Error::new(
             "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
             "supervisor child PID is unavailable",
         )
     })?;
-    let birth = process_birth_identity(pid)
+    let birth = read_birth(pid)
         .map_err(|_| {
             Error::new(
                 "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
@@ -1156,13 +1172,13 @@ fn capture_supervisor_child_identity(
                 "supervisor child exited before birth identity capture",
             )
         })?;
-    let image = process_image_identity(pid).map_err(|_| {
+    let image = read_image(pid).map_err(|_| {
         Error::new(
             "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
             "supervisor child image identity could not be read",
         )
     })?;
-    let after = process_birth_identity(pid)
+    let after = read_birth(pid)
         .map_err(|_| {
             Error::new(
                 "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
@@ -1562,6 +1578,27 @@ async fn spawn_supervisor_child(
 ) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     let mut command = Command::new(executable);
     swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
+    spawn_supervisor_child_with_identity_reader(
+        store,
+        executable,
+        frame,
+        shutdown_custody,
+        command,
+        capture_supervisor_child_identity,
+    )
+    .await
+}
+
+// The acquisition, bootstrap and failure-custody path is shared unchanged with
+// private tests that launch the existing real-child fixture command.
+async fn spawn_supervisor_child_with_identity_reader(
+    store: &Store,
+    executable: &Path,
+    frame: &[u8],
+    shutdown_custody: &ShutdownCustody,
+    mut command: Command,
+    read_identity: impl FnOnce(&Child, &Path) -> Result<SupervisorChildIdentity>,
+) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1573,7 +1610,7 @@ async fn spawn_supervisor_child(
             "installed supervisor process could not be started",
         )
     })?;
-    let identity = match capture_supervisor_child_identity(&child, executable) {
+    let identity = match read_identity(&child, executable) {
         Ok(identity) => identity,
         Err(error) => {
             let _ = reap_failed_supervisor_child(
@@ -2191,6 +2228,12 @@ mod tests {
     }
 
     fn spawn_fixture_child(release: &Path, pipe_stdin: bool) -> Child {
+        fixture_child_command(release, pipe_stdin)
+            .spawn()
+            .expect("start real fixture child process")
+    }
+
+    fn fixture_child_command(release: &Path, pipe_stdin: bool) -> Command {
         let mut command = Command::new(std::env::current_exe().expect("resolve test executable"));
         command
             .args(["--exact", CHILD_TEST, "--nocapture"])
@@ -2203,7 +2246,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(false);
-        command.spawn().expect("start real fixture child process")
+        command
     }
 
     async fn append_launch_record(path: &Path, pid: u32) {
@@ -2299,6 +2342,441 @@ mod tests {
             if self.armed {
                 let _ = fs::write(&self.path, b"release");
             }
+        }
+    }
+
+    mod identity_reader_custody {
+        use super::*;
+
+        type SpawnedFixtureChild = (Child, ChildStdin, SupervisorChildIdentity);
+
+        #[derive(Clone, Copy)]
+        enum ReaderFailure {
+            Birth,
+            Image,
+        }
+
+        #[tokio::test]
+        async fn unknown362_birth_read_failure_and_health_write_failure_keep_exact_child_custody() {
+            reader_failure_keeps_exact_child_custody(ReaderFailure::Birth).await;
+        }
+
+        #[tokio::test]
+        async fn unknown362_image_read_failure_and_health_write_failure_keep_exact_child_custody() {
+            reader_failure_keeps_exact_child_custody(ReaderFailure::Image).await;
+        }
+
+        // Compose the same prior-child/admission/intent/readback/spawn gates as
+        // the host loop. The command is the existing release-file child probe;
+        // this does not qualify the installed supervisor or its bootstrap.
+        async fn guarded_fixture_spawn(
+            runtime: &TestIpcRuntime,
+            release: &Path,
+            custody: &ShutdownCustody,
+            read_identity: impl FnOnce(&Child, &Path) -> Result<SupervisorChildIdentity>,
+        ) -> Result<Option<SpawnedFixtureChild>> {
+            let prior_departure = match reconcile_prior_child(&runtime.control).await? {
+                PriorChildState::Clear { retained } => retained,
+                PriorChildState::Alive(_) => return Ok(None),
+            };
+            runtime
+                .owner
+                .store
+                .admit_module_supervisor_actor(&Uuid::new_v4().to_string())
+                .await?;
+            record_module_actor_status(
+                &runtime.owner.store,
+                "isolated",
+                0,
+                Some(SUPERVISOR_SPAWN_PENDING),
+                Some(MODULE_ACTOR_ISOLATED_RETRY),
+            )
+            .await?;
+            let (_stop, stopping) = watch::channel(false);
+            if !prepare_supervisor_spawn(&runtime.owner.store, &stopping, prior_departure.as_ref())
+                .await?
+            {
+                return Ok(None);
+            }
+            let executable = std::env::current_exe()?;
+            spawn_supervisor_child_with_identity_reader(
+                &runtime.owner.store,
+                &executable,
+                b"",
+                custody,
+                fixture_child_command(release, true),
+                read_identity,
+            )
+            .await
+            .map(Some)
+        }
+
+        fn install_health_rejection(root: &Path, code: &str) {
+            let db = Connection::open(root.join("swarm.db")).unwrap();
+            db.execute_batch(&format!(
+                r#"CREATE TRIGGER reject_unknown362_reader_health
+                   BEFORE UPDATE OF value_json ON meta
+                   WHEN OLD.key = 'host:optional-workers:v1'
+                    AND json_extract(NEW.value_json,
+                        '$.workers."module-supervisor".last_error_code') = '{code}'
+                    AND json_extract(NEW.value_json,
+                        '$.workers."module-supervisor".consecutive_failures') = 1
+                   BEGIN
+                       SELECT RAISE(ABORT, 'fixture rejected actual postspawn health');
+                   END;"#,
+            ))
+            .expect("reject only the selected postspawn Store health write");
+        }
+
+        fn remove_health_rejection(root: &Path) {
+            Connection::open(root.join("swarm.db"))
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_unknown362_reader_health;")
+                .expect("remove only this test's rejected-write fault");
+        }
+
+        fn assert_restart_root_is_owned(root: &Path) {
+            match DataRoot::acquire(root) {
+                Err(error) => assert_eq!(error.code, "HOST_ALREADY_RUNNING"),
+                Ok(_) => panic!("restart acquired the host root before child custody drained"),
+            }
+        }
+
+        fn observe_acquired_child(child: &Child, launches: &mut Vec<(u32, Value)>) {
+            let pid = child.id().expect("production spawn acquired a real Child");
+            let birth = process_birth_identity(pid)
+                .expect("independently observe the acquired Child incarnation")
+                .expect("acquired Child is live");
+            launches.push((pid, birth));
+        }
+
+        async fn reader_failure_keeps_exact_child_custody(failure: ReaderFailure) {
+            let root = std::env::temp_dir().join(format!(
+                "eliot-unknown362-reader-{}",
+                crate::model::new_id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let release = root.join("release-child");
+            let mut release_guard = ReleaseFileGuard::new(release.clone());
+            let runtime = TestIpcRuntime::start(&root).await;
+            let custody = ShutdownCustody::new(runtime.owner.store.clone());
+            install_health_rejection(&root, SUPERVISOR_SPAWN_PENDING);
+
+            let mut launches = Vec::new();
+            let mut birth_reads = 0;
+            let mut image_reads = 0;
+            let capture_error =
+                guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
+                    observe_acquired_child(child, &mut launches);
+                    let expected_pid = child.id().unwrap();
+                    capture_supervisor_child_identity_with_readers(
+                        child,
+                        executable,
+                        |pid| {
+                            assert_eq!(pid, expected_pid, "birth reader received this exact Child");
+                            birth_reads += 1;
+                            if matches!(failure, ReaderFailure::Birth) {
+                                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+                                    .into())
+                            } else {
+                                process_birth_identity(pid)
+                            }
+                        },
+                        |pid| {
+                            assert_eq!(pid, expected_pid, "image reader received this exact Child");
+                            image_reads += 1;
+                            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+                        },
+                    )
+                })
+                .await
+                .expect_err("actual spawned Child must enter the reader-error custody path");
+            assert_eq!(
+                capture_error.code,
+                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN"
+            );
+            assert_eq!(
+                capture_error.message,
+                match failure {
+                    ReaderFailure::Birth => "supervisor child birth identity could not be read",
+                    ReaderFailure::Image => "supervisor child image identity could not be read",
+                }
+            );
+            assert_eq!(birth_reads, 1);
+            assert_eq!(
+                image_reads,
+                usize::from(matches!(failure, ReaderFailure::Image))
+            );
+            assert_eq!(launches.len(), 1, "one actual Child was acquired");
+            let (pid, birth) = launches[0].clone();
+
+            let before = runtime.control.read_health().await.unwrap();
+            assert_eq!(before.error_code.as_deref(), Some(SUPERVISOR_SPAWN_PENDING));
+            assert!(
+                before.child.is_none(),
+                "failed capture cannot mint a child receipt"
+            );
+            let rejected = record_module_actor_spawn_failure(
+                &runtime.owner.store,
+                "isolated",
+                1,
+                &capture_error,
+                MODULE_ACTOR_ISOLATED_RETRY,
+            )
+            .await
+            .expect_err("reject the same health write attempted by the production loop");
+            assert_eq!(rejected.code, "STORE_ERROR");
+            let loop_error = capture_error.with_secondary_error(rejected);
+            assert_eq!(loop_error.secondary_codes, vec!["STORE_ERROR"]);
+            assert!(!is_retryable_child_spawn_error(&loop_error));
+            assert_eq!(
+                serde_json::to_value(runtime.control.read_health().await.unwrap()).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                "rejected health must preserve the exact pending receipt"
+            );
+
+            let draining_custody = custody.clone();
+            let mut drain = tokio::spawn(async move { draining_custody.drain().await });
+            assert!(
+                time::timeout(Duration::from_millis(250), &mut drain)
+                    .await
+                    .is_err(),
+                "registered reaper must keep host shutdown pending while this Child is live"
+            );
+            assert_same_live_process(pid, &birth, "during failed-reader custody drain");
+            assert_restart_root_is_owned(&root);
+            let blocked =
+                guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
+                    observe_acquired_child(child, &mut launches);
+                    capture_supervisor_child_identity(child, executable)
+                })
+                .await
+                .expect_err("pending retained intent must prevent another actual OS launch");
+            assert_eq!(blocked.code, SUPERVISOR_SPAWN_PENDING);
+            assert_eq!(
+                launches.len(),
+                1,
+                "live restart attempt acquired no second Child"
+            );
+
+            remove_health_rejection(&root);
+            release_guard.release();
+            time::timeout(Duration::from_secs(10), &mut drain)
+                .await
+                .expect("custody drain completed only after real Child departure")
+                .expect("custody drain task joined")
+                .expect("unidentified Child wait succeeded");
+            wait_for_process_departure(pid, &birth).await;
+            assert_eq!(
+                serde_json::to_value(runtime.control.read_health().await.unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "a local wait cannot invent a verified identity/departure receipt"
+            );
+            drop(custody);
+            runtime.close().await;
+
+            let restarted = TestIpcRuntime::start(&root).await;
+            let restarted_custody = ShutdownCustody::new(restarted.owner.store.clone());
+            let blocked = guarded_fixture_spawn(
+                &restarted,
+                &release,
+                &restarted_custody,
+                |child, executable| {
+                    observe_acquired_child(child, &mut launches);
+                    capture_supervisor_child_identity(child, executable)
+                },
+            )
+            .await
+            .expect_err("actual Store/IPC restart cannot replace an unverified pending intent");
+            assert_eq!(blocked.code, SUPERVISOR_SPAWN_PENDING);
+            assert_eq!(launches.len(), 1);
+            let retained = restarted.control.read_health().await.unwrap();
+            assert_eq!(
+                retained.error_code.as_deref(),
+                Some(SUPERVISOR_SPAWN_PENDING)
+            );
+            assert!(retained.child.is_none());
+            drop(restarted_custody);
+            restarted.close().await;
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[tokio::test]
+        async fn unknown362_verified_departure_after_health_failure_allows_only_exact_successor() {
+            let root = std::env::temp_dir().join(format!(
+                "eliot-unknown362-successor-{}",
+                crate::model::new_id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let release = root.join("release-child");
+            let mut release_guard = ReleaseFileGuard::new(release.clone());
+            let runtime = TestIpcRuntime::start(&root).await;
+            let custody = ShutdownCustody::new(runtime.owner.store.clone());
+            let mut launches = Vec::new();
+            let (child, stdin, identity) =
+                guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
+                    observe_acquired_child(child, &mut launches);
+                    capture_supervisor_child_identity(child, executable)
+                })
+                .await
+                .unwrap()
+                .expect("verified first Child admitted through the real spawn gates");
+            record_module_actor_health(
+                &runtime.owner.store,
+                "running",
+                0,
+                None,
+                None,
+                Some(&supervisor_child_health(
+                    &identity,
+                    None,
+                    SupervisorChildStopState::Running,
+                )),
+            )
+            .await
+            .expect("persist the actual first Child's verified live identity");
+            install_health_rejection(&root, SUPERVISOR_CHILD_RETAINED);
+            let rejected = reap_failed_supervisor_child(
+                child,
+                Some(stdin),
+                Some(identity.clone()),
+                &runtime.owner.store,
+                SUPERVISOR_CHILD_RETAINED,
+                &custody,
+            )
+            .await
+            .expect_err("reject initial retained health while transferring this exact Child");
+            assert_eq!(rejected.code, "STORE_ERROR");
+            match reconcile_prior_child(&runtime.control).await.unwrap() {
+                PriorChildState::Alive(receipt) => {
+                    assert_eq!(receipt.process.pid, identity.pid);
+                    assert_eq!(receipt.process.birth, identity.birth);
+                    assert_eq!(receipt.process.image, identity.image);
+                }
+                PriorChildState::Clear { .. } => panic!("live verified Child became replaceable"),
+            }
+            assert!(
+                guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
+                    observe_acquired_child(child, &mut launches);
+                    capture_supervisor_child_identity(child, executable)
+                })
+                .await
+                .unwrap()
+                .is_none(),
+                "exact live prior-child gate must prevent replacement"
+            );
+            assert_eq!(launches.len(), 1);
+            let draining_custody = custody.clone();
+            let mut drain = tokio::spawn(async move { draining_custody.drain().await });
+            assert!(
+                time::timeout(Duration::from_millis(250), &mut drain)
+                    .await
+                    .is_err()
+            );
+            assert_same_live_process(
+                identity.pid,
+                &identity.birth,
+                "during verified custody drain",
+            );
+            assert_restart_root_is_owned(&root);
+
+            remove_health_rejection(&root);
+            release_guard.release();
+            let drained = time::timeout(Duration::from_secs(10), &mut drain)
+                .await
+                .expect("verified exact Child departed")
+                .expect("verified reaper joined");
+            assert_eq!(
+                drained
+                    .expect_err("initial health failure remains reported")
+                    .code,
+                "STORE_ERROR"
+            );
+            wait_for_process_departure(identity.pid, &identity.birth).await;
+            let departed = runtime.control.read_health().await.unwrap().child.unwrap();
+            assert_eq!(departed.process.pid, identity.pid);
+            assert_eq!(departed.process.birth, identity.birth);
+            assert_eq!(departed.process.image, identity.image);
+            assert!(matches!(departed.stop, SupervisorChildStopState::Confirmed));
+            assert_eq!(departed.exit.as_ref().unwrap().code, Some(0));
+            drop(custody);
+            runtime.close().await;
+
+            let restarted = TestIpcRuntime::start(&root).await;
+            match reconcile_prior_child(&restarted.control).await.unwrap() {
+                PriorChildState::Clear {
+                    retained: Some(receipt),
+                } => {
+                    assert_eq!(
+                        serde_json::to_value(receipt).unwrap(),
+                        serde_json::to_value(&departed).unwrap()
+                    );
+                }
+                _ => panic!("actual restart lost the exact verified departure receipt"),
+            }
+            let next_release = root.join("release-successor");
+            let mut next_release_guard = ReleaseFileGuard::new(next_release.clone());
+            let next_custody = ShutdownCustody::new(restarted.owner.store.clone());
+            let (child, stdin, next_identity) = guarded_fixture_spawn(
+                &restarted,
+                &next_release,
+                &next_custody,
+                |child, executable| {
+                    observe_acquired_child(child, &mut launches);
+                    capture_supervisor_child_identity(child, executable)
+                },
+            )
+            .await
+            .unwrap()
+            .expect("only a verified prior departure admits the next actual Child");
+            assert_eq!(
+                launches.len(),
+                2,
+                "one legitimate successor and no overlapping launch"
+            );
+            assert_ne!(
+                launches[0], launches[1],
+                "successor is a new actual incarnation"
+            );
+            let lease = SupervisorChildLease::new(
+                child,
+                stdin,
+                next_identity.clone(),
+                restarted.owner.store.clone(),
+                next_custody.clone(),
+            );
+            assert_same_live_process(
+                next_identity.pid,
+                &next_identity.birth,
+                "after successor admission",
+            );
+            next_release_guard.release();
+            drop(lease);
+            time::timeout(Duration::from_secs(10), next_custody.drain())
+                .await
+                .expect("successor custody completed")
+                .expect("successor exact wait and health write succeeded");
+            wait_for_process_departure(next_identity.pid, &next_identity.birth).await;
+            let successor = restarted
+                .control
+                .read_health()
+                .await
+                .unwrap()
+                .child
+                .unwrap();
+            assert_eq!(successor.process.pid, next_identity.pid);
+            assert_eq!(successor.process.birth, next_identity.birth);
+            assert_eq!(successor.process.image, next_identity.image);
+            assert!(matches!(
+                successor.stop,
+                SupervisorChildStopState::Confirmed
+            ));
+            assert_eq!(successor.exit.as_ref().unwrap().code, Some(0));
+            drop(next_custody);
+            restarted.close().await;
+            fs::remove_dir_all(root).unwrap();
         }
     }
 }
