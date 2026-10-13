@@ -1705,14 +1705,8 @@ fn require_dashboard_reader(db: &Connection, p: &Principal) -> Result<()> {
         _ => Err(Error::new("FORBIDDEN", "dashboard read authority required")),
     }
 }
-/// The fleet-wide read set a principal may observe across queue,
-/// dashboard, and exception projections. The local Operator and the
-/// current GM retain the whole fleet. Every other Manager is scoped to
-/// the exact Task set the documented launcher read policy grants them:
-/// the Tasks whose current unreleased Attempt they own, resolved through
-/// the same ownership rule the launch path enforces for current Task
-/// scope. Observer has no manager read surface here and is handled by
-/// the aggregate-only dashboard branch.
+/// Read sets for bounded fleet projections and exact Task detail consumers.
+/// Queue/dashboard/exceptions inventory does not grant object drill-down.
 #[derive(Debug, Clone)]
 enum FleetReadScope {
     Fleet,
@@ -1721,7 +1715,25 @@ enum FleetReadScope {
 
 fn fleet_read_scope(db: &Connection, p: &Principal) -> Result<FleetReadScope> {
     match p.role {
-        Role::Operator | Role::Observer => Ok(FleetReadScope::Fleet),
+        Role::Operator => super::require_local_operator(db, &p.client_id)?,
+        Role::Manager => {
+            crate::automation::authorization::require_registered_manager(db, &p.client_id)?;
+        }
+        // Only dashboard admits Observer and omits all detailed pages.
+        Role::Observer => {}
+        _ => return Err(Error::new("FORBIDDEN", "fleet read authority required")),
+    }
+    Ok(FleetReadScope::Fleet)
+}
+
+/// Exact launch/inspection decorations retain the own-Task or current-GM
+/// grant. They must not reuse the fleet inventory audience.
+fn exact_object_read_scope(db: &Connection, p: &Principal) -> Result<FleetReadScope> {
+    match p.role {
+        Role::Operator => {
+            super::require_local_operator(db, &p.client_id)?;
+            Ok(FleetReadScope::Fleet)
+        }
         Role::Manager => {
             crate::automation::authorization::require_registered_manager(db, &p.client_id)?;
             let current_gm = super::gm::read_current(db)?;
@@ -1761,7 +1773,10 @@ fn fleet_read_scope(db: &Connection, p: &Principal) -> Result<FleetReadScope> {
             }
             Ok(FleetReadScope::ManagerTasks { task_ids })
         }
-        _ => Err(Error::new("FORBIDDEN", "manager read authority required")),
+        _ => Err(Error::new(
+            "FORBIDDEN",
+            "exact object read authority required",
+        )),
     }
 }
 
@@ -1790,7 +1805,10 @@ fn launch_task_read_scope(
     project_id: &str,
 ) -> Result<FleetReadScope> {
     if let Some(principal) = actor.direct_principal() {
-        return Ok(task_read_scope(&fleet_read_scope(db, principal)?, task_id));
+        return Ok(task_read_scope(
+            &exact_object_read_scope(db, principal)?,
+            task_id,
+        ));
     }
     let context = actor
         .work_dispatch_context()
@@ -6812,7 +6830,7 @@ pub(super) fn agent_inspect(
     config: &Config,
 ) -> Result<Value> {
     require_manager(db, p)?;
-    let read_scope = fleet_read_scope(db, p)?;
+    let read_scope = exact_object_read_scope(db, p)?;
     model::fields(
         params_value,
         &[
