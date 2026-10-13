@@ -2054,6 +2054,198 @@ async fn coordination_inbox_resumes_damaged_window_and_preserves_byte_excluded_d
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+// Admit real deliveries, then retain reverse-timestamp legacy locators so
+// the earliest canonical delivery is deliberately last in the legacy scan.
+async fn retain_reversed_legacy_inbox(
+    store: &Store,
+    subject: &ReviewSubject,
+    sender: &Principal,
+    recipient: &Principal,
+    legacy_count: usize,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut ids = Vec::with_capacity(legacy_count + 1);
+    for index in 0..=legacy_count {
+        let sent = store
+            .call(
+                sender.clone(),
+                "coordination.send".into(),
+                json!({"client_request_id":format!("reverse-legacy-{index}"),
+                       "recipient":recipient.client_id,"body":{"seq":index}}),
+            )
+            .await
+            .unwrap();
+        ids.push(sent["operation_id"].as_str().unwrap().to_owned());
+    }
+    let scope = crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap();
+    let prefix = crate::coordination::mailbox_prefix(&scope, &recipient.client_id);
+    let rows = store
+        .run({
+            let ids = ids.clone();
+            let recipient_id = recipient.client_id.clone();
+            move |db| {
+                let tx = db.transaction()?;
+                let mut rows = Vec::with_capacity(legacy_count);
+                for (index, id) in ids.iter().take(legacy_count).enumerate() {
+                    let position: i64 = tx.query_row(
+                        "SELECT observation_id FROM observations WHERE \
+                         source_stream_id='controller:read-position:operation' AND source_event_key=?1",
+                        [id], |row| row.get(0),
+                    )?;
+                    let v2 = format!("{prefix}v2:{position:020}:{}", crate::coordination::key_component(id));
+                    let mut record = meta(&tx, &v2)?.unwrap();
+                    let stamp = 10_000 + (legacy_count - index) as i64;
+                    tx.execute("UPDATE operations SET created_at_ms=?1 WHERE operation_id=?2", params![stamp,id])?;
+                    tx.execute(
+                        "UPDATE observations SET recorded_at_ms=?1 WHERE \
+                         source_stream_id='controller:read-position:operation' AND source_event_key=?2",
+                        params![stamp,id],
+                    )?;
+                    record["created_at_ms"] = json!(stamp);
+                    record.as_object_mut().unwrap().remove("read_position");
+                    let legacy = crate::coordination::mailbox_key(&scope, &recipient_id, stamp, id);
+                    set_meta(&tx, &legacy, &record)?;
+                    tx.execute("DELETE FROM meta WHERE key=?1", [&v2])?;
+                    rows.push((legacy, model::canonical(&record)?));
+                }
+                tx.commit()?;
+                Ok(rows)
+            }
+        })
+        .await
+        .unwrap();
+    (ids, rows)
+}
+
+#[tokio::test]
+async fn coordination_inbox_withholds_items_until_more_than_64_legacy_rows_are_normalized() {
+    let (owner, directory, subject, sender, recipient) =
+        start_inbox_participants("inbox-normalization-bound").await;
+    let (ids, _) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 66).await;
+    let prefix = crate::coordination::mailbox_prefix(
+        &crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap(),
+        &recipient.client_id,
+    );
+    let checkpoint_key = format!("coordination:mailbox-normalization:{}", crate::coordination::key_component(&prefix));
+    let pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    assert_eq!(pending["items"], json!([]));
+    assert_eq!(pending["coverage"], "partial");
+    assert_eq!(pending["availability"], "legacy_order_normalization_pending");
+    assert_eq!(pending["gaps"][0]["kind"], "inbox_normalization_pending");
+    assert_eq!(pending["next_after"], Value::Null);
+    assert_eq!(pending["next_after_key"], Value::Null);
+    owner.store.run({
+        let prefix = prefix.clone();
+        let checkpoint_key = checkpoint_key.clone();
+        move |db| {
+            let count: i64 = db.query_row("SELECT count(*) FROM meta WHERE key>=?1 AND key<?2", params![prefix,format!("{prefix}v")], |row| row.get(0))?;
+            assert_eq!(count, 2);
+            assert!(meta(db, &checkpoint_key)?.is_some());
+            Ok(())
+        }
+    }).await.unwrap();
+    let first = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    assert_eq!(first["items"][0]["operation_id"], ids[0]);
+    assert_eq!(first["next_after"], ids[0]);
+    let rest = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":50,"after_operation_id":ids[0]})).await.unwrap();
+    let got: Vec<_> = rest["items"].as_array().unwrap().iter().map(|item| item["operation_id"].as_str().unwrap()).collect();
+    assert_eq!(got, ids[1..51].iter().map(String::as_str).collect::<Vec<_>>());
+    let tail = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":50,"after_operation_id":rest["next_after"]})).await.unwrap();
+    let got: Vec<_> = tail["items"].as_array().unwrap().iter().map(|item| item["operation_id"].as_str().unwrap()).collect();
+    assert_eq!(got, ids[51..].iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(tail["coverage"], "complete");
+    owner.store.run(move |db| {
+        assert!(meta(db, &checkpoint_key)?.is_none());
+        Ok(())
+    }).await.unwrap();
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn coordination_inbox_normalization_advances_past_damaged_legacy_prefix() {
+    let (owner, directory, subject, sender, recipient) =
+        start_inbox_participants("inbox-normalization-damage").await;
+    let (ids, _) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 2).await;
+    let prefix = crate::coordination::mailbox_prefix(
+        &crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap(),
+        &recipient.client_id,
+    );
+    let damaged: Vec<_> = (0..70).map(|index| format!("{prefix}!damage:{index:03}")).collect();
+    owner.store.run({
+        let damaged = damaged.clone();
+        move |db| {
+            for key in &damaged { set_meta(db, key, &json!({"damaged":true}))?; }
+            Ok(())
+        }
+    }).await.unwrap();
+    let pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    assert_eq!(pending["items"], json!([]));
+    assert_eq!(pending["gaps"][0]["after_index_key"], damaged[63]);
+    let gap = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    assert_eq!(gap["items"], json!([]));
+    assert_eq!(gap["next_after_key"], damaged[35]);
+    assert!(gap["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "damaged_mailbox_indexes" && entry["count"] == 36));
+    // A new bounded damage sweep must preserve the delivery recovery cut.
+    let resumed_pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_key":gap["next_after_key"]})).await.unwrap();
+    assert_eq!(resumed_pending["items"], json!([]));
+    assert_eq!(resumed_pending["next_after_key"], gap["next_after_key"]);
+    let first = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_key":resumed_pending["next_after_key"]})).await.unwrap();
+    assert_eq!(first["items"][0]["operation_id"], ids[0]);
+    // An Operation cursor also stays unchanged while normalization is pending.
+    let operation_pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":first["next_after"]})).await.unwrap();
+    assert_eq!(operation_pending["items"], json!([]));
+    assert_eq!(operation_pending["next_after"], ids[0]);
+    let second = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":1,"after_operation_id":operation_pending["next_after"]})).await.unwrap();
+    assert_eq!(second["items"][0]["operation_id"], ids[1]);
+    assert_eq!(second["coverage"], "partial");
+    assert!(second["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "legacy_mailbox_normalization_damage" && entry["count"] == 70));
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn coordination_inbox_normalization_delete_failure_rolls_back_locator_batch() {
+    let (owner, directory, subject, sender, recipient) =
+        start_inbox_participants("inbox-normalization-rollback").await;
+    let (ids, legacy) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 66).await;
+    // Reverse timestamp order visits index 65 first and fails deleting 64:
+    // both the preceding successful replacement and the failing one roll back.
+    owner.store.run({
+        let fail_key = legacy[64].0.clone();
+        move |db| {
+            db.execute_batch("CREATE TEMP TABLE normalization_delete_fault(key TEXT PRIMARY KEY);
+                CREATE TEMP TRIGGER abort_mailbox_legacy_delete BEFORE DELETE ON main.meta
+                WHEN OLD.key IN (SELECT key FROM normalization_delete_fault)
+                BEGIN SELECT RAISE(ABORT,'injected legacy delete failure'); END;")?;
+            db.execute("INSERT INTO normalization_delete_fault(key) VALUES(?1)", [&fail_key])?;
+            Ok(())
+        }
+    }).await.unwrap();
+    assert!(owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.is_err());
+    owner.store.run(move |db| {
+        for (key, raw) in legacy {
+            let retained: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| row.get(0))?;
+            assert_eq!(retained, raw);
+        }
+        let checkpoint_count: i64 = db.query_row("SELECT count(*) FROM meta WHERE key LIKE 'coordination:mailbox-normalization:%'", [], |row| row.get(0))?;
+        assert_eq!(checkpoint_count, 0);
+        for id in ids.iter().take(66) {
+            let position: i64 = db.query_row("SELECT observation_id FROM observations WHERE source_stream_id='controller:read-position:operation' AND source_event_key=?1", [id], |row| row.get(0))?;
+            let suffix = format!("%v2:{position:020}:{}", crate::coordination::key_component(id));
+            let count: i64 = db.query_row("SELECT count(*) FROM meta WHERE key LIKE ?1", [suffix], |row| row.get(0))?;
+            assert_eq!(count, 0);
+        }
+        db.execute_batch("DROP TRIGGER temp.abort_mailbox_legacy_delete; DROP TABLE temp.normalization_delete_fault;")?;
+        Ok(())
+    }).await.unwrap();
+    let pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    assert_eq!(pending["items"], json!([]));
+    let recovered = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":1})).await.unwrap();
+    assert_eq!(recovered["items"][0]["body"]["seq"], 0);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
     // PR34: one retained read-position sequence orders every valid mailbox
@@ -2338,11 +2530,11 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
             let v2_lower = v2_lower.clone();
             let v2_upper = v2_upper.clone();
             move |db| {
-                db.query_row(
+                Ok(db.query_row(
                     "SELECT COUNT(*) FROM meta WHERE key>=?1 AND key<?2",
                     rusqlite::params![v2_lower, v2_upper],
                     |row| row.get(0),
-                )
+                )?)
             }
         })
         .await
@@ -2368,7 +2560,7 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
         .call(
             recipient.clone(),
             "coordination.inbox".into(),
-            json!({"limit": 2, "after_operation_id": first["next_after"]}),
+            json!({"limit": 2, "after_operation_id": first_items[1]["operation_id"]}),
         )
         .await
         .unwrap();
@@ -2387,7 +2579,9 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
         .await
         .unwrap();
     assert!(resumed["items"].as_array().unwrap().is_empty());
-    assert_eq!(resumed["coverage"], "complete");
+    assert_eq!(resumed["coverage"], "partial");
+    assert_eq!(resumed["gaps"][0]["kind"], "legacy_mailbox_normalization_damage");
+    assert_eq!(resumed["gaps"][0]["count"], 2);
     // requirement 8: repeated bounded migration/page calls are idempotent.
     let again = owner
         .store
