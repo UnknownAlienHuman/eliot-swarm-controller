@@ -20,6 +20,7 @@ fn fixture_work() -> (FixtureDirectory, Work, PathBuf) {
     let root =
         std::env::temp_dir().join(format!("check-durable-authority-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
     let cleanup = FixtureDirectory(root.clone());
     let work = Work {
         check_id: uuid::Uuid::new_v4().to_string(),
@@ -130,7 +131,7 @@ fn check_go_reader_does_not_return_start_until_its_read_barrier_succeeds() {
 #[test]
 fn visible_terminal_completion_and_release_bytes_do_not_yield_a_release_proof() {
     let (_cleanup, work, dir) = fixture_work();
-    let files = ArtifactFiles::new(&work.data_dir.join("artifacts")).unwrap();
+    let files = ArtifactFiles::new(&work.data_dir).unwrap();
     let terminal_path = dir.join("terminal.json");
     let completion_path = dir.join("completion.json");
     fs::write(&terminal_path, b"visible terminal bytes").unwrap();

@@ -17,13 +17,14 @@ fn store_observer_does_not_consume_visible_terminal_without_its_read_barrier() {
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&root).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
     let _cleanup = FixtureDirectory(root.clone());
     let work = fixture_work(&root, None);
     let dir = runner::directory(&root, &work.run_id).unwrap();
     fs::create_dir_all(&dir).unwrap();
     let terminal_path = dir.join("terminal.json");
     fs::write(&terminal_path, b"visible terminal bytes").unwrap();
-    let files = ArtifactFiles::new(&root.join("artifacts")).unwrap();
+    let files = ArtifactFiles::new(&root).unwrap();
     let blocked_for_scope = terminal_path.clone();
     let _barrier = swarm_process::test_support::scoped_durability_barrier(move |target| {
         if target == blocked_for_scope {
