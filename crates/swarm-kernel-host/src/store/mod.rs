@@ -6951,6 +6951,8 @@ mod gm_automation_recovery_tests;
 #[cfg(test)]
 mod gm_continuation_tests;
 #[cfg(test)]
+mod gm_public_matrix_tests;
+#[cfg(test)]
 mod gm_submission_recovery_tests;
 #[cfg(test)]
 mod mailbox_tests;
