@@ -231,12 +231,14 @@ fn decode_key_component(value: &str) -> Option<String> {
         }
     }
 
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes = value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect::<Option<Vec<u8>>>()?;
     String::from_utf8(bytes).ok()
