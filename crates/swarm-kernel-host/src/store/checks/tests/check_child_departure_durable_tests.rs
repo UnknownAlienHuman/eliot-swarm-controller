@@ -118,6 +118,7 @@ fn child_departure_barrier_failure_stays_unknown_on_equal_retry() {
     failing.set(false);
     retain_check_child_departure(&work, 4242, false, None, &launch_error).unwrap();
     assert_eq!(fs::read(&path).unwrap(), visible);
+    assert_eq!(read_check_launch_fact(&work).unwrap(), None);
     let mut names: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())

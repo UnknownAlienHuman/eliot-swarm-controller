@@ -112,6 +112,10 @@ fn launch_unknown_barrier_failure_stays_unknown_on_equal_retry() {
     failing.set(false);
     retain_check_launch_unknown(&work, 4242, &launch_error).unwrap();
     assert_eq!(fs::read(&path).unwrap(), visible);
+    assert_eq!(
+        read_check_launch_fact(&work).unwrap_err().code,
+        "CHECK_LAUNCH_IDENTITY_UNKNOWN"
+    );
     let mut names: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
