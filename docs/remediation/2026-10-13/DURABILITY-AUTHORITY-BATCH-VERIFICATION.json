@@ -1,6 +1,6 @@
 {
   "schema": "swarm.durability_authority_verification@1",
-  "recorded_utc": "2026-10-13T21:32:29.4257209+00:00",
+  "recorded_utc": "2026-10-13T17:32:29.4257209-04:00",
   "accepted_source_head": "664e908bff723c9d4bf9d64d0b102c089c97fbc9",
   "base_head": "3442f9d5bc6afea6dcb6d946c64a00edfd633b24",
   "scope": "Issue143 shared exact-file authority consumers plus PR67 decision/reopen/legacy subset",
@@ -82,7 +82,8 @@
     "PR67 complete Store-to-worker start-once/custody matrix not asserted here",
     "Held145 remains unqualified and preserves old138 hard identity/shape requirement",
     "Scope49/51/52 complete producer matrix remains open",
-    "Source fixtures do not qualify any model/vendor/full459/release"
+    "Source fixtures do not qualify any model/vendor/full459/release",
+    "Issue143 expanded launch.json, launch-unknown.json and launch-departed.json caller fault matrix remains unqualified; issue stays open"
   ],
   "evidence_hashes": {
     "batch-windows-durability-publication-v2.log": "98917817a631ef90bd836637d0f2585cdd91ac6d8f7b145f256add66ef40b1e6",
@@ -93,5 +94,18 @@
     "durability-windows-junction-diagnostic-v2.log": "1d42cb1c8ca0548dd92454328a7901ef214466636729bec52d2875ce6d840c36",
     "next-combined-strict-windows-v5.log": "f68b8e46dc62e761168c77d3c4e49bc3a833e9292d2fc5b4ec2c57dd3dfb0ee4",
     "next-combined-strict-linux-v5.log": "ed43b503e8f6110637898d73b0709fb96c2c25ae11d4151dd7dd12dfe1d64c83"
+  },
+  "mechanical_helper_runtime": {
+    "log": "next-review-scope-helpers-linux-v1.log",
+    "sha256": "4ab1dabb5dcf90df5518cb166f2028a86b9dacf9c0af11dbe0ca9f41f1a19d17",
+    "head": "664e908bff723c9d4bf9d64d0b102c089c97fbc9",
+    "linux_review": {
+      "failed": 0,
+      "passed": 5
+    },
+    "linux_scope": {
+      "failed": 0,
+      "passed": 14
+    }
   }
 }
