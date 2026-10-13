@@ -220,7 +220,7 @@ async fn consume_review_disposition_and_repair(
     assignment_id: &str,
     result_operation_id: &str,
     retained_feedback_operation_id: Option<&str>,
-) -> std::result::Result<Value, (crate::error::Error, Value)> {
+) -> std::result::Result<Value, (Box<crate::error::Error>, Value)> {
     let reconciled = store.reconcile_review_dispositions_once().await.unwrap();
     assert_eq!(
         reconciled["review_results"]["quarantined"], 0,
@@ -286,13 +286,13 @@ async fn consume_review_disposition_and_repair(
                 .unwrap_or_else(|snapshot_error| {
                     json!({"diagnostic_snapshot_error":format!("{snapshot_error:#?}")})
                 });
-            Err((error, diagnostic))
+            Err((Box::new(error), diagnostic))
         }
     }
 }
 
 fn expect_review_disposition_consumer_success(
-    result: std::result::Result<Value, (crate::error::Error, Value)>,
+    result: std::result::Result<Value, (Box<crate::error::Error>, Value)>,
 ) -> Value {
     match result {
         Ok(value) => value,

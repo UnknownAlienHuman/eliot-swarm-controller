@@ -4777,7 +4777,6 @@ mod tests {
         fixture.store.finalize_acknowledged_releases()?;
         assert!(
             fs::read_dir(&fixture.store.root)?
-                .into_iter()
                 .next()
                 .transpose()?
                 .is_none(),
