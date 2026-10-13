@@ -224,6 +224,17 @@ fn scoped_operation_readback(
     binding_id: &str,
     generation: i64,
 ) -> Result<Vec<StoredOperation>> {
+    let tx = db.unchecked_transaction()?;
+    let rows = scoped_operation_readback_in_snapshot(&tx, binding_id, generation)?;
+    tx.commit()?;
+    Ok(rows)
+}
+
+fn scoped_operation_readback_in_snapshot(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+) -> Result<Vec<StoredOperation>> {
     if generation <= 0 {
         return Err(Error::new(
             "MODULE_READBACK_SCOPE_INVALID",
@@ -234,15 +245,14 @@ fn scoped_operation_readback(
     // Keep the state-integrity probe and unresolved projection on one SQLite
     // snapshot. The scope/state index lets the probe seek the fixed gaps in
     // the Store's state vocabulary without walking terminal lifetime history.
-    let tx = db.unchecked_transaction()?;
-    if let Some(state) = unknown_operation_state(&tx, binding_id, generation)? {
+    if let Some(state) = unknown_operation_state(db, binding_id, generation)? {
         return Err(Error::new(
             "MODULE_READBACK_STATE_UNKNOWN",
             format!("binding Operation has an unrecognized state: {state:?}"),
         ));
     }
 
-    let mut statement = tx.prepare(
+    let mut statement = db.prepare(
         "SELECT operation_id,method,state,binding_id,binding_generation FROM operations \
          INDEXED BY unresolved_target_operations \
          WHERE binding_id=?1 AND binding_generation=?2 \
@@ -292,7 +302,6 @@ fn scoped_operation_readback(
         ));
     }
 
-    tx.commit()?;
     Ok(rows)
 }
 
@@ -509,11 +518,11 @@ fn managed_owner_requires_custody(
 /// idempotent Store write containing only route/Task/Attempt/lease facts; all
 /// filesystem reads and native effects remain outside the Store writer.
 fn prepare_owned_intents(
-    db: &mut Connection,
+    tx: &rusqlite::Transaction<'_>,
     config: &Config,
 ) -> Result<BTreeMap<(String, i64), String>> {
     let candidates = {
-        let mut statement = db.prepare(
+        let mut statement = tx.prepare(
             "SELECT DISTINCT b.binding_id,b.generation
              FROM bindings AS b
              JOIN operations AS o
@@ -532,19 +541,51 @@ fn prepare_owned_intents(
     if candidates.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut errors = BTreeMap::new();
     for (binding_id, generation) in candidates {
-        if let Err(error) = launcher_owned_service::ensure_module_owned_service_intent(
-            &tx,
+        match launcher_owned_service::ensure_module_owned_service_intent(
+            tx,
             config,
             &binding_id,
             generation,
         ) {
-            errors.insert((binding_id, generation), error.code);
+            Ok(()) => {}
+            // Only failures of this exact retained launch subject are blocks.
+            // SQL, shared metadata, conversion and future error codes remain hard.
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "BINDING_CLOSED"
+                        | "BINDING_NOT_READY"
+                        | "CONFIG_ERROR"
+                        | "FORBIDDEN"
+                        | "INVALID_LAUNCH_MANIFEST"
+                        | "LAUNCH_MANIFEST_CORRUPT"
+                        | "LAUNCH_OPEN_CORRUPT"
+                        | "LAUNCH_OPEN_MISSING"
+                        | "NOT_FOUND"
+                        | "OWNED_SERVICE_CONFIG"
+                        | "OWNED_SERVICE_RECEIPT_CORRUPT"
+                        | "OWNED_SERVICE_ROUTE_REQUIRED"
+                        | "OWNED_SERVICE_SCOPE"
+                        | "OWNED_SERVICE_SCOPE_STALE"
+                        | "OWNED_SERVICE_VERSION"
+                        | "ROUTE_DISABLED"
+                        | "STALE_LAUNCH"
+                        | "UNKNOWN_ROUTE"
+                        | "WORKSPACE_LEASE_AMBIGUOUS"
+                        | "WORKSPACE_LEASE_INVALID"
+                        | "WORKSPACE_LEASE_MISSING"
+                        | "WORKSPACE_LEASE_STALE"
+                        | "WORKSPACE_REGISTRATION_CHANGED"
+                        | "WORKSPACE_UNREGISTERED"
+                ) =>
+            {
+                errors.insert((binding_id, generation), error.code);
+            }
+            Err(error) => return Err(error),
         }
     }
-    tx.commit()?;
     Ok(errors)
 }
 
@@ -553,6 +594,19 @@ fn prepare_owned_intents(
 /// `operations` rows and binding tuple as direct manager admissions.
 pub(super) fn pending(
     db: &mut Connection,
+    config: &Config,
+    cursor: Option<&ModuleDemandCursor>,
+) -> Result<ModuleDemandSnapshot> {
+    // Reserve intents and project demand on one Store snapshot. A hard error
+    // anywhere in the projection must not commit earlier owner reservations.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let snapshot = pending_in_transaction(&tx, config, cursor)?;
+    tx.commit()?;
+    Ok(snapshot)
+}
+
+fn pending_in_transaction(
+    db: &rusqlite::Transaction<'_>,
     config: &Config,
     cursor: Option<&ModuleDemandCursor>,
 ) -> Result<ModuleDemandSnapshot> {
@@ -624,7 +678,15 @@ pub(super) fn pending(
                     });
                     continue;
                 }
-                Err(error) => {
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "MODULE_ROUTE_CORRUPT"
+                            | "MODULE_DESCRIPTOR_MISSING"
+                            | "MODULE_DISABLED"
+                            | "MODULE_PROTOCOL_INCOMPATIBLE"
+                    ) =>
+                {
                     output.blocked.push(ModuleDemandBlock {
                         binding_id: operation.binding_id,
                         generation,
@@ -634,10 +696,11 @@ pub(super) fn pending(
                     });
                     continue;
                 }
+                Err(error) => return Err(error),
             };
         let descriptor = match module_handshake::retained_descriptor(db, &retained) {
             Ok(descriptor) => descriptor,
-            Err(error) => {
+            Err(error) if error.code == "MODULE_DESCRIPTOR_MISSING" => {
                 output.blocked.push(ModuleDemandBlock {
                     binding_id: operation.binding_id,
                     generation,
@@ -647,6 +710,7 @@ pub(super) fn pending(
                 });
                 continue;
             }
+            Err(error) => return Err(error),
         };
         let command = match classify_runtime_command(&operation.method, &operation.input) {
             Ok(command) => command,
@@ -698,11 +762,19 @@ pub(super) fn pending(
             continue;
         }
         if !readbacks.contains_key(&scope_key) {
-            match scoped_operation_readback(db, &scope_key.0, scope_key.1) {
+            match scoped_operation_readback_in_snapshot(db, &scope_key.0, scope_key.1) {
                 Ok(readback) => {
                     readbacks.insert(scope_key.clone(), readback);
                 }
-                Err(error) => {
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "MODULE_READBACK_SCOPE_INVALID"
+                            | "MODULE_READBACK_STATE_UNKNOWN"
+                            | "MODULE_READBACK_UNRESOLVED_OVERFLOW"
+                            | "MODULE_READBACK_CORRUPT"
+                    ) =>
+                {
                     output.blocked.push(ModuleDemandBlock {
                         binding_id: operation.binding_id,
                         generation,
@@ -712,6 +784,7 @@ pub(super) fn pending(
                     });
                     continue;
                 }
+                Err(error) => return Err(error),
             }
         }
         let operation_readback = readbacks.get(&scope_key).cloned().unwrap_or_default();
@@ -723,7 +796,22 @@ pub(super) fn pending(
             binding["route"]["native_options"].clone(),
         ) {
             Ok(options) => options,
-            Err(error) => {
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "BINDING_CLOSED"
+                        | "CONFIG_ERROR"
+                        | "MODULE_CONFIG_INVALID"
+                        | "OWNED_SERVICE_CONFIG"
+                        | "OWNED_SERVICE_INTENT_MISSING"
+                        | "OWNED_SERVICE_RECOVERY_REQUIRED"
+                        | "OWNED_SERVICE_RECEIPT_CORRUPT"
+                        | "OWNED_SERVICE_SCOPE"
+                        | "OWNED_SERVICE_SCOPE_STALE"
+                        | "ROUTE_DISABLED"
+                        | "UNKNOWN_ROUTE"
+                ) =>
+            {
                 output.blocked.push(ModuleDemandBlock {
                     binding_id: operation.binding_id,
                     generation,
@@ -733,6 +821,7 @@ pub(super) fn pending(
                 });
                 continue;
             }
+            Err(error) => return Err(error),
         };
         let launch_credential_ref = descriptor
             .launch

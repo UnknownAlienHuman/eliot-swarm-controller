@@ -14,6 +14,10 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "module_demand/reg23_hard_failure_tests.rs"]
+mod reg23_hard_failure_tests;
+
 const DASHBOARD_PAGE_LIMIT: i64 = 5;
 const MAX_INSPECT_OPERATIONS: i64 = 20;
 const MAX_INSPECT_CHECKS: i64 = 20;
