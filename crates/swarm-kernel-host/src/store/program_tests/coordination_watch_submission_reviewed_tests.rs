@@ -2053,3 +2053,503 @@ async fn coordination_inbox_resumes_damaged_window_and_preserves_byte_excluded_d
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
+    // PR34: one retained read-position sequence orders every valid mailbox
+    // delivery. Legacy timestamp locators sort before all v2 locators and
+    // same-stamp legacy locators sort by Operation ID, so a mixed namespace
+    // cannot page canonically until valid legacy locators are retired into
+    // v2 positions. New writes stay v2-only; each inbox read retires a
+    // bounded window while damaged rows stay explicit for after_key resume.
+    const MESSAGE_COUNT: usize = 8;
+
+    let (owner, directory, subject, sender, recipient) =
+        start_inbox_participants("mailbox-mixed-canonical").await;
+    let sender_id = sender.client_id.clone();
+    let recipient_id = recipient.client_id.clone();
+    let task_id = subject.task_id.clone();
+    let attempt_id = subject.attempt_id.clone();
+
+    let mut operation_ids = Vec::with_capacity(MESSAGE_COUNT);
+    for index in 0..MESSAGE_COUNT {
+        let sent = owner
+            .store
+            .call(
+                sender.clone(),
+                "coordination.send".into(),
+                json!({
+                    "client_request_id": format!("mixed-canonical-{index}"),
+                    "recipient": recipient_id,
+                    "body": {"seq": index},
+                }),
+            )
+            .await
+            .unwrap();
+        operation_ids.push(sent["operation_id"].as_str().unwrap().to_owned());
+    }
+
+    let scope_id =
+        crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap();
+    let prefix = crate::coordination::mailbox_prefix(&scope_id, &recipient_id);
+    let legacy_upper = format!("{prefix}v");
+    let v2_lower = format!("{prefix}v2:");
+    let v2_upper = format!("{prefix}v3");
+    let malformed_key = format!("{prefix}!malformed");
+
+    // Read back every admitted stamp and v2 locator before crafting history.
+    let (admitted, index_rows): (Vec<(String, i64)>, Vec<(String, String)>) = owner
+        .store
+        .run({
+            let operation_ids = operation_ids.clone();
+            let prefix = prefix.clone();
+            move |db| {
+                let mailbox_upper = format!("{prefix}z");
+                let mut admitted = Vec::with_capacity(operation_ids.len());
+                for operation_id in &operation_ids {
+                    let created_at: i64 = db.query_row(
+                        "SELECT created_at_ms FROM operations WHERE operation_id=?1",
+                        [operation_id],
+                        |row| row.get(0),
+                    )?;
+                    admitted.push((operation_id.clone(), created_at));
+                }
+                let mut statement = db.prepare(
+                    "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key",
+                )?;
+                let index_rows: Vec<(String, String)> = statement
+                    .query_map(rusqlite::params![prefix, mailbox_upper], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok((admitted, index_rows))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(admitted.len(), MESSAGE_COUNT);
+    let mut created_of = std::collections::HashMap::new();
+    for (operation_id, created_at) in &admitted {
+        created_of.insert(operation_id.clone(), *created_at);
+    }
+    let mut v2key_of = std::collections::HashMap::new();
+    for (key, raw) in &index_rows {
+        let index: Value = serde_json::from_str(raw).unwrap();
+        if let Some(operation_id) = index["operation_id"].as_str() {
+            v2key_of.insert(operation_id.to_owned(), key.clone());
+        }
+    }
+    assert_eq!(v2key_of.len(), MESSAGE_COUNT);
+    let hexes: Vec<String> = operation_ids
+        .iter()
+        .map(|operation_id| {
+            v2key_of[operation_id.as_str()]
+                .rsplit(':')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    // Find a same-stamp pair whose Operation-ID tiebreak provably disagrees
+    // with canonical position order; fall back deterministically otherwise.
+    let mut pair = (1usize, 2usize);
+    for i in 0..MESSAGE_COUNT {
+        for j in (i + 1)..MESSAGE_COUNT {
+            if hexes[i] > hexes[j] {
+                pair = (i, j);
+            }
+        }
+    }
+    let (pair_a, pair_b) = pair;
+    let mut rest: Vec<usize> = (0..MESSAGE_COUNT)
+        .filter(|index| *index != pair_a && *index != pair_b)
+        .collect();
+    let duplicate_index = rest.remove(0);
+    let missing_index = rest.remove(0);
+    let interleave_a = rest.remove(0);
+    let interleave_b = rest.remove(0);
+    let stamp_a = created_of[operation_ids[pair_a].as_str()];
+    let badhex_key = format!("{prefix}{stamp_a:020}:zzzz");
+    let trailing_key = format!("{prefix}v9:trailing");
+    let legacy_index = |operation_id: &str, stamp: i64| {
+        json!({
+            "operation_id": operation_id,
+            "sender": sender_id.as_str(),
+            "recipient": recipient_id.as_str(),
+            "task_id": task_id.as_str(),
+            "task_revision": 1,
+            "attempt_id": attempt_id.as_str(),
+            "created_at_ms": stamp,
+        })
+    };
+    let mut retire_keys = Vec::new();
+    let mut legacy_rows: Vec<(String, Value)> = Vec::new();
+    for index in [pair_a, pair_b, interleave_a, interleave_b] {
+        let stamp = if index == pair_a || index == pair_b {
+            stamp_a
+        } else {
+            created_of[operation_ids[index].as_str()]
+        };
+        retire_keys.push(v2key_of[operation_ids[index].as_str()].clone());
+        legacy_rows.push((
+            crate::coordination::mailbox_key(
+                &scope_id,
+                &recipient_id,
+                stamp,
+                &operation_ids[index],
+            ),
+            legacy_index(operation_ids[index].as_str(), stamp),
+        ));
+    }
+    let duplicate_id = operation_ids[duplicate_index].clone();
+    let duplicate_stamp = created_of[duplicate_id.as_str()];
+    let duplicate_legacy = (
+        crate::coordination::mailbox_key(&scope_id, &recipient_id, duplicate_stamp, &duplicate_id),
+        legacy_index(duplicate_id.as_str(), duplicate_stamp),
+    );
+    let missing_id = operation_ids[missing_index].clone();
+    let malformed_rows: Vec<(String, Value)> = vec![
+        (malformed_key.clone(), json!({"damaged": true})),
+        (badhex_key.clone(), json!({"damaged": true})),
+        (trailing_key.clone(), json!({"damaged": true})),
+    ];
+    // Craft history: same-stamp legacy pair, interleaved legacy locators, one
+    // dual-locator delivery, one missing read position, malformed rows.
+    owner
+        .store
+        .run({
+            let pair_b_id = operation_ids[pair_b].clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET created_at_ms=?1 WHERE operation_id=?2",
+                    rusqlite::params![stamp_a, pair_b_id],
+                )?;
+                db.execute(
+                    "UPDATE observations SET recorded_at_ms=?1 \
+                     WHERE source_stream_id='controller:read-position:operation' \
+                       AND source_event_key=?2",
+                    rusqlite::params![stamp_a, pair_b_id],
+                )?;
+                for key in &retire_keys {
+                    assert_eq!(db.execute("DELETE FROM meta WHERE key=?1", [key])?, 1);
+                }
+                for (key, index) in &legacy_rows {
+                    set_meta(db, key, index)?;
+                }
+                set_meta(db, &duplicate_legacy.0, &duplicate_legacy.1)?;
+                let deleted = db.execute(
+                    "DELETE FROM observations \
+                     WHERE source_stream_id='controller:read-position:operation' \
+                       AND source_event_key=?1",
+                    [&missing_id],
+                )?;
+                assert_eq!(deleted, 1);
+                for (key, index) in &malformed_rows {
+                    set_meta(db, key, index)?;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    // Authoritative Operation and message bytes snapshotted after crafting;
+    // bounded normalization must never rewrite them.
+    let snapshot = owner
+        .store
+        .run({
+            let operation_ids = operation_ids.clone();
+            move |db| {
+                let mut snapshot = Vec::with_capacity(operation_ids.len());
+                for operation_id in &operation_ids {
+                    let row: (String, String, i64, String) = db.query_row(
+                        "SELECT original_request_json,result_json,created_at_ms,state \
+                         FROM operations WHERE operation_id=?1",
+                        [operation_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                    snapshot.push((operation_id.clone(), row));
+                }
+                Ok(snapshot)
+            }
+        })
+        .await
+        .unwrap();
+    let want: Vec<String> = operation_ids
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != missing_index)
+        .map(|(_, operation_id)| operation_id.clone())
+        .collect();
+    // requirements 1 + 2: interleaved and same-stamp legacy deliveries page
+    // once in canonical read-position order, never timestamp/Operation-ID order.
+    let full = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 50}),
+        )
+        .await
+        .unwrap();
+    let items = full["items"].as_array().unwrap();
+    let got: Vec<String> = items
+        .iter()
+        .map(|item| item["operation_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(got, want);
+    // requirement 6: the retired dual-locator delivery is never duplicated.
+    assert_eq!(
+        got.iter()
+            .filter(|operation_id| operation_id.as_str() == duplicate_id.as_str())
+            .count(),
+        1
+    );
+    // requirements 4 + 7: malformed and missing-position rows stay explicit
+    // partial-coverage damage with a resumable trailing key cursor.
+    assert_eq!(full["coverage"], "partial");
+    let gaps = full["gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["kind"], json!("damaged_mailbox_indexes"));
+    assert_eq!(gaps[0]["count"], json!(4));
+    assert_eq!(full["next_after"], Value::Null);
+    assert_eq!(full["next_after_key"], trailing_key);
+    // every valid legacy locator retired; only damaged rows keep old keys.
+    let legacy_keys: Vec<String> = owner
+        .store
+        .run({
+            let prefix = prefix.clone();
+            let legacy_upper = legacy_upper.clone();
+            move |db| {
+                let mut statement = db.prepare(
+                    "SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key",
+                )?;
+                let rows: Vec<String> = statement
+                    .query_map(rusqlite::params![prefix, legacy_upper], |row| row.get(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok(rows)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(legacy_keys, vec![malformed_key.clone(), badhex_key.clone()]);
+    let v2_count: i64 = owner
+        .store
+        .run({
+            let v2_lower = v2_lower.clone();
+            let v2_upper = v2_upper.clone();
+            move |db| {
+                db.query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key>=?1 AND key<?2",
+                    rusqlite::params![v2_lower, v2_upper],
+                    |row| row.get(0),
+                )
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(v2_count, MESSAGE_COUNT as i64);
+    // requirement 3 + 5: after_operation_id resumes across the retired
+    // legacy/v2 boundary and item budgets preserve the first excluded item.
+    let first = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 2}),
+        )
+        .await
+        .unwrap();
+    let first_items = first["items"].as_array().unwrap();
+    assert_eq!(first_items.len(), 2);
+    assert_eq!(first_items[0]["operation_id"], want[0]);
+    assert_eq!(first_items[1]["operation_id"], want[1]);
+    let second = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 2, "after_operation_id": first["next_after"]}),
+        )
+        .await
+        .unwrap();
+    let second_items = second["items"].as_array().unwrap();
+    assert_eq!(second_items.len(), 2);
+    assert_eq!(second_items[0]["operation_id"], want[2]);
+    assert_eq!(second_items[1]["operation_id"], want[3]);
+    // requirement 4: the damaged trailing key resumes without consuming.
+    let resumed = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 50, "after_key": full["next_after_key"]}),
+        )
+        .await
+        .unwrap();
+    assert!(resumed["items"].as_array().unwrap().is_empty());
+    assert_eq!(resumed["coverage"], "complete");
+    // requirement 8: repeated bounded migration/page calls are idempotent.
+    let again = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 50}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["items"], full["items"]);
+    assert_eq!(again["next_after"], full["next_after"]);
+    assert_eq!(again["next_after_key"], full["next_after_key"]);
+    // requirement 6, explicit half: a legacy twin beside a damaged v2 twin
+    // stays explicit damage without duplicating the message ...
+    let target = want[5].clone();
+    let found: Option<(String, String)> = owner
+        .store
+        .run({
+            let target = target.clone();
+            move |db| {
+                let mut statement = db.prepare(
+                    "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key",
+                )?;
+                let rows: Vec<(String, String)> = statement
+                    .query_map(rusqlite::params![v2_lower, v2_upper], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<std::result::Result<_, _>>()?;
+                for (key, raw) in rows {
+                    let index: Value = serde_json::from_str(&raw).unwrap();
+                    if index["operation_id"].as_str() == Some(target.as_str()) {
+                        return Ok(Some((key, raw)));
+                    }
+                }
+                Ok(None)
+            }
+        })
+        .await
+        .unwrap();
+    let (target_key, target_json) = found.unwrap();
+    owner
+        .store
+        .run({
+            let target = target.clone();
+            let target_key = target_key.clone();
+            move |db| {
+                let stamp: i64 = db.query_row(
+                    "SELECT created_at_ms FROM operations WHERE operation_id=?1",
+                    [&target],
+                    |row| row.get(0),
+                )?;
+                let twin = crate::coordination::mailbox_key(
+                    &scope_id,
+                    &recipient_id,
+                    stamp,
+                    &target,
+                );
+                let damaged = model::canonical(&json!({"damaged": true}))?;
+                db.execute(
+                    "UPDATE meta SET value_json=?1 WHERE key=?2",
+                    rusqlite::params![damaged, target_key],
+                )?;
+                set_meta(
+                    db,
+                    &twin,
+                    &json!({
+                        "operation_id": target.as_str(),
+                        "sender": sender_id,
+                        "recipient": recipient_id,
+                        "task_id": task_id,
+                        "task_revision": 1,
+                        "attempt_id": attempt_id,
+                        "created_at_ms": stamp,
+                    }),
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let conflicted = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 50}),
+        )
+        .await
+        .unwrap();
+    let conflicted_items = conflicted["items"].as_array().unwrap();
+    assert_eq!(conflicted_items.len(), MESSAGE_COUNT - 2);
+    assert!(!conflicted_items
+        .iter()
+        .any(|item| item["operation_id"] == target));
+    assert_eq!(conflicted["coverage"], "partial");
+    // ... and resolves onto the repaired twin without duplicating.
+    owner
+        .store
+        .run({
+            move |db| {
+                db.execute(
+                    "UPDATE meta SET value_json=?1 WHERE key=?2",
+                    rusqlite::params![target_json, target_key],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let resolved = owner
+        .store
+        .call(
+            recipient.clone(),
+            "coordination.inbox".into(),
+            json!({"limit": 50}),
+        )
+        .await
+        .unwrap();
+    let resolved_items = resolved["items"].as_array().unwrap();
+    let resolved_got: Vec<String> = resolved_items
+        .iter()
+        .map(|item| item["operation_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(resolved_got, want);
+    assert_eq!(resolved["next_after_key"], trailing_key);
+    let legacy_final: Vec<String> = owner
+        .store
+        .run({
+            move |db| {
+                let mut statement = db.prepare(
+                    "SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key",
+                )?;
+                let rows: Vec<String> = statement
+                    .query_map(rusqlite::params![prefix, legacy_upper], |row| row.get(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok(rows)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(legacy_final, vec![malformed_key, badhex_key]);
+    let snapshot_final = owner
+        .store
+        .run({
+            move |db| {
+                let mut snapshot = Vec::with_capacity(operation_ids.len());
+                for operation_id in &operation_ids {
+                    let row: (String, String, i64, String) = db.query_row(
+                        "SELECT original_request_json,result_json,created_at_ms,state \
+                         FROM operations WHERE operation_id=?1",
+                        [operation_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                    snapshot.push((operation_id.clone(), row));
+                }
+                Ok(snapshot)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot_final, snapshot);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}

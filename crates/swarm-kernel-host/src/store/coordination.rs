@@ -28,6 +28,14 @@ const LIVE_ATTEMPT_STATES: &[&str] = &[
 ];
 const INBOUND_POLICIES: &[&str] = &["pull_only", "safe_boundary", "hold", "refuse"];
 const RELEVANCE_SCAN_FACTOR: i64 = 4;
+/// Bound on legacy mailbox locators retired per inbox read.
+///
+/// Legacy timestamp locators sort before every v2 read-position locator, so
+/// a mixed namespace cannot page in canonical Observation order. Each inbox
+/// read first retires up to this many valid legacy locators into canonical
+/// v2 positions; repeated page reads converge and are idempotent. Damaged
+/// rows stay in place as explicit gaps for after_key recovery.
+const INBOX_NORMALIZE_BOUND: i64 = 64;
 
 #[derive(Clone)]
 struct ScopeData {
@@ -3324,6 +3332,12 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             "gaps":[],
         }));
     }
+    // Retire valid legacy timestamp locators into canonical v2 read
+    // positions before paging (bounded per read; damaged rows stay explicit
+    // for after_key recovery). Past this point every valid delivery is
+    // ordered by its retained Observation position, so the lexical page
+    // below reads in canonical order.
+    normalize_legacy_mailbox_indexes(db, &scope, &principal.client_id, INBOX_NORMALIZE_BOUND)?;
     // Operation IDs remain the normal cursor. A scoped key is the bounded
     // recovery cursor when damaged indexes cannot be represented by one.
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
@@ -3689,6 +3703,138 @@ fn mailbox_position_key(scope: &str, recipient: &str, position: i64, operation_i
         keys::mailbox_prefix(scope, recipient),
         keys::key_component(operation_id),
     )
+}
+
+/// Retire valid legacy timestamp mailbox locators into canonical v2
+/// read-position locators for one recipient scope.
+///
+/// New writes are v2-only, but historical timestamp locators sort before
+/// every v2 locator, so a mixed namespace cannot page in canonical retained
+/// Observation order. Each call examines up to `bound` legacy-namespace rows
+/// and, for every row the inbox would otherwise accept, inserts the
+/// canonical v2 locator and retires the legacy one; repeated calls converge
+/// and are idempotent. Rows with an unknown, missing, conflicting or
+/// nonpositive canonical position are left untouched as explicit inbox
+/// damage: timestamps and Operation IDs stay compatibility locators, never
+/// ordering authority. A legacy locator coexisting with its valid v2 twin is
+/// retired onto the twin; coexistence with a damaged twin stays explicit, so
+/// a message is never duplicated. Only derived `meta` locator rows are
+/// touched; authoritative Operation and message bytes are never rewritten.
+/// The v2 insert precedes the legacy retire, so a crash between the two
+/// leaves an explicit duplicate that the next pass retires.
+pub(super) fn normalize_legacy_mailbox_indexes(
+    db: &Connection,
+    scope: &ScopeData,
+    recipient: &str,
+    bound: i64,
+) -> Result<usize> {
+    let bound = bound.clamp(1, keys::MAX_INBOX_SCAN);
+    let prefix = keys::mailbox_prefix(&scope.scope_id, recipient);
+    // Legacy locators carry a digit timestamp where v2 locators carry `v`,
+    // so the legacy namespace is exactly the prefix window below `v`.
+    let legacy_upper = format!("{prefix}v");
+    let mut statement = db.prepare(
+        "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT ?3",
+    )?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![prefix, legacy_upper, bound + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut retired = 0usize;
+    for (key, raw_index) in rows.iter().take(bound as usize) {
+        let Some(operation_id) = inbox_operation_id_from_key(&prefix, key) else {
+            continue;
+        };
+        let Some((position, indexed_at_ms)) = operation_read_position(db, &operation_id)?
+        else {
+            continue;
+        };
+        if position <= 0 {
+            continue;
+        }
+        let expected_position_key =
+            mailbox_position_key(&scope.scope_id, recipient, position, &operation_id);
+        let expected_legacy_key =
+            keys::mailbox_key(&scope.scope_id, recipient, indexed_at_ms, &operation_id);
+        if key.as_str() != expected_legacy_key.as_str() {
+            continue;
+        }
+        let operation: Option<(String, i64)> = db
+            .query_row(
+                "SELECT caller_id,created_at_ms FROM operations WHERE operation_id=?1 \
+                 AND method IN ('coordination.send','coordination.consult') \
+                 AND state='settled'",
+                [&operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((sender, created_at)) = operation else {
+            continue;
+        };
+        if indexed_at_ms != created_at {
+            continue;
+        }
+        let index: Value = match serde_json::from_str(raw_index) {
+            Ok(index) => index,
+            Err(_) => continue,
+        };
+        // The legacy locator must already agree with the authoritative
+        // receipt on every field the inbox checks; anything else stays
+        // exactly as the inbox would report it (damage or stale).
+        if index["operation_id"].as_str() != Some(operation_id.as_str())
+            || index["created_at_ms"].as_i64() != Some(created_at)
+            || index["sender"].as_str() != Some(sender.as_str())
+            || index["recipient"].as_str() != Some(recipient)
+            || index["task_id"] != scope.task["task_id"]
+            || index["task_revision"] != scope.task["revision"]
+            || index["attempt_id"] != scope.attempt["attempt_id"]
+        {
+            continue;
+        }
+        if inbox_key_exists(db, &expected_position_key)? {
+            let twin: Option<String> = db
+                .query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&expected_position_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let twin_valid = twin.as_deref().is_some_and(|raw| {
+                serde_json::from_str::<Value>(raw).is_ok_and(|twin_index| {
+                    twin_index["operation_id"].as_str() == Some(operation_id.as_str())
+                        && twin_index["read_position"].as_i64() == Some(position)
+                        && twin_index["created_at_ms"].as_i64() == Some(created_at)
+                        && twin_index["sender"].as_str() == Some(sender.as_str())
+                        && twin_index["recipient"].as_str() == Some(recipient)
+                        && twin_index["task_id"] == scope.task["task_id"]
+                        && twin_index["task_revision"] == scope.task["revision"]
+                        && twin_index["attempt_id"] == scope.attempt["attempt_id"]
+                })
+            });
+            // Retire onto a valid canonical twin only; otherwise the
+            // conflict stays explicit damage and still resumes by key.
+            if twin_valid {
+                db.execute("DELETE FROM meta WHERE key=?1", [key])?;
+                retired = retired.saturating_add(1);
+            }
+            continue;
+        }
+        let canonical = json!({
+            "operation_id": operation_id,
+            "read_position": position,
+            "sender": sender,
+            "recipient": recipient,
+            "task_id": scope.task["task_id"],
+            "task_revision": scope.task["revision"],
+            "attempt_id": scope.attempt["attempt_id"],
+            "created_at_ms": created_at,
+        });
+        set_meta(db, &expected_position_key, &canonical)?;
+        db.execute("DELETE FROM meta WHERE key=?1", [key])?;
+        retired = retired.saturating_add(1);
+    }
+    Ok(retired)
 }
 
 fn delivery_matches_scope(result: &Value, scope: &ScopeData, recipient: &str) -> Result<bool> {
