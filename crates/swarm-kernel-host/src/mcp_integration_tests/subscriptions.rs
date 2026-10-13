@@ -1066,9 +1066,12 @@ async fn concilium_and_coordination_subscriptions_fan_out_authorized_facts() {
         concilium_fact["payload"]["operation_id"],
         json!(concilium_operation_id)
     );
-    assert_eq!(
-        concilium_fact["payload"]["proposal_operation_id"],
-        json!(concilium_operation_id)
+    // Timeline facts carry the committing Operation, while the proposal
+    // Operation relation is read through the exact typed resync projection.
+    assert!(
+        concilium_fact["payload"]
+            .get("proposal_operation_id")
+            .is_none()
     );
     assert_eq!(
         concilium_fact["payload"]["concilium_id"],
@@ -1097,6 +1100,10 @@ async fn concilium_and_coordination_subscriptions_fan_out_authorized_facts() {
         .unwrap();
     let concilium_projection = &concilium_read["structuredContent"];
     assert_eq!(concilium_projection["concilium_id"], json!(concilium_id));
+    assert_eq!(
+        concilium_projection["proposal_operation_id"],
+        json!(concilium_operation_id)
+    );
     assert_eq!(
         concilium_projection["proposal"]["operation_id"],
         json!(concilium_operation_id)
