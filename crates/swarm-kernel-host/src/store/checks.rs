@@ -1963,7 +1963,90 @@ const MAX_PENDING_QUARANTINE_BYTES: usize = 16 * 1024;
 const PENDING_CURSOR_KEY: &str = "checks:pending:v1:cursor";
 const PENDING_QUARANTINE_PREFIX: &str = "checks:pending:v1:quarantine:";
 const PENDING_QUARANTINE_SCHEMA: u32 = 1;
+const PENDING_CYCLE_KEY: &str = "checks:pending:v1:cycle";
+const PENDING_CYCLE_SCHEMA: u32 = 1;
+const MAX_PENDING_SUFFIX: usize = 12;
+const MAX_PENDING_WRAP: usize = 4;
 const PENDING_SUBJECT_SAVEPOINT: &str = "checks_pending_subject";
+
+/// Durable CheckRun pending-cycle boundary for one bounded sweep.
+///
+/// `cut` names the lexical high-water of the cycle: identifiers admitted past
+/// the cut stay out of the active page until the cycle turns over, so a
+/// continuously replenished lexical tail cannot starve the failed older
+/// subject. The cut is ordering metadata only, never execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCycle {
+    schema_version: u32,
+    cut: String,
+}
+
+/// Closed canonical server identifier shape: lowercase hyphenated UUIDv4,
+/// exactly as model::new_id mints every CheckRun identifier. Existence in
+/// the current pending set is never required; shape is.
+fn valid_pending_cursor_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
+        return false;
+    }
+    if bytes[14] != b'4' {
+        return false;
+    }
+    if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 | 14 | 19 => {}
+            _ => {
+                if !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn read_pending_cycle(db: &Connection) -> Result<Option<PendingCycle>> {
+    let Some(value) = meta(db, PENDING_CYCLE_KEY)? else {
+        return Ok(None);
+    };
+    let cycle: PendingCycle = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "CHECK_PENDING_CYCLE_CORRUPT",
+            "retained pending cycle boundary cannot be decoded",
+        )
+    })?;
+    if cycle.schema_version != PENDING_CYCLE_SCHEMA || !valid_pending_cursor_id(&cycle.cut) {
+        return Err(Error::new(
+            "CHECK_PENDING_CYCLE_CORRUPT",
+            "retained pending cycle boundary is not a canonical CheckRun ordering identity",
+        ));
+    }
+    Ok(Some(cycle))
+}
+
+fn max_pending_id(tx: &Transaction<'_>) -> Result<Option<String>> {
+    let max: Option<String> = tx.query_row(
+        "SELECT max(c.check_id) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')))",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(max)
+}
+
+fn pending_subject_count(tx: &Transaction<'_>) -> Result<i64> {
+    Ok(tx.query_row(
+        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')))",
+        [],
+        |row| row.get(0),
+    )?)
+}
 
 enum PendingSubjectOutcome {
     Applied(Box<Work>),
@@ -2057,19 +2140,32 @@ fn read_pending_cursor(db: &Connection) -> Result<Option<String>> {
             "checks pending cursor identity is invalid",
         ));
     }
+    // The cursor is a closed ordering coordinate minted only by
+    // model::new_id: canonical lowercase UUIDv4. Any other retained value
+    // would silently skip the live set, so it is a hard integrity error and
+    // no Work is processed and no metadata is written.
+    if !valid_pending_cursor_id(cursor) {
+        return Err(Error::new(
+            "CHECK_PENDING_CURSOR_CORRUPT",
+            "checks pending cursor is not a canonical CheckRun ordering identity",
+        ));
+    }
     Ok(Some(cursor.to_owned()))
 }
 
 fn pending_ids_after(
     tx: &Transaction<'_>,
     cursor: Option<&str>,
+    cut: Option<&str>,
     limit: usize,
 ) -> Result<Vec<String>> {
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND (?1 IS NULL OR c.check_id>?1) ORDER BY c.check_id LIMIT ?2",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND (?1 IS NULL OR c.check_id>?1) AND (?2 IS NULL OR c.check_id<=?2) ORDER BY c.check_id LIMIT ?3",
     )?;
     let ids = statement
-        .query_map(params![cursor, limit as i64], |row| row.get::<_, String>(0))?
+        .query_map(params![cursor, cut, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(ids)
 }
@@ -2084,15 +2180,83 @@ fn pending_ids_through(tx: &Transaction<'_>, cursor: &str, limit: usize) -> Resu
     Ok(ids)
 }
 
-fn pending_page(tx: &Transaction<'_>, cursor: Option<&str>) -> Result<Vec<String>> {
-    let mut ids = pending_ids_after(tx, cursor, MAX_PENDING_PAGE)?;
+/// Bounded pending selection for one pass over the retained cycle.
+///
+/// Reads only: the captured cut is returned in memory and persisted only
+/// together with a subject cursor after a stable subject disposition, so a
+/// crash or failure before the first completed subject leaves both the prior
+/// cursor and the prior cut untouched. Identifiers admitted past the cut stay
+/// out of the active page until turnover. Turnover (clearing the cut and
+/// capturing a fresh maximum) happens at most once per call and only when the
+/// suffix and the wrap prefix are both empty while subjects remain, so
+/// post-cut admissions alone can neither skip nor duplicate pre-cut subjects.
+fn select_pending_page(
+    tx: &Transaction<'_>,
+    cursor: Option<&str>,
+) -> Result<(Vec<String>, Option<PendingCycle>)> {
+    let retained = read_pending_cycle(tx)?;
+    let mut cycle = retained;
+    if cycle.is_none() {
+        if let Some(max) = max_pending_id(tx)? {
+            if !valid_pending_cursor_id(&max) {
+                return Err(Error::new(
+                    "CHECK_PENDING_CYCLE_CORRUPT",
+                    "live pending CheckRun ordering identity is not canonical",
+                ));
+            }
+            cycle = Some(PendingCycle {
+                schema_version: PENDING_CYCLE_SCHEMA,
+                cut: max,
+            });
+        }
+    }
+    let Some(active) = cycle.clone() else {
+        return Ok((Vec::new(), None));
+    };
+    let suffix_limit = if cursor.is_none() {
+        MAX_PENDING_PAGE
+    } else {
+        MAX_PENDING_SUFFIX
+    };
+    // The wrap prefix is reserved on every pass: even while the suffix
+    // stays full under continuous admissions, the failed older subject
+    // before the cursor is revisited within a deterministic bounded number
+    // of passes. Both ranges stay within the cut; the wrap range needs no
+    // explicit cut filter because the cut always names the maximum pending
+    // identifier, so every still-pending wrapped row is at or below it.
+    let mut ids = pending_ids_after(tx, cursor, Some(active.cut.as_str()), suffix_limit)?;
     if ids.len() < MAX_PENDING_PAGE
         && let Some(cursor) = cursor
     {
-        let remaining = MAX_PENDING_PAGE - ids.len();
-        ids.extend(pending_ids_through(tx, cursor, remaining)?);
+        let wrap_limit = (MAX_PENDING_PAGE - ids.len()).max(MAX_PENDING_WRAP);
+        ids.extend(pending_ids_through(tx, cursor, wrap_limit)?);
     }
-    Ok(ids)
+    if ids.is_empty() && pending_subject_count(tx)? > 0 {
+        tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CYCLE_KEY])?;
+        if let Some(max) = max_pending_id(tx)? {
+            if !valid_pending_cursor_id(&max) {
+                return Err(Error::new(
+                    "CHECK_PENDING_CYCLE_CORRUPT",
+                    "live pending CheckRun ordering identity is not canonical",
+                ));
+            }
+            let fresh = PendingCycle {
+                schema_version: PENDING_CYCLE_SCHEMA,
+                cut: max,
+            };
+            let mut fresh_ids =
+                pending_ids_after(tx, cursor, Some(fresh.cut.as_str()), suffix_limit)?;
+            if fresh_ids.len() < MAX_PENDING_PAGE
+                && let Some(cursor) = cursor
+            {
+                let wrap_limit = (MAX_PENDING_PAGE - fresh_ids.len()).max(MAX_PENDING_WRAP);
+                fresh_ids.extend(pending_ids_through(tx, cursor, wrap_limit)?);
+            }
+            return Ok((fresh_ids, Some(fresh)));
+        }
+        return Ok((Vec::new(), None));
+    }
+    Ok((ids, cycle))
 }
 
 fn read_subject_identity(tx: &Transaction<'_>, check_id: &str) -> Result<PendingSubjectIdentity> {
@@ -2352,13 +2516,26 @@ fn retain_pending_quarantine(
     Ok(())
 }
 
-fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
+/// Durable pending CheckRun selection with completed-subject cursor motion.
+///
+/// Selection itself never advances the subject cursor past healthy Work:
+/// healthy subjects advance only after their stable disposition is durable,
+/// through retain_pending_progress in the startup reconciliation and
+/// supervisor seams. Deterministic damage retains its exact quarantine
+/// evidence; the cursor advances through a page only when the page carries no
+/// healthy Work, so unexamined Work is never marked visited.
+struct PendingSelection {
+    work: Vec<Work>,
+    cycle: Option<PendingCycle>,
+}
+
+fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelection> {
     // Deferred snapshot: empty scans and unchanged stable pages stay read-only
     // and never reserve the SQLite writer. Stale-cursor cleanup and new
-    // quarantine/cursor dispositions upgrade the same transaction atomically.
+    // quarantine dispositions upgrade the same transaction atomically.
     let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let cursor = read_pending_cursor(&tx)?;
-    let ids = pending_page(&tx, cursor.as_deref())?;
+    let (ids, cycle) = select_pending_page(&tx, cursor.as_deref())?;
     let mut work = Vec::with_capacity(ids.len());
     let mut last_id = None;
     let mut quarantined_new = false;
@@ -2377,26 +2554,103 @@ fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
             }
         }
     }
-    if let Some(check_id) = last_id {
-        let cursor_unchanged = cursor.as_deref() == Some(check_id.as_str());
-        if quarantined_new || !cursor_unchanged {
-            set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
+    let selection = PendingSelection { work, cycle };
+    if selection.work.is_empty() {
+        // Pages without healthy Work advance the cursor through their stable
+        // subjects (new or already-retained quarantine) atomically with the
+        // evidence, or stay read-only when nothing changed.
+        if let Some(check_id) = last_id {
+            let cursor_unchanged = cursor.as_deref() == Some(check_id.as_str());
+            if quarantined_new || !cursor_unchanged {
+                set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
+                match &selection.cycle {
+                    Some(snapshot) if snapshot.cut.as_str() == check_id.as_str() => {
+                        // Reaching the cut closes the cycle exactly at the
+                        // completed subject: the next selection captures a
+                        // fresh cut.
+                        tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CYCLE_KEY])?;
+                    }
+                    Some(snapshot) => {
+                        set_meta(&tx, PENDING_CYCLE_KEY, &json!(snapshot))?;
+                    }
+                    None => {}
+                }
+            } else {
+                return Ok(selection);
+            }
+        } else if pending_subject_count(&tx)? == 0 {
+            if cursor.is_none() && read_pending_cycle(&tx)?.is_none() {
+                // Empty scan with no retained cursor or cycle: read-only, no
+                // meta mutation.
+                return Ok(selection);
+            }
+            // Stale cursor or cycle with no subjects: delete once; the next
+            // empty scan is read-only.
+            tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CURSOR_KEY])?;
+            tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CYCLE_KEY])?;
         } else {
-            // Stable page with no new disposition and an unchanged cursor:
-            // drop the read snapshot without reserving the writer.
-            return Ok(work);
+            // Subjects remain but none are selected (only post-cut admissions
+            // remain): keep the cursor and cycle untouched and read-only.
+            return Ok(selection);
         }
+    } else if quarantined_new {
+        // New quarantine evidence commits even though healthy Work is also
+        // returned. The subject cursor and cycle cut stay untouched here:
+        // unexamined healthy Work is never marked visited.
     } else {
-        if cursor.is_none() {
-            // Empty scan with no retained cursor: read-only, no meta mutation.
-            return Ok(work);
-        }
-        // Stale cursor with no subjects: delete once; the next empty scan is
-        // read-only.
-        tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CURSOR_KEY])?;
+        // Healthy page with no new disposition: read-only.
+        return Ok(selection);
     }
     tx.commit()?;
-    Ok(work)
+    Ok(selection)
+}
+
+fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
+    pending_selection(db, root).map(|selection| selection.work)
+}
+
+/// Persist the subject cursor (and its cycle snapshot) after one subject
+/// reached a stable, truthfully retained disposition: terminal finish,
+/// accepted ready, examined no-op, retained incident, or exact quarantine.
+/// The disposition itself is already durable in its own transaction; this
+/// write only moves the ordering coordinate, so a cursor-write failure never
+/// erases CheckRun truth and retry converges by exact readback of the same
+/// subject. Reaching the cut closes the cycle exactly at the completed
+/// subject.
+fn retain_pending_progress(
+    db: &mut Connection,
+    check_id: &str,
+    cycle: &Option<PendingCycle>,
+) -> Result<()> {
+    if !valid_pending_cursor_id(check_id) {
+        return Err(Error::new(
+            "CHECK_PENDING_CURSOR_CORRUPT",
+            "completed CheckRun ordering identity is not canonical",
+        ));
+    }
+    if let Some(snapshot) = cycle {
+        if snapshot.schema_version != PENDING_CYCLE_SCHEMA
+            || !valid_pending_cursor_id(&snapshot.cut)
+        {
+            return Err(Error::new(
+                "CHECK_PENDING_CYCLE_CORRUPT",
+                "pending cycle snapshot is not a canonical CheckRun ordering identity",
+            ));
+        }
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
+    match cycle {
+        Some(snapshot) if snapshot.cut.as_str() == check_id => {
+            tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CYCLE_KEY])?;
+        }
+        Some(snapshot) => {
+            set_meta(&tx, PENDING_CYCLE_KEY, &json!(snapshot))?;
+        }
+        None => {}
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn ready(db: &mut Connection, w: &Work, identity: Value) -> Result<bool> {
@@ -2990,10 +3244,36 @@ impl Store {
     /// It never launches a worker or repeats a command. Live workers remain
     /// under the normal supervisor, which owns their acknowledged go-ahead.
     pub(crate) async fn reconcile_checks_once(&self) -> Result<()> {
+    /// Advance the pending subject cursor after one subject reached a stable,
+    /// truthfully retained disposition. The disposition is already durable;
+    /// a cursor-write failure propagates as a hard error without erasing
+    /// CheckRun truth, and retry converges by exact readback because the
+    /// cursor still names the last completed subject.
+    async fn advance_pending_cursor(
+        &self,
+        check_id: &str,
+        cycle: &Option<PendingCycle>,
+    ) -> Result<()> {
+        let id = check_id.to_owned();
+        let snapshot = cycle.clone();
+        self.run(move |db| retain_pending_progress(db, &id, &snapshot))
+            .await
+    }
+
+    /// Startup readback of retained CheckRun evidence before schedule catch-up.
+    /// It never launches a worker or repeats a command. Live workers remain
+    /// under the normal supervisor, which owns their acknowledged go-ahead.
+    pub(crate) async fn reconcile_checks_once(&self) -> Result<()> {
         let root = self.data_dir.clone();
-        let items = self.run(move |db| pending(db, root)).await?;
+        let selection = self.run(move |db| pending_selection(db, root)).await?;
+        let PendingSelection { work: items, cycle } = selection;
+        // The cursor advances only through subjects that reached a stable,
+        // truthfully retained disposition. A hard failure returns with the
+        // cursor at the last completed subject; the failed subject stays
+        // eligible and converges on retry by exact readback.
         for work in items {
             if self.terminalize_unstarted_check(&work).await? {
+                self.advance_pending_cursor(&work.check_id, &cycle).await?;
                 continue;
             }
             self.record_check_process_diagnostic(&work).await?;
@@ -3012,6 +3292,7 @@ impl Store {
                 self.run(move |db| finish(db, &work, completion)).await?;
                 self.changed
                     .send_modify(|revision| *revision = revision.wrapping_add(1));
+                self.advance_pending_cursor(&work.check_id, &cycle).await?;
                 continue;
             }
             let scan = work.clone();
@@ -3022,14 +3303,18 @@ impl Store {
                 self.run(move |db| finish(db, &work, completion)).await?;
                 self.changed
                     .send_modify(|revision| *revision = revision.wrapping_add(1));
+                self.advance_pending_cursor(&work.check_id, &cycle).await?;
                 continue;
             }
             let scan = work.clone();
             match self.file_io(move |_| worker::ready(&scan)).await {
                 Ok(Some(identity)) => {
                     self.run(move |db| ready(db, &work, identity)).await?;
+                    self.advance_pending_cursor(&work.check_id, &cycle).await?;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    self.advance_pending_cursor(&work.check_id, &cycle).await?;
+                }
                 Err(error) if error.code == "CHECK_WORKER_LOST" => {
                     let id = work.check_id.clone();
                     self.run(move |db| {
@@ -3046,6 +3331,7 @@ impl Store {
                         self.changed
                             .send_modify(|revision| *revision = revision.wrapping_add(1));
                     }
+                    self.advance_pending_cursor(&work.check_id, &cycle).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -3451,7 +3737,13 @@ impl Store {
             }
 
             let root = self.data_dir.clone();
-            let items = self.run(move |db| pending(db, root)).await?;
+            let selection = self.run(move |db| pending_selection(db, root)).await?;
+            let PendingSelection { work: items, cycle } = selection;
+            // Same corrected seam as startup reconciliation: the cursor
+            // advances only through subjects with a durable disposition.
+            // Infrastructure failures return with the cursor at the last
+            // completed subject; handled subject-local errors advance only
+            // after their incident is retained.
             for mut w in items {
                 if self.check_child_has_launch_error(&w.check_id).await {
                     continue;
@@ -3514,6 +3806,7 @@ impl Store {
                                 error,
                             )
                             .await?;
+                            self.advance_pending_cursor(&w.check_id, &cycle).await?;
                             continue;
                         }
                     }
@@ -3636,6 +3929,9 @@ impl Store {
                         error,
                     )
                     .await?;
+                    self.advance_pending_cursor(&w.check_id, &cycle).await?;
+                } else {
+                    self.advance_pending_cursor(&w.check_id, &cycle).await?;
                 }
             }
 

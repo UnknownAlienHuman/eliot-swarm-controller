@@ -908,6 +908,11 @@ async fn durable_disposition_rejects_identity_and_shape_mutations() {
 }
 
 #[tokio::test]
+/// Bounded selector progress moves only through completed subjects: bare
+/// selection without any stable disposition re-selects the same page, so
+/// unexamined Work is never marked visited. Real dispositions recorded
+/// through the startup reconciliation seam still cover all rows across
+/// bounded pages, and a late admission waits at most one exact cycle turn.
 async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
     let fixture = fixture().await;
     let mut expected = BTreeSet::new();
@@ -922,15 +927,66 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
         .await
         .unwrap();
     assert_eq!(first.len(), 16);
-    let first_ids: BTreeSet<String> = first.into_iter().map(|work| work.check_id).collect();
-    let second = pending_page(&fixture.owner.store, fixture.directory.clone())
+    let first_ids: BTreeSet<String> =
+        first.iter().map(|work| work.check_id.clone()).collect();
+    // Bare re-selection without any stable disposition returns the same
+    // page and leaves the cursor untouched.
+    assert_eq!(
+        fixture
+            .owner
+            .store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        None
+    );
+    let reselect = pending_page(&fixture.owner.store, fixture.directory.clone())
         .await
         .unwrap();
-    assert_eq!(second.len(), 16);
-    let mut visited = first_ids;
-    visited.extend(second.into_iter().map(|work| work.check_id));
-    assert_eq!(visited, expected, "both bounded pages cover later rows");
+    assert_eq!(
+        reselect
+            .iter()
+            .map(|work| &work.check_id)
+            .collect::<BTreeSet<_>>(),
+        first_ids.iter().collect::<BTreeSet<_>>(),
+        "selection without a stable disposition must not advance"
+    );
+    assert_eq!(
+        fixture
+            .owner
+            .store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        None
+    );
 
+    // Real terminal dispositions recorded through actual reconciliation
+    // complete the whole first page and move the cursor to its last row.
+    for check_id in &first_ids {
+        mark_preflight_terminal(&fixture.owner.store, check_id).await;
+    }
+    for check_id in expected.difference(&first_ids) {
+        mark_preflight_terminal(&fixture.owner.store, check_id).await;
+    }
+    fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap();
+    let completed: BTreeSet<String> = first_ids.clone();
+    for check_id in &completed {
+        assert_eq!(
+            check_state(&fixture.owner.store, check_id).await["state"],
+            "error",
+            "first-page row must reach its terminal disposition"
+        );
+    }
+
+    // A late admission waits at most one exact cycle turn: it stays out of
+    // the active page while pre-cut rows remain, then enters with a fresh
+    // cut once the cycle drains.
     let new_admission = admit_pending(
         &fixture,
         "reg23-page-added-later",
@@ -939,17 +995,41 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
     )
     .await;
     let new_id = new_admission["check_id"].as_str().unwrap().to_owned();
-    let third = pending_page(&fixture.owner.store, fixture.directory.clone())
+    mark_preflight_terminal(&fixture.owner.store, &new_id).await;
+    fixture
+        .owner
+        .store
+        .reconcile_checks_once()
         .await
         .unwrap();
-    let fourth = pending_page(&fixture.owner.store, fixture.directory.clone())
+    assert_eq!(
+    // A late admission either joins the open cycle (visited immediately)
+    // or waits exactly one turnover (post-cut); both converge on the next
+    // pass, so the row is terminal after at most two more passes.
+    fixture
+        .owner
+        .store
+        .reconcile_checks_once()
         .await
         .unwrap();
-    assert!(
-        third.iter().any(|work| work.check_id == new_id)
-            || fourth.iter().any(|work| work.check_id == new_id),
-        "a new ID before or after the cursor is visited by bounded wraparound"
+    assert_eq!(
+        check_state(&fixture.owner.store, &new_id).await["state"],
+        "error",
+        "a new ID is visited within one exact cycle turn"
     );
+    let terminal = fixture
+        .owner
+        .store
+        .run(|db| {
+            Ok(db.query_row(
+                "SELECT count(*) FROM check_runs WHERE state='error'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(terminal, 19, "every admitted row reaches terminal exactly once");
 
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
@@ -1182,7 +1262,11 @@ async fn stale_cursor_is_removed_once_then_read_only() {
     fixture
         .owner
         .store
-        .run(|db| set_meta(db, PENDING_CURSOR_KEY, &json!("stale-cursor-check-id")))
+        // A stale cursor must still be canonical to stay a valid ordering
+        // boundary: noncanonical values are hard integrity errors (see the
+        // canonical cursor fixture), so this names a canonical UUID that was
+        // never admitted.
+        .run(|db| set_meta(db, PENDING_CURSOR_KEY, &json!(model::new_id())))
         .await
         .unwrap();
     assert!(
@@ -1228,6 +1312,798 @@ async fn stale_cursor_is_removed_once_then_read_only() {
         })
         .await
         .unwrap();
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// Test-only retained-state fault injection: record a genuine terminal
+/// preflight failure for real reconciliation to consume. The error is an
+/// exact retained CheckRun fact (not a fabricated outcome): the startup
+/// and supervisor seams terminalize it through worker::failure and the
+/// existing finish gates without spawning any worker.
+async fn mark_preflight_terminal(store: &Store, check_id: &str) {
+    let id = check_id.to_owned();
+    let failure = model::canonical(&json!({
+        "code": "CHECK_FIXTURE_PREFLIGHT",
+        "message": "fixture terminal path for completed-subject cursor",
+    }))
+    .unwrap();
+    store
+        .run(move |db| {
+            let changed = db.execute(
+                "UPDATE check_runs SET spec_json=json_set(spec_json,'$.preflight_error',json(?2)) WHERE check_id=?1",
+                params![id, failure],
+            )?;
+            if changed != 1 {
+                return Err(crate::error::Error::new(
+                    "TEST_STATE",
+                    "publicly admitted CheckRun disappeared before fault injection",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn check_state(store: &Store, check_id: &str) -> Value {
+    let id = check_id.to_owned();
+    store
+        .run(move |db| describe(db, &json!({ "check_id": id })))
+        .await
+        .unwrap()
+}
+
+async fn retained_cursor(store: &Store) -> Option<Value> {
+    store.run(|db| meta(db, PENDING_CURSOR_KEY)).await.unwrap()
+}
+
+async fn retained_cycle_cut(store: &Store) -> Option<String> {
+    store
+        .run(|db| {
+            Ok(read_pending_cycle(db)?.map(|cycle| cycle.cut))
+        })
+        .await
+        .unwrap()
+}
+
+/// The cursor advances only through subjects that reached a stable,
+/// truthfully retained disposition. Seventeen pending CheckRuns with a hard
+/// Store failure injected while real reconciliation handles row 2 leave the
+/// cursor at row 1, never at the end of the selected page; selection alone
+/// before the first completed subject leaves the prior cursor untouched;
+/// after the fault is removed row 2 is next eligible and every later row
+/// reaches its terminal disposition exactly once.
+#[tokio::test]
+async fn pending_cursor_advances_only_through_completed_subjects() {
+    let fixture = fixture().await;
+    let mut admitted = Vec::new();
+    for index in 0..17 {
+        let project_id = format!("reg23-cursor-{index}");
+        let content = format!("completed-subject cursor source {index}");
+        admitted.push(admit_pending(&fixture, &project_id, content.as_bytes(), "v1").await);
+    }
+    for receipt in &admitted {
+        mark_preflight_terminal(
+            &fixture.owner.store,
+            receipt["check_id"].as_str().unwrap(),
+        )
+        .await;
+    }
+    let root = fixture.directory.clone();
+    let first = fixture
+        .owner
+        .store
+        .run(move |db| pending_selection(db, root))
+        .await
+        .unwrap();
+    assert_eq!(first.work.len(), 16);
+    let ordered: Vec<String> = first
+        .work
+        .iter()
+        .map(|work| work.check_id.clone())
+        .collect();
+    let mut lexical = ordered.clone();
+    lexical.sort();
+    assert_eq!(ordered, lexical, "the active page stays in lexical order");
+    let row1 = ordered[0].clone();
+    let row2 = ordered[1].clone();
+    let late: Vec<String> = admitted
+        .iter()
+        .map(|receipt| receipt["check_id"].as_str().unwrap().to_owned())
+        .filter(|id| *id != row1 && ordered.iter().all(|seen| seen != id))
+        .collect();
+    assert_eq!(late.len(), 1, "one admitted row stays outside the first page");
+    let row17 = late[0].clone();
+    assert_eq!(
+        retained_cycle_cut(&fixture.owner.store).await,
+        None,
+        "selection alone persists no cycle cut"
+    );
+
+    // Failure before the first completed subject leaves the prior cursor
+    // (absent here) unchanged.
+    let first_trigger = row1.clone();
+    fixture
+        .owner
+        .store
+        .run(move |db| {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reg23_fail_first_finish BEFORE UPDATE ON check_runs WHEN NEW.check_id='{first_trigger}' BEGIN SELECT RAISE(ABORT,'injected first-row finish failure'); END;"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_first_finish")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_cursor(&fixture.owner.store).await,
+        None,
+        "failure before the first completed subject leaves the prior cursor unchanged"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &row1).await["state"],
+        "queued",
+        "the rolled-back row stays eligible"
+    );
+
+    // A hard failure while real reconciliation handles row 2 leaves the
+    // cursor at row 1, not at the end of the selected page.
+    let second_trigger = row2.clone();
+    fixture
+        .owner
+        .store
+        .run(move |db| {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reg23_fail_second_finish BEFORE UPDATE ON check_runs WHEN NEW.check_id='{second_trigger}' BEGIN SELECT RAISE(ABORT,'injected second-row finish failure'); END;"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_second_finish")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_cursor(&fixture.owner.store).await,
+        Some(json!(row1)),
+        "the cursor ends at row 1, not at the end of the selected page"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &row1).await["state"],
+        "error",
+        "row 1 reached its terminal disposition"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &row2).await["state"],
+        "queued",
+        "the failed row stays eligible"
+    );
+    assert_eq!(
+        retained_cycle_cut(&fixture.owner.store).await,
+        Some(row17.clone()),
+        "the cycle cut is captured at the admitted maximum"
+    );
+
+    // Removing the fault makes row 2 next eligible; every later row then
+    // reaches its terminal disposition exactly once, and reaching the cut
+    // closes the cycle.
+    let head = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        head[0].check_id, row2,
+        "row 2 stays next eligible after recovery"
+    );
+    for _ in 0..3 {
+        fixture
+            .owner
+            .store
+            .reconcile_checks_once()
+            .await
+            .unwrap();
+    }
+    for receipt in &admitted {
+        let check_id = receipt["check_id"].as_str().unwrap();
+        assert_eq!(
+            check_state(&fixture.owner.store, check_id).await["state"],
+            "error",
+            "no later row is skipped"
+        );
+    }
+    assert_eq!(
+        retained_cursor(&fixture.owner.store).await,
+        Some(json!(row17)),
+        "recovery converges on the last completed subject"
+    );
+    assert_eq!(
+        retained_cycle_cut(&fixture.owner.store).await,
+        None,
+        "reaching the cut closes the cycle"
+    );
+    let terminal = fixture
+        .owner
+        .store
+        .run(|db| {
+            Ok(db.query_row(
+                "SELECT count(*) FROM check_runs WHERE state='error'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(terminal, 17, "no later row is duplicated");
+
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// The pending cursor is a closed canonical UUIDv4 coordinate: retained
+/// values such as "zzzz", truncated or noncanonical UUIDs, or the wrong
+/// UUID version are hard integrity errors with no Work processing and no
+/// metadata writes, while a canonical completed CheckRun keeps working as
+/// an ordering boundary.
+#[tokio::test]
+async fn canonical_pending_cursor_is_closed_uuidv4() {
+    let fixture = fixture().await;
+    let admitted = admit_pending(
+        &fixture,
+        "reg23-canonical-cursor",
+        b"canonical cursor source",
+        "v1",
+    )
+    .await;
+    let check_id = admitted["check_id"].as_str().unwrap().to_owned();
+    damage_profile(&fixture.owner.store, &check_id).await;
+    for broken in [
+        "zzzz",
+        "not-a-uuid",
+        "550e8400-e29b-11d3-a456-426614174000",
+        "550E8400-E29B-41D4-A716-446655440000",
+        "6ba7b8109dad11d180b400c04fd430c",
+        "",
+    ] {
+        let value = broken.to_owned();
+        fixture
+            .owner
+            .store
+            .run(move |db| set_meta(db, PENDING_CURSOR_KEY, &json!(value)))
+            .await
+            .unwrap();
+        let error = pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "CHECK_PENDING_CURSOR_CORRUPT");
+        assert_eq!(
+            retained_quarantine(&fixture.owner.store, &check_id).await,
+            Value::Null,
+            "a corrupt cursor processes no Work"
+        );
+    }
+    // A canonical but dangling cursor is accepted as an ordering
+    // coordinate; the damaged row is then quarantined exactly once.
+    let dangling = model::new_id();
+    fixture
+        .owner
+        .store
+        .run(move |db| set_meta(db, PENDING_CURSOR_KEY, &json!(dangling)))
+        .await
+        .unwrap();
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let evidence = retained_quarantine(&fixture.owner.store, &check_id).await;
+    assert_eq!(evidence["field"], "profile");
+    assert_eq!(evidence["reason"], "invalid_subject_shape");
+
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// A canonical cursor that names a completed CheckRun stays a valid
+/// ordering boundary, and reopening the Store preserves the in-progress
+/// cycle: recovery resumes after the last completed subject, never after
+/// the last selected one.
+#[tokio::test]
+async fn completed_cursor_and_cycle_survive_reopen_after_hard_failure() {
+    let fixture = fixture().await;
+    let done_a = admit_pending(&fixture, "reg23-reopen-a", b"reopen source a", "v1").await;
+    let done_b = admit_pending(&fixture, "reg23-reopen-b", b"reopen source b", "v1").await;
+    let done_ids = vec![
+        done_a["check_id"].as_str().unwrap().to_owned(),
+        done_b["check_id"].as_str().unwrap().to_owned(),
+    ];
+    for id in &done_ids {
+        mark_preflight_terminal(&fixture.owner.store, id).await;
+    }
+    fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap();
+    let mut done_lexical = done_ids.clone();
+    done_lexical.sort();
+    assert_eq!(
+        retained_cursor(&fixture.owner.store).await,
+        Some(json!(done_lexical[1].clone())),
+        "both rows complete through the corrected seam"
+    );
+    // Explicitly naming the completed row keeps working as a boundary for
+    // later admissions.
+    let boundary = done_lexical[1].clone();
+    fixture
+        .owner
+        .store
+        .run(move |db| set_meta(db, PENDING_CURSOR_KEY, &json!(boundary)))
+        .await
+        .unwrap();
+    let late = admit_pending(&fixture, "reg23-reopen-late", b"reopen late", "v1").await;
+    let late_id = late["check_id"].as_str().unwrap().to_owned();
+    let page = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert!(
+        page.iter().any(|work| work.check_id == late_id),
+        "a completed cursor never hides later admissions"
+    );
+    // Stall one row of the next page with a hard failure: the rows before
+    // it complete, and the cursor plus the captured cycle stay exactly
+    // there across reopen.
+    let fourth = admit_pending(&fixture, "reg23-reopen-d", b"reopen source d", "v1").await;
+    let fifth = admit_pending(&fixture, "reg23-reopen-e", b"reopen source e", "v1").await;
+    let mut pending_ids = vec![
+        late_id.clone(),
+        fourth["check_id"].as_str().unwrap().to_owned(),
+        fifth["check_id"].as_str().unwrap().to_owned(),
+    ];
+    for id in &pending_ids {
+        mark_preflight_terminal(&fixture.owner.store, id).await;
+    }
+    pending_ids.sort();
+    let stalled = pending_ids[1].clone();
+    let stalled_trigger = stalled.clone();
+    fixture
+        .owner
+        .store
+        .run(move |db| {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reg23_fail_middle_finish BEFORE UPDATE ON check_runs WHEN NEW.check_id='{stalled_trigger}' BEGIN SELECT RAISE(ABORT,'injected middle-row finish failure'); END;"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    // The first row of the page completed (terminal or examined no-op);
+    // the stalled middle row stays eligible.
+    let cursor_before = retained_cursor(&fixture.owner.store).await;
+    assert_eq!(cursor_before, Some(json!(pending_ids[0].clone())));
+    let cycle_before = retained_cycle_cut(&fixture.owner.store).await;
+    assert!(cycle_before.is_some(), "the in-progress cycle is durable");
+    assert_eq!(
+        check_state(&fixture.owner.store, &stalled).await["state"],
+        "queued",
+        "the stalled row stays eligible"
+    );
+
+    fixture.owner.close().await.unwrap();
+    let credential = crate::platform::bootstrap_credential(&fixture.directory).unwrap();
+    let root = crate::platform::DataRoot::acquire(&fixture.directory).unwrap();
+    let reopened =
+        crate::store::StoreOwner::start(root, fixture.config.clone(), credential.clone())
+            .await
+            .unwrap();
+    let reopened_store = reopened.store.clone();
+    reopened_store.authenticate(credential).await.unwrap();
+    assert_eq!(retained_cursor(&reopened_store).await, cursor_before);
+    assert_eq!(retained_cycle_cut(&reopened_store).await, cycle_before);
+    // Recovery resumes after the last completed subject: the stalled row
+    // heads the next page, not the rows already completed before it.
+    let head = pending_page(&reopened_store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert_eq!(head[0].check_id, stalled);
+    reopened
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_middle_finish")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    reopened.store.reconcile_checks_once().await.unwrap();
+    reopened.store.reconcile_checks_once().await.unwrap();
+    for id in pending_ids.iter().chain(done_ids.iter()) {
+        assert_eq!(check_state(&reopened_store, id).await["state"], "error");
+    }
+
+    reopened.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// The bounded cycle revisits a failed older subject within a deterministic
+/// number of passes while later admissions keep arriving on either lexical
+/// side: post-cut admissions stay out of the active page, and the reserved
+/// wrap prefix keeps moving, so the failed row is reprocessed every pass
+/// until it recovers instead of starving behind a replenished suffix.
+#[tokio::test]
+async fn pending_cycle_revisits_failed_subject_under_continuous_admissions() {
+    let fixture = fixture().await;
+    let mut initial = Vec::new();
+    for index in 0..8 {
+        let project_id = format!("reg23-cycle-{index}");
+        let content = format!("cycle fairness source {index}");
+        initial.push(admit_pending(&fixture, &project_id, content.as_bytes(), "v1").await);
+    }
+    for receipt in &initial {
+        mark_preflight_terminal(
+            &fixture.owner.store,
+            receipt["check_id"].as_str().unwrap(),
+        )
+        .await;
+    }
+    let head = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert_eq!(head.len(), 8);
+    let mut ordered: Vec<String> =
+        head.iter().map(|work| work.check_id.clone()).collect();
+    ordered.sort();
+    let failed = ordered[2].clone();
+    let failed_trigger = failed.clone();
+    fixture
+        .owner
+        .store
+        .run(move |db| {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reg23_fail_cycle_row BEFORE UPDATE ON check_runs WHEN NEW.check_id='{failed_trigger}' BEGIN SELECT RAISE(ABORT,'injected cycle-row finish failure'); END;"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    assert_eq!(
+        retained_cursor(&fixture.owner.store).await,
+        Some(json!(ordered[1].clone())),
+        "the cursor stops at the last completed subject before the failure"
+    );
+    // Three rounds of later admissions: every pass still reaches the
+    // failed row (each pass ends in its hard failure) and the cursor never
+    // moves past it.
+    for round in 0..3 {
+        for index in 0..3 {
+            let flood_project = format!("reg23-cycle-flood-{round}-{index}");
+            let flood_content = format!("cycle flood {round} {index}");
+            admit_pending(&fixture, &flood_project, flood_content.as_bytes(), "v1").await;
+        }
+        let error = fixture
+            .owner
+            .store
+            .reconcile_checks_once()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "STORE_ERROR");
+        assert_ne!(
+            retained_cursor(&fixture.owner.store).await,
+            Some(json!(&failed)),
+            "continuous admissions never push the cursor past the failed row"
+        );
+    }
+    // Recovery converges: the failed row terminalizes through the same
+    // real gates, and every initial row reaches terminal exactly once.
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_cycle_row")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        fixture
+            .owner
+            .store
+            .reconcile_checks_once()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        check_state(&fixture.owner.store, &failed).await["state"],
+        "error",
+        "the failed row converges after recovery"
+    );
+    for receipt in &initial {
+        assert_eq!(
+            check_state(
+                &fixture.owner.store,
+                receipt["check_id"].as_str().unwrap()
+            )
+            .await["state"],
+            "error"
+        );
+    }
+
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// The supervisor consumes the same corrected seam: a hard failure stops
+/// the pass with the cursor at the last completed subject, a handled
+/// subject-local launch defect advances only after its incident is retained
+/// (authorizing no execution and releasing no custody), and recovery
+/// converges with a single retained incident and no second worker.
+#[tokio::test]
+async fn supervisor_hard_failure_keeps_last_completed_cursor_and_converges_on_retry() {
+    let fixture = fixture().await;
+    let admitted_a = admit_pending(&fixture, "reg23-sup-a", b"supervisor source a", "v1").await;
+    let admitted_b = admit_pending(&fixture, "reg23-sup-b", b"supervisor source b", "v1").await;
+    let admitted_c = admit_pending(&fixture, "reg23-sup-c", b"supervisor source c", "v1").await;
+    let row_a = admitted_a["check_id"].as_str().unwrap().to_owned();
+    let row_b = admitted_b["check_id"].as_str().unwrap().to_owned();
+    let row_c = admitted_c["check_id"].as_str().unwrap().to_owned();
+    mark_preflight_terminal(&fixture.owner.store, &row_a).await;
+    mark_preflight_terminal(&fixture.owner.store, &row_b).await;
+    // A launch receipt the supervisor can read but never accept: valid
+    // JSON with the wrong shape fails closed as a subject-local incident
+    // instead of authorizing execution.
+    let c_dir = worker::directory(&fixture.directory, &row_c).unwrap();
+    std::fs::create_dir_all(&c_dir).unwrap();
+    std::fs::write(c_dir.join("launch.json"), b"{\"version\":2}").unwrap();
+    let launch_bytes = std::fs::read(c_dir.join("launch.json")).unwrap();
+    let mut lexical = vec![row_a.clone(), row_b.clone(), row_c.clone()];
+    lexical.sort();
+    // Order the fault and the incident row by page position: the trigger
+    // hits the middle row so the first row must complete first.
+    assert_eq!(lexical.len(), 3);
+    let fault_trigger = lexical[1].clone();
+    fixture
+        .owner
+        .store
+        .run(move |db| {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reg23_fail_sup_finish BEFORE UPDATE ON check_runs WHEN NEW.check_id='{fault_trigger}' BEGIN SELECT RAISE(ABORT,'injected supervisor finish failure'); END;"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (_stop_tx, stopping) = tokio::sync::watch::channel(false);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        fixture.owner.store.clone().supervise_checks(stopping),
+    )
+    .await
+    .expect("supervisor must return the injected hard failure")
+    .unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_sup_finish")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_cursor(&fixture.owner.store).await,
+        Some(json!(lexical[0].clone())),
+        "the supervisor stops with the cursor at the last completed subject"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &lexical[0]).await["state"],
+        "error"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &lexical[1]).await["state"],
+        "queued",
+        "the faulted row stays eligible"
+    );
+    // Recovery converges through the supervisor: the middle row finishes,
+    // the launch-defective row is held by incident without execution, and
+    // the run stops cleanly with no owned child.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let supervising = fixture.owner.store.clone().supervise_checks(stop_rx);
+    tokio::pin!(supervising);
+    let held = lexical[2].clone();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                outcome = &mut supervising => {
+                    break outcome;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if retained_cursor(&fixture.owner.store).await == Some(json!(&held)) {
+                        stop_tx.send_replace(true);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("supervisor must converge on the held row");
+    outcome.unwrap();
+    assert_eq!(
+        check_state(&fixture.owner.store, &lexical[1]).await["state"],
+        "error",
+        "the faulted row finishes on retry"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &lexical[2]).await["state"],
+        "queued",
+        "the held row stays nonterminal without execution"
+    );
+    let incidents = fixture
+        .owner
+        .store
+        .run(move |db| {
+            Ok(db.query_row(
+                "SELECT count(*) FROM incidents WHERE dedup_key=?1",
+                params![format!("check:{}:CONFLICT", lexical[2].clone())],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(incidents, 1, "the held row retains exactly one incident");
+    assert_eq!(
+        std::fs::read(c_dir.join("launch.json")).unwrap(),
+        launch_bytes,
+        "the defective receipt is only observed, never repaired"
+    );
+    for check_id in [lexical[0].as_str(), lexical[1].as_str()] {
+        let dir = worker::directory(&fixture.directory, check_id).unwrap();
+        for receipt in ["launch.json", "worker.json", "go.json"] {
+            assert!(
+                !dir.join(receipt).exists(),
+                "terminalized rows never authorize a worker"
+            );
+        }
+    }
+    for receipt in ["worker.json", "go.json", "completion.json"] {
+        assert!(
+            !c_dir.join(receipt).exists(),
+            "the held row never authorizes execution"
+        );
+    }
+    assert_eq!(
+        fixture.owner.store.check_child_custody_count().await,
+        0,
+        "no child custody is retained"
+    );
+
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// A cursor-write failure after a stable subject never erases CheckRun
+/// truth and never starts a second worker: the terminal disposition is
+/// already durable, and retry converges by exact readback of the same
+/// subject without republishing its completion.
+#[tokio::test]
+async fn pending_cursor_write_failure_preserves_truth_and_converges_on_retry() {
+    let fixture = fixture().await;
+    let admitted_a = admit_pending(&fixture, "reg23-cursor-a", b"cursor write source a", "v1").await;
+    let admitted_b = admit_pending(&fixture, "reg23-cursor-b", b"cursor write source b", "v1").await;
+    let row_a = admitted_a["check_id"].as_str().unwrap().to_owned();
+    let row_b = admitted_b["check_id"].as_str().unwrap().to_owned();
+    mark_preflight_terminal(&fixture.owner.store, &row_a).await;
+    mark_preflight_terminal(&fixture.owner.store, &row_b).await;
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch(
+                "CREATE TRIGGER reg23_fail_cursor_insert BEFORE INSERT ON meta WHEN NEW.key='checks:pending:v1:cursor' BEGIN SELECT RAISE(ABORT,'injected cursor write failure'); END; CREATE TRIGGER reg23_fail_cursor_update BEFORE UPDATE ON meta WHEN NEW.key='checks:pending:v1:cursor' BEGIN SELECT RAISE(ABORT,'injected cursor write failure'); END;"
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    let first = row_a.clone();
+    let dir_a = worker::directory(&fixture.directory, &first).unwrap();
+    let completion_before = std::fs::read(dir_a.join("completion.json")).unwrap();
+    assert_eq!(
+        check_state(&fixture.owner.store, &row_a).await["state"],
+        "error",
+        "the terminal disposition stays durable without its cursor"
+    );
+    assert_eq!(retained_cursor(&fixture.owner.store).await, None);
+    assert_eq!(retained_cycle_cut(&fixture.owner.store).await, None);
+    assert_eq!(
+        check_state(&fixture.owner.store, &row_b).await["state"],
+        "queued",
+        "the unexamined row stays eligible"
+    );
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_cursor_insert; DROP TRIGGER reg23_fail_cursor_update;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    fixture
+        .owner
+        .store
+        .reconcile_checks_once()
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dir_a.join("completion.json")).unwrap(),
+        completion_before,
+        "retry converges by exact readback without republishing"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &row_a).await["state"],
+        "error"
+    );
+    assert_eq!(
+        check_state(&fixture.owner.store, &row_b).await["state"],
+        "error",
+        "the remaining row finishes on retry"
+    );
+    assert_eq!(
+        fixture.owner.store.check_child_custody_count().await,
+        0,
+        "retry starts no second worker"
+    );
+
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
 }
