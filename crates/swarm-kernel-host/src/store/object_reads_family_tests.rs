@@ -196,3 +196,29 @@ fn family_uses_exact_attempt_after_long_binding_history_and_gaps_foreign_members
     assert!(!encoded.contains("FOREIGN_ROOT_SECRET"));
     assert!(!encoded.contains("FOREIGN_MEMBER_SECRET"));
 }
+/// Role routing for agent.family reads: a Manager without attempt_id gets
+/// NOT_FOUND (no scope fallback exists for Managers); the bootstrap
+/// Operator bypasses attempt scoping; an explicit Attempt ID grants
+/// nothing without a read grant. Participant scope-fallback needs
+/// coordination seeding and stays with the owning scope matrix.
+#[test]
+fn family_attempt_selection_is_role_routed_without_grant_bypass() {
+    let db = fixture_db();
+    insert_task(&db, "task-owned", "open");
+    let owned_producers = json!([{"attempt_id":"attempt-owned","task_id":"task-owned","task_revision":1,"binding_id":BINDING_ID,"binding_generation":GENERATION,"native_session_id":"ses_owned","native_run_id":"run-owned"}]);
+    insert_attempt(&db, "attempt-owned", "task-owned", "family-manager", None, &owned_producers);
+    let state = json!({"native_root_id":"ses_root","native_scope_key":"native:family-scope","session":{"sessionId":"ses_root"},"turns":[],"observed_children":[],"family_completeness":"complete","gaps":0});
+    db.execute("INSERT INTO observations(observation_id,source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) VALUES(?1,'module:family','family-observation',?2,?3,'runtime.state',?4,100)", params![OBSERVATION_ID, BINDING_ID, GENERATION, model::canonical(&state).unwrap()]).unwrap();
+    let manager = Principal { link_id: "family-manager-link".into(), client_id: "family-manager".into(), role: Role::Manager };
+    let omitted = json!({"binding_id":BINDING_ID,"generation":GENERATION,"observation_id":OBSERVATION_ID,"after":0,"limit":10});
+    let err = super::family(&db, &manager, &omitted).expect_err("manager must name the exact attempt");
+    assert_eq!(err.code, "NOT_FOUND");
+    super::super::set_meta(&db, super::super::LOCAL_OPERATOR_CLIENT_ID_KEY, &json!("family-operator")).unwrap();
+    let operator = Principal { link_id: "family-operator-link".into(), client_id: "family-operator".into(), role: Role::Operator };
+    let with_attempt = json!({"binding_id":BINDING_ID,"generation":GENERATION,"attempt_id":"attempt-owned","observation_id":OBSERVATION_ID,"after":0,"limit":10});
+    super::family(&db, &operator, &with_attempt).expect("operator reads without attempt scope");
+    super::super::set_meta(&db, "client:family-stranger", &json!({"role":"manager","disabled":false})).unwrap();
+    let stranger = Principal { link_id: "family-stranger-link".into(), client_id: "family-stranger".into(), role: Role::Manager };
+    let err = super::family(&db, &stranger, &with_attempt).expect_err("explicit id grants no scope");
+    assert_eq!(err.code, "NOT_FOUND");
+ }

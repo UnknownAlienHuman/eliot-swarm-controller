@@ -5032,3 +5032,35 @@ mod producer_terminal_metadata_current_consumers;
 #[cfg(test)]
 #[path = "program_tests/coordination_integration_current_consumers.rs"]
 mod coordination_integration_current_consumers;
+
+/// Legacy V1 request_changes shape (caller-authored finding fields, no schema
+/// version or review anchors) is rejected by V2-only parsing before any
+/// attempt lookup or subject write.
+#[tokio::test]
+async fn request_changes_legacy_v1_shape_rejected_before_attempt_lookup() {
+    let (owner, directory, _) = start_store("request-changes-v1-shape").await;
+    seed_clients(&owner.store).await;
+    let manager = principal("review-owner-v2", Role::Manager);
+    let err = owner
+        .store
+        .call(
+            manager,
+            "task.request_changes".into(),
+            json!({
+                "client_request_id": model::new_id(),
+                "attempt_id": "attempt-absent",
+                "expected_revision": 1,
+                "submission_ref": "submission-absent",
+                "candidate_ref": "candidate-absent",
+                "finding_id": "legacy-finding",
+                "reason": "legacy caller-authored reason",
+                "requirement_ids": ["R1"],
+                "evidence": ["evidence://legacy/r1"],
+            }),
+        )
+        .await
+        .expect_err("legacy V1 shape must not parse as V2");
+    assert_eq!(err.code, "INVALID_PARAMS");
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}

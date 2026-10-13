@@ -1928,3 +1928,84 @@ async fn coalesced_v2_acceptance_rejects_changed_reviews_checks_and_feedback() {
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+fn pr40_v2_admission_spec(objective: &str, acceptance: Value) -> Value {
+    json!({
+        "client_request_id": model::new_id(),
+        "project_id": "pr40-v2-admission",
+        "spec": {
+            "objective": objective,
+            "phase": "verification",
+            "requirements": [{"id":"R1","statement":"Evidence is required."}],
+            "acceptance": acceptance,
+            "dependencies": [],
+            "owner_policy_id": crate::policy::OWNER_POLICY_V2_ID,
+            "source_refs": [],
+        },
+    })
+}
+/// task.create with a legacy V1 acceptance policy or a mixed/partial marker
+/// is rejected at admission; neither reaches Operation admission.
+#[tokio::test]
+async fn create_legacy_and_mixed_acceptance_rejected_at_admission() {
+    let (owner, directory, _bootstrap) =
+        start_store_with_config("pr40-v2-admission", Config::default()).await;
+    let store = owner.store.clone();
+    seed_clients(&store).await;
+    let task_owner = principal("review-owner-v2", Role::Manager);
+    let legacy = store
+        .call(
+            task_owner.clone(),
+            "task.create".into(),
+            pr40_v2_admission_spec(
+                "Legacy acceptance must not admit.",
+                json!({"required_check_profiles":[]}),
+            ),
+        )
+        .await
+        .expect_err("legacy V1 acceptance must not admit");
+    assert_eq!(legacy.code, "ACCEPTANCE_POLICY_VERSION");
+    let mixed = store
+        .call(
+            task_owner.clone(),
+            "task.create".into(),
+            pr40_v2_admission_spec(
+                "Mixed marker must not admit.",
+                json!({"schema_id":"swarm.acceptance_policy"}),
+            ),
+        )
+        .await
+        .expect_err("mixed acceptance marker must not admit");
+    assert_eq!(mixed.code, "INVALID_PARAMS");
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// Claiming a retained legacy V1 Task requires an explicit task.revise to
+/// the exact V2 marker; the claim gate fires before any attempt write.
+#[tokio::test]
+async fn claim_legacy_v1_task_requires_explicit_revise_to_v2() {
+    let (owner, directory, _bootstrap) =
+        start_store_with_config("pr40-v2-claim-gate", Config::default()).await;
+    let store = owner.store.clone();
+    seed_clients(&store).await;
+    let (task_id, _attempt_id) =
+        seed_retained_v1_attempt(&store, "pr40-v2-claim-gate", None).await;
+    let gm = principal("review-gm", Role::Manager);
+    let err = store
+        .call(
+            gm,
+            "task.claim".into(),
+            json!({
+                "client_request_id": model::new_id(),
+                "task_id": task_id,
+                "expected_revision": 1,
+                "owner_id": "review-gm",
+            }),
+        )
+        .await
+        .expect_err("legacy V1 task claim must require revise to V2");
+    assert_eq!(err.code, "TASK_ACCEPTANCE_POLICY_UPGRADE_REQUIRED");
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
