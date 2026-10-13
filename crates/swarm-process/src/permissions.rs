@@ -29,8 +29,7 @@ pub mod test_support {
     pub fn scoped_durability_barrier(
         hook: impl Fn(&Path) -> Result<()> + 'static,
     ) -> ScopedDurabilityBarrier {
-        let previous = ACTIVE_BARRIER
-            .with(|active| std::mem::replace(&mut *active.borrow_mut(), Some(Rc::new(hook))));
+        let previous = ACTIVE_BARRIER.with(|active| active.borrow_mut().replace(Rc::new(hook)));
         ScopedDurabilityBarrier { previous }
     }
 
