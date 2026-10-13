@@ -2549,6 +2549,7 @@ mod connected_store {
                         "acceptance_operation_id":accept_id,
                         "task_id":task_id,
                         "attempt_id":attempt_id,
+                        "task_revision":1,
                     });
                     db.execute(
                         "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.accept',?4,'{}',?5,?6,'settled',?7,1,1,1,1)",
