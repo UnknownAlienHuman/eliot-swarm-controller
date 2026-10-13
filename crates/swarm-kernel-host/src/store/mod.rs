@@ -6961,6 +6961,8 @@ mod program_tests;
 #[cfg(test)]
 mod receipt_tests;
 #[cfg(test)]
+mod review_replacement_matrix_fixture;
+#[cfg(test)]
 mod runtime_admission_tests;
 #[cfg(test)]
 mod security_tests;

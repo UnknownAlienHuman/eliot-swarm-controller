@@ -315,6 +315,112 @@ fn classify_dispatch_subject_error(
     })
 }
 
+/// Exact code retained for one quarantined ScriptTriggerState subject load.
+/// It satisfies the shared quarantine code vocabulary and never carries a
+/// foreign error code into the quarantine record.
+const SCRIPT_TRIGGER_DAMAGED_CODE: &str = "SCRIPT_TRIGGER_RECORD_DAMAGED";
+
+/// Read the retained raw bytes behind one derived meta key without decoding
+/// them. The reader returns None only when the key has no retained row;
+/// SQLite failures reach the caller unchanged so the classifier can bind the
+/// isolation decision to the exact failed source read.
+fn read_script_trigger_record_raw(tx: &Connection, key: &str) -> Result<Option<String>> {
+    let raw: Option<String> = tx
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(raw)
+}
+
+/// Decode one retained ScriptTriggerState from its exact raw source bytes.
+/// Only the healthy state or the closed subject-local defect set reaches
+/// classification. The sealed-envelope and scope checks below emit exactly
+/// the cursor-domain codes the loader has always surfaced; SQLite and
+/// model-infrastructure failures bypass classification and stay fatal.
+fn parse_script_trigger_state(entry: &AutomationEntry, raw: &str) -> Result<ScriptTriggerState> {
+    let envelope: Value = serde_json::from_str(raw)
+        .map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_CORRUPT",
+                "ScriptRun trigger cursor JSON is invalid",
+            )
+        })
+        .and_then(|value| config::open_record(value, "ScriptRun trigger cursor"))
+        .map_err(|error| {
+            dispatch_domain_record_error(
+                error,
+                "AUTOMATION_CURSOR_CORRUPT",
+                "ScriptRun trigger cursor record is damaged",
+                false,
+            )
+        })?;
+    let state: ScriptTriggerState = serde_json::from_value(envelope).map_err(|_| {
+        Error::new(
+            "AUTOMATION_CURSOR_CORRUPT",
+            "ScriptRun trigger cursor fields are invalid",
+        )
+    })?;
+    validate_script_trigger_state(&state)?;
+    if state.owner_manager_id != entry.owner_manager_id
+        || state.project_id != entry.project_id
+        || state.automation_id != entry.automation_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_CURSOR_CORRUPT",
+            "ScriptRun trigger cursor belongs to another automation scope",
+        ));
+    }
+    Ok(state)
+}
+
+/// Bounded quarantine evidence for one enabled-entry ScriptTriggerState subject.
+/// Identity comes only from the validated entry and its exact derived meta key.
+/// The raw argument is the exact retained record bytes read once inside the
+/// subject savepoint, digested without ever being rewritten. A None raw marks
+/// the proved absent-record case, which retains no source bytes. No plaintext
+/// identifiers and no raw bytes are persisted.
+fn script_trigger_state_quarantine_evidence(
+    entry: &AutomationEntry,
+    key: &str,
+    raw: Option<&str>,
+) -> Result<QuarantineEvidence> {
+    let key_digest = model::digest(key.as_bytes());
+    let identity_digest = model::digest(
+        model::canonical(&json!({
+            "domain":"script_run",
+            "owner_manager_id":entry.owner_manager_id,
+            "project_id":entry.project_id,
+            "automation_id":entry.automation_id
+        }))?
+        .as_bytes(),
+    );
+    Ok(QuarantineEvidence {
+        subject_identity: format!("automation-dispatch:{identity_digest}:script_trigger_state"),
+        source_pointer: Some(format!("meta/key-sha256:{key_digest}")),
+        source_digest: raw.map(|bytes| model::digest(bytes.as_bytes())),
+    })
+}
+
+/// Classify one failed ScriptTriggerState subject load. Only the proved
+/// absent-record case is classified here: activation always seeds the cursor
+/// record of an enabled entry, so a missing row is a local subject defect and
+/// never a global state. SQLite, savepoint, clock, model, key-derivation,
+/// record-envelope and unknown codes return None and reach the owning
+/// supervisor unchanged.
+fn classify_script_trigger_state_error(
+    error: &Error,
+    missing_evidence: &QuarantineEvidence,
+) -> Option<SubjectErrorDisposition> {
+    if error.code.as_str() != "AUTOMATION_CURSOR_MISSING" {
+        return None;
+    }
+    Some(SubjectErrorDisposition::Quarantined {
+        code: SCRIPT_TRIGGER_DAMAGED_CODE.to_owned(),
+        evidence: missing_evidence.clone(),
+    })
+}
+
 type RetainedOperationScope = (
     Option<String>,
     Option<String>,
@@ -989,12 +1095,76 @@ fn reconcile_script_trigger_entry(
         &entry.project_id,
         &entry.automation_id,
     )?;
-    let mut state = load_script_trigger_state(tx, entry)?.ok_or_else(|| {
-        Error::new(
-            "AUTOMATION_CURSOR_MISSING",
-            "enabled ScriptRun action has no durable O1 trigger cursor",
-        )
-    })?;
+    // One damaged enabled-entry record must not abort the whole page. The
+    // entry identity is already validated above, so isolate only the local
+    // subject load behind the shared savepoint. The raw record bytes are read
+    // exactly once inside this writer transaction, which holds the Store write
+    // lock for its whole lifetime, so the quarantined digest always names the
+    // exact bytes that failed to decode: no torn read can slip between
+    // classification and quarantine persistence. Storage, SQLite, savepoint,
+    // clock, model and unknown failures stay fatal and propagate unchanged;
+    // earlier-domain writes in this transaction are committed, never rolled
+    // back, by the quarantine path, which adds exactly one meta quarantine
+    // record and never rewrites or deletes the damaged row.
+    let missing_evidence = script_trigger_state_quarantine_evidence(entry, &key, None)?;
+    let disposition = with_subject_savepoint(
+        tx,
+        || {
+            let raw = read_script_trigger_record_raw(tx, &key)?;
+            let Some(raw) = raw else {
+                return Err(Error::new(
+                    "AUTOMATION_CURSOR_MISSING",
+                    "enabled ScriptRun action has no durable O1 trigger cursor",
+                ));
+            };
+            match parse_script_trigger_state(entry, &raw) {
+                Ok(state) => Ok(SubjectDisposition::Applied(state)),
+                Err(error) if error.code.as_str() == "AUTOMATION_CURSOR_CORRUPT" => {
+                    let evidence =
+                        script_trigger_state_quarantine_evidence(entry, &key, Some(raw.as_str()))?;
+                    Ok(SubjectDisposition::Quarantined {
+                        code: SCRIPT_TRIGGER_DAMAGED_CODE.to_owned(),
+                        evidence,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        },
+        |error| classify_script_trigger_state_error(error, &missing_evidence),
+    )?;
+    let mut state = match disposition {
+        SubjectDisposition::Applied(state) => state,
+        SubjectDisposition::Quarantined { code, evidence } => {
+            let quarantine_key =
+                quarantine_record_key("automation:v1:quarantine:dispatch:", &evidence)?;
+            persist_dispatch_quarantine(tx, &code, evidence, now_ms)?;
+            // The damaged cursor and activation cut are unknown, not zero: a
+            // damaged record authorizes no position. Both stay null so no
+            // consumer can mistake this receipt for a healthy page at origin.
+            return Ok(json!({
+                "automation_id":entry.automation_id,
+                "step":"script_run",
+                "cursor":Value::Null,
+                "activation_cut":Value::Null,
+                "catch_up_until":Value::Null,
+                "pending":[],
+                "recent":[{
+                    "disposition":"quarantined",
+                    "reason":code.to_ascii_lowercase(),
+                    "quarantine_key":quarantine_key
+                }],
+                "processed":0,
+                "quarantined":1,
+                "status":"degraded"
+            }));
+        }
+        SubjectDisposition::Pending { .. } | SubjectDisposition::Skipped { .. } => {
+            return Err(Error::new(
+                "AUTOMATION_SCRIPT_DISPOSITION_INVALID",
+                "ScriptRun trigger cursor load returned an unsupported direct disposition",
+            ));
+        }
+    };
     let mut quarantined =
         revalidate_script_trigger_intents(tx, entry, &mut state, app_config, now_ms)?;
     let page_limit = budget
@@ -5446,35 +5616,14 @@ fn load_script_trigger_state(
         &entry.project_id,
         &entry.automation_id,
     )?;
-    let Some(record) =
-        config::read_record(db, &key, "ScriptRun trigger cursor").map_err(|error| {
-            dispatch_domain_record_error(
-                error,
-                "AUTOMATION_CURSOR_CORRUPT",
-                "ScriptRun trigger cursor record is damaged",
-                false,
-            )
-        })?
-    else {
+    // The raw bytes stay available to the caller through
+    // read_script_trigger_record_raw; the decode below is the single shared
+    // tail so the savepoint path and every existing reader classify the same
+    // retained bytes with the same codes.
+    let Some(raw) = read_script_trigger_record_raw(db, &key)? else {
         return Ok(None);
     };
-    let state: ScriptTriggerState = serde_json::from_value(record).map_err(|_| {
-        Error::new(
-            "AUTOMATION_CURSOR_CORRUPT",
-            "ScriptRun trigger cursor fields are invalid",
-        )
-    })?;
-    validate_script_trigger_state(&state)?;
-    if state.owner_manager_id != entry.owner_manager_id
-        || state.project_id != entry.project_id
-        || state.automation_id != entry.automation_id
-    {
-        return Err(Error::new(
-            "AUTOMATION_CURSOR_CORRUPT",
-            "ScriptRun trigger cursor belongs to another automation scope",
-        ));
-    }
-    Ok(Some(state))
+    parse_script_trigger_state(entry, &raw).map(Some)
 }
 
 fn validate_script_trigger_state(state: &ScriptTriggerState) -> Result<()> {
@@ -6705,6 +6854,389 @@ mod script_event_trigger_tests {
         assert_eq!(second_state.pending.len(), 1);
         assert_eq!(second_state.pending[0].cause["id"], first_cause["id"]);
         assert_eq!(second_state.cursor, first_state.cursor);
+    }
+}
+
+#[cfg(test)]
+mod script_trigger_state_quarantine_tests {
+    use super::*;
+    use crate::automation::{
+        actions::AutomationStep,
+        config::{AutomationEntry, ScriptRunSettings},
+        event_rules::{EventRule, EventRuleAction},
+    };
+    use rusqlite::{Connection, params};
+    use serde_json::{Value, json};
+
+    const MANAGER_ID: &str = "trigger-quarantine-manager";
+    const PROJECT_ID: &str = "trigger-quarantine-project";
+    const AUTOMATION_ID: &str = "trigger-quarantine-route";
+    const SCRIPT_ID: &str = "trigger_quarantine_fixture";
+
+    fn ready_entry(automation_id: &str) -> AutomationEntry {
+        let mut entry = AutomationEntry::new(MANAGER_ID, PROJECT_ID, automation_id, 1);
+        entry.enabled = true;
+        entry.steps = vec![AutomationStep::ScriptRun];
+        entry.script_run = Some(ScriptRunSettings {
+            script_id: SCRIPT_ID.to_owned(),
+        });
+        entry.event_rules = Some(vec![EventRule {
+            source: None,
+            predicate: None,
+            source_id: Some("controller".to_owned()),
+            event_kind: Some("coordination.consult".to_owned()),
+            status: None,
+            action: EventRuleAction::ScriptRun,
+        }]);
+        crate::automation::config::validate_entry(&entry).unwrap();
+        entry
+    }
+
+    fn fixture_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute_batch(super::super::WORKSPACE_SCHEMA).unwrap();
+        db.execute_batch(super::super::SCRIPT_SCHEMA).unwrap();
+        super::super::set_meta(
+            &db,
+            &format!("client:{MANAGER_ID}"),
+            &json!({"role":"manager","disabled":false}),
+        )
+        .unwrap();
+        super::super::set_meta(
+            &db,
+            "gm",
+            &json!({"client_id":MANAGER_ID,"binding_id":null,"binding_generation":null,"epoch":1}),
+        )
+        .unwrap();
+        db
+    }
+
+    fn activate(db: &mut Connection, entry: &AutomationEntry) {
+        let tx = db.transaction().unwrap();
+        let cut = super::automation_intake::observed_event_high_water(&tx).unwrap();
+        super::configure_script_trigger_activation(&tx, None, entry, false, cut, 1).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn state_key(entry: &AutomationEntry) -> String {
+        config::script_dispatch_state_key(
+            &entry.owner_manager_id,
+            &entry.project_id,
+            &entry.automation_id,
+        )
+        .unwrap()
+    }
+
+    fn stored_raw(db: &Connection, key: &str) -> String {
+        let raw: String = db
+            .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        raw
+    }
+
+    fn reconcile_receipt(db: &mut Connection, entry: &AutomationEntry, now_ms: i64) -> Value {
+        let app_config = Config::default();
+        let tx = db.transaction().unwrap();
+        let intake = super::reconcile_source_intake(&tx, 64, false, now_ms).unwrap();
+        let receipt =
+            super::reconcile_script_trigger_entry(&tx, entry, 16, intake, &app_config, now_ms)
+                .unwrap();
+        tx.commit().unwrap();
+        receipt
+    }
+
+    fn quarantine_keys(db: &Connection) -> Vec<String> {
+        let mut statement = db
+            .prepare("SELECT key FROM meta WHERE key LIKE 'automation:v1:quarantine:dispatch:%'")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn quarantine_record(db: &Connection, key: &str) -> Value {
+        config::read_record(db, key, "automation quarantine")
+            .unwrap()
+            .expect("quarantine row is retained")
+    }
+
+    fn tamper_digest(raw: &str) -> String {
+        let anchor = "\"sha256\":\"";
+        let start = raw.find(anchor).unwrap() + anchor.len();
+        let mut damaged = raw.to_owned();
+        let replacement = if damaged[start..].starts_with('a') {
+            "b"
+        } else {
+            "a"
+        };
+        damaged.replace_range(start..start + 1, replacement);
+        damaged
+    }
+
+    #[test]
+    fn damaged_sealed_record_quarantines_with_exact_raw_digest() {
+        let mut db = fixture_db();
+        let entry = ready_entry(AUTOMATION_ID);
+        activate(&mut db, &entry);
+        let key = state_key(&entry);
+        let raw = stored_raw(&db, &key);
+        let damaged = tamper_digest(&raw);
+        assert_ne!(damaged, raw);
+        db.execute(
+            "UPDATE meta SET value_json=?1 WHERE key=?2",
+            params![&damaged, &key],
+        )
+        .unwrap();
+
+        let receipt = reconcile_receipt(&mut db, &entry, 10);
+        assert_eq!(receipt["step"], "script_run");
+        assert_eq!(receipt["quarantined"].as_i64().unwrap(), 1);
+        assert_eq!(receipt["status"], "degraded");
+        // The damaged position is unknown, never zero.
+        assert!(receipt["cursor"].is_null());
+        assert!(receipt["activation_cut"].is_null());
+        assert_eq!(receipt["recent"][0]["disposition"], "quarantined");
+        assert_eq!(
+            receipt["recent"][0]["reason"],
+            "script_trigger_record_damaged"
+        );
+        let quarantine_key = receipt["recent"][0]["quarantine_key"]
+            .as_str()
+            .expect("receipt names its quarantine row")
+            .to_owned();
+
+        // The damaged row is retained byte-for-byte: no silent repair.
+        assert_eq!(stored_raw(&db, &key), damaged);
+        // The evidence digest names exactly those retained bytes.
+        let record = quarantine_record(&db, &quarantine_key);
+        assert_eq!(record["code"], "SCRIPT_TRIGGER_RECORD_DAMAGED");
+        assert_eq!(
+            record["evidence"]["source_digest"],
+            json!(model::digest(damaged.as_bytes()))
+        );
+        assert_eq!(record["occurrences"].as_u64().unwrap(), 1);
+        assert_eq!(record["first_seen_at_ms"].as_i64().unwrap(), 10);
+
+        // A retry converges on the same bounded row and only bumps the counter.
+        let retry = reconcile_receipt(&mut db, &entry, 20);
+        assert_eq!(retry["recent"][0]["quarantine_key"], json!(quarantine_key));
+        let converged = quarantine_record(&db, &quarantine_key);
+        assert_eq!(converged["occurrences"].as_u64().unwrap(), 2);
+        assert_eq!(converged["first_seen_at_ms"].as_i64().unwrap(), 10);
+        assert_eq!(converged["last_seen_at_ms"].as_i64().unwrap(), 20);
+        assert_eq!(quarantine_keys(&db), vec![quarantine_key]);
+    }
+
+    #[test]
+    fn distinct_damaged_bytes_produce_distinct_quarantine_keys() {
+        let mut db = fixture_db();
+        let entry = ready_entry(AUTOMATION_ID);
+        activate(&mut db, &entry);
+        let key = state_key(&entry);
+        let raw = stored_raw(&db, &key);
+
+        let first_damage = tamper_digest(&raw);
+        db.execute(
+            "UPDATE meta SET value_json=?1 WHERE key=?2",
+            params![&first_damage, &key],
+        )
+        .unwrap();
+        let first = reconcile_receipt(&mut db, &entry, 10);
+        let first_key = first["recent"][0]["quarantine_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let second_damage = format!("{first_damage} ");
+        db.execute(
+            "UPDATE meta SET value_json=?1 WHERE key=?2",
+            params![&second_damage, &key],
+        )
+        .unwrap();
+        let second = reconcile_receipt(&mut db, &entry, 20);
+        let second_key = second["recent"][0]["quarantine_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(second_key, first_key);
+        let record = quarantine_record(&db, &second_key);
+        assert_eq!(
+            record["evidence"]["source_digest"],
+            json!(model::digest(second_damage.as_bytes()))
+        );
+        assert_eq!(quarantine_keys(&db).len(), 2);
+    }
+
+    #[test]
+    fn healthy_neighbor_progresses_past_quarantined_entry() {
+        let mut db = fixture_db();
+        let damaged_entry = ready_entry("trigger-quarantine-damaged");
+        let healthy_entry = ready_entry("trigger-quarantine-healthy");
+        activate(&mut db, &damaged_entry);
+        activate(&mut db, &healthy_entry);
+        let damaged_key = state_key(&damaged_entry);
+        let damaged = tamper_digest(&stored_raw(&db, &damaged_key));
+        db.execute(
+            "UPDATE meta SET value_json=?1 WHERE key=?2",
+            params![&damaged, &damaged_key],
+        )
+        .unwrap();
+
+        let app_config = Config::default();
+        let tx = db.transaction().unwrap();
+        let first_intake = super::reconcile_source_intake(&tx, 64, false, 30).unwrap();
+        let damaged_receipt = super::reconcile_script_trigger_entry(
+            &tx,
+            &damaged_entry,
+            16,
+            first_intake,
+            &app_config,
+            30,
+        )
+        .unwrap();
+        let second_intake = super::reconcile_source_intake(&tx, 64, false, 30).unwrap();
+        let healthy_receipt = super::reconcile_script_trigger_entry(
+            &tx,
+            &healthy_entry,
+            16,
+            second_intake,
+            &app_config,
+            30,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(damaged_receipt["quarantined"].as_i64().unwrap(), 1);
+        assert!(damaged_receipt["cursor"].is_null());
+        assert_eq!(healthy_receipt["step"], "script_run");
+        assert!(healthy_receipt["cursor"].is_i64());
+        assert!(healthy_receipt.get("quarantine_key").is_none());
+        assert_eq!(quarantine_keys(&db).len(), 1);
+        // The healthy neighbor keeps its exact seeded cursor.
+        let healthy = super::load_script_trigger_state(&db, &healthy_entry)
+            .unwrap()
+            .expect("healthy entry retains its cursor");
+        assert_eq!(healthy.cursor, healthy_receipt["cursor"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn missing_state_record_quarantines_without_source_digest() {
+        let mut db = fixture_db();
+        let entry = ready_entry(AUTOMATION_ID);
+        activate(&mut db, &entry);
+        let key = state_key(&entry);
+        db.execute("DELETE FROM meta WHERE key=?1", [&key]).unwrap();
+
+        let receipt = reconcile_receipt(&mut db, &entry, 10);
+        assert_eq!(receipt["quarantined"].as_i64().unwrap(), 1);
+        assert_eq!(receipt["status"], "degraded");
+        assert!(receipt["cursor"].is_null());
+        assert!(receipt["activation_cut"].is_null());
+        let quarantine_key = receipt["recent"][0]["quarantine_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let record = quarantine_record(&db, &quarantine_key);
+        assert_eq!(record["code"], "SCRIPT_TRIGGER_RECORD_DAMAGED");
+        // No bytes were retained, so sanitized evidence reports no digest.
+        assert!(record["evidence"]["source_digest"].is_null());
+        assert!(
+            record["evidence"]["source_pointer"]
+                .as_str()
+                .unwrap()
+                .starts_with("meta/key-sha256:")
+        );
+    }
+
+    #[test]
+    fn foreign_scope_record_quarantines_without_cross_contamination() {
+        let mut db = fixture_db();
+        let entry = ready_entry(AUTOMATION_ID);
+        let foreign = ready_entry("trigger-quarantine-foreign");
+        activate(&mut db, &entry);
+        let key = state_key(&entry);
+        let tx = db.transaction().unwrap();
+        let foreign_state = super::empty_script_trigger_state(&foreign, 5, 7);
+        super::save_script_trigger_state(&tx, &key, &foreign_state).unwrap();
+        tx.commit().unwrap();
+        let raw = stored_raw(&db, &key);
+
+        let receipt = reconcile_receipt(&mut db, &entry, 10);
+        assert_eq!(receipt["quarantined"].as_i64().unwrap(), 1);
+        assert!(receipt["cursor"].is_null());
+        let quarantine_key = receipt["recent"][0]["quarantine_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let record = quarantine_record(&db, &quarantine_key);
+        assert_eq!(
+            record["evidence"]["source_digest"],
+            json!(model::digest(raw.as_bytes()))
+        );
+        // The foreign bytes are retained untouched for forensics.
+        assert_eq!(stored_raw(&db, &key), raw);
+    }
+
+    #[test]
+    fn invalid_entry_key_derivation_stays_fatal_without_quarantine() {
+        let mut db = fixture_db();
+        let mut entry = ready_entry(AUTOMATION_ID);
+        entry.automation_id = "bad id!".to_owned();
+        assert!(entry.script_run_ready());
+
+        let app_config = Config::default();
+        let tx = db.transaction().unwrap();
+        let intake = super::reconcile_source_intake(&tx, 64, false, 11).unwrap();
+        let error = super::reconcile_script_trigger_entry(&tx, &entry, 16, intake, &app_config, 11)
+            .unwrap_err();
+        assert_eq!(error.code.as_str(), "INVALID_PARAMS");
+        drop(tx);
+        assert!(quarantine_keys(&db).is_empty());
+    }
+
+    #[test]
+    fn state_error_classifier_keeps_foreign_codes_fatal() {
+        let entry = ready_entry(AUTOMATION_ID);
+        let key = state_key(&entry);
+        let evidence = super::script_trigger_state_quarantine_evidence(&entry, &key, None).unwrap();
+        assert!(evidence.source_digest.is_none());
+        let missing = Error::new("AUTOMATION_CURSOR_MISSING", "absent record");
+        let disposition =
+            super::classify_script_trigger_state_error(&missing, &evidence).expect("missing");
+        match disposition {
+            SubjectErrorDisposition::Quarantined {
+                code,
+                evidence: kept,
+            } => {
+                assert_eq!(code, "SCRIPT_TRIGGER_RECORD_DAMAGED");
+                assert_eq!(kept, evidence);
+            }
+            _ => panic!("missing record must quarantine"),
+        }
+        for code in [
+            "AUTOMATION_CURSOR_CORRUPT",
+            "AUTOMATION_RECORD_CORRUPT",
+            "AUTOMATION_RECORD_VERSION",
+            "AUTOMATION_RECORD_INVALID",
+            "INVALID_PARAMS",
+            "STORE_BUSY",
+            "AUTOMATION_SUBJECT_SAVEPOINT_UNCERTAIN",
+        ] {
+            assert!(
+                super::classify_script_trigger_state_error(
+                    &Error::new(code, "foreign failure"),
+                    &evidence
+                )
+                .is_none(),
+                "code must stay fatal",
+            );
+        }
     }
 }
 
