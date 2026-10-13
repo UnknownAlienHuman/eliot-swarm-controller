@@ -1060,6 +1060,45 @@ fn make_admission(scope: &OpeningScope, owner_nonce: String) -> Result<StartAdmi
 /// Retain the existing Store-owned intent and immutable nonce before the
 /// standalone module supervisor asks for launch. This is admission only: it
 /// performs no file reads, provider work, HTTP, or native process effect.
+fn module_owned_service_admission(
+    scope: &OpeningScope,
+    existing: Option<&OwnedStartRow>,
+) -> Result<StartAdmission> {
+    let owner_nonce = existing
+        .map(|row| row.owner_nonce.clone())
+        .unwrap_or_else(model::new_id);
+    let admission = make_admission(scope, owner_nonce)?;
+    let expected_workspace_directory = admission.route.workspace_directory().to_path_buf();
+    verify_scope_for_admission(
+        scope,
+        &admission.actor,
+        &admission.row,
+        &expected_workspace_directory,
+    )?;
+    if let Some(row) = existing {
+        verify_start_row(row, &admission.row)?;
+    }
+    Ok(admission)
+}
+
+/// Validate an existing immutable intent and its exact launch, Task, owner,
+/// and workspace provenance without reserving the Store writer. Returns
+/// `false` only when the current scope has no retained intent; callers must
+/// revalidate that case under `IMMEDIATE` before inserting one.
+pub(crate) fn validate_existing_module_owned_service_intent(
+    db: &Connection,
+    config: &Config,
+    binding_id: &str,
+    generation: i64,
+) -> Result<bool> {
+    let Some(existing) = load_start_row(db, binding_id, generation)? else {
+        return Ok(false);
+    };
+    let scope = opening_scope(db, config, binding_id, generation)?;
+    let _admission = module_owned_service_admission(&scope, Some(&existing))?;
+    Ok(true)
+}
+
 pub(crate) fn ensure_module_owned_service_intent(
     tx: &Transaction<'_>,
     config: &Config,
@@ -1068,20 +1107,9 @@ pub(crate) fn ensure_module_owned_service_intent(
 ) -> Result<()> {
     let scope = opening_scope(tx, config, binding_id, generation)?;
     let existing = load_start_row(tx, binding_id, generation)?;
-    let owner_nonce = existing
-        .as_ref()
-        .map(|row| row.owner_nonce.clone())
-        .unwrap_or_else(model::new_id);
-    let admission = make_admission(&scope, owner_nonce)?;
-    let expected_workspace_directory = admission.route.workspace_directory().to_path_buf();
-    verify_scope_for_admission(
-        &scope,
-        &admission.actor,
-        &admission.row,
-        &expected_workspace_directory,
-    )?;
+    let admission = module_owned_service_admission(&scope, existing.as_ref())?;
     match existing {
-        Some(row) => verify_start_row(&row, &admission.row),
+        Some(_) => Ok(()),
         None => {
             insert_start_reservation(tx, &admission.row)?;
             Ok(())

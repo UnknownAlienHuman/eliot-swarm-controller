@@ -8,7 +8,7 @@ use crate::{
     runtime::opencode_v2::ModelRef,
     store::{module_demand, module_handshake, workspace},
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use swarm_contracts::{
@@ -31,7 +31,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let db = Connection::open_in_memory().unwrap();
+        Self::with_database(Connection::open_in_memory().unwrap())
+    }
+
+    fn with_database(db: Connection) -> Self {
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db.execute_batch(crate::store::SCHEMA).unwrap();
         db.execute_batch(crate::store::WORKSPACE_SCHEMA).unwrap();
@@ -406,6 +409,39 @@ fn real_owned_intents_commit_only_with_complete_projection() {
             .map(|d| d.route_native_options["__eliot_owner_nonce"].clone())
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn repeated_existing_owned_intents_do_not_reserve_the_store_writer() {
+    let database_uri = format!(
+        "file:reg23-demand-{}?mode=memory&cache=shared",
+        model::new_id()
+    );
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI;
+    let db = Connection::open_with_flags(&database_uri, flags).unwrap();
+    let mut f = Fixture::with_database(db);
+    f.add_binding("a-owned", true);
+    let first = f.pending().unwrap();
+    assert_eq!(first.demands.len(), 1);
+    assert!(first.blocked.is_empty(), "{:?}", first.blocked);
+    let nonce = first.demands[0].route_native_options["__eliot_owner_nonce"].clone();
+
+    f.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let writer = Connection::open_with_flags(&database_uri, flags).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let repeated = f.pending().unwrap();
+    writer.execute_batch("ROLLBACK;").unwrap();
+
+    assert_eq!(repeated.demands.len(), 1);
+    assert!(repeated.blocked.is_empty(), "{:?}", repeated.blocked);
+    assert_eq!(
+        repeated.demands[0].route_native_options["__eliot_owner_nonce"],
+        nonce
+    );
+    assert_eq!(f.intent_count(), 1);
+    assert!(f.db.is_autocommit());
 }
 
 #[test]

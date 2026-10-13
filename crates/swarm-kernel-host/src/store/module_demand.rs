@@ -578,41 +578,43 @@ fn prepare_owned_intents_for_scopes(
             Ok(()) => {}
             // Only failures of this exact retained launch subject are blocks.
             // SQL, shared metadata, conversion and future error codes remain hard.
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "BINDING_CLOSED"
-                        | "BINDING_NOT_READY"
-                        | "CONFIG_ERROR"
-                        | "FORBIDDEN"
-                        | "INVALID_LAUNCH_MANIFEST"
-                        | "LAUNCH_MANIFEST_CORRUPT"
-                        | "LAUNCH_OPEN_CORRUPT"
-                        | "LAUNCH_OPEN_MISSING"
-                        | "NOT_FOUND"
-                        | "OWNED_SERVICE_CONFIG"
-                        | "OWNED_SERVICE_RECEIPT_CORRUPT"
-                        | "OWNED_SERVICE_ROUTE_REQUIRED"
-                        | "OWNED_SERVICE_SCOPE"
-                        | "OWNED_SERVICE_SCOPE_STALE"
-                        | "OWNED_SERVICE_VERSION"
-                        | "ROUTE_DISABLED"
-                        | "STALE_LAUNCH"
-                        | "UNKNOWN_ROUTE"
-                        | "WORKSPACE_LEASE_AMBIGUOUS"
-                        | "WORKSPACE_LEASE_INVALID"
-                        | "WORKSPACE_LEASE_MISSING"
-                        | "WORKSPACE_LEASE_STALE"
-                        | "WORKSPACE_REGISTRATION_CHANGED"
-                        | "WORKSPACE_UNREGISTERED"
-                ) =>
-            {
+            Err(error) if owned_intent_error_is_subject_local(&error.code) => {
                 errors.insert((binding_id.clone(), *generation), error.code);
             }
             Err(error) => return Err(error),
         }
     }
     Ok(errors)
+}
+
+fn owned_intent_error_is_subject_local(code: &str) -> bool {
+    matches!(
+        code,
+        "BINDING_CLOSED"
+            | "BINDING_NOT_READY"
+            | "CONFIG_ERROR"
+            | "FORBIDDEN"
+            | "INVALID_LAUNCH_MANIFEST"
+            | "LAUNCH_MANIFEST_CORRUPT"
+            | "LAUNCH_OPEN_CORRUPT"
+            | "LAUNCH_OPEN_MISSING"
+            | "NOT_FOUND"
+            | "OWNED_SERVICE_CONFIG"
+            | "OWNED_SERVICE_RECEIPT_CORRUPT"
+            | "OWNED_SERVICE_ROUTE_REQUIRED"
+            | "OWNED_SERVICE_SCOPE"
+            | "OWNED_SERVICE_SCOPE_STALE"
+            | "OWNED_SERVICE_VERSION"
+            | "ROUTE_DISABLED"
+            | "STALE_LAUNCH"
+            | "UNKNOWN_ROUTE"
+            | "WORKSPACE_LEASE_AMBIGUOUS"
+            | "WORKSPACE_LEASE_INVALID"
+            | "WORKSPACE_LEASE_MISSING"
+            | "WORKSPACE_LEASE_STALE"
+            | "WORKSPACE_REGISTRATION_CHANGED"
+            | "WORKSPACE_UNREGISTERED"
+    )
 }
 
 /// Build a bounded in-process snapshot from committed Operations. Automation
@@ -623,21 +625,39 @@ pub(super) fn pending(
     config: &Config,
     cursor: Option<&ModuleDemandCursor>,
 ) -> Result<ModuleDemandSnapshot> {
-    // Bounded read-only probe first: empty demand and pages without owned
-    // scopes must never acquire the IMMEDIATE writer reservation. The probe
-    // page only decides whether a writer is needed; a writer path always
-    // revalidates the exact current page under IMMEDIATE.
+    // Bounded read-only probe first: empty demand and pages whose exact owned
+    // intents already exist must never acquire the IMMEDIATE writer
+    // reservation. A missing-intent path always revalidates the exact current
+    // page under IMMEDIATE before reserving and projecting it atomically.
     let read_tx = db.unchecked_transaction()?;
     let (probe_candidates, probe_truncated, probe_next) = operation_candidates(&read_tx, cursor)?;
     let probe_scopes = page_owned_scopes(&read_tx, &probe_candidates)?;
-    if probe_scopes.is_empty() {
+    let mut probe_preparation_errors = BTreeMap::new();
+    let mut missing_intent = false;
+    for (binding_id, generation) in &probe_scopes {
+        match launcher_owned_service::validate_existing_module_owned_service_intent(
+            &read_tx,
+            config,
+            binding_id,
+            *generation,
+        ) {
+            Ok(true) => {}
+            Ok(false) => missing_intent = true,
+            Err(error) if owned_intent_error_is_subject_local(&error.code) => {
+                probe_preparation_errors
+                    .insert((binding_id.clone(), *generation), error.code);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !missing_intent {
         let snapshot = pending_in_transaction(
             &read_tx,
             config,
             probe_candidates,
             probe_truncated,
             probe_next,
-            &BTreeMap::new(),
+            &probe_preparation_errors,
         )?;
         read_tx.commit()?;
         return Ok(snapshot);
@@ -967,6 +987,75 @@ mod tests {
             );
         }
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn owned_intent_preparation_stays_within_the_bounded_operation_page() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE bindings(
+                 binding_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 released_at_ms INTEGER,
+                 native_root_id TEXT,
+                 native_scope_key TEXT,
+                 route_json TEXT NOT NULL,
+                 state_json TEXT NOT NULL,
+                 PRIMARY KEY(binding_id,generation)
+             );
+             CREATE TABLE operations(
+                 operation_id TEXT PRIMARY KEY NOT NULL,
+                 method TEXT NOT NULL,
+                 binding_id TEXT NOT NULL,
+                 binding_generation INTEGER NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 original_request_json TEXT NOT NULL,
+                 state TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        {
+            let mut insert_binding = tx
+                .prepare(
+                    "INSERT INTO bindings(
+                         binding_id,generation,released_at_ms,native_root_id,native_scope_key,
+                         route_json,state_json
+                     ) VALUES(?1,1,NULL,NULL,NULL,?2,?3)",
+                )
+                .unwrap();
+            let mut insert_open = tx
+                .prepare(
+                    "INSERT INTO operations(
+                         operation_id,method,binding_id,binding_generation,created_at_ms,
+                         original_request_json,state
+                     ) VALUES(?1,'agent.open',?2,1,1,'{}','queued')",
+                )
+                .unwrap();
+            for index in 0..=MAX_DEMAND_OPERATIONS {
+                let binding_id = format!("owned-binding-{index:05}");
+                insert_binding
+                    .execute(params![
+                        binding_id,
+                        r#"{"owned_service":{}}"#,
+                        r#"{"module_contract_selector":{}}"#
+                    ])
+                    .unwrap();
+                insert_open
+                    .execute(params![format!("owned-open-{index:05}"), binding_id])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let (candidates, truncated, next_cursor) = operation_candidates(&db, None).unwrap();
+        assert!(truncated);
+        assert_eq!(candidates.len(), MAX_DEMAND_OPERATIONS);
+        assert_eq!(next_cursor.unwrap().operation_id, "owned-open-04095");
+        let scopes = page_owned_scopes(&db, &candidates).unwrap();
+        assert_eq!(scopes.len(), MAX_DEMAND_OPERATIONS);
+        assert!(scopes.contains(&("owned-binding-00000".to_owned(), 1)));
+        assert!(!scopes.contains(&("owned-binding-04096".to_owned(), 1)));
     }
 
     #[test]
