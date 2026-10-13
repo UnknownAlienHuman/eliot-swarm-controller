@@ -1868,7 +1868,7 @@ async fn supervisor_hard_failure_keeps_last_completed_cursor_and_converges_on_re
     let row_c = admitted_c["check_id"].as_str().unwrap().to_owned();
     // Assign test roles to the actual publicly minted identities in page
     // order. Never rewrite CheckRun IDs or their retained receipt backlinks.
-    let mut lexical = vec![row_a, row_b, row_c];
+    let mut lexical = [row_a, row_b, row_c];
     lexical.sort();
     let row_a = lexical[0].clone();
     let row_b = lexical[1].clone();
