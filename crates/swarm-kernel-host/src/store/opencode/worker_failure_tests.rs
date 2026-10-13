@@ -351,3 +351,57 @@ async fn shutdown_preserves_a_finished_workers_typed_hard_error() {
     .await;
     assert_eq!(result.unwrap_err().code, "STORE_ERROR");
 }
+
+async fn assert_shutdown_collector_preserves_joined_error(owned: bool) {
+    let fixture = Fixture::new().await;
+    let (owner, _) = start(&fixture).await;
+    let (_, stopping) = watch::channel(true);
+    let worker = tokio::spawn(async {
+        Err(Error::new(
+            "STORE_ERROR",
+            "fixture selector failure before shutdown",
+        ))
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed worker must be collectable");
+    let result = if owned {
+        let mut workers =
+            std::collections::BTreeMap::from([(("held-owned-worker".to_owned(), 1), worker)]);
+        let result = owner
+            .store
+            .consume_finished_owned_workers(&mut workers, &stopping)
+            .await;
+        assert!(workers.is_empty());
+        result
+    } else {
+        let mut workers =
+            std::collections::BTreeMap::from([(fixture.options.service_id.clone(), worker)]);
+        let result = owner
+            .store
+            .consume_finished_shared_workers(&mut workers, &stopping)
+            .await;
+        assert!(workers.is_empty());
+        result
+    };
+    assert_eq!(result.unwrap_err().code, "STORE_ERROR");
+    assert!(
+        fixture.world.lock().unwrap().requests.is_empty(),
+        "shutdown collection must not issue native recovery or replacement work"
+    );
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_shutdown_collector_preserves_the_joined_hard_error() {
+    assert_shutdown_collector_preserves_joined_error(false).await;
+}
+
+#[tokio::test]
+async fn owned_shutdown_collector_preserves_the_joined_hard_error() {
+    assert_shutdown_collector_preserves_joined_error(true).await;
+}

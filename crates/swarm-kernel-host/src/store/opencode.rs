@@ -322,20 +322,8 @@ impl Store {
             while !*stopping.borrow() {
                 self.consume_finished_shared_workers(&mut workers, &stopping)
                     .await?;
-                let finished_owned = owned_workers
-                    .iter()
-                    .filter(|(_, task)| task.is_finished())
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-                for key in finished_owned {
-                    if let Some(task) = owned_workers.remove(&key) {
-                        let result = task.await;
-                        if !*stopping.borrow() {
-                            self.recover_finished_owned_worker(&key.0, key.1, result)
-                                .await?;
-                        }
-                    }
-                }
+                self.consume_finished_owned_workers(&mut owned_workers, &stopping)
+                    .await?;
                 let active_bindings = self.run(|db| bindings(db, None)).await?;
                 for b in active_bindings {
                     let Ok(options) = Options::parse(&b["route"]["native_options"]) else {
@@ -398,6 +386,32 @@ impl Store {
                 let result = task.await;
                 if !*stopping.borrow() {
                     self.recover_finished_shared_worker(&key, result).await?;
+                } else {
+                    joined_worker_result(result)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn consume_finished_owned_workers(
+        &self,
+        workers: &mut BTreeMap<(String, i64), JoinHandle<Result<()>>>,
+        stopping: &watch::Receiver<bool>,
+    ) -> Result<()> {
+        let finished = workers
+            .iter()
+            .filter(|(_, task)| task.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in finished {
+            if let Some(task) = workers.remove(&key) {
+                let result = task.await;
+                if !*stopping.borrow() {
+                    self.recover_finished_owned_worker(&key.0, key.1, result)
+                        .await?;
+                } else {
+                    joined_worker_result(result)?;
                 }
             }
         }
@@ -1144,6 +1158,24 @@ fn worker_failure_code(result: &std::result::Result<Result<()>, tokio::task::Joi
     }
 }
 
+fn joined_worker_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(Error::new(
+            if error.is_panic() {
+                "NATIVE_WORKER_PANICKED"
+            } else if error.is_cancelled() {
+                "NATIVE_WORKER_CANCELLED"
+            } else {
+                "NATIVE_WORKER_FAILED"
+            },
+            "builtin OpenCode worker failed during supervisor shutdown",
+        )),
+    }
+}
+
 async fn finish_opencode_supervisor(
     worker_stop: watch::Sender<bool>,
     workers: BTreeMap<String, JoinHandle<Result<()>>>,
@@ -1154,19 +1186,7 @@ async fn finish_opencode_supervisor(
     for worker in workers.into_values().chain(owned_workers.into_values()) {
         let joined = worker.await;
         if result.is_ok() {
-            result = match joined {
-                Ok(result) => result,
-                Err(error) => Err(Error::new(
-                    if error.is_panic() {
-                        "NATIVE_WORKER_PANICKED"
-                    } else if error.is_cancelled() {
-                        "NATIVE_WORKER_CANCELLED"
-                    } else {
-                        "NATIVE_WORKER_FAILED"
-                    },
-                    "builtin OpenCode worker failed during supervisor shutdown",
-                )),
-            };
+            result = joined_worker_result(joined);
         }
     }
     result
