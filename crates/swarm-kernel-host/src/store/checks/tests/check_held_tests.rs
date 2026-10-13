@@ -306,8 +306,18 @@ async fn acknowledge_held_changed_source_conflicts() {
     pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
     let first_digest = spec_digest(&fixture.owner.store, &check_id).await;
     damage_profile_shape(&fixture.owner.store, &check_id).await;
-    let changed = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap_err();
-    assert_eq!(changed.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
+    // The changed row leaves the active page silently: no Work is admitted
+    // under stale quarantine. The conflict still fails closed on every
+    // explicit touch below.
+    let held_back = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    assert!(held_back.is_empty(), "changed source is held, never selected");
+    let conflict_read = fixture
+        .owner
+        .store
+        .call(operator.clone(), "check.get".to_owned(), json!({"check_id": &check_id}))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict_read.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
     let conflicted = fixture
         .owner
         .store

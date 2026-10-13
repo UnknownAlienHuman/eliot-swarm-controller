@@ -2357,7 +2357,7 @@ fn max_pending_id(tx: &Transaction<'_>) -> Result<Option<String>> {
 
 fn pending_subject_count(tx: &Transaction<'_>) -> Result<i64> {
     Ok(tx.query_row(
-        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id)",
+        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')))",
         [],
         |row| row.get(0),
     )?)
