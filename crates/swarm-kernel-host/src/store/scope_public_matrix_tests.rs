@@ -1329,7 +1329,7 @@ mod connected_store {
             &f.manager_a,
             "task.dispatch",
             json!({
-                "attempt_id":attempt["attempt_id"], "text":"scope fixture dispatch; no vendor work",
+                "attempt_id":attempt["attempt_id"], "text":DISPATCH_TEXT,
             }),
         )
         .await;
@@ -1337,6 +1337,17 @@ mod connected_store {
         let context: TaskDispatchContext =
             serde_json::from_value(command.input["task_dispatch_context"].clone()).unwrap();
         let receipt = module_receipt(&command, descriptor);
+        // Donor pattern from module_bridge_recovery_tests: derive the TaskPrompt
+        // envelope with production's own builder over the retained Attempt row
+        // instead of hand-computing digests. The dispatch handler admitted the
+        // identical envelope (plain dispatch, no launch packet) in the same
+        // transaction, so the receipt below echoes retained truth.
+        let attempt_id = attempt["attempt_id"].as_str().unwrap().to_owned();
+        let attempt_row = store
+            .run(move |db| crate::store::tasks::get_attempt(db, &attempt_id))
+            .await
+            .unwrap();
+        let envelope = crate::store::task_prompt::build(&attempt_row, DISPATCH_TEXT, None).unwrap();
         let admission = TaskDispatchAdmissionReceipt {
             schema_version: context.schema_version,
             module_receipt: receipt.clone(),
@@ -1350,8 +1361,8 @@ mod connected_store {
             task_snapshot_sha256: context.task_snapshot_sha256,
             source_text_sha256: context.source_text_sha256.clone(),
             source_text_bytes: context.source_text_bytes,
-            native_payload_sha256: context.source_text_sha256,
-            native_payload_bytes: context.source_text_bytes,
+            native_payload_sha256: envelope.prompt_sha256,
+            native_payload_bytes: envelope.prompt_bytes,
             native_input_id: Some("scope-fixture-input".into()),
         };
         admission.validate().unwrap();
@@ -1374,7 +1385,7 @@ mod connected_store {
             &f.manager_a,
             "task.dispatch",
             json!({
-                "attempt_id":attempt["attempt_id"],"text":"scope fixture dispatch; no vendor work",
+                "attempt_id":attempt["attempt_id"],"text":DISPATCH_TEXT,
             }),
         )
         .await;
@@ -1560,6 +1571,7 @@ mod connected_store {
 
     const PAGES_PAYLOAD: &[u8] = b"private result bytes from the exact admitted source";
     const PAGES_SPLIT: usize = 16;
+    const DISPATCH_TEXT: &str = "scope fixture dispatch; no vendor work";
 
     struct PagesSetup {
         fixture: Fixture,
