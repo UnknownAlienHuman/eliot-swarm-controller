@@ -409,7 +409,11 @@ impl Store {
     /// family. Genuine terminal evidence stays with the reap and finish
     /// gates and is never inferred here; the synchronous admission below
     /// keeps the run nonterminal and the quarantine evidence immutable.
-    pub(super) async fn acknowledge_held_check(&self, principal: Principal, params: Value) -> Result<Value> {
+    pub(super) async fn acknowledge_held_check(
+        &self,
+        principal: Principal,
+        params: Value,
+    ) -> Result<Value> {
         model::validate_mutation("check.acknowledge_held", &params)?;
         let check = model::text(&params, "check_id")?.to_owned();
         {
@@ -1532,7 +1536,7 @@ fn read_quarantine_for_held(
             "CheckRun has no retained quarantine evidence",
         ));
     };
-    if record.identity.check_attempt_id != check_id
+    if record.identity.check_id != check_id
         || record.identity.operation_id != operation_id
         || record.identity.attempt_id != attempt_id
         || record.identity.check_spec_sha256 != model::digest(spec_json.as_bytes())
@@ -1565,8 +1569,16 @@ fn write_held_acknowledged(
 /// or worker is produced, and the quarantine evidence itself is never
 /// rewritten. Only the held inventory record flips to acknowledged under
 /// the exact retained source digest.
-pub(super) fn acknowledge_held(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
-    model::fields(v, &["client_request_id", "check_id", "expected_source_digest"])?;
+pub(super) fn acknowledge_held(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    v: &Value,
+    id: &str,
+) -> Result<Value> {
+    model::fields(
+        v,
+        &["client_request_id", "check_id", "expected_source_digest"],
+    )?;
     let check = model::text(v, "check_id")?;
     let expected = model::text(v, "expected_source_digest")?;
     if !valid_held_digest(expected) {
@@ -1614,7 +1626,9 @@ pub(super) fn acknowledge_held(tx: &Transaction<'_>, p: &Principal, v: &Value, i
                 ));
             }
             if held.acknowledged {
-                return Ok(json!({"operation_id":id,"check_id":check,"acknowledged":true,"coalesced":true,"held":true,"state":state,"source_digest":source_digest,"ack_operation_id":held.ack_operation_id}));
+                return Ok(
+                    json!({"operation_id":id,"check_id":check,"acknowledged":true,"coalesced":true,"held":true,"state":state,"source_digest":source_digest,"ack_operation_id":held.ack_operation_id}),
+                );
             }
             write_held_acknowledged(tx, &held, &p.client_id, now, id)?;
         }
@@ -1638,9 +1652,15 @@ pub(super) fn acknowledge_held(tx: &Transaction<'_>, p: &Principal, v: &Value, i
     }
     tx.execute(
         "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
-        params![id, attempt["task_id"].as_str(), attempt["attempt_id"].as_str()],
+        params![
+            id,
+            attempt["task_id"].as_str(),
+            attempt["attempt_id"].as_str()
+        ],
     )?;
-    Ok(json!({"operation_id":id,"check_id":check,"acknowledged":true,"held":true,"state":state,"source_digest":source_digest}))
+    Ok(
+        json!({"operation_id":id,"check_id":check,"acknowledged":true,"held":true,"state":state,"source_digest":source_digest}),
+    )
 }
 pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     model::fields(v, &["check_id"])?;
@@ -1673,7 +1693,7 @@ pub(super) fn held_projection(
     let Some((state, candidate_ref, spec_json)) = row else {
         return Err(Error::new("NOT_FOUND", "unknown CheckRun"));
     };
-    if record.identity.check_attempt_id != check_id
+    if record.identity.check_id != check_id
         || record.identity.operation_id != operation_id
         || record.identity.attempt_id != attempt_id
         || record.identity.check_spec_sha256 != model::digest(spec_json.as_bytes())
@@ -4576,10 +4596,10 @@ mod tests {
     mod check_launch_fact_durable_tests;
     #[path = "check_launch_unknown_durable_tests.rs"]
     mod check_launch_unknown_durable_tests;
-    #[path = "reg23_pending_isolation_tests.rs"]
-    mod reg23_pending_isolation_tests;
     #[path = "check_held_tests.rs"]
     mod check_held_tests;
+    #[path = "reg23_pending_isolation_tests.rs"]
+    mod reg23_pending_isolation_tests;
     use crate::{
         artifacts::ArtifactFiles,
         checks::{
