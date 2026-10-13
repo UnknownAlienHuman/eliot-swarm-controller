@@ -14,7 +14,7 @@ use swarm_contracts::{
     runtime::{ModuleReceiptIdentity, RuntimeOutcome},
 };
 use swarm_process::{
-    JsonlScanVerdict, private_permissions, remove_private_durable, replace_private_durable,
+    JsonlScanVerdict, private_permissions, remove_private_acknowledged, replace_private_durable,
     scan_jsonl, write_private_new,
 };
 
@@ -2791,7 +2791,7 @@ fn remove_exact_file(path: &Path) -> Result<()> {
                 "retention cleanup target is not an exact regular file",
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => {
             return Err(Error::new(
                 "ADAPTER_RETENTION_STATE",
@@ -2799,7 +2799,7 @@ fn remove_exact_file(path: &Path) -> Result<()> {
             ));
         }
     }
-    remove_private_durable(path).map(|_| ()).map_err(|_| {
+    remove_private_acknowledged(path).map(|_| ()).map_err(|_| {
         Error::new(
             "ADAPTER_RETENTION_STATE",
             "retention target cannot be removed",

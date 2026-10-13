@@ -331,6 +331,49 @@ pub fn remove_private_durable(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Remove a private file only when its absence crosses the supported
+/// durability boundary. Unix syncs the parent directory after unlinking or
+/// confirming that the path is already absent. Windows returns an explicit
+/// unsupported error because its write-through move does not provide an
+/// equivalent parent-directory barrier for removal.
+pub fn remove_private_acknowledged(path: &Path) -> Result<bool> {
+    remove_private_acknowledged_with_barrier(path, sync_parent_directory)
+}
+
+fn remove_private_acknowledged_with_barrier(
+    path: &Path,
+    barrier: impl FnOnce(&Path) -> Result<()>,
+) -> Result<bool> {
+    let target = private_target_path(path)?;
+    let existed = target_is_regular_file(&target)?;
+    #[cfg(unix)]
+    {
+        if existed {
+            fs::remove_file(&target)?;
+        }
+        barrier(&target).map_err(durability_unknown)?;
+        Ok(existed)
+    }
+    #[cfg(windows)]
+    {
+        let _ = barrier;
+        let _ = existed;
+        Err(Error::new(
+            "DURABILITY_UNSUPPORTED",
+            "acknowledged removal requires a parent-directory durability barrier unavailable on Windows",
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = barrier;
+        let _ = existed;
+        Err(Error::new(
+            "DURABILITY_UNSUPPORTED",
+            "acknowledged removal requires a parent-directory durability barrier unavailable on this platform",
+        ))
+    }
+}
+
 /// Sync the parent directory on Unix. Windows currently has no directory
 /// flush implementation here, so this returns success without claiming that
 /// the directory entry itself is durable there.
@@ -702,6 +745,64 @@ mod publication_tests {
             "INJECTED_SYNC_FAILURE",
             "injected durability boundary failure",
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acknowledged_removal_reports_parent_barrier_failure_and_is_idempotent() {
+        let root = fixture();
+        let path = root.join("pending.json");
+        fs::write(&path, b"acknowledged payload").unwrap();
+
+        let mut barrier_calls = 0;
+        let error = remove_private_acknowledged_with_barrier(&path, |target| {
+            assert_eq!(target, path.as_path());
+            barrier_calls += 1;
+            failed_barrier(target)
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+        assert_eq!(barrier_calls, 1);
+        assert!(!path.exists());
+
+        let mut barrier_calls = 0;
+        let error = remove_private_acknowledged_with_barrier(&path, |target| {
+            assert_eq!(target, path.as_path());
+            barrier_calls += 1;
+            failed_barrier(target)
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+        assert_eq!(barrier_calls, 1);
+        assert!(!remove_private_acknowledged(&path).unwrap());
+        fs::write(&path, b"acknowledged payload").unwrap();
+        assert!(remove_private_acknowledged(&path).unwrap());
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acknowledged_removal_without_windows_parent_barrier_retains_target() {
+        let root = fixture();
+        let path = root.join("pending.json");
+        fs::write(&path, b"acknowledged payload").unwrap();
+
+        let error = remove_private_acknowledged_with_barrier(&path, |_| {
+            panic!("Windows removal must fail before invoking a parent barrier")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "DURABILITY_UNSUPPORTED");
+        assert_eq!(fs::read(&path).unwrap(), b"acknowledged payload");
+
+        let absent = root.join("already-absent.json");
+        let error = remove_private_acknowledged_with_barrier(&absent, |_| {
+            panic!("Windows removal must not acknowledge an unbarriered absence")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "DURABILITY_UNSUPPORTED");
+        assert!(!absent.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use super::{
     Error, HISTORY_LIMIT, Journal, Result, RetainedOperation, RetentionSummary, StateIdentity,
     inspect_retained_operation, operation_key, read_limited, read_operation_history_bytes,
-    remove_private_durable, replace_private_durable, summarize_retained_operation,
+    remove_private_acknowledged, replace_private_durable, summarize_retained_operation,
     write_private_new,
 };
 use serde::{Deserialize, Serialize};
@@ -386,7 +386,7 @@ pub(super) fn reclaim_acknowledged(
                 "operation journal changed during retention classification",
             ));
         }
-        match remove_private_durable(&operation.path) {
+        match remove_private_acknowledged(&operation.path) {
             Ok(true) => summary.reclaimed += 1,
             Ok(false) => {
                 return Err(Error::new(

@@ -17,7 +17,7 @@ use swarm_contracts::{
     runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext},
 };
 use swarm_process::{
-    private_permissions, remove_private_durable, sync_parent_directory, write_private_new,
+    private_permissions, remove_private_acknowledged, sync_parent_directory, write_private_new,
 };
 
 pub const MAX_RECORD_BYTES: u64 = 1_048_576;
@@ -2183,9 +2183,8 @@ fn remove_result_page_cleanup_file(directory: &Path, name: &str) -> Result<()> {
         ));
     }
     let path = directory.join(name);
-    if optional_regular_file(&path, "result-page cleanup entry is not a regular file")? {
-        remove_private_durable(&path)?;
-    }
+    optional_regular_file(&path, "result-page cleanup entry is not a regular file")?;
+    remove_private_acknowledged(&path)?;
     Ok(())
 }
 
@@ -3163,12 +3162,11 @@ fn remove_captured_streams(directory: &Path) -> Result<()> {
                     "Command capture release target is not a regular file",
                 ));
             }
-            Ok(_) => {
-                remove_private_durable(&path)?;
-            }
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        remove_private_acknowledged(&path)?;
     }
     sync_parent_directory(&directory.join("release-intent.json"))?;
     Ok(())
@@ -3375,9 +3373,8 @@ fn remove_allowed_regular_file(directory: &Path, name: &str, allowed_files: &[&s
         ));
     }
     let path = directory.join(name);
-    if optional_regular_file(&path, "cleanup entry is not a regular file")? {
-        remove_private_durable(&path)?;
-    }
+    optional_regular_file(&path, "cleanup entry is not a regular file")?;
+    remove_private_acknowledged(&path)?;
     Ok(())
 }
 

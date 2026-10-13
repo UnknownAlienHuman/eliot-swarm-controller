@@ -20,7 +20,7 @@ use swarm_contracts::{
     runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeOutcome, TaskDispatchAdmissionReceipt},
 };
 use swarm_process::{
-    JsonlScanVerdict, private_permissions, remove_private_durable, replace_private_durable,
+    JsonlScanVerdict, private_permissions, remove_private_acknowledged, replace_private_durable,
     scan_jsonl, write_private_new,
 };
 
@@ -1281,7 +1281,7 @@ impl Journal {
             .and_then(|bytes| serde_json::from_slice::<PendingItem>(bytes).ok())
             .filter(|item| matches!(item.kind.as_str(), "outcome" | "result"))
             .map(|item| item.key);
-        match remove_private_durable(path) {
+        match remove_private_acknowledged(path) {
             Ok(_) => {
                 if let Some(operation_id) = retention_operation_id {
                     retention::refresh_operation(self, &operation_id);
