@@ -851,6 +851,74 @@ fn only_the_exact_pristine_launch_placeholder_is_excluded_from_root_claims() {
     assert_root_admission_unknown(&db, &route);
 }
 
+#[test]
+fn at_limit_root_claims_hold_with_limit_reached_before_any_new_effect() {
+    // Bound: root_claim_requires_the_complete_typed_admission_projection proves
+    // the Admit shape and its non-claiming mutations, and
+    // only_the_exact_pristine_launch_placeholder_is_excluded_from_root_claims
+    // proves exclusion, but no fixture drives the exact threshold through the
+    // real admission caller. This one proves below-limit admits and at-limit
+    // holds with ROUTE_ROOT_LIMIT_REACHED before any new Operation exists.
+    let db = fixture_db();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+    db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    let route = root_admission_route();
+    insert_task(&db, "task-placeholder");
+
+    // Below the exact threshold one retained Admit claim still admits.
+    let first_admission = serde_json::to_value(
+        launcher::route_admission(&db, &route, None, Some("launch-first-claim")).unwrap(),
+    )
+    .unwrap();
+    insert_retained_root_claim_operation(&db, &route, "launch-first-claim", first_admission);
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(1)
+    );
+    let below_limit =
+        launcher::route_admission(&db, &route, None, Some("launch-second-claim")).unwrap();
+    assert_eq!(
+        below_limit.root_limit,
+        provider_conditions::RootLimitProjection::WithinLimit {
+            max_concurrent_roots: 2,
+            current_claims: 1,
+        }
+    );
+    assert!(matches!(
+        below_limit.decision,
+        provider_conditions::RouteAdmissionDecision::Admit
+    ));
+
+    // At the exact threshold the same caller holds before any new effect.
+    let second_admission = serde_json::to_value(
+        launcher::route_admission(&db, &route, None, Some("launch-second-claim")).unwrap(),
+    )
+    .unwrap();
+    insert_retained_root_claim_operation(&db, &route, "launch-second-claim", second_admission);
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(2)
+    );
+    let at_limit =
+        launcher::route_admission(&db, &route, None, Some("launch-third-claim")).unwrap();
+    assert_eq!(
+        at_limit.root_limit,
+        provider_conditions::RootLimitProjection::LimitReached {
+            max_concurrent_roots: 2,
+            current_claims: 2,
+        }
+    );
+    assert!(matches!(
+        at_limit.decision,
+        provider_conditions::RouteAdmissionDecision::Hold { ref code, .. }
+            if code == "ROUTE_ROOT_LIMIT_REACHED"
+    ));
+    assert_eq!(
+        launcher::require_route_admission(&at_limit).unwrap_err().code,
+        "ROUTE_ADMISSION_HELD"
+    );
+}
+
 fn insert_runtime_state_observation(
     db: &Connection,
     binding_id: &str,
