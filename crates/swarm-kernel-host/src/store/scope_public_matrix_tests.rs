@@ -2362,8 +2362,8 @@ mod connected_store {
         let reviewer_token = "scope-sponsored-reviewer-token".to_owned();
         let pending_scope = json!({
             "review_assignment_id":null,
-            "task_id":format!("task-review-evidence-a"),
-            "attempt_id":format!("attempt-review-evidence-a"),
+            "task_id":"task-review-evidence-a",
+            "attempt_id":"attempt-review-evidence-a",
             "task_revision":1,
             "submission_ref":subject.submission_ref,
             "candidate_ref":subject.candidate_ref,
@@ -2376,9 +2376,9 @@ mod connected_store {
                 "client_request_id":format!("register-{reviewer_id}"),
                 "client_id":reviewer_id,
                 "token_hash":model::digest(reviewer_token.as_bytes()),
-                "task_id":format!("task-review-evidence-a"),
+                "task_id":"task-review-evidence-a",
                 "task_revision":1,
-                "attempt_id":format!("attempt-review-evidence-a"),
+                "attempt_id":"attempt-review-evidence-a",
                 "participation_basis":{"kind":"sponsored_reviewer","review_scope":pending_scope},
             }),
         )
@@ -2389,7 +2389,7 @@ mod connected_store {
             "review.assign",
             json!({
                 "client_request_id":format!("assign-{reviewer_id}"),
-                "attempt_id":format!("attempt-review-evidence-a"),
+                "attempt_id":"attempt-review-evidence-a",
                 "expected_revision":1,
                 "submission_ref":subject.submission_ref,
                 "candidate_ref":subject.candidate_ref,
