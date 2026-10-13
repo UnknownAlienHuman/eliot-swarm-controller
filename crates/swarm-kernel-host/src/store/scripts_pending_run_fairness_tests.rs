@@ -304,7 +304,7 @@ async fn reg23_pending_run_cursor_reaches_the_65th_public_admission_after_reopen
                 .map(|row| row.run_id.clone())
                 .collect::<Vec<_>>();
             let last = rows.last().expect("the first pending page is non-empty");
-            advance_pending_run_cursor(db, last)?;
+            advance_pending_run_cursor(db, &last.cursor_key())?;
             Ok((page_ids, meta(db, PENDING_RUN_CURSOR_KEY)?))
         })
         .await
@@ -372,15 +372,15 @@ async fn reg142_corrupt_cursor_blocks_subject_processing() {
     for cursor in cases {
         let (owner, directory, manager) = fairness_store().await;
         register_active_script(&owner.store, &manager).await;
-        let (_task_id, attempt_id) =
-            create_current_task_attempt(&owner.store, &manager, 0).await;
+        let (_task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager, 0).await;
         let (run_id, _operation_id) =
             admit_script_run(&owner.store, &manager, &attempt_id, 0).await;
         assert!(pending_run_cursor(&owner.store).await.is_none());
+        let retained_cursor = cursor.clone();
         owner
             .store
-            .run(|db| {
-                set_meta(db, PENDING_RUN_CURSOR_KEY, &cursor)?;
+            .run(move |db| {
+                set_meta(db, PENDING_RUN_CURSOR_KEY, &retained_cursor)?;
                 Ok(())
             })
             .await
@@ -424,21 +424,24 @@ async fn reg142_captured_tuple_change_blocks_cursor_jump() {
         created_at_ms: row1.created_at_ms,
         run_id: row1.run_id.clone(),
     };
+    let first_captured = captured.clone();
     let moved = owner
         .store
-        .run(|db| {
-            verify_captured_tuple(db, &captured)?;
-            advance_pending_run_cursor(db, &captured)
+        .run(move |db| {
+            verify_captured_tuple(db, &first_captured)?;
+            advance_pending_run_cursor(db, &first_captured)
         })
         .await
         .expect("first advance from captured tuple");
     assert!(moved);
+    let changed_run_id = row1.run_id.clone();
+    let changed_timestamp = row1.created_at_ms + 1_000;
     owner
         .store
-        .run(|db| {
+        .run(move |db| {
             db.execute(
                 "UPDATE script_runs SET created_at_ms=?1 WHERE run_id=?2",
-                (row1.created_at_ms + 1_000, row1.run_id.clone()),
+                (changed_timestamp, changed_run_id),
             )?;
             Ok(())
         })
@@ -446,7 +449,7 @@ async fn reg142_captured_tuple_change_blocks_cursor_jump() {
         .expect("mutate retained tuple");
     let err = owner
         .store
-        .run(|db| {
+        .run(move |db| {
             verify_captured_tuple(db, &captured)?;
             advance_pending_run_cursor(db, &captured)
         })
@@ -461,10 +464,7 @@ async fn reg142_captured_tuple_change_blocks_cursor_jump() {
         Some(row1.created_at_ms),
         "no jump to the changed coordinate"
     );
-    assert_eq!(
-        cursor["run_id"].as_str(),
-        Some(row1.run_id.as_str())
-    );
+    assert_eq!(cursor["run_id"].as_str(), Some(row1.run_id.as_str()));
     owner.close().await.expect("close Store");
     std::fs::remove_dir_all(&directory).expect("remove temporary Store directory");
 }
@@ -581,7 +581,7 @@ async fn reg142_single_subject_writes_no_loop() {
         .store
         .run(move |db| {
             let key = selected_pending_run_key(db, &direct_run)?.expect("subject is selected");
-            advance_pending_run_cursor(db, &key)
+            advance_pending_run_cursor(db, &key.cursor_key())
         })
         .await
         .expect("re-advance the identical value");

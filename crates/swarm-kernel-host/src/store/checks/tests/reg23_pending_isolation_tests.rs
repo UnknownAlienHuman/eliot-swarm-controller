@@ -1940,13 +1940,14 @@ async fn supervisor_hard_failure_keeps_last_completed_cursor_and_converges_on_re
         "queued",
         "the held row stays nonterminal without execution"
     );
+    let held_incident_key = format!("check:{}:CONFLICT", lexical[2]);
     let incidents = fixture
         .owner
         .store
         .run(move |db| {
             Ok(db.query_row(
                 "SELECT count(*) FROM incidents WHERE dedup_key=?1",
-                params![format!("check:{}:CONFLICT", lexical[2].clone())],
+                params![held_incident_key],
                 |row| row.get::<_, i64>(0),
             )?)
         })

@@ -2110,10 +2110,7 @@ impl Store {
     /// moving the cursor. An identical value is skipped, and a cursor-write
     /// failure stays hard without erasing the subject's retained
     /// Operation/ScriptRun truth.
-    async fn advance_fairness_cursor_to_captured(
-        &self,
-        captured: &PendingRunCursor,
-    ) -> Result<()> {
+    async fn advance_fairness_cursor_to_captured(&self, captured: &PendingRunCursor) -> Result<()> {
         let captured = captured.clone();
         self.run(move |db| {
             verify_captured_tuple(db, &captured)?;
@@ -2844,7 +2841,8 @@ const MAX_PENDING_RUN_PAGE: usize = 64;
 fn canonical_run_id(run_id: &str) -> bool {
     uuid::Uuid::parse_str(run_id).is_ok_and(|parsed| {
         parsed.get_version() == Some(uuid::Version::Random)
-            && parsed.as_hyphenated() == run_id
+            && parsed.get_variant() == uuid::Variant::RFC4122
+            && parsed.hyphenated().to_string() == run_id
     })
 }
 
@@ -2894,9 +2892,9 @@ impl PendingRunCursor {
     /// cursor fields, a nonnegative timestamp and the canonical run identity.
     /// No other shape is accepted.
     fn from_retained(value: &Value) -> Result<Self> {
-        let object = value.as_object().ok_or_else(|| {
-            Error::invalid("script pending-run cursor has an unexpected shape")
-        })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::invalid("script pending-run cursor has an unexpected shape"))?;
         if object.len() != 2
             || !object.contains_key("created_at_ms")
             || !object.contains_key("run_id")
@@ -2909,15 +2907,10 @@ impl PendingRunCursor {
             .get("created_at_ms")
             .and_then(Value::as_i64)
             .filter(|value| *value >= 0)
-            .ok_or_else(|| {
-                Error::invalid("script pending-run cursor has no valid timestamp")
-            })?;
-        let run_id = value
-            .get("run_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::invalid("script pending-run cursor has no valid run identifier")
-            })?;
+            .ok_or_else(|| Error::invalid("script pending-run cursor has no valid timestamp"))?;
+        let run_id = value.get("run_id").and_then(Value::as_str).ok_or_else(|| {
+            Error::invalid("script pending-run cursor has no valid run identifier")
+        })?;
         if run_id.is_empty() || run_id.len() > 128 || !canonical_run_id(run_id) {
             return Err(Error::invalid(
                 "script pending-run cursor has an invalid run identifier",
