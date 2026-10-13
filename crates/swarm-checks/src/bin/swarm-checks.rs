@@ -886,35 +886,12 @@ fn read_value(path: &Path, maximum: u64) -> Result<Value> {
 }
 
 fn read_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if is_link_or_reparse(&metadata) || !metadata.is_file() {
-        return Err(Error::invalid("CheckRun receipt is not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(maximum.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > maximum {
-        return Err(Error::invalid(
-            "CheckRun control envelope exceeds its limit",
-        ));
-    }
-    Ok(bytes)
+    swarm_process::read_private_durable(path, maximum)
 }
 
 fn write_once(path: &Path, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    match swarm_process::write_private_new(path, &bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
-            if read_bytes(path, MAX_CONTROL_BYTES)? == bytes {
-                Ok(())
-            } else {
-                Err(Error::conflict("retained CheckRun receipt differs"))
-            }
-        }
-        Err(error) => Err(error),
-    }
+    swarm_process::write_private_exact(path, &bytes, MAX_CONTROL_BYTES)
 }
 
 fn sha256(bytes: &[u8]) -> String {

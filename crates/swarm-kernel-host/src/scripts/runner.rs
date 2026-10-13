@@ -1779,17 +1779,7 @@ fn ensure_private_directory(root: &Path, dir: &Path) -> Result<()> {
 }
 
 fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
-    match swarm_process::write_private_new(path, bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
-            if read_control_bytes(path)? == bytes {
-                Ok(())
-            } else {
-                Err(Error::conflict("retained script control file differs"))
-            }
-        }
-        Err(error) => Err(error.into()),
-    }
+    swarm_process::write_private_exact(path, bytes, CONTROL_LIMIT as u64).map_err(Into::into)
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -1797,30 +1787,7 @@ fn read_json(path: &Path) -> Result<Value> {
 }
 
 fn read_control_bytes(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err(Error::invalid("script control file is a reparse point"));
-        }
-    }
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > CONTROL_LIMIT as u64
-    {
-        return Err(Error::invalid(
-            "script control file must be a bounded regular file",
-        ));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(CONTROL_LIMIT as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > CONTROL_LIMIT {
-        return Err(Error::invalid("script control file exceeds 16 MiB"));
-    }
-    Ok(bytes)
+    swarm_process::read_private_durable(path, CONTROL_LIMIT as u64).map_err(Into::into)
 }
 
 fn validate_work(work: &Work) -> Result<()> {

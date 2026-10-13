@@ -21,8 +21,9 @@ pub use capture::{
 pub use jsonl::{JsonlDamage, JsonlScanVerdict, scan_jsonl};
 pub use module_membership::module_child_belongs_to_owner;
 pub use permissions::{
-    opened_regular_file_matches_path, private_permissions, remove_private_durable,
-    replace_private_durable, sync_parent_directory, write_private_new,
+    opened_regular_file_matches_path, private_permissions, read_private_durable,
+    remove_private_durable, replace_private_durable, sync_parent_directory, write_private_exact,
+    write_private_new,
 };
 pub use process_group::{
     Group, departed_empty, process_birth_identity, process_image_identity, service_owner_is_live,

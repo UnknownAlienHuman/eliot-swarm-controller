@@ -938,7 +938,9 @@ pub fn read_start_decision(
     }
 
     let current = if has_current {
-        let value = read_start_decision_json(&current_path)?;
+        let bytes = swarm_process::read_private_durable(&current_path, CONTROL_LIMIT as u64)?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| start_decision_invalid("decision receipt contains invalid JSON"))?;
         let decision: ScriptStartDecision = serde_json::from_value(value)
             .map_err(|_| start_decision_invalid("current decision cannot be decoded"))?;
         validate_start_decision(&decision, run_id, operation_id, token)?;
@@ -994,6 +996,11 @@ pub fn publish_start_decision(
 
     let bytes = canonical_json(&serde_json::to_value(&decision)?)?.into_bytes();
     let write_result = write_private_new(&dir.join("start-decision.json"), &bytes);
+    if let Err(error) = &write_result
+        && error.code != "PRIVATE_FILE_ALREADY_EXISTS"
+    {
+        return Err(error.clone());
+    }
     let retained = read_start_decision(dir, run_id, operation_id, token)?;
     if retained != StartDecisionRead::Pending {
         return Ok(if start_read_matches_intent(&retained, &decision) {
@@ -1321,7 +1328,7 @@ fn wait_for_plan(work: &ScriptWork, work_sha256: &str, dir: &Path) -> Result<Scr
                 serde_json::from_value(read_json(&ready_path)?).map_err(|_| {
                     Error::new("SCRIPT_PLAN_INVALID", "plan-ready receipt cannot be parsed")
                 })?;
-            let plan_bytes = read_bytes(&plan_path, CONTROL_LIMIT as u64)?;
+            let plan_bytes = swarm_process::read_private_durable(&plan_path, CONTROL_LIMIT as u64)?;
             if ready.schema_version != 1
                 || ready.run_id != work.run_id
                 || ready.operation_id != work.operation_id
@@ -2728,17 +2735,7 @@ fn now_ms() -> Result<i64> {
 }
 
 fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
-    match write_private_new(path, bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
-            if read_bytes(path, CONTROL_LIMIT as u64)? == bytes {
-                Ok(())
-            } else {
-                Err(Error::conflict("retained ScriptRun control file differs"))
-            }
-        }
-        Err(error) => Err(error),
-    }
+    swarm_process::write_private_exact(path, bytes, CONTROL_LIMIT as u64)
 }
 
 fn write_process_control_failure(
@@ -2780,23 +2777,18 @@ fn write_process_control_failure(
                 "retained script cancellation diagnostic is not bounded and regular",
             ))
         }
-        Ok(_) => {
-            let retained = read_bytes(&path, MAX_PROCESS_CONTROL_FAILURE_BYTES as u64)?;
-            if retained == bytes {
-                Ok(())
-            } else {
-                Err(Error::conflict(
-                    "retained script cancellation diagnostic differs",
-                ))
-            }
-        }
+        Ok(_) => swarm_process::write_private_exact(
+            &path,
+            &bytes,
+            MAX_PROCESS_CONTROL_FAILURE_BYTES as u64,
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_once(&path, &bytes),
         Err(error) => Err(error.into()),
     }
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    let bytes = read_bytes(path, CONTROL_LIMIT as u64)?;
+    let bytes = swarm_process::read_private_durable(path, CONTROL_LIMIT as u64)?;
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
 
@@ -2880,5 +2872,60 @@ mod publication_failure_fault_fixture {
         assert!(!script_owner_release_authorized(false, true));
         assert!(!script_owner_release_authorized(true, false));
         assert!(script_owner_release_authorized(true, true));
+    }
+
+    #[test]
+    fn concurrent_public_decisions_reopen_one_winner_and_conflict_without_overwrite() {
+        let root = std::env::temp_dir().join(format!("swarm-decision-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let allow = ScriptStartDecision::Allow {
+            schema_version: 1,
+            run_id: "run".to_owned(),
+            operation_id: "operation".to_owned(),
+            token: "token".to_owned(),
+            decided_at_ms: 1,
+        };
+        let deny = ScriptStartDecision::Deny {
+            schema_version: 1,
+            run_id: "run".to_owned(),
+            operation_id: "operation".to_owned(),
+            token: "token".to_owned(),
+            error_code: "DENIED".to_owned(),
+            decided_at_ms: 1,
+        };
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_root = root.clone();
+        let other_ready = ready.clone();
+        let other_allow = allow.clone();
+        let writer = std::thread::spawn(move || {
+            other_ready.wait();
+            publish_start_decision(&other_root, other_allow)
+        });
+        ready.wait();
+        let denied = publish_start_decision(&root, deny.clone()).unwrap();
+        let allowed = writer.join().unwrap().unwrap();
+        let retained = read_start_decision(&root, "run", "operation", "token").unwrap();
+        match &retained {
+            StartDecisionRead::Current(decision) if *decision == allow => {
+                assert_eq!(allowed, StartDecisionPublish::Retained(retained.clone()));
+                assert_eq!(denied, StartDecisionPublish::Conflict(retained.clone()));
+            }
+            StartDecisionRead::Current(decision) if *decision == deny => {
+                assert_eq!(denied, StartDecisionPublish::Retained(retained.clone()));
+                assert_eq!(allowed, StartDecisionPublish::Conflict(retained.clone()));
+            }
+            other => panic!("expected one current decision, got {other:?}"),
+        }
+        let bytes = fs::read(root.join("start-decision.json")).unwrap();
+        let StartDecisionRead::Current(winner) = retained else {
+            unreachable!()
+        };
+        assert!(matches!(
+            publish_start_decision(&root, winner).unwrap(),
+            StartDecisionPublish::Retained(_)
+        ));
+        assert_eq!(fs::read(root.join("start-decision.json")).unwrap(), bytes);
+        assert!(read_start_decision(&root, "run", "different-operation", "token").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

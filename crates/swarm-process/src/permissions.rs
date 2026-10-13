@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
 };
 use swarm_contracts::error::{Error, Result};
@@ -93,6 +93,14 @@ pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
 /// before success. Windows uses a write-through move; this does not claim a
 /// Unix-equivalent parent-directory fsync.
 pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
+    write_private_new_with_barrier(path, data, sync_parent_directory)
+}
+
+fn write_private_new_with_barrier(
+    path: &Path,
+    data: &[u8],
+    barrier: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let target = private_target_path(path)?;
     if target_is_regular_file(&target)? {
         return Err(private_file_exists());
@@ -104,12 +112,124 @@ pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
         file.sync_all()?;
         drop(file);
         publish_new(&temp, &target)?;
-        sync_parent_directory(&target)
+        barrier(&target)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Publish exact bounded bytes, or converge on the same retained regular file.
+/// An existing file must pass its own file-sync and platform parent boundary;
+/// matching visible bytes alone never establish success. Other publication
+/// errors remain errors even if they left the target visible.
+pub fn write_private_exact(path: &Path, data: &[u8], maximum: u64) -> Result<()> {
+    write_private_exact_with_barrier(path, data, maximum, sync_parent_directory)
+}
+
+fn write_private_exact_with_barrier(
+    path: &Path,
+    data: &[u8],
+    maximum: u64,
+    mut barrier: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    if data.len() as u64 > maximum {
+        return Err(Error::invalid("private file exceeds its size limit"));
+    }
+    match write_private_new_with_barrier(path, data, |target| {
+        barrier(target).map_err(durability_unknown)
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
+            read_private_durable_with_barrier(path, maximum, Some(data), barrier).map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Read bounded regular bytes only after re-establishing their durability.
+/// Retain and recheck the opened identity and exact bytes across the boundary.
+/// Unix syncs the file and its parent; Windows flushes the retained file handle
+/// (opened for write access), with no claim of Unix directory-fsync equivalence.
+/// New Windows publication still uses the existing write-through move.
+pub fn read_private_durable(path: &Path, maximum: u64) -> Result<Vec<u8>> {
+    read_private_durable_with_barrier(path, maximum, None, sync_parent_directory)
+}
+
+fn read_private_durable_with_barrier(
+    path: &Path,
+    maximum: u64,
+    expected: Option<&[u8]>,
+    barrier: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let target = private_target_path(path)?;
+    if !target_is_regular_file(&target)? {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(&target)?;
+    let changed = || {
+        Error::new(
+            "PRIVATE_FILE_CHANGED",
+            "private file changed across durability boundary",
+        )
+    };
+    if !opened_regular_file_matches_path(&file, &target)? {
+        return Err(changed());
+    }
+    let bytes = read_bounded_file(&mut file, maximum)?;
+    if expected.is_some_and(|expected| bytes != expected) {
+        return Err(Error::conflict("retained private file bytes differ"));
+    }
+    file.sync_all()
+        .map_err(|error| durability_unknown(error.into()))?;
+    barrier(&target).map_err(durability_unknown)?;
+    if !opened_regular_file_matches_path(&file, &target)? {
+        return Err(changed());
+    }
+    file.rewind()?;
+    if read_bounded_file(&mut file, maximum)? != bytes
+        || !opened_regular_file_matches_path(&file, &target)?
+    {
+        return Err(changed());
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_file(file: &mut fs::File, maximum: u64) -> Result<Vec<u8>> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > maximum {
+        return Err(Error::invalid("private file must be bounded and regular"));
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
+        return Err(Error::invalid("private file exceeds its size limit"));
+    }
+    Ok(bytes)
+}
+
+fn durability_unknown(error: Error) -> Error {
+    Error::new(
+        "PRIVATE_FILE_DURABILITY_UNKNOWN",
+        format!("private file durability boundary failed: {}", error.code),
+    )
 }
 
 fn private_file_exists() -> Error {
@@ -520,6 +640,161 @@ mod windows {
 #[cfg(all(test, any(unix, windows)))]
 mod publication_tests {
     use super::*;
+
+    fn fixture() -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("swarm-durable-exact-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn failed_barrier(_: &Path) -> Result<()> {
+        Err(Error::new(
+            "INJECTED_SYNC_FAILURE",
+            "injected durability boundary failure",
+        ))
+    }
+
+    #[test]
+    fn exact_publication_failure_stays_unknown_until_retry_barrier_succeeds() {
+        let root = fixture();
+        let path = root.join("go.json");
+        let error =
+            write_private_exact_with_barrier(&path, b"allow", 32, failed_barrier).unwrap_err();
+        assert_eq!(error.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+        assert_eq!(fs::read(&path).unwrap(), b"allow");
+        assert_eq!(
+            write_private_exact_with_barrier(&path, b"allow", 32, failed_barrier)
+                .unwrap_err()
+                .code,
+            "PRIVATE_FILE_DURABILITY_UNKNOWN"
+        );
+        let mut barrier_calls = 0;
+        write_private_exact_with_barrier(&path, b"allow", 32, |target| {
+            barrier_calls += 1;
+            sync_parent_directory(target)
+        })
+        .unwrap();
+        assert_eq!(barrier_calls, 1);
+        assert_eq!(read_private_durable(&path, 32).unwrap(), b"allow");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn visible_authority_and_release_receipts_require_read_barrier() {
+        let root = fixture();
+        for name in [
+            "start-decision.json",
+            "go.json",
+            "terminal.json",
+            "completion.json",
+            "release-evidence.json",
+        ] {
+            let path = root.join(name);
+            assert!(
+                write_private_exact_with_barrier(&path, b"retained", 32, failed_barrier).is_err()
+            );
+            assert_eq!(
+                read_private_durable_with_barrier(&path, 32, None, failed_barrier)
+                    .unwrap_err()
+                    .code,
+                "PRIVATE_FILE_DURABILITY_UNKNOWN"
+            );
+            assert_eq!(read_private_durable(&path, 32).unwrap(), b"retained");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_same_bytes_cannot_skip_its_own_barrier() {
+        use std::{sync::mpsc, time::Duration};
+        let root = fixture();
+        let path = root.join("decision.json");
+        let writer_path = path.clone();
+        let (visible_tx, visible_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            write_private_exact_with_barrier(&writer_path, b"allow", 32, |target| {
+                visible_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                sync_parent_directory(target)
+            })
+        });
+        visible_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let publisher = write_private_exact_with_barrier(&path, b"allow", 32, failed_barrier);
+        let reader = read_private_durable_with_barrier(&path, 32, None, failed_barrier);
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            publisher.unwrap_err().code,
+            "PRIVATE_FILE_DURABILITY_UNKNOWN"
+        );
+        assert_eq!(reader.unwrap_err().code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+        write_private_exact(&path, b"allow", 32).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_conflicting_and_oversized_bytes_never_overwrite_or_sync() {
+        let root = fixture();
+        let path = root.join("receipt.json");
+        write_private_exact(&path, b"original", 32).unwrap();
+        let mut barrier_calls = 0;
+        let error = write_private_exact_with_barrier(&path, b"changed", 32, |_| {
+            barrier_calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        assert_eq!(barrier_calls, 0);
+        assert!(write_private_exact(&path, b"too long", 1).is_err());
+        assert!(read_private_durable(&path, 1).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_read_rejects_identical_replacement_during_barrier() {
+        let root = fixture();
+        let path = root.join("receipt.json");
+        write_private_exact(&path, b"original", 32).unwrap();
+        let error = read_private_durable_with_barrier(&path, 32, None, |target| {
+            fs::rename(target, root.join("previous.json"))?;
+            write_private_new(target, b"original")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "PRIVATE_FILE_CHANGED");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_convergence_rejects_symlink_and_nonregular_targets() {
+        let root = fixture();
+        let source = root.join("source.json");
+        let link = root.join("link.json");
+        write_private_exact(&source, b"original", 32).unwrap();
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(write_private_exact(&link, b"original", 32).is_err());
+        assert!(read_private_durable(&link, 32).is_err());
+        assert!(write_private_exact(&root, b"original", 32).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_through_publication_and_existing_exact_convergence() {
+        let root = fixture();
+        let path = root.join("receipt.json");
+        write_private_exact(&path, b"original", 32).unwrap();
+        assert_eq!(
+            write_private_new(&path, b"original").unwrap_err().code,
+            "PRIVATE_FILE_ALREADY_EXISTS"
+        );
+        write_private_exact(&path, b"original", 32).unwrap();
+        assert_eq!(read_private_durable(&path, 32).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn existing_target_never_clobbers_and_publication_race_is_explicit() {

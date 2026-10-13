@@ -192,43 +192,14 @@ pub fn directory(root: &Path, id: &str) -> Result<PathBuf> {
 }
 pub fn write_once(path: &Path, body: &Value) -> Result<()> {
     let bytes = model::canonical(body)?.into_bytes();
-    match swarm_process::write_private_new(path, &bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
-            if read_control_bytes(path)? == bytes {
-                Ok(())
-            } else {
-                Err(Error::conflict("retained check control file differs"))
-            }
-        }
-        Err(error) => Err(error.into()),
-    }
+    swarm_process::write_private_exact(path, &bytes, 8_388_608).map_err(Into::into)
 }
 fn read_value(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&read_control_bytes(path)?)?)
 }
 
 fn read_control_bytes(path: &Path) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let metadata = fs::symlink_metadata(path)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err(Error::invalid("check control file is a reparse point"));
-        }
-    }
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(Error::invalid("check control file is not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    File::open(path)?.take(8_388_609).read_to_end(&mut bytes)?;
-    if bytes.len() > 8_388_608 {
-        return Err(Error::invalid(
-            "check control file exceeds metadata envelope",
-        ));
-    }
-    Ok(bytes)
+    swarm_process::read_private_durable(path, 8_388_608).map_err(Into::into)
 }
 
 fn profile_report_matches(work: &Work, reported: &Value) -> Result<bool> {
@@ -924,11 +895,7 @@ pub(super) fn release_evidence(work: &Work, directory: &Path, process: &Value) -
             "token":work.token,
             "observed_at_ms":model::now_ms()?
         });
-        if let Err(error) = write_once(&path, &proposed)
-            && !path.try_exists()?
-        {
-            return Err(error);
-        }
+        write_once(&path, &proposed)?;
     }
     let proof = read_value(&path)?;
     if proof.as_object().is_none_or(|fields| {
