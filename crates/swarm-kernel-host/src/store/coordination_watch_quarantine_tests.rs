@@ -550,10 +550,15 @@ async fn malformed_index_neighbor_case(raw_index: &str) {
     owner
         .store
         .run(move |db| {
-            db.execute(
+            // Inject corrupt retained bytes after public admission; restore
+            // the schema guard before the real reconciliation consumer runs.
+            db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+            let injected = db.execute(
                 "UPDATE meta SET value_json=?2 WHERE key=?1",
                 params![key, raw],
-            )?;
+            );
+            db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+            injected?;
             Ok(())
         })
         .await
