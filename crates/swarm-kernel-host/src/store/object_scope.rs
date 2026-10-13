@@ -31,6 +31,9 @@ use serde_json::{Value, json};
 #[cfg(test)]
 #[path = "object_scope_review_tests.rs"]
 mod assigned_reviewer_operation_tests;
+#[cfg(test)]
+#[path = "scope_public_matrix_tests.rs"]
+mod scope_public_matrix_tests;
 
 /// Exact Task graph identity, loaded from a retained object.
 ///
