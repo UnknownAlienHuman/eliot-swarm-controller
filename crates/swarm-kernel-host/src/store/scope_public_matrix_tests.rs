@@ -1556,6 +1556,12 @@ mod connected_store {
 
     #[tokio::test]
     async fn store_authenticated_result_pages_reads_parts_and_assembly_inherit_sources() {
+        // The monolithic debug future for this scenario exceeded the default
+        // Windows test-thread stack (STATUS_STACK_OVERFLOW, exit 0xc00000fd)
+        // while its smaller siblings passed. Heap-pin the scenario future so
+        // its across-await state lives on the heap; assertions and order are
+        // unchanged and no production code is touched.
+        Box::pin(async {
         let f = start().await;
         assert_profile_is_not_object_authority(&f).await;
         let descriptor = fixture_descriptor();
@@ -2096,5 +2102,7 @@ mod connected_store {
         denied_assembly_has_no_output(&f, &f.operator, &[first, second], "OBJECT_SCOPE_DAMAGED")
             .await;
         f.close().await;
+        })
+        .await;
     }
 }
