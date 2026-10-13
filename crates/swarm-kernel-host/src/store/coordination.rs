@@ -2037,7 +2037,18 @@ fn verify_review_assignment(
     let identity: crate::review::ReviewSlotIdentity =
         serde_json::from_value(observation["identity"].clone())?;
     let current_slot = meta(db, &format!("review:slot:{}", identity.digest()?))?;
-    if !current_slot.is_some_and(|slot| slot["review_assignment_id"] == assignment_id) {
+    let lives_current_slot =
+        current_slot.is_some_and(|slot| slot["review_assignment_id"] == assignment_id);
+    // Purpose-specific retained-assignment relaxation. The O11 table requires
+    // "Trusted old evidence retained historically" for a late result, so the first
+    // result of an unanswered assignment that a replacement has already retired
+    // must be retained as historical evidence instead of being refused. Only that
+    // exact case skips the live-slot condition; a second, differing result still
+    // meets the immutable one-result-per-assignment rule, and a replacement that
+    // already changed a current-slot assignment keeps the strict refusal.
+    let retained_first_result_only =
+        !lives_current_slot && !retained_review_result_exists(db, assignment_id)?;
+    if !lives_current_slot && !retained_first_result_only {
         return Err(Error::new(
             "STALE_REVIEW_ASSIGNMENT",
             "reviewer assignment has been replaced for this exact slot",
@@ -2074,6 +2085,26 @@ fn verify_review_assignment(
         ));
     }
     Ok(())
+}
+
+/// Whether this exact assignment already retained a review result observation.
+///
+/// This is the one-result-per-assignment guard for the purpose-specific
+/// retained-assignment relaxation in `verify_review_assignment`. It reads only
+/// retained `review.result` existence, so the semantic-input comparison and
+/// `REVIEW_RESULT_CONFLICT` refusal in `reviews::reserve_submit` remain the sole
+/// authority for what a second result may contain.
+fn retained_review_result_exists(db: &Connection, assignment_id: &str) -> Result<bool> {
+    let event_key = format!("result:{assignment_id}");
+    let row: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 \
+             AND kind='review.result'",
+            params!["controller:review", event_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
 }
 
 fn review_record_matches(
