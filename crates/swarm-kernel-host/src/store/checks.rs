@@ -1966,10 +1966,10 @@ const PENDING_QUARANTINE_SCHEMA: u32 = 1;
 const PENDING_SUBJECT_SAVEPOINT: &str = "checks_pending_subject";
 
 enum PendingSubjectOutcome {
-    Applied(Work),
+    Applied(Box<Work>),
     AlreadyQuarantined,
     Quarantined {
-        identity: PendingSubjectIdentity,
+        identity: Box<PendingSubjectIdentity>,
         field: &'static str,
         reason: SubjectDamageReason,
     },
@@ -2292,10 +2292,10 @@ fn materialize_pending_subject(
             }
         }
         match materialized {
-            SubjectMaterialization::Decoded(work) => Ok(PendingSubjectOutcome::Applied(*work)),
+            SubjectMaterialization::Decoded(work) => Ok(PendingSubjectOutcome::Applied(work)),
             SubjectMaterialization::Damaged { field, reason } => {
                 Ok(PendingSubjectOutcome::Quarantined {
-                    identity,
+                    identity: Box::new(identity),
                     field,
                     reason,
                 })
@@ -2365,14 +2365,14 @@ fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
     for check_id in ids {
         last_id = Some(check_id.clone());
         match materialize_pending_subject(&tx, &check_id, root.clone())? {
-            PendingSubjectOutcome::Applied(item) => work.push(item),
+            PendingSubjectOutcome::Applied(item) => work.push(*item),
             PendingSubjectOutcome::AlreadyQuarantined => {}
             PendingSubjectOutcome::Quarantined {
                 identity,
                 field,
                 reason,
             } => {
-                retain_pending_quarantine(&tx, identity, field, reason, model::now_ms()?)?;
+                retain_pending_quarantine(&tx, *identity, field, reason, model::now_ms()?)?;
                 quarantined_new = true;
             }
         }

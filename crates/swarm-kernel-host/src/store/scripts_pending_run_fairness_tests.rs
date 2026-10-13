@@ -455,7 +455,7 @@ async fn reg142_single_subject_writes_no_loop() {
         .expect("second pass observes the same subject");
     let again = stored_run_states(&owner.store).await;
     assert_eq!(again, states);
-    assert_eq!(pending_run_cursor(&owner.store).await, cursor);
+    assert_eq!(pending_run_cursor(&owner.store).await, Some(cursor));
     assert_eq!(reg142_cursor_writes(&owner.store).await, 1);
 
     let direct_run = states[0].run_id.clone();

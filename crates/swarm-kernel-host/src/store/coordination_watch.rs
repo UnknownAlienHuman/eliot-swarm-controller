@@ -1921,11 +1921,9 @@ fn queue_pending_watch(tx: &Transaction<'_>, index_key: &str, raw_index: &str) -
     Ok(())
 }
 
-fn scan_active(
-    tx: &Transaction<'_>,
-    cursor: Option<&str>,
-    limit: i64,
-) -> Result<(Vec<(String, String)>, Option<String>)> {
+type ActiveWatchPage = (Vec<(String, String)>, Option<String>);
+
+fn scan_active(tx: &Transaction<'_>, cursor: Option<&str>, limit: i64) -> Result<ActiveWatchPage> {
     let cursor = match meta(tx, REVISIT_SEQUENCE_KEY)? {
         None => {
             // One bounded sweep from the start enrolls pending subjects that

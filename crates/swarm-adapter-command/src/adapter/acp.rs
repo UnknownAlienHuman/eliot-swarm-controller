@@ -2370,7 +2370,7 @@ async fn restore_session(
     updated["native_close_capability"] = json!(close_supported);
     updated["agent_info"] = features.agent_info.clone().unwrap_or(Value::Null);
     updated["agent_capabilities"] = features.capabilities.clone();
-    updated["model_readback"] = json!(model_id.clone());
+    updated["model_readback"] = json!(session.model_id.clone());
     updated["config_options"] = config_snapshot;
     updated["family_departure_claimed"] = json!(false);
     journal.save_session(&updated)?;
@@ -3896,7 +3896,7 @@ mod tests {
 
     #[test]
     fn config_option_snapshot_respects_record_byte_bound() -> super::Result<()> {
-        let oversized_id = "x".repeat(MAX_RECORD_BYTES as usize);
+        let oversized_id = "x".repeat(super::MAX_RECORD_BYTES as usize);
         let options = [super::SessionConfigOption::boolean(
             oversized_id,
             "toggle",
