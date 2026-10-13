@@ -105,6 +105,8 @@ fn launch_unknown_barrier_failure_stays_unknown_on_equal_retry() {
     let retry = retain_check_launch_unknown(&work, 4242, &launch_error).unwrap_err();
     assert_eq!(retry.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
     assert_eq!(fs::read(&path).unwrap(), visible);
+    let read = read_check_launch_fact(&work).unwrap_err();
+    assert_eq!(read.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
 
     // A healed barrier converges on the identical bytes with no extra files.
     failing.set(false);
@@ -115,8 +117,5 @@ fn launch_unknown_barrier_failure_stays_unknown_on_equal_retry() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     names.sort();
-    assert_eq!(
-        names,
-        vec![std::ffi::OsString::from("launch-unknown.json")]
-    );
+    assert_eq!(names, vec![std::ffi::OsString::from("launch-unknown.json")]);
 }

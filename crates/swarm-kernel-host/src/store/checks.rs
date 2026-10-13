@@ -22,7 +22,6 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
     path::{Path, PathBuf},
     process::Child,
     time::Duration,
@@ -3011,19 +3010,12 @@ fn check_child_departure_receipt(
     })
 }
 
+const MAX_CHECK_LAUNCH_RECEIPT_BYTES: u64 = 1024 * 1024;
+
 fn write_check_receipt(path: &Path, value: &Value) -> Result<()> {
     let bytes = model::canonical(value)?.into_bytes();
-    match swarm_process::write_private_new(path, &bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code == "PRIVATE_FILE_ALREADY_EXISTS" => {
-            if read_check_receipt(path)?.as_ref() == Some(value) {
-                Ok(())
-            } else {
-                Err(Error::conflict("retained CheckRun launch receipt differs"))
-            }
-        }
-        Err(error) => Err(error.into()),
-    }
+    swarm_process::write_private_exact(path, &bytes, MAX_CHECK_LAUNCH_RECEIPT_BYTES)
+        .map_err(Into::into)
 }
 
 fn read_check_receipt(path: &Path) -> Result<Option<Value>> {
@@ -3043,21 +3035,12 @@ fn read_check_receipt(path: &Path) -> Result<Option<Value>> {
             "CheckRun launch receipt is not a regular file",
         ));
     }
-    const MAX_CHECK_LAUNCH_RECEIPT_BYTES: u64 = 1024 * 1024;
     if metadata.len() > MAX_CHECK_LAUNCH_RECEIPT_BYTES {
         return Err(Error::invalid(
             "CheckRun launch receipt exceeds its size limit",
         ));
     }
-    let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_CHECK_LAUNCH_RECEIPT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CHECK_LAUNCH_RECEIPT_BYTES {
-        return Err(Error::invalid(
-            "CheckRun launch receipt exceeds its size limit",
-        ));
-    }
+    let bytes = swarm_process::read_private_durable(path, MAX_CHECK_LAUNCH_RECEIPT_BYTES)?;
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
@@ -4194,14 +4177,14 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[path = "reg23_pending_isolation_tests.rs"]
-    mod reg23_pending_isolation_tests;
+    #[path = "check_child_departure_durable_tests.rs"]
+    mod check_child_departure_durable_tests;
     #[path = "check_launch_fact_durable_tests.rs"]
     mod check_launch_fact_durable_tests;
     #[path = "check_launch_unknown_durable_tests.rs"]
     mod check_launch_unknown_durable_tests;
-    #[path = "check_child_departure_durable_tests.rs"]
-    mod check_child_departure_durable_tests;
+    #[path = "reg23_pending_isolation_tests.rs"]
+    mod reg23_pending_isolation_tests;
     use crate::{
         artifacts::ArtifactFiles,
         checks::{

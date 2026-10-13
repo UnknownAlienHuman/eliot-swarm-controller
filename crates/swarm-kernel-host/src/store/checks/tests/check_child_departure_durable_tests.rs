@@ -90,8 +90,7 @@ fn child_departure_barrier_failure_stays_unknown_on_equal_retry() {
 
     // First write: the barrier fails, the error stays explicit, and the exact
     // bytes remain visible on disk.
-    let first =
-        retain_check_child_departure(&work, 4242, false, None, &launch_error).unwrap_err();
+    let first = retain_check_child_departure(&work, 4242, false, None, &launch_error).unwrap_err();
     assert_eq!(first.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
     let visible = fs::read(&path).unwrap();
     assert_eq!(
@@ -109,10 +108,11 @@ fn child_departure_barrier_failure_stays_unknown_on_equal_retry() {
 
     // Equal-bytes retry under the still-failing barrier must remain an
     // explicit persistence Unknown instead of promoting visibility to success.
-    let retry =
-        retain_check_child_departure(&work, 4242, false, None, &launch_error).unwrap_err();
+    let retry = retain_check_child_departure(&work, 4242, false, None, &launch_error).unwrap_err();
     assert_eq!(retry.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
     assert_eq!(fs::read(&path).unwrap(), visible);
+    let read = read_check_launch_fact(&work).unwrap_err();
+    assert_eq!(read.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
 
     // A healed barrier converges on the identical bytes with no extra files.
     failing.set(false);

@@ -13,8 +13,10 @@ fn fixture_work() -> (FixtureDirectory, Work, PathBuf) {
     // Mirrors the CheckRun worker durable-authority donor: a bare retained
     // Work identity with no live child, native send, or Store behind it. PIDs
     // and exit values below are opaque pass-through bytes, never interpreted.
-    let root =
-        std::env::temp_dir().join(format!("check-launch-fact-durable-{}", uuid::Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!(
+        "check-launch-fact-durable-{}",
+        uuid::Uuid::new_v4()
+    ));
     fs::create_dir_all(&root).unwrap();
     let root = fs::canonicalize(&root).unwrap();
     let cleanup = FixtureDirectory(root.clone());
@@ -100,11 +102,14 @@ fn launch_fact_barrier_failure_stays_unknown_on_equal_retry() {
     let retry = retain_check_launch_fact(&work, &launch).unwrap_err();
     assert_eq!(retry.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
     assert_eq!(fs::read(&path).unwrap(), visible);
+    let read = read_check_launch_fact(&work).unwrap_err();
+    assert_eq!(read.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
 
     // A healed barrier converges on the identical bytes with no extra files.
     failing.set(false);
     retain_check_launch_fact(&work, &launch).unwrap();
     assert_eq!(fs::read(&path).unwrap(), visible);
+    assert_eq!(read_check_launch_fact(&work).unwrap(), Some(launch));
     let mut names: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
