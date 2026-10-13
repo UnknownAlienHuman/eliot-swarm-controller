@@ -379,7 +379,7 @@ fn store_allow_rejects_a_reparse_decision_path_without_changing_its_target() {
 
     #[cfg(unix)]
     assert!(
-        fs::symlink_metadata(&dir.join("start-decision.json"))
+        fs::symlink_metadata(dir.join("start-decision.json"))
             .unwrap()
             .file_type()
             .is_symlink()
