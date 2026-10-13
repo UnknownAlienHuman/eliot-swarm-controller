@@ -267,7 +267,7 @@ impl SubClient {
         seen: &mut Vec<Value>,
         pred: impl Fn(&Value) -> bool,
     ) -> Option<Value> {
-        if let Some(index) = seen.iter().position(|message| pred(message)) {
+        if let Some(index) = seen.iter().position(&pred) {
             return Some(seen.remove(index));
         }
         let deadline = tokio::time::Instant::now() + dur;

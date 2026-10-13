@@ -333,7 +333,7 @@ fn diagnostic_operation(
     db: &rusqlite::Connection,
     operation_id: &str,
 ) -> crate::error::Result<Value> {
-    let row: Option<(
+    type DiagnosticOperationRow = (
         String,
         String,
         String,
@@ -343,7 +343,8 @@ fn diagnostic_operation(
         String,
         Option<String>,
         String,
-    )> = db
+    );
+    let row: Option<DiagnosticOperationRow> = db
         .query_row(
             "SELECT caller_id,method,state,result_json,task_id,attempt_id,original_request_json,\
                     effective_request_json,client_request_id FROM operations WHERE operation_id=?1",

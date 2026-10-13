@@ -1320,189 +1320,6 @@ fn reject_reparse_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn disabled_forge_registration_passes_trusted_repository_readback() {
-        let root = std::env::temp_dir().join(format!("swarm-wr-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).expect("fresh test directory");
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(root.clone());
-        swarm_process::private_permissions(&root, true).expect("private test root");
-        let repository = root.join("repository");
-        let allowed = root.join("worktrees");
-        for directory in [&repository, &allowed] {
-            fs::create_dir(directory).expect("fresh child directory");
-            swarm_process::private_permissions(directory, true).expect("private child directory");
-        }
-        let executable = if cfg!(windows) { "git.exe" } else { "git" };
-        let git = std::env::split_paths(&std::env::var_os("PATH").expect("Git search path"))
-            .map(|path| path.join(executable))
-            .find(|path| path.is_file())
-            .and_then(|path| fs::canonicalize(path).ok())
-            .expect("installed Git executable");
-        for arguments in [
-            vec!["init", "--quiet"],
-            vec![
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/example/fixture.git",
-            ],
-        ] {
-            let mut command = std::process::Command::new(&git);
-            for variable in [
-                "GIT_DIR",
-                "GIT_WORK_TREE",
-                "GIT_INDEX_FILE",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            ] {
-                command.env_remove(variable);
-            }
-            assert!(
-                command
-                    .args(arguments)
-                    .current_dir(&repository)
-                    .status()
-                    .expect("fixture Git command")
-                    .success()
-            );
-        }
-        let project = ForgeProject {
-            repository_path: repository.clone(),
-            canonical_repository: "github.com/example/fixture".into(),
-            remote_name: "origin".into(),
-            policy_revision: "fixture-policy-v1".into(),
-            target_refs: vec![],
-        };
-        let mut forge = ForgeConfig {
-            enabled: false,
-            git_executable: git,
-            ..ForgeConfig::default()
-        };
-        forge.projects.insert("fixture".into(), project.clone());
-        let mut workspace = WorkspaceConfig::default();
-        workspace.projects.insert(
-            "fixture".into(),
-            WorkspaceProjectConfig {
-                allowed_roots: vec![allowed],
-            },
-        );
-        forge
-            .resolve_paths(&root)
-            .expect("disabled publication remains disabled");
-        workspace
-            .resolve_paths(&root)
-            .expect("canonical workspace roots");
-        workspace
-            .validate(&forge)
-            .expect("workspace project remains valid");
-        let registration = WorkspaceRegistration::from_config(
-            "fixture",
-            &workspace,
-            &forge,
-            "registration".into(),
-            1,
-        )
-        .expect("workspace registration");
-        assert!(!forge.enabled);
-        assert_eq!(
-            registration.repository_path,
-            fs::canonicalize(&repository).expect("canonical repository")
-        );
-        verify_registration_binding(&registration, "fixture").expect("exact registration digest");
-        crate::store::fixture_with_forge_git(|git| {
-            verify_trusted_repository(git, &forge, &project, &registration)
-        })
-        .await
-        .expect("actual trusted Git root and remote readback");
-        let mut damaged = registration;
-        damaged.registration_digest = "damaged".into();
-        assert_eq!(
-            verify_registration_binding(&damaged, "fixture")
-                .expect_err("changed registration refused")
-                .code,
-            "WORKSPACE_REGISTRATION_CHANGED"
-        );
-    }
-
-    #[test]
-    fn absolute_root_is_assembled_before_component_metadata_checks() {
-        let cwd = std::env::current_dir().expect("test working directory is available");
-        let mut root = PathBuf::new();
-        for component in cwd.components() {
-            match component {
-                Component::Prefix(_) | Component::RootDir => {
-                    root.push(component.as_os_str());
-                }
-                _ => break,
-            }
-        }
-        assert!(root.is_absolute());
-        reject_reparse_components(&root).expect("assembled absolute root is available");
-
-        let traversing = root.join("..");
-        let error =
-            reject_reparse_components(&traversing).expect_err("parent traversal remains forbidden");
-        assert_eq!(error.code, "WORKSPACE_PATH");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn git_path_arguments_normalize_only_supported_verbatim_roots() {
-        assert_eq!(
-            git_path_argument(Path::new(r"\\?\C:\workspace\worktrees\wt-a"))
-                .expect("verbatim disk path is a supported Git argument"),
-            r"C:\workspace\worktrees\wt-a"
-        );
-        assert_eq!(
-            git_path_argument(Path::new(r"\\?\UNC\server\share\workspace\wt-a"))
-                .expect("verbatim UNC path is a supported Git argument"),
-            r"\\server\share\workspace\wt-a"
-        );
-        assert!(
-            git_path_argument(Path::new(
-                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\workspace"
-            ))
-            .is_err()
-        );
-        assert!(git_path_argument(Path::new(r"\\.\PhysicalDrive0")).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn git_dir_admission_boundary_handles_normal_and_verbatim_paths() {
-        let normal_at_limit = format!(r"C:\{}é\.git", "a".repeat(210));
-        let normal_over_limit = format!(r"C:\{}é\.git", "a".repeat(211));
-        let verbatim_at_limit = format!(r"\\?\{normal_at_limit}");
-        let verbatim_over_limit = format!(r"\\?\{normal_over_limit}");
-        assert_eq!(normal_at_limit.len(), 220);
-        assert_eq!(normal_over_limit.len(), 221);
-        assert_eq!(
-            git_path_argument(Path::new(&verbatim_at_limit))
-                .expect("verbatim path at the policy boundary is supported"),
-            normal_at_limit
-        );
-        assert_eq!(
-            git_path_argument(Path::new(&verbatim_over_limit))
-                .expect("verbatim path over the boundary remains a valid argument"),
-            normal_over_limit
-        );
-        assert!(check_git_dir_length("normal-at-limit", &normal_at_limit).is_ok());
-        assert!(check_git_dir_length("verbatim-at-limit", &normal_at_limit).is_ok());
-        assert!(check_git_dir_length("normal-over-limit", &normal_over_limit).is_err());
-        assert!(check_git_dir_length("verbatim-over-limit", &normal_over_limit).is_err());
-    }
-}
-
 fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -1826,4 +1643,187 @@ fn validate_allowed_path(value: &str) -> Result<()> {
 
 fn workspace_config_error(message: &str) -> Error {
     Error::new("WORKSPACE_CONFIG", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disabled_forge_registration_passes_trusted_repository_readback() {
+        let root = std::env::temp_dir().join(format!("swarm-wr-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).expect("fresh test directory");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        swarm_process::private_permissions(&root, true).expect("private test root");
+        let repository = root.join("repository");
+        let allowed = root.join("worktrees");
+        for directory in [&repository, &allowed] {
+            fs::create_dir(directory).expect("fresh child directory");
+            swarm_process::private_permissions(directory, true).expect("private child directory");
+        }
+        let executable = if cfg!(windows) { "git.exe" } else { "git" };
+        let git = std::env::split_paths(&std::env::var_os("PATH").expect("Git search path"))
+            .map(|path| path.join(executable))
+            .find(|path| path.is_file())
+            .and_then(|path| fs::canonicalize(path).ok())
+            .expect("installed Git executable");
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/fixture.git",
+            ],
+        ] {
+            let mut command = std::process::Command::new(&git);
+            for variable in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            ] {
+                command.env_remove(variable);
+            }
+            assert!(
+                command
+                    .args(arguments)
+                    .current_dir(&repository)
+                    .status()
+                    .expect("fixture Git command")
+                    .success()
+            );
+        }
+        let project = ForgeProject {
+            repository_path: repository.clone(),
+            canonical_repository: "github.com/example/fixture".into(),
+            remote_name: "origin".into(),
+            policy_revision: "fixture-policy-v1".into(),
+            target_refs: vec![],
+        };
+        let mut forge = ForgeConfig {
+            enabled: false,
+            git_executable: git,
+            ..ForgeConfig::default()
+        };
+        forge.projects.insert("fixture".into(), project.clone());
+        let mut workspace = WorkspaceConfig::default();
+        workspace.projects.insert(
+            "fixture".into(),
+            WorkspaceProjectConfig {
+                allowed_roots: vec![allowed],
+            },
+        );
+        forge
+            .resolve_paths(&root)
+            .expect("disabled publication remains disabled");
+        workspace
+            .resolve_paths(&root)
+            .expect("canonical workspace roots");
+        workspace
+            .validate(&forge)
+            .expect("workspace project remains valid");
+        let registration = WorkspaceRegistration::from_config(
+            "fixture",
+            &workspace,
+            &forge,
+            "registration".into(),
+            1,
+        )
+        .expect("workspace registration");
+        assert!(!forge.enabled);
+        assert_eq!(
+            registration.repository_path,
+            fs::canonicalize(&repository).expect("canonical repository")
+        );
+        verify_registration_binding(&registration, "fixture").expect("exact registration digest");
+        crate::store::fixture_with_forge_git(|git| {
+            verify_trusted_repository(git, &forge, &project, &registration)
+        })
+        .await
+        .expect("actual trusted Git root and remote readback");
+        let mut damaged = registration;
+        damaged.registration_digest = "damaged".into();
+        assert_eq!(
+            verify_registration_binding(&damaged, "fixture")
+                .expect_err("changed registration refused")
+                .code,
+            "WORKSPACE_REGISTRATION_CHANGED"
+        );
+    }
+
+    #[test]
+    fn absolute_root_is_assembled_before_component_metadata_checks() {
+        let cwd = std::env::current_dir().expect("test working directory is available");
+        let mut root = PathBuf::new();
+        for component in cwd.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    root.push(component.as_os_str());
+                }
+                _ => break,
+            }
+        }
+        assert!(root.is_absolute());
+        reject_reparse_components(&root).expect("assembled absolute root is available");
+
+        let traversing = root.join("..");
+        let error =
+            reject_reparse_components(&traversing).expect_err("parent traversal remains forbidden");
+        assert_eq!(error.code, "WORKSPACE_PATH");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_path_arguments_normalize_only_supported_verbatim_roots() {
+        assert_eq!(
+            git_path_argument(Path::new(r"\\?\C:\workspace\worktrees\wt-a"))
+                .expect("verbatim disk path is a supported Git argument"),
+            r"C:\workspace\worktrees\wt-a"
+        );
+        assert_eq!(
+            git_path_argument(Path::new(r"\\?\UNC\server\share\workspace\wt-a"))
+                .expect("verbatim UNC path is a supported Git argument"),
+            r"\\server\share\workspace\wt-a"
+        );
+        assert!(
+            git_path_argument(Path::new(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\workspace"
+            ))
+            .is_err()
+        );
+        assert!(git_path_argument(Path::new(r"\\.\PhysicalDrive0")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_dir_admission_boundary_handles_normal_and_verbatim_paths() {
+        let normal_at_limit = format!(r"C:\{}é\.git", "a".repeat(210));
+        let normal_over_limit = format!(r"C:\{}é\.git", "a".repeat(211));
+        let verbatim_at_limit = format!(r"\\?\{normal_at_limit}");
+        let verbatim_over_limit = format!(r"\\?\{normal_over_limit}");
+        assert_eq!(normal_at_limit.len(), 220);
+        assert_eq!(normal_over_limit.len(), 221);
+        assert_eq!(
+            git_path_argument(Path::new(&verbatim_at_limit))
+                .expect("verbatim path at the policy boundary is supported"),
+            normal_at_limit
+        );
+        assert_eq!(
+            git_path_argument(Path::new(&verbatim_over_limit))
+                .expect("verbatim path over the boundary remains a valid argument"),
+            normal_over_limit
+        );
+        assert!(check_git_dir_length("normal-at-limit", &normal_at_limit).is_ok());
+        assert!(check_git_dir_length("verbatim-at-limit", &normal_at_limit).is_ok());
+        assert!(check_git_dir_length("normal-over-limit", &normal_over_limit).is_err());
+        assert!(check_git_dir_length("verbatim-over-limit", &normal_over_limit).is_err());
+    }
 }

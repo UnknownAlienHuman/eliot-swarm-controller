@@ -2290,10 +2290,10 @@ mod tests {
                 continue;
             }
             let root = base.join(format!("{label}-{}", model::new_id()));
-            if fs::create_dir(&root).is_ok() {
-                if let Ok(root) = fs::canonicalize(root) {
-                    return root;
-                }
+            if fs::create_dir(&root).is_ok()
+                && let Ok(root) = fs::canonicalize(root)
+            {
+                return root;
             }
         }
         panic!("no writable temporary root without ancestor Cargo configuration");

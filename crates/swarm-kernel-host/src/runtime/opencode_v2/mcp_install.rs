@@ -23,12 +23,9 @@ use std::{
 
 const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 const MAX_PROFILE_CONFIG_BYTES: u64 = 131_072;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained response cap for the pinned OpenCode 2.0.7 MCP inventory schema"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained response cap for the pinned OpenCode 2.0.7 MCP inventory schema"
 )]
 const MAX_MCP_SERVERS: usize = 256;
 const MAX_TEXT_BYTES: usize = 32_768;
@@ -41,12 +38,9 @@ pub(crate) struct PreparedMcpInstall {
     assignment: AssignmentContext,
     service_id: String,
     expected_version: String,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retained private location path for exact prepared-route equality and omitted from identity JSON"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retained private location path for exact prepared-route equality and omitted from identity JSON"
     )]
     directory: PathBuf,
     directory_text: String,
@@ -155,12 +149,9 @@ impl PreparedMcpInstall {
 
 /// Runtime status read from the exact OpenCode location after registration.
 /// This reports only that a uniquely named runtime entry is visible.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained legacy readback model for the pinned OpenCode registration flow"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained legacy readback model for the pinned OpenCode registration flow"
 )]
 pub(crate) struct InstallReadback {
     intent: Value,
@@ -172,12 +163,9 @@ pub(crate) struct InstallReadback {
 }
 
 impl InstallReadback {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retained serialized projection for the legacy OpenCode install readback schema"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retained serialized projection for the legacy OpenCode install readback schema"
     )]
     pub(crate) fn as_value(&self) -> Value {
         json!({
@@ -381,12 +369,9 @@ pub(crate) fn prepare(
 /// is a conflict: OpenCode 2.0.7 implements this route as add-or-replace and
 /// offers no compare-and-create. The PUT is issued once; any uncertain result
 /// must be recorded by Store and read back, never replayed.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained legacy exact-location registration path with precondition and readback"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained legacy exact-location registration path with precondition and readback"
 )]
 pub(crate) async fn register(
     service: &Service,
@@ -429,12 +414,9 @@ pub(crate) async fn register(
 
 /// Read only the uniquely named entry for a previously prepared intent. This
 /// is the safe recovery path after an unknown PUT result; it never mutates.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained read-only recovery after an uncertain legacy registration PUT"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained read-only recovery after an uncertain legacy registration PUT"
 )]
 pub(crate) async fn observe(
     service: &Service,
@@ -468,12 +450,9 @@ pub(crate) async fn observe(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained pinned OpenCode 2.0.7 location envelope for legacy MCP readback"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained pinned OpenCode 2.0.7 location envelope for legacy MCP readback"
 )]
 struct LocationEnvelope<T> {
     location: LocationRef,
@@ -482,12 +461,9 @@ struct LocationEnvelope<T> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained exact directory identity in the legacy OpenCode location response"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained exact directory identity in the legacy OpenCode location response"
 )]
 struct LocationRef {
     directory: String,
@@ -511,12 +487,9 @@ struct ScopedStorage {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained pinned OpenCode 2.0.7 MCP server entry schema for legacy readback"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained pinned OpenCode 2.0.7 MCP server entry schema for legacy readback"
 )]
 struct NativeMcpServer {
     name: String,
@@ -527,12 +500,9 @@ struct NativeMcpServer {
 
 #[derive(Deserialize)]
 #[serde(tag = "status", deny_unknown_fields)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained pinned OpenCode 2.0.7 MCP server status wire variants"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained pinned OpenCode 2.0.7 MCP server status wire variants"
 )]
 enum NativeMcpStatus {
     #[serde(rename = "connected")]
@@ -548,12 +518,9 @@ enum NativeMcpStatus {
 }
 
 impl NativeMcpStatus {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retained status-to-safe-readback projection for the legacy install flow"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retained status-to-safe-readback projection for the legacy install flow"
     )]
     fn readback(self) -> (&'static str, bool) {
         match self {
@@ -572,12 +539,9 @@ impl NativeMcpStatus {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained bounded exact-location MCP inventory reader for legacy registration recovery"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained bounded exact-location MCP inventory reader for legacy registration recovery"
 )]
 async fn list_location(
     service: &Service,
@@ -629,12 +593,9 @@ fn validate_options(options: &Options) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained service-version and exact-location binding before legacy install effects"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained service-version and exact-location binding before legacy install effects"
 )]
 fn validate_prepared_route(
     service: &Service,
@@ -687,12 +648,9 @@ fn list_route(prepared: &PreparedMcpInstall) -> Result<String> {
     Ok(format!("{}?{}", url.path(), query))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Retained no-replay error projection for uncertain legacy OpenCode PUT outcomes"
-    )
+#[expect(
+    dead_code,
+    reason = "Retained no-replay error projection for uncertain legacy OpenCode PUT outcomes"
 )]
 fn unknown_after_put(message: &str) -> Error {
     Error::new("NATIVE_OUTCOME_UNKNOWN", message)

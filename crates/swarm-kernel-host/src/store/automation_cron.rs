@@ -1444,7 +1444,7 @@ mod tests {
         store::StoreOwner,
     };
     use rusqlite::params;
-    use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+    use std::{collections::BTreeMap, path::Path, sync::Arc};
 
     const PROJECT: &str = "manager-cron-regression";
     const AUTOMATION_ID: &str = "calendar-check";
@@ -1486,7 +1486,7 @@ mod tests {
 
     async fn create_source_snapshot(
         store: &Store,
-        directory: &PathBuf,
+        directory: &Path,
         task_id: &str,
         attempt_id: &str,
     ) -> String {

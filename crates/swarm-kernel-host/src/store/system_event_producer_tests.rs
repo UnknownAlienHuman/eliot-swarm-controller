@@ -1,6 +1,6 @@
 use super::*;
 use crate::platform::{DataRoot, bootstrap_credential};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::engine::general_purpose::STANDARD;
 use std::sync::Arc;
 
 const TERMINAL_EVENT_MANAGER_ID: &str = "host-terminal-event-manager";
@@ -801,7 +801,7 @@ async fn terminal_host_exit_is_a_safe_any_event_and_failure_views_share_one_scri
             )?;
             let event = automation_intake::observed_event_by_id(db, observation_id)?
                 .expect("completed host exit observation");
-            Ok(automation_intake::safe_event_projection(db, &event)?)
+            automation_intake::safe_event_projection(db, &event)
         })
         .await
         .expect("project a graceful terminal lifecycle observation");

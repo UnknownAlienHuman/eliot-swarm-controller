@@ -61,7 +61,7 @@ fn current_task_prompt_command() -> (RuntimeCommand, String) {
                 "attempt_id":"attempt-task-prompt-current",
                 "task_snapshot_sha256":snapshot_sha256,
                 "prompt_sha256":model::digest(prompt.as_bytes()),
-                "prompt_bytes":prompt.as_bytes().len() as u64,
+                "prompt_bytes":prompt.len() as u64,
                 "prompt":prompt
             },
             "task_dispatch_context":{
@@ -75,7 +75,7 @@ fn current_task_prompt_command() -> (RuntimeCommand, String) {
                 "task_revision":7,
                 "task_snapshot_sha256":snapshot_sha256,
                 "source_text_sha256":model::digest(source_text.as_bytes()),
-                "source_text_bytes":source_text.as_bytes().len() as u64
+                "source_text_bytes":source_text.len() as u64
             }
         }),
         input_sha256: Some(input_sha256),
@@ -140,7 +140,7 @@ fn builtin_task_prompt_uses_store_bytes_and_emits_the_exact_dispatch_receipt() {
     );
     assert_eq!(
         receipt["native_payload_bytes"].as_u64(),
-        Some(prompt.as_bytes().len() as u64)
+        Some(prompt.len() as u64)
     );
     assert_eq!(
         receipt["module_receipt"]["artifact"]["artifact_id"],

@@ -3001,14 +3001,6 @@ mod tests {
         assert_eq!(revision, 7);
     }
 
-    fn operation_row(operation_id: &str, state: &str, result: Option<Value>) -> Value {
-        json!({
-            "operation_id":operation_id,
-            "state":state,
-            "result":result,
-        })
-    }
-
     #[test]
     fn native_goal_predecessor_decodes_every_known_lifecycle_state_through_the_typed_parser() {
         let db = Connection::open_in_memory().unwrap();

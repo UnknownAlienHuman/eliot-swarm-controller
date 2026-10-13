@@ -913,6 +913,36 @@ impl Service {
         }
     }
 }
+fn inbox_matches(item: &Value, root: &str, id: &str, text: &str, command: &RuntimeCommand) -> bool {
+    item["id"] == id
+        && item["sessionID"] == root
+        && item["type"] == "user"
+        && item["delivery"].as_str() == native_delivery_for_method(&command.method)
+        && item["payload"]["text"] == text
+        && item["payload"]["metadata"]["eliot"] == marker(command)
+        && no_attachments(&item["payload"])
+}
+
+// Exact IDs and the original content/metadata are necessary, not a substring or
+// equal text alone. Extra native attachments change the admitted assignment.
+pub(super) fn no_attachments(value: &Value) -> bool {
+    ["files", "agents", "skills"].iter().all(|key| {
+        value
+            .get(*key)
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+    })
+}
+pub(super) fn delivered_matches(message: &Value, command: &RuntimeCommand) -> Result<bool> {
+    Ok(message["id"] == input_id(&command.operation_id)
+        && message["type"] == "user"
+        && message
+            .get("sessionID")
+            .is_none_or(|id| id.as_str() == command.native_root_id.as_deref())
+        && message["text"] == prompt(command)?
+        && message["delivery"].as_str() == native_delivery_for_method(&command.method)
+        && message["metadata"]["eliot"] == marker(command)
+        && no_attachments(message))
+}
 
 #[cfg(test)]
 mod app214_family_reply_consumer_tests {
@@ -1070,34 +1100,4 @@ mod app214_family_reply_consumer_tests {
             );
         }
     }
-}
-fn inbox_matches(item: &Value, root: &str, id: &str, text: &str, command: &RuntimeCommand) -> bool {
-    item["id"] == id
-        && item["sessionID"] == root
-        && item["type"] == "user"
-        && item["delivery"].as_str() == native_delivery_for_method(&command.method)
-        && item["payload"]["text"] == text
-        && item["payload"]["metadata"]["eliot"] == marker(command)
-        && no_attachments(&item["payload"])
-}
-
-// Exact IDs and the original content/metadata are necessary, not a substring or
-// equal text alone. Extra native attachments change the admitted assignment.
-pub(super) fn no_attachments(value: &Value) -> bool {
-    ["files", "agents", "skills"].iter().all(|key| {
-        value
-            .get(*key)
-            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
-    })
-}
-pub(super) fn delivered_matches(message: &Value, command: &RuntimeCommand) -> Result<bool> {
-    Ok(message["id"] == input_id(&command.operation_id)
-        && message["type"] == "user"
-        && message
-            .get("sessionID")
-            .is_none_or(|id| id.as_str() == command.native_root_id.as_deref())
-        && message["text"] == prompt(command)?
-        && message["delivery"].as_str() == native_delivery_for_method(&command.method)
-        && message["metadata"]["eliot"] == marker(command)
-        && no_attachments(message))
 }

@@ -6804,3 +6804,7 @@ mod script_trigger_admission_isolation_tests {
         std::fs::remove_dir_all(directory).expect("remove owned temporary Store directory");
     }
 }
+
+#[cfg(test)]
+#[path = "scripts_current_concilium_consumers.rs"]
+mod scripts_current_concilium_consumers;

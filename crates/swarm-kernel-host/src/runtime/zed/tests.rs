@@ -392,7 +392,7 @@ exit 9
         let (batch, intent) = run_batch_command(
             &options,
             &command,
-            &instruction,
+            instruction,
             &fixture.out_root,
             &artifact_files,
         )

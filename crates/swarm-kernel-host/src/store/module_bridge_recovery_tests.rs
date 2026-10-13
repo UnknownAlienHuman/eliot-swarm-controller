@@ -298,8 +298,7 @@ fn zed_command_intake_preserves_idle_errors_and_taken_operation_state() {
     let next_error = runtime::next(&mut db, &stale_link).unwrap_err();
     assert_eq!(next_error.code, "STALE_LINK");
     let propagated = runtime::decode_zed_command(Err(next_error))
-        .err()
-        .expect("Store next failure must not become idle");
+        .expect_err("Store next failure must not become idle");
     assert_eq!(propagated.code, "STALE_LINK");
     assert_eq!(stored_operation_state(&db).0, "queued");
 
@@ -311,8 +310,7 @@ fn zed_command_intake_preserves_idle_errors_and_taken_operation_state() {
     assert_eq!(stored_operation_state(&db).0, "sending");
     taken["command"]["operation_id"] = json!(false);
     let decode_error = runtime::decode_zed_command(Ok(taken))
-        .err()
-        .expect("malformed taken command must remain an error");
+        .expect_err("malformed taken command must remain an error");
     assert_eq!(decode_error.code, "INVALID_PARAMS");
     assert_eq!(stored_operation_state(&db).0, "sending");
 

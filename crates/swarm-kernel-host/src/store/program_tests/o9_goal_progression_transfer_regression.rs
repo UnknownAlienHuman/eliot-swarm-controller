@@ -1832,18 +1832,26 @@ async fn assert_queued_codex_goal_rejected(fixture: &QueuedCodexGoalFixture, exp
     assert_eq!(next["rejected_operation_id"], fixture.operation_id);
     assert_eq!(next["error"]["code"], expected_error);
     let operation_id = fixture.operation_id.clone();
-    let (state, sent_at_ms) = fixture
-        .owner
-        .store
-        .run(move |db| {
-            Ok(db.query_row(
-                "SELECT state,sent_at_ms FROM operations WHERE operation_id=?1",
+    let (state, sent_at_ms, task_id, attempt_id) =
+        fixture
+            .owner
+            .store
+            .run(move |db| {
+                Ok(db.query_row(
+                "SELECT state,sent_at_ms,task_id,attempt_id FROM operations WHERE operation_id=?1",
                 [operation_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                )),
             )?)
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
+    assert_eq!(task_id.as_deref(), Some(fixture.task_id.as_str()));
+    assert_eq!(attempt_id.as_deref(), Some(fixture.attempt_id.as_str()));
     assert_eq!(state, "rejected");
     assert!(sent_at_ms.is_none(), "rejected Operation was marked sent");
 }

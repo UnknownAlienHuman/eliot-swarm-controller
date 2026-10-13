@@ -642,7 +642,7 @@ async fn admit_coalesced_wrapper(
         retained_operation(&fixture.owner.store, &fixture.operator, &owner_operation_id).await;
     assert_eq!(admitted_owner["state"], "queued");
 
-    let first_pass = reconcile_publication_fixture(&fixture).await.unwrap();
+    let first_pass = reconcile_publication_fixture(fixture).await.unwrap();
     assert_eq!(first_pass["publication"]["processed"], 1);
     let rows = retained_forge_operations(&fixture.owner.store).await;
     assert_eq!(rows.len(), 2);

@@ -551,7 +551,7 @@ mod tests {
         let second = command_receipt_facts("operation-雪", &instruction);
         assert_eq!(first, second);
         assert_eq!(first.prompt_sha256, model::digest(instruction.as_bytes()));
-        assert_eq!(first.prompt_bytes, instruction.as_bytes().len());
+        assert_eq!(first.prompt_bytes, instruction.len());
         assert!(first.batch_run_id.starts_with("command-batch:"));
         assert_eq!(first.batch_run_id.len(), "command-batch:".len() + 32);
     }

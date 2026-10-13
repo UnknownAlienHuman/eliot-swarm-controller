@@ -535,7 +535,7 @@ async fn mixed_requirement_evidence_plan_flows_through_review_and_acceptance() {
             &candidate_ref,
             feedback_cursor,
             &missing_review,
-            &[wrong_revision_check.clone()],
+            std::slice::from_ref(&wrong_revision_check),
         ),
     )
     .await;

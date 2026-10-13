@@ -898,122 +898,6 @@ fn process_scoped_system_event(
     Ok(())
 }
 
-#[cfg(test)]
-mod native_mcp_phase_contract_tests {
-    use super::*;
-
-    #[test]
-    fn native_mcp_phase_map_rejects_cross_pairs() {
-        let phase_contract = crate::store::launcher_mcp_tools::native_mcp_phase_contract;
-        assert_eq!(
-            phase_contract("native.mcp.observe", "observe_assignment"),
-            Some(("observe", Some("assigned_session")))
-        );
-        assert_eq!(
-            phase_contract("native.mcp.observe", "observe_refresh"),
-            Some(("observe", Some("installed_server")))
-        );
-        assert_eq!(
-            phase_contract("native.mcp.install", "observe_assignment"),
-            None
-        );
-        assert_eq!(phase_contract("native.mcp.observe", "install"), None);
-        assert_eq!(phase_contract("native.mcp.arm", "read"), None);
-        assert_eq!(phase_contract("native.mcp.read", "arm"), None);
-        assert_eq!(
-            phase_contract("native.mcp.unknown", "observe_assignment"),
-            None
-        );
-    }
-
-    #[test]
-    fn retained_observation_purpose_and_schema_are_bound_to_phase() {
-        let phase_contract = crate::store::launcher_mcp_tools::native_mcp_phase_contract;
-        let (_, assigned_kind) = phase_contract("native.mcp.observe", "observe_assignment")
-            .expect("assigned-session phase is explicit");
-        assert!(native_mcp_phase_observation_matches(
-            Some(2),
-            "observe_assignment",
-            assigned_kind,
-            assigned_kind,
-            assigned_kind,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(1),
-            "observe_assignment",
-            None,
-            None,
-            assigned_kind,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(2),
-            "observe_assignment",
-            Some("installed_server"),
-            Some("installed_server"),
-            assigned_kind,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(2),
-            "observe_assignment",
-            assigned_kind,
-            Some("installed_server"),
-            assigned_kind,
-        ));
-
-        let (_, installed_kind) = phase_contract("native.mcp.observe", "observe_unknown")
-            .expect("C8 installed-server phase remains explicit");
-        assert!(native_mcp_phase_observation_matches(
-            Some(2),
-            "observe_unknown",
-            installed_kind,
-            installed_kind,
-            installed_kind,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(2),
-            "observe_unknown",
-            Some("assigned_session"),
-            Some("assigned_session"),
-            installed_kind,
-        ));
-        assert!(native_mcp_phase_observation_matches(
-            Some(1),
-            "observe_refresh",
-            None,
-            None,
-            installed_kind,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(1),
-            "observe_refresh",
-            installed_kind,
-            installed_kind,
-            installed_kind,
-        ));
-        assert!(native_mcp_phase_observation_matches(
-            Some(2),
-            "install",
-            None,
-            None,
-            None,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(2),
-            "install",
-            Some("assigned_session"),
-            Some("assigned_session"),
-            None,
-        ));
-        assert!(!native_mcp_phase_observation_matches(
-            Some(3),
-            "observe_assignment",
-            assigned_kind,
-            assigned_kind,
-            assigned_kind,
-        ));
-    }
-}
-
 pub(super) fn current_submission_scope_matches_for_owner(
     db: &Connection,
     owner_manager_id: &str,
@@ -3689,4 +3573,120 @@ fn require_module_lifecycle_binding_source(
         (None, None) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_mcp_phase_contract_tests {
+    use super::*;
+
+    #[test]
+    fn native_mcp_phase_map_rejects_cross_pairs() {
+        let phase_contract = crate::store::launcher_mcp_tools::native_mcp_phase_contract;
+        assert_eq!(
+            phase_contract("native.mcp.observe", "observe_assignment"),
+            Some(("observe", Some("assigned_session")))
+        );
+        assert_eq!(
+            phase_contract("native.mcp.observe", "observe_refresh"),
+            Some(("observe", Some("installed_server")))
+        );
+        assert_eq!(
+            phase_contract("native.mcp.install", "observe_assignment"),
+            None
+        );
+        assert_eq!(phase_contract("native.mcp.observe", "install"), None);
+        assert_eq!(phase_contract("native.mcp.arm", "read"), None);
+        assert_eq!(phase_contract("native.mcp.read", "arm"), None);
+        assert_eq!(
+            phase_contract("native.mcp.unknown", "observe_assignment"),
+            None
+        );
+    }
+
+    #[test]
+    fn retained_observation_purpose_and_schema_are_bound_to_phase() {
+        let phase_contract = crate::store::launcher_mcp_tools::native_mcp_phase_contract;
+        let (_, assigned_kind) = phase_contract("native.mcp.observe", "observe_assignment")
+            .expect("assigned-session phase is explicit");
+        assert!(native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_assignment",
+            assigned_kind,
+            assigned_kind,
+            assigned_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(1),
+            "observe_assignment",
+            None,
+            None,
+            assigned_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_assignment",
+            Some("installed_server"),
+            Some("installed_server"),
+            assigned_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_assignment",
+            assigned_kind,
+            Some("installed_server"),
+            assigned_kind,
+        ));
+
+        let (_, installed_kind) = phase_contract("native.mcp.observe", "observe_unknown")
+            .expect("C8 installed-server phase remains explicit");
+        assert!(native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_unknown",
+            installed_kind,
+            installed_kind,
+            installed_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "observe_unknown",
+            Some("assigned_session"),
+            Some("assigned_session"),
+            installed_kind,
+        ));
+        assert!(native_mcp_phase_observation_matches(
+            Some(1),
+            "observe_refresh",
+            None,
+            None,
+            installed_kind,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(1),
+            "observe_refresh",
+            installed_kind,
+            installed_kind,
+            installed_kind,
+        ));
+        assert!(native_mcp_phase_observation_matches(
+            Some(2),
+            "install",
+            None,
+            None,
+            None,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(2),
+            "install",
+            Some("assigned_session"),
+            Some("assigned_session"),
+            None,
+        ));
+        assert!(!native_mcp_phase_observation_matches(
+            Some(3),
+            "observe_assignment",
+            assigned_kind,
+            assigned_kind,
+            assigned_kind,
+        ));
+    }
 }

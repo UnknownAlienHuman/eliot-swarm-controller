@@ -1639,7 +1639,7 @@ mod tests {
             set_worker_status(&fixture, worker, "running", None, None).await;
         }
         let (native_ready, native) = install_native_worker(&mut slots, Worker::Checks);
-        let _ = native_ready
+        native_ready
             .await
             .expect("native child worker started before shutdown");
         let script = install_controlled_worker(&mut slots, Worker::Scripts);

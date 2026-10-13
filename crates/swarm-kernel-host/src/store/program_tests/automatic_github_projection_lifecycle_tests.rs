@@ -552,7 +552,7 @@ async fn projection_lifecycle_case(terminal_state: Option<&'static str>) {
     assert_eq!(second_rows[0].2, *semantic_id);
     assert_eq!(second_rows[0].3, *original_json);
     assert_eq!(second_rows[0].4, *effective_json);
-    assert_eq!(second_rows[0].6.is_some(), true);
+    assert!(second_rows[0].6.is_some());
     assert_eq!(second_rows[0].7, None);
     assert_eq!(
         second_entry["recent"].as_array().unwrap().last().unwrap()["effect_status"],

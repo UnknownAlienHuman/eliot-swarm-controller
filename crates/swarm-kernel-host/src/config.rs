@@ -549,192 +549,6 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod owned_opencode_route_validation_tests {
-    use super::{
-        OPENCODE_RUST_ARTIFACT_ID, OpenCodeRouteKind, OwnedOpenCodeServiceConfig, Route,
-        opencode_route_kind,
-    };
-    use serde_json::{Value, json};
-
-    fn absolute_fixture_path(name: &str) -> String {
-        std::env::temp_dir()
-            .join(name)
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn owned_service() -> OwnedOpenCodeServiceConfig {
-        OwnedOpenCodeServiceConfig {
-            origin: "fresh_owned_service".to_owned(),
-            service_id: "native-prereq-opencode".to_owned(),
-            model: crate::runtime::opencode_v2::ModelRef {
-                id: "step-5-preview-free".to_owned(),
-                provider_id: "opencode".to_owned(),
-                variant: "high".to_owned(),
-            },
-            model_catalog: "refresh".to_owned(),
-            credential_ref: None,
-            bun_executable: std::env::temp_dir().join("fixture-bun.exe"),
-            bun_sha256: "a".repeat(64),
-            server_program: std::env::temp_dir().join("fixture-serve.mjs"),
-            server_program_sha256: "b".repeat(64),
-            state_root: std::env::temp_dir().join("fixture-owned-state"),
-            port: 0,
-        }
-    }
-
-    fn route(native_options: Value, owned_service: Option<OwnedOpenCodeServiceConfig>) -> Route {
-        Route {
-            alias: "native-prereq-opencode".to_owned(),
-            runtime: "module".to_owned(),
-            module_artifact_id: OPENCODE_RUST_ARTIFACT_ID.to_owned(),
-            enabled: true,
-            native_options,
-            workspace_option: Some("directory".to_owned()),
-            owned_service,
-            admission_policy: None,
-        }
-    }
-
-    #[test]
-    fn opencode_route_kind_accepts_only_exact_runtime_artifact_pairs() {
-        let cases = [
-            (
-                crate::runtime::opencode_v2::RUNTIME,
-                crate::runtime::opencode_v2::ARTIFACT_ID,
-                Some(OpenCodeRouteKind::Builtin),
-            ),
-            (
-                crate::runtime::opencode_v2::RUNTIME,
-                crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID,
-                Some(OpenCodeRouteKind::Builtin),
-            ),
-            (
-                "module",
-                OPENCODE_RUST_ARTIFACT_ID,
-                Some(OpenCodeRouteKind::Standalone),
-            ),
-            (
-                crate::runtime::opencode_v2::RUNTIME,
-                OPENCODE_RUST_ARTIFACT_ID,
-                None,
-            ),
-            ("module", crate::runtime::opencode_v2::ARTIFACT_ID, None),
-            (
-                "module",
-                crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID,
-                None,
-            ),
-            ("module", "eliot-opencode-v2.rust-http.1.extra", None),
-            ("MODULE", OPENCODE_RUST_ARTIFACT_ID, None),
-            ("unknown", "unknown-artifact", None),
-        ];
-
-        for (runtime, artifact_id, expected) in cases {
-            assert_eq!(
-                opencode_route_kind(runtime, artifact_id),
-                expected,
-                "unexpected classification for runtime={runtime:?}, artifact={artifact_id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn documented_fresh_owned_route_accepts_directory_only_and_keeps_its_pin() {
-        let directory = absolute_fixture_path("owned-opencode-workspace");
-        let route = route(json!({"directory": directory}), Some(owned_service()));
-
-        assert!(route.validate_activation_contract().is_ok());
-        assert_eq!(route.runtime, "module");
-        assert_eq!(route.module_artifact_id, OPENCODE_RUST_ARTIFACT_ID);
-        assert_eq!(route.workspace_option.as_deref(), Some("directory"));
-        assert_eq!(
-            route.native_options["directory"].as_str(),
-            Some(directory.as_str())
-        );
-        let owner = route.owned_service.as_ref().expect("owned route fixture");
-        assert_eq!(owner.service_id, "native-prereq-opencode");
-        assert_eq!(owner.model.id, "step-5-preview-free");
-        assert_eq!(owner.model.provider_id, "opencode");
-        assert_eq!(owner.model.variant, "high");
-    }
-
-    #[test]
-    fn owned_route_rejects_static_external_identity_fields() {
-        for (key, value) in [
-            ("service_id", json!("external-opencode")),
-            (
-                "connection_file",
-                json!(absolute_fixture_path("external-connection.json")),
-            ),
-            ("expected_version", json!("2.0.7")),
-            (
-                "model",
-                json!({"id": "step-5-preview-free", "providerID": "opencode", "variant": "high"}),
-            ),
-        ] {
-            let mut options = json!({
-                "directory": absolute_fixture_path("owned-opencode-workspace")
-            });
-            options
-                .as_object_mut()
-                .expect("object fixture")
-                .insert(key.to_owned(), value);
-
-            assert!(
-                route(options, Some(owned_service()))
-                    .validate_activation_contract()
-                    .is_err(),
-                "owned route accepted conflicting external field {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn external_route_still_requires_the_complete_static_connection_source() {
-        let directory = absolute_fixture_path("external-opencode-workspace");
-        assert!(
-            route(json!({"directory": directory}), None)
-                .validate_activation_contract()
-                .is_err()
-        );
-
-        let external_options = json!({
-            "service_id": "external-opencode",
-            "connection_file": absolute_fixture_path("external-connection.json"),
-            "directory": absolute_fixture_path("external-opencode-workspace"),
-            "model": {
-                "id": "step-5-preview-free",
-                "providerID": "opencode",
-                "variant": "high"
-            }
-        });
-        assert!(
-            route(external_options, None)
-                .validate_activation_contract()
-                .is_ok()
-        );
-
-        let versioned_options = json!({
-            "service_id": "external-opencode",
-            "connection_file": absolute_fixture_path("external-connection.json"),
-            "expected_version": "2.0.7",
-            "directory": absolute_fixture_path("external-opencode-workspace"),
-            "model": {
-                "id": "step-5-preview-free",
-                "providerID": "opencode",
-                "variant": "high"
-            }
-        });
-        assert!(
-            route(versioned_options, None)
-                .validate_activation_contract()
-                .is_err()
-        );
-    }
-}
-
 fn validate_provider_auth_source(
     credential_ref: &str,
     source: &OwnedProviderAuthSourceConfig,
@@ -1066,5 +880,191 @@ impl Config {
             return Err(Error::new("ROUTE_DISABLED", alias));
         }
         Ok(r.clone())
+    }
+}
+
+#[cfg(test)]
+mod owned_opencode_route_validation_tests {
+    use super::{
+        OPENCODE_RUST_ARTIFACT_ID, OpenCodeRouteKind, OwnedOpenCodeServiceConfig, Route,
+        opencode_route_kind,
+    };
+    use serde_json::{Value, json};
+
+    fn absolute_fixture_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn owned_service() -> OwnedOpenCodeServiceConfig {
+        OwnedOpenCodeServiceConfig {
+            origin: "fresh_owned_service".to_owned(),
+            service_id: "native-prereq-opencode".to_owned(),
+            model: crate::runtime::opencode_v2::ModelRef {
+                id: "step-5-preview-free".to_owned(),
+                provider_id: "opencode".to_owned(),
+                variant: "high".to_owned(),
+            },
+            model_catalog: "refresh".to_owned(),
+            credential_ref: None,
+            bun_executable: std::env::temp_dir().join("fixture-bun.exe"),
+            bun_sha256: "a".repeat(64),
+            server_program: std::env::temp_dir().join("fixture-serve.mjs"),
+            server_program_sha256: "b".repeat(64),
+            state_root: std::env::temp_dir().join("fixture-owned-state"),
+            port: 0,
+        }
+    }
+
+    fn route(native_options: Value, owned_service: Option<OwnedOpenCodeServiceConfig>) -> Route {
+        Route {
+            alias: "native-prereq-opencode".to_owned(),
+            runtime: "module".to_owned(),
+            module_artifact_id: OPENCODE_RUST_ARTIFACT_ID.to_owned(),
+            enabled: true,
+            native_options,
+            workspace_option: Some("directory".to_owned()),
+            owned_service,
+            admission_policy: None,
+        }
+    }
+
+    #[test]
+    fn opencode_route_kind_accepts_only_exact_runtime_artifact_pairs() {
+        let cases = [
+            (
+                crate::runtime::opencode_v2::RUNTIME,
+                crate::runtime::opencode_v2::ARTIFACT_ID,
+                Some(OpenCodeRouteKind::Builtin),
+            ),
+            (
+                crate::runtime::opencode_v2::RUNTIME,
+                crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID,
+                Some(OpenCodeRouteKind::Builtin),
+            ),
+            (
+                "module",
+                OPENCODE_RUST_ARTIFACT_ID,
+                Some(OpenCodeRouteKind::Standalone),
+            ),
+            (
+                crate::runtime::opencode_v2::RUNTIME,
+                OPENCODE_RUST_ARTIFACT_ID,
+                None,
+            ),
+            ("module", crate::runtime::opencode_v2::ARTIFACT_ID, None),
+            (
+                "module",
+                crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID,
+                None,
+            ),
+            ("module", "eliot-opencode-v2.rust-http.1.extra", None),
+            ("MODULE", OPENCODE_RUST_ARTIFACT_ID, None),
+            ("unknown", "unknown-artifact", None),
+        ];
+
+        for (runtime, artifact_id, expected) in cases {
+            assert_eq!(
+                opencode_route_kind(runtime, artifact_id),
+                expected,
+                "unexpected classification for runtime={runtime:?}, artifact={artifact_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn documented_fresh_owned_route_accepts_directory_only_and_keeps_its_pin() {
+        let directory = absolute_fixture_path("owned-opencode-workspace");
+        let route = route(json!({"directory": directory}), Some(owned_service()));
+
+        assert!(route.validate_activation_contract().is_ok());
+        assert_eq!(route.runtime, "module");
+        assert_eq!(route.module_artifact_id, OPENCODE_RUST_ARTIFACT_ID);
+        assert_eq!(route.workspace_option.as_deref(), Some("directory"));
+        assert_eq!(
+            route.native_options["directory"].as_str(),
+            Some(directory.as_str())
+        );
+        let owner = route.owned_service.as_ref().expect("owned route fixture");
+        assert_eq!(owner.service_id, "native-prereq-opencode");
+        assert_eq!(owner.model.id, "step-5-preview-free");
+        assert_eq!(owner.model.provider_id, "opencode");
+        assert_eq!(owner.model.variant, "high");
+    }
+
+    #[test]
+    fn owned_route_rejects_static_external_identity_fields() {
+        for (key, value) in [
+            ("service_id", json!("external-opencode")),
+            (
+                "connection_file",
+                json!(absolute_fixture_path("external-connection.json")),
+            ),
+            ("expected_version", json!("2.0.7")),
+            (
+                "model",
+                json!({"id": "step-5-preview-free", "providerID": "opencode", "variant": "high"}),
+            ),
+        ] {
+            let mut options = json!({
+                "directory": absolute_fixture_path("owned-opencode-workspace")
+            });
+            options
+                .as_object_mut()
+                .expect("object fixture")
+                .insert(key.to_owned(), value);
+
+            assert!(
+                route(options, Some(owned_service()))
+                    .validate_activation_contract()
+                    .is_err(),
+                "owned route accepted conflicting external field {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_route_still_requires_the_complete_static_connection_source() {
+        let directory = absolute_fixture_path("external-opencode-workspace");
+        assert!(
+            route(json!({"directory": directory}), None)
+                .validate_activation_contract()
+                .is_err()
+        );
+
+        let external_options = json!({
+            "service_id": "external-opencode",
+            "connection_file": absolute_fixture_path("external-connection.json"),
+            "directory": absolute_fixture_path("external-opencode-workspace"),
+            "model": {
+                "id": "step-5-preview-free",
+                "providerID": "opencode",
+                "variant": "high"
+            }
+        });
+        assert!(
+            route(external_options, None)
+                .validate_activation_contract()
+                .is_ok()
+        );
+
+        let versioned_options = json!({
+            "service_id": "external-opencode",
+            "connection_file": absolute_fixture_path("external-connection.json"),
+            "expected_version": "2.0.7",
+            "directory": absolute_fixture_path("external-opencode-workspace"),
+            "model": {
+                "id": "step-5-preview-free",
+                "providerID": "opencode",
+                "variant": "high"
+            }
+        });
+        assert!(
+            route(versioned_options, None)
+                .validate_activation_contract()
+                .is_err()
+        );
     }
 }

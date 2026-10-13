@@ -186,7 +186,9 @@ mod tests {
                     [SCRIPT_ID],
                     |row| row.get(0),
                 )?;
-                let operation: Option<(String, String, String, Option<String>, Option<String>, String, String, String)> = db
+                type TasklessOperationRow = (String, String, String, Option<String>, Option<String>, String, String, String);
+                type TasklessScriptRunRow = (String, Option<String>, Option<i64>, Option<String>, String, String);
+                let operation: Option<TasklessOperationRow> = db
                     .query_row(
                         "SELECT operation_id,caller_id,client_request_id,task_id,attempt_id,state,result_json,effective_request_json \
                          FROM operations WHERE method='script.run' ORDER BY created_at_ms,operation_id LIMIT 1",
@@ -194,7 +196,7 @@ mod tests {
                         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
                     )
                     .optional()?;
-                let script_run: Option<(String, Option<String>, Option<i64>, Option<String>, String, String)> =
+                let script_run: Option<TasklessScriptRunRow> =
                     if let Some((operation_id, ..)) = operation.as_ref() {
                         db.query_row(
                             "SELECT run_id,task_id,task_revision,attempt_id,state,spec_json FROM script_runs WHERE operation_id=?1",
@@ -246,7 +248,7 @@ mod tests {
                             "attempt_id":attempt_id,"state":state,"spec":serde_json::from_str::<Value>(&spec_json)?
                         }))
                     }).transpose()?,
-                    "link":link.map(|link| serde_json::to_value(link)).transpose()?,
+                    "link":link.map(serde_json::to_value).transpose()?,
                     "source":source,
                     "dispatch":dispatch,
                 }))

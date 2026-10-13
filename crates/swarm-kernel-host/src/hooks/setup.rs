@@ -1158,106 +1158,106 @@ mod tests {
             credential_before
         );
 
-        let trace = trace.lock().expect("test IPC trace mutex is healthy");
-        assert_eq!(
-            trace.dropped_operation_replies,
-            vec![drop_operation.to_owned()]
-        );
-        assert!(!trace.drop_operation_armed);
-        let preview = trace
-            .preview
-            .as_ref()
-            .expect("the real hook_setup Preview response crossed local IPC");
-        assert_eq!(
-            preview["existing_post_commit_exe"]["sha256"].as_str(),
-            Some(expected_prior_digest.as_str()),
-            "the large existing executable digest reaches the actual setup preview"
-        );
+        {
+            let trace = trace.lock().expect("test IPC trace mutex is healthy");
+            assert_eq!(
+                trace.dropped_operation_replies,
+                vec![drop_operation.to_owned()]
+            );
+            assert!(!trace.drop_operation_armed);
+            let preview = trace
+                .preview
+                .as_ref()
+                .expect("the real hook_setup Preview response crossed local IPC");
+            assert_eq!(
+                preview["existing_post_commit_exe"]["sha256"].as_str(),
+                Some(expected_prior_digest.as_str()),
+                "the large existing executable digest reaches the actual setup preview"
+            );
 
-        let applications: Vec<_> = trace
-            .requests
-            .iter()
-            .filter(|request| {
-                request.method == "hook.local.operation"
-                    && request.operation.as_deref() == Some("apply")
-            })
-            .collect();
-        assert_eq!(
-            applications.len(),
-            1,
-            "the native Apply effect is never replayed"
-        );
-        assert_eq!(
-            applications[0].source_id.as_deref(),
-            Some(prepared.source_id.as_str())
-        );
+            let applications: Vec<_> = trace
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.method == "hook.local.operation"
+                        && request.operation.as_deref() == Some("apply")
+                })
+                .collect();
+            assert_eq!(
+                applications.len(),
+                1,
+                "the native Apply effect is never replayed"
+            );
+            assert_eq!(
+                applications[0].source_id.as_deref(),
+                Some(prepared.source_id.as_str())
+            );
 
-        let source_setups: Vec<_> = trace
-            .requests
-            .iter()
-            .filter(|request| request.method == "hook.source.setup")
-            .collect();
-        assert_eq!(source_setups.len(), 1);
-        assert_eq!(
-            source_setups[0].source_id.as_deref(),
-            Some(prepared.source_id.as_str())
-        );
-        assert_eq!(
-            source_setups[0].client_request_id.as_deref(),
-            Some(request_id.as_str())
-        );
+            let source_setups: Vec<_> = trace
+                .requests
+                .iter()
+                .filter(|request| request.method == "hook.source.setup")
+                .collect();
+            assert_eq!(source_setups.len(), 1);
+            assert_eq!(
+                source_setups[0].source_id.as_deref(),
+                Some(prepared.source_id.as_str())
+            );
+            assert_eq!(
+                source_setups[0].client_request_id.as_deref(),
+                Some(request_id.as_str())
+            );
 
-        let local_operations: Vec<_> = trace
-            .requests
-            .iter()
-            .filter(|request| request.method == "hook.local.operation")
-            .filter_map(|request| request.operation.as_deref())
-            .collect();
-        let expected_local_operations = match drop_operation {
-            "apply" => vec!["preview", "apply", "readback", "complete_setup"],
-            "readback" => vec!["preview", "apply", "readback", "readback", "complete_setup"],
-            _ => unreachable!("the test enumerates only Apply and Readback faults"),
-        };
-        assert_eq!(local_operations, expected_local_operations);
-        let readbacks: Vec<_> = trace
-            .requests
-            .iter()
-            .filter(|request| {
-                request.method == "hook.local.operation"
-                    && request.operation.as_deref() == Some("readback")
-            })
-            .collect();
-        assert_eq!(
-            readbacks.len(),
-            if drop_operation == "apply" { 1 } else { 2 }
-        );
-        assert!(
-            readbacks.iter().all(|request| {
+            let local_operations: Vec<_> = trace
+                .requests
+                .iter()
+                .filter(|request| request.method == "hook.local.operation")
+                .filter_map(|request| request.operation.as_deref())
+                .collect();
+            let expected_local_operations = match drop_operation {
+                "apply" => vec!["preview", "apply", "readback", "complete_setup"],
+                "readback" => vec!["preview", "apply", "readback", "readback", "complete_setup"],
+                _ => unreachable!("the test enumerates only Apply and Readback faults"),
+            };
+            assert_eq!(local_operations, expected_local_operations);
+            let readbacks: Vec<_> = trace
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.method == "hook.local.operation"
+                        && request.operation.as_deref() == Some("readback")
+                })
+                .collect();
+            assert_eq!(
+                readbacks.len(),
+                if drop_operation == "apply" { 1 } else { 2 }
+            );
+            assert!(readbacks.iter().all(|request| {
                 request.source_id.as_deref() == Some(prepared.source_id.as_str())
-            })
-        );
-        let completions: Vec<_> = trace
-            .requests
-            .iter()
-            .filter(|request| {
-                request.method == "hook.local.operation"
-                    && request.operation.as_deref() == Some("complete_setup")
-            })
-            .collect();
-        assert_eq!(completions.len(), 1);
-        assert_eq!(
-            completions[0].source_id.as_deref(),
-            Some(prepared.source_id.as_str())
-        );
-        assert_eq!(
-            completions[0].client_request_id.as_deref(),
-            Some(request_id.as_str())
-        );
-        assert!(!trace.requests.iter().any(|request| {
-            request.method == "hook.source.revoke"
-                || request.operation.as_deref() == Some("revoke")
-                || request.operation.as_deref() == Some("rollback_setup")
-        }));
+            }));
+            let completions: Vec<_> = trace
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.method == "hook.local.operation"
+                        && request.operation.as_deref() == Some("complete_setup")
+                })
+                .collect();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(
+                completions[0].source_id.as_deref(),
+                Some(prepared.source_id.as_str())
+            );
+            assert_eq!(
+                completions[0].client_request_id.as_deref(),
+                Some(request_id.as_str())
+            );
+            assert!(!trace.requests.iter().any(|request| {
+                request.method == "hook.source.revoke"
+                    || request.operation.as_deref() == Some("revoke")
+                    || request.operation.as_deref() == Some("rollback_setup")
+            }));
+        }
 
         stop.send(true).expect("stop the local IPC fixture");
         accept_task

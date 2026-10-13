@@ -123,7 +123,7 @@ async fn public_module_observe_bounds_terminal_evidence_metadata() {
     });
     let wrong_type_cursor_event = event_ref("evt-app144-wrong-cursor-type", 14);
     let oversized_cursor_event = event_ref("evt-app144-oversized-cursor", 15);
-    let cases = vec![
+    let cases = [
         ("valid", valid.clone(), json!(11), valid.clone(), json!(11)),
         (
             "oversized_event",

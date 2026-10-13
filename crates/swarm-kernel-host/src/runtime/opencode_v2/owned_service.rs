@@ -4215,7 +4215,7 @@ mod deadline_contract_tests {
             bytes_written < 8 * 1024 * 1024,
             "child unexpectedly drained stdin"
         );
-        let probe = [b'x'];
+        let probe = *b"x";
         assert!(
             timeout(Duration::from_millis(50), helper_stdin.write(&probe))
                 .await

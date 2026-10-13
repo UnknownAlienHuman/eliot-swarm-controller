@@ -293,11 +293,10 @@ mod tests {
                 .send(reply)
                 .await
                 .expect("write fake handshake reply");
-            match tokio::time::timeout(Duration::from_secs(1), reader.next()).await {
-                Ok(Some(Ok(line))) => {
-                    panic!("Client sent application frame after rejected hello: {line}")
-                }
-                _ => {}
+            if let Ok(Some(Ok(line))) =
+                tokio::time::timeout(Duration::from_secs(1), reader.next()).await
+            {
+                panic!("Client sent application frame after rejected hello: {line}")
             }
         });
         let credential = Credential {

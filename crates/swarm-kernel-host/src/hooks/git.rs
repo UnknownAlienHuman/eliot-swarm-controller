@@ -3502,7 +3502,7 @@ mod tests {
         assert_eq!(retry.state, "absent");
         assert!(!fixture.source_dir().exists());
         assert_eq!(
-            fs::read(&fixture.hook_path()).unwrap().as_slice(),
+            fs::read(fixture.hook_path()).unwrap().as_slice(),
             ORIGINAL_HOOK
         );
     }

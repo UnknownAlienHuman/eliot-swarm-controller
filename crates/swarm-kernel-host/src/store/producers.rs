@@ -170,100 +170,6 @@ fn matching_run<'a>(state: &'a Value, session: &str, run: &str) -> Option<&'a Va
     }
     observed
 }
-
-#[cfg(test)]
-mod receipt_ambiguity_tests {
-    use super::*;
-
-    #[test]
-    fn identical_run_copies_settle_once_but_conflicts_remain_unresolved() {
-        let terminal = json!({"sessionId":"session","turnId":"turn",
-            "terminal":"completed",
-            "event":{"id":"evt_session_turn","seq":1,"sha256":model::digest(b"session turn")},
-            "viewCursor":1});
-        let producer =
-            json!({"native_session_id":"session","native_run_id":"turn","disposition":"admitted"});
-        let mut consistent = producer.clone();
-        apply_evidence(
-            &mut consistent,
-            &json!({"turns":[terminal.clone()],
-            "observed_children":[{"sessionId":"session","last_turn":terminal.clone()}]}),
-            Some(1),
-        );
-        assert_eq!(consistent["disposition"], "completed");
-        let mut conflicted = terminal.clone();
-        conflicted["terminal"] = json!("failed");
-        for turns in [
-            json!([terminal.clone(), conflicted.clone()]),
-            json!([conflicted.clone(), terminal.clone()]),
-        ] {
-            let mut unresolved = producer.clone();
-            apply_evidence(&mut unresolved, &json!({"turns":turns}), Some(2));
-            assert_eq!(unresolved["disposition"], "admitted");
-        }
-        let mut unresolved = producer;
-        apply_evidence(
-            &mut unresolved,
-            &json!({"turns":[terminal],
-            "observed_children":[{"sessionId":"session","last_turn":conflicted}]}),
-            Some(3),
-        );
-        assert_eq!(unresolved["disposition"], "admitted");
-    }
-
-    #[test]
-    fn child_terminal_diagnostics_are_bounded_and_match_exact_run() {
-        let terminal = json!({
-            "sessionId":"ses_child",
-            "turnId":"run_child",
-            "terminal":"failed",
-            "event":{"id":"evt_child_failed","seq":4,"sha256":model::digest(b"child failed")},
-            "viewCursor":4,
-            "stage":"execution_failed",
-            "error_code":"NATIVE_CHILD_FAILED"
-        });
-        let state = json!({
-            "turns":[],
-            "observed_children":[{"sessionId":"ses_child","last_turn":terminal}]
-        });
-        let producer = json!({
-            "native_session_id":"ses_child",
-            "native_run_id":"run_child",
-            "disposition":"admitted"
-        });
-
-        let mut valid = producer.clone();
-        apply_evidence(&mut valid, &state, Some(7));
-        assert_eq!(valid["disposition"], "failed");
-        assert_eq!(valid["terminal_evidence"]["stage"], "execution_failed");
-        assert_eq!(
-            valid["terminal_evidence"]["error_code"],
-            "NATIVE_CHILD_FAILED"
-        );
-        assert_eq!(valid["terminal_evidence"]["event"]["seq"], 4);
-        assert_eq!(valid["terminal_evidence"]["view_cursor"], 4);
-
-        for (field, value) in [
-            ("stage", json!("raw stage text")),
-            ("error_code", json!("raw native error text")),
-            ("error_code", json!("A".repeat(65))),
-        ] {
-            let mut invalid_state = state.clone();
-            invalid_state["observed_children"][0]["last_turn"][field] = value;
-            let mut sanitized = producer.clone();
-            apply_evidence(&mut sanitized, &invalid_state, Some(8));
-            assert_eq!(sanitized["disposition"], "failed");
-            assert_eq!(sanitized["terminal_evidence"][field], Value::Null);
-            assert_eq!(sanitized["terminal_evidence"]["observation_id"], 8);
-        }
-
-        let mut wrong_run = producer;
-        wrong_run["native_run_id"] = json!("run_other");
-        apply_evidence(&mut wrong_run, &state, Some(9));
-        assert_eq!(wrong_run["disposition"], "admitted");
-        assert!(wrong_run["terminal_evidence"].is_null());
-    }
-}
 fn run_observed(state: &Value, session: &str, run: &str) -> bool {
     let member = state["native_root_id"] == session
         || state["observed_children"]
@@ -712,4 +618,98 @@ pub(super) fn bind(
     Ok(
         json!({"operation_id":operation,"attempt_id":attempt_id,"producer":producers[index],"native_start_sent":false}),
     )
+}
+
+#[cfg(test)]
+mod receipt_ambiguity_tests {
+    use super::*;
+
+    #[test]
+    fn identical_run_copies_settle_once_but_conflicts_remain_unresolved() {
+        let terminal = json!({"sessionId":"session","turnId":"turn",
+            "terminal":"completed",
+            "event":{"id":"evt_session_turn","seq":1,"sha256":model::digest(b"session turn")},
+            "viewCursor":1});
+        let producer =
+            json!({"native_session_id":"session","native_run_id":"turn","disposition":"admitted"});
+        let mut consistent = producer.clone();
+        apply_evidence(
+            &mut consistent,
+            &json!({"turns":[terminal.clone()],
+            "observed_children":[{"sessionId":"session","last_turn":terminal.clone()}]}),
+            Some(1),
+        );
+        assert_eq!(consistent["disposition"], "completed");
+        let mut conflicted = terminal.clone();
+        conflicted["terminal"] = json!("failed");
+        for turns in [
+            json!([terminal.clone(), conflicted.clone()]),
+            json!([conflicted.clone(), terminal.clone()]),
+        ] {
+            let mut unresolved = producer.clone();
+            apply_evidence(&mut unresolved, &json!({"turns":turns}), Some(2));
+            assert_eq!(unresolved["disposition"], "admitted");
+        }
+        let mut unresolved = producer;
+        apply_evidence(
+            &mut unresolved,
+            &json!({"turns":[terminal],
+            "observed_children":[{"sessionId":"session","last_turn":conflicted}]}),
+            Some(3),
+        );
+        assert_eq!(unresolved["disposition"], "admitted");
+    }
+
+    #[test]
+    fn child_terminal_diagnostics_are_bounded_and_match_exact_run() {
+        let terminal = json!({
+            "sessionId":"ses_child",
+            "turnId":"run_child",
+            "terminal":"failed",
+            "event":{"id":"evt_child_failed","seq":4,"sha256":model::digest(b"child failed")},
+            "viewCursor":4,
+            "stage":"execution_failed",
+            "error_code":"NATIVE_CHILD_FAILED"
+        });
+        let state = json!({
+            "turns":[],
+            "observed_children":[{"sessionId":"ses_child","last_turn":terminal}]
+        });
+        let producer = json!({
+            "native_session_id":"ses_child",
+            "native_run_id":"run_child",
+            "disposition":"admitted"
+        });
+
+        let mut valid = producer.clone();
+        apply_evidence(&mut valid, &state, Some(7));
+        assert_eq!(valid["disposition"], "failed");
+        assert_eq!(valid["terminal_evidence"]["stage"], "execution_failed");
+        assert_eq!(
+            valid["terminal_evidence"]["error_code"],
+            "NATIVE_CHILD_FAILED"
+        );
+        assert_eq!(valid["terminal_evidence"]["event"]["seq"], 4);
+        assert_eq!(valid["terminal_evidence"]["view_cursor"], 4);
+
+        for (field, value) in [
+            ("stage", json!("raw stage text")),
+            ("error_code", json!("raw native error text")),
+            ("error_code", json!("A".repeat(65))),
+        ] {
+            let mut invalid_state = state.clone();
+            invalid_state["observed_children"][0]["last_turn"][field] = value;
+            let mut sanitized = producer.clone();
+            apply_evidence(&mut sanitized, &invalid_state, Some(8));
+            assert_eq!(sanitized["disposition"], "failed");
+            assert_eq!(sanitized["terminal_evidence"][field], Value::Null);
+            assert_eq!(sanitized["terminal_evidence"]["observation_id"], 8);
+        }
+
+        let mut wrong_run = producer;
+        wrong_run["native_run_id"] = json!("run_other");
+        apply_evidence(&mut wrong_run, &state, Some(9));
+        assert_eq!(wrong_run["disposition"], "admitted");
+        assert!(wrong_run["terminal_evidence"].is_null());
+    }
 }

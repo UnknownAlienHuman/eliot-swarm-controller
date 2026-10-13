@@ -209,6 +209,45 @@ fn first_occurrence_at_or_after(
     ))
 }
 
+/// Return the first future occurrence, or the first occurrence at/after the
+/// calendar anchor when the anchor has not yet arrived.
+pub(crate) fn next_due_at_ms(definition: &CalendarDefinition, now_ms: i64) -> Result<Option<i64>> {
+    let lower_bound_ms = now_ms.max(definition.anchor_ms);
+    let inclusive = now_ms < definition.anchor_ms;
+    let parsed = parse_calendar(definition)?;
+    first_occurrence_at_or_after(&parsed, lower_bound_ms, inclusive).map(Some)
+}
+
+/// Preview a bounded list of upcoming occurrences, beginning strictly after
+/// `after_ms` and respecting the calendar's inclusive activation anchor.
+pub(crate) fn preview_next_occurrences(
+    definition: &CalendarDefinition,
+    after_ms: i64,
+    limit: usize,
+) -> Result<Vec<CalendarOccurrence>> {
+    if !(1..=MAX_PREVIEW_OCCURRENCES).contains(&limit) {
+        return Err(Error::invalid(format!(
+            "calendar preview limit must be between 1 and {MAX_PREVIEW_OCCURRENCES}"
+        )));
+    }
+    let parsed = parse_calendar(definition)?;
+    let mut result = Vec::with_capacity(limit);
+    let lower_bound_ms = after_ms.max(definition.anchor_ms);
+    let first_is_inclusive = after_ms < definition.anchor_ms;
+    let mut next = first_occurrence_at_or_after(&parsed, lower_bound_ms, first_is_inclusive)?;
+    result.push(CalendarOccurrence { due_at_ms: next });
+    while result.len() < limit {
+        let cursor = local_second_at(&parsed, next)?;
+        let occurrence = parsed
+            .cron
+            .find_next_occurrence(&cursor, false)
+            .map_err(|error| Error::new("CRON_EVALUATION", error.to_string()))?;
+        next = occurrence_epoch_ms(&occurrence);
+        result.push(CalendarOccurrence { due_at_ms: next });
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,43 +290,4 @@ mod tests {
             Some(epoch_ms("2024-11-03T05:30:00Z"))
         );
     }
-}
-
-/// Return the first future occurrence, or the first occurrence at/after the
-/// calendar anchor when the anchor has not yet arrived.
-pub(crate) fn next_due_at_ms(definition: &CalendarDefinition, now_ms: i64) -> Result<Option<i64>> {
-    let lower_bound_ms = now_ms.max(definition.anchor_ms);
-    let inclusive = now_ms < definition.anchor_ms;
-    let parsed = parse_calendar(definition)?;
-    first_occurrence_at_or_after(&parsed, lower_bound_ms, inclusive).map(Some)
-}
-
-/// Preview a bounded list of upcoming occurrences, beginning strictly after
-/// `after_ms` and respecting the calendar's inclusive activation anchor.
-pub(crate) fn preview_next_occurrences(
-    definition: &CalendarDefinition,
-    after_ms: i64,
-    limit: usize,
-) -> Result<Vec<CalendarOccurrence>> {
-    if !(1..=MAX_PREVIEW_OCCURRENCES).contains(&limit) {
-        return Err(Error::invalid(format!(
-            "calendar preview limit must be between 1 and {MAX_PREVIEW_OCCURRENCES}"
-        )));
-    }
-    let parsed = parse_calendar(definition)?;
-    let mut result = Vec::with_capacity(limit);
-    let lower_bound_ms = after_ms.max(definition.anchor_ms);
-    let first_is_inclusive = after_ms < definition.anchor_ms;
-    let mut next = first_occurrence_at_or_after(&parsed, lower_bound_ms, first_is_inclusive)?;
-    result.push(CalendarOccurrence { due_at_ms: next });
-    while result.len() < limit {
-        let cursor = local_second_at(&parsed, next)?;
-        let occurrence = parsed
-            .cron
-            .find_next_occurrence(&cursor, false)
-            .map_err(|error| Error::new("CRON_EVALUATION", error.to_string()))?;
-        next = occurrence_epoch_ms(&occurrence);
-        result.push(CalendarOccurrence { due_at_ms: next });
-    }
-    Ok(result)
 }

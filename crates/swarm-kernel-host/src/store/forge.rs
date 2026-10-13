@@ -3739,9 +3739,11 @@ mod tests {
     }
 
     fn reconciliation_config() -> ForgeConfig {
-        let mut config = ForgeConfig::default();
-        config.enabled = true;
-        config.git_executable = std::env::current_exe().unwrap();
+        let mut config = ForgeConfig {
+            enabled: true,
+            git_executable: std::env::current_exe().unwrap(),
+            ..Default::default()
+        };
         config.projects.insert(
             "project-1".into(),
             ForgeProject {
@@ -3896,9 +3898,11 @@ mod tests {
             policy_revision: "owner-policy-v1".into(),
             target_refs: vec!["refs/heads/main".into()],
         };
-        let mut config = ForgeConfig::default();
-        config.enabled = true;
-        config.git_executable = git.clone();
+        let mut config = ForgeConfig {
+            enabled: true,
+            git_executable: git.clone(),
+            ..Default::default()
+        };
         config.projects.insert("project-1".into(), project.clone());
         let intent = PublicationIntent {
             operation_id: "forge-split-url-test".into(),

@@ -150,7 +150,7 @@ mod tests {
             .map(|offset| start + heading.len() + offset)
             .expect("following section heading exists");
         assert_eq!(
-            crate::model::digest(document[start..end].as_bytes()),
+            crate::model::digest(&document.as_bytes()[start..end]),
             OWNER_POLICY_V1_DOCUMENT_SHA256
         );
     }

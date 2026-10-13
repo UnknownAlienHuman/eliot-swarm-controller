@@ -86,6 +86,11 @@ fn fixture_db() -> Connection {
     db
 }
 
+struct StoredOperationIdentity<'a> {
+    operation_id: &'a str,
+    client_request_id: &'a str,
+}
+
 fn seed_direct_slot(
     db: &Connection,
     package: &ReviewFindingsPackage,
@@ -93,9 +98,12 @@ fn seed_direct_slot(
     semantic_slot_id: &str,
     findings_digest: Option<String>,
     finding_id: Option<String>,
-    operation_id: &str,
-    stored_request_id: &str,
+    identity: StoredOperationIdentity<'_>,
 ) {
+    let StoredOperationIdentity {
+        operation_id,
+        client_request_id: stored_request_id,
+    } = identity;
     let original_request = request(package, stored_request_id);
     let original = model::canonical(&original_request).expect("canonical fixture request");
     let parameters_digest = repair_request_digest(&original_request).expect("request digest");
@@ -211,8 +219,10 @@ fn same_correction_across_reviews_reads_back_the_original_legacy_slot_and_native
         &retained_slot_id,
         Some(retained.findings_digest.clone()),
         None,
-        operation_id,
-        &retained_slot_id,
+        StoredOperationIdentity {
+            operation_id,
+            client_request_id: &retained_slot_id,
+        },
     );
     let native_result = json!({
         "outcome":"applied",
@@ -302,8 +312,10 @@ fn pre_package_singleton_text_reuses_the_immutable_operation_and_rejects_tamperi
         &legacy_id,
         None,
         Some(package.findings[0].finding_id.clone()),
-        operation_id,
-        "retained-singleton-request",
+        StoredOperationIdentity {
+            operation_id,
+            client_request_id: "retained-singleton-request",
+        },
     );
     let mut original = request(&package, "retained-singleton-request");
     // Golden bytes from the pre-package renderer (3fff155), independent of
@@ -372,8 +384,10 @@ fn changed_package_on_legacy_singleton_key_is_a_bounded_conflict() {
         &legacy_id,
         Some(previous.findings_digest.clone()),
         None,
-        "operation-previous-package",
-        "retained-v1-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-previous-package",
+            client_request_id: "retained-v1-request-id",
+        },
     );
 
     let resolution = resolve_direct_slot(&db, &direct_slot(current))
@@ -406,8 +420,10 @@ fn exact_v1_slots_with_both_historical_receipt_shapes_coalesce_without_another_o
             &legacy_id,
             findings_digest,
             finding_id,
-            &operation_id,
-            "retained-v1-request-id",
+            StoredOperationIdentity {
+                operation_id: &operation_id,
+                client_request_id: "retained-v1-request-id",
+            },
         );
         let before: i64 = db
             .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
@@ -439,8 +455,10 @@ fn forged_digest_and_mixed_version_slot_identity_are_denied() {
         &legacy_id,
         Some("forged-package-digest".to_owned()),
         Some("finding-stable-id".to_owned()),
-        "operation-forged-digest",
-        "retained-v1-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-forged-digest",
+            client_request_id: "retained-v1-request-id",
+        },
     );
     let error = resolve_direct_slot(&db, &direct_slot(package.clone()))
         .expect_err("a finding ID cannot mask a forged retained digest");
@@ -454,8 +472,10 @@ fn forged_digest_and_mixed_version_slot_identity_are_denied() {
         &legacy_id,
         Some("forged-package-digest-only".to_owned()),
         None,
-        "operation-forged-digest-only",
-        "retained-v1-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-forged-digest-only",
+            client_request_id: "retained-v1-request-id",
+        },
     );
     let error = resolve_direct_slot(&db, &direct_slot(package.clone()))
         .expect_err("a forged digest that disagrees with immutable Operation text is denied");
@@ -469,8 +489,10 @@ fn forged_digest_and_mixed_version_slot_identity_are_denied() {
         &legacy_id,
         Some(package.findings_digest.clone()),
         None,
-        "operation-mixed-version",
-        "retained-v2-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-mixed-version",
+            client_request_id: "retained-v2-request-id",
+        },
     );
     let error = resolve_direct_slot(&db, &direct_slot(package))
         .expect_err("a v2 receipt cannot occupy the v1 finding-ID key");
@@ -493,8 +515,10 @@ fn legacy_slot_with_forged_operation_binding_is_denied() {
         &legacy_id,
         None,
         Some("finding-stable-id".to_owned()),
-        "operation-forged-binding",
-        "retained-v1-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-forged-binding",
+            client_request_id: "retained-v1-request-id",
+        },
     );
     db.execute(
         "UPDATE operations SET binding_id='forged-binding' WHERE operation_id=?1",
@@ -521,8 +545,10 @@ fn simultaneous_digest_and_legacy_slots_are_explicitly_ambiguous() {
         &current_id,
         Some(package.findings_digest.clone()),
         None,
-        "operation-current",
-        "retained-v2-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-current",
+            client_request_id: "retained-v2-request-id",
+        },
     );
     seed_direct_slot(
         &db,
@@ -531,8 +557,10 @@ fn simultaneous_digest_and_legacy_slots_are_explicitly_ambiguous() {
         &legacy_id,
         None,
         Some("finding-stable-id".to_owned()),
-        "operation-legacy",
-        "retained-v1-request-id",
+        StoredOperationIdentity {
+            operation_id: "operation-legacy",
+            client_request_id: "retained-v1-request-id",
+        },
     );
 
     let error = resolve_direct_slot(&db, &direct_slot(package))

@@ -2097,6 +2097,65 @@ fn retain_review_disposition(
     Ok(())
 }
 
+fn require_review_package_provenance(
+    tx: &Transaction<'_>,
+    package: &ReviewFindingsPackage,
+) -> Result<Value> {
+    let damaged = || {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "feedback package does not match its exact retained review result",
+        )
+    };
+    package.validate().map_err(|_| damaged())?;
+    for finding in &package.findings {
+        let provenance = super::reviews::actionable_finding(
+            tx,
+            &package.identity.task_id,
+            &package.identity.attempt_id,
+            package.identity.task_revision,
+            &package.identity.submission_ref,
+            &package.identity.candidate_ref,
+            &finding.finding_id,
+        )?;
+        if provenance["review_assignment_id"] != package.review_assignment_id
+            || provenance["review_operation_id"] != package.review_result_operation_id
+            || provenance["identity"] != json!(package.identity)
+            || provenance["finding"] != serde_json::to_value(finding)?
+        {
+            return Err(damaged());
+        }
+    }
+    Ok(json!({
+        "review_assignment_id":package.review_assignment_id,
+        "review_operation_id":package.review_result_operation_id,
+        "identity":package.identity,
+        "findings_package":package,
+        "findings_digest":package.findings_digest,
+        "findings":package.findings
+    }))
+}
+
+fn require_automation_review_package_provenance(
+    tx: &Transaction<'_>,
+    context: &ReviewDispositionContext,
+    package: &ReviewFindingsPackage,
+) -> Result<Value> {
+    let damaged = || {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "automation feedback package does not match its exact retained review result",
+        )
+    };
+    if &package.identity != context.identity()
+        || package.review_assignment_id != context.review_assignment_id()
+        || package.review_result_operation_id != context.review_result_operation_id()
+    {
+        return Err(damaged());
+    }
+    require_review_package_provenance(tx, package)
+}
+
 #[cfg(test)]
 mod disposition_retention_tests {
     use super::*;
@@ -2253,63 +2312,4 @@ mod disposition_retention_tests {
         let retained: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(retained["operation_id"], "feedback-operation-first");
     }
-}
-
-fn require_review_package_provenance(
-    tx: &Transaction<'_>,
-    package: &ReviewFindingsPackage,
-) -> Result<Value> {
-    let damaged = || {
-        Error::new(
-            "REVIEW_RESULT_DAMAGED",
-            "feedback package does not match its exact retained review result",
-        )
-    };
-    package.validate().map_err(|_| damaged())?;
-    for finding in &package.findings {
-        let provenance = super::reviews::actionable_finding(
-            tx,
-            &package.identity.task_id,
-            &package.identity.attempt_id,
-            package.identity.task_revision,
-            &package.identity.submission_ref,
-            &package.identity.candidate_ref,
-            &finding.finding_id,
-        )?;
-        if provenance["review_assignment_id"] != package.review_assignment_id
-            || provenance["review_operation_id"] != package.review_result_operation_id
-            || provenance["identity"] != json!(package.identity)
-            || provenance["finding"] != serde_json::to_value(finding)?
-        {
-            return Err(damaged());
-        }
-    }
-    Ok(json!({
-        "review_assignment_id":package.review_assignment_id,
-        "review_operation_id":package.review_result_operation_id,
-        "identity":package.identity,
-        "findings_package":package,
-        "findings_digest":package.findings_digest,
-        "findings":package.findings
-    }))
-}
-
-fn require_automation_review_package_provenance(
-    tx: &Transaction<'_>,
-    context: &ReviewDispositionContext,
-    package: &ReviewFindingsPackage,
-) -> Result<Value> {
-    let damaged = || {
-        Error::new(
-            "REVIEW_RESULT_DAMAGED",
-            "automation feedback package does not match its exact retained review result",
-        )
-    };
-    if &package.identity != context.identity()
-        || package.review_assignment_id != context.review_assignment_id()
-        || package.review_result_operation_id != context.review_result_operation_id()
-    {
-        return Err(damaged());
-    }
-    require_review_package_provenance(tx, package)
 }

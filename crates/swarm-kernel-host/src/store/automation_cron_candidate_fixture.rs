@@ -296,8 +296,7 @@ fn unknown_and_non_candidate_errors_remain_fatal() {
                 .with_secondary_code("SQLITE_BUSY"),
             10,
         )
-        .err()
-        .expect("secondary infrastructure failures must remain fatal");
+        .expect_err("secondary infrastructure failures must remain fatal");
         assert_eq!(error.code, code);
         assert_eq!(error.secondary_codes, vec!["SQLITE_BUSY"]);
         assert_eq!(
