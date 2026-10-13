@@ -1806,20 +1806,10 @@ impl Store {
     pub(crate) async fn reconcile_scripts_once(&self) -> Result<()> {
         self.poll_script_children(false).await?;
         let rows = self.run(|db| pending_runs(db)).await?;
-        // Advance the durable fairness cursor only after this whole pass
-        // selected its subjects. A Store failure stays fatal and preserves the
-        // previous cursor, so an unexamined run is never reported as visited.
-        let last_run_id = rows.last().map(|row| row.run_id.clone());
-        self.run(move |db| {
-            if let Some(run_id) = last_run_id.as_deref() {
-                let key = selected_pending_run_key(db, run_id)?;
-                if let Some(key) = key {
-                    advance_pending_run_cursor(db, &key)?;
-                }
-            }
-            Ok(())
-        })
-        .await?;
+        // The durable fairness cursor advances only after one subject reaches
+        // a stable, truthfully retained disposition. A hard failure returns
+        // with the cursor at the last completed subject, never beyond the
+        // selected page. An identical already-saved value is never rewritten.
         for pending in rows {
             let run_id = pending.run_id.clone();
             let digest = pending.work_digest.clone();
@@ -1867,12 +1857,14 @@ impl Store {
                         self.settle_incomplete_if_worker_departed(&pending, &error.code)
                             .await?;
                     }
+                    self.advance_fairness_cursor_to(&pending.run_id).await?;
                     continue;
                 }
             };
             if work.executor.is_none() && pending.operation_state == "queued" {
                 self.fail_before_start(&pending, "SCRIPT_EXECUTOR_UNSELECTED")
                     .await?;
+                self.advance_fairness_cursor_to(&pending.run_id).await?;
                 continue;
             }
             let observe_work = work.clone();
@@ -1908,6 +1900,7 @@ impl Store {
                     } else {
                         self.mark_unknown(&pending, &error.code).await?;
                     }
+                    self.advance_fairness_cursor_to(&pending.run_id).await?;
                     continue;
                 }
             };
@@ -1924,6 +1917,7 @@ impl Store {
                     self.changed
                         .send_modify(|revision| *revision = revision.wrapping_add(1));
                 }
+                self.advance_fairness_cursor_to(&pending.run_id).await?;
                 continue;
             }
             if let Some(completion) = observed.completion {
@@ -1939,6 +1933,7 @@ impl Store {
                     .await?;
                     self.settle_incomplete_if_worker_departed(&pending, code)
                         .await?;
+                    self.advance_fairness_cursor_to(&pending.run_id).await?;
                     continue;
                 }
                 if !observed.launch_departed {
@@ -1952,6 +1947,7 @@ impl Store {
                     )
                     .await?;
                     self.mark_unknown(&pending, code).await?;
+                    self.advance_fairness_cursor_to(&pending.run_id).await?;
                     continue;
                 }
                 let execution_may_have_started =
@@ -1974,6 +1970,7 @@ impl Store {
                     self.changed
                         .send_modify(|revision| *revision = revision.wrapping_add(1));
                 }
+                self.advance_fairness_cursor_to(&pending.run_id).await?;
                 continue;
             }
             match pending.operation_state.as_str() {
@@ -2003,7 +2000,8 @@ impl Store {
                         }
                         Ok(false) => {}
                         Err(error) => {
-                            self.record_run_error(&pending, error).await?;
+                            self.record_run_error(&pending, error.clone()).await?;
+                            return Err(error);
                         }
                     }
                 }
@@ -2098,8 +2096,26 @@ impl Store {
                 }
                 _ => {}
             }
+            self.advance_fairness_cursor_to(&pending.run_id).await?;
         }
         Ok(())
+    }
+
+    /// Persist the fairness cursor at one successfully reconciled subject.
+    /// The ordering key is re-read in this same pass; caller input never
+    /// becomes a cursor. An identical value is skipped, a missing row is
+    /// ignored, and a cursor-write failure stays hard without erasing the
+    /// subject's retained Operation/ScriptRun truth.
+    async fn advance_fairness_cursor_to(&self, run_id: &str) -> Result<()> {
+        let run_id = run_id.to_owned();
+        self.run(move |db| {
+            let Some(key) = selected_pending_run_key(db, &run_id)? else {
+                return Ok(());
+            };
+            advance_pending_run_cursor(db, &key)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn deny_work(&self, work: &runner::Work, code: &str) -> Result<bool> {
@@ -2972,17 +2988,27 @@ fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
     Ok(rows.into_iter().map(|row| row.projection()).collect())
 }
 
-/// Advance the durable cursor to the last examined subject. A Store-level
-/// failure stays fatal and leaves the cursor unchanged, so an unexamined
-/// subject is never reported as visited.
-fn advance_pending_run_cursor(db: &Connection, last: &PendingRunRow) -> Result<()> {
+/// Advance the durable cursor to one subject that reached a stable,
+/// truthfully retained disposition. An identical already-saved value is
+/// never rewritten, so an empty page and one unchanged long-running subject
+/// do not create a permanent metadata-write loop. A Store-level failure
+/// stays fatal and leaves the cursor unchanged, so an unexamined subject is
+/// never reported as visited. Returns true when the cursor moved.
+fn advance_pending_run_cursor(db: &Connection, last: &PendingRunRow) -> Result<bool> {
+    let current = load_pending_run_cursor(db)?;
+    if current.as_ref().is_some_and(|cursor| {
+        cursor.created_at_ms == last.created_at_ms && cursor.run_id == last.run_id
+    }) {
+        return Ok(false);
+    }
     save_pending_run_cursor(
         db,
         &PendingRunCursor {
             created_at_ms: last.created_at_ms,
             run_id: last.run_id.clone(),
         },
-    )
+    )?;
+    Ok(true)
 }
 
 fn script_worker_observation_expired(pending: &PendingRun) -> bool {
