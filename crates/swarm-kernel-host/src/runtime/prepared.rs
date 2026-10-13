@@ -12,14 +12,16 @@ use serde_json::{Value, json};
 use swarm_contracts::module_catalog::PreInputOpenContract;
 
 pub const CLAUDE_RUNTIME: &str = "claude";
-pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.4";
+pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.5";
 pub const CLAUDE_RETAINED_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.3";
+pub const CLAUDE_RETAINED_ARTIFACT_ID_V4: &str = "claude-agent-sdk-0.3.287-bridge.4";
 
 pub fn is_prepared_claude_route(route: &Value) -> bool {
     let artifact_id = route["module_artifact_id"].as_str();
     route["runtime"] == CLAUDE_RUNTIME
         && (artifact_id == Some(CLAUDE_ARTIFACT_ID)
-            || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID))
+            || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID)
+            || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID_V4))
 }
 
 fn nonempty<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
@@ -685,6 +687,9 @@ mod tests {
         let mut retained = binding();
         retained["route"]["module_artifact_id"] = json!(CLAUDE_RETAINED_ARTIFACT_ID);
         assert!(is_prepared_claude_route(&retained["route"]));
+        let mut retained_v4 = binding();
+        retained_v4["route"]["module_artifact_id"] = json!(CLAUDE_RETAINED_ARTIFACT_ID_V4);
+        assert!(is_prepared_claude_route(&retained_v4["route"]));
         assert!(is_prepared_claude_route(&binding()["route"]));
         assert!(!is_prepared_claude_route(&json!({
             "runtime":CLAUDE_RUNTIME,
