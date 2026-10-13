@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-13",
+  "issues": [
+    138,
+    139
+  ],
+  "source_head": "cbcff1068e256edc15a8121c65ce25b641d9c81d",
+  "source_hashes": [
+    {
+      "path": "crates/swarm-kernel-host/src/store/checks.rs",
+      "sha256": "37DB2ABE6010F61EF02DA4B300B339EAF70A532BDA37385C7DF48DA38167A398"
+    },
+    {
+      "path": "crates/swarm-kernel-host/src/store/checks/tests/reg23_pending_isolation_tests.rs",
+      "sha256": "4924E14743CE49C6C07FFB30B28AB146749E37A399B414AE0309070459A3F7CA"
+    }
+  ],
+  "scope": "CheckRun pending reader/materialization only",
+  "changes": [
+    "invalid retained JSON uses exact spec/invalid_json quarantine, healthy neighbor progresses",
+    "Deferred bounded snapshot leaves empty scans read-only; stale cursor deleted once",
+    "unchanged quarantine occurrence/last_seen/cursor stays stable; changed identity conflicts"
+  ],
+  "windows": {
+    "strict_clippy": {
+      "source": "0577628a760f32820197a74df90b91785f22f8f1",
+      "exit_code": 0,
+      "log_sha256": "1096542E72E40E3F1F472F3C8DC05C21920F2A6FCD289C6A58B9159EB24115EB"
+    },
+    "full_focused": {
+      "source": "cbcff1068e256edc15a8121c65ce25b641d9c81d",
+      "exit_code": 0,
+      "passed": 13,
+      "failed": 0,
+      "filter": "reg23_pending_isolation_tests",
+      "log_sha256": "A30484DE1AED6DC760B3BF38936E15A518A115284FACDA5FA44C5BAF46E95B17"
+    },
+    "repository_just_verify": {
+      "source": "cbcff1068e256edc15a8121c65ce25b641d9c81d",
+      "exit_code": 0,
+      "log_sha256": "915243828D8B7253343F2CFD71B6257AC0745DCC88984C2C13C9ADC4B3096F02"
+    }
+  },
+  "linux": {
+    "strict_clippy": {
+      "source": "0577628a760f32820197a74df90b91785f22f8f1",
+      "exit_code": 0
+    },
+    "focused": {
+      "source": "0577628a760f32820197a74df90b91785f22f8f1",
+      "exit_code": 0,
+      "passed": 13,
+      "failed": 0
+    },
+    "final_source_leaf": {
+      "source": "cbcff1068e256edc15a8121c65ce25b641d9c81d",
+      "exit_code": 0,
+      "passed": 1,
+      "failed": 0,
+      "test": "empty_pending_scan_succeeds_under_external_immediate_lock",
+      "change": "explicit drop of external SQLite connection before directory cleanup; all other focused functions byte-identical"
+    }
+  },
+  "failed_attempts": [
+    "Initial Windows/Linux invalid-JSON fault injection blocked by schema CHECK; fixture-only scopedPRAGMA repaired",
+    "Windows external-writer consumer passed but teardown Win32code32 until externalconnectiondropped"
+  ],
+  "not_run": [
+    "native/model qualification",
+    "PR61 probe cleanup",
+    "PR71 terminal CheckRun",
+    "full V27"
+  ],
+  "eliot_packet": "NOT_CONNECTED_STANDALONE_DOCUMENTED",
+  "full_v27_qualified": false
+}
