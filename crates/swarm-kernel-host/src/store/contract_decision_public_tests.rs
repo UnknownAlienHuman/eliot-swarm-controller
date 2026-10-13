@@ -1,41 +1,12 @@
-//! Focused public-path regression for PR 58 (contract ratify/reject).
+//! PR58 contract decisions: preserved private unit fixtures plus authenticated
+//! StoreOwner regressions in `public_store`. Only the latter author the public
+//! nine-row matrix. All authoritative setup there uses Store.call; its sole SQL
+//! mutation injects a missing scope record after public scope admission.
 //!
-//! The typed producers (coordination.contract.ratify / .reject) are already
-//! implemented, so this fixture rebuilds nothing: it exercises the real Store
-//! wire parser, the real retained-decision readback, the real Thread operation
-//! read gate and the real generic Operation projection. Row map against the
-//! PR 58 'Remaining focused verification' list:
-//!
-//! 1. exact current proposal ratifies once, retained decision readable:
-//!    contract_decision_retained_ratification_is_readable (+ wire accept test).
-//! 2. reject stays terminal history and must not satisfy ratification:
-//!    contract_decision_rejected_history_loads_but_does_not_satisfy_ratification.
-//! 3. one revision cannot take the opposite terminal decision: one key pins one
-//!    meta row per revision and the producer refuses a second terminal row with
-//!    CONTRACT_DECISION_ALREADY_RECORDED; the live conflict stays parent-gated.
-//! 4. stale/incomplete/wrong-scope requests fail before mutation: the parser
-//!    rejects malformed wire input and retained readback refuses identity
-//!    mismatches without side effects (see the two negative tests).
-//! 5. former owner / unrelated Manager denied, owner / GM / Operator authority:
-//!    readback refuses a forged authority basis and unrelated readers get no
-//!    grant; live GM/Operator admission stays parent-gated.
-//! 6. thread.resolve accepts only the exact ratified revision: a rejected row
-//!    demonstrably fails the decision-is-ratified plus exact-operation
-//!    requirement consumed by thread.resolve; the live resolve round-trip stays
-//!    parent-gated.
-//! 7. same request reuses one immutable decision, changed decision conflicts:
-//!    one deterministic decision key per revision; generic request-id reuse and
-//!    REQUEST_ID_CONFLICT stay in the shared operation admission path.
-//! 8. generic Operation reads expose only the bounded retained relation:
-//!    contract_decision_operation_projection_hides_rationale_and_conditions
-//!    and contract_decision_thread_operation_read_allows_caller_and_denies_unrelated.
-//!    This privacy row also covers PR 49 row 6.
-//! 9. denied/stale requests create no Observation, resolution or side effect:
-//!    counts are unchanged across the negative readback cases.
-//!
-//! Live Thread/proposal/scope admission (thread.open, contract.propose with the
-//! exact affected-scope snapshot, GM/Operator admission, thread.resolve) is
-//! intentionally left to the parent scoped gate.
+//! Public row map: ratify/replay/resolve (1,3,6,7,9), reject history (2,3,6,7,9),
+//! stale identity/scope and missing coverage (4,9), current/denied authority
+//! (5,9), bounded generic Operation get/list/delta (8, also PR49 row 6).
+//! Test execution and compiler qualification remain the parent's responsibility.
 
 use super::coordination::{
     ContractDecisionIdentity, contract_decision_key, load_contract_decision,
@@ -434,4 +405,1216 @@ fn contract_decision_thread_operation_read_allows_caller_and_denies_unrelated() 
     assert!(authorize_operation_read(&db, &caller, "contract-reject-op-1").is_ok());
     let unrelated = manager("unrelated-manager");
     assert!(authorize_operation_read(&db, &unrelated, "contract-reject-op-1").is_err());
+}
+
+mod public_store {
+    use super::super::{Store, StoreOwner};
+    use crate::{
+        config::Config,
+        error::Result,
+        model::{self, Credential, Principal, Role},
+        platform::{DataRoot, bootstrap_credential},
+    };
+    use serde_json::{Value, json};
+    use std::{path::PathBuf, sync::Arc};
+
+    const PRIVATE_REASON: &str = "PRIVATE_RATIONALE_public_decision";
+    const PRIVATE_CONDITION: &str = "PRIVATE_CONDITION_public_decision";
+    const PRIVATE_CAVEAT: &str = "PRIVATE_CAVEAT_public_decision";
+
+    // The existing program_tests start_store pattern, with public authentication
+    // and admission throughout. No seed_clients/seed_subject SQL facts are used.
+    struct Fixture {
+        owner: StoreOwner,
+        directory: PathBuf,
+        operator: Principal,
+        manager: Principal,
+        former_owner: Principal,
+        gm: Principal,
+        unrelated: Principal,
+        observer: Principal,
+        participant: Principal,
+        gm_epoch: Value,
+        task_id: Value,
+        attempt_id: Value,
+        former_attempt_id: Value,
+        thread_id: Value,
+        proposal: Value,
+        scope_ref: Value,
+    }
+
+    async fn register(
+        store: &Store,
+        operator: &Principal,
+        client_id: &str,
+        role: &str,
+    ) -> Principal {
+        let token = format!("{}{}", model::new_id(), model::new_id());
+        store
+            .call(
+                operator.clone(),
+                "client.register".into(),
+                json!({
+                    "client_request_id":model::new_id(), "client_id":client_id,
+                    "role":role, "token_hash":model::digest(token.as_bytes()),
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .authenticate(Credential {
+                client_id: client_id.into(),
+                token,
+            })
+            .await
+            .unwrap()
+    }
+
+    fn proposal_request(thread_id: &Value, supersedes: Value) -> Value {
+        json!({
+            "client_request_id":model::new_id(), "thread_id":thread_id,
+            "supersedes_revision_id":supersedes, "topic":"exact public contract",
+            "affected":{"paths":["src/contract.rs"], "symbols":[], "schemas":[]},
+            "statement":{
+                "producer":"typed decision producer", "consumer":"Thread resolution",
+                "identity":"exact proposal revision and digest", "payload":"bounded relation",
+                "observation_boundary":"immutable decision Observation",
+                "failure_semantics":"deny before decision mutation", "versioning":"revision pinned",
+            },
+            "acceptance_conditions":[], "claims":[], "open_questions":[],
+        })
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let directory = std::env::temp_dir()
+                .join(format!("swarm-contract-public-{label}-{}", model::new_id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let root = DataRoot::acquire(&directory).unwrap();
+            let credential = bootstrap_credential(&root.path).unwrap();
+            let mut config = Config::default();
+            config.storage.data_dir = root.path.clone();
+            let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+                .await
+                .unwrap();
+            let store = &owner.store;
+            let operator = store.authenticate(credential).await.unwrap();
+            assert_eq!(operator.role, Role::Operator);
+            let manager = register(store, &operator, "decision-owner", "manager").await;
+            let former_owner = register(store, &operator, "former-decision-owner", "manager").await;
+            let gm = register(store, &operator, "decision-gm", "manager").await;
+            let unrelated =
+                register(store, &operator, "unrelated-decision-manager", "manager").await;
+            let observer =
+                register(store, &operator, "unrelated-decision-observer", "observer").await;
+            let handover = store
+                .call(
+                    operator.clone(),
+                    "gm.handover".into(),
+                    json!({
+                        "client_request_id":model::new_id(), "client_id":gm.client_id,
+                    }),
+                )
+                .await
+                .unwrap();
+            let created = store.call(operator.clone(), "task.create".into(), json!({
+                "client_request_id":model::new_id(), "project_id":"public-contract-matrix",
+                "spec":{"objective":"Qualify exact public contract decisions", "phase":"implementation",
+                    "requirements":[{"id":"R58", "statement":"one immutable scoped decision"}]},
+            })).await.unwrap();
+            let task_id = created["task_id"].clone();
+            // Make former_owner an actual prior Task owner through public release
+            // and claim, rather than a label on an invented principal.
+            let former = store.call(former_owner.clone(), "task.claim".into(), json!({
+                "client_request_id":model::new_id(), "task_id":task_id, "expected_revision":1,
+            })).await.unwrap();
+            let former_attempt_id = former["attempt_id"].clone();
+            store.call(former_owner.clone(), "attempt.release".into(), json!({
+                "client_request_id":model::new_id(), "attempt_id":former_attempt_id,
+                "outcome":"cancelled", "reason":"public ownership transfer", "assignment_closed":true,
+            })).await.unwrap();
+            let claimed = store.call(manager.clone(), "task.claim".into(), json!({
+                "client_request_id":model::new_id(), "task_id":task_id, "expected_revision":1,
+            })).await.unwrap();
+            let attempt_id = claimed["attempt_id"].clone();
+            let token = format!("{}{}", model::new_id(), model::new_id());
+            store
+                .call(
+                    manager.clone(),
+                    "coordination.participant.register".into(),
+                    json!({
+                        "client_request_id":model::new_id(), "client_id":"decision-proposer",
+                        "token_hash":model::digest(token.as_bytes()), "task_id":task_id,
+                        "task_revision":1, "attempt_id":attempt_id,
+                        "participation_basis":{"kind":"attempt_owner"},
+                    }),
+                )
+                .await
+                .unwrap();
+            let participant = store
+                .authenticate(Credential {
+                    client_id: "decision-proposer".into(),
+                    token,
+                })
+                .await
+                .unwrap();
+            assert_eq!(participant.role, Role::Participant);
+            let scope = store.call(participant.clone(), "code.scope.propose".into(), json!({
+                "client_request_id":model::new_id(), "task_id":task_id, "task_revision":1,
+                "attempt_id":attempt_id, "mode":"exclusive_edit", "paths":["src/contract.rs"],
+                "symbols":[], "interfaces":[], "baseline_candidate_ref":"advisory-public-baseline",
+                "reason":"exact affected contract path",
+            })).await.unwrap();
+            store.call(manager.clone(), "code.scope.accept".into(), json!({
+                "client_request_id":model::new_id(), "scope_intent_id":scope["scope_intent_id"],
+                "expected_state_revision":scope["state_revision"], "proposal_digest":scope["digest"],
+                "reason":"accept exact affected path",
+            })).await.unwrap();
+            let inspected = store
+                .call(
+                    manager.clone(),
+                    "code.scope.inspect".into(),
+                    json!({
+                        "task_id":task_id, "task_revision":1, "attempt_id":attempt_id,
+                        "scope_intent_id":scope["scope_intent_id"],
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(inspected["coverage"], "complete");
+            assert_eq!(inspected["items"].as_array().unwrap().len(), 1);
+            let accepted = &inspected["items"][0];
+            assert_eq!(accepted["state"], "active");
+            // Closed decision-reference wire shape derived from the public
+            // inspect receipt, including every accepted-scope field.
+            let scope_ref = json!({
+                "scope_intent_id":accepted["scope_intent_id"], "state_revision":accepted["state_revision"],
+                "digest":accepted["digest"], "state":accepted["state"],
+                "owner_client_id":accepted["actor"]["client_id"], "actor":accepted["actor"],
+                "assignment_id":accepted["assignment_id"], "participation_basis":accepted["participation_basis"],
+                "mode":accepted["mode"], "paths":accepted["paths"], "symbols":accepted["symbols"],
+                "interfaces":accepted["interfaces"], "expires_at_ms":accepted["expires_at_ms"],
+                "override_scope_intent_ids":accepted["override_scope_intent_ids"],
+            });
+            let opened = store.call(manager.clone(), "coordination.thread.open".into(), json!({
+                "client_request_id":model::new_id(), "task_id":task_id, "attempt_id":attempt_id,
+                "topic_kind":"contract", "subject":"public contract decision matrix",
+                "participants":[{"client_id":participant.client_id, "generation":null, "reason":"exact proposer"}],
+                "reasonability":{
+                    "blocking_fact":"producer and consumer need an exact contract",
+                    "decision_needed":"ratify or reject retained proposal", "why_coordination_is_needed":"shared boundary",
+                    "expected_output":"immutable terminal decision", "close_condition":"exact ratification Operation",
+                },
+                "related_scopes":[{"kind":"path", "value":"src/contract.rs"}], "delivery_mode":"mailbox_only",
+            })).await.unwrap();
+            let thread_id = opened["thread_id"].clone();
+            let proposal = store
+                .call(
+                    participant.clone(),
+                    "coordination.contract.propose".into(),
+                    proposal_request(&thread_id, Value::Null),
+                )
+                .await
+                .unwrap();
+            Self {
+                owner,
+                directory,
+                operator,
+                manager,
+                former_owner,
+                gm,
+                unrelated,
+                observer,
+                participant,
+                gm_epoch: handover["gm_epoch"].clone(),
+                task_id,
+                attempt_id,
+                former_attempt_id,
+                thread_id,
+                proposal,
+                scope_ref,
+            }
+        }
+
+        async fn call(&self, actor: &Principal, method: &str, request: Value) -> Result<Value> {
+            self.owner
+                .store
+                .call(actor.clone(), method.into(), request)
+                .await
+        }
+
+        fn decision(&self, proposal: &Value) -> Value {
+            json!({
+                "client_request_id":model::new_id(), "thread_id":self.thread_id, "expected_state_revision":1,
+                "proposal_id":proposal["proposal_id"], "proposal_revision_id":proposal["proposal_revision_id"],
+                "proposal_digest":proposal["proposal_digest"], "task_id":self.task_id, "task_revision":1,
+                "attempt_id":self.attempt_id, "affected_scope_revisions":[self.scope_ref],
+                "reason":PRIVATE_REASON, "conditions":[PRIVATE_CONDITION], "caveats":[PRIVATE_CAVEAT],
+            })
+        }
+
+        fn resolve(&self, proposal: &Value, operation_id: &Value) -> Value {
+            json!({
+                "client_request_id":model::new_id(), "thread_id":self.thread_id, "expected_state_revision":1,
+                "outcome":"resolved", "resolution_summary":"exact retained ratification",
+                "selected_proposal_revision_id":proposal["proposal_revision_id"],
+                "manager_ratification_operation_id":operation_id, "remaining_objections":[], "follow_up_operation_ids":[],
+            })
+        }
+
+        async fn contract(&self, proposal: &Value) -> Value {
+            self.call(
+                &self.operator,
+                "coordination.contract.get",
+                json!({
+                    "thread_id":self.thread_id, "proposal_id":proposal["proposal_id"],
+                    "proposal_revision_id":proposal["proposal_revision_id"],
+                }),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn thread(&self) -> Value {
+            self.call(
+                &self.operator,
+                "coordination.thread.get",
+                json!({"thread_id":self.thread_id}),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn delta(&self, after: i64) -> Value {
+            let page = self
+                .call(
+                    &self.operator,
+                    "report.delta",
+                    json!({"after":after, "limit":200}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                page["projection"]["has_newer"], false,
+                "bounded fixture must fit one page: {page}"
+            );
+            assert_eq!(page["projection"]["coverage_complete"], true);
+            page
+        }
+
+        async fn snapshot(&self) -> Value {
+            json!({
+                "thread":self.thread().await,
+                "contract":self.contract(&self.proposal).await,
+                "proposals":self.call(&self.operator, "coordination.contract.list", json!({"thread_id":self.thread_id})).await.unwrap(),
+                "scopes":self.call(&self.operator, "code.scope.inspect", json!({"task_id":self.task_id, "attempt_id":self.attempt_id})).await.unwrap(),
+                "task":self.call(&self.operator, "task.get", json!({"task_id":self.task_id})).await.unwrap(),
+                "attempt":self.call(&self.operator, "attempt.get", json!({"attempt_id":self.attempt_id})).await.unwrap(),
+            })
+        }
+
+        async fn denied(&self, actor: &Principal, method: &str, request: Value, code: &str) {
+            let before = self.snapshot().await;
+            let after = self.delta(0).await["next_cursor"].as_i64().unwrap();
+            let error = self.call(actor, method, request).await.unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(
+                self.snapshot().await,
+                before,
+                "denied admission changed a retained business fact"
+            );
+            let delta = self.delta(after).await;
+            assert!(
+                delta["items"].as_array().unwrap().iter().all(|item| {
+                    !matches!(
+                        item["kind"].as_str(),
+                        Some(
+                            "coordination.contract_ratified"
+                                | "coordination.contract_rejected"
+                                | "coordination.thread.resolve"
+                                | "coordination.contract.ratify"
+                                | "coordination.contract.reject"
+                        )
+                    )
+                }),
+                "denied admission retained a decision/resolution effect: {delta}"
+            );
+        }
+
+        async fn assert_one_decision(&self, proposal: &Value, receipt: &Value, kind: &str) {
+            let page = self.delta(0).await;
+            let decisions: Vec<&Value> = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item["kind"].as_str(),
+                        Some("coordination.contract_ratified" | "coordination.contract_rejected")
+                    ) && item["payload"]["proposal_id"] == proposal["proposal_id"]
+                        && item["payload"]["proposal_revision_id"]
+                            == proposal["proposal_revision_id"]
+                })
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "one terminal decision Observation per exact revision"
+            );
+            assert_eq!(decisions[0]["kind"], kind);
+            assert_eq!(decisions[0]["operation_id"], receipt["operation_id"]);
+            assert_eq!(
+                decisions[0]["payload"]["decision_operation_id"],
+                receipt["operation_id"]
+            );
+            assert_eq!(decisions[0]["cursor"], receipt["decision_observation_id"]);
+        }
+
+        async fn supersede(&self, proposal: &Value) -> Value {
+            self.call(
+                &self.participant,
+                "coordination.contract.propose",
+                proposal_request(&self.thread_id, proposal["proposal_revision_id"].clone()),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn close(self) {
+            self.owner.close().await.unwrap();
+            std::fs::remove_dir_all(self.directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ratify_replay_opposite_conflict_and_exact_thread_resolution() {
+        let f = Fixture::new("ratify").await;
+        let request = f.decision(&f.proposal);
+        let receipt = f
+            .call(&f.manager, "coordination.contract.ratify", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt["decision"], "ratified");
+        assert_eq!(receipt["task_id"], f.task_id);
+        assert_eq!(receipt["attempt_id"], f.attempt_id);
+        assert_eq!(receipt["proposal_digest"], f.proposal["proposal_digest"]);
+        assert_eq!(receipt["model_work_started"], false);
+        assert_eq!(receipt["native_execution"], false);
+        let retained = f.contract(&f.proposal).await;
+        assert_eq!(
+            retained["decision"]["decision_operation_id"],
+            receipt["operation_id"]
+        );
+        assert_eq!(
+            retained["decision"]["affected_scope_revisions"],
+            request["affected_scope_revisions"]
+        );
+        assert_eq!(
+            retained["decision"]["authority_basis"]["kind"],
+            "attempt_owner"
+        );
+        assert_eq!(
+            retained["decision"]["actor"]["client_id"],
+            f.manager.client_id
+        );
+        assert_eq!(retained["decision"]["reason"], PRIVATE_REASON);
+        let before = f.snapshot().await;
+        let cursor = f.delta(0).await["next_cursor"].as_i64().unwrap();
+        assert_eq!(
+            f.call(&f.manager, "coordination.contract.ratify", request.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(f.snapshot().await, before);
+        assert!(
+            f.delta(cursor).await["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let mut changed = request.clone();
+        changed["conditions"] = json!(["changed decision content"]);
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            changed,
+            "REQUEST_ID_CONFLICT",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            request,
+            "REQUEST_ID_CONFLICT",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            f.decision(&f.proposal),
+            "CONTRACT_DECISION_ALREADY_RECORDED",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            f.decision(&f.proposal),
+            "CONTRACT_DECISION_ALREADY_RECORDED",
+        )
+        .await;
+        f.assert_one_decision(&f.proposal, &receipt, "coordination.contract_ratified")
+            .await;
+        // This is a real settled proposal Operation, not a fabricated Operation ID.
+        f.denied(
+            &f.manager,
+            "coordination.thread.resolve",
+            f.resolve(&f.proposal, &f.proposal["operation_id"]),
+            "RATIFICATION_INVALID",
+        )
+        .await;
+        let resolution_request = f.resolve(&f.proposal, &receipt["operation_id"]);
+        let resolved = f
+            .call(
+                &f.manager,
+                "coordination.thread.resolve",
+                resolution_request.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved["state"], "resolved");
+        assert_eq!(resolved["state_revision"], 2);
+        assert_eq!(
+            f.thread().await["thread"]["resolution"]["manager_ratification_operation_id"],
+            receipt["operation_id"]
+        );
+        let after_resolution = f.delta(0).await["next_cursor"].as_i64().unwrap();
+        assert_eq!(
+            f.call(
+                &f.manager,
+                "coordination.thread.resolve",
+                resolution_request
+            )
+            .await
+            .unwrap(),
+            resolved
+        );
+        assert!(
+            f.delta(after_resolution).await["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn reject_replay_is_terminal_history_and_cannot_resolve_thread() {
+        let f = Fixture::new("reject").await;
+        let request = f.decision(&f.proposal);
+        let receipt = f
+            .call(&f.manager, "coordination.contract.reject", request.clone())
+            .await
+            .unwrap();
+        let retained = f.contract(&f.proposal).await;
+        assert_eq!(retained["decision"]["decision"], "rejected");
+        assert_eq!(
+            retained["decision"]["decision_operation_id"],
+            receipt["operation_id"]
+        );
+        let before = f.snapshot().await;
+        let cursor = f.delta(0).await["next_cursor"].as_i64().unwrap();
+        assert_eq!(
+            f.call(&f.manager, "coordination.contract.reject", request.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(f.snapshot().await, before);
+        assert!(
+            f.delta(cursor).await["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            request,
+            "REQUEST_ID_CONFLICT",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            f.decision(&f.proposal),
+            "CONTRACT_DECISION_ALREADY_RECORDED",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            f.decision(&f.proposal),
+            "CONTRACT_DECISION_ALREADY_RECORDED",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.thread.resolve",
+            f.resolve(&f.proposal, &receipt["operation_id"]),
+            "RATIFICATION_INVALID",
+        )
+        .await;
+        assert_eq!(f.thread().await["thread"]["state"], "open");
+        assert_eq!(f.thread().await["thread"]["state_revision"], 1);
+        f.assert_one_decision(&f.proposal, &receipt, "coordination.contract_rejected")
+            .await;
+        let next = f.supersede(&f.proposal).await;
+        assert_eq!(next["proposal_id"], f.proposal["proposal_id"]);
+        assert_eq!(next["revision"], 2);
+        assert_eq!(
+            f.contract(&f.proposal).await,
+            retained,
+            "rejection remains immutable history after supersession"
+        );
+        assert!(f.contract(&next).await["decision"].is_null());
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn stale_identity_and_incomplete_scope_fail_without_decision_effects() {
+        let f = Fixture::new("stale").await;
+        let other_task = f
+            .call(
+                &f.operator,
+                "task.create",
+                json!({
+                    "client_request_id":model::new_id(), "project_id":"public-contract-matrix",
+                    "spec":{"objective":"wrong Task control", "phase":"implementation",
+                        "requirements":[{"id":"R", "statement":"unrelated Task"}]},
+                }),
+            )
+            .await
+            .unwrap();
+        let sibling = f
+            .call(
+                &f.participant,
+                "coordination.contract.propose",
+                proposal_request(&f.thread_id, Value::Null),
+            )
+            .await
+            .unwrap();
+        let mut wrong_task = f.decision(&f.proposal);
+        wrong_task["task_id"] = other_task["task_id"].clone();
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            wrong_task,
+            "STALE_REVISION",
+        )
+        .await;
+        let mut wrong_attempt = f.decision(&f.proposal);
+        wrong_attempt["attempt_id"] = f.former_attempt_id.clone();
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            wrong_attempt,
+            "STALE_REVISION",
+        )
+        .await;
+        let mut wrong_task_revision = f.decision(&f.proposal);
+        wrong_task_revision["task_revision"] = json!(2);
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            wrong_task_revision,
+            "STALE_REVISION",
+        )
+        .await;
+        let mut wrong_thread_revision = f.decision(&f.proposal);
+        wrong_thread_revision["expected_state_revision"] = json!(2);
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            wrong_thread_revision,
+            "STALE_REVISION",
+        )
+        .await;
+        let mut wrong_proposal = f.decision(&f.proposal);
+        wrong_proposal["proposal_id"] = sibling["proposal_id"].clone();
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            wrong_proposal,
+            "STALE_CONTRACT_REVISION",
+        )
+        .await;
+        let mut wrong_digest = f.decision(&f.proposal);
+        wrong_digest["proposal_digest"] = json!("0".repeat(64));
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            wrong_digest,
+            "STALE_CONTRACT_REVISION",
+        )
+        .await;
+        let mut missing_revision = f.decision(&f.proposal);
+        missing_revision["proposal_revision_id"] = json!(format!("cprev-{}", model::new_id()));
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            missing_revision,
+            "CONTRACT_PROPOSAL_NOT_FOUND",
+        )
+        .await;
+        let mut omitted_scope = f.decision(&f.proposal);
+        omitted_scope["affected_scope_revisions"] = json!([]);
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            omitted_scope,
+            "STALE_SCOPE_REVISION",
+        )
+        .await;
+        let mut stale_scope = f.decision(&f.proposal);
+        stale_scope["affected_scope_revisions"][0]["state_revision"] = json!(1);
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            stale_scope,
+            "STALE_SCOPE_REVISION",
+        )
+        .await;
+        let mut stale_scope_digest = f.decision(&f.proposal);
+        stale_scope_digest["affected_scope_revisions"][0]["digest"] = json!("0".repeat(64));
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            stale_scope_digest,
+            "STALE_SCOPE_REVISION",
+        )
+        .await;
+        let mut incomplete_scope_ref = f.decision(&f.proposal);
+        incomplete_scope_ref["affected_scope_revisions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("paths");
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            incomplete_scope_ref,
+            "INVALID_PARAMS",
+        )
+        .await;
+        let next = f.supersede(&f.proposal).await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            f.decision(&f.proposal),
+            "STALE_CONTRACT_REVISION",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.contract.reject",
+            f.decision(&f.proposal),
+            "STALE_CONTRACT_REVISION",
+        )
+        .await;
+        assert!(f.contract(&f.proposal).await["decision"].is_null());
+        let ratified = f
+            .call(
+                &f.manager,
+                "coordination.contract.ratify",
+                f.decision(&next),
+            )
+            .await
+            .unwrap();
+        f.assert_one_decision(&next, &ratified, "coordination.contract_ratified")
+            .await;
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_current_revision_and_its_exact_ratification_operation() {
+        let f = Fixture::new("resolve-current").await;
+        let old = f
+            .call(
+                &f.manager,
+                "coordination.contract.ratify",
+                f.decision(&f.proposal),
+            )
+            .await
+            .unwrap();
+        let next = f.supersede(&f.proposal).await;
+        f.denied(
+            &f.manager,
+            "coordination.thread.resolve",
+            f.resolve(&f.proposal, &old["operation_id"]),
+            "STALE_CONTRACT_REVISION",
+        )
+        .await;
+        f.denied(
+            &f.manager,
+            "coordination.thread.resolve",
+            f.resolve(&next, &old["operation_id"]),
+            "RATIFICATION_REQUIRED",
+        )
+        .await;
+        let current = f
+            .call(
+                &f.manager,
+                "coordination.contract.ratify",
+                f.decision(&next),
+            )
+            .await
+            .unwrap();
+        f.denied(
+            &f.manager,
+            "coordination.thread.resolve",
+            f.resolve(&next, &old["operation_id"]),
+            "RATIFICATION_INVALID",
+        )
+        .await;
+        let resolved = f
+            .call(
+                &f.manager,
+                "coordination.thread.resolve",
+                f.resolve(&next, &current["operation_id"]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved["state"], "resolved");
+        assert_eq!(
+            resolved["resolution"]["selected_proposal_revision_id"],
+            next["proposal_revision_id"]
+        );
+        assert_eq!(
+            resolved["resolution"]["manager_ratification_operation_id"],
+            current["operation_id"]
+        );
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn current_gm_and_local_operator_admit_former_and_unrelated_actors_denied() {
+        let f = Fixture::new("authority").await;
+        f.denied(
+            &f.former_owner,
+            "coordination.contract.ratify",
+            f.decision(&f.proposal),
+            "FORBIDDEN",
+        )
+        .await;
+        f.denied(
+            &f.unrelated,
+            "coordination.contract.reject",
+            f.decision(&f.proposal),
+            "FORBIDDEN",
+        )
+        .await;
+        f.denied(
+            &f.participant,
+            "coordination.contract.ratify",
+            f.decision(&f.proposal),
+            "FORBIDDEN",
+        )
+        .await;
+        f.denied(
+            &f.observer,
+            "coordination.contract.reject",
+            f.decision(&f.proposal),
+            "FORBIDDEN",
+        )
+        .await;
+        let gm_receipt = f
+            .call(
+                &f.gm,
+                "coordination.contract.ratify",
+                f.decision(&f.proposal),
+            )
+            .await
+            .unwrap();
+        let gm_decision = f.contract(&f.proposal).await;
+        assert_eq!(
+            gm_decision["decision"]["authority_basis"]["kind"],
+            "current_gm"
+        );
+        assert_eq!(
+            gm_decision["decision"]["authority_basis"]["gm_epoch"],
+            f.gm_epoch
+        );
+        assert_eq!(
+            gm_decision["decision"]["actor"]["client_id"],
+            f.gm.client_id
+        );
+        f.assert_one_decision(&f.proposal, &gm_receipt, "coordination.contract_ratified")
+            .await;
+        let next = f.supersede(&f.proposal).await;
+        let gm_rejection = f
+            .call(&f.gm, "coordination.contract.reject", f.decision(&next))
+            .await
+            .unwrap();
+        let gm_rejected = f.contract(&next).await;
+        assert_eq!(
+            gm_rejected["decision"]["authority_basis"]["kind"],
+            "current_gm"
+        );
+        assert_eq!(
+            gm_rejected["decision"]["authority_basis"]["gm_epoch"],
+            f.gm_epoch
+        );
+        f.assert_one_decision(&next, &gm_rejection, "coordination.contract_rejected")
+            .await;
+        let operator_proposal = f.supersede(&next).await;
+        f.call(
+            &f.operator,
+            "gm.handover",
+            json!({
+                "client_request_id":model::new_id(), "client_id":f.unrelated.client_id,
+            }),
+        )
+        .await
+        .unwrap();
+        f.denied(
+            &f.gm,
+            "coordination.contract.ratify",
+            f.decision(&operator_proposal),
+            "FORBIDDEN",
+        )
+        .await;
+        let operator_ratification = f
+            .call(
+                &f.operator,
+                "coordination.contract.ratify",
+                f.decision(&operator_proposal),
+            )
+            .await
+            .unwrap();
+        let operator_ratified = f.contract(&operator_proposal).await;
+        assert_eq!(
+            operator_ratified["decision"]["authority_basis"]["kind"],
+            "local_operator"
+        );
+        assert_eq!(
+            operator_ratified["decision"]["actor"]["client_id"],
+            f.operator.client_id
+        );
+        f.assert_one_decision(
+            &operator_proposal,
+            &operator_ratification,
+            "coordination.contract_ratified",
+        )
+        .await;
+        let rejected_proposal = f.supersede(&operator_proposal).await;
+        let operator_receipt = f
+            .call(
+                &f.operator,
+                "coordination.contract.reject",
+                f.decision(&rejected_proposal),
+            )
+            .await
+            .unwrap();
+        let operator_decision = f.contract(&rejected_proposal).await;
+        assert_eq!(
+            operator_decision["decision"]["authority_basis"]["kind"],
+            "local_operator"
+        );
+        assert!(operator_decision["decision"]["authority_basis"]["gm_epoch"].is_null());
+        assert_eq!(
+            operator_decision["decision"]["actor"]["client_id"],
+            f.operator.client_id
+        );
+        f.assert_one_decision(
+            &rejected_proposal,
+            &operator_receipt,
+            "coordination.contract_rejected",
+        )
+        .await;
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_publicly_admitted_scope_forces_partial_coverage_and_no_decision() {
+        let f = Fixture::new("coverage-fault").await;
+        let key = format!(
+            "code.scope:v1:record:{}",
+            f.scope_ref["scope_intent_id"].as_str().unwrap()
+        );
+        // The only SQL mutation in the public fixture: delete one exact current
+        // record admitted by code.scope.propose/accept; leave its active index.
+        f.owner
+            .store
+            .run_fixture(move |db| {
+                assert_eq!(db.execute("DELETE FROM meta WHERE key=?1", [key])?, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let conflicts = f
+            .call(
+                &f.operator,
+                "code.scope.conflicts",
+                json!({
+                    "task_id":f.task_id, "attempt_id":f.attempt_id,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflicts["coverage"], "partial");
+        assert!(
+            conflicts["gaps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("active_scope_record_missing"))
+        );
+        f.denied(
+            &f.manager,
+            "coordination.contract.ratify",
+            f.decision(&f.proposal),
+            "SCOPE_COVERAGE_INCOMPLETE",
+        )
+        .await;
+        f.denied(
+            &f.operator,
+            "coordination.contract.reject",
+            f.decision(&f.proposal),
+            "SCOPE_COVERAGE_INCOMPLETE",
+        )
+        .await;
+        assert!(f.contract(&f.proposal).await["decision"].is_null());
+        assert_eq!(f.thread().await["thread"]["state"], "open");
+        f.close().await;
+    }
+
+    fn assert_private_fields_absent(value: &Value) {
+        let encoded = model::canonical(value).unwrap();
+        assert!(!encoded.contains(PRIVATE_REASON));
+        assert!(!encoded.contains(PRIVATE_CONDITION));
+        assert!(!encoded.contains(PRIVATE_CAVEAT));
+        assert!(value.get("original_request").is_none());
+        assert!(value.get("effective_request").is_none());
+    }
+
+    #[tokio::test]
+    async fn generic_operation_get_list_delta_bound_relations_and_hide_private_decision_text() {
+        let f = Fixture::new("privacy").await;
+        let receipt = f
+            .call(
+                &f.gm,
+                "coordination.contract.ratify",
+                f.decision(&f.proposal),
+            )
+            .await
+            .unwrap();
+        let operation_request = json!({"operation_id":receipt["operation_id"]});
+        let caller = f
+            .call(&f.gm, "operation.get", operation_request.clone())
+            .await
+            .unwrap();
+        let owner_read = f
+            .call(&f.manager, "operation.get", operation_request.clone())
+            .await
+            .unwrap();
+        let operator_read = f
+            .call(&f.operator, "operation.get", operation_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(owner_read["task_id"], f.task_id);
+        assert_eq!(owner_read["attempt_id"], f.attempt_id);
+        assert_eq!(owner_read["result"], caller["result"]);
+        assert_eq!(
+            owner_read["result"]["proposal_revision_id"],
+            f.proposal["proposal_revision_id"]
+        );
+        assert_eq!(
+            owner_read["result"]["decision_observation_id"],
+            receipt["decision_observation_id"]
+        );
+        assert!(owner_read.get("client_request_id").is_none());
+        assert!(owner_read.get("diagnostic").is_none());
+        assert!(operator_read["diagnostic"].is_object());
+        assert_private_fields_absent(&caller);
+        assert_private_fields_absent(&owner_read);
+        assert_private_fields_absent(&operator_read);
+        assert_eq!(
+            f.call(&f.unrelated, "operation.get", operation_request.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        assert_eq!(
+            f.call(&f.observer, "operation.get", operation_request.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        let full = f.contract(&f.proposal).await;
+        assert_eq!(full["decision"]["reason"], PRIVATE_REASON);
+        assert_eq!(full["decision"]["conditions"], json!([PRIVATE_CONDITION]));
+        assert_eq!(full["decision"]["caveats"], json!([PRIVATE_CAVEAT]));
+        let next = f.supersede(&f.proposal).await;
+        let rejected_decision = f
+            .call(&f.gm, "coordination.contract.reject", f.decision(&next))
+            .await
+            .unwrap();
+        let rejected_operation = json!({"operation_id":rejected_decision["operation_id"]});
+        let retained_rejection = f
+            .call(&f.manager, "operation.get", rejected_operation.clone())
+            .await
+            .unwrap();
+        assert_eq!(retained_rejection["result"]["decision"], "rejected");
+        assert_eq!(retained_rejection["task_id"], f.task_id);
+        assert_eq!(retained_rejection["attempt_id"], f.attempt_id);
+        assert_eq!(
+            retained_rejection["result"]["proposal_revision_id"],
+            next["proposal_revision_id"]
+        );
+        assert!(retained_rejection.get("diagnostic").is_none());
+        assert!(retained_rejection.get("client_request_id").is_none());
+        assert_private_fields_absent(&retained_rejection);
+        assert_eq!(
+            f.call(&f.unrelated, "operation.get", rejected_operation)
+                .await
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        let list = f
+            .call(&f.manager, "operation.list", json!({"limit":200}))
+            .await
+            .unwrap();
+        assert_eq!(list["has_newer"], false);
+        assert!(
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["operation_id"] == receipt["operation_id"])
+        );
+        assert!(
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["operation_id"] == rejected_decision["operation_id"])
+        );
+        assert_private_fields_absent(&list);
+        let denied_list = f
+            .call(&f.unrelated, "operation.list", json!({"limit":200}))
+            .await
+            .unwrap();
+        assert_eq!(denied_list["has_newer"], false);
+        assert!(denied_list["items"].as_array().unwrap().is_empty());
+        let denied_delta = f
+            .call(
+                &f.unrelated,
+                "report.delta",
+                json!({"after":0, "limit":200}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_delta["projection"]["has_newer"], false);
+        assert!(
+            denied_delta["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["operation_id"] != receipt["operation_id"])
+        );
+        assert!(
+            denied_delta["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["operation_id"] != rejected_decision["operation_id"])
+        );
+        assert_private_fields_absent(&denied_delta);
+        let owner_delta = f
+            .call(&f.manager, "report.delta", json!({"after":0, "limit":200}))
+            .await
+            .unwrap();
+        assert_eq!(owner_delta["projection"]["has_newer"], false);
+        assert!(owner_delta["items"].as_array().unwrap().iter().any(|item| {
+            item["kind"] == "coordination.contract_ratified"
+                && item["operation_id"] == receipt["operation_id"]
+                && item["payload"]["proposal_revision_id"] == f.proposal["proposal_revision_id"]
+        }));
+        assert!(owner_delta["items"].as_array().unwrap().iter().any(|item| {
+            item["kind"] == "coordination.contract_rejected"
+                && item["operation_id"] == rejected_decision["operation_id"]
+                && item["payload"]["proposal_revision_id"] == next["proposal_revision_id"]
+        }));
+        assert_private_fields_absent(&owner_delta);
+        let rejected_request = f.decision(&f.proposal);
+        f.denied(
+            &f.unrelated,
+            "coordination.contract.reject",
+            rejected_request.clone(),
+            "FORBIDDEN",
+        )
+        .await;
+        let rejection_cursor = f.delta(0).await["next_cursor"].as_i64().unwrap();
+        assert_eq!(
+            f.call(
+                &f.unrelated,
+                "coordination.contract.reject",
+                rejected_request.clone()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "FORBIDDEN"
+        );
+        assert!(
+            f.delta(rejection_cursor).await["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let rejected_list = f
+            .call(
+                &f.unrelated,
+                "operation.list",
+                json!({"limit":200, "state":"rejected"}),
+            )
+            .await
+            .unwrap();
+        let rejected = rejected_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["client_request_id"] == rejected_request["client_request_id"])
+            .unwrap();
+        let rejected_get = f
+            .call(
+                &f.unrelated,
+                "operation.get",
+                json!({"operation_id":rejected["operation_id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_get["state"], "rejected");
+        assert_eq!(
+            rejected_get["client_request_id"],
+            rejected_request["client_request_id"]
+        );
+        assert!(rejected_get["task_id"].is_null());
+        assert!(rejected_get["attempt_id"].is_null());
+        assert_private_fields_absent(&rejected_get);
+        assert_eq!(
+            f.call(
+                &f.former_owner,
+                "operation.get",
+                json!({"operation_id":rejected["operation_id"]})
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "NOT_FOUND"
+        );
+        f.close().await;
+    }
 }
