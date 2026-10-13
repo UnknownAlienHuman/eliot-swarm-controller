@@ -1146,6 +1146,7 @@ async fn empty_pending_scan_succeeds_under_external_immediate_lock() {
     // strand a writer-lock thread or leave the Store owner blocked.
     db.execute_batch("ROLLBACK")
         .expect("release external writer");
+    drop(db);
     assert!(
         observed
             .expect("empty pending read must finish while the writer is reserved")
