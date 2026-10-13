@@ -1134,3 +1134,334 @@ async fn reg23_watch_singleton_pending_reconciles_without_metadata_churn() {
     owner.close().await.expect("close Store");
     std::fs::remove_dir_all(directory).expect("remove temporary Store");
 }
+async fn inject_raw_meta(store: &Store, key: String, raw: String) {
+    store
+        .run(move |db| {
+            db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+            let injected = db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![key, raw],
+            );
+            db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+            injected?;
+            Ok(())
+        })
+        .await
+        .expect("inject raw retained bytes");
+}
+
+async fn inject_bad_selected_page(store: &Store) {
+    store
+        .run(|db| {
+            let tx = db.transaction()?;
+            for index in 0..31 {
+                let id = format!("zz-bad-{index:02}");
+                let key = format!("{ACTIVE_PREFIX}{}", hex_component(&id));
+                set_meta(&tx, &key, &json!({"watch_id": id}))?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("retain noncanonical selected page");
+}
+
+async fn slot_count(store: &Store, key: &str) -> i64 {
+    let key = key.to_owned();
+    store
+        .run(move |db| {
+            let count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .await
+        .expect("count slot locator")
+}
+
+async fn slot_raw(store: &Store, key: &str) -> String {
+    let key = key.to_owned();
+    store
+        .run(move |db| {
+            let raw: String = db.query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )?;
+            Ok(raw)
+        })
+        .await
+        .expect("read slot bytes")
+}
+
+#[tokio::test]
+async fn reg23_watch_noncanonical_selected_key_never_persists_as_cursor() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-bad-selected").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "bad-selected").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let canonical = active_key_for(&watch_id);
+    let first = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("observe pending");
+    assert_eq!(first["processed"], 1);
+    assert_eq!(first["cursor"], json!(canonical));
+    inject_bad_selected_page(&owner.store).await;
+    let second = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("retire bad selected page");
+    assert_eq!(second["processed"], 32);
+    assert_eq!(second["stale"], 31);
+    assert_eq!(second["quarantined"], 0);
+    assert_eq!(second["cursor"], json!(canonical));
+    let stored = owner
+        .store
+        .run(|db| meta(db, RECONCILE_CURSOR_KEY))
+        .await
+        .expect("read cursor after bad selection")
+        .expect("cursor retained");
+    assert_eq!(stored, json!(canonical));
+    let third = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("next pass stays valid");
+    assert_eq!(third["processed"], 1);
+    assert_eq!(third["stale"], 0);
+    assert_eq!(third["cursor"], json!(canonical));
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+#[tokio::test]
+async fn reg23_watch_wrong_variant_cursor_hard_without_subject_writes() {
+    // Version nibble 4 with NCS variant bits: only the variant gate rejects.
+    let suffix = hex_component("123e4567-e89b-42d3-0232-426614174000");
+    assert_eq!(suffix.len(), 72);
+    cursor_damage_zero_writes_case(
+        "watch-cursor-variant",
+        json!(format!("coordination:watch:v1:active:{suffix}")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reg23_watch_oversized_cursor_hard_without_subject_writes() {
+    let oversized = format!("{}00", active_key_for(&model::new_id()));
+    cursor_damage_zero_writes_case("watch-cursor-oversized", json!(oversized)).await;
+}
+
+#[tokio::test]
+async fn reg23_watch_damaged_revisit_slot_quarantined_neighbors_progress() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-poison-slot").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "poison-slot").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let first = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("observe pending");
+    assert_eq!(first["processed"], 1);
+    let retained_record = record_raw(&owner.store, &watch_id).await;
+    let retained_index = active_raw(&owner.store, &watch_id).await;
+    let slot_key = format!(
+        "coordination:watch:v1:revisit:00000000000000000000:{}",
+        hex_component("zz-poison")
+    );
+    let slot_raw_value = "{corrupt revisit slot".to_owned();
+    inject_raw_meta(&owner.store, slot_key.clone(), slot_raw_value.clone()).await;
+    let second = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("quarantine poison slot");
+    assert_eq!(second["processed"], 1);
+    assert_eq!(second["quarantined"], 1);
+    assert_eq!(second["matched"], 0);
+    assert_eq!(record_raw(&owner.store, &watch_id).await, retained_record);
+    assert_eq!(active_raw(&owner.store, &watch_id).await, retained_index);
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
+    assert_eq!(slot_count(&owner.store, &slot_key).await, 0);
+    let keys = quarantine_keys(&owner.store).await;
+    assert_eq!(keys.len(), 1);
+    let evidence = quarantine_record(&owner.store, &keys[0]).await;
+    assert_eq!(evidence["code"], "WATCH_REVISIT_SLOT_DAMAGED");
+    assert_eq!(
+        evidence["evidence"]["source_digest"],
+        model::digest(slot_raw_value.as_bytes())
+    );
+    assert_eq!(
+        evidence["evidence"]["source_pointer"],
+        format!(
+            "meta/key-sha256:{}",
+            model::digest(slot_key.as_bytes())
+        )
+    );
+    assert!(evidence["evidence"]["subject_identity"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("watch-revisit-key-sha256:")));
+    let third = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("converged retry");
+    assert_eq!(third["processed"], 1);
+    assert_eq!(third["quarantined"], 0);
+    assert_eq!(quarantine_keys(&owner.store).await, keys);
+    assert_eq!(
+        quarantine_record(&owner.store, &keys[0]).await["occurrences"],
+        1
+    );
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+#[tokio::test]
+async fn reg23_watch_stale_revisit_pointer_quarantined_watch_intact() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-stale-pointer").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "stale-pointer").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let first = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("observe pending");
+    assert_eq!(first["processed"], 1);
+    let retained_record = record_raw(&owner.store, &watch_id).await;
+    let retained_index = active_raw(&owner.store, &watch_id).await;
+    // A well-formed slot whose locator binds a foreign component while its
+    // pointer names the healthy watch: only the slot is damage.
+    let slot_key = format!(
+        "coordination:watch:v1:revisit:00000000000000000000:{}",
+        hex_component("zz-other")
+    );
+    let poisoning = active_key_for(&watch_id);
+    owner
+        .store
+        .run(move |db| {
+            set_meta(db, &slot_key, &json!({"active_key": poisoning}))?;
+            Ok(())
+        })
+        .await
+        .expect("inject stale pointer slot");
+    let injected_raw = slot_raw(&owner.store, &slot_key).await;
+    let second = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("quarantine stale pointer");
+    assert_eq!(second["processed"], 1);
+    assert_eq!(second["quarantined"], 1);
+    assert_eq!(record_raw(&owner.store, &watch_id).await, retained_record);
+    assert_eq!(active_raw(&owner.store, &watch_id).await, retained_index);
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
+    assert_eq!(slot_count(&owner.store, &slot_key).await, 0);
+    let keys = quarantine_keys(&owner.store).await;
+    assert_eq!(keys.len(), 1);
+    let evidence = quarantine_record(&owner.store, &keys[0]).await;
+    assert_eq!(evidence["code"], "WATCH_REVISIT_SLOT_DAMAGED");
+    assert_eq!(
+        evidence["evidence"]["source_digest"],
+        model::digest(injected_raw.as_bytes())
+    );
+    assert_eq!(
+        evidence["evidence"]["source_pointer"],
+        format!(
+            "meta/key-sha256:{}",
+            model::digest(slot_key.as_bytes())
+        )
+    );
+    let third = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("converged retry");
+    assert_eq!(third["processed"], 1);
+    assert_eq!(third["quarantined"], 0);
+    assert_eq!(
+        quarantine_record(&owner.store, &keys[0]).await["occurrences"],
+        1
+    );
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_slot_quarantine_write_failure_rolls_back() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-slot-rollback").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "slot-rollback").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let first = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("observe pending");
+    assert_eq!(first["processed"], 1);
+    let retained_record = record_raw(&owner.store, &watch_id).await;
+    let retained_index = active_raw(&owner.store, &watch_id).await;
+    let slot_key = format!(
+        "coordination:watch:v1:revisit:00000000000000000000:{}",
+        hex_component("zz-poison")
+    );
+    inject_raw_meta(&owner.store, slot_key.clone(), "{corrupt revisit slot".to_owned()).await;
+    owner
+        .store
+        .run(|db| {
+            db.execute_batch(
+                "CREATE TEMP TRIGGER watch_slot_quarantine_fault BEFORE INSERT ON main.meta WHEN NEW.key LIKE 'coordination:watch:v1:quarantine:%' BEGIN SELECT RAISE(ABORT, 'watch slot quarantine fault'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("install slot evidence fault");
+    let error = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect_err("slot evidence failure stays hard");
+    assert_eq!(error.code.as_str(), "STORE_ERROR");
+    assert_eq!(slot_count(&owner.store, &slot_key).await, 1);
+    assert_eq!(record_raw(&owner.store, &watch_id).await, retained_record);
+    assert_eq!(active_raw(&owner.store, &watch_id).await, retained_index);
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER temp.watch_slot_quarantine_fault")?;
+            Ok(())
+        })
+        .await
+        .expect("remove slot evidence fault");
+    let retry = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("retry quarantines poison slot");
+    assert_eq!(retry["processed"], 1);
+    assert_eq!(retry["quarantined"], 1);
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+
+

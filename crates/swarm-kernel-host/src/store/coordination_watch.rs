@@ -685,7 +685,9 @@ fn valid_reconcile_cursor(key: &str) -> bool {
     let Some(suffix) = key.strip_prefix(ACTIVE_PREFIX) else {
         return false;
     };
-    if suffix.is_empty() || suffix.len() % 2 != 0 {
+    // A canonical server key encodes exactly one UUIDv4 (36 bytes as 72
+    // lowercase hex digits). The length gate runs before any allocation.
+    if suffix.len() != 72 {
         return false;
     }
     if !suffix
@@ -694,26 +696,30 @@ fn valid_reconcile_cursor(key: &str) -> bool {
     {
         return false;
     }
-    let mut bytes = Vec::with_capacity(suffix.len() / 2);
-    for index in (0..suffix.len()).step_by(2) {
+    let mut bytes = [0u8; 36];
+    for index in 0..36 {
         let Ok(byte) = u8::from_str_radix(&suffix[index..index + 2], 16) else {
             return false;
         };
-        bytes.push(byte);
+        bytes[index] = byte;
     }
-    let Ok(watch_id) = String::from_utf8(bytes) else {
+    let Ok(watch_id) = std::str::from_utf8(&bytes) else {
         return false;
     };
-    let Ok(uuid) = uuid::Uuid::parse_str(&watch_id) else {
+    let Ok(uuid) = uuid::Uuid::parse_str(watch_id) else {
         return false;
     };
-    if uuid.get_version() != Some(uuid::Version::Random) {
+    // get_version reads only the version nibble; the variant bits must also
+    // select RFC4122. get_variant returns Variant directly, not an Option.
+    if uuid.get_version() != Some(uuid::Version::Random)
+        || uuid.get_variant() != uuid::Variant::RFC4122
+    {
         return false;
     }
     if uuid.hyphenated().to_string() != watch_id {
         return false;
     }
-    keys::key_component(&watch_id) == suffix
+    keys::key_component(watch_id) == suffix
 }
 
 pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Value> {
@@ -728,7 +734,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
             ));
         }
     };
-    let (rows, next_cursor) = scan_active(tx, cursor.as_deref(), limit)?;
+    let (rows, next_cursor, quarantined_slots) = scan_active(tx, cursor.as_deref(), limit, now)?;
     let mut matched = 0usize;
     let mut expired = 0usize;
     let mut stale = 0usize;
@@ -760,10 +766,17 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
         }
         remove_watch_revisit(tx, active_key, raw_index)?;
     }
+    quarantined += quarantined_slots;
+    // The forward page may end on a selected key whose bytes are not a
+    // canonical server key, or whose row is retired by this same tick. A
+    // noncanonical candidate is never persisted: the previous canonical
+    // boundary is retained instead of guessing a new authority.
     let cursor_receipt = if rows.is_empty() {
         None
     } else {
-        next_cursor.or(cursor.clone())
+        next_cursor
+            .filter(|key| valid_reconcile_cursor(key))
+            .or(cursor.clone())
     };
     // Identical cursor bytes are read-only. Rewriting the same key on every
     // tick would keep one unchanged pending watch dirty forever.
@@ -1956,9 +1969,83 @@ fn queue_pending_watch(tx: &Transaction<'_>, index_key: &str, raw_index: &str) -
     Ok(())
 }
 
-type ActiveWatchPage = (Vec<(String, String)>, Option<String>);
+type ActiveWatchPage = (Vec<(String, String)>, Option<String>, usize);
 
-fn scan_active(tx: &Transaction<'_>, cursor: Option<&str>, limit: i64) -> Result<ActiveWatchPage> {
+/// Parse one revisit queue slot to its pointed active key. A slot whose
+/// bytes or pointer cannot be decoded is slot-local damage, not a global
+/// cursor failure: the caller quarantines that exact slot locator.
+fn parse_revisit_slot(queue_key: &str, raw: &str) -> Result<String> {
+    let queued: Value = serde_json::from_str(raw).map_err(|_| {
+        Error::new(
+            "WATCH_REVISIT_SLOT_DAMAGED",
+            "watch revisit slot bytes are invalid",
+        )
+    })?;
+    let index_key = model::text(&queued, "active_key").map_err(|_| {
+        Error::new(
+            "WATCH_REVISIT_SLOT_DAMAGED",
+            "watch revisit slot pointer is invalid",
+        )
+    })?;
+    if !valid_revisit_key(queue_key, index_key) {
+        return Err(Error::new(
+            "WATCH_REVISIT_SLOT_DAMAGED",
+            "watch revisit slot binding is invalid",
+        ));
+    }
+    Ok(index_key.to_owned())
+}
+
+/// Retire one damaged revisit slot locator with its exact source evidence.
+/// Only the derived queue locator is removed, atomically with its evidence;
+/// the underlying active watch is never guessed or removed without the
+/// identity proof that only its own subject path can supply.
+fn retire_damaged_revisit_slot(
+    tx: &Transaction<'_>,
+    queue_key: &str,
+    raw: &str,
+    now: i64,
+) -> Result<()> {
+    // Fence concurrent mutation of the exact slot bytes before retiring.
+    require_watch_source(tx, queue_key, raw)?;
+    let evidence = automation_reconcile::QuarantineEvidence {
+        subject_identity: format!(
+            "watch-revisit-key-sha256:{}",
+            model::digest(queue_key.as_bytes())
+        ),
+        source_pointer: Some(format!(
+            "meta/key-sha256:{}",
+            model::digest(queue_key.as_bytes())
+        )),
+        source_digest: Some(model::digest(raw.as_bytes())),
+    };
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &evidence)?;
+    automation_reconcile::persist_quarantine(
+        tx,
+        &record_key,
+        "WATCH_REVISIT_SLOT_DAMAGED",
+        evidence,
+        now,
+    )?;
+    let removed = tx.execute(
+        "DELETE FROM meta WHERE key=?1 AND value_json=?2",
+        params![queue_key, raw],
+    )?;
+    if removed != 1 {
+        return Err(Error::new(
+            "WATCH_SOURCE_CONFLICT",
+            "watch revisit slot changed during retirement",
+        ));
+    }
+    Ok(())
+}
+
+fn scan_active(
+    tx: &Transaction<'_>,
+    cursor: Option<&str>,
+    limit: i64,
+    now: i64,
+) -> Result<ActiveWatchPage> {
     let cursor = match meta(tx, REVISIT_SEQUENCE_KEY)? {
         None => {
             // One bounded sweep from the start enrolls pending subjects that
@@ -2015,34 +2102,39 @@ fn scan_active(tx: &Transaction<'_>, cursor: Option<&str>, limit: i64) -> Result
         .take(revisit_limit as usize)
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
+    let mut quarantined_slots = 0usize;
     for (queue_key, raw) in revisit_rows {
-        let queued: Value = serde_json::from_str(&raw)?;
-        let index_key = model::text(&queued, "active_key")?;
-        if !valid_revisit_key(&queue_key, index_key) {
-            return Err(Error::new(
-                "WATCH_CURSOR_DAMAGED",
-                "watch revisit index is invalid",
-            ));
-        }
+        let index_key = match parse_revisit_slot(&queue_key, &raw) {
+            Ok(index_key) => index_key,
+            Err(_) => {
+                // Slot-local damage is quarantined with its exact bytes and
+                // only its own locator is retired; healthy neighbors proceed.
+                retire_damaged_revisit_slot(tx, &queue_key, &raw, now)?;
+                quarantined_slots += 1;
+                continue;
+            }
+        };
         let raw_index: Option<String> = tx
             .query_row(
                 "SELECT value_json FROM meta WHERE key=?1",
-                [index_key],
+                params![index_key],
                 |row| row.get(0),
             )
             .optional()?;
         if let Some(raw_index) = raw_index {
             // A damaged active row is still processed as its own source.
-            if watch_id_from_active_index(index_key, &raw_index).is_ok()
+            if watch_id_from_active_index(&index_key, &raw_index).is_ok()
                 && let Ok(index) = serde_json::from_str::<Value>(&raw_index)
                 && index["revisit_key"].as_str() != Some(queue_key.as_str())
             {
-                return Err(Error::new(
-                    "WATCH_CURSOR_DAMAGED",
-                    "watch revisit binding differs",
-                ));
+                // A stale slot pointer for a healthy active row is slot
+                // damage, not a global failure: quarantine the slot and let
+                // the row proceed through its live slot or forward lane.
+                retire_damaged_revisit_slot(tx, &queue_key, &raw, now)?;
+                quarantined_slots += 1;
+                continue;
             }
-            rows.push((index_key.to_owned(), raw_index));
+            rows.push((index_key, raw_index));
             if revisit_overflow {
                 tx.execute("DELETE FROM meta WHERE key=?1", [queue_key])?;
             }
@@ -2081,7 +2173,7 @@ fn scan_active(tx: &Transaction<'_>, cursor: Option<&str>, limit: i64) -> Result
             rows.push(row);
         }
     }
-    Ok((rows, next_cursor))
+    Ok((rows, next_cursor, quarantined_slots))
 }
 
 fn role_tag(role: &Role) -> Result<&'static str> {
