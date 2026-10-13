@@ -87,11 +87,11 @@ async fn spec_digest(store: &Store, check_id: &str) -> String {
     let id = check_id.to_owned();
     let raw: String = store
         .run(move |db| {
-            db.query_row(
+            Ok(db.query_row(
                 "SELECT spec_json FROM check_runs WHERE check_id=?1",
                 [id],
                 |row| row.get(0),
-            )
+            )?)
         })
         .await
         .unwrap();
@@ -101,11 +101,11 @@ async fn operation_id_of(store: &Store, check_id: &str) -> String {
     let id = check_id.to_owned();
     store
         .run(move |db| {
-            db.query_row(
+            Ok(db.query_row(
                 "SELECT operation_id FROM check_runs WHERE check_id=?1",
                 [id],
                 |row| row.get(0),
-            )
+            )?)
         })
         .await
         .unwrap()
@@ -117,7 +117,13 @@ async fn write(store: &Store, principal: &Principal, method: &str, mut value: Va
         .await
         .unwrap()
 }
-async fn write_with_id(store: &Store, principal: &Principal, method: &str, request_id: &str, mut value: Value) -> Value {
+async fn write_with_id(
+    store: &Store,
+    principal: &Principal,
+    method: &str,
+    request_id: &str,
+    mut value: Value,
+) -> Value {
     value["client_request_id"] = json!(request_id);
     store
         .call(principal.clone(), method.to_owned(), value)
@@ -126,7 +132,11 @@ async fn write_with_id(store: &Store, principal: &Principal, method: &str, reque
 }
 async fn read_check(store: &Store, principal: &Principal, check_id: &str) -> Value {
     store
-        .call(principal.clone(), "check.get".to_owned(), json!({"check_id": check_id}))
+        .call(
+            principal.clone(),
+            "check.get".to_owned(),
+            json!({"check_id": check_id}),
+        )
         .await
         .unwrap()
 }
@@ -160,18 +170,32 @@ async fn held_check_get_reports_invalid_json_quarantine() {
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
     damage_spec_json(&fixture.owner.store, &check_id).await;
-    let selected = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    let selected = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
     assert!(selected.is_empty(), "damaged subject yields no Work");
     let readback = read_check(&fixture.owner.store, &fixture.principal, &check_id).await;
     assert_eq!(readback["check_id"], json!(&check_id));
     assert_eq!(readback["state"], json!("queued"));
-    assert_eq!(readback["reconciliation"]["disposition"], json!("quarantined"));
-    assert_eq!(readback["reconciliation"]["code"], json!("CHECK_SPEC_SUBJECT_CORRUPT"));
+    assert_eq!(
+        readback["reconciliation"]["disposition"],
+        json!("quarantined")
+    );
+    assert_eq!(
+        readback["reconciliation"]["code"],
+        json!("CHECK_SPEC_SUBJECT_CORRUPT")
+    );
     assert_eq!(readback["reconciliation"]["field"], json!("spec"));
     assert_eq!(readback["reconciliation"]["reason"], json!("invalid_json"));
     assert_eq!(readback["reconciliation"]["held"], json!(false));
-    assert!(readback.get("profile_id").is_none(), "sanitized view exposes no spec fields");
-    assert_eq!(readback["reconciliation"]["source_digest"], json!(spec_digest(&fixture.owner.store, &check_id).await));
+    assert!(
+        readback.get("profile_id").is_none(),
+        "sanitized view exposes no spec fields"
+    );
+    assert_eq!(
+        readback["reconciliation"]["source_digest"],
+        json!(spec_digest(&fixture.owner.store, &check_id).await)
+    );
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
 }
@@ -182,12 +206,20 @@ async fn held_check_get_reports_malformed_field_quarantine() {
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
     damage_profile_shape(&fixture.owner.store, &check_id).await;
-    let selected = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    let selected = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
     assert!(selected.is_empty(), "damaged subject yields no Work");
     let readback = read_check(&fixture.owner.store, &fixture.principal, &check_id).await;
-    assert_eq!(readback["reconciliation"]["disposition"], json!("quarantined"));
+    assert_eq!(
+        readback["reconciliation"]["disposition"],
+        json!("quarantined")
+    );
     assert_eq!(readback["reconciliation"]["field"], json!("profile"));
-    assert_eq!(readback["reconciliation"]["reason"], json!("invalid_subject_shape"));
+    assert_eq!(
+        readback["reconciliation"]["reason"],
+        json!("invalid_subject_shape")
+    );
     assert_eq!(readback["reconciliation"]["held"], json!(false));
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
@@ -197,7 +229,12 @@ async fn held_poison_leaves_active_page_capacity() {
     let fixture = fixture().await;
     let mut poisoned = Vec::new();
     for index in 0..16 {
-        let admitted = admit_held(&fixture, &format!("held-poison-{index}"), b"held poison source").await;
+        let admitted = admit_held(
+            &fixture,
+            &format!("held-poison-{index}"),
+            b"held poison source",
+        )
+        .await;
         let check_id = admitted["check_id"].as_str().unwrap().to_owned();
         mark_sending(&fixture.owner.store, &check_id).await;
         damage_spec_json(&fixture.owner.store, &check_id).await;
@@ -208,20 +245,25 @@ async fn held_poison_leaves_active_page_capacity() {
     mark_sending(&fixture.owner.store, &healthy_id).await;
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..4 {
-        let page = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+        let page = pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap();
         seen.extend(page.into_iter().map(|work| work.check_id));
     }
     assert_eq!(seen.len(), 1, "only the healthy row is ever selected");
-    assert!(seen.contains(&healthy_id), "the healthy row is reachable past sixteen poisons");
+    assert!(
+        seen.contains(&healthy_id),
+        "the healthy row is reachable past sixteen poisons"
+    );
     let quarantined: i64 = fixture
         .owner
         .store
         .run(|db| {
-            db.query_row(
+            Ok(db.query_row(
                 "SELECT count(*) FROM meta WHERE key LIKE 'checks:pending:v1:quarantine:%'",
                 [],
                 |row| row.get(0),
-            )
+            )?)
         })
         .await
         .unwrap();
@@ -237,7 +279,9 @@ async fn acknowledge_held_cas_matrix() {
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
     damage_spec_json(&fixture.owner.store, &check_id).await;
-    pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
     let digest = spec_digest(&fixture.owner.store, &check_id).await;
     let cid = check_id.as_str();
     let expected = digest.as_str();
@@ -262,10 +306,18 @@ async fn acknowledge_held_cas_matrix() {
         json!({"check_id": cid, "expected_source_digest": expected}),
     )
     .await;
-    assert_eq!(reread["operation_id"], json!(&ack_operation), "lost reply returns the retained receipt");
+    assert_eq!(
+        reread["operation_id"],
+        json!(&ack_operation),
+        "lost reply returns the retained receipt"
+    );
     let readback = read_check(&fixture.owner.store, &operator, &check_id).await;
     assert_eq!(readback["reconciliation"]["held"], json!(true));
-    assert_eq!(readback["state"], json!("queued"), "acknowledgement keeps the run nonterminal");
+    assert_eq!(
+        readback["state"],
+        json!("queued"),
+        "acknowledgement keeps the run nonterminal"
+    );
     let mismatch = fixture
         .owner
         .store
@@ -303,28 +355,45 @@ async fn acknowledge_held_changed_source_conflicts() {
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
     damage_spec_json(&fixture.owner.store, &check_id).await;
-    pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
     let first_digest = spec_digest(&fixture.owner.store, &check_id).await;
     damage_profile_shape(&fixture.owner.store, &check_id).await;
     // The changed row leaves the active page silently: no Work is admitted
     // under stale quarantine. The conflict still fails closed on every
     // explicit touch below.
-    let held_back = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
-    assert!(held_back.is_empty(), "changed source is held, never selected");
+    let held_back = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert!(
+        held_back.is_empty(),
+        "changed source is held, never selected"
+    );
     let conflict_read = fixture
         .owner
         .store
-        .call(operator.clone(), "check.get".to_owned(), json!({"check_id": &check_id}))
+        .call(
+            operator.clone(),
+            "check.get".to_owned(),
+            json!({"check_id": &check_id}),
+        )
         .await
         .unwrap_err();
-    assert_eq!(conflict_read.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
+    assert_eq!(
+        conflict_read.code,
+        "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
+    );
     let conflicted = fixture
         .owner
         .store
         .call(operator.clone(), "check.acknowledge_held".to_owned(), json!({"client_request_id": model::new_id(), "check_id": check_id, "expected_source_digest": first_digest}))
         .await
         .unwrap_err();
-    assert_eq!(conflicted.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
+    assert_eq!(
+        conflicted.code,
+        "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
+    );
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
 }
@@ -335,8 +404,13 @@ async fn acknowledge_held_rejects_live_child() {
     let admitted = admit_held(&fixture, "held-live", b"held live source").await;
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
-    let works = pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
-    let work = works.into_iter().find(|item| item.check_id == check_id).expect("healthy check is selected");
+    let works = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    let work = works
+        .into_iter()
+        .find(|item| item.check_id == check_id)
+        .expect("healthy check is selected");
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--list")
         .stdin(std::process::Stdio::null())
@@ -344,7 +418,12 @@ async fn acknowledge_held_rejects_live_child() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    fixture.owner.store.retain_test_live_child(work, child).await;
+    fixture
+        .owner
+        .store
+        .check_child_custody
+        .retain_test_live_child(work, child)
+        .await;
     let digest = spec_digest(&fixture.owner.store, &check_id).await;
     let uncertain = fixture
         .owner
@@ -364,22 +443,44 @@ async fn reopen_held_never_relaunches() {
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
     damage_spec_json(&fixture.owner.store, &check_id).await;
-    pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
     let digest = spec_digest(&fixture.owner.store, &check_id).await;
-    write(&fixture.owner.store, &operator, "check.acknowledge_held", json!({"check_id": &check_id, "expected_source_digest": &digest})).await;
+    write(
+        &fixture.owner.store,
+        &operator,
+        "check.acknowledge_held",
+        json!({"check_id": &check_id, "expected_source_digest": &digest}),
+    )
+    .await;
     let directory = fixture.directory.clone();
     let config = fixture.config.clone();
     fixture.owner.close().await.unwrap();
     let root = crate::platform::DataRoot::acquire(&directory).unwrap();
     let credential = crate::platform::bootstrap_credential(&directory).unwrap();
-    let reopened = crate::store::StoreOwner::start(root, config, credential.clone()).await.unwrap();
+    let reopened = crate::store::StoreOwner::start(root, config, credential.clone())
+        .await
+        .unwrap();
     let successor = reopened.store.authenticate(credential).await.unwrap();
     let readback = read_check(&reopened.store, &successor, &check_id).await;
-    assert_eq!(readback["reconciliation"]["disposition"], json!("quarantined"));
+    assert_eq!(
+        readback["reconciliation"]["disposition"],
+        json!("quarantined")
+    );
     assert_eq!(readback["reconciliation"]["held"], json!(true));
-    assert_eq!(reopened.store.check_child_custody_count().await, 0, "reopen retains no child custody");
-    let reselected = pending_page(&reopened.store, directory.clone()).await.unwrap();
-    assert!(reselected.is_empty(), "held rows never re-enter the active page");
+    assert_eq!(
+        reopened.store.check_child_custody_count().await,
+        0,
+        "reopen retains no child custody"
+    );
+    let reselected = pending_page(&reopened.store, directory.clone())
+        .await
+        .unwrap();
+    assert!(
+        reselected.is_empty(),
+        "held rows never re-enter the active page"
+    );
     reopened.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -391,24 +492,46 @@ async fn operation_get_reports_held_disposition() {
     let check_id = admitted["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &check_id).await;
     damage_spec_json(&fixture.owner.store, &check_id).await;
-    pending_page(&fixture.owner.store, fixture.directory.clone()).await.unwrap();
+    pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
     let operation_id = operation_id_of(&fixture.owner.store, &check_id).await;
     let projection = fixture
         .owner
         .store
-        .call(operator.clone(), "operation.get".to_owned(), json!({"operation_id": &operation_id}))
+        .call(
+            operator.clone(),
+            "operation.get".to_owned(),
+            json!({"operation_id": &operation_id}),
+        )
         .await
         .unwrap();
     assert_eq!(projection["method"], json!("check.run"));
-    assert_eq!(projection["reconciliation"]["disposition"], json!("quarantined"));
-    assert_eq!(projection["reconciliation"]["code"], json!("CHECK_SPEC_SUBJECT_CORRUPT"));
+    assert_eq!(
+        projection["reconciliation"]["disposition"],
+        json!("quarantined")
+    );
+    assert_eq!(
+        projection["reconciliation"]["code"],
+        json!("CHECK_SPEC_SUBJECT_CORRUPT")
+    );
     assert_eq!(projection["reconciliation"]["held"], json!(false));
     let digest = spec_digest(&fixture.owner.store, &check_id).await;
-    write(&fixture.owner.store, &operator, "check.acknowledge_held", json!({"check_id": check_id, "expected_source_digest": digest})).await;
+    write(
+        &fixture.owner.store,
+        &operator,
+        "check.acknowledge_held",
+        json!({"check_id": check_id, "expected_source_digest": digest}),
+    )
+    .await;
     let reread = fixture
         .owner
         .store
-        .call(operator, "operation.get".to_owned(), json!({"operation_id": &operation_id}))
+        .call(
+            operator,
+            "operation.get".to_owned(),
+            json!({"operation_id": &operation_id}),
+        )
         .await
         .unwrap();
     assert_eq!(reread["reconciliation"]["held"], json!(true));
