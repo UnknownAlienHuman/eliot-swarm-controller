@@ -762,8 +762,12 @@ async fn append_pending_page(store: &Store, watch_id: &str, page: usize) {
         .run(move |db| {
             let tx = db.transaction()?;
             // Fixed 33-row influx exceeds the public 32-row tick budget.
+            // Influx rows use canonical server-shaped UUIDv4 ids that sort
+            // after a random watch id, so the forward page stays full while
+            // the retained cursor remains a valid ordering boundary.
             for index in 0..33 {
-                let id = format!("zz-influx-{page:02}-{index:02}");
+                let influx_n = page as u32 * 33 + index as u32;
+                let id = format!("ffffffff-ffff-4fff-bfff-{influx_n:012x}");
                 let mut record = original.clone();
                 record["watch_id"] = json!(id);
                 set_meta(&tx, &record_key(&id), &record)?;
@@ -881,6 +885,251 @@ async fn reg23_watch_malformed_global_cursor_remains_hard() {
         .await
         .expect_err("global cursor must stay hard");
     assert_eq!(error.code, "WATCH_CURSOR_DAMAGED");
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+fn hex_component(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn meta_snapshot(store: &Store) -> Vec<(String, String)> {
+    store
+        .run(|db| {
+            let mut statement = db.prepare("SELECT key, value_json FROM meta ORDER BY key")?;
+            let rows = statement
+                .query_map(params![], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("snapshot retained meta")
+}
+
+async fn active_raw(store: &Store, watch_id: &str) -> String {
+    let key = active_key_for(watch_id);
+    store
+        .run(move |db| {
+            let raw = db.query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok(raw)
+        })
+        .await
+        .expect("read active watch index")
+}
+
+async fn cursor_damage_zero_writes_case(label: &str, cursor: Value) {
+    let (owner, directory, _operator, manager) = store_fixture(label).await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "cursor-damage").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let retained_record = record_raw(&owner.store, &watch_id).await;
+    owner
+        .store
+        .run(move |db| {
+            set_meta(db, RECONCILE_CURSOR_KEY, &cursor)?;
+            Ok(())
+        })
+        .await
+        .expect("retain damaged cursor");
+    let before = meta_snapshot(&owner.store).await;
+    let error = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect_err("damaged cursor must stay hard");
+    assert_eq!(error.code, "WATCH_CURSOR_DAMAGED");
+    assert_eq!(meta_snapshot(&owner.store).await, before);
+    assert_eq!(record_raw(&owner.store, &watch_id).await, retained_record);
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_null_cursor_hard_without_subject_writes() {
+    cursor_damage_zero_writes_case("watch-cursor-null", json!(null)).await;
+}
+
+#[tokio::test]
+async fn reg23_watch_wrong_prefix_cursor_hard_without_subject_writes() {
+    cursor_damage_zero_writes_case(
+        "watch-cursor-prefix",
+        json!("coordination:watch:v1:record:deadbeef"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reg23_watch_odd_cursor_hard_without_subject_writes() {
+    cursor_damage_zero_writes_case(
+        "watch-cursor-odd",
+        json!("coordination:watch:v1:active:abc"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reg23_watch_non_uuid_cursor_hard_without_subject_writes() {
+    let cursor = format!(
+        "coordination:watch:v1:active:{}",
+        hex_component("another-watch")
+    );
+    cursor_damage_zero_writes_case("watch-cursor-non-uuid", json!(cursor)).await;
+}
+
+#[tokio::test]
+async fn reg23_watch_uppercase_cursor_hard_without_subject_writes() {
+    let cursor = format!(
+        "coordination:watch:v1:active:{}",
+        hex_component("another-watch").to_ascii_uppercase()
+    );
+    cursor_damage_zero_writes_case("watch-cursor-uppercase", json!(cursor)).await;
+}
+
+#[tokio::test]
+async fn reg23_watch_canonical_removed_row_cursor_allowed() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-cursor-removed").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "removed-cursor").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    cancel_operation(&owner.store, &manager, &operation_id).await;
+    let matched = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("match watch");
+    assert_eq!(matched["matched"], 1);
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 0);
+    // The retained cursor now points at a removed canonical row. It stays a
+    // valid ordering boundary and the empty retry converges.
+    let retry = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("removed-row cursor stays valid");
+    assert_eq!(retry["processed"], 0);
+    assert_eq!(retry["matched"], 0);
+    assert_eq!(retry["quarantined"], 0);
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_active_key_binds_payload_protects_canonical_neighbor() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-key-binding").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_a) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "binding-a").await;
+    let (_, operation_b) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "binding-b").await;
+    let watch_a =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_a).await;
+    let watch_b =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_b).await;
+    let (selected, neighbor) = if active_key_for(&watch_a) < active_key_for(&watch_b) {
+        (watch_a, watch_b)
+    } else {
+        (watch_b, watch_a)
+    };
+    let neighbor_record_before = record_raw(&owner.store, &neighbor).await;
+    let selected_key = active_key_for(&selected);
+    let neighbor_id = neighbor.clone();
+    owner
+        .store
+        .run(move |db| {
+            set_meta(db, &selected_key, &json!({"watch_id": neighbor_id}))?;
+            Ok(())
+        })
+        .await
+        .expect("point selected index at neighbor payload");
+    let injected_raw = active_raw(&owner.store, &selected).await;
+    let receipt = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("bind selected key before lookup");
+    assert_eq!(receipt["processed"], 2);
+    assert_eq!(receipt["quarantined"], 1);
+    assert_eq!(
+        record_raw(&owner.store, &neighbor).await,
+        neighbor_record_before
+    );
+    let neighbor_index: Value = serde_json::from_str(&active_raw(&owner.store, &neighbor).await)
+        .expect("neighbor index stays valid JSON");
+    assert_eq!(neighbor_index["watch_id"].as_str(), Some(neighbor.as_str()));
+    assert_eq!(active_index_count(&owner.store, &selected).await, 0);
+    assert_eq!(active_index_count(&owner.store, &neighbor).await, 1);
+    let keys = quarantine_keys(&owner.store).await;
+    assert_eq!(keys.len(), 1);
+    let evidence = quarantine_record(&owner.store, &keys[0]).await;
+    assert_eq!(evidence["code"], "WATCH_ACTIVE_INDEX_DAMAGED");
+    assert_eq!(
+        evidence["evidence"]["source_digest"],
+        model::digest(injected_raw.as_bytes())
+    );
+    assert_eq!(
+        evidence["evidence"]["source_pointer"],
+        format!(
+            "meta/key-sha256:{}",
+            model::digest(active_key_for(&selected).as_bytes())
+        )
+    );
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_singleton_pending_reconciles_without_metadata_churn() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-singleton-no-churn").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "singleton").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let first = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("observe pending");
+    assert_eq!(first["processed"], 1);
+    for field in ["matched", "expired", "stale", "quarantined"] {
+        assert_eq!(first[field], 0);
+    }
+    let baseline = meta_snapshot(&owner.store).await;
+    assert!(!baseline.is_empty());
+    for _ in 0..2 {
+        let retry = owner
+            .store
+            .reconcile_watches_once()
+            .await
+            .expect("singleton pending stays read-only");
+        assert_eq!(retry["processed"], 1);
+        for field in ["matched", "expired", "stale", "quarantined"] {
+            assert_eq!(retry[field], 0);
+        }
+        assert_eq!(retry["model_wake"], false);
+        assert_eq!(retry["native_work_queued"], false);
+        assert_eq!(meta_snapshot(&owner.store).await, baseline);
+    }
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
     assert!(quarantine_keys(&owner.store).await.is_empty());
     owner.close().await.expect("close Store");
     std::fs::remove_dir_all(directory).expect("remove temporary Store");

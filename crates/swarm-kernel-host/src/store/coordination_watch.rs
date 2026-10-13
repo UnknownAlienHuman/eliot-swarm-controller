@@ -675,21 +675,52 @@ fn reconcile_watch_subject(
 /// transaction that advances the cursor, so one poison row cannot starve the
 /// subjects behind it. A broken global reconcile cursor fails
 /// the whole domain transaction without partial subject writes.
+/// A retained reconcile cursor is only an ordering boundary when it has the
+/// exact canonical shape of a server-produced active key: the hex component
+/// must decode to a canonical lowercase UUIDv4 watch id and round-trip
+/// through the server key encoder. Removed rows stay valid boundaries, so
+/// existence is never required. Anything else is retained cursor damage and
+/// stays hard before any subject write.
+fn valid_reconcile_cursor(key: &str) -> bool {
+    let Some(suffix) = key.strip_prefix(ACTIVE_PREFIX) else {
+        return false;
+    };
+    if suffix.is_empty() || suffix.len() % 2 != 0 {
+        return false;
+    }
+    if !suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(suffix.len() / 2);
+    for index in (0..suffix.len()).step_by(2) {
+        let Ok(byte) = u8::from_str_radix(&suffix[index..index + 2], 16) else {
+            return false;
+        };
+        bytes.push(byte);
+    }
+    let Ok(watch_id) = String::from_utf8(bytes) else {
+        return false;
+    };
+    let Ok(uuid) = uuid::Uuid::parse_str(&watch_id) else {
+        return false;
+    };
+    if uuid.get_version() != Some(uuid::Version::Random) {
+        return false;
+    }
+    if uuid.hyphenated().to_string() != watch_id {
+        return false;
+    }
+    keys::key_component(&watch_id) == suffix
+}
+
 pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Value> {
     let limit = limit.clamp(1, MAX_RECONCILE_LIMIT);
     let cursor = match meta(tx, RECONCILE_CURSOR_KEY)? {
         None => None,
-        Some(Value::String(key))
-            if key.strip_prefix(ACTIVE_PREFIX).is_some_and(|suffix| {
-                !suffix.is_empty()
-                    && suffix.len() % 2 == 0
-                    && suffix
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }) =>
-        {
-            Some(key)
-        }
+        Some(Value::String(key)) if valid_reconcile_cursor(&key) => Some(key),
         Some(_) => {
             return Err(Error::new(
                 "WATCH_CURSOR_DAMAGED",
@@ -732,12 +763,16 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
     let cursor_receipt = if rows.is_empty() {
         None
     } else {
-        next_cursor.or(cursor)
+        next_cursor.or(cursor.clone())
     };
-    if let Some(key) = &cursor_receipt {
-        set_meta(tx, RECONCILE_CURSOR_KEY, &json!(key))?;
-    } else {
-        tx.execute("DELETE FROM meta WHERE key=?1", [RECONCILE_CURSOR_KEY])?;
+    // Identical cursor bytes are read-only. Rewriting the same key on every
+    // tick would keep one unchanged pending watch dirty forever.
+    if cursor_receipt != cursor {
+        if let Some(key) = &cursor_receipt {
+            set_meta(tx, RECONCILE_CURSOR_KEY, &json!(key))?;
+        } else {
+            tx.execute("DELETE FROM meta WHERE key=?1", [RECONCILE_CURSOR_KEY])?;
+        }
     }
     Ok(json!({
         "processed":rows.len(),
@@ -1955,17 +1990,30 @@ fn scan_active(tx: &Transaction<'_>, cursor: Option<&str>, limit: i64) -> Result
         limit / 2
     };
     let revisit_upper = format!("{REVISIT_PREFIX}g");
-    let revisit_rows = {
+    let revisit_fetch = if revisit_limit > 0 {
+        revisit_limit.saturating_add(1)
+    } else {
+        0
+    };
+    let fetched_revisit_rows = {
         let mut statement = tx.prepare(
             "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT ?3",
         )?;
         statement
             .query_map(
-                params![REVISIT_PREFIX, revisit_upper, revisit_limit],
+                params![REVISIT_PREFIX, revisit_upper, revisit_fetch],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
+    // Rotation is only needed when more pendings wait than the bounded
+    // revisit budget serves. When every queued pending fits, the slots are
+    // kept so a singleton (or small) unchanged pending set stays read-only.
+    let revisit_overflow = fetched_revisit_rows.len() as i64 > revisit_limit;
+    let revisit_rows = fetched_revisit_rows
+        .into_iter()
+        .take(revisit_limit as usize)
+        .collect::<Vec<_>>();
     let mut rows = Vec::new();
     for (queue_key, raw) in revisit_rows {
         let queued: Value = serde_json::from_str(&raw)?;
@@ -1995,7 +2043,9 @@ fn scan_active(tx: &Transaction<'_>, cursor: Option<&str>, limit: i64) -> Result
                 ));
             }
             rows.push((index_key.to_owned(), raw_index));
-            tx.execute("DELETE FROM meta WHERE key=?1", [queue_key])?;
+            if revisit_overflow {
+                tx.execute("DELETE FROM meta WHERE key=?1", [queue_key])?;
+            }
         } else {
             tx.execute("DELETE FROM meta WHERE key=?1", [queue_key])?;
         }
