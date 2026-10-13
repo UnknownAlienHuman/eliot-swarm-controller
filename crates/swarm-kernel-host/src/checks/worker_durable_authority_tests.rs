@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
 };
-use swarm_checks::{CheckIdentity, OwnedCheckProcess};
+use swarm_checks::CheckIdentity;
 
 struct FixtureDirectory(PathBuf);
 
@@ -37,7 +37,7 @@ fn fixture_work() -> (FixtureDirectory, Work, PathBuf) {
         profile: CheckProfile {
             profile_id: "profile".to_owned(),
             profile_revision: "1".to_owned(),
-            executable: "fixture-command-not-started".to_owned(),
+            executable: PathBuf::from("fixture-command-not-started"),
             args: Vec::new(),
             parser: Parser::ExitCode,
             resource: "target".to_owned(),

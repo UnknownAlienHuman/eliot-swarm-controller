@@ -1,5 +1,6 @@
 use super::*;
-use std::{cell::Cell, fs, path::PathBuf, rc::Rc};
+use crate::scripts::protocol;
+use std::{cell::Cell, fs, path::PathBuf, rc::Rc, sync::Barrier, thread};
 
 pub(crate) fn fixture_work(
     root: &std::path::Path,
@@ -104,8 +105,9 @@ fn store_allow_keeps_visible_decision_unknown_before_plan_materialization() {
     let decision_path = dir.join("start-decision.json");
     let fail_barrier = Rc::new(Cell::new(true));
     let fail_for_scope = Rc::clone(&fail_barrier);
+    let barrier_decision_path = decision_path.clone();
     let scoped_barrier = swarm_process::test_support::scoped_durability_barrier(move |path| {
-        if path == decision_path && fail_for_scope.get() {
+        if path == barrier_decision_path && fail_for_scope.get() {
             Err(swarm_contracts::error::Error::new(
                 "PRIVATE_FILE_DURABILITY_UNKNOWN",
                 "fixture failed after publication",

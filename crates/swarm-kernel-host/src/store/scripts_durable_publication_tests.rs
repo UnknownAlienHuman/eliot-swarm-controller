@@ -1,6 +1,6 @@
 use super::*;
 use crate::scripts::runner::durable_authority_tests::fixture_work;
-use std::{cell::RefCell, fs, path::PathBuf, rc::Rc};
+use std::{fs, path::PathBuf};
 
 struct FixtureDirectory(PathBuf);
 
