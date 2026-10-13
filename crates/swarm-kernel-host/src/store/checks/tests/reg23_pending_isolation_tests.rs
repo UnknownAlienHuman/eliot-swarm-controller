@@ -88,6 +88,29 @@ async fn damage_profile(store: &Store, check_id: &str) -> String {
         .unwrap()
 }
 
+/// Test-only retained-state fault injection: replace the exact spec bytes with
+/// truncated invalid JSON while keeping every Operation/Attempt/Task fact.
+async fn damage_spec_invalid_json(store: &Store, check_id: &str) -> String {
+    let id = check_id.to_owned();
+    store
+        .run(move |db| {
+            let damaged = "{\"token\": \"reg23-invalid-json\", \"candidate\":".to_owned();
+            let changed = db.execute(
+                "UPDATE check_runs SET spec_json=?2 WHERE check_id=?1",
+                params![id, damaged],
+            )?;
+            if changed != 1 {
+                return Err(crate::error::Error::new(
+                    "TEST_STATE",
+                    "publicly admitted CheckRun disappeared before fault injection",
+                ));
+            }
+            Ok(damaged)
+        })
+        .await
+        .unwrap()
+}
+
 async fn retained_quarantine(store: &Store, check_id: &str) -> Value {
     let key = quarantine_key(check_id);
     store
@@ -249,19 +272,16 @@ async fn repeated_consumer_call_preserves_bounded_disposition() {
             .is_empty()
     );
     let second = retained_quarantine(&fixture.owner.store, &check_id).await;
-    let mut expected = first.clone();
-    expected["occurrences"] = json!(2);
-    expected["last_seen_at_ms"] = second["last_seen_at_ms"].clone();
     assert_eq!(
-        second, expected,
-        "every immutable quarantine field is retained"
-    );
-    assert!(
-        second["last_seen_at_ms"].as_i64().unwrap() >= first["last_seen_at_ms"].as_i64().unwrap()
+        second, first,
+        "unchanged quarantine is stable across polls: polling alone must not rewrite occurrences or last_seen"
     );
 
-    let mut saturated = second;
-    saturated["occurrences"] = json!(u32::MAX);
+    let saturated = {
+        let mut saturated = second.clone();
+        saturated["occurrences"] = json!(u32::MAX);
+        saturated
+    };
     write_quarantine(&fixture.owner.store, &check_id, saturated.clone()).await;
     assert!(
         pending_page(&fixture.owner.store, fixture.directory.clone())
@@ -270,14 +290,9 @@ async fn repeated_consumer_call_preserves_bounded_disposition() {
             .is_empty()
     );
     let after = retained_quarantine(&fixture.owner.store, &check_id).await;
-    assert!(
-        after["last_seen_at_ms"].as_i64().unwrap()
-            >= saturated["last_seen_at_ms"].as_i64().unwrap()
-    );
-    saturated["last_seen_at_ms"] = after["last_seen_at_ms"].clone();
     assert_eq!(
         after, saturated,
-        "observation count saturates without changing identity"
+        "stable re-observation keeps the saturating bound without rewriting identity"
     );
     assert_eq!(
         spec_bytes(&fixture.owner.store, &check_id).await,
@@ -342,15 +357,17 @@ async fn durable_disposition_survives_an_actual_store_restart() {
             .is_empty()
     );
     let after = retained_quarantine(&reopened_store, &check_id).await;
-    assert!(
-        after["last_seen_at_ms"].as_i64().unwrap() >= before["last_seen_at_ms"].as_i64().unwrap()
-    );
-    let mut expected = before.clone();
-    expected["occurrences"] = json!(before["occurrences"].as_u64().unwrap() + 1);
-    expected["last_seen_at_ms"] = after["last_seen_at_ms"].clone();
     assert_eq!(
-        after, expected,
-        "reopened consumer retains origin and records observation"
+        after, before,
+        "restart recognizes retained quarantine without rewriting occurrences or last_seen"
+    );
+    assert_eq!(
+        reopened_store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        Some(json!(check_id)),
+        "restart preserves the durable cursor without a rewrite"
     );
     assert_eq!(
         spec_bytes(&reopened_store, &check_id).await,
@@ -361,10 +378,13 @@ async fn durable_disposition_survives_an_actual_store_restart() {
     std::fs::remove_dir_all(fixture.directory).unwrap();
 }
 
-/// An existing quarantine observation write stays inside the hard-failure
-/// boundary and cannot advance either the record or the page cursor.
+/// Unchanged deterministic damage stays read-only across polls: polling alone
+/// must not rewrite occurrences/last_seen and must not hit the writer, even
+/// with an observation-write failure trigger installed. New quarantine/cursor
+/// hard-failure rollback stays covered by the late-write and
+/// quarantine-insert fixtures.
 #[tokio::test]
-async fn existing_quarantine_observation_write_failure_is_hard_and_atomic() {
+async fn unchanged_quarantine_poll_stays_read_only() {
     let fixture = fixture().await;
     let admitted = admit_pending(
         &fixture,
@@ -399,7 +419,13 @@ async fn existing_quarantine_observation_write_failure_is_hard_and_atomic() {
         })
         .await
         .unwrap();
-    assert_pending_error_code(&fixture, "STORE_ERROR").await;
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty(),
+        "unchanged poll must stay read-only and not hit the observation-write trigger"
+    );
     assert_eq!(
         retained_quarantine(&fixture.owner.store, &check_id).await,
         before
@@ -433,12 +459,9 @@ async fn existing_quarantine_observation_write_failure_is_hard_and_atomic() {
             .is_empty()
     );
     let after = retained_quarantine(&fixture.owner.store, &check_id).await;
-    let mut expected = before;
-    expected["occurrences"] = json!(2);
-    expected["last_seen_at_ms"] = after["last_seen_at_ms"].clone();
     assert_eq!(
-        after, expected,
-        "changed-condition recovery records exactly one observation"
+        after, before,
+        "polling alone must not rewrite occurrences or last_seen"
     );
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
@@ -922,6 +945,234 @@ async fn bounded_cursor_progress_includes_later_rows_and_new_admissions() {
         "a new ID before or after the cursor is visited by bounded wraparound"
     );
 
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// Invalid JSON in one subject is isolated: the healthy neighbor still
+/// returns as real Work, the damaged subject retains one bounded quarantine
+/// record bound to its exact raw digest, and repeat polls stay stable without
+/// rewriting occurrences or the cursor.
+#[tokio::test]
+async fn invalid_json_pending_spec_does_not_block_healthy_neighbor() {
+    let fixture = fixture().await;
+    let damaged = admit_pending(
+        &fixture,
+        "reg23-invalid-json-neighbor",
+        b"invalid json subject source",
+        "v1",
+    )
+    .await;
+    let healthy = admit_pending(
+        &fixture,
+        "reg23-invalid-json-healthy",
+        b"invalid json healthy source",
+        "v2",
+    )
+    .await;
+    let damaged_id = damaged["check_id"].as_str().unwrap().to_owned();
+    let healthy_id = healthy["check_id"].as_str().unwrap().to_owned();
+    let damaged_spec = damage_spec_invalid_json(&fixture.owner.store, &damaged_id).await;
+    assert!(
+        serde_json::from_str::<Value>(&damaged_spec).is_err(),
+        "fault injection must retain invalid JSON bytes"
+    );
+    let before = retained_domain_snapshot(&fixture.owner.store, &damaged_id).await;
+
+    let page = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].check_id, healthy_id);
+    assert_eq!(
+        page[0].operation_id,
+        healthy["operation_id"].as_str().unwrap()
+    );
+    assert_eq!(page[0].profile.profile_revision, "v2");
+    assert!(!page.iter().any(|work| work.check_id == damaged_id));
+    assert_eq!(
+        retained_domain_snapshot(&fixture.owner.store, &damaged_id).await,
+        before,
+        "quarantine must leave CheckRun, Operation, Attempt, and Task facts unchanged"
+    );
+    assert_eq!(
+        spec_bytes(&fixture.owner.store, &damaged_id).await,
+        damaged_spec
+    );
+
+    let evidence = retained_quarantine(&fixture.owner.store, &damaged_id).await;
+    assert_eq!(evidence["schema_version"], 1);
+    assert_eq!(evidence["identity"]["check_id"], damaged_id);
+    assert_eq!(
+        evidence["identity"]["operation_id"],
+        damaged["operation_id"].as_str().unwrap()
+    );
+    assert_eq!(evidence["code"], "CHECK_SPEC_SUBJECT_CORRUPT");
+    assert_eq!(evidence["field"], "spec");
+    assert_eq!(evidence["reason"], "invalid_json");
+    assert_eq!(
+        evidence["identity"]["check_spec_sha256"],
+        model::digest(damaged_spec.as_bytes())
+    );
+    assert!(
+        evidence["identity"]["operation_original_request_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(
+        evidence["identity"]["attempt_task_snapshot_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(evidence["first_seen_at_ms"].as_i64().is_some());
+    assert!(evidence["last_seen_at_ms"].as_i64().is_some());
+    assert_eq!(evidence["occurrences"], 1);
+    assert_eq!(fixture.owner.store.check_child_custody_count().await, 0);
+
+    let second = pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    assert!(
+        second.iter().any(|work| work.check_id == healthy_id),
+        "healthy later subject still progresses while invalid-JSON neighbor stays quarantined"
+    );
+    assert!(!second.iter().any(|work| work.check_id == damaged_id));
+    assert_eq!(
+        retained_quarantine(&fixture.owner.store, &damaged_id).await,
+        evidence,
+        "repeat poll must not rewrite invalid-JSON quarantine occurrences or last_seen"
+    );
+    assert_eq!(
+        spec_bytes(&fixture.owner.store, &damaged_id).await,
+        damaged_spec
+    );
+
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// Empty Store with no retained cursor stays read-only: repeated pending
+/// scans return no Work, retain no cursor, and do not hit the SQLite writer.
+#[tokio::test]
+async fn empty_pending_scan_stays_read_only() {
+    let fixture = fixture().await;
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .owner
+            .store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        None
+    );
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch(
+                "CREATE TRIGGER reg23_fail_empty_insert BEFORE INSERT ON meta BEGIN SELECT RAISE(ABORT,'injected empty insert'); END; CREATE TRIGGER reg23_fail_empty_update BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT,'injected empty update'); END; CREATE TRIGGER reg23_fail_empty_delete BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT,'injected empty delete'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty(),
+        "empty scan with no cursor must not attempt any meta write"
+    );
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch(
+                "DROP TRIGGER reg23_fail_empty_insert; DROP TRIGGER reg23_fail_empty_update; DROP TRIGGER reg23_fail_empty_delete;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .owner
+            .store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        None
+    );
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// A stale cursor with no subjects is removed once; the next empty scan is
+/// read-only and does not attempt a second delete.
+#[tokio::test]
+async fn stale_cursor_is_removed_once_then_read_only() {
+    let fixture = fixture().await;
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    fixture
+        .owner
+        .store
+        .run(|db| set_meta(db, PENDING_CURSOR_KEY, &json!("stale-cursor-check-id")))
+        .await
+        .unwrap();
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .owner
+            .store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        None,
+        "stale cursor is deleted once"
+    );
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch(
+                "CREATE TRIGGER reg23_fail_stale_delete BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT,'injected stale second delete'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty(),
+        "second empty scan must be read-only and not attempt another delete"
+    );
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            db.execute_batch("DROP TRIGGER reg23_fail_stale_delete")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
 }

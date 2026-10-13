@@ -1605,6 +1605,7 @@ fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
 enum SubjectDamageReason {
     MissingRequiredField,
     InvalidSubjectShape,
+    InvalidJson,
 }
 
 impl SubjectDamageReason {
@@ -1612,6 +1613,7 @@ impl SubjectDamageReason {
         match self {
             Self::MissingRequiredField => "missing_required_field",
             Self::InvalidSubjectShape => "invalid_subject_shape",
+            Self::InvalidJson => "invalid_json",
         }
     }
 }
@@ -1653,7 +1655,15 @@ fn decode_subject_fields(
     identity: Option<String>,
     root: PathBuf,
 ) -> Result<SubjectMaterialization> {
-    let spec: Value = serde_json::from_str(&raw)?;
+    let spec: Value = match serde_json::from_str(&raw) {
+        Ok(spec) => spec,
+        Err(_) => {
+            return Ok(SubjectMaterialization::Damaged {
+                field: "spec",
+                reason: SubjectDamageReason::InvalidJson,
+            });
+        }
+    };
     let Some(fields) = spec.as_object() else {
         return Ok(SubjectMaterialization::Damaged {
             field: "spec",
@@ -2160,6 +2170,7 @@ fn valid_pending_damage(field: &str, reason: &str) -> bool {
                 "spec" | "token" | "candidate" | "profile" | "executor" | "cancel_request",
                 "invalid_subject_shape",
             )
+            | ("spec", "invalid_json")
     )
 }
 
@@ -2262,22 +2273,14 @@ fn materialize_pending_subject(
             )
         })?;
         let materialized = decode_pending_row(&identity, row, root)?;
-        if let Some(mut record) = read_pending_quarantine(tx, check_id, &identity)? {
+        if let Some(record) = read_pending_quarantine(tx, check_id, &identity)? {
             match materialized {
                 SubjectMaterialization::Damaged { field, reason }
                     if record.field == field && record.reason == reason.name() =>
                 {
-                    record.occurrences = record.occurrences.saturating_add(1);
-                    record.last_seen_at_ms = record.last_seen_at_ms.max(model::now_ms()?);
-                    validate_pending_quarantine(&record, check_id)?;
-                    let value = json!(&record);
-                    if model::canonical(&value)?.len() > MAX_PENDING_QUARANTINE_BYTES {
-                        return Err(Error::new(
-                            "CHECK_PENDING_QUARANTINE_INVALID",
-                            "pending quarantine observation exceeds its bounded size",
-                        ));
-                    }
-                    set_meta(tx, &quarantine_key(check_id), &value)?;
+                    // Unchanged deterministic damage stays stable across polls and
+                    // restarts: no occurrence/last_seen rewrite and no writer churn.
+                    // A changed digest or classification remains a hard conflict.
                     return Ok(PendingSubjectOutcome::AlreadyQuarantined);
                 }
                 SubjectMaterialization::Decoded(_) | SubjectMaterialization::Damaged { .. } => {
@@ -2350,11 +2353,15 @@ fn retain_pending_quarantine(
 }
 
 fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Deferred snapshot: empty scans and unchanged stable pages stay read-only
+    // and never reserve the SQLite writer. Stale-cursor cleanup and new
+    // quarantine/cursor dispositions upgrade the same transaction atomically.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let cursor = read_pending_cursor(&tx)?;
     let ids = pending_page(&tx, cursor.as_deref())?;
     let mut work = Vec::with_capacity(ids.len());
     let mut last_id = None;
+    let mut quarantined_new = false;
     for check_id in ids {
         last_id = Some(check_id.clone());
         match materialize_pending_subject(&tx, &check_id, root.clone())? {
@@ -2364,12 +2371,28 @@ fn pending(db: &mut Connection, root: PathBuf) -> Result<Vec<Work>> {
                 identity,
                 field,
                 reason,
-            } => retain_pending_quarantine(&tx, identity, field, reason, model::now_ms()?)?,
+            } => {
+                retain_pending_quarantine(&tx, identity, field, reason, model::now_ms()?)?;
+                quarantined_new = true;
+            }
         }
     }
     if let Some(check_id) = last_id {
-        set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
+        let cursor_unchanged = cursor.as_deref() == Some(check_id.as_str());
+        if quarantined_new || !cursor_unchanged {
+            set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
+        } else {
+            // Stable page with no new disposition and an unchanged cursor:
+            // drop the read snapshot without reserving the writer.
+            return Ok(work);
+        }
     } else {
+        if cursor.is_none() {
+            // Empty scan with no retained cursor: read-only, no meta mutation.
+            return Ok(work);
+        }
+        // Stale cursor with no subjects: delete once; the next empty scan is
+        // read-only.
         tx.execute("DELETE FROM meta WHERE key=?1", [PENDING_CURSOR_KEY])?;
     }
     tx.commit()?;
