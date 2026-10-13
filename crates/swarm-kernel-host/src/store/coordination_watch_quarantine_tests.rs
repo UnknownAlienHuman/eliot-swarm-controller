@@ -915,11 +915,9 @@ async fn active_raw(store: &Store, watch_id: &str) -> String {
     let key = active_key_for(watch_id);
     store
         .run(move |db| {
-            let raw = db.query_row(
-                "SELECT value_json FROM meta WHERE key=?1",
-                [key],
-                |row| row.get::<_, String>(0),
-            )?;
+            let raw = db.query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+                row.get::<_, String>(0)
+            })?;
             Ok(raw)
         })
         .await
@@ -1035,10 +1033,8 @@ async fn reg23_watch_active_key_binds_payload_protects_canonical_neighbor() {
     let (owner, directory, _operator, manager) = store_fixture("watch-key-binding").await;
     register_active_script(&owner.store, &manager).await;
     let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
-    let (_, operation_a) =
-        admit_script_run(&owner.store, &manager, &attempt_id, "binding-a").await;
-    let (_, operation_b) =
-        admit_script_run(&owner.store, &manager, &attempt_id, "binding-b").await;
+    let (_, operation_a) = admit_script_run(&owner.store, &manager, &attempt_id, "binding-a").await;
+    let (_, operation_b) = admit_script_run(&owner.store, &manager, &attempt_id, "binding-b").await;
     let watch_a =
         create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_a).await;
     let watch_b =
@@ -1170,11 +1166,10 @@ async fn slot_count(store: &Store, key: &str) -> i64 {
     let key = key.to_owned();
     store
         .run(move |db| {
-            let count: i64 = db.query_row(
-                "SELECT COUNT(*) FROM meta WHERE key=?1",
-                [key],
-                |row| row.get(0),
-            )?;
+            let count: i64 =
+                db.query_row("SELECT COUNT(*) FROM meta WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })?;
             Ok(count)
         })
         .await
@@ -1185,11 +1180,10 @@ async fn slot_raw(store: &Store, key: &str) -> String {
     let key = key.to_owned();
     store
         .run(move |db| {
-            let raw: String = db.query_row(
-                "SELECT value_json FROM meta WHERE key=?1",
-                [key],
-                |row| row.get(0),
-            )?;
+            let raw: String =
+                db.query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })?;
             Ok(raw)
         })
         .await
@@ -1305,14 +1299,13 @@ async fn reg23_watch_damaged_revisit_slot_quarantined_neighbors_progress() {
     );
     assert_eq!(
         evidence["evidence"]["source_pointer"],
-        format!(
-            "meta/key-sha256:{}",
-            model::digest(slot_key.as_bytes())
-        )
+        format!("meta/key-sha256:{}", model::digest(slot_key.as_bytes()))
     );
-    assert!(evidence["evidence"]["subject_identity"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("watch-revisit-key-sha256:")));
+    assert!(
+        evidence["evidence"]["subject_identity"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("watch-revisit-key-sha256:"))
+    );
     let third = owner
         .store
         .reconcile_watches_once()
@@ -1352,10 +1345,11 @@ async fn reg23_watch_stale_revisit_pointer_quarantined_watch_intact() {
         hex_component("zz-other")
     );
     let poisoning = active_key_for(&watch_id);
+    let injected_slot_key = slot_key.clone();
     owner
         .store
         .run(move |db| {
-            set_meta(db, &slot_key, &json!({"active_key": poisoning}))?;
+            set_meta(db, &injected_slot_key, &json!({"active_key": poisoning}))?;
             Ok(())
         })
         .await
@@ -1382,10 +1376,7 @@ async fn reg23_watch_stale_revisit_pointer_quarantined_watch_intact() {
     );
     assert_eq!(
         evidence["evidence"]["source_pointer"],
-        format!(
-            "meta/key-sha256:{}",
-            model::digest(slot_key.as_bytes())
-        )
+        format!("meta/key-sha256:{}", model::digest(slot_key.as_bytes()))
     );
     let third = owner
         .store
@@ -1423,7 +1414,12 @@ async fn reg23_watch_slot_quarantine_write_failure_rolls_back() {
         "coordination:watch:v1:revisit:00000000000000000000:{}",
         hex_component("zz-poison")
     );
-    inject_raw_meta(&owner.store, slot_key.clone(), "{corrupt revisit slot".to_owned()).await;
+    inject_raw_meta(
+        &owner.store,
+        slot_key.clone(),
+        "{corrupt revisit slot".to_owned(),
+    )
+    .await;
     owner
         .store
         .run(|db| {
@@ -1462,6 +1458,3 @@ async fn reg23_watch_slot_quarantine_write_failure_rolls_back() {
     owner.close().await.expect("close Store");
     std::fs::remove_dir_all(directory).expect("remove temporary Store");
 }
-
-
-
