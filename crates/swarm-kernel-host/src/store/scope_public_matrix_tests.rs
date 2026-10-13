@@ -2671,7 +2671,7 @@ mod connected_store {
 
         let acceptance = call(
             store,
-            &reviewer,
+            &f.manager_a,
             "task.acceptance",
             json!({"acceptance_operation_id":accept_a}),
         )
@@ -2688,12 +2688,22 @@ mod connected_store {
         assert_eq!(check["candidate_ref"], candidate_a);
         assert_eq!(check["state"], "queued");
 
+        // The sponsored reviewer may read its assigned CheckRun evidence,
+        // but does not acquire the rest of the Task graph (PR51 row 4).
+        denied(
+            store,
+            &reviewer,
+            "task.acceptance",
+            json!({"acceptance_operation_id":accept_a}),
+            "FORBIDDEN",
+        )
+        .await;
         denied(
             store,
             &reviewer,
             "task.acceptance",
             json!({"acceptance_operation_id":accept_b}),
-            "NOT_FOUND",
+            "FORBIDDEN",
         )
         .await;
         denied(
