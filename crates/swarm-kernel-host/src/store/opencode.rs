@@ -1,6 +1,7 @@
 //! External HTTP bindings attach to an explicit service; the separate owned
 //! route keeps its helper lifecycle and exact process proof binding-scoped.
 mod execution_reads;
+mod reg23_isolation;
 mod result_reads;
 pub(crate) use super::launcher_owned_service::owned_service_for_binding;
 use super::{Store, meta, operations, runtime, set_meta, tasks};
@@ -226,7 +227,18 @@ fn original(db: &Connection, p: &Principal, id: &str) -> Result<RuntimeCommand> 
         [id],
         |r| r.get(0),
     )?;
-    let mut input: Value = serde_json::from_str(&raw)?;
+    let mut input: Value = serde_json::from_str(&raw).map_err(|_| {
+        Error::new(
+            "RUNTIME_COMMAND_INVALID",
+            "retained OpenCode command input is invalid JSON",
+        )
+    })?;
+    if !input.is_object() {
+        return Err(Error::new(
+            "RUNTIME_COMMAND_INVALID",
+            "retained OpenCode command input must be an object",
+        ));
+    }
     let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&o, "method")?.to_owned();
     if method == "task.dispatch" {
@@ -303,24 +315,13 @@ impl Store {
 
     pub async fn supervise_opencode(self, mut stopping: watch::Receiver<bool>) -> Result<()> {
         let (worker_stop, worker_stopping) = watch::channel(false);
-        let mut workers: BTreeMap<String, JoinHandle<()>> = BTreeMap::new();
-        let mut owned_workers: BTreeMap<(String, i64), JoinHandle<()>> = BTreeMap::new();
+        let mut workers: BTreeMap<String, JoinHandle<Result<()>>> = BTreeMap::new();
+        let mut owned_workers: BTreeMap<(String, i64), JoinHandle<Result<()>>> = BTreeMap::new();
         let mut changed = self.changed.subscribe();
         let result = async {
             while !*stopping.borrow() {
-                let finished = workers
-                    .iter()
-                    .filter(|(_, task)| task.is_finished())
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-                for key in finished {
-                    if let Some(task) = workers.remove(&key) {
-                        let result = task.await;
-                        if !*stopping.borrow() {
-                            self.recover_finished_shared_worker(&key, result).await?;
-                        }
-                    }
-                }
+                self.consume_finished_shared_workers(&mut workers, &stopping)
+                    .await?;
                 let finished_owned = owned_workers
                     .iter()
                     .filter(|(_, task)| task.is_finished())
@@ -346,7 +347,7 @@ impl Store {
                         let store = self.clone();
                         let stop = worker_stopping.clone();
                         entry.insert(tokio::spawn(async move {
-                            store.drive_opencode(&options.service_id, stop).await;
+                            store.drive_opencode(&options.service_id, stop).await
                         }));
                     }
                 }
@@ -366,7 +367,7 @@ impl Store {
                         let store = self.clone();
                         let stop = worker_stopping.clone();
                         entry.insert(tokio::spawn(async move {
-                            store.drive_owned_opencode(&key.0, key.1, stop).await;
+                            store.drive_owned_opencode(&key.0, key.1, stop).await
                         }));
                     }
                 }
@@ -382,16 +383,41 @@ impl Store {
         finish_opencode_supervisor(worker_stop, workers, owned_workers, result).await
     }
 
+    async fn consume_finished_shared_workers(
+        &self,
+        workers: &mut BTreeMap<String, JoinHandle<Result<()>>>,
+        stopping: &watch::Receiver<bool>,
+    ) -> Result<()> {
+        let finished = workers
+            .iter()
+            .filter(|(_, task)| task.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in finished {
+            if let Some(task) = workers.remove(&key) {
+                let result = task.await;
+                if !*stopping.borrow() {
+                    self.recover_finished_shared_worker(&key, result).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn recover_finished_shared_worker(
         &self,
         service_id: &str,
-        result: std::result::Result<(), tokio::task::JoinError>,
+        result: std::result::Result<Result<()>, tokio::task::JoinError>,
     ) -> Result<()> {
-        let code = worker_failure_code(&result);
+        let failure = match &result {
+            Ok(Err(error)) => Some(error.clone()),
+            _ => None,
+        };
+        let code = worker_failure_code(&result).to_owned();
         let service_id = service_id.to_owned();
         let boot = model::new_id();
         let detail = oc::diagnostic(&Error::new(
-            code,
+            code.clone(),
             "builtin OpenCode worker terminated unexpectedly",
         ));
         let recovered = self
@@ -403,7 +429,7 @@ impl Store {
                 let mut recovered = false;
                 for binding in active {
                     let principal = attach(db, &binding, &boot, "external_shared_service")?;
-                    write_connection_state(db, &principal, false, &detail, Some(code))?;
+                    write_connection_state(db, &principal, false, &detail, Some(&code))?;
                     recovered = true;
                 }
                 Ok(recovered)
@@ -413,20 +439,24 @@ impl Store {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     async fn recover_finished_owned_worker(
         &self,
         binding_id: &str,
         generation: i64,
-        result: std::result::Result<(), tokio::task::JoinError>,
+        result: std::result::Result<Result<()>, tokio::task::JoinError>,
     ) -> Result<()> {
-        let code = worker_failure_code(&result);
+        let failure = match &result {
+            Ok(Err(error)) => Some(error.clone()),
+            _ => None,
+        };
+        let code = worker_failure_code(&result).to_owned();
         let binding_id = binding_id.to_owned();
         let boot = model::new_id();
         let detail = oc::diagnostic(&Error::new(
-            code,
+            code.clone(),
             "builtin OpenCode owned worker terminated unexpectedly",
         ));
         let recovered = self
@@ -437,7 +467,7 @@ impl Store {
                     return Ok(false);
                 };
                 let principal = attach(db, &binding, &boot, "owned_fresh_service")?;
-                write_connection_state(db, &principal, false, &detail, Some(code))?;
+                write_connection_state(db, &principal, false, &detail, Some(&code))?;
                 Ok(true)
             })
             .await?;
@@ -445,7 +475,7 @@ impl Store {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
     async fn record_oc_outcome(&self, p: &Principal, outcome: RuntimeOutcome) -> Result<()> {
         let p = p.clone();
@@ -594,7 +624,7 @@ impl Store {
         execution_reader: &mut execution_reads::Reader,
         result_retries: &mut BTreeMap<(String, i64), (String, Instant)>,
         stopping: &watch::Receiver<bool>,
-    ) {
+    ) -> Result<()> {
         execution_reader
             .schedule(
                 self,
@@ -605,7 +635,7 @@ impl Store {
                 self.config.as_ref(),
                 stopping.clone(),
             )
-            .await;
+            .await?;
         for binding in bindings {
             if *stopping.borrow() {
                 break;
@@ -647,23 +677,21 @@ impl Store {
             let config = self.config.clone();
             let principal = p.clone();
             let pending = self
-                .run(move |db| {
-                    let (id, generation, _) = runtime::scope(db, &principal, true)?;
-                    let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.background') ORDER BY created_at_ms LIMIT 16")?;
-                    let ids=stmt.query_map(params![id,generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                    ids.into_iter().map(|id|original_with_config(db,&principal,&id,&config)).collect::<Result<Vec<_>>>()
-                })
+                .run(move |db| reg23_isolation::pending_commands(db, &principal, &config))
                 .await;
-            if let Ok(pending) = pending {
-                for command in pending {
-                    if *stopping.borrow() {
-                        break;
-                    }
-                    let result = service.reconcile(&command, &binding_options).await;
-                    if matches!(result.outcome, EffectOutcome::Applied) {
-                        let _ = self.record_oc_outcome(p, result).await;
+            match pending {
+                Ok(pending) => {
+                    for command in pending {
+                        if *stopping.borrow() {
+                            break;
+                        }
+                        let result = service.reconcile(&command, &binding_options).await;
+                        if matches!(result.outcome, EffectOutcome::Applied) {
+                            let _ = self.record_oc_outcome(p, result).await;
+                        }
                     }
                 }
+                Err(error) => return Err(error),
             }
             let principal = p.clone();
             let fresh = self
@@ -720,7 +748,7 @@ impl Store {
                     // Do not turn selector infrastructure or authority errors
                     // into an idle readback pass. A later pass may retry only
                     // the same durable queued Operation.
-                    continue;
+                    return Err(error);
                 }
             };
             let Some(raw_command) = next.get("command") else {
@@ -761,8 +789,12 @@ impl Store {
                 let read = self
                     .run(move |db| result_reads::next_read(db, &principal, &after, &config))
                     .await;
-                let Ok(Some(command)) = read else {
-                    continue;
+                let command = match read {
+                    Ok(Some(command)) => command,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        return Err(error);
+                    }
                 };
                 result_retries.insert(key.clone(), (command.operation_id.clone(), Instant::now()));
                 command
@@ -808,6 +840,7 @@ impl Store {
                 eprintln!("OpenCode receipt: {}", error.code);
             }
         }
+        Ok(())
     }
 
     async fn drive_owned_opencode(
@@ -815,7 +848,7 @@ impl Store {
         binding_id: &str,
         generation: i64,
         mut stopping: watch::Receiver<bool>,
-    ) {
+    ) -> Result<()> {
         let binding_id = binding_id.to_owned();
         let boot = model::new_id();
         let mut changed = self.changed.subscribe();
@@ -827,7 +860,7 @@ impl Store {
         // it cannot mint a replacement process for an unresolved effect.
         let handle = loop {
             if *stopping.borrow() {
-                return;
+                return Ok(());
             }
             match self
                 .ensure_owned_opencode_service(&binding_id, generation, stopping.clone())
@@ -844,7 +877,7 @@ impl Store {
                         .run(move |db| active_owned_binding(db, &id, generation))
                         .await;
                     if !matches!(still_active, Ok(Some(_))) {
-                        return;
+                        return still_active.map(|_| ());
                     }
                     tokio::select! {
                         _ = stopping.changed() => {},
@@ -866,13 +899,13 @@ impl Store {
             Ok(None) => {
                 execution_reader.close().await;
                 self.close_owned_opencode_service(handle).await;
-                return;
+                return Ok(());
             }
             Err(error) => {
                 eprintln!("OpenCode owned-service binding: {}", error.code);
                 execution_reader.close().await;
                 self.close_owned_opencode_service(handle).await;
-                return;
+                return Err(error);
             }
         };
         let attach_binding = binding.clone();
@@ -886,7 +919,7 @@ impl Store {
                 eprintln!("OpenCode owned-service attachment: {}", error.code);
                 execution_reader.close().await;
                 self.close_owned_opencode_service(handle).await;
-                return;
+                return Err(error);
             }
         };
         let key = (binding_id.clone(), generation);
@@ -898,14 +931,17 @@ impl Store {
             last_gap: None,
         };
 
-        while !*stopping.borrow() {
+        let loop_result = loop {
+            if *stopping.borrow() {
+                break Ok(());
+            }
             let id = binding_id.clone();
             let _binding = match self
                 .run(move |db| active_owned_binding(db, &id, generation))
                 .await
             {
                 Ok(Some(binding)) => binding,
-                Ok(None) => break,
+                Ok(None) => break Ok(()),
                 Err(error) => {
                     eprintln!("OpenCode owned-service scope: {}", error.code);
                     tokio::select! {
@@ -928,7 +964,7 @@ impl Store {
                         error.code.as_str(),
                         "BINDING_CLOSED" | "UNAUTHORIZED" | "STALE_LINK"
                     ) {
-                        break;
+                        break Ok(());
                     }
                     eprintln!("OpenCode owned-service authority: {}", error.code);
                     tokio::select! {
@@ -943,19 +979,23 @@ impl Store {
             match service.verify().await {
                 Ok(()) => {
                     let bindings = [binding];
-                    self.drive_opencode_bindings(
-                        &bindings,
-                        &principals,
-                        &service,
-                        &options,
-                        Some(&options),
-                        &boot,
-                        &event_state,
-                        &mut execution_reader,
-                        &mut result_retries,
-                        &stopping,
-                    )
-                    .await;
+                    if let Err(error) = self
+                        .drive_opencode_bindings(
+                            &bindings,
+                            &principals,
+                            &service,
+                            &options,
+                            Some(&options),
+                            &boot,
+                            &event_state,
+                            &mut execution_reader,
+                            &mut result_retries,
+                            &stopping,
+                        )
+                        .await
+                    {
+                        break Err(error);
+                    }
                 }
                 Err(error) => {
                     let _ = self.oc_connection(&principal, false, Some(&error)).await;
@@ -966,14 +1006,19 @@ impl Store {
                 _ = changed.changed() => {},
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
             }
-        }
+        };
 
         execution_reader.close().await;
         let _ = self.oc_connection(&principal, false, None).await;
         self.close_owned_opencode_service(handle).await;
+        loop_result
     }
 
-    async fn drive_opencode(&self, service_id: &str, mut stopping: watch::Receiver<bool>) {
+    async fn drive_opencode(
+        &self,
+        service_id: &str,
+        mut stopping: watch::Receiver<bool>,
+    ) -> Result<()> {
         let boot = model::new_id();
         let mut principals = BTreeMap::new();
         let mut execution_reader = execution_reads::Reader::default();
@@ -981,18 +1026,21 @@ impl Store {
         let mut connection = None;
         let mut events: Option<oc::EventReader> = None;
         let mut changed = self.changed.subscribe();
-        while !*stopping.borrow() {
+        let loop_result = loop {
+            if *stopping.borrow() {
+                break Ok(());
+            }
             let service_id = service_id.to_owned();
             let list = match self.run(move |db| bindings(db, Some(&service_id))).await {
                 Ok(v) => v,
-                Err(_) => break,
+                Err(error) => break Err(error),
             };
             if list.is_empty() {
-                break;
+                break Ok(());
             }
             let options = match Options::parse(&list[0]["route"]["native_options"]) {
                 Ok(o) => o,
-                Err(_) => break,
+                Err(error) => break Err(error),
             };
             for b in &list {
                 let key = (
@@ -1037,19 +1085,23 @@ impl Store {
                         connection = None;
                     }
                     Ok(()) => {
-                        self.drive_opencode_bindings(
-                            &list,
-                            &principals,
-                            service,
-                            &options,
-                            None,
-                            &boot,
-                            &event_state,
-                            &mut execution_reader,
-                            &mut result_retries,
-                            &stopping,
-                        )
-                        .await;
+                        if let Err(error) = self
+                            .drive_opencode_bindings(
+                                &list,
+                                &principals,
+                                service,
+                                &options,
+                                None,
+                                &boot,
+                                &event_state,
+                                &mut execution_reader,
+                                &mut result_retries,
+                                &stopping,
+                            )
+                            .await
+                        {
+                            break Err(error);
+                        }
                     }
                 }
             }
@@ -1063,11 +1115,12 @@ impl Store {
                 _=tokio::time::sleep(Duration::from_secs(5))=>{},
                 _=async { match events.as_mut() { Some(reader)=>{let _=reader.state.changed().await;},None=>std::future::pending::<()>().await } }=>{},
             }
-        }
+        };
         execution_reader.close().await;
         for p in principals.values() {
             let _ = self.oc_connection(p, false, None).await;
         }
+        loop_result
     }
 }
 
@@ -1081,9 +1134,10 @@ fn safe_runtime_error_code(code: &str) -> Option<&str> {
     .then_some(code)
 }
 
-fn worker_failure_code(result: &std::result::Result<(), tokio::task::JoinError>) -> &'static str {
+fn worker_failure_code(result: &std::result::Result<Result<()>, tokio::task::JoinError>) -> &str {
     match result {
-        Ok(()) => "NATIVE_WORKER_EXITED",
+        Ok(Ok(())) => "NATIVE_WORKER_EXITED",
+        Ok(Err(error)) => safe_runtime_error_code(&error.code).unwrap_or("NATIVE_WORKER_FAILED"),
         Err(error) if error.is_panic() => "NATIVE_WORKER_PANICKED",
         Err(error) if error.is_cancelled() => "NATIVE_WORKER_CANCELLED",
         Err(_) => "NATIVE_WORKER_FAILED",
@@ -1092,16 +1146,28 @@ fn worker_failure_code(result: &std::result::Result<(), tokio::task::JoinError>)
 
 async fn finish_opencode_supervisor(
     worker_stop: watch::Sender<bool>,
-    workers: BTreeMap<String, JoinHandle<()>>,
-    owned_workers: BTreeMap<(String, i64), JoinHandle<()>>,
-    result: Result<()>,
+    workers: BTreeMap<String, JoinHandle<Result<()>>>,
+    owned_workers: BTreeMap<(String, i64), JoinHandle<Result<()>>>,
+    mut result: Result<()>,
 ) -> Result<()> {
     let _ = worker_stop.send(true);
-    for worker in workers.into_values() {
-        let _ = worker.await;
-    }
-    for worker in owned_workers.into_values() {
-        let _ = worker.await;
+    for worker in workers.into_values().chain(owned_workers.into_values()) {
+        let joined = worker.await;
+        if result.is_ok() {
+            result = match joined {
+                Ok(result) => result,
+                Err(error) => Err(Error::new(
+                    if error.is_panic() {
+                        "NATIVE_WORKER_PANICKED"
+                    } else if error.is_cancelled() {
+                        "NATIVE_WORKER_CANCELLED"
+                    } else {
+                        "NATIVE_WORKER_FAILED"
+                    },
+                    "builtin OpenCode worker failed during supervisor shutdown",
+                )),
+            };
+        }
     }
     result
 }
@@ -1113,6 +1179,9 @@ mod tests;
 #[path = "opencode/reconcile_failure_tests.rs"]
 mod reconcile_failure_tests;
 
+#[cfg(test)]
+#[path = "opencode/reg23_isolation_tests.rs"]
+mod reg23_isolation_tests;
 #[cfg(test)]
 #[path = "opencode/worker_failure_tests.rs"]
 mod worker_failure_tests;

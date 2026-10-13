@@ -233,16 +233,34 @@ async fn panicked_worker_marks_in_flight_unknown_and_reports_safe_failure() {
 
     let native_request_count_before = fixture.world.lock().unwrap().requests.len();
     let panic_marker = "fixture panic payload is private";
-    let result = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         panic!("{panic_marker}");
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
     })
-    .await;
-    assert!(matches!(&result, Err(error) if error.is_panic()));
+    .await
+    .expect("panicked worker must finish before supervisor collection");
+
+    let mut workers =
+        std::collections::BTreeMap::from([(fixture.options.service_id.clone(), task)]);
+    assert!(
+        workers
+            .get(&fixture.options.service_id)
+            .expect("actual panicked JoinHandle remains in the shared-worker map")
+            .is_finished()
+    );
+    let (_, recovery_stopping) = watch::channel(false);
     store
-        .recover_finished_shared_worker(&fixture.options.service_id, result)
+        .consume_finished_shared_workers(&mut workers, &recovery_stopping)
         .await
         .unwrap();
-
+    assert!(
+        workers.is_empty(),
+        "production consumer removes and joins the finished worker handle"
+    );
     let manager = register_manager(&store, &operator).await;
     let state = store
         .call(
@@ -300,10 +318,11 @@ async fn supervisor_store_error_signals_and_joins_workers_before_returning() {
                 break;
             }
             if receiver.changed().await.is_err() {
-                return;
+                return Ok(());
             }
         }
         worker_exited.store(true, Ordering::SeqCst);
+        Ok(())
     });
 
     let result = super::finish_opencode_supervisor(
@@ -316,4 +335,19 @@ async fn supervisor_store_error_signals_and_joins_workers_before_returning() {
 
     assert_eq!(result.unwrap_err().code, "STORE_ERROR");
     assert!(exited.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn shutdown_preserves_a_finished_workers_typed_hard_error() {
+    let (stop, _) = watch::channel(false);
+    let worker =
+        tokio::spawn(async { Err(Error::new("STORE_ERROR", "fixture selector Store failure")) });
+    let result = super::finish_opencode_supervisor(
+        stop,
+        std::collections::BTreeMap::from([("failed-worker".to_owned(), worker)]),
+        std::collections::BTreeMap::new(),
+        Ok(()),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().code, "STORE_ERROR");
 }

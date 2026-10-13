@@ -374,6 +374,88 @@ async fn subscribe_delivers_committed_transitions_with_frame_identity() {
     assert_eq!(params["frame"]["range"]["after"], json!(0));
     assert_eq!(params["frame"]["coverage_complete"], json!(true));
 
+    // A later public commit on this same subscription is the cut: once its
+    // notification arrives, count every delivery of the exact earlier fact
+    // already observed on the ordered stream.
+    let barrier = client
+        .call_tool(
+            "task_create",
+            json!({"project_id": "p", "spec": {"objective": "barrier", "phase": "p", "requirements": [{"id": "r1", "statement": "s"}]}}),
+        )
+        .await
+        .unwrap();
+    let barrier_operation_id = barrier["structuredContent"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cut_read = client
+        .call_tool("report_delta", json!({"after": 0, "limit": 50}))
+        .await
+        .unwrap();
+    let cut_items = cut_read["structuredContent"]["items"].as_array().unwrap();
+    let target_cut_facts = cut_items
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(operation_id) && fact["kind"] == json!("task.create")
+        })
+        .collect::<Vec<_>>();
+    let barrier_cut_facts = cut_items
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(barrier_operation_id)
+                && fact["kind"] == json!("task.create")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        target_cut_facts.len(),
+        1,
+        "the target fact is independently committed once"
+    );
+    assert_eq!(
+        barrier_cut_facts.len(),
+        1,
+        "the later barrier fact is independently committed once"
+    );
+    let target_cut_cursor = target_cut_facts[0]["cursor"].as_i64().unwrap();
+    let barrier_cut_cursor = barrier_cut_facts[0]["cursor"].as_i64().unwrap();
+    assert_eq!(target_cut_cursor, committed_cursor);
+    assert!(barrier_cut_cursor > target_cut_cursor);
+
+    let barrier_notification = client
+        .until_notification(Duration::from_secs(10), &mut seen, |message| {
+            message["method"] == json!("notifications/eliot/committed")
+                && message["params"]["subscription_id"] == json!(subscription_id)
+                && message["params"]["item"]["operation_id"] == json!(barrier_operation_id)
+                && message["params"]["item"]["kind"] == json!("task.create")
+        })
+        .await
+        .expect("the same subscription must deliver the later committed cursor cut");
+    assert_eq!(
+        barrier_notification["params"]["cursor"],
+        json!(barrier_cut_cursor)
+    );
+    assert_eq!(
+        barrier_notification["params"]["item"]["cursor"],
+        json!(barrier_cut_cursor)
+    );
+    assert_eq!(
+        barrier_notification["params"]["categories"],
+        json!(["reports", "operations"])
+    );
+    let target_deliveries_through_cut = 1 + seen
+        .iter()
+        .filter(|message| {
+            message["method"] == json!("notifications/eliot/committed")
+                && message["params"]["subscription_id"] == json!(subscription_id)
+                && message["params"]["item"]["operation_id"] == json!(operation_id)
+                && message["params"]["item"]["kind"] == json!("task.create")
+        })
+        .count();
+    assert_eq!(
+        target_deliveries_through_cut, 1,
+        "one committed fact is delivered once across both categories"
+    );
+
     // Unsubscribe stops delivery; committed work continues regardless.
     let ack = client
         .request(
@@ -612,12 +694,89 @@ async fn rejected_admission_notifies_one_safe_failure_fact_without_message_data(
     let stored_payload_json = serde_json::to_string(&stored_payload).unwrap();
     assert!(!stored_payload_json.contains("private-body-sentinel"));
     assert!(!stored_payload_json.contains("private-receiver-sentinel"));
-    assert!(
-        client
-            .next_notification(Duration::from_millis(900))
-            .await
-            .is_none(),
-        "an exact rejection replay does not emit a duplicate notification"
+    let rejected_fact_cursor = facts[0]["cursor"]
+        .as_i64()
+        .expect("independently committed rejection fact cursor");
+    assert_eq!(params["cursor"], json!(rejected_fact_cursor));
+    assert_eq!(item["cursor"], json!(rejected_fact_cursor));
+
+    // The replay exclusion is checked through a later committed fact on this
+    // same subscription, rather than through elapsed silence.
+    let barrier = client
+        .call_tool(
+            "task_create",
+            json!({"project_id": "p", "spec": {"objective": "replay barrier", "phase": "p", "requirements": [{"id": "r1", "statement": "s"}]}}),
+        )
+        .await
+        .unwrap();
+    let barrier_operation_id = barrier["structuredContent"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cut_read = client
+        .call_tool("report_delta", json!({"after": 0, "limit": 50}))
+        .await
+        .unwrap();
+    let cut_items = cut_read["structuredContent"]["items"].as_array().unwrap();
+    let rejected_cut_facts = cut_items
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(operation_id)
+                && fact["kind"] == json!("operation.rejected")
+        })
+        .collect::<Vec<_>>();
+    let barrier_cut_facts = cut_items
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(barrier_operation_id)
+                && fact["kind"] == json!("task.create")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejected_cut_facts.len(),
+        1,
+        "the replay fact remains committed exactly once"
+    );
+    assert_eq!(
+        barrier_cut_facts.len(),
+        1,
+        "the later barrier fact is committed exactly once"
+    );
+    assert_eq!(rejected_cut_facts[0]["cursor"], json!(rejected_fact_cursor));
+    let barrier_cut_cursor = barrier_cut_facts[0]["cursor"]
+        .as_i64()
+        .expect("independently committed barrier cursor");
+    assert!(barrier_cut_cursor > rejected_fact_cursor);
+
+    let barrier_notification = client
+        .until_notification(Duration::from_secs(10), &mut seen, |message| {
+            message["method"] == json!("notifications/eliot/committed")
+                && message["params"]["subscription_id"] == json!(subscription_id)
+                && message["params"]["item"]["operation_id"] == json!(barrier_operation_id)
+                && message["params"]["item"]["kind"] == json!("task.create")
+        })
+        .await
+        .expect("the same subscription must deliver the later committed replay cut");
+    assert_eq!(
+        barrier_notification["params"]["cursor"],
+        json!(barrier_cut_cursor)
+    );
+    assert_eq!(
+        barrier_notification["params"]["item"]["cursor"],
+        json!(barrier_cut_cursor)
+    );
+    let rejected_deliveries_through_cut = 1 + seen
+        .iter()
+        .filter(|message| {
+            message["method"] == json!("notifications/eliot/committed")
+                && message["params"]["subscription_id"] == json!(subscription_id)
+                && message["params"]["item"]["operation_id"] == json!(operation_id)
+                && message["params"]["item"]["kind"] == json!("operation.rejected")
+        })
+        .count();
+    assert_eq!(
+        rejected_deliveries_through_cut, 1,
+        "an exact request replay emits no second fact through the committed cut"
     );
 
     client.close().await;
@@ -698,6 +857,322 @@ async fn reconnect_resubscribes_from_cursor_without_replay_continuity() {
     );
 
     client.close().await;
+    stack.close().await;
+}
+
+#[tokio::test]
+async fn concilium_and_coordination_subscriptions_fan_out_authorized_facts() {
+    let stack = start_stack().await;
+    let mut manager = SubClient::connect(
+        stack.profiled_facade(stack.credential.clone(), McpToolProfile::Manager),
+    )
+    .await;
+
+    let task = manager
+        .call_tool(
+            "task_create",
+            json!({
+                "client_request_id":model::new_id(),
+                "project_id":"p",
+                "spec":{
+                    "objective":"MCP subscription producer fixture",
+                    "phase":"p",
+                    "requirements":[{"id":"r1","statement":"retain exact public facts"}],
+                    "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let task_id = task["structuredContent"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attempt = manager
+        .call_tool(
+            "task_claim",
+            json!({
+                "client_request_id":model::new_id(),
+                "task_id":task_id,
+                "expected_revision":1,
+            }),
+        )
+        .await
+        .unwrap();
+    let attempt_id = attempt["structuredContent"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let participant_id = format!("mcp-subscription-participant-{}", model::new_id());
+    let participant_token = format!("{}{}", model::new_id(), model::new_id());
+    manager
+        .call_tool(
+            "coordination_participant_register",
+            json!({
+                "client_request_id":model::new_id(),
+                "client_id":participant_id,
+                "token_hash":model::digest(participant_token.as_bytes()),
+                "task_id":task_id,
+                "task_revision":1,
+                "attempt_id":attempt_id,
+                "participation_basis":{"kind":"attempt_owner"},
+            }),
+        )
+        .await
+        .unwrap();
+    let mut participant = SubClient::connect(stack.profiled_facade(
+        Credential {
+            client_id: participant_id.clone(),
+            token: participant_token,
+        },
+        McpToolProfile::Participant,
+    ))
+    .await;
+
+    // A Manager can read each documented typed resync projection, so it is
+    // the authenticated subscriber. Concilium mutation uses the separately
+    // registered Participant credential below.
+    let setup_read = manager
+        .call_tool("report_delta", json!({"after": 0, "limit": 50}))
+        .await
+        .unwrap();
+    let head = setup_read["structuredContent"]["projection"]["range"]["next_cursor"]
+        .as_i64()
+        .expect("setup high-water cursor");
+    let ack = manager
+        .request(
+            "eliot/subscribe",
+            json!({"categories": ["concilium", "coordination"], "after": head}),
+        )
+        .await
+        .unwrap();
+    let subscription_id = ack["subscription_id"].as_str().unwrap().to_owned();
+    assert_eq!(ack["cursor"], json!(head));
+
+    let thread_subject = "MCP subscription Coordination fanout";
+    let opened = manager
+        .call_tool(
+            "coordination_thread_open",
+            json!({
+                "client_request_id":model::new_id(),
+                "task_id":task_id,
+                "attempt_id":attempt_id,
+                "topic_kind":"subscription_fixture",
+                "subject":thread_subject,
+                "participants":[{
+                    "client_id":participant_id,
+                    "reason":"Receive the exact retained Coordination fixture.",
+                }],
+                "reasonability":{
+                    "blocking_fact":"The public Thread must remain independently readable.",
+                    "decision_needed":"Verify the committed Coordination fanout.",
+                    "why_coordination_is_needed":"The subscription fixture needs a real Thread producer.",
+                    "expected_output":"One retained Thread projection.",
+                    "close_condition":"The exact Thread projection is readable.",
+                },
+                "delivery_mode":"mailbox_only",
+            }),
+        )
+        .await
+        .unwrap();
+    let thread_operation_id = opened["structuredContent"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let thread_id = opened["structuredContent"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let decision_question = "Should this exact public Concilium fact remain readable?";
+    let proposal = participant
+        .call_tool(
+            "concilium_propose",
+            json!({
+                "client_request_id":model::new_id(),
+                "task_id":task_id,
+                "attempt_id":attempt_id,
+                "failed_thread_id":thread_id,
+                "decision_question":decision_question,
+                "material_conflict":"The notification cursor and typed projection must name the same proposal.",
+                "participants":[{
+                    "client_id":participant_id,
+                    "reason":"Inspect the proposal through its exact authorized read.",
+                }],
+                "proposal_revision_ids":[],
+                "evidence_refs":[],
+                "expected_output":"A retained advisory proposal projection.",
+                "suggested_max_rounds":1,
+                "suggested_budget":{"model_calls":0,"tokens":0},
+                "close_condition":"The exact proposal is readable by its registered Participant.",
+            }),
+        )
+        .await
+        .unwrap();
+    let concilium_operation_id = proposal["structuredContent"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let concilium_id = proposal["structuredContent"]["concilium_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let committed = manager
+        .call_tool("report_delta", json!({"after": head, "limit": 50}))
+        .await
+        .unwrap();
+    let items = committed["structuredContent"]["items"].as_array().unwrap();
+    let thread_facts = items
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(thread_operation_id)
+                && fact["kind"] == json!("coordination.thread_opened")
+        })
+        .collect::<Vec<_>>();
+    let concilium_facts = items
+        .iter()
+        .filter(|fact| {
+            fact["operation_id"] == json!(concilium_operation_id)
+                && fact["kind"] == json!("concilium.propose")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_facts.len(),
+        1,
+        "one committed Coordination producer fact"
+    );
+    assert_eq!(
+        concilium_facts.len(),
+        1,
+        "one committed Concilium producer fact"
+    );
+    let thread_fact = thread_facts[0];
+    let concilium_fact = concilium_facts[0];
+    let thread_cursor = thread_fact["cursor"].as_i64().unwrap();
+    let concilium_cursor = concilium_fact["cursor"].as_i64().unwrap();
+    assert!(thread_cursor > head);
+    assert!(concilium_cursor > thread_cursor);
+    assert_eq!(
+        thread_fact["payload"]["operation_id"],
+        json!(thread_operation_id)
+    );
+    assert_eq!(thread_fact["payload"]["thread_id"], json!(thread_id));
+    assert_eq!(thread_fact["payload"]["task_id"], json!(task_id));
+    assert_eq!(thread_fact["payload"]["attempt_id"], json!(attempt_id));
+    assert_eq!(thread_fact["payload"]["state"], json!("open"));
+    assert_eq!(
+        concilium_fact["payload"]["operation_id"],
+        json!(concilium_operation_id)
+    );
+    assert_eq!(
+        concilium_fact["payload"]["proposal_operation_id"],
+        json!(concilium_operation_id)
+    );
+    assert_eq!(
+        concilium_fact["payload"]["concilium_id"],
+        json!(concilium_id)
+    );
+    assert_eq!(concilium_fact["payload"]["task_id"], json!(task_id));
+    assert_eq!(concilium_fact["payload"]["attempt_id"], json!(attempt_id));
+
+    let thread_read = manager
+        .call_tool("coordination_thread_get", json!({"thread_id":thread_id}))
+        .await
+        .unwrap();
+    let thread_projection = &thread_read["structuredContent"]["thread"];
+    assert_eq!(thread_projection["thread_id"], json!(thread_id));
+    assert_eq!(thread_projection["task_id"], json!(task_id));
+    assert_eq!(thread_projection["attempt_id"], json!(attempt_id));
+    assert_eq!(
+        thread_projection["topic_kind"],
+        json!("subscription_fixture")
+    );
+    assert_eq!(thread_projection["subject"], json!(thread_subject));
+
+    let concilium_read = participant
+        .call_tool("concilium_get", json!({"concilium_id":concilium_id}))
+        .await
+        .unwrap();
+    let concilium_projection = &concilium_read["structuredContent"];
+    assert_eq!(concilium_projection["concilium_id"], json!(concilium_id));
+    assert_eq!(
+        concilium_projection["proposal"]["operation_id"],
+        json!(concilium_operation_id)
+    );
+    assert_eq!(
+        concilium_projection["proposal"]["failed_thread_id"],
+        json!(thread_id)
+    );
+    assert_eq!(
+        concilium_projection["proposal"]["decision_question"],
+        json!(decision_question)
+    );
+
+    let mut seen = Vec::new();
+    let thread_notification = manager
+        .until_notification(Duration::from_secs(10), &mut seen, |message| {
+            message["method"] == json!("notifications/eliot/committed")
+                && message["params"]["subscription_id"] == json!(subscription_id)
+                && message["params"]["item"]["operation_id"] == json!(thread_operation_id)
+        })
+        .await
+        .expect("the Manager subscription receives the public Coordination producer");
+    assert_eq!(
+        thread_notification["params"]["categories"],
+        json!(["coordination"])
+    );
+    assert_eq!(
+        thread_notification["params"]["cursor"],
+        json!(thread_cursor)
+    );
+    assert_eq!(
+        thread_notification["params"]["item"]["cursor"],
+        json!(thread_cursor)
+    );
+    assert_eq!(
+        thread_notification["params"]["item"]["kind"],
+        json!("coordination.thread_opened")
+    );
+    assert_eq!(
+        thread_notification["params"]["item"]["thread_id"],
+        json!(thread_id)
+    );
+
+    let concilium_notification = manager
+        .until_notification(Duration::from_secs(10), &mut seen, |message| {
+            message["method"] == json!("notifications/eliot/committed")
+                && message["params"]["subscription_id"] == json!(subscription_id)
+                && message["params"]["item"]["operation_id"] == json!(concilium_operation_id)
+        })
+        .await
+        .expect(
+            "the Manager subscription receives the authenticated Participant Concilium producer",
+        );
+    assert_eq!(
+        concilium_notification["params"]["categories"],
+        json!(["concilium"])
+    );
+    assert_eq!(
+        concilium_notification["params"]["cursor"],
+        json!(concilium_cursor)
+    );
+    assert_eq!(
+        concilium_notification["params"]["item"]["cursor"],
+        json!(concilium_cursor)
+    );
+    assert_eq!(
+        concilium_notification["params"]["item"]["kind"],
+        json!("concilium.propose")
+    );
+    assert_eq!(
+        concilium_notification["params"]["item"]["concilium_id"],
+        json!(concilium_id)
+    );
+
+    participant.close().await;
+    manager.close().await;
     stack.close().await;
 }
 

@@ -8,7 +8,7 @@ use crate::{
         opencode_v2::{self as oc, ExecutionRead, Options, Service},
     },
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -39,14 +39,14 @@ impl Reader {
         principals: &BTreeMap<BindingKey, Principal>,
         config: &crate::config::Config,
         stopping: watch::Receiver<bool>,
-    ) {
+    ) -> Result<()> {
         if self.task.as_ref().is_some_and(|task| task.is_finished())
             && let Some(task) = self.task.take()
         {
             let _ = task.await;
         }
         if self.task.is_some() || *stopping.borrow() {
-            return;
+            return Ok(());
         }
         self.retries.retain(|key, _| {
             bindings.iter().any(|b| {
@@ -121,8 +121,12 @@ impl Reader {
             let next = store
                 .run(move |db| next_read(db, &principal, &after, &read_config))
                 .await;
-            let Ok(Some((command, saved))) = next else {
-                continue;
+            let (command, saved) = match next {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Err(error);
+                }
             };
             self.retries
                 .insert(key.clone(), (command.operation_id.clone(), Instant::now()));
@@ -143,6 +147,7 @@ impl Reader {
             }));
             break;
         }
+        Ok(())
     }
     pub(super) async fn close(mut self) {
         if let Some(task) = self.task.take() {
@@ -233,24 +238,7 @@ fn next_read(
     after: &str,
     config: &crate::config::Config,
 ) -> Result<Option<(RuntimeCommand, Option<Value>)>> {
-    let (id, generation, _) = runtime::scope(db, p, true)?;
-    let query = |after: &str| -> Result<Option<String>> {
-        Ok(db.query_row("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2
-          AND method IN ('task.dispatch','agent.send','agent.goal') AND (method!='agent.goal' OR json_extract(original_request_json,'$.action')='continue') AND state IN ('sending','native_accepted','outcome_unknown','settled')
-          AND COALESCE(json_extract(native_refs_json,'$.input_execution.disposition'),'') NOT IN ('completed','failed','cancelled')
-          AND operation_id>?3 ORDER BY operation_id LIMIT 1", params![id,generation,after], |r| r.get(0)).optional()?)
-    };
-    let next = match query(after)? {
-        Some(id) => Some(id),
-        None if !after.is_empty() => query("")?,
-        None => None,
-    };
-    next.map(|id| {
-        let command = original_with_config(db, p, &id, config)?;
-        let op = operations::get_operation(db, &id)?;
-        Ok((command, op["native_refs"].get("execution_scan").cloned()))
-    })
-    .transpose()
+    super::reg23_isolation::next_execution_read(db, p, after, config)
 }
 
 /// The single SQLite owner rechecks the exact command/link after network I/O.

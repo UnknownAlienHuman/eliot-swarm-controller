@@ -1,5 +1,5 @@
 //! Result recovery repeats only scoped GET reads, never native input admission.
-use super::{Store, original_with_config, runtime};
+use super::{Store, original_with_config};
 use crate::{
     error::{Error, Result},
     model::Principal,
@@ -8,7 +8,7 @@ use crate::{
         opencode_v2::{self as oc, Options, Service},
     },
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 use serde_json::json;
 use std::time::Duration;
 
@@ -18,18 +18,7 @@ pub(super) fn next_read(
     after: &str,
     config: &crate::config::Config,
 ) -> Result<Option<RuntimeCommand>> {
-    let (id, generation, _) = runtime::scope(db, p, true)?;
-    let query = |after: &str| -> Result<Option<String>> {
-        Ok(db.query_row("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND method='agent.result' AND state IN ('sending','native_accepted','outcome_unknown') AND operation_id>?3 ORDER BY operation_id LIMIT 1",
-            params![id, generation, after], |r| r.get(0)).optional()?)
-    };
-    let next = match query(after)? {
-        Some(id) => Some(id),
-        None if !after.is_empty() => query("")?,
-        None => None,
-    };
-    next.map(|id| original_with_config(db, p, &id, config))
-        .transpose()
+    super::reg23_isolation::next_result_read(db, p, after, config)
 }
 
 impl Store {
