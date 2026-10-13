@@ -14,10 +14,10 @@ use crate::{
     artifacts::ArtifactRecord,
     config::Config,
     model::{self, Credential, Principal},
-    platform::{bootstrap_credential, DataRoot},
+    platform::{DataRoot, bootstrap_credential},
 };
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 const PROJECT: &str = "gm-public-matrix-project";
@@ -590,20 +590,25 @@ async fn damaged_designation_without_high_water_stays_unavailable_not_epoch_one(
     let (owner, _directory, operator) = start_store().await;
     let old = register_manager(&owner.store, &operator, "gm-nofloor-old").await;
     let replacement = register_manager(&owner.store, &operator, "gm-nofloor-replacement").await;
-    write(
+    let designated = write(
         &owner.store,
         &operator,
         "gm.handover",
         json!({"client_id": old.client_id}),
     )
     .await;
-    // Fault injection on already-retained admissions: drop the only
-    // successful handover receipt and damage the surviving pointer, leaving
-    // no recoverable high-water behind.
+    // Fault injection retains the exact admitted Operation and its foreign
+    // references, but removes its settled-success ledger eligibility. The
+    // damaged pointer then has no recoverable high-water.
+    let designated_id = designated["operation_id"].as_str().unwrap().to_owned();
     owner
         .store
-        .run(|db| {
-            db.execute("DELETE FROM operations WHERE method='gm.handover'", [])?;
+        .run(move |db| {
+            let changed = db.execute(
+                "UPDATE operations SET state='outcome_unknown',settled_at_ms=NULL WHERE operation_id=?1 AND method='gm.handover' AND state='settled'",
+                [designated_id],
+            )?;
+            assert_eq!(changed, 1);
             Ok(())
         })
         .await
