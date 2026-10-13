@@ -1805,12 +1805,14 @@ impl Store {
 
     pub(crate) async fn reconcile_scripts_once(&self) -> Result<()> {
         self.poll_script_children(false).await?;
-        let rows = self.run(|db| pending_runs(db)).await?;
+        let rows = self.run(|db| pending_run_rows(db)).await?;
         // The durable fairness cursor advances only after one subject reaches
         // a stable, truthfully retained disposition. A hard failure returns
         // with the cursor at the last completed subject, never beyond the
         // selected page. An identical already-saved value is never rewritten.
-        for pending in rows {
+        for row in rows {
+            let captured = row.cursor_key();
+            let pending = row.projection();
             let run_id = pending.run_id.clone();
             let digest = pending.work_digest.clone();
             let data_dir = self.data_dir.clone();
@@ -1857,14 +1859,14 @@ impl Store {
                         self.settle_incomplete_if_worker_departed(&pending, &error.code)
                             .await?;
                     }
-                    self.advance_fairness_cursor_to(&pending.run_id).await?;
+                    self.advance_fairness_cursor_to_captured(&captured).await?;
                     continue;
                 }
             };
             if work.executor.is_none() && pending.operation_state == "queued" {
                 self.fail_before_start(&pending, "SCRIPT_EXECUTOR_UNSELECTED")
                     .await?;
-                self.advance_fairness_cursor_to(&pending.run_id).await?;
+                self.advance_fairness_cursor_to_captured(&captured).await?;
                 continue;
             }
             let observe_work = work.clone();
@@ -1900,7 +1902,7 @@ impl Store {
                     } else {
                         self.mark_unknown(&pending, &error.code).await?;
                     }
-                    self.advance_fairness_cursor_to(&pending.run_id).await?;
+                    self.advance_fairness_cursor_to_captured(&captured).await?;
                     continue;
                 }
             };
@@ -1917,7 +1919,7 @@ impl Store {
                     self.changed
                         .send_modify(|revision| *revision = revision.wrapping_add(1));
                 }
-                self.advance_fairness_cursor_to(&pending.run_id).await?;
+                self.advance_fairness_cursor_to_captured(&captured).await?;
                 continue;
             }
             if let Some(completion) = observed.completion {
@@ -1933,7 +1935,7 @@ impl Store {
                     .await?;
                     self.settle_incomplete_if_worker_departed(&pending, code)
                         .await?;
-                    self.advance_fairness_cursor_to(&pending.run_id).await?;
+                    self.advance_fairness_cursor_to_captured(&captured).await?;
                     continue;
                 }
                 if !observed.launch_departed {
@@ -1947,7 +1949,7 @@ impl Store {
                     )
                     .await?;
                     self.mark_unknown(&pending, code).await?;
-                    self.advance_fairness_cursor_to(&pending.run_id).await?;
+                    self.advance_fairness_cursor_to_captured(&captured).await?;
                     continue;
                 }
                 let execution_may_have_started =
@@ -1970,7 +1972,7 @@ impl Store {
                     self.changed
                         .send_modify(|revision| *revision = revision.wrapping_add(1));
                 }
-                self.advance_fairness_cursor_to(&pending.run_id).await?;
+                self.advance_fairness_cursor_to_captured(&captured).await?;
                 continue;
             }
             match pending.operation_state.as_str() {
@@ -2096,23 +2098,26 @@ impl Store {
                 }
                 _ => {}
             }
-            self.advance_fairness_cursor_to(&pending.run_id).await?;
+            self.advance_fairness_cursor_to_captured(&captured).await?;
         }
         Ok(())
     }
 
-    /// Persist the fairness cursor at one successfully reconciled subject.
-    /// The ordering key is re-read in this same pass; caller input never
-    /// becomes a cursor. An identical value is skipped, a missing row is
-    /// ignored, and a cursor-write failure stays hard without erasing the
-    /// subject's retained Operation/ScriptRun truth.
-    async fn advance_fairness_cursor_to(&self, run_id: &str) -> Result<()> {
-        let run_id = run_id.to_owned();
+    /// Persist the fairness cursor at one successfully reconciled subject,
+    /// from the immutable ordering tuple captured at selection in this same
+    /// pass. The retained row is re-read only to verify it still carries that
+    /// exact tuple; a departed row or a changed coordinate fails without
+    /// moving the cursor. An identical value is skipped, and a cursor-write
+    /// failure stays hard without erasing the subject's retained
+    /// Operation/ScriptRun truth.
+    async fn advance_fairness_cursor_to_captured(
+        &self,
+        captured: &PendingRunCursor,
+    ) -> Result<()> {
+        let captured = captured.clone();
         self.run(move |db| {
-            let Some(key) = selected_pending_run_key(db, &run_id)? else {
-                return Ok(());
-            };
-            advance_pending_run_cursor(db, &key)?;
+            verify_captured_tuple(db, &captured)?;
+            advance_pending_run_cursor(db, &captured)?;
             Ok(())
         })
         .await
@@ -2832,6 +2837,17 @@ fn require_optional_run_scope(
 const PENDING_RUN_CURSOR_KEY: &str = "coordination:script:v1:pending_run_cursor";
 const MAX_PENDING_RUN_PAGE: usize = 64;
 
+/// Exact retained run identity for a pending-run cursor. Run identifiers are the
+/// server-issued canonical UUIDv4 values, so a retained cursor is the exact
+/// serialized coordinate the writer committed, never a reordered, re-cased or
+/// whitespace-touched rendering of one.
+fn canonical_run_id(run_id: &str) -> bool {
+    uuid::Uuid::parse_str(run_id).is_ok_and(|parsed| {
+        parsed.get_version() == Some(uuid::Version::Random)
+            && parsed.as_hyphenated() == run_id
+    })
+}
+
 /// One selected pending subject plus the ordering key the durable cursor
 /// needs. The projection the caller consumes stays `PendingRun` unchanged.
 struct PendingRunRow {
@@ -2846,6 +2862,14 @@ struct PendingRunRow {
 }
 
 impl PendingRunRow {
+    /// The exact ordering tuple this selected subject contributes to the
+    /// durable cursor.
+    fn cursor_key(&self) -> PendingRunCursor {
+        PendingRunCursor {
+            created_at_ms: self.created_at_ms,
+            run_id: self.run_id.clone(),
+        }
+    }
     fn projection(&self) -> PendingRun {
         PendingRun {
             run_id: self.run_id.clone(),
@@ -2865,28 +2889,52 @@ struct PendingRunCursor {
     run_id: String,
 }
 
+impl PendingRunCursor {
+    /// The retained value must be exactly the object the server wrote: the two
+    /// cursor fields, a nonnegative timestamp and the canonical run identity.
+    /// No other shape is accepted.
+    fn from_retained(value: &Value) -> Result<Self> {
+        let object = value.as_object().ok_or_else(|| {
+            Error::invalid("script pending-run cursor has an unexpected shape")
+        })?;
+        if object.len() != 2
+            || !object.contains_key("created_at_ms")
+            || !object.contains_key("run_id")
+        {
+            return Err(Error::invalid(
+                "script pending-run cursor has an unexpected shape",
+            ));
+        }
+        let created_at_ms = value
+            .get("created_at_ms")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| {
+                Error::invalid("script pending-run cursor has no valid timestamp")
+            })?;
+        let run_id = value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::invalid("script pending-run cursor has no valid run identifier")
+            })?;
+        if run_id.is_empty() || run_id.len() > 128 || !canonical_run_id(run_id) {
+            return Err(Error::invalid(
+                "script pending-run cursor has an invalid run identifier",
+            ));
+        }
+        Ok(Self {
+            created_at_ms,
+            run_id: run_id.to_owned(),
+        })
+    }
+}
+
 fn decode_pending_run_cursor(value: Option<Value>) -> Result<Option<PendingRunCursor>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    if value.is_null() {
-        return Ok(None);
-    }
-    let created_at_ms = value
-        .get("created_at_ms")
-        .and_then(Value::as_i64)
-        .filter(|value| *value >= 0)
-        .ok_or_else(|| Error::invalid("script pending-run cursor has no valid timestamp"))?;
-    let run_id = model::text(&value, "run_id")?.to_owned();
-    if run_id.is_empty() || run_id.len() > 128 {
-        return Err(Error::invalid(
-            "script pending-run cursor has an invalid run identifier",
-        ));
-    }
-    Ok(Some(PendingRunCursor {
-        created_at_ms,
-        run_id,
-    }))
+    Ok(Some(PendingRunCursor::from_retained(&value)?))
 }
 
 fn load_pending_run_cursor(db: &Connection) -> Result<Option<PendingRunCursor>> {
@@ -2929,8 +2977,9 @@ const PENDING_RUN_QUERY: &str = "
 /// durable cursor and then wrapped to the earliest rows that this pass has
 /// not examined. Nothing here starts, settles, reaps or releases a run: the
 /// caller's existing custody and unknown-departure handling still decides.
-/// Re-read the exact ordering key for a selected run. The cursor is only
-/// advanced from a key observed in this same pass, never from caller input.
+/// Look up one retained run for verify-only comparison against the tuple
+/// captured at selection. The re-read never replaces the captured tuple:
+/// the cursor advances only from the immutable selected coordinate.
 fn selected_pending_run_key(db: &Connection, run_id: &str) -> Result<Option<PendingRunRow>> {
     let mut statement =
         db.prepare("SELECT run_id,created_at_ms FROM script_runs WHERE run_id=?1")?;
@@ -2949,6 +2998,24 @@ fn selected_pending_run_key(db: &Connection, run_id: &str) -> Result<Option<Pend
         })
         .optional()?;
     Ok(row)
+}
+
+/// Verify-only re-read for a captured ordering tuple. The retained row must
+/// still carry exactly the selected `(created_at_ms, run_id)`; the re-read
+/// never replaces the captured tuple. A missing row or a changed coordinate
+/// is a cursor-integrity failure: the cursor stays where it is and the
+/// subject is not reported as visited.
+fn verify_captured_tuple(db: &Connection, captured: &PendingRunCursor) -> Result<()> {
+    let observed = selected_pending_run_key(db, &captured.run_id)?;
+    match observed {
+        None => Err(Error::invalid(
+            "script pending-run selection departed before cursor advance; cursor unchanged",
+        )),
+        Some(row) if row.created_at_ms == captured.created_at_ms => Ok(()),
+        Some(_) => Err(Error::invalid(
+            "script pending-run tuple changed after selection; cursor unchanged",
+        )),
+    }
 }
 
 fn pending_run_page(
@@ -2971,7 +3038,7 @@ fn pending_run_page(
     Ok(rows)
 }
 
-fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
+fn pending_run_rows(db: &Connection) -> Result<Vec<PendingRunRow>> {
     let cursor = load_pending_run_cursor(db)?;
     let mut rows = pending_run_page(db, cursor.as_ref())?;
     if rows.len() < MAX_PENDING_RUN_PAGE
@@ -2985,16 +3052,24 @@ fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
         rows.extend(wrapped);
     }
     rows.truncate(MAX_PENDING_RUN_PAGE);
-    Ok(rows.into_iter().map(|row| row.projection()).collect())
+    Ok(rows)
 }
 
-/// Advance the durable cursor to one subject that reached a stable,
-/// truthfully retained disposition. An identical already-saved value is
-/// never rewritten, so an empty page and one unchanged long-running subject
-/// do not create a permanent metadata-write loop. A Store-level failure
-/// stays fatal and leaves the cursor unchanged, so an unexamined subject is
-/// never reported as visited. Returns true when the cursor moved.
-fn advance_pending_run_cursor(db: &Connection, last: &PendingRunRow) -> Result<bool> {
+fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
+    Ok(pending_run_rows(db)?
+        .into_iter()
+        .map(|row| row.projection())
+        .collect())
+}
+
+/// Advance the durable cursor to the captured tuple of one subject that
+/// reached a stable, truthfully retained disposition. An identical
+/// already-saved value is never rewritten, so an empty page and one
+/// unchanged long-running subject do not create a permanent metadata-write
+/// loop. A Store-level failure stays fatal and leaves the cursor unchanged,
+/// so an unexamined subject is never reported as visited. Returns true when
+/// the cursor moved.
+fn advance_pending_run_cursor(db: &Connection, last: &PendingRunCursor) -> Result<bool> {
     let current = load_pending_run_cursor(db)?;
     if current.as_ref().is_some_and(|cursor| {
         cursor.created_at_ms == last.created_at_ms && cursor.run_id == last.run_id

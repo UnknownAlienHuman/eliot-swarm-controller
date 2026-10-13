@@ -351,6 +351,124 @@ async fn reg23_pending_run_cursor_reaches_the_65th_public_admission_after_reopen
     std::fs::remove_dir_all(&directory).expect("remove temporary Store directory");
 }
 
+/// A retained cursor value must be exactly the server-written object:
+/// missing key is the valid initial state, while null, array, string,
+/// incomplete, negative-timestamp, noncanonical and extra-field shapes are
+/// cursor-integrity errors with no subject processing or writes.
+#[tokio::test]
+async fn reg142_corrupt_cursor_blocks_subject_processing() {
+    let valid_run = model::new_id();
+    let cases: Vec<Value> = vec![
+        Value::Null,
+        json!([]),
+        json!("just-a-string"),
+        json!({"created_at_ms": 0}),
+        json!({"run_id": valid_run}),
+        json!({"created_at_ms": -1, "run_id": valid_run}),
+        json!({"created_at_ms": 0, "run_id": "not-a-uuid"}),
+        json!({"created_at_ms": 0, "run_id": "550E8400-E29B-41D4-A716-446655440000"}),
+        json!({"created_at_ms": 0, "run_id": valid_run, "extra": 1}),
+    ];
+    for cursor in cases {
+        let (owner, directory, manager) = fairness_store().await;
+        register_active_script(&owner.store, &manager).await;
+        let (_task_id, attempt_id) =
+            create_current_task_attempt(&owner.store, &manager, 0).await;
+        let (run_id, _operation_id) =
+            admit_script_run(&owner.store, &manager, &attempt_id, 0).await;
+        assert!(pending_run_cursor(&owner.store).await.is_none());
+        owner
+            .store
+            .run(|db| {
+                set_meta(db, PENDING_RUN_CURSOR_KEY, &cursor)?;
+                Ok(())
+            })
+            .await
+            .expect("install corrupt cursor");
+        let before = stored_run_states(&owner.store).await;
+        let err = owner
+            .store
+            .reconcile_scripts_once()
+            .await
+            .expect_err("corrupt cursor must fail before subject processing");
+        assert_eq!(err.code, "INVALID_PARAMS");
+        assert!(err.message.contains("cursor"));
+        let after = stored_run_states(&owner.store).await;
+        assert_eq!(before, after, "no subject writes under corrupt cursor");
+        assert_eq!(
+            reg142_incident_count(&owner.store, &run_id).await,
+            0,
+            "no incident recorded under corrupt cursor"
+        );
+        assert_eq!(
+            pending_run_cursor(&owner.store).await,
+            Some(cursor.clone()),
+            "corrupt value retained, not reset"
+        );
+        owner.close().await.expect("close Store");
+        std::fs::remove_dir_all(&directory).expect("remove temporary Store directory");
+    }
+}
+
+/// A retained tuple change between selection and advance never moves the
+/// cursor: the captured coordinate is verified, not replaced.
+#[tokio::test]
+async fn reg142_captured_tuple_change_blocks_cursor_jump() {
+    let (owner, directory, manager) = fairness_store().await;
+    register_active_script(&owner.store, &manager).await;
+    reg142_admit_many(&owner.store, &manager, 0, 2).await;
+    let before = stored_run_states(&owner.store).await;
+    assert_eq!(before.len(), 2);
+    let row1 = before[0].clone();
+    let captured = PendingRunCursor {
+        created_at_ms: row1.created_at_ms,
+        run_id: row1.run_id.clone(),
+    };
+    let moved = owner
+        .store
+        .run(|db| {
+            verify_captured_tuple(db, &captured)?;
+            advance_pending_run_cursor(db, &captured)
+        })
+        .await
+        .expect("first advance from captured tuple");
+    assert!(moved);
+    owner
+        .store
+        .run(|db| {
+            db.execute(
+                "UPDATE script_runs SET created_at_ms=?1 WHERE run_id=?2",
+                (row1.created_at_ms + 1_000, row1.run_id.clone()),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mutate retained tuple");
+    let err = owner
+        .store
+        .run(|db| {
+            verify_captured_tuple(db, &captured)?;
+            advance_pending_run_cursor(db, &captured)
+        })
+        .await
+        .expect_err("stale tuple must not advance");
+    assert_eq!(err.code, "INVALID_PARAMS");
+    let cursor = pending_run_cursor(&owner.store)
+        .await
+        .expect("cursor is set");
+    assert_eq!(
+        cursor["created_at_ms"].as_i64(),
+        Some(row1.created_at_ms),
+        "no jump to the changed coordinate"
+    );
+    assert_eq!(
+        cursor["run_id"].as_str(),
+        Some(row1.run_id.as_str())
+    );
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(&directory).expect("remove temporary Store directory");
+}
+
 async fn reg142_install_cursor_counter(store: &Store) {
     let key = PENDING_RUN_CURSOR_KEY;
     let sql = format!(
