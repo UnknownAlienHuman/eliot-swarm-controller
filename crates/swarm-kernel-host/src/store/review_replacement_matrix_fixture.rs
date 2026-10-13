@@ -49,10 +49,8 @@ fn reviewer_token(n: u32) -> String {
 }
 
 async fn start_store(label: &str) -> (StoreOwner, std::path::PathBuf, Credential) {
-    let directory = std::env::temp_dir().join(format!(
-        "swarm-r35-matrix-{label}-{}",
-        model::new_id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("swarm-r35-matrix-{label}-{}", model::new_id()));
     std::fs::create_dir_all(&directory).unwrap();
     let root = crate::platform::DataRoot::acquire(&directory).unwrap();
     let credential = crate::platform::bootstrap_credential(&root.path).unwrap();
@@ -313,11 +311,7 @@ async fn submit(
     result["operation_id"].as_str().unwrap().to_owned()
 }
 
-async fn review_get(
-    store: &Store,
-    principal: Principal,
-    assignment_id: &str,
-) -> serde_json::Value {
+async fn review_get(store: &Store, principal: Principal, assignment_id: &str) -> serde_json::Value {
     store
         .call(
             principal,
@@ -328,7 +322,11 @@ async fn review_get(
         .unwrap()
 }
 
-async fn review_list(store: &Store, principal: Principal, request: serde_json::Value) -> serde_json::Value {
+async fn review_list(
+    store: &Store,
+    principal: Principal,
+    request: serde_json::Value,
+) -> serde_json::Value {
     store
         .call(principal, "review.list".into(), request)
         .await
@@ -455,7 +453,15 @@ async fn r35_unanswered_replacement_retires_predecessor_slot() {
     register(store, s, &r1_id, &r1_token).await;
     register(store, s, &r2_id, &r2_token).await;
     let (_r1, a1) = assign(store, s, &r1_id, &r1_token, "r35-unanswered-assign-1", None).await;
-    let (r2, a2) = assign(store, s, &r2_id, &r2_token, "r35-unanswered-assign-2", Some(&a1)).await;
+    let (r2, a2) = assign(
+        store,
+        s,
+        &r2_id,
+        &r2_token,
+        "r35-unanswered-assign-2",
+        Some(&a1),
+    )
+    .await;
     assert_ne!(a1, a2);
     let old_view = review_get(store, manager(), &a1).await;
     assert!(old_view["result"].is_null());
@@ -507,7 +513,15 @@ async fn r35_inconclusive_result_replaced_once() {
     let (r2_id, r2_token) = (reviewer_id(4), reviewer_token(4));
     register(store, s, &r1_id, &r1_token).await;
     register(store, s, &r2_id, &r2_token).await;
-    let (r1, a1) = assign(store, s, &r1_id, &r1_token, "r35-inconclusive-assign-1", None).await;
+    let (r1, a1) = assign(
+        store,
+        s,
+        &r1_id,
+        &r1_token,
+        "r35-inconclusive-assign-1",
+        None,
+    )
+    .await;
     let _op1 = submit(
         store,
         &r1,
@@ -567,10 +581,16 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
     let manual = request_changes(store, c, &a1, &op1, "r35-chain-request-changes").await;
     assert_eq!(manual["applied"], true);
     assert_eq!(manual["status"], "needs_correction");
-    assert_eq!(attempt_state(store, &c.1).await.as_str(), "needs_correction");
+    assert_eq!(
+        attempt_state(store, &c.1).await.as_str(),
+        "needs_correction"
+    );
     let (_c2, a2) = assign(store, c, &c2_id, &c2_token, "r35-chain-assign-2", Some(&a1)).await;
     assert_ne!(a1, a2);
-    assert_eq!(review_get(store, manager(), &a2).await["current_slot"], true);
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
     refuse_request_changes(
         store,
         json!({
@@ -594,7 +614,17 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
     register(store, p, &p1_id, &p1_token).await;
     register(store, p, &p2_id, &p2_token).await;
     let (pp1, pa1) = assign(store, p, &p1_id, &p1_token, "r35-pass-assign-1", None).await;
-    let _pop = submit(store, &pp1, p, &pa1, "r35-pass-submit-1", "pass", "complete", &[]).await;
+    let _pop = submit(
+        store,
+        &pp1,
+        p,
+        &pa1,
+        "r35-pass-submit-1",
+        "pass",
+        "complete",
+        &[],
+    )
+    .await;
     refuse_assign(
         store,
         json!({
@@ -611,7 +641,10 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
         "REVIEW_REPLACEMENT_NOT_ALLOWED",
     )
     .await;
-    assert_eq!(review_get(store, manager(), &pa1).await["current_slot"], true);
+    assert_eq!(
+        review_get(store, manager(), &pa1).await["current_slot"],
+        true
+    );
     let undis = seed_subject(store, "r35-undisposed").await;
     let u = &undis;
     let (u1_id, u1_token) = (reviewer_id(9), reviewer_token(9));
@@ -646,7 +679,10 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
         "REVIEW_REPLACEMENT_UNDISPOSED",
     )
     .await;
-    assert_eq!(review_get(store, manager(), &ua1).await["current_slot"], true);
+    assert_eq!(
+        review_get(store, manager(), &ua1).await["current_slot"],
+        true
+    );
     let stale = seed_subject(store, "r35-stale").await;
     let t = &stale;
     let (t1_id, t1_token) = (reviewer_id(11), reviewer_token(11));
@@ -718,7 +754,10 @@ async fn r35_returned_for_correction_replacement_and_refusals() {
         "REVIEW_ANCHOR_MISMATCH",
     )
     .await;
-    assert_eq!(review_get(store, manager(), &ta1).await["current_slot"], true);
+    assert_eq!(
+        review_get(store, manager(), &ta1).await["current_slot"],
+        true
+    );
     drop(owner);
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -748,7 +787,17 @@ async fn r35_late_predecessor_excluded_from_consumers() {
     let (_f1, a1) = assign(store, s, &f1_id, &f1_token, "r35-late-assign-1", None).await;
     let (f2, a2) = assign(store, s, &f2_id, &f2_token, "r35-late-assign-2", Some(&a1)).await;
     let f1 = auth(store, &f1_id, &f1_token).await;
-    let late_op = submit(store, &f1, s, &a1, "r35-late-submit-1", "pass", "complete", &[]).await;
+    let late_op = submit(
+        store,
+        &f1,
+        s,
+        &a1,
+        "r35-late-submit-1",
+        "pass",
+        "complete",
+        &[],
+    )
+    .await;
     let late_view = review_get(store, manager(), &a1).await;
     assert_eq!(late_view["result"]["verdict"], "pass");
     assert_eq!(late_view["result"]["applicability"], "historical_candidate");
@@ -805,7 +854,15 @@ async fn r35_review_list_pagination_has_no_filtered_skips() {
     register(store, lb, &bb1_id, &bb1_token).await;
     let (_aa1, a1) = assign(store, la, &aa1_id, &aa1_token, "r35-list-assign-a1", None).await;
     let (bb1, b1) = assign(store, lb, &bb1_id, &bb1_token, "r35-list-assign-b1", None).await;
-    let (_aa2, a2) = assign(store, la, &aa2_id, &aa2_token, "r35-list-assign-a2", Some(&a1)).await;
+    let (_aa2, a2) = assign(
+        store,
+        la,
+        &aa2_id,
+        &aa2_token,
+        "r35-list-assign-a2",
+        Some(&a1),
+    )
+    .await;
     fn item_id(page: &serde_json::Value, index: usize) -> &str {
         page["items"][index]["assignment"]["review_assignment_id"]
             .as_str()
@@ -853,7 +910,6 @@ async fn r35_review_list_pagination_has_no_filtered_skips() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-
 async fn consume_acceptance(
     store: &Store,
     assignment_id: &str,
@@ -881,11 +937,7 @@ async fn consume_acceptance(
         .unwrap()
 }
 
-async fn consume_repair(
-    store: &Store,
-    assignment_id: &str,
-    result_id: &str,
-) -> serde_json::Value {
+async fn consume_repair(store: &Store, assignment_id: &str, result_id: &str) -> serde_json::Value {
     let assignment_id = assignment_id.to_owned();
     let result_id = result_id.to_owned();
     store
@@ -908,4 +960,3 @@ async fn consume_repair(
         .await
         .unwrap()
 }
-

@@ -324,7 +324,7 @@ const SCRIPT_TRIGGER_DAMAGED_CODE: &str = "SCRIPT_TRIGGER_RECORD_DAMAGED";
 /// them. The reader returns None only when the key has no retained row;
 /// SQLite failures reach the caller unchanged so the classifier can bind the
 /// isolation decision to the exact failed source read.
-fn read_script_trigger_record_raw(tx: &Transaction<'_>, key: &str) -> Result<Option<String>> {
+fn read_script_trigger_record_raw(tx: &Connection, key: &str) -> Result<Option<String>> {
     let raw: Option<String> = tx
         .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
             row.get(0)
@@ -6970,7 +6970,11 @@ mod script_trigger_state_quarantine_tests {
         let anchor = "\"sha256\":\"";
         let start = raw.find(anchor).unwrap() + anchor.len();
         let mut damaged = raw.to_owned();
-        let replacement = if damaged[start..].starts_with('a') { "b" } else { "a" };
+        let replacement = if damaged[start..].starts_with('a') {
+            "b"
+        } else {
+            "a"
+        };
         damaged.replace_range(start..start + 1, replacement);
         damaged
     }
@@ -6998,7 +7002,10 @@ mod script_trigger_state_quarantine_tests {
         assert!(receipt["cursor"].is_null());
         assert!(receipt["activation_cut"].is_null());
         assert_eq!(receipt["recent"][0]["disposition"], "quarantined");
-        assert_eq!(receipt["recent"][0]["reason"], "script_trigger_record_damaged");
+        assert_eq!(
+            receipt["recent"][0]["reason"],
+            "script_trigger_record_damaged"
+        );
         let quarantine_key = receipt["recent"][0]["quarantine_key"]
             .as_str()
             .expect("receipt names its quarantine row")
@@ -7009,7 +7016,10 @@ mod script_trigger_state_quarantine_tests {
         // The evidence digest names exactly those retained bytes.
         let record = quarantine_record(&db, &quarantine_key);
         assert_eq!(record["code"], "SCRIPT_TRIGGER_RECORD_DAMAGED");
-        assert_eq!(record["evidence"]["source_digest"], json!(model::digest(damaged.as_bytes())));
+        assert_eq!(
+            record["evidence"]["source_digest"],
+            json!(model::digest(damaged.as_bytes()))
+        );
         assert_eq!(record["occurrences"].as_u64().unwrap(), 1);
         assert_eq!(record["first_seen_at_ms"].as_i64().unwrap(), 10);
 
@@ -7056,7 +7066,10 @@ mod script_trigger_state_quarantine_tests {
             .to_owned();
         assert_ne!(second_key, first_key);
         let record = quarantine_record(&db, &second_key);
-        assert_eq!(record["evidence"]["source_digest"], json!(model::digest(second_damage.as_bytes())));
+        assert_eq!(
+            record["evidence"]["source_digest"],
+            json!(model::digest(second_damage.as_bytes()))
+        );
         assert_eq!(quarantine_keys(&db).len(), 2);
     }
 
@@ -7133,10 +7146,12 @@ mod script_trigger_state_quarantine_tests {
         assert_eq!(record["code"], "SCRIPT_TRIGGER_RECORD_DAMAGED");
         // No bytes were retained, so sanitized evidence reports no digest.
         assert!(record["evidence"]["source_digest"].is_null());
-        assert!(record["evidence"]["source_pointer"]
-            .as_str()
-            .unwrap()
-            .starts_with("meta/key-sha256:"));
+        assert!(
+            record["evidence"]["source_pointer"]
+                .as_str()
+                .unwrap()
+                .starts_with("meta/key-sha256:")
+        );
     }
 
     #[test]
@@ -7160,7 +7175,10 @@ mod script_trigger_state_quarantine_tests {
             .unwrap()
             .to_owned();
         let record = quarantine_record(&db, &quarantine_key);
-        assert_eq!(record["evidence"]["source_digest"], json!(model::digest(raw.as_bytes())));
+        assert_eq!(
+            record["evidence"]["source_digest"],
+            json!(model::digest(raw.as_bytes()))
+        );
         // The foreign bytes are retained untouched for forensics.
         assert_eq!(stored_raw(&db, &key), raw);
     }
@@ -7175,9 +7193,8 @@ mod script_trigger_state_quarantine_tests {
         let app_config = Config::default();
         let tx = db.transaction().unwrap();
         let intake = super::reconcile_source_intake(&tx, 64, false, 11).unwrap();
-        let error =
-            super::reconcile_script_trigger_entry(&tx, &entry, 16, intake, &app_config, 11)
-                .unwrap_err();
+        let error = super::reconcile_script_trigger_entry(&tx, &entry, 16, intake, &app_config, 11)
+            .unwrap_err();
         assert_eq!(error.code.as_str(), "INVALID_PARAMS");
         drop(tx);
         assert!(quarantine_keys(&db).is_empty());
@@ -7187,14 +7204,16 @@ mod script_trigger_state_quarantine_tests {
     fn state_error_classifier_keeps_foreign_codes_fatal() {
         let entry = ready_entry(AUTOMATION_ID);
         let key = state_key(&entry);
-        let evidence =
-            super::script_trigger_state_quarantine_evidence(&entry, &key, None).unwrap();
+        let evidence = super::script_trigger_state_quarantine_evidence(&entry, &key, None).unwrap();
         assert!(evidence.source_digest.is_none());
         let missing = Error::new("AUTOMATION_CURSOR_MISSING", "absent record");
         let disposition =
             super::classify_script_trigger_state_error(&missing, &evidence).expect("missing");
         match disposition {
-            SubjectErrorDisposition::Quarantined { code, evidence: kept } => {
+            SubjectErrorDisposition::Quarantined {
+                code,
+                evidence: kept,
+            } => {
                 assert_eq!(code, "SCRIPT_TRIGGER_RECORD_DAMAGED");
                 assert_eq!(kept, evidence);
             }
