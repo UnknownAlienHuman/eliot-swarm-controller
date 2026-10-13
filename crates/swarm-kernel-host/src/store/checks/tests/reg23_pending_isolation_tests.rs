@@ -1507,7 +1507,7 @@ async fn pending_cursor_advances_only_through_completed_subjects() {
         head[0].check_id, row2,
         "row 2 stays next eligible after recovery"
     );
-    for _ in 0..3 {
+    for _ in 0..2 {
         fixture.owner.store.reconcile_checks_once().await.unwrap();
     }
     for receipt in &admitted {
@@ -1528,6 +1528,10 @@ async fn pending_cursor_advances_only_through_completed_subjects() {
         None,
         "reaching the cut closes the cycle"
     );
+    // Convergence and the next empty-page cleanup are separate boundaries.
+    fixture.owner.store.reconcile_checks_once().await.unwrap();
+    assert!(retained_cursor(&fixture.owner.store).await.is_none());
+    assert!(retained_cycle_cut(&fixture.owner.store).await.is_none());
     let terminal = fixture
         .owner
         .store
@@ -1653,6 +1657,20 @@ async fn completed_cursor_and_cycle_survive_reopen_after_hard_failure() {
         page.iter().any(|work| work.check_id == late_id),
         "a completed cursor never hides later admissions"
     );
+    // Put every newly admitted UUIDv4 in one lexical suffix for the fault
+    // contour; the earlier completed-row boundary is covered above.
+    fixture
+        .owner
+        .store
+        .run(|db| {
+            set_meta(
+                db,
+                PENDING_CURSOR_KEY,
+                &json!("00000000-0000-4000-8000-000000000000"),
+            )
+        })
+        .await
+        .unwrap();
     // Stall one row of the next page with a hard failure: the rows before
     // it complete, and the cursor plus the captured cycle stay exactly
     // there across reopen.
@@ -1848,6 +1866,13 @@ async fn supervisor_hard_failure_keeps_last_completed_cursor_and_converges_on_re
     let row_a = admitted_a["check_id"].as_str().unwrap().to_owned();
     let row_b = admitted_b["check_id"].as_str().unwrap().to_owned();
     let row_c = admitted_c["check_id"].as_str().unwrap().to_owned();
+    // Assign test roles to the actual publicly minted identities in page
+    // order. Never rewrite CheckRun IDs or their retained receipt backlinks.
+    let mut lexical = vec![row_a, row_b, row_c];
+    lexical.sort();
+    let row_a = lexical[0].clone();
+    let row_b = lexical[1].clone();
+    let row_c = lexical[2].clone();
     mark_preflight_terminal(&fixture.owner.store, &row_a).await;
     mark_preflight_terminal(&fixture.owner.store, &row_b).await;
     // A launch receipt the supervisor can read but never accept: valid
@@ -1857,8 +1882,6 @@ async fn supervisor_hard_failure_keeps_last_completed_cursor_and_converges_on_re
     std::fs::create_dir_all(&c_dir).unwrap();
     std::fs::write(c_dir.join("launch.json"), b"{\"version\":2}").unwrap();
     let launch_bytes = std::fs::read(c_dir.join("launch.json")).unwrap();
-    let mut lexical = vec![row_a.clone(), row_b.clone(), row_c.clone()];
-    lexical.sort();
     // Order the fault and the incident row by page position: the trigger
     // hits the middle row so the first row must complete first.
     assert_eq!(lexical.len(), 3);
