@@ -4196,6 +4196,12 @@ mod tests {
     use super::*;
     #[path = "reg23_pending_isolation_tests.rs"]
     mod reg23_pending_isolation_tests;
+    #[path = "check_launch_fact_durable_tests.rs"]
+    mod check_launch_fact_durable_tests;
+    #[path = "check_launch_unknown_durable_tests.rs"]
+    mod check_launch_unknown_durable_tests;
+    #[path = "check_child_departure_durable_tests.rs"]
+    mod check_child_departure_durable_tests;
     use crate::{
         artifacts::ArtifactFiles,
         checks::{
