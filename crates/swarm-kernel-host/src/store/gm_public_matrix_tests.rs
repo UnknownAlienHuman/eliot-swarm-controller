@@ -219,7 +219,13 @@ async fn successor_continues_retained_attempt_without_replay() {
     let old = register_manager(&owner.store, &operator, "gm-matrix-old").await;
     let successor = register_manager(&owner.store, &operator, "gm-matrix-successor").await;
     let unrelated = register_manager(&owner.store, &operator, "gm-matrix-unrelated").await;
-    write(&owner.store, &operator, "gm.handover", json!({"client_id": old.client_id})).await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id": old.client_id}),
+    )
+    .await;
     let created = write_with_id(
         &owner.store,
         &old,
@@ -374,7 +380,13 @@ async fn missing_designation_reports_high_water_and_operator_recovers() {
     let old = register_manager(&owner.store, &operator, "gm-matrix-old").await;
     let successor = register_manager(&owner.store, &operator, "gm-matrix-successor").await;
     let replacement = register_manager(&owner.store, &operator, "gm-matrix-replacement").await;
-    write(&owner.store, &operator, "gm.handover", json!({"client_id": old.client_id})).await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id": old.client_id}),
+    )
+    .await;
     let second = write(
         &owner.store,
         &old,
