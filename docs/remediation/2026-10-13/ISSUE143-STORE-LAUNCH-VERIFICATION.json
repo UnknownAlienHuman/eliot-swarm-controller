@@ -1,0 +1,84 @@
+{
+  "schema": "swarm.issue143.store_launch_verification@1",
+  "recorded_utc": "2026-10-13T23:20:20.5052727+00:00",
+  "issue": 143,
+  "base_head": "162b3045f30ebedf2442f348fa862a345bd1a8eb",
+  "accepted_source_head": "8a4729a8424ebe4df8b9e9b525acfb56118bea5e",
+  "status": "SCOPED_VERIFIED",
+  "original459_complete": false,
+  "production_problem": "Store write_check_receipt still treated AlreadyExists plus decoded-equal JSON as success; read_check_receipt used raw file read without shared durability",
+  "production_fix": "075cfdd shared write_private_exact and read_private_durable with common1MiB bound; original reparse/regular checks and run/Operation/token validation retained",
+  "read_consumer": "read_check_launch_fact does not return launch/nativeUnknown/departed meanings while its barrier fails",
+  "tests": [
+    "store::checks::tests::check_launch_fact_durable_tests::launch_fact_barrier_failure_stays_unknown_on_equal_retry",
+    "store::checks::tests::check_launch_unknown_durable_tests::launch_unknown_barrier_failure_stays_unknown_on_equal_retry",
+    "store::checks::tests::check_child_departure_durable_tests::child_departure_barrier_failure_stays_unknown_on_equal_retry"
+  ],
+  "first_red": {
+    "result": "0/3 bothOS; second same-byte retry incorrectlyOk",
+    "head": "b63e2d47d6fa9778955aec79cd61fcffbc4d9b59",
+    "windows": "launch143-three-store-callers-windows-first-v1.log",
+    "linux": "launch143-three-store-callers-linux-first-v1.log"
+  },
+  "fixed_gates": {
+    "windows": {
+      "log": "launch143-three-store-callers-windows-fixed-v2.log",
+      "passed": 3,
+      "failed": 0
+    },
+    "linux": {
+      "log": "launch143-three-store-callers-linux-fixed-v2.log",
+      "passed": 3,
+      "failed": 0
+    }
+  },
+  "strict": {
+    "windows": {
+      "exit_code": 0,
+      "log": "launch143-final-strict-windows-v1.log"
+    },
+    "scope": "scoped rustfmt and productionClippy plus host lib/tests warnings denied",
+    "linux": {
+      "exit_code": 0,
+      "log": "launch143-final-strict-linux-v1.log"
+    }
+  },
+  "independent_source": {
+    "range": "162b304..8a4729a writer/reader plus connected primitives and threefixtures",
+    "exact_head": "8a4729a8424ebe4df8b9e9b525acfb56118bea5e",
+    "executed_tests_by_reviewer": false,
+    "failed_muse_audit": "PeirceAPI400 no new143 result; no source verdict borrowed from unrelatedbfc",
+    "reviewer": "Singer01a13728-3ff1 opencode-go3/step-5-preview-free high",
+    "verdict": "boundedNO_P1_P2"
+  },
+  "carried_issue143_scope": {
+    "previous_evidence": "DURABILITY-AUTHORITY-BATCH-VERIFICATION.json",
+    "primitive_each_os": 7,
+    "unchanged_source": "shared production primitive/other exact-file callers unchanged by this Store correction",
+    "connected_authority_new_each_os": 7
+  },
+  "asserted": [
+    "First publication failure remains explicitUnknown with visible bytes",
+    "Samebytes retry underfailedbarrier remainsUnknown",
+    "Recoveryread underfailedbarrier remainsUnknown",
+    "Healedbarrier converges byte-identically on oneexactfile",
+    "Durablelaunch read returnssameexactobject",
+    "Durableunknown receipt remainsCHECK_LAUNCH_IDENTITY_UNKNOWN",
+    "Durabledeparture read preservesNone; no guessedexit/resource state"
+  ],
+  "boundaries": [
+    "Windows existing write-through and file-flush boundary; no Unix directory-fsync equivalence claim",
+    "No new journal or execution scheduler",
+    "PR67 decision/start-once fullmatrix separate",
+    "PR71 freshterminal no-model contour separate",
+    "NoNative/model/SDK/load/release/full459 qualification"
+  ],
+  "evidence_sha256": {
+    "launch143-three-store-callers-linux-first-v1.log": "d9b9e6c9bf2705dba207c5726366a513757af55d47248a09c9cab951d651a062",
+    "launch143-final-strict-linux-v1.log": "777059d6894def1a7a98c9a24110389d598fbf71ff8a6fb02913675231ef6cb3",
+    "launch143-three-store-callers-windows-first-v1.log": "0c9725c103e5cdd53d12e06d279de2cf6417f8b064eb2f9ca69c422f790a8013",
+    "launch143-final-strict-windows-v1.log": "8d3c067a0f42fc6f72ae0448d8f13a2a38241547c3650a6385eb1928a76e2f87",
+    "launch143-three-store-callers-windows-fixed-v2.log": "fc21e8604ec42278bad4d37a231fd5be066647cecb3f13bc5688c5e76856163e",
+    "launch143-three-store-callers-linux-fixed-v2.log": "e67b445ad06c99ff584958de5c0a6d0b55ed3f5133cb2700879996e267787bdf"
+  }
+}
