@@ -2565,7 +2565,8 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
     let malformed_key = format!("{prefix}!malformed");
 
     // Read back every admitted stamp and v2 locator before crafting history.
-    let (admitted, index_rows): (Vec<(String, i64)>, Vec<(String, String)>) = owner
+    type AdmittedMailboxRows = (Vec<(String, i64)>, Vec<(String, String)>);
+    let (admitted, index_rows): AdmittedMailboxRows = owner
         .store
         .run({
             let operation_ids = operation_ids.clone();
