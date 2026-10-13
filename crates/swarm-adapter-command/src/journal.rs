@@ -17,7 +17,8 @@ use swarm_contracts::{
     runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext},
 };
 use swarm_process::{
-    private_permissions, remove_private_acknowledged, sync_parent_directory, write_private_new,
+    RemovalDurability, private_permissions, remove_private_acknowledged, sync_parent_directory,
+    write_private_new,
 };
 
 pub const MAX_RECORD_BYTES: u64 = 1_048_576;
@@ -1135,7 +1136,11 @@ impl RunStore {
             // the target directory and its tombstone exist is the ambiguous
             // state the release contract forbids resolving automatically.
             require_original_release_path_absent(&self.root, &intent.target_operation_id)?;
-            remove_captured_streams(&existing)?;
+            if remove_captured_streams(&existing)? == RemovalDurability::Unknown {
+                eprintln!(
+                    "Command capture cleanup durability is unknown; retained release intent remains the recovery authority"
+                );
+            }
             return Ok(capture_release_outcome(&intent));
         }
 
@@ -1184,7 +1189,11 @@ impl RunStore {
         fs::rename(&target_dir, &tombstone)?;
         sync_parent_directory(&tombstone)?;
         require_original_release_path_absent(&self.root, &intent.target_operation_id)?;
-        remove_captured_streams(&tombstone)?;
+        if remove_captured_streams(&tombstone)? == RemovalDurability::Unknown {
+            eprintln!(
+                "Command capture cleanup durability is unknown; retained release intent remains the recovery authority"
+            );
+        }
         Ok(capture_release_outcome(&intent))
     }
 
@@ -2184,7 +2193,12 @@ fn remove_result_page_cleanup_file(directory: &Path, name: &str) -> Result<()> {
     }
     let path = directory.join(name);
     optional_regular_file(&path, "result-page cleanup entry is not a regular file")?;
-    remove_private_acknowledged(&path)?;
+    let removal = remove_private_acknowledged(&path)?;
+    if removal.durability == RemovalDurability::Unknown {
+        eprintln!(
+            "Command result-page cleanup durability is unknown; exact cleanup marker remains the recovery authority"
+        );
+    }
     Ok(())
 }
 
@@ -3152,7 +3166,8 @@ fn capture_release_outcome_matches(
         && outcome.details["native_replay"] == false
 }
 
-fn remove_captured_streams(directory: &Path) -> Result<()> {
+fn remove_captured_streams(directory: &Path) -> Result<RemovalDurability> {
+    let mut durability = RemovalDurability::Confirmed;
     for name in ["stdout.ndjson", "stderr.txt"] {
         let path = directory.join(name);
         match fs::symlink_metadata(&path) {
@@ -3166,10 +3181,13 @@ fn remove_captured_streams(directory: &Path) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        remove_private_acknowledged(&path)?;
+        let removal = remove_private_acknowledged(&path)?;
+        if removal.durability == RemovalDurability::Unknown {
+            durability = RemovalDurability::Unknown;
+        }
     }
     sync_parent_directory(&directory.join("release-intent.json"))?;
-    Ok(())
+    Ok(durability)
 }
 
 fn require_original_release_path_absent(root: &Path, target_operation_id: &str) -> Result<()> {
@@ -3374,7 +3392,12 @@ fn remove_allowed_regular_file(directory: &Path, name: &str, allowed_files: &[&s
     }
     let path = directory.join(name);
     optional_regular_file(&path, "cleanup entry is not a regular file")?;
-    remove_private_acknowledged(&path)?;
+    let removal = remove_private_acknowledged(&path)?;
+    if removal.durability == RemovalDurability::Unknown {
+        eprintln!(
+            "Command release cleanup durability is unknown; exact release ACK and cleanup intent remain the recovery authority"
+        );
+    }
     Ok(())
 }
 

@@ -281,6 +281,18 @@ fn durability_unknown(error: Error) -> Error {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalDurability {
+    Confirmed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemovalOutcome {
+    pub removed: bool,
+    pub durability: RemovalDurability,
+}
+
 fn private_file_exists() -> Error {
     Error::new("PRIVATE_FILE_ALREADY_EXISTS", "private file already exists")
 }
@@ -331,19 +343,19 @@ pub fn remove_private_durable(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Remove a private file only when its absence crosses the supported
-/// durability boundary. Unix syncs the parent directory after unlinking or
-/// confirming that the path is already absent. Windows returns an explicit
-/// unsupported error because its write-through move does not provide an
-/// equivalent parent-directory barrier for removal.
-pub fn remove_private_acknowledged(path: &Path) -> Result<bool> {
+/// Remove an exact regular private file and report the platform's durability
+/// boundary. Unix syncs the parent directory after unlinking or confirming
+/// that the path is already absent. Windows performs the file removal but
+/// reports `Unknown`: its documented write-through move does not establish an
+/// equivalent parent-directory barrier for `DeleteFile`.
+pub fn remove_private_acknowledged(path: &Path) -> Result<RemovalOutcome> {
     remove_private_acknowledged_with_barrier(path, sync_parent_directory)
 }
 
 fn remove_private_acknowledged_with_barrier(
     path: &Path,
     barrier: impl FnOnce(&Path) -> Result<()>,
-) -> Result<bool> {
+) -> Result<RemovalOutcome> {
     let target = private_target_path(path)?;
     let existed = target_is_regular_file(&target)?;
     #[cfg(unix)]
@@ -352,16 +364,21 @@ fn remove_private_acknowledged_with_barrier(
             fs::remove_file(&target)?;
         }
         barrier(&target).map_err(durability_unknown)?;
-        Ok(existed)
+        Ok(RemovalOutcome {
+            removed: existed,
+            durability: RemovalDurability::Confirmed,
+        })
     }
     #[cfg(windows)]
     {
         let _ = barrier;
-        let _ = existed;
-        Err(Error::new(
-            "DURABILITY_UNSUPPORTED",
-            "acknowledged removal requires a parent-directory durability barrier unavailable on Windows",
-        ))
+        if existed {
+            fs::remove_file(&target)?;
+        }
+        Ok(RemovalOutcome {
+            removed: existed,
+            durability: RemovalDurability::Unknown,
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -774,34 +791,39 @@ mod publication_tests {
         .unwrap_err();
         assert_eq!(error.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
         assert_eq!(barrier_calls, 1);
-        assert!(!remove_private_acknowledged(&path).unwrap());
+        let absent = remove_private_acknowledged(&path).unwrap();
+        assert!(!absent.removed);
+        assert_eq!(absent.durability, RemovalDurability::Confirmed);
         fs::write(&path, b"acknowledged payload").unwrap();
-        assert!(remove_private_acknowledged(&path).unwrap());
+        let removed = remove_private_acknowledged(&path).unwrap();
+        assert!(removed.removed);
+        assert_eq!(removed.durability, RemovalDurability::Confirmed);
         assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
-    fn acknowledged_removal_without_windows_parent_barrier_retains_target() {
+    fn acknowledged_removal_reports_unknown_after_windows_namespace_delete() {
         let root = fixture();
         let path = root.join("pending.json");
         fs::write(&path, b"acknowledged payload").unwrap();
 
-        let error = remove_private_acknowledged_with_barrier(&path, |_| {
-            panic!("Windows removal must fail before invoking a parent barrier")
+        let removed = remove_private_acknowledged_with_barrier(&path, |_| {
+            panic!("Windows removal must not invoke a parent barrier")
         })
-        .unwrap_err();
-        assert_eq!(error.code, "DURABILITY_UNSUPPORTED");
-        assert_eq!(fs::read(&path).unwrap(), b"acknowledged payload");
+        .unwrap();
+        assert!(removed.removed);
+        assert_eq!(removed.durability, RemovalDurability::Unknown);
+        assert!(!path.exists());
 
         let absent = root.join("already-absent.json");
-        let error = remove_private_acknowledged_with_barrier(&absent, |_| {
-            panic!("Windows removal must not acknowledge an unbarriered absence")
+        let absent = remove_private_acknowledged_with_barrier(&absent, |_| {
+            panic!("Windows removal must report an unbarriered absence as unknown")
         })
-        .unwrap_err();
-        assert_eq!(error.code, "DURABILITY_UNSUPPORTED");
-        assert!(!absent.exists());
+        .unwrap();
+        assert!(!absent.removed);
+        assert_eq!(absent.durability, RemovalDurability::Unknown);
         fs::remove_dir_all(root).unwrap();
     }
 

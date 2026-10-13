@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::MutexGuard,
 };
+use swarm_process::RemovalDurability;
 
 const MAX_RETENTION_STEPS: usize = 32;
 const RETENTION_CURSOR_FILE: &str = "retention-cursor.json";
@@ -326,6 +327,7 @@ pub(super) fn reclaim_acknowledged(
     let step_limit = initial_work.min(MAX_RETENTION_STEPS);
     let mut visited = BTreeSet::new();
     let mut summary = RetentionSummary::default();
+    let mut removal_durability_unknown = false;
     while summary.examined < step_limit {
         let Some(key) = index.next_candidate(&visited) else {
             break;
@@ -387,8 +389,14 @@ pub(super) fn reclaim_acknowledged(
             ));
         }
         match remove_private_acknowledged(&operation.path) {
-            Ok(true) => summary.reclaimed += 1,
-            Ok(false) => {
+            Ok(outcome) if outcome.durability == RemovalDurability::Unknown => {
+                if outcome.removed {
+                    summary.reclaimed += 1;
+                }
+                removal_durability_unknown = true;
+            }
+            Ok(outcome) if outcome.removed => summary.reclaimed += 1,
+            Ok(_) => {
                 return Err(Error::new(
                     "ADAPTER_JOURNAL",
                     "acknowledged operation journal disappeared during retention",
@@ -412,6 +420,6 @@ pub(super) fn reclaim_acknowledged(
         index.cursor = Some(key);
         index.persist_cursor()?;
     }
-    summary.complete = index.queue.is_empty();
+    summary.complete = index.queue.is_empty() && !removal_durability_unknown;
     Ok(summary)
 }

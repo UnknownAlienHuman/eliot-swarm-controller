@@ -2799,12 +2799,18 @@ fn remove_exact_file(path: &Path) -> Result<()> {
             ));
         }
     }
-    remove_private_acknowledged(path).map(|_| ()).map_err(|_| {
+    let removal = remove_private_acknowledged(path).map_err(|_| {
         Error::new(
             "ADAPTER_RETENTION_STATE",
             "retention target cannot be removed",
         )
-    })
+    })?;
+    if removal.durability == swarm_process::RemovalDurability::Unknown {
+        eprintln!(
+            "Claude adapter cleanup durability is unknown; retained ACK/readback state remains authoritative"
+        );
+    }
+    Ok(())
 }
 
 fn valid_operation_id(value: &str) -> bool {

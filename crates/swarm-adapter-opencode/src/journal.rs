@@ -20,8 +20,8 @@ use swarm_contracts::{
     runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeOutcome, TaskDispatchAdmissionReceipt},
 };
 use swarm_process::{
-    JsonlScanVerdict, private_permissions, remove_private_acknowledged, replace_private_durable,
-    scan_jsonl, write_private_new,
+    JsonlScanVerdict, RemovalOutcome, private_permissions, remove_private_acknowledged,
+    replace_private_durable, scan_jsonl, write_private_new,
 };
 
 const RECORD_LIMIT: usize = 1_048_576;
@@ -1257,7 +1257,7 @@ impl Journal {
         Ok(root_checkpoint)
     }
 
-    pub fn remove_pending(&self, path: &Path) -> Result<()> {
+    pub fn remove_pending(&self, path: &Path) -> Result<RemovalOutcome> {
         if path.parent() != Some(self.outbox.as_path()) {
             return Err(Error::new(
                 "ADAPTER_OUTBOX",
@@ -1282,11 +1282,11 @@ impl Journal {
             .filter(|item| matches!(item.kind.as_str(), "outcome" | "result"))
             .map(|item| item.key);
         match remove_private_acknowledged(path) {
-            Ok(_) => {
+            Ok(outcome) => {
                 if let Some(operation_id) = retention_operation_id {
                     retention::refresh_operation(self, &operation_id);
                 }
-                Ok(())
+                Ok(outcome)
             }
             Err(_) => {
                 if let Some(bytes) = retained_bytes {

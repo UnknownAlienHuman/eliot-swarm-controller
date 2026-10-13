@@ -2587,7 +2587,30 @@ where
                         acknowledged_now = true;
                     }
                     after_delivery(&item)?;
-                    journal.remove_pending(&path)?;
+                    let cleanup = match journal.remove_pending(&path) {
+                        Ok(cleanup) => cleanup,
+                        Err(_)
+                            if acknowledged_now
+                                || history.acknowledged_sha256.as_deref()
+                                    == Some(digest.as_str()) =>
+                        {
+                            eprintln!(
+                                "OpenCode outcome ACK is durable; outbox removal is unknown and deferred"
+                            );
+                            deferred_paths.insert(path.clone());
+                            if acknowledged_now {
+                                after_acknowledged();
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if cleanup.durability == swarm_process::RemovalDurability::Unknown {
+                        eprintln!(
+                            "OpenCode outcome ACK is durable; outbox removal durability is unknown"
+                        );
+                        deferred_paths.insert(path.clone());
+                    }
                     if acknowledged_now {
                         after_acknowledged();
                     }
@@ -2595,7 +2618,11 @@ where
                 "observation" => {
                     send_recorded("module.observe", item.payload.clone()).await?;
                     after_delivery(&item)?;
-                    journal.remove_pending(&path)?;
+                    let cleanup = journal.remove_pending(&path)?;
+                    if cleanup.durability == swarm_process::RemovalDurability::Unknown {
+                        eprintln!("OpenCode observation cleanup durability is unknown");
+                        deferred_paths.insert(path.clone());
+                    }
                 }
                 "result" => {
                     let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
@@ -2610,7 +2637,30 @@ where
                         acknowledged_now = true;
                     }
                     after_delivery(&item)?;
-                    journal.remove_pending(&path)?;
+                    let cleanup = match journal.remove_pending(&path) {
+                        Ok(cleanup) => cleanup,
+                        Err(_)
+                            if acknowledged_now
+                                || history.result_acknowledged_sha256.as_deref()
+                                    == Some(digest.as_str()) =>
+                        {
+                            eprintln!(
+                                "OpenCode result ACK is durable; outbox removal is unknown and deferred"
+                            );
+                            deferred_paths.insert(path.clone());
+                            if acknowledged_now {
+                                after_acknowledged();
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if cleanup.durability == swarm_process::RemovalDurability::Unknown {
+                        eprintln!(
+                            "OpenCode result ACK is durable; outbox removal durability is unknown"
+                        );
+                        deferred_paths.insert(path.clone());
+                    }
                     if acknowledged_now {
                         after_acknowledged();
                     }
