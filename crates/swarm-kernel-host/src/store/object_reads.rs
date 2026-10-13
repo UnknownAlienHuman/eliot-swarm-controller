@@ -668,7 +668,6 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
     let mut examined = after;
     let mut before = Vec::new();
     let mut projected = Vec::new();
-    let mut filtered = Vec::new();
     let mut damaged = Vec::new();
     for (position, id) in rows.iter().take(scan_limit as usize) {
         let value = match kind {
@@ -678,7 +677,6 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
         let mut value = match value {
             Ok(value) => value,
             Err(error) if error.code == "NOT_FOUND" => {
-                filtered.push(*position);
                 examined = *position;
                 continue;
             }
@@ -717,7 +715,7 @@ pub(super) fn list(db: &Connection, p: &Principal, kind: ObjectKind, v: &Value) 
     let has_newer = limited.stopped_early || rows.iter().any(|(position, _)| *position > next);
     Ok(
         json!({"items":limited.items,"next_after":next,"pagination":"committed_observation_position",
-        "examined_through":next,"filtered_count":filtered.iter().filter(|position| **position<=next).count(),
+        "examined_through":next,
         "has_newer":has_newer,"coverage_complete":limited.gap_count==0 && damaged.iter().all(|position| *position>next),
         "gap_count":limited.gap_count+damaged.iter().filter(|position| **position<=next).count()}),
     )
@@ -1073,7 +1071,6 @@ pub(super) fn timeline(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut examined = after;
     let mut before = Vec::new();
-    let mut filtered = Vec::new();
     let mut damaged = Vec::new();
     let mut entries = Vec::new();
     for (cursor, kind, time, operation_id) in rows.iter().take(scan_limit as usize) {
@@ -1118,7 +1115,6 @@ pub(super) fn timeline(
         let entry = match projected {
             Ok(Some(entry)) => entry,
             Ok(None) => {
-                filtered.push(*cursor);
                 examined = *cursor;
                 continue;
             }
@@ -1157,7 +1153,7 @@ pub(super) fn timeline(
             "observation_timeline"
         },
         json!({"after":after,"next_cursor":next,"examined_through":next,
-            "filtered_count":filtered.iter().filter(|cursor| **cursor<=next).count()}),
+        }),
         &limited,
         scan_limit + 1,
         after > 0,

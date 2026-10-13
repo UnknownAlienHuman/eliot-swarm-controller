@@ -1101,7 +1101,7 @@ fn scopes_are_isolated_per_service() {
 }
 
 #[test]
-fn manager_read_projections_share_current_task_scope_and_nested_attention_scope() {
+fn manager_fleet_projections_preserve_exact_object_and_nested_attention_scope() {
     let db = fixture_db();
     db.execute_batch(WORKSPACE_SCHEMA).unwrap();
     db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
@@ -1174,8 +1174,8 @@ fn manager_read_projections_share_current_task_scope_and_nested_attention_scope(
         [model::canonical(&json!("operator-1")).unwrap()],
     )
     .unwrap();
-    // Put another Manager's Task ahead of manager-a's Task in fleet order.
-    // The scoped one-item page must still count and return manager-a's row.
+    // Fleet order includes another Manager's Task before manager-a's Task.
+    // Per-Task attention remains exact to the row, not the caller's ownership.
     db.execute(
         "UPDATE tasks SET created_at_ms=500 WHERE task_id='task-b'",
         [],
@@ -1187,6 +1187,8 @@ fn manager_read_projections_share_current_task_scope_and_nested_attention_scope(
     let manager_b = read_scope_principal("manager-b", crate::model::Role::Manager);
     let current_gm = read_scope_principal("manager-gm", crate::model::Role::Manager);
     let former_gm = read_scope_principal("former-gm", crate::model::Role::Manager);
+    let local_operator = read_scope_principal("operator-1", crate::model::Role::Operator);
+    let nonlocal_operator = read_scope_principal("operator-2", crate::model::Role::Operator);
     let disabled = read_scope_principal("disabled-manager", crate::model::Role::Manager);
     let task_a_scope = vec!["task-a".to_owned()];
     let capacity_a = capacity::capacity_report_for_scope(&db, 1, 0, &task_a_scope).unwrap();
@@ -1214,20 +1216,25 @@ fn manager_read_projections_share_current_task_scope_and_nested_attention_scope(
     let queue_a =
         super::launcher::queue_get(&db, &manager_a, &json!({"after":0,"limit":1}), &config)
             .unwrap();
-    assert_eq!(queue_a["total_items"], 1);
+    assert_eq!(queue_a["total_items"], 3);
     assert_eq!(queue_a["next_after"], 1);
     assert_eq!(queue_a["items"].as_array().unwrap().len(), 1);
-    assert_eq!(queue_a["items"][0]["task_id"], "task-a");
-    let queue_a_end =
+    assert_eq!(queue_a["items"][0]["task_id"], "task-b");
+    let queue_a_next =
         super::launcher::queue_get(&db, &manager_a, &json!({"after":1,"limit":1}), &config)
             .unwrap();
-    assert_eq!(queue_a_end["total_items"], 1);
-    assert_eq!(queue_a_end["next_after"], 1);
+    assert_eq!(queue_a_next["items"][0]["task_id"], "task-a");
+    let queue_a_end =
+        super::launcher::queue_get(&db, &manager_a, &json!({"after":3,"limit":1}), &config)
+            .unwrap();
+    assert_eq!(queue_a_end["total_items"], 3);
+    assert_eq!(queue_a_end["next_after"], 3);
     assert!(queue_a_end["items"].as_array().unwrap().is_empty());
-    let nested_attention = &queue_a["items"][0]["current_attempt"]["binding"]["manager_attention"];
+    let nested_attention =
+        &queue_a_next["items"][0]["current_attempt"]["binding"]["manager_attention"];
     assert_eq!(
         nested_attention["source"]["total_items"],
-        attention_a["total_items"]
+        capacity::attention_report(&db, 200, 0).unwrap()["total_items"]
     );
     assert_eq!(nested_attention["items"].as_array().unwrap().len(), 1);
     assert_eq!(nested_attention["items"][0]["address"]["task_id"], "task-a");
@@ -1238,29 +1245,28 @@ fn manager_read_projections_share_current_task_scope_and_nested_attention_scope(
         exceptions_a["source_attention"]["total_items"],
         attention_a["total_items"]
     );
-    assert_eq!(exceptions_a["items"].as_array().unwrap().len(), 1);
-    assert_eq!(exceptions_a["items"][0]["address"]["task_id"], "task-a");
+    assert_eq!(exceptions_a["items"].as_array().unwrap().len(), 3);
 
     let dashboard_a =
         super::launcher::dashboard(&db, &manager_a, &json!({"limit":5}), &config).unwrap();
-    assert_eq!(dashboard_a["tasks"]["total"], 1);
+    assert_eq!(dashboard_a["tasks"]["total"], 3);
     assert_eq!(
         dashboard_a["queue_preview"]["items"]
             .as_array()
             .unwrap()
             .len(),
-        1
+        3
     );
-    assert_eq!(dashboard_a["capacity"]["total_items"], 1);
+    assert_eq!(dashboard_a["capacity"]["total_items"], 2);
     assert_eq!(
         dashboard_a["exceptions"]["items"].as_array().unwrap().len(),
-        1
+        3
     );
 
     let queue_b =
         super::launcher::queue_get(&db, &manager_b, &json!({"after":0,"limit":5}), &config)
             .unwrap();
-    assert_eq!(queue_b["items"].as_array().unwrap().len(), 1);
+    assert_eq!(queue_b["items"].as_array().unwrap().len(), 3);
     assert_eq!(queue_b["items"][0]["task_id"], "task-b");
 
     let queue_gm =
@@ -1289,18 +1295,46 @@ fn manager_read_projections_share_current_task_scope_and_nested_attention_scope(
     let queue_former =
         super::launcher::queue_get(&db, &former_gm, &json!({"after":0,"limit":5}), &config)
             .unwrap();
-    assert!(queue_former["items"].as_array().unwrap().is_empty());
+    assert_eq!(queue_former["items"].as_array().unwrap().len(), 3);
     let exceptions_former =
         super::launcher::exceptions_get(&db, &former_gm, &json!({"after":0,"limit":5})).unwrap();
-    assert!(exceptions_former["items"].as_array().unwrap().is_empty());
+    assert_eq!(exceptions_former["items"].as_array().unwrap().len(), 3);
     let dashboard_former =
         super::launcher::dashboard(&db, &former_gm, &json!({"limit":5}), &config).unwrap();
-    assert_eq!(dashboard_former["tasks"]["total"], 0);
-    assert!(
+    assert_eq!(dashboard_former["tasks"]["total"], 3);
+    assert_eq!(
         dashboard_former["queue_preview"]["items"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .len(),
+        3
+    );
+    // Fleet inventory never grants a foreign exact Attempt inspection.
+    assert_eq!(
+        super::launcher::agent_inspect(&db, &manager_a, &json!({"attempt_id":"att-b"}), &config)
+            .unwrap_err()
+            .code,
+        "FORBIDDEN"
+    );
+    super::launcher::agent_inspect(&db, &current_gm, &json!({"attempt_id":"att-b"}), &config)
+        .expect("current GM retains exact cross-Manager inspection");
+    super::launcher::agent_inspect(
+        &db,
+        &local_operator,
+        &json!({"attempt_id":"att-b"}),
+        &config,
+    )
+    .expect("verified local Operator retains exact fleet inspection");
+    assert_eq!(
+        super::launcher::agent_inspect(
+            &db,
+            &nonlocal_operator,
+            &json!({"attempt_id":"att-b"}),
+            &config,
+        )
+        .unwrap_err()
+        .code,
+        "FORBIDDEN"
     );
 
     assert_eq!(
