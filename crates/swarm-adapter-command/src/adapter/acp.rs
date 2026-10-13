@@ -2866,6 +2866,39 @@ async fn cancel_pending_permissions(
     Ok(())
 }
 
+fn record_permission_reply_intent(
+    journal: &AcpJournal,
+    command: &RuntimeCommand,
+    key: &str,
+    session_id: &str,
+    request_id: &Value,
+    fingerprint: &str,
+    option_id: &str,
+    selected_kind: PermissionOptionKind,
+) -> Result<()> {
+    if !matches!(
+        selected_kind,
+        PermissionOptionKind::AllowOnce | PermissionOptionKind::RejectOnce
+    ) {
+        return Err(Error::new(
+            "NATIVE_PERMISSION_PERSISTENT_UNSUPPORTED",
+            "ACP persistent permission choices require a separate policy mutation and readback",
+        ));
+    }
+    journal.record_effect(
+        command,
+        &format!("permission-reply:{}", digest(key.as_bytes())),
+        "intent",
+        json!({
+            "session_id":session_id,
+            "request_id":request_id,
+            "fingerprint":fingerprint,
+            "option_id":option_id,
+            "option_kind":format!("{:?}",selected_kind)
+        }),
+    )
+}
+
 async fn reply_to_permission(
     context: &mut CommandContext<'_>,
     command: &RuntimeCommand,
@@ -2936,28 +2969,18 @@ async fn reply_to_permission(
                 )
             })?
     };
-    if !matches!(
-        selected_kind,
-        PermissionOptionKind::AllowOnce | PermissionOptionKind::RejectOnce
-    ) {
-        return Err(Error::new(
-            "NATIVE_PERMISSION_PERSISTENT_UNSUPPORTED",
-            "ACP persistent permission choices require a separate policy mutation and readback",
-        ));
-    }
     let selected_option = option_id.to_owned();
-    context.journal.record_effect(
+    record_permission_reply_intent(
+        context.journal,
         command,
-        &format!("permission-reply:{}", digest(key.as_bytes())),
-        "intent",
-        json!({
-            "session_id":session_id,
-            "request_id":request_id,
-            "fingerprint":fingerprint,
-            "option_id":selected_option,
-            "option_kind":format!("{:?}",selected_kind)
-        }),
+        &key,
+        session_id,
+        &request_id,
+        fingerprint,
+        &selected_option,
+        selected_kind,
     )?;
+
     let pending = context
         .permissions
         .lock()
@@ -3669,6 +3692,71 @@ mod tests {
             native_input_id: None,
             details: json!({"recovery_reason":reason,"native_replay":false}),
         }
+    }
+
+    fn permission_reply_command() -> RuntimeCommand {
+        RuntimeCommand {
+            operation_id: format!("op-{}", Uuid::new_v4()),
+            method: "agent.reply".to_owned(),
+            created_at_ms: 1,
+            binding_id: "binding-fixture".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: json!({}),
+            input: json!({}),
+            input_sha256: None,
+            target_input_sha256: None,
+        }
+    }
+
+    fn journal_effect_count(state: &TestState, command: &RuntimeCommand) -> super::Result<usize> {
+        let directory = state.journal.operation_dir(&command.operation_id)?;
+        fs::read_dir(directory)?.try_fold(0usize, |count, entry| {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("effect-") {
+                Ok(count + 1)
+            } else {
+                Ok(count)
+            }
+        })
+    }
+
+    #[test]
+    fn persistent_permission_rejects_before_once_only_intent() -> super::Result<()> {
+        let state = TestState::new()?;
+        let request_id = json!("permission-request-1");
+        let request_key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"pending permission request fixture");
+
+        let persistent_command = permission_reply_command();
+        assert_error_code(
+            super::record_permission_reply_intent(
+                &state.journal,
+                &persistent_command,
+                &request_key,
+                "session-fixture",
+                &request_id,
+                &fingerprint,
+                "allow-always",
+                super::PermissionOptionKind::AllowAlways,
+            ),
+            "NATIVE_PERMISSION_PERSISTENT_UNSUPPORTED",
+        );
+        assert_eq!(journal_effect_count(&state, &persistent_command)?, 0);
+
+        let once_command = permission_reply_command();
+        super::record_permission_reply_intent(
+            &state.journal,
+            &once_command,
+            &request_key,
+            "session-fixture",
+            &request_id,
+            &fingerprint,
+            "allow-once",
+            super::PermissionOptionKind::AllowOnce,
+        )?;
+        assert_eq!(journal_effect_count(&state, &once_command)?, 1);
+        Ok(())
     }
 
     #[test]
