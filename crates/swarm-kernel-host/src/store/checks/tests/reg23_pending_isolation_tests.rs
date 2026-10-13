@@ -95,10 +95,16 @@ async fn damage_spec_invalid_json(store: &Store, check_id: &str) -> String {
     store
         .run(move |db| {
             let damaged = "{\"token\": \"reg23-invalid-json\", \"candidate\":".to_owned();
-            let changed = db.execute(
+            // Corruption injection intentionally bypasses the admission-time
+            // JSON CHECK on this test connection only, then restores it before
+            // the real pending consumer observes the retained damaged bytes.
+            db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+            let injected = db.execute(
                 "UPDATE check_runs SET spec_json=?2 WHERE check_id=?1",
                 params![id, damaged],
-            )?;
+            );
+            db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+            let changed = injected?;
             if changed != 1 {
                 return Err(crate::error::Error::new(
                     "TEST_STATE",
@@ -1108,6 +1114,54 @@ async fn empty_pending_scan_stays_read_only() {
             .await
             .unwrap(),
         None
+    );
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+/// Empty pending scans never reserve the SQLite writer: they succeed while an
+/// unrelated external connection holds an IMMEDIATE writer reservation on the
+/// same swarm.db. An IMMEDIATE pending reader would block on that RESERVED
+/// lock and deadlock this fixture because release happens only after pending
+/// returns; a Deferred read-only snapshot returns promptly.
+#[tokio::test]
+async fn empty_pending_scan_succeeds_under_external_immediate_lock() {
+    let fixture = fixture().await;
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let db_path = fixture.directory.join("swarm.db");
+    let db = rusqlite::Connection::open(&db_path).expect("open external Store database");
+    db.execute_batch("BEGIN IMMEDIATE")
+        .expect("reserve external IMMEDIATE writer");
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pending_page(&fixture.owner.store, fixture.directory.clone()),
+    )
+    .await;
+    // Release even when the regression times out, so the negative cannot
+    // strand a writer-lock thread or leave the Store owner blocked.
+    db.execute_batch("ROLLBACK")
+        .expect("release external writer");
+    assert!(
+        observed
+            .expect("empty pending read must finish while the writer is reserved")
+            .unwrap()
+            .is_empty(),
+        "empty Deferred reader must not block on an external IMMEDIATE reservation"
+    );
+    assert_eq!(
+        fixture
+            .owner
+            .store
+            .run(|db| meta(db, PENDING_CURSOR_KEY))
+            .await
+            .unwrap(),
+        None,
+        "empty scan under external lock must not retain a cursor"
     );
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
