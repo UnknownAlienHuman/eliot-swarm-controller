@@ -520,6 +520,7 @@ mod public_store {
             let created = store.call(operator.clone(), "task.create".into(), json!({
                 "client_request_id":model::new_id(), "project_id":"public-contract-matrix",
                 "spec":{"objective":"Qualify exact public contract decisions", "phase":"implementation",
+                    "owner_policy_id":crate::policy::OWNER_POLICY_V1_ID,
                     "requirements":[{"id":"R58", "statement":"one immutable scoped decision"}]},
             })).await.unwrap();
             let task_id = created["task_id"].clone();
