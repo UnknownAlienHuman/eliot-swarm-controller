@@ -1647,6 +1647,10 @@ mod connected_store {
                 "task_id":attempt["task_id"],
                 "task_revision":attempt["task_revision"],
                 "attempt_id":target["attempt_id"],
+                // The Attempt was claimed under this binding; a binding-less
+                // credential fails generation match and reads nothing.
+                "binding_id":binding["binding_id"],
+                "binding_generation":binding["generation"],
                 "participation_basis":{"kind":"attempt_owner"},
             }),
         )
