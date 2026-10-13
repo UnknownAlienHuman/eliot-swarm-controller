@@ -2530,7 +2530,16 @@ mod connected_store {
         let candidate_a = subject.candidate_ref.clone();
         let candidate_b = foreign.candidate_ref.clone();
         store
-            .run(move |db| {
+            .run({
+                let accept_a = accept_a.clone();
+                let accept_b = accept_b.clone();
+                let task_a = task_a.clone();
+                let attempt_a = attempt_a.clone();
+                let check_a = check_a.clone();
+                let check_b = check_b.clone();
+                let check_op_a = check_op_a.clone();
+                let candidate_a = candidate_a.clone();
+                move |db| {
                 for (accept_id, task_id, attempt_id) in
                     [(&accept_a, &task_a, &attempt_a), (&accept_b, &task_b, &attempt_b)]
                 {
@@ -2585,7 +2594,8 @@ mod connected_store {
                         ],
                     )?;
                 }
-                Ok(())
+                    Ok(())
+                }
             })
             .await
             .unwrap();
