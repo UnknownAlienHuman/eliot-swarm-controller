@@ -405,11 +405,33 @@ async fn reg23_watch_quarantines_invalid_retained_scope_and_matches_healthy_neig
             .is_some_and(|value| value.starts_with("meta/key-sha256:"))
     );
     assert_eq!(evidence["source_digest"].as_str().map(str::len), Some(64));
+    assert_eq!(
+        evidence["source_digest"],
+        model::digest(damaged_snapshot.as_bytes())
+    );
+    assert_eq!(
+        evidence["source_pointer"],
+        format!(
+            "meta/key-sha256:{}",
+            model::digest(record_key_for(&damaged_watch).as_bytes()),
+        )
+    );
     let serialized_evidence = quarantine.to_string();
     assert!(serialized_evidence.len() <= 1024);
     for plaintext in [&damaged_watch, &task_id, &attempt_id, &damaged_operation] {
         assert!(!serialized_evidence.contains(plaintext));
     }
+    let retry = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("retry settled page");
+    assert_eq!(retry["processed"], 0);
+    assert_eq!(quarantine_keys(&owner.store).await, keys);
+    assert_eq!(
+        quarantine_record(&owner.store, &keys[0]).await["occurrences"],
+        1
+    );
 
     owner.close().await.expect("close Store");
     std::fs::remove_dir_all(&directory).expect("remove temporary directory");
@@ -503,4 +525,358 @@ async fn reg23_watch_cursor_write_failure_rolls_back_subject_and_retry_matches()
 
     owner.close().await.expect("close Store");
     std::fs::remove_dir_all(&directory).expect("remove temporary directory");
+}
+
+async fn malformed_index_neighbor_case(raw_index: &str) {
+    let (owner, directory, _operator, manager) = store_fixture("watch-malformed-index").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_a) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "malformed-a").await;
+    let (_, operation_b) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "malformed-b").await;
+    let watch_a =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_a).await;
+    let watch_b =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_b).await;
+    let (damaged_watch, healthy_watch) = if active_key_for(&watch_a) < active_key_for(&watch_b) {
+        (watch_a, watch_b)
+    } else {
+        (watch_b, watch_a)
+    };
+    let retained_raw = record_raw(&owner.store, &damaged_watch).await;
+    let key = active_key_for(&damaged_watch);
+    let raw = raw_index.to_owned();
+    owner
+        .store
+        .run(move |db| {
+            db.execute(
+                "UPDATE meta SET value_json=?2 WHERE key=?1",
+                params![key, raw],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("damage only active index bytes");
+    cancel_operation(&owner.store, &manager, &operation_a).await;
+    cancel_operation(&owner.store, &manager, &operation_b).await;
+
+    let result = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("isolate malformed active index");
+    assert_eq!(result["processed"], 2);
+    assert_eq!(result["quarantined"], 1);
+    assert_eq!(result["matched"], 1);
+    assert_eq!(result["stale"], 0);
+    assert_eq!(result["model_wake"], false);
+    assert_eq!(result["native_work_queued"], false);
+    assert_eq!(record_raw(&owner.store, &damaged_watch).await, retained_raw);
+    assert_eq!(active_index_count(&owner.store, &damaged_watch).await, 0);
+    assert_eq!(active_index_count(&owner.store, &healthy_watch).await, 0);
+    let keys = quarantine_keys(&owner.store).await;
+    assert_eq!(keys.len(), 1);
+    let evidence = quarantine_record(&owner.store, &keys[0]).await;
+    assert_eq!(evidence["code"], "WATCH_ACTIVE_INDEX_DAMAGED");
+    assert_eq!(
+        evidence["evidence"]["source_digest"],
+        model::digest(raw_index.as_bytes())
+    );
+    assert_eq!(
+        evidence["evidence"]["source_pointer"],
+        format!(
+            "meta/key-sha256:{}",
+            model::digest(active_key_for(&damaged_watch).as_bytes()),
+        )
+    );
+    let retry = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("retry disposed subject");
+    assert_eq!(retry["processed"], 0);
+    assert_eq!(
+        quarantine_record(&owner.store, &keys[0]).await["occurrences"],
+        1
+    );
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_invalid_active_json_isolated_from_healthy_neighbor() {
+    malformed_index_neighbor_case("{invalid").await;
+}
+
+#[tokio::test]
+async fn reg23_watch_missing_active_watch_id_isolated_from_healthy_neighbor() {
+    malformed_index_neighbor_case("{}").await;
+}
+
+#[tokio::test]
+async fn reg23_watch_changed_active_watch_id_does_not_lookup_other_record() {
+    malformed_index_neighbor_case(r#"{"watch_id":"another-watch"}"#).await;
+}
+
+#[tokio::test]
+async fn reg23_watch_changed_retained_source_aborts_quarantine_retirement() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-source-cas").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "source-cas").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let snapshot = damage_scope_revision(&owner.store, &watch_id).await;
+    let key = active_key_for(&watch_id);
+    let retained_key = record_key_for(&watch_id);
+    let error = owner
+        .store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            let raw: String =
+                tx.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
+                    row.get(0)
+                })?;
+            let disposition = reconcile_watch_subject(&tx, &key, &raw, model::now_ms()?)?;
+            let WatchSubjectDisposition::Quarantined {
+                code,
+                evidence,
+                source,
+            } = disposition
+            else {
+                panic!("damaged source must be classified");
+            };
+            set_meta(&tx, &retained_key, &json!({"different":"source bytes"}))?;
+            retire_quarantined_watch(&tx, &key, &raw, &source, &evidence, &code, model::now_ms()?)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect_err("changed source cannot be retired with old evidence");
+    assert_eq!(error.code, "WATCH_SOURCE_CONFLICT");
+    assert_eq!(record_raw(&owner.store, &watch_id).await, snapshot);
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+async fn quarantine_write_rollback_case(cursor_fault: bool) {
+    let (owner, directory, _operator, manager) = store_fixture("watch-quarantine-rollback").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_a) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "rollback-a").await;
+    let (_, operation_b) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "rollback-b").await;
+    let watch_a =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_a).await;
+    let watch_b =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_b).await;
+    let damaged_raw = damage_scope_revision(&owner.store, &watch_a).await;
+    let healthy_raw = record_raw(&owner.store, &watch_b).await;
+    cancel_operation(&owner.store, &manager, &operation_a).await;
+    cancel_operation(&owner.store, &manager, &operation_b).await;
+    if cursor_fault {
+        install_cursor_write_fault(&owner.store).await;
+    } else {
+        owner
+            .store
+            .run(|db| {
+                db.execute_batch(
+                    r#"
+                CREATE TEMP TRIGGER watch_quarantine_write_fault
+                BEFORE INSERT ON main.meta
+                WHEN NEW.key LIKE 'coordination:watch:v1:quarantine:%'
+                BEGIN SELECT RAISE(ABORT, 'watch quarantine write fault'); END;
+            "#,
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("install evidence write fault");
+    }
+    let error = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect_err("write failure stays hard");
+    assert_eq!(error.code, "STORE_ERROR");
+    assert_eq!(record_raw(&owner.store, &watch_a).await, damaged_raw);
+    assert_eq!(record_raw(&owner.store, &watch_b).await, healthy_raw);
+    assert_eq!(active_index_count(&owner.store, &watch_a).await, 1);
+    assert_eq!(active_index_count(&owner.store, &watch_b).await, 1);
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    assert!(
+        owner
+            .store
+            .run(|db| meta(db, RECONCILE_CURSOR_KEY))
+            .await
+            .expect("cursor read")
+            .is_none()
+    );
+    if cursor_fault {
+        remove_cursor_write_fault(&owner.store).await;
+    } else {
+        owner
+            .store
+            .run(|db| {
+                db.execute_batch("DROP TRIGGER temp.watch_quarantine_write_fault")?;
+                Ok(())
+            })
+            .await
+            .expect("remove evidence fault");
+    }
+    let retry = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("retry exact subjects");
+    assert_eq!(retry["quarantined"], 1);
+    assert_eq!(retry["matched"], 1);
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_quarantine_evidence_write_failure_rolls_back_healthy_neighbor() {
+    quarantine_write_rollback_case(false).await;
+}
+
+#[tokio::test]
+async fn reg23_watch_quarantine_cursor_write_failure_rolls_back_healthy_neighbor() {
+    quarantine_write_rollback_case(true).await;
+}
+
+async fn append_pending_page(store: &Store, watch_id: &str, page: usize) {
+    let original: Value =
+        serde_json::from_str(&record_raw(store, watch_id).await).expect("template record");
+    store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            // Fixed 33-row influx exceeds the public 32-row tick budget.
+            for index in 0..33 {
+                let id = format!("zz-influx-{page:02}-{index:02}");
+                let mut record = original.clone();
+                record["watch_id"] = json!(id);
+                set_meta(&tx, &record_key(&id), &record)?;
+                set_meta(&tx, &active_key(&id), &json!({"watch_id":id}))?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("retain bounded influx fixture");
+}
+
+#[tokio::test]
+async fn reg23_watch_pending_revisited_under_full_page_influx_without_stale_or_effects() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-pending-influx").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "pending-influx").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let pending = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("observe pending watch");
+    assert_eq!(pending["processed"], 1);
+    for field in ["matched", "expired", "stale", "quarantined"] {
+        assert_eq!(pending[field], 0);
+    }
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 1);
+    append_pending_page(&owner.store, &watch_id, 0).await;
+    let pending_again = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("full pending page");
+    assert_eq!(pending_again["stale"], 0);
+    assert_eq!(pending_again["quarantined"], 0);
+    assert_eq!(pending_again["model_wake"], false);
+    assert_eq!(pending_again["native_work_queued"], false);
+    append_pending_page(&owner.store, &watch_id, 1).await;
+    cancel_operation(&owner.store, &manager, &operation_id).await;
+    // Oldest queued pending watch is reached within the next two ticks even
+    // though fresh later keys continuously keep the forward page full.
+    owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("first revisit tick");
+    append_pending_page(&owner.store, &watch_id, 2).await;
+    owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("second revisit tick");
+    let record: Value =
+        serde_json::from_str(&record_raw(&owner.store, &watch_id).await).expect("watch receipt");
+    assert_eq!(record["state"], "matched");
+    assert_eq!(record["cursor"]["operation_id"], operation_id);
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_pending_expiry_revisited_under_full_page_influx() {
+    let (owner, directory, _operator, manager) = store_fixture("watch-expiry-influx").await;
+    register_active_script(&owner.store, &manager).await;
+    let (task_id, attempt_id) = create_current_task_attempt(&owner.store, &manager).await;
+    let (_, operation_id) =
+        admit_script_run(&owner.store, &manager, &attempt_id, "expiry-influx").await;
+    let watch_id =
+        create_operation_watch(&owner.store, &manager, &task_id, &attempt_id, &operation_id).await;
+    let record: Value =
+        serde_json::from_str(&record_raw(&owner.store, &watch_id).await).expect("watch record");
+    let expires = record["expires_at_ms"].as_i64().expect("expiry");
+    owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect("queue pending subject");
+    append_pending_page(&owner.store, &watch_id, 0).await;
+    let receipt = owner
+        .store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            let receipt = reconcile(&tx, 32, expires)?;
+            tx.commit()?;
+            Ok(receipt)
+        })
+        .await
+        .expect("exact expiry tick through Store transaction");
+    assert!(receipt["expired"].as_u64().is_some_and(|count| count > 0));
+    assert_eq!(active_index_count(&owner.store, &watch_id).await, 0);
+    let record: Value =
+        serde_json::from_str(&record_raw(&owner.store, &watch_id).await).expect("expired receipt");
+    assert_eq!(record["state"], "expired");
+    assert!(record["notification"].is_null());
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
+}
+
+#[tokio::test]
+async fn reg23_watch_malformed_global_cursor_remains_hard() {
+    let (owner, directory, _operator, _manager) = store_fixture("watch-global-cursor").await;
+    owner
+        .store
+        .run(|db| set_meta(db, RECONCILE_CURSOR_KEY, &json!({"invalid":"cursor"})))
+        .await
+        .expect("damage global cursor");
+    let error = owner
+        .store
+        .reconcile_watches_once()
+        .await
+        .expect_err("global cursor must stay hard");
+    assert_eq!(error.code, "WATCH_CURSOR_DAMAGED");
+    assert!(quarantine_keys(&owner.store).await.is_empty());
+    owner.close().await.expect("close Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store");
 }

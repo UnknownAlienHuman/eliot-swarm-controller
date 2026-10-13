@@ -21,6 +21,9 @@ const SUBJECT_PREFIX: &str = "coordination:watch:v1:subject:";
 const NOTICE_PREFIX: &str = "coordination:watch:v1:notice:";
 const OWNER_NOTICE_PREFIX: &str = "coordination:watch:v1:owner-notice:";
 const RECONCILE_CURSOR_KEY: &str = "coordination:watch:v1:reconcile_cursor";
+const REVISIT_PREFIX: &str = "coordination:watch:v1:revisit:";
+const REVISIT_SEQUENCE_KEY: &str = "coordination:watch:v1:revisit_sequence";
+const REVISIT_TURN_KEY: &str = "coordination:watch:v1:revisit_turn";
 const QUARANTINE_PREFIX: &str = "coordination:watch:v1:quarantine:";
 const MAX_RECONCILE_LIMIT: i64 = 256;
 const DEFAULT_NOTICE_LIMIT: i64 = 20;
@@ -329,9 +332,11 @@ mod coordination_watch_quarantine_tests;
 enum WatchSubjectDisposition {
     Applied(WatchSubjectKind),
     Skipped,
+    Pending,
     Quarantined {
         code: String,
         evidence: automation_reconcile::QuarantineEvidence,
+        source: WatchDamagedSource,
     },
 }
 
@@ -341,13 +346,33 @@ enum WatchSubjectKind {
     Stale,
 }
 
-/// Bounded quarantine identity for one retained watch subject. Only digests
-/// and the retained key pointer are written; the damaged record itself is
-/// never rewritten or removed by this path.
+enum WatchDamagedSource {
+    ActiveIndex { key: String, raw: String },
+    RetainedRecord { key: String, raw: String },
+}
+
+impl WatchDamagedSource {
+    fn key_and_raw(&self) -> (&str, &str) {
+        match self {
+            Self::ActiveIndex { key, raw } | Self::RetainedRecord { key, raw } => (key, raw),
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ActiveIndex { .. } => "WATCH_ACTIVE_INDEX_DAMAGED",
+            Self::RetainedRecord { .. } => "WATCH_RECORD_DAMAGED",
+        }
+    }
+}
+
+/// Identity addresses the active subject; pointer and digest address the
+/// exact damaged source. Neither raw source nor plaintext IDs are persisted.
 fn watch_subject_evidence(
     active_key: &str,
-    raw_index: &str,
+    source: &WatchDamagedSource,
 ) -> automation_reconcile::QuarantineEvidence {
+    let (source_key, raw_source) = source.key_and_raw();
     automation_reconcile::QuarantineEvidence {
         subject_identity: format!(
             "watch-active-key-sha256:{}",
@@ -355,29 +380,41 @@ fn watch_subject_evidence(
         ),
         source_pointer: Some(format!(
             "meta/key-sha256:{}",
-            model::digest(active_key.as_bytes())
+            model::digest(source_key.as_bytes())
         )),
-        source_digest: Some(model::digest(raw_index.as_bytes())),
+        source_digest: Some(model::digest(raw_source.as_bytes())),
     }
 }
 
-/// Domain-specific classifier for retained watch rows. Only a semantically
-/// damaged retained record produces bounded quarantine evidence. SQLite,
-/// read, write, commit and savepoint failures return None and stay fatal.
-fn classify_watch_subject(
-    error: &Error,
-    active_key: &str,
-    raw_index: &str,
-) -> Option<automation_reconcile::SubjectErrorDisposition> {
-    match error.code.as_str() {
-        "WATCH_RECORD_DAMAGED" => {
-            Some(automation_reconcile::SubjectErrorDisposition::Quarantined {
-                code: error.code.clone(),
-                evidence: watch_subject_evidence(active_key, raw_index),
-            })
-        }
-        _ => None,
+fn watch_id_from_active_index(index_key: &str, raw_index: &str) -> Result<String> {
+    let index: Value = serde_json::from_str(raw_index)?;
+    model::fields(&index, &["watch_id", "revisit_key"])?;
+    let watch_id = model::text(&index, "watch_id")?;
+    if watch_id.len() > 128 || active_key(watch_id) != index_key {
+        return Err(Error::invalid("watch active key differs from its index"));
     }
+    if index.get("revisit_key").is_some_and(|key| {
+        !key.as_str()
+            .is_some_and(|key| valid_revisit_key(key, index_key))
+    }) {
+        return Err(Error::invalid("watch active revisit key is invalid"));
+    }
+    Ok(watch_id.to_owned())
+}
+
+fn require_watch_source(tx: &Transaction<'_>, key: &str, raw: &str) -> Result<()> {
+    let current: Option<String> = tx
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if current.as_deref() != Some(raw) {
+        return Err(Error::new(
+            "WATCH_SOURCE_CONFLICT",
+            "watch source changed after damage classification",
+        ));
+    }
+    Ok(())
 }
 
 /// Remove an already-quarantined subject from the durable active index and
@@ -386,6 +423,8 @@ fn classify_watch_subject(
 fn retire_quarantined_watch(
     tx: &Transaction<'_>,
     active_key: &str,
+    raw_index: &str,
+    source: &WatchDamagedSource,
     evidence: &automation_reconcile::QuarantineEvidence,
     code: &str,
     now: i64,
@@ -394,8 +433,23 @@ fn retire_quarantined_watch(
     match automation_reconcile::with_subject_savepoint(
         tx,
         || {
+            let (source_key, raw_source) = source.key_and_raw();
+            require_watch_source(tx, source_key, raw_source)?;
             automation_reconcile::persist_quarantine(tx, &record_key, code, evidence.clone(), now)?;
-            tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+            let removed = tx.execute(
+                "DELETE FROM meta WHERE key=?1 AND value_json=?2",
+                params![active_key, raw_index],
+            )?;
+            if removed != 1 {
+                return Err(Error::new(
+                    "WATCH_SOURCE_CONFLICT",
+                    "watch active index changed",
+                ));
+            }
+            // Also fence changes caused by evidence/index write triggers.
+            if matches!(source, WatchDamagedSource::RetainedRecord { .. }) {
+                require_watch_source(tx, source_key, raw_source)?;
+            }
             Ok(automation_reconcile::SubjectDisposition::Applied(()))
         },
         |_| None,
@@ -409,8 +463,8 @@ fn retire_quarantined_watch(
 }
 
 /// One bounded subject behind the shared subject savepoint. Global row scans,
-/// the reconcile cursor and their writes stay outside this boundary, so a
-/// broken index or cursor still fails the whole domain transaction.
+/// the reconcile cursor and their writes stay outside this boundary. Only
+/// decoding this subject's two source rows may classify source damage.
 fn reconcile_watch_subject(
     tx: &Transaction<'_>,
     active_key: &str,
@@ -421,27 +475,61 @@ fn reconcile_watch_subject(
     // vocabulary is Applied / Pending / Skipped / Quarantined. The watch
     // domain maps its outcome into that vocabulary here and records the
     // matched / expired / stale ledger in the Applied payload.
+    let mut damaged_source = None;
+    let mut quarantine = |source: WatchDamagedSource| {
+        let code = source.code().to_owned();
+        let evidence = watch_subject_evidence(active_key, &source);
+        damaged_source = Some(source);
+        automation_reconcile::SubjectDisposition::Quarantined { code, evidence }
+    };
     let disposition = automation_reconcile::with_subject_savepoint(
         tx,
         || {
-            let index: Value = serde_json::from_str(raw_index)?;
-            let watch_id = model::text(&index, "watch_id")?;
-            let Some(mut record) = meta(tx, &record_key(watch_id))? else {
-                tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-                return Ok(automation_reconcile::SubjectDisposition::Skipped {
-                    code: "WATCH_ACTIVE_WITHOUT_RECORD".to_owned(),
-                    reason: "active index row has no retained watch record".to_owned(),
-                });
+            let watch_id = match watch_id_from_active_index(active_key, raw_index) {
+                Ok(watch_id) => watch_id,
+                Err(_) => {
+                    return Ok(quarantine(WatchDamagedSource::ActiveIndex {
+                        key: active_key.to_owned(),
+                        raw: raw_index.to_owned(),
+                    }));
+                }
             };
-            // A damaged retained record is classified by the domain below;
-            // the classifier decides whether it becomes bounded quarantine.
-            verify_reconcile_record(&record, watch_id)?;
+            let watch_id = watch_id.as_str();
+            let retained_key = record_key(watch_id);
+            let raw_record: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&retained_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(raw_record) = raw_record else {
+                tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
+                return Ok(automation_reconcile::SubjectDisposition::Applied(
+                    WatchSubjectKind::Stale,
+                ));
+            };
+            let parsed_record = serde_json::from_str::<Value>(&raw_record)
+                .map_err(|_| damaged("retained watch record JSON is invalid"))
+                .and_then(|record| {
+                    verify_reconcile_record(&record, watch_id)?;
+                    Ok(record)
+                });
+            let mut record = match parsed_record {
+                Ok(record) => record,
+                Err(error) if error.code == "WATCH_RECORD_DAMAGED" => {
+                    return Ok(quarantine(WatchDamagedSource::RetainedRecord {
+                        key: retained_key,
+                        raw: raw_record,
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
             if record["state"] != "active" {
                 tx.execute("DELETE FROM meta WHERE key=?1", [active_key])?;
-                return Ok(automation_reconcile::SubjectDisposition::Skipped {
-                    code: "WATCH_NOT_ACTIVE".to_owned(),
-                    reason: "retained watch is not active".to_owned(),
-                });
+                return Ok(automation_reconcile::SubjectDisposition::Applied(
+                    WatchSubjectKind::Stale,
+                ));
             }
             let expires_at_ms = record["expires_at_ms"].as_i64().unwrap_or_default();
             let deadline_boundary = record["watch_kind"] == "exact_deadline_reached"
@@ -473,7 +561,7 @@ fn reconcile_watch_subject(
                             WatchSubjectKind::Expired,
                         ));
                     }
-                    Ok(automation_reconcile::SubjectDisposition::Skipped {
+                    Ok(automation_reconcile::SubjectDisposition::Pending {
                         code: "WATCH_EVENT_PENDING".to_owned(),
                         reason: "watch event cursor is still pending".to_owned(),
                     })
@@ -552,7 +640,7 @@ fn reconcile_watch_subject(
                 }
             }
         },
-        |error| classify_watch_subject(error, active_key, raw_index),
+        |_| None,
     )?;
     // Translate the shared vocabulary into this domain’s ledger value.
     Ok(match disposition {
@@ -563,16 +651,19 @@ fn reconcile_watch_subject(
             WatchSubjectDisposition::Skipped
         }
         automation_reconcile::SubjectDisposition::Quarantined { code, evidence } => {
-            WatchSubjectDisposition::Quarantined { code, evidence }
+            WatchSubjectDisposition::Quarantined {
+                code,
+                evidence,
+                source: damaged_source.ok_or_else(|| {
+                    Error::new(
+                        "WATCH_QUARANTINE_INVALID",
+                        "watch quarantine has no exact damaged source",
+                    )
+                })?,
+            }
         }
-        // The watch domain never produces Pending itself, so an unexpected
-        // Pending is a hard contract violation rather than a silent skip.
-        automation_reconcile::SubjectDisposition::Pending { code, .. } => {
-            return Err(Error::new(
-                "WATCH_SUBJECT_PENDING_UNEXPECTED",
-                "watch subject isolation reported an unsupported pending disposition",
-            )
-            .with_secondary_code(code));
+        automation_reconcile::SubjectDisposition::Pending { .. } => {
+            WatchSubjectDisposition::Pending
         }
     })
 }
@@ -582,21 +673,36 @@ fn reconcile_watch_subject(
 /// the caller's transaction. A semantically damaged retained subject is
 /// quarantined with its evidence and removed from the active index in the same
 /// transaction that advances the cursor, so one poison row cannot starve the
-/// subjects behind it. A broken global active index or reconcile cursor fails
+/// subjects behind it. A broken global reconcile cursor fails
 /// the whole domain transaction without partial subject writes.
 pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Value> {
     let limit = limit.clamp(1, MAX_RECONCILE_LIMIT);
-    let cursor = meta(tx, RECONCILE_CURSOR_KEY)?
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .filter(|value| value.starts_with(ACTIVE_PREFIX));
-    let rows = scan_active(tx, cursor.as_deref(), limit)?;
+    let cursor = match meta(tx, RECONCILE_CURSOR_KEY)? {
+        None => None,
+        Some(Value::String(key))
+            if key.strip_prefix(ACTIVE_PREFIX).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() % 2 == 0
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) =>
+        {
+            Some(key)
+        }
+        Some(_) => {
+            return Err(Error::new(
+                "WATCH_CURSOR_DAMAGED",
+                "watch reconcile cursor is invalid",
+            ));
+        }
+    };
+    let (rows, next_cursor) = scan_active(tx, cursor.as_deref(), limit)?;
     let mut matched = 0usize;
     let mut expired = 0usize;
     let mut stale = 0usize;
     let mut quarantined = 0usize;
-    let mut last_key = None;
     for (active_key, raw_index) in &rows {
-        last_key = Some(active_key.clone());
         match reconcile_watch_subject(tx, active_key, raw_index, now)? {
             WatchSubjectDisposition::Applied(kind) => match kind {
                 WatchSubjectKind::Matched => matched += 1,
@@ -604,17 +710,32 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
                 WatchSubjectKind::Stale => stale += 1,
             },
             WatchSubjectDisposition::Skipped => stale += 1,
-            WatchSubjectDisposition::Quarantined { code, evidence } => {
+            WatchSubjectDisposition::Pending => {
+                queue_pending_watch(tx, active_key, raw_index)?;
+                continue;
+            }
+            WatchSubjectDisposition::Quarantined {
+                code,
+                evidence,
+                source,
+            } => {
                 // The active-index row is removed with its durable evidence, so
                 // the cursor only advances past a disposed subject.
-                retire_quarantined_watch(tx, active_key, &evidence, &code, now)?;
+                retire_quarantined_watch(
+                    tx, active_key, raw_index, &source, &evidence, &code, now,
+                )?;
                 quarantined += 1;
             }
         }
+        remove_watch_revisit(tx, active_key, raw_index)?;
     }
-    let cursor_receipt = last_key.clone();
-    if let Some(last_key) = last_key {
-        set_meta(tx, RECONCILE_CURSOR_KEY, &json!(last_key))?;
+    let cursor_receipt = if rows.is_empty() {
+        None
+    } else {
+        next_cursor.or(cursor)
+    };
+    if let Some(key) = &cursor_receipt {
+        set_meta(tx, RECONCILE_CURSOR_KEY, &json!(key))?;
     } else {
         tx.execute("DELETE FROM meta WHERE key=?1", [RECONCILE_CURSOR_KEY])?;
     }
@@ -1742,45 +1863,177 @@ fn watch_projection(record: &Value) -> Value {
     })
 }
 
-fn scan_active(db: &Connection, cursor: Option<&str>, limit: i64) -> Result<Vec<(String, String)>> {
-    let upper = format!("{ACTIVE_PREFIX}g");
-    let Some(cursor) = cursor else {
-        return scan_active_segment(db, ACTIVE_PREFIX, ">=", &upper, "<", limit);
-    };
-    let mut rows = scan_active_segment(db, cursor, ">", &upper, "<", limit)?;
-    if (rows.len() as i64) < limit {
-        let remaining = limit - rows.len() as i64;
-        rows.extend(scan_active_segment(
-            db,
-            ACTIVE_PREFIX,
-            ">=",
-            cursor,
-            "<=",
-            remaining,
-        )?);
-    }
-    Ok(rows)
+fn valid_revisit_key(key: &str, index_key: &str) -> bool {
+    key.strip_prefix(REVISIT_PREFIX).is_some_and(|suffix| {
+        suffix.split_once(':').is_some_and(|(sequence, component)| {
+            sequence.len() == 20
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                && index_key.strip_prefix(ACTIVE_PREFIX) == Some(component)
+        })
+    })
 }
 
-fn scan_active_segment(
-    db: &Connection,
-    lower: &str,
-    lower_op: &str,
-    upper: &str,
-    upper_op: &str,
+fn remove_watch_revisit(tx: &Transaction<'_>, index_key: &str, raw_index: &str) -> Result<()> {
+    // Malformed active bytes do not authorize a guessed queue deletion.
+    if let Ok(index) = serde_json::from_str::<Value>(raw_index)
+        && let Some(key) = index["revisit_key"].as_str()
+        && valid_revisit_key(key, index_key)
+    {
+        tx.execute("DELETE FROM meta WHERE key=?1", [key])?;
+    }
+    Ok(())
+}
+
+fn queue_pending_watch(tx: &Transaction<'_>, index_key: &str, raw_index: &str) -> Result<()> {
+    let mut index: Value = serde_json::from_str(raw_index)?;
+    if let Some(key) = index["revisit_key"].as_str() {
+        let retained: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+            [key],
+            |row| row.get(0),
+        )?;
+        // A forward-page observation must not send an unserved pending
+        // subject to the back of the FIFO. Only a due revisit rotates it.
+        if retained {
+            return Ok(());
+        }
+    }
+    let sequence = match meta(tx, REVISIT_SEQUENCE_KEY)? {
+        None => 0,
+        Some(value) => value
+            .as_i64()
+            .filter(|sequence| *sequence >= 0)
+            .ok_or_else(|| {
+                Error::new("WATCH_CURSOR_DAMAGED", "watch revisit sequence is invalid")
+            })?,
+    }
+    .checked_add(1)
+    .ok_or_else(|| Error::new("WATCH_CURSOR_DAMAGED", "watch revisit sequence overflow"))?;
+    let component = index_key
+        .strip_prefix(ACTIVE_PREFIX)
+        .ok_or_else(|| Error::new("WATCH_CURSOR_DAMAGED", "watch revisit subject is invalid"))?;
+    let key = format!("{REVISIT_PREFIX}{sequence:020}:{component}");
+    remove_watch_revisit(tx, index_key, raw_index)?;
+    index["revisit_key"] = json!(key);
+    set_meta(tx, &key, &json!({"active_key":index_key}))?;
+    set_meta(tx, index_key, &index)?;
+    set_meta(tx, REVISIT_SEQUENCE_KEY, &json!(sequence))?;
+    Ok(())
+}
+
+fn scan_active(
+    tx: &Transaction<'_>,
+    cursor: Option<&str>,
     limit: i64,
-) -> Result<Vec<(String, String)>> {
-    // Operators are selected only from the constant call sites above.
-    let sql = format!(
-        "SELECT key,value_json FROM meta WHERE key {lower_op} ?1 AND key {upper_op} ?2 ORDER BY key LIMIT ?3"
-    );
-    let mut statement = db.prepare(&sql)?;
-    let rows = statement
-        .query_map(params![lower, upper, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+) -> Result<(Vec<(String, String)>, Option<String>)> {
+    let cursor = match meta(tx, REVISIT_SEQUENCE_KEY)? {
+        None => {
+            // One bounded sweep from the start enrolls pending subjects that
+            // the previous implementation already passed without scheduling.
+            set_meta(tx, REVISIT_SEQUENCE_KEY, &json!(0))?;
+            None
+        }
+        Some(value) if value.as_i64().is_some_and(|sequence| sequence >= 0) => cursor,
+        Some(_) => {
+            return Err(Error::new(
+                "WATCH_CURSOR_DAMAGED",
+                "watch revisit sequence is invalid",
+            ));
+        }
+    };
+    // Half the bounded page revisits oldest pending subjects. Requeueing
+    // appends a monotonically increasing key, so new rows cannot pass them.
+    // For a one-row budget alternate the two lanes durably.
+    let revisit_limit = if limit == 1 {
+        let turn = match meta(tx, REVISIT_TURN_KEY)? {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                Error::new("WATCH_CURSOR_DAMAGED", "watch revisit turn is invalid")
+            })?,
+        };
+        set_meta(tx, REVISIT_TURN_KEY, &json!(!turn))?;
+        i64::from(turn)
+    } else {
+        limit / 2
+    };
+    let revisit_upper = format!("{REVISIT_PREFIX}g");
+    let revisit_rows = {
+        let mut statement = tx.prepare(
+            "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![REVISIT_PREFIX, revisit_upper, revisit_limit],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut rows = Vec::new();
+    for (queue_key, raw) in revisit_rows {
+        let queued: Value = serde_json::from_str(&raw)?;
+        let index_key = model::text(&queued, "active_key")?;
+        if !valid_revisit_key(&queue_key, index_key) {
+            return Err(Error::new(
+                "WATCH_CURSOR_DAMAGED",
+                "watch revisit index is invalid",
+            ));
+        }
+        let raw_index: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [index_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw_index) = raw_index {
+            // A damaged active row is still processed as its own source.
+            if watch_id_from_active_index(index_key, &raw_index).is_ok()
+                && let Ok(index) = serde_json::from_str::<Value>(&raw_index)
+                && index["revisit_key"].as_str() != Some(queue_key.as_str())
+            {
+                return Err(Error::new(
+                    "WATCH_CURSOR_DAMAGED",
+                    "watch revisit binding differs",
+                ));
+            }
+            rows.push((index_key.to_owned(), raw_index));
+            tx.execute("DELETE FROM meta WHERE key=?1", [queue_key])?;
+        } else {
+            tx.execute("DELETE FROM meta WHERE key=?1", [queue_key])?;
+        }
+    }
+    let upper = format!("{ACTIVE_PREFIX}g");
+    let remaining = limit - rows.len() as i64;
+    let (lower, comparison) = cursor.map_or((ACTIVE_PREFIX, ">="), |key| (key, ">"));
+    let mut statement = tx.prepare(&format!(
+        "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key<?2 ORDER BY key LIMIT ?3",
+    ))?;
+    let mut forward = statement
+        .query_map(params![lower, upper, remaining], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+    if (forward.len() as i64) < remaining
+        && let Some(cursor) = cursor
+    {
+        let mut statement = tx.prepare(
+            "SELECT key,value_json FROM meta WHERE key>=?1 AND key<=?2 ORDER BY key LIMIT ?3",
+        )?;
+        let wrapped = statement
+            .query_map(
+                params![ACTIVE_PREFIX, cursor, remaining - forward.len() as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        forward.extend(wrapped);
+    }
+    let next_cursor = forward.last().map(|(key, _)| key.clone());
+    for row in forward {
+        if !rows.iter().any(|(key, _)| key == &row.0) {
+            rows.push(row);
+        }
+    }
+    Ok((rows, next_cursor))
 }
 
 fn role_tag(role: &Role) -> Result<&'static str> {
