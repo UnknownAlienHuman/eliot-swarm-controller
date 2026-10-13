@@ -114,6 +114,8 @@ const MAX_CAPACITY_LEDGER_SQL_BYTES: i64 = MAX_CAPACITY_LEDGER_BYTES as i64 + 1;
 const MAX_CAPACITY_LEDGER_SQL_ROWS: i64 = MAX_CAPACITY_LEDGER_ENTRIES as i64 + 1;
 const MAX_ROSTER_SQL_ROWS: i64 = MAX_ROSTER_ROWS as i64 + 1;
 const MAX_CAPACITY_ENTRY_SCOPE_SQL_ROWS: i64 = MAX_ROSTER_ROWS as i64 + 1;
+const CAPACITY_LIMIT_REFUSAL_PREFIX: &str = "capacity-limit-refusal:";
+const MAX_CAPACITY_LIMIT_REFUSAL_BYTES: usize = MAX_CAPACITY_ID_BYTES * 6 + 256;
 /// Prefix for per-entry incremental rows. Distinct from `capacity:` so the
 /// roster enumeration (`key LIKE 'capacity:%'`) never selects an entry row.
 const CAPACITY_ENTRY_KEY_PREFIX: &str = "capacity-entry:";
@@ -220,6 +222,13 @@ fn encode_key_component(value: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+fn capacity_limit_refusal_key(scope_key: &str) -> String {
+    format!(
+        "{CAPACITY_LIMIT_REFUSAL_PREFIX}{}",
+        encode_key_component(scope_key.as_bytes())
+    )
 }
 
 fn decode_key_component(value: &str) -> Option<String> {
@@ -389,6 +398,39 @@ enum LedgerStorage {
 struct LoadedLedger {
     ledger: CapacityLedger,
     storage: LedgerStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CapacityLedgerLimit {
+    Bytes,
+    Entries,
+}
+
+impl CapacityLedgerLimit {
+    fn damage_code(self) -> &'static str {
+        match self {
+            Self::Bytes => "ledger_byte_limit_refused",
+            Self::Entries => "ledger_entry_limit_refused",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LedgerStoreOutcome {
+    Stored,
+    LimitRefused(CapacityLedgerLimit),
+}
+
+/// One sticky scope invalidation fact. Reservation history stays in the
+/// existing ledger; refusal cannot erase native evidence or authorize replay.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityLimitRefusal {
+    schema_version: i64,
+    scope_key: String,
+    limit: CapacityLedgerLimit,
+    recorded_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -695,6 +737,77 @@ fn read_ledger_bytes(db: &Connection, key: &str) -> Result<Option<(usize, Vec<u8
     .transpose()
 }
 
+fn capacity_limit_refusal_damage(
+    db: &Connection,
+    scope_key: &str,
+) -> Result<Option<CapacityLedgerDamage>> {
+    let key = capacity_limit_refusal_key(scope_key);
+    let row: Option<(i64, Vec<u8>)> = db
+        .query_row(
+            "SELECT length(CAST(value_json AS BLOB)),\
+                    substr(CAST(value_json AS BLOB),1,?2) FROM meta WHERE key=?1",
+            params![key, MAX_CAPACITY_LIMIT_REFUSAL_BYTES as i64 + 1],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((size, raw)) = row else {
+        return Ok(None);
+    };
+    let size = usize::try_from(size).map_err(|_| {
+        Error::new(
+            "CAPACITY_LEDGER_DAMAGED",
+            "limit refusal byte length is invalid",
+        )
+    })?;
+    let invalid = || damage_for_raw("ledger_limit_refusal_invalid", &raw, size);
+    if size > MAX_CAPACITY_LIMIT_REFUSAL_BYTES || raw.len() != size {
+        return Ok(Some(invalid()));
+    }
+    let Ok(refusal) = serde_json::from_slice::<CapacityLimitRefusal>(&raw) else {
+        return Ok(Some(invalid()));
+    };
+    if refusal.schema_version != 1 || refusal.scope_key != scope_key || refusal.recorded_at_ms < 0 {
+        return Ok(Some(invalid()));
+    }
+    Ok(Some(damage_for_raw(
+        refusal.limit.damage_code(),
+        &raw,
+        size,
+    )))
+}
+
+fn record_capacity_limit_refusal(
+    db: &Connection,
+    scope_key: &str,
+    limit: CapacityLedgerLimit,
+    now: i64,
+) -> Result<()> {
+    if !valid_identity_text(scope_key) || now < 0 {
+        return Err(Error::new(
+            "CAPACITY_SCOPE_DAMAGED",
+            "limit refusal scope or timestamp is invalid",
+        ));
+    }
+    let refusal = CapacityLimitRefusal {
+        schema_version: 1,
+        scope_key: scope_key.to_owned(),
+        limit,
+        recorded_at_ms: now,
+    };
+    let raw = model::canonical(&serde_json::to_value(refusal)?)?;
+    if raw.len() > MAX_CAPACITY_LIMIT_REFUSAL_BYTES {
+        return Err(Error::new(
+            "CAPACITY_LEDGER_DAMAGED",
+            "limit refusal exceeds its metadata bound",
+        ));
+    }
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+        params![capacity_limit_refusal_key(scope_key), raw],
+    )?;
+    Ok(())
+}
+
 fn has_capacity_entry_rows(db: &Connection, scope_key: &str) -> Result<bool> {
     let prefix = capacity_entry_scope_prefix(scope_key);
     Ok(db.query_row(
@@ -711,6 +824,9 @@ fn parse_ledger_bytes(
     size: usize,
     raw: &[u8],
 ) -> Result<LedgerLoad> {
+    if let Some(damage) = capacity_limit_refusal_damage(db, scope_key)? {
+        return Ok(LedgerLoad::Damaged(damage));
+    }
     if size > MAX_CAPACITY_LEDGER_BYTES || raw.len() != size {
         return Ok(LedgerLoad::Damaged(damage_for_raw(
             "ledger_size_exceeded",
@@ -946,6 +1062,9 @@ fn load_ledger(db: &Connection, scope: &Value) -> Result<LedgerLoad> {
         .ok_or_else(|| Error::new("CAPACITY_SCOPE_DAMAGED", "capacity scope key is invalid"))?;
     let key = ledger_key(scope_key);
     let Some((size, raw)) = read_ledger_bytes(db, &key)? else {
+        if let Some(damage) = capacity_limit_refusal_damage(db, scope_key)? {
+            return Ok(LedgerLoad::Damaged(damage));
+        }
         if has_capacity_entry_rows(db, scope_key)? {
             return Ok(LedgerLoad::Damaged(damage_for_raw(
                 "ledger_entry_scope_orphaned",
@@ -1041,10 +1160,15 @@ fn store_ledger(
     ledger: &CapacityLedger,
     storage: &LedgerStorage,
     touched_entry_id: &str,
-) -> Result<bool> {
+) -> Result<LedgerStoreOutcome> {
     let scope_key = ledger.scope["scope_key"]
         .as_str()
         .ok_or_else(|| Error::new("CAPACITY_SCOPE_DAMAGED", "capacity scope key is missing"))?;
+    if ledger.entries.len() > MAX_CAPACITY_LEDGER_ENTRIES {
+        return Ok(LedgerStoreOutcome::LimitRefused(
+            CapacityLedgerLimit::Entries,
+        ));
+    }
     if !validate_ledger(ledger, scope_key, Some(&ledger.scope)) {
         return Err(Error::new(
             "CAPACITY_LEDGER_DAMAGED",
@@ -1108,13 +1232,13 @@ fn store_ledger(
         }
     };
     if header_size.saturating_add(entry_bytes) > MAX_CAPACITY_LEDGER_BYTES {
-        return Ok(false);
+        return Ok(LedgerStoreOutcome::LimitRefused(CapacityLedgerLimit::Bytes));
     }
     for (key, value) in writes {
         set_meta(db, &key, &value)?;
     }
     set_meta(db, &ledger_key(scope_key), &header_value)?;
-    Ok(true)
+    Ok(LedgerStoreOutcome::Stored)
 }
 
 enum LedgerRow {
@@ -1141,9 +1265,10 @@ fn all_ledgers(db: &Connection) -> Result<Vec<LedgerRow>> {
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
-    let overflow = rows.len() > MAX_ROSTER_ROWS;
+    let mut overflow = rows.len() > MAX_ROSTER_ROWS;
     let extra_row = if overflow { 1 } else { 0 };
     let mut parsed = Vec::with_capacity(rows.len().min(MAX_ROSTER_ROWS) + extra_row);
+    let mut seen_scopes = std::collections::BTreeSet::new();
     for (key, size_i64, raw) in rows.into_iter().take(MAX_ROSTER_ROWS) {
         let scope_key = key.strip_prefix("capacity:").unwrap_or_default();
         let size = usize::try_from(size_i64)
@@ -1155,11 +1280,61 @@ fn all_ledgers(db: &Connection) -> Result<Vec<LedgerRow>> {
             ));
             continue;
         }
+        seen_scopes.insert(scope_key.to_owned());
         parsed.push(match parse_ledger_bytes(db, scope_key, None, size, &raw)? {
             LedgerLoad::Valid(loaded) => LedgerRow::Valid(scope_key.to_owned(), loaded.ledger),
             LedgerLoad::Damaged(damage) => LedgerRow::Damaged(scope_key.to_owned(), damage),
             LedgerLoad::Missing => unreachable!("a selected ledger row cannot be missing"),
         });
+    }
+    if !overflow {
+        let mut stmt = db.prepare(
+            "SELECT substr(key,1,?1) FROM meta \
+             WHERE key GLOB 'capacity-limit-refusal:*' ORDER BY key LIMIT ?2",
+        )?;
+        let keys = stmt
+            .query_map(
+                params![
+                    (CAPACITY_LIMIT_REFUSAL_PREFIX.len() + MAX_CAPACITY_ID_BYTES * 2 + 1) as i64,
+                    MAX_ROSTER_SQL_ROWS
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        overflow = keys.len() > MAX_ROSTER_ROWS;
+        for key in keys.into_iter().take(MAX_ROSTER_ROWS) {
+            let scope_key = key
+                .strip_prefix(CAPACITY_LIMIT_REFUSAL_PREFIX)
+                .filter(|encoded| encoded.len() <= MAX_CAPACITY_ID_BYTES * 2)
+                .and_then(decode_key_component)
+                .filter(|scope_key| {
+                    valid_identity_text(scope_key) && capacity_limit_refusal_key(scope_key) == key
+                });
+            let Some(scope_key) = scope_key else {
+                parsed.push(LedgerRow::Damaged(
+                    "unknown:damaged-ledger-key".into(),
+                    damage_for_raw(
+                        "ledger_limit_refusal_key_invalid",
+                        key.as_bytes(),
+                        key.len(),
+                    ),
+                ));
+                continue;
+            };
+            if seen_scopes.contains(&scope_key) {
+                continue;
+            }
+            if seen_scopes.len() >= MAX_ROSTER_ROWS {
+                overflow = true;
+                break;
+            }
+            seen_scopes.insert(scope_key.clone());
+            let damage = capacity_limit_refusal_damage(db, &scope_key)?.unwrap_or_else(|| {
+                damage_for_raw("ledger_limit_refusal_missing", key.as_bytes(), key.len())
+            });
+            parsed.push(LedgerRow::Damaged(scope_key, damage));
+        }
     }
     if overflow {
         parsed.push(LedgerRow::Damaged(
@@ -2580,9 +2755,6 @@ fn sync_evidence(
                 }
             }
             None => {
-                if ledger.entries.len() >= MAX_CAPACITY_LEDGER_ENTRIES {
-                    return Ok(());
-                }
                 ledger.entries.insert(
                     evidence.entry_id.clone(),
                     entry_from_evidence(&evidence, now),
@@ -2594,8 +2766,12 @@ fn sync_evidence(
         if ledger.scope["scope_key"] != scope_key {
             return Ok(());
         }
-        let _stored = store_ledger(db, &ledger, &storage, &evidence.entry_id)?;
-        Ok(())
+        match store_ledger(db, &ledger, &storage, &evidence.entry_id)? {
+            LedgerStoreOutcome::Stored => Ok(()),
+            LedgerStoreOutcome::LimitRefused(limit) => {
+                record_capacity_limit_refusal(db, scope_key, limit, now)
+            }
+        }
     })
 }
 
