@@ -5,10 +5,11 @@
 //!
 //! Every native admission on a binding — an `agent.*` command, a
 //! `task.dispatch`, a `native.opencode.loop_step`, or an Attempt producer —
-//! holds a reservation in a per-scope ledger. The ledger is a durable record in
-//! the Store's `meta` table under `capacity:<scope_key>`: one entry per
-//! admission, keyed by the operation (or producer assignment) identity,
-//! with the phase the recorded evidence supports:
+//! holds a reservation in a per-scope ledger. Its scope header is a durable
+//! record in the Store's `meta` table under `capacity:<scope_key>`; retained
+//! entries have individual metadata rows keyed by the exact scope and
+//! operation (or producer assignment) identities. Each entry keeps the phase
+//! the recorded evidence supports:
 //!
 //! - `reserved` — admitted (locally queued, sent, or natively admitted)
 //!   but no execution-start evidence exists yet. Pending admissions are
@@ -96,13 +97,26 @@ const ADMISSION_METHODS: &[&str] = &[
 ];
 
 const CAPACITY_LEDGER_SCHEMA_VERSION: i64 = 1;
+/// Durable layout version for the incremental ledger. Version 1 ledgers are a
+/// single JSON blob under `capacity:<scope_key>`; version 2 stores a compact
+/// scope header at that key plus one row per retained entry, keyed by the
+/// exact scope and entry identities, so a merge rewrites only the touched
+/// entry instead of the whole ledger.
+const CAPACITY_LEDGER_STORAGE_VERSION: i64 = 2;
 const MAX_CAPACITY_LEDGER_BYTES: usize = 1024 * 1024;
 const MAX_CAPACITY_LEDGER_ENTRIES: usize = 4096;
 const MAX_CAPACITY_ID_BYTES: usize = 512;
 const MAX_ATTEMPT_PRODUCERS: usize = 4096;
 const MAX_ROSTER_ROWS: usize = 10_000;
 const MAX_CAPACITY_LEDGER_SQL_BYTES: i64 = MAX_CAPACITY_LEDGER_BYTES as i64 + 1;
+/// Bounds per-scope entry-row reads to the configured maximum plus one
+/// overflow sentinel.
+const MAX_CAPACITY_LEDGER_SQL_ROWS: i64 = MAX_CAPACITY_LEDGER_ENTRIES as i64 + 1;
 const MAX_ROSTER_SQL_ROWS: i64 = MAX_ROSTER_ROWS as i64 + 1;
+const MAX_CAPACITY_ENTRY_SCOPE_SQL_ROWS: i64 = MAX_ROSTER_ROWS as i64 + 1;
+/// Prefix for per-entry incremental rows. Distinct from `capacity:` so the
+/// roster enumeration (`key LIKE 'capacity:%'`) never selects an entry row.
+const CAPACITY_ENTRY_KEY_PREFIX: &str = "capacity-entry:";
 
 fn is_admission(method: &str) -> bool {
     ADMISSION_METHODS.contains(&method)
@@ -194,6 +208,55 @@ pub(super) fn scope_facts(
 
 fn ledger_key(scope_key: &str) -> String {
     format!("capacity:{scope_key}")
+}
+
+/// Hex-encodes a key component so a scope or entry identity that contains
+/// the `:` separator cannot forge a different scope or entry key.
+fn encode_key_component(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_key_component(value: &str) -> Option<String> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn capacity_entry_scope_prefix(scope_key: &str) -> String {
+    format!(
+        "{CAPACITY_ENTRY_KEY_PREFIX}{}:",
+        encode_key_component(scope_key.as_bytes())
+    )
+}
+
+/// The exact durable key for one entry in a scope. Entry identity is encoded
+/// for the same reason the scope is: neither identity may forge another key.
+fn capacity_entry_key(scope_key: &str, entry_id: &str) -> String {
+    format!(
+        "{}{}",
+        capacity_entry_scope_prefix(scope_key),
+        encode_key_component(entry_id.as_bytes())
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +358,37 @@ struct CapacityLedger {
     updated_at_ms: i64,
 }
 
+/// The compact per-scope header stored at `capacity:<scope_key>` for an
+/// incremental (version 2) ledger. It records the scope identity and the
+/// exact number of retained entry rows so a load can detect a missing or
+/// orphaned entry row instead of silently reconstructing a shorter ledger.
+/// It never carries entry payloads; those live in their own rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityLedgerHeader {
+    storage_version: i64,
+    scope: Value,
+    entry_count: usize,
+    updated_at_ms: i64,
+}
+
+/// How a scope ledger is durably represented after a load. `Legacy` marks a
+/// version 1 whole-blob ledger that still needs a bounded migration;
+/// `Incremental` is the version 2 layout and carries the per-entry encoded
+/// sizes so a bounded migration can reserve exactly the rows it needs.
+enum LedgerStorage {
+    Missing,
+    Legacy,
+    Incremental {
+        entry_sizes: BTreeMap<String, usize>,
+    },
+}
+
+struct LoadedLedger {
+    ledger: CapacityLedger,
+    storage: LedgerStorage,
+}
+
 #[derive(Debug, Clone)]
 struct CapacityLedgerDamage {
     code: String,
@@ -305,7 +399,7 @@ struct CapacityLedgerDamage {
 
 enum LedgerLoad {
     Missing,
-    Valid(CapacityLedger),
+    Valid(LoadedLedger),
     Damaged(CapacityLedgerDamage),
 }
 
@@ -599,23 +693,248 @@ fn read_ledger_bytes(db: &Connection, key: &str) -> Result<Option<(usize, Vec<u8
     .transpose()
 }
 
+fn has_capacity_entry_rows(db: &Connection, scope_key: &str) -> Result<bool> {
+    let prefix = capacity_entry_scope_prefix(scope_key);
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE substr(key,1,length(?1))=?1)",
+        [prefix],
+        |row| row.get(0),
+    )?)
+}
+
 fn parse_ledger_bytes(
+    db: &Connection,
     scope_key: &str,
     expected_scope: Option<&Value>,
     size: usize,
     raw: &[u8],
-) -> LedgerLoad {
+) -> Result<LedgerLoad> {
     if size > MAX_CAPACITY_LEDGER_BYTES || raw.len() != size {
-        return LedgerLoad::Damaged(damage_for_raw("ledger_size_exceeded", raw, size));
+        return Ok(LedgerLoad::Damaged(damage_for_raw(
+            "ledger_size_exceeded",
+            raw,
+            size,
+        )));
+    }
+    match serde_json::from_slice::<Value>(raw) {
+        Ok(Value::Object(ref object)) if object.contains_key("entries") => {}
+        Ok(Value::Object(ref object))
+            if object.contains_key("entry_count") && object.contains_key("storage_version") =>
+        {
+            return parse_incremental_from_header_value(
+                db,
+                scope_key,
+                expected_scope,
+                raw,
+                size,
+                object,
+            );
+        }
+        _ => {}
     }
     let ledger: CapacityLedger = match serde_json::from_slice(raw) {
         Ok(ledger) => ledger,
-        Err(_) => return LedgerLoad::Damaged(damage_for_raw("ledger_invalid_json", raw, size)),
+        Err(_) => {
+            return Ok(LedgerLoad::Damaged(damage_for_raw(
+                "ledger_invalid_json",
+                raw,
+                size,
+            )));
+        }
     };
     if !validate_ledger(&ledger, scope_key, expected_scope) {
-        return LedgerLoad::Damaged(damage_for_raw("ledger_invalid_shape", raw, size));
+        return Ok(LedgerLoad::Damaged(damage_for_raw(
+            "ledger_invalid_shape",
+            raw,
+            size,
+        )));
     }
-    LedgerLoad::Valid(ledger)
+    if has_capacity_entry_rows(db, scope_key)? {
+        return Ok(LedgerLoad::Damaged(damage_for_raw(
+            "ledger_mixed_storage_layout",
+            raw,
+            size,
+        )));
+    }
+    Ok(LedgerLoad::Valid(LoadedLedger {
+        ledger,
+        storage: LedgerStorage::Legacy,
+    }))
+}
+
+/// Rebuilds an incremental scope ledger from its header row plus one row per
+/// entry. A header whose `entry_count` does not match the number of valid
+/// entry rows, an entry row that fails its own validation, or a scope identity
+/// that disagrees with the header is damage, never a silently shorter ledger.
+fn parse_incremental_from_header_value(
+    db: &Connection,
+    scope_key: &str,
+    expected_scope: Option<&Value>,
+    raw: &[u8],
+    size: usize,
+    object: &serde_json::Map<String, Value>,
+) -> Result<LedgerLoad> {
+    let damaged = |code: &str| LedgerLoad::Damaged(damage_for_raw(code, raw, size));
+    let Ok(header) = serde_json::from_value::<CapacityLedgerHeader>(Value::Object(object.clone()))
+    else {
+        return Ok(damaged("ledger_invalid_shape"));
+    };
+    if header.storage_version != CAPACITY_LEDGER_STORAGE_VERSION
+        || header.entry_count > MAX_CAPACITY_LEDGER_ENTRIES
+        || header.scope["scope_key"].as_str() != Some(scope_key)
+    {
+        return Ok(damaged("ledger_invalid_shape"));
+    }
+
+    let prefix = capacity_entry_scope_prefix(scope_key);
+    let mut stmt = db.prepare(
+        "SELECT key,length(CAST(value_json AS BLOB)),\
+                substr(CAST(value_json AS BLOB),1,?2) FROM meta \
+         WHERE substr(key,1,length(?1))=?1 ORDER BY key LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            prefix.as_str(),
+            MAX_CAPACITY_LEDGER_SQL_BYTES,
+            MAX_CAPACITY_LEDGER_SQL_ROWS
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        },
+    )?;
+    let mut entries = BTreeMap::new();
+    let mut entry_sizes = BTreeMap::new();
+    let mut entry_bytes = 0usize;
+    let mut row_count = 0usize;
+    for row in rows {
+        let (key, size_i64, entry_raw) = row?;
+        row_count += 1;
+        if row_count > MAX_CAPACITY_LEDGER_ENTRIES {
+            return Ok(damaged("ledger_entry_count_exceeded"));
+        }
+        let Ok(entry_size) = usize::try_from(size_i64) else {
+            return Ok(damaged("ledger_entry_size_invalid"));
+        };
+        if entry_size > MAX_CAPACITY_LEDGER_BYTES || entry_raw.len() != entry_size {
+            return Ok(LedgerLoad::Damaged(damage_for_raw(
+                "ledger_entry_size_exceeded",
+                &entry_raw,
+                entry_size,
+            )));
+        }
+        entry_bytes = entry_bytes.saturating_add(entry_size);
+        if entry_bytes.saturating_add(size) > MAX_CAPACITY_LEDGER_BYTES {
+            return Ok(damaged("ledger_size_exceeded"));
+        }
+        let Some(encoded_id) = key.strip_prefix(&prefix) else {
+            return Ok(damaged("ledger_entry_key_invalid"));
+        };
+        let Some(entry_id) = decode_key_component(encoded_id) else {
+            return Ok(damaged("ledger_entry_key_invalid"));
+        };
+        if !valid_identity_text(&entry_id) || capacity_entry_key(scope_key, &entry_id) != key {
+            return Ok(damaged("ledger_entry_key_invalid"));
+        }
+        let entry: CapacityEntry = match serde_json::from_slice(&entry_raw) {
+            Ok(entry) => entry,
+            Err(_) => {
+                return Ok(LedgerLoad::Damaged(damage_for_raw(
+                    "ledger_entry_invalid_json",
+                    &entry_raw,
+                    entry_size,
+                )));
+            }
+        };
+        if !valid_entry_identity(&entry, &entry_id)
+            || entries.insert(entry_id.clone(), entry).is_some()
+        {
+            return Ok(damaged("ledger_entry_invalid_shape"));
+        }
+        entry_sizes.insert(entry_id, entry_size);
+    }
+    drop(stmt);
+    if row_count != header.entry_count {
+        return Ok(damaged("ledger_entry_rows_missing"));
+    }
+    let ledger = CapacityLedger {
+        schema_version: CAPACITY_LEDGER_SCHEMA_VERSION,
+        scope: header.scope,
+        entries,
+        updated_at_ms: header.updated_at_ms,
+    };
+    if !validate_ledger(&ledger, scope_key, expected_scope) {
+        return Ok(damaged("ledger_invalid_shape"));
+    }
+    Ok(LedgerLoad::Valid(LoadedLedger {
+        ledger,
+        storage: LedgerStorage::Incremental { entry_sizes },
+    }))
+}
+
+fn capacity_entry_orphan_damage(db: &Connection) -> Result<Option<CapacityLedgerDamage>> {
+    let prefix_len = CAPACITY_ENTRY_KEY_PREFIX.len() as i64;
+    let mut stmt = db.prepare(
+        "SELECT DISTINCT substr(key,1,?1+instr(substr(key,?2),':')) \
+         FROM meta WHERE substr(key,1,?1)=?3 ORDER BY 1 LIMIT ?4",
+    )?;
+    let prefixes = stmt
+        .query_map(
+            params![
+                prefix_len,
+                prefix_len + 1,
+                CAPACITY_ENTRY_KEY_PREFIX,
+                MAX_CAPACITY_ENTRY_SCOPE_SQL_ROWS
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    if prefixes.len() > MAX_ROSTER_ROWS {
+        return Ok(Some(damage_for_raw(
+            "ledger_entry_scope_roster_limit_exceeded",
+            &[],
+            0,
+        )));
+    }
+    for scope_prefix in prefixes {
+        let Some(encoded_scope) = scope_prefix
+            .strip_prefix(CAPACITY_ENTRY_KEY_PREFIX)
+            .and_then(|value| value.strip_suffix(':'))
+        else {
+            return Ok(Some(damage_for_raw(
+                "ledger_entry_scope_key_invalid",
+                scope_prefix.as_bytes(),
+                scope_prefix.len(),
+            )));
+        };
+        let Some(scope_key) =
+            decode_key_component(encoded_scope).filter(|value| valid_identity_text(value))
+        else {
+            return Ok(Some(damage_for_raw(
+                "ledger_entry_scope_key_invalid",
+                scope_prefix.as_bytes(),
+                scope_prefix.len(),
+            )));
+        };
+        let header_key = ledger_key(&scope_key);
+        let has_header = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+            [header_key],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_header {
+            return Ok(Some(damage_for_raw(
+                "ledger_entry_scope_orphaned",
+                scope_prefix.as_bytes(),
+                scope_prefix.len(),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn load_ledger(db: &Connection, scope: &Value) -> Result<LedgerLoad> {
@@ -625,9 +944,31 @@ fn load_ledger(db: &Connection, scope: &Value) -> Result<LedgerLoad> {
         .ok_or_else(|| Error::new("CAPACITY_SCOPE_DAMAGED", "capacity scope key is invalid"))?;
     let key = ledger_key(scope_key);
     let Some((size, raw)) = read_ledger_bytes(db, &key)? else {
+        if has_capacity_entry_rows(db, scope_key)? {
+            return Ok(LedgerLoad::Damaged(damage_for_raw(
+                "ledger_entry_scope_orphaned",
+                scope_key.as_bytes(),
+                scope_key.len(),
+            )));
+        }
         return Ok(LedgerLoad::Missing);
     };
-    Ok(parse_ledger_bytes(scope_key, Some(scope), size, &raw))
+    parse_ledger_bytes(db, scope_key, Some(scope), size, &raw)
+}
+
+#[cfg(test)]
+pub(super) fn ledger_value_for_test(db: &Connection, scope_key: &str) -> Result<Option<Value>> {
+    let Some((size, raw)) = read_ledger_bytes(db, &ledger_key(scope_key))? else {
+        return Ok(None);
+    };
+    match parse_ledger_bytes(db, scope_key, None, size, &raw)? {
+        LedgerLoad::Missing => Ok(None),
+        LedgerLoad::Valid(loaded) => Ok(Some(serde_json::to_value(loaded.ledger)?)),
+        LedgerLoad::Damaged(_) => Err(Error::new(
+            "CAPACITY_LEDGER_DAMAGED",
+            "stored capacity ledger is damaged",
+        )),
+    }
 }
 
 /// Projects bounded accounting for one exact Attempt from its validated
@@ -659,7 +1000,7 @@ pub(super) fn attempt_accounting(
             "ledger_updated_at_ms": null,
             "damage": damage_value(&damage),
         })),
-        LedgerLoad::Valid(ledger) => {
+        LedgerLoad::Valid(LoadedLedger { ledger, .. }) => {
             let mut reserved = 0usize;
             let mut active = 0usize;
             let mut outcome_unknown = 0usize;
@@ -693,12 +1034,85 @@ pub(super) fn attempt_accounting(
     }
 }
 
-fn store_ledger(db: &Connection, ledger: &CapacityLedger) -> Result<()> {
-    let value = serde_json::to_value(ledger)?;
+fn store_ledger(
+    db: &Connection,
+    ledger: &CapacityLedger,
+    storage: &LedgerStorage,
+    touched_entry_id: &str,
+) -> Result<bool> {
     let scope_key = ledger.scope["scope_key"]
         .as_str()
         .ok_or_else(|| Error::new("CAPACITY_SCOPE_DAMAGED", "capacity scope key is missing"))?;
-    set_meta(db, &ledger_key(scope_key), &value)
+    if !validate_ledger(ledger, scope_key, Some(&ledger.scope)) {
+        return Err(Error::new(
+            "CAPACITY_LEDGER_DAMAGED",
+            "cannot store an invalid capacity ledger",
+        ));
+    }
+
+    let header = CapacityLedgerHeader {
+        storage_version: CAPACITY_LEDGER_STORAGE_VERSION,
+        scope: ledger.scope.clone(),
+        entry_count: ledger.entries.len(),
+        updated_at_ms: ledger.updated_at_ms,
+    };
+    let header_value = serde_json::to_value(header)?;
+    let header_size = model::canonical(&header_value)?.len();
+    let mut writes = Vec::new();
+    let entry_bytes = match storage {
+        LedgerStorage::Missing | LedgerStorage::Legacy => {
+            let mut total = 0usize;
+            for (entry_id, entry) in &ledger.entries {
+                let value = serde_json::to_value(entry)?;
+                let size = model::canonical(&value)?.len();
+                total = total.saturating_add(size);
+                writes.push((capacity_entry_key(scope_key, entry_id), value));
+            }
+            total
+        }
+        LedgerStorage::Incremental { entry_sizes } => {
+            let touched_existed = entry_sizes.contains_key(touched_entry_id);
+            let expected_len = entry_sizes.len() + if touched_existed { 0 } else { 1 };
+            if ledger.entries.len() != expected_len
+                || entry_sizes
+                    .keys()
+                    .any(|entry_id| !ledger.entries.contains_key(entry_id))
+                || ledger.entries.keys().any(|entry_id| {
+                    !entry_sizes.contains_key(entry_id) && entry_id != touched_entry_id
+                })
+            {
+                return Err(Error::new(
+                    "CAPACITY_LEDGER_DAMAGED",
+                    "incremental merge changed entries outside its target",
+                ));
+            }
+            let Some(entry) = ledger.entries.get(touched_entry_id) else {
+                return Err(Error::new(
+                    "CAPACITY_LEDGER_DAMAGED",
+                    "incremental merge target is missing",
+                ));
+            };
+            let mut total = entry_sizes
+                .values()
+                .fold(0usize, |sum, size| sum.saturating_add(*size));
+            if let Some(previous_size) = entry_sizes.get(touched_entry_id) {
+                total = total.saturating_sub(*previous_size);
+            }
+            let value = serde_json::to_value(entry)?;
+            let size = model::canonical(&value)?.len();
+            total = total.saturating_add(size);
+            writes.push((capacity_entry_key(scope_key, touched_entry_id), value));
+            total
+        }
+    };
+    if header_size.saturating_add(entry_bytes) > MAX_CAPACITY_LEDGER_BYTES {
+        return Ok(false);
+    }
+    for (key, value) in writes {
+        set_meta(db, &key, &value)?;
+    }
+    set_meta(db, &ledger_key(scope_key), &header_value)?;
+    Ok(true)
 }
 
 enum LedgerRow {
@@ -724,32 +1138,36 @@ fn all_ledgers(db: &Connection) -> Result<Vec<LedgerRow>> {
             },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
     let overflow = rows.len() > MAX_ROSTER_ROWS;
-    let mut parsed = rows
-        .into_iter()
-        .take(MAX_ROSTER_ROWS)
-        .map(|(key, size, raw)| {
-            let scope_key = key.strip_prefix("capacity:").unwrap_or_default();
-            let size = usize::try_from(size).map_err(|_| {
-                Error::new("CAPACITY_LEDGER_DAMAGED", "ledger byte length is invalid")
-            })?;
-            if !valid_identity_text(scope_key) {
-                return Ok(LedgerRow::Damaged(
-                    "unknown:damaged-ledger-key".into(),
-                    damage_for_raw("ledger_invalid_key", key.as_bytes(), key.len()),
-                ));
-            }
-            Ok(match parse_ledger_bytes(scope_key, None, size, &raw) {
-                LedgerLoad::Valid(ledger) => LedgerRow::Valid(scope_key.to_owned(), ledger),
-                LedgerLoad::Damaged(damage) => LedgerRow::Damaged(scope_key.to_owned(), damage),
-                LedgerLoad::Missing => unreachable!("a selected ledger row cannot be missing"),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let extra_row = if overflow { 1 } else { 0 };
+    let mut parsed = Vec::with_capacity(rows.len().min(MAX_ROSTER_ROWS) + extra_row);
+    for (key, size_i64, raw) in rows.into_iter().take(MAX_ROSTER_ROWS) {
+        let scope_key = key.strip_prefix("capacity:").unwrap_or_default();
+        let size = usize::try_from(size_i64)
+            .map_err(|_| Error::new("CAPACITY_LEDGER_DAMAGED", "ledger byte length is invalid"))?;
+        if !valid_identity_text(scope_key) {
+            parsed.push(LedgerRow::Damaged(
+                "unknown:damaged-ledger-key".into(),
+                damage_for_raw("ledger_invalid_key", key.as_bytes(), key.len()),
+            ));
+            continue;
+        }
+        parsed.push(match parse_ledger_bytes(db, scope_key, None, size, &raw)? {
+            LedgerLoad::Valid(loaded) => LedgerRow::Valid(scope_key.to_owned(), loaded.ledger),
+            LedgerLoad::Damaged(damage) => LedgerRow::Damaged(scope_key.to_owned(), damage),
+            LedgerLoad::Missing => unreachable!("a selected ledger row cannot be missing"),
+        });
+    }
     if overflow {
         parsed.push(LedgerRow::Damaged(
             "unknown:capacity-ledger-roster-limit".into(),
             damage_for_raw("ledger_roster_limit_exceeded", &[], 0),
+        ));
+    } else if let Some(damage) = capacity_entry_orphan_damage(db)? {
+        parsed.push(LedgerRow::Damaged(
+            "unknown:damaged-ledger-key".into(),
+            damage,
         ));
     }
     Ok(parsed)
@@ -2099,6 +2517,28 @@ fn binding_scope(db: &Connection, binding_id: &str, generation: i64) -> Result<O
     )))
 }
 
+fn with_capacity_ledger_savepoint<T>(
+    db: &Connection,
+    write: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    db.execute_batch("SAVEPOINT capacity_ledger_sync")?;
+    match write() {
+        Ok(value) => {
+            if let Err(release_error) = db.execute_batch("RELEASE SAVEPOINT capacity_ledger_sync") {
+                db.execute_batch("ROLLBACK TO SAVEPOINT capacity_ledger_sync")?;
+                db.execute_batch("RELEASE SAVEPOINT capacity_ledger_sync")?;
+                return Err(release_error.into());
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            db.execute_batch("ROLLBACK TO SAVEPOINT capacity_ledger_sync")?;
+            db.execute_batch("RELEASE SAVEPOINT capacity_ledger_sync")?;
+            Err(error)
+        }
+    }
+}
+
 fn sync_evidence(
     db: &Connection,
     scope: &Value,
@@ -2114,42 +2554,47 @@ fn sync_evidence(
     let Some(scope_key) = scope["scope_key"].as_str() else {
         return Ok(());
     };
-    let mut ledger = match load_ledger(db, scope)? {
-        LedgerLoad::Missing => CapacityLedger {
-            schema_version: CAPACITY_LEDGER_SCHEMA_VERSION,
-            scope: scope.clone(),
-            entries: BTreeMap::new(),
-            updated_at_ms: now,
-        },
-        LedgerLoad::Valid(ledger) => ledger,
-        LedgerLoad::Damaged(_) => return Ok(()),
-    };
-    if ledger.scope != *scope {
-        return Ok(());
-    }
-    match ledger.entries.get_mut(&evidence.entry_id) {
-        Some(entry) => {
-            if merge_entry(entry, &evidence, now) == MergeResult::Conflict {
-                return Ok(());
+    with_capacity_ledger_savepoint(db, || {
+        let (mut ledger, storage) = match load_ledger(db, scope)? {
+            LedgerLoad::Missing => (
+                CapacityLedger {
+                    schema_version: CAPACITY_LEDGER_SCHEMA_VERSION,
+                    scope: scope.clone(),
+                    entries: BTreeMap::new(),
+                    updated_at_ms: now,
+                },
+                LedgerStorage::Missing,
+            ),
+            LedgerLoad::Valid(loaded) => (loaded.ledger, loaded.storage),
+            LedgerLoad::Damaged(_) => return Ok(()),
+        };
+        if ledger.scope != *scope {
+            return Ok(());
+        }
+        match ledger.entries.get_mut(&evidence.entry_id) {
+            Some(entry) => {
+                if merge_entry(entry, &evidence, now) == MergeResult::Conflict {
+                    return Ok(());
+                }
+            }
+            None => {
+                if ledger.entries.len() >= MAX_CAPACITY_LEDGER_ENTRIES {
+                    return Ok(());
+                }
+                ledger.entries.insert(
+                    evidence.entry_id.clone(),
+                    entry_from_evidence(&evidence, now),
+                );
             }
         }
-        None => {
-            if ledger.entries.len() >= MAX_CAPACITY_LEDGER_ENTRIES {
-                return Ok(());
-            }
-            ledger.entries.insert(
-                evidence.entry_id.clone(),
-                entry_from_evidence(&evidence, now),
-            );
+        ledger.updated_at_ms = now;
+        // The scope key was validated by load_ledger and remains explicit here.
+        if ledger.scope["scope_key"] != scope_key {
+            return Ok(());
         }
-    }
-    ledger.updated_at_ms = now;
-    // `scope_key` was validated by load_ledger and is kept here to make the
-    // metadata write's identity explicit at the call site.
-    if ledger.scope["scope_key"] != scope_key {
-        return Ok(());
-    }
-    store_ledger(db, &ledger)
+        let _stored = store_ledger(db, &ledger, &storage, &evidence.entry_id)?;
+        Ok(())
+    })
 }
 
 /// Re-derives the ledger entry for one operation from its durable row.
@@ -4463,3 +4908,7 @@ pub(crate) fn attention_report_for_scope(
     report["generated_at_ms"] = json!(model::now_ms()?);
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "capacity_incremental_tests.rs"]
+mod capacity_incremental_tests;

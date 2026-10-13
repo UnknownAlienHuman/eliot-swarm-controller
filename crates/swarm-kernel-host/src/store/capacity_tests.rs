@@ -210,7 +210,7 @@ fn meta_rows(db: &Connection) -> Vec<(String, String)> {
 }
 
 fn ledger(db: &Connection, scope_key: &str) -> Value {
-    meta(db, &format!("capacity:{scope_key}"))
+    capacity::ledger_value_for_test(db, scope_key)
         .unwrap()
         .unwrap_or(Value::Null)
 }
