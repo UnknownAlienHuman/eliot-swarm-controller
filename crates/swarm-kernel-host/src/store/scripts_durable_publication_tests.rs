@@ -23,7 +23,7 @@ fn store_observer_does_not_consume_visible_terminal_without_its_read_barrier() {
     fs::create_dir_all(&dir).unwrap();
     let terminal_path = dir.join("terminal.json");
     fs::write(&terminal_path, b"visible terminal bytes").unwrap();
-    let files = ArtifactFiles::new(&root).unwrap();
+    let files = ArtifactFiles::new(&root.join("artifacts")).unwrap();
     let blocked_for_scope = terminal_path.clone();
     let _barrier = swarm_process::test_support::scoped_durability_barrier(move |target| {
         if target == blocked_for_scope {

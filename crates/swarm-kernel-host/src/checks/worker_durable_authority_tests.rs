@@ -130,7 +130,7 @@ fn check_go_reader_does_not_return_start_until_its_read_barrier_succeeds() {
 #[test]
 fn visible_terminal_completion_and_release_bytes_do_not_yield_a_release_proof() {
     let (_cleanup, work, dir) = fixture_work();
-    let files = ArtifactFiles::new(&work.data_dir).unwrap();
+    let files = ArtifactFiles::new(&work.data_dir.join("artifacts")).unwrap();
     let terminal_path = dir.join("terminal.json");
     let completion_path = dir.join("completion.json");
     fs::write(&terminal_path, b"visible terminal bytes").unwrap();
