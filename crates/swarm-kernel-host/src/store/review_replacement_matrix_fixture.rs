@@ -414,33 +414,6 @@ async fn configure_entry(store: &Store, steps: Vec<crate::automation::actions::A
         .unwrap();
 }
 
-async fn consume_disposition(
-    store: &Store,
-    assignment_id: &str,
-    result_id: &str,
-) -> serde_json::Value {
-    let assignment_id = assignment_id.to_owned();
-    let result_id = result_id.to_owned();
-    store
-        .run(move |db| {
-            let tx = db.transaction()?;
-            let entry =
-                crate::automation::config::load_entry(&tx, MANAGER_ID, PROJECT_ID, AUTOMATION_ID)?
-                    .unwrap();
-            let result = super::automation_disposition::consume_review_result_for_entry(
-                &tx,
-                &Config::default(),
-                &entry,
-                &assignment_id,
-                &result_id,
-                model::now_ms()?,
-            )?;
-            tx.commit()?;
-            Ok(result)
-        })
-        .await
-        .unwrap()
-}
 #[tokio::test]
 async fn r35_unanswered_replacement_retires_predecessor_slot() {
     let (owner, directory, _credential) = start_store("unanswered").await;

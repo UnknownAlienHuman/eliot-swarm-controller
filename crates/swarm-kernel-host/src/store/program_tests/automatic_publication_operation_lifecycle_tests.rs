@@ -1247,7 +1247,8 @@ async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
     // native effect may have crossed the write boundary, so unlike the
     // never-sent queued case it must never settle stale_gm_epoch.
     retain_ambiguous_publication_effect(&fixture.owner.store, &operation_id).await;
-    let ambiguous = retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
+    let ambiguous =
+        retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
     assert_eq!(ambiguous["state"], "outcome_unknown");
     let ambiguous_sent_at = ambiguous["sent_at_ms"].clone();
     assert!(ambiguous_sent_at.is_number());
@@ -1288,8 +1289,10 @@ async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
         .unwrap_err();
     assert_eq!(former_replay.code, "FORBIDDEN");
     // A changed effect from the former GM is fenced at the same gate.
-    let mut changed =
-        manual_publication_request(&fixture, &format!("changed-unknown-effect-{}", model::new_id()));
+    let mut changed = manual_publication_request(
+        &fixture,
+        &format!("changed-unknown-effect-{}", model::new_id()),
+    );
     changed["candidate_ref"] = json!("changed-candidate-ref");
     let former_change = fixture
         .owner
@@ -1357,13 +1360,22 @@ async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
         )
         .await
         .unwrap();
-    assert_eq!(explanation["publication"]["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        explanation["publication"]["pending"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let recent = explanation["publication"]["recent"]
         .as_array()
         .unwrap()
         .last()
         .unwrap();
-    assert_eq!(recent["publication_status"], "publication_readback_required");
+    assert_eq!(
+        recent["publication_status"],
+        "publication_readback_required"
+    );
     assert_eq!(recent["operation_id"], operation_id);
     assert_eq!(recent["operation_state"], "outcome_unknown");
     assert_eq!(recent["publication_started"], true);
