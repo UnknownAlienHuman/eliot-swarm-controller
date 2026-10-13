@@ -17,9 +17,8 @@
 use super::super::{SCHEMA, SCRIPT_SCHEMA, WORKSPACE_SCHEMA, set_meta};
 use super::{
     ArtifactReadBasis, ArtifactReadLevel, OperationReadBasis, OperationReadLevel,
-    TaskGraphIdentity, TaskReadBasis, TaskReadLevel, identity_for_attempt,
-    resolve_artifact_read, resolve_assembly_sources, resolve_operation_read,
-    resolve_task_read,
+    TaskGraphIdentity, TaskReadBasis, TaskReadLevel, identity_for_attempt, resolve_artifact_read,
+    resolve_assembly_sources, resolve_operation_read, resolve_task_read,
 };
 use crate::{
     artifacts::ArtifactRecord,
@@ -135,7 +134,14 @@ fn scope_public_operator_diagnostic_vs_observer_filtered() {
     let db = empty_db();
     pin_local_operator(&db, "matrix-operator");
     insert_task(&db, "matrix-task-op", 1);
-    insert_attempt_running(&db, "matrix-attempt-op", "matrix-task-op", 1, "matrix-owner", None);
+    insert_attempt_running(
+        &db,
+        "matrix-attempt-op",
+        "matrix-task-op",
+        1,
+        "matrix-owner",
+        None,
+    );
     insert_operation(
         &db,
         "matrix-op-op",
@@ -323,16 +329,20 @@ fn scope_public_operation_list_filters_without_skipping_later_visible() {
     insert_operation_position(&db, "matrix-list-b1", 2);
     insert_operation_position(&db, "matrix-list-a2", 3);
     let caller_a = test_principal("matrix-caller-a", Role::Participant);
-    assert!(resolve_operation_read(&db, &caller_a, "matrix-list-a1")
-        .unwrap()
-        .is_some());
+    assert!(
+        resolve_operation_read(&db, &caller_a, "matrix-list-a1")
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         resolve_operation_read(&db, &caller_a, "matrix-list-b1").unwrap(),
         None
     );
-    assert!(resolve_operation_read(&db, &caller_a, "matrix-list-a2")
-        .unwrap()
-        .is_some());
+    assert!(
+        resolve_operation_read(&db, &caller_a, "matrix-list-a2")
+            .unwrap()
+            .is_some()
+    );
     let page = super::super::object_reads::list(
         &db,
         &caller_a,
@@ -375,9 +385,11 @@ fn scope_public_queue_visibility_does_not_grant_exact_objects() {
     let identity = identity_for_attempt(&db, "matrix-attempt-queue")
         .unwrap()
         .unwrap();
-    assert!(resolve_task_read(&db, &owner, &identity, TaskReadLevel::Detail)
-        .unwrap()
-        .is_some());
+    assert!(
+        resolve_task_read(&db, &owner, &identity, TaskReadLevel::Detail)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         resolve_task_read(&db, &viewer, &identity, TaskReadLevel::Detail).unwrap(),
         None
@@ -419,7 +431,10 @@ fn scope_public_task_submission_artifact_inherits_narrowest_grant() {
     register_manager(&db, "matrix-art-manager");
     register_manager(&db, "matrix-art-unrelated");
     let submit_operation_id = "matrix-submit-op-1";
-    let submit_artifact_id = format!("submission-{}", model::digest(submit_operation_id.as_bytes()));
+    let submit_artifact_id = format!(
+        "submission-{}",
+        model::digest(submit_operation_id.as_bytes())
+    );
     let document = json!({
         "operation_id": submit_operation_id,
         "task_id": "matrix-task-art",
@@ -459,8 +474,7 @@ fn scope_public_task_submission_artifact_inherits_narrowest_grant() {
         ],
     )
     .unwrap();
-    let record: ArtifactRecord =
-        super::super::results::get(&db, &submit_artifact_id).unwrap();
+    let record: ArtifactRecord = super::super::results::get(&db, &submit_artifact_id).unwrap();
     let submitter = test_principal("matrix-art-submitter", Role::Participant);
     let grant = resolve_artifact_read(&db, &submitter, &record, ArtifactReadLevel::Bytes)
         .unwrap()
@@ -472,10 +486,9 @@ fn scope_public_task_submission_artifact_inherits_narrowest_grant() {
         .unwrap();
     assert_eq!(capped.level, ArtifactReadLevel::Bytes);
     let manager = test_principal("matrix-art-manager", Role::Manager);
-    let manager_grant =
-        resolve_artifact_read(&db, &manager, &record, ArtifactReadLevel::Bytes)
-            .unwrap()
-            .unwrap();
+    let manager_grant = resolve_artifact_read(&db, &manager, &record, ArtifactReadLevel::Bytes)
+        .unwrap()
+        .unwrap();
     assert_eq!(manager_grant.basis, ArtifactReadBasis::CurrentTaskManager);
     let unrelated = test_principal("matrix-art-unrelated", Role::Manager);
     assert_eq!(
@@ -488,17 +501,23 @@ fn scope_public_task_submission_artifact_inherits_narrowest_grant() {
         None
     );
     let operator = test_principal("matrix-art-operator", Role::Operator);
-    let operator_grant =
-        resolve_artifact_read(&db, &operator, &record, ArtifactReadLevel::Bytes)
-            .unwrap()
-            .unwrap();
+    let operator_grant = resolve_artifact_read(&db, &operator, &record, ArtifactReadLevel::Bytes)
+        .unwrap()
+        .unwrap();
     assert_eq!(operator_grant.basis, ArtifactReadBasis::LocalOperator);
 }
 #[test]
 fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
     let db = empty_db();
     insert_task(&db, "matrix-task-bad", 1);
-    insert_attempt_running(&db, "matrix-attempt-bad", "matrix-task-bad", 1, "matrix-owner", None);
+    insert_attempt_running(
+        &db,
+        "matrix-attempt-bad",
+        "matrix-task-bad",
+        1,
+        "matrix-owner",
+        None,
+    );
     register_manager(&db, "matrix-unrelated");
     let unrelated = test_principal("matrix-unrelated", Role::Manager);
     insert_operation(
@@ -522,8 +541,8 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
         [],
     )
     .unwrap();
-    let err = resolve_operation_read(&db, &unrelated, "matrix-op-binding-without-attempt")
-        .unwrap_err();
+    let err =
+        resolve_operation_read(&db, &unrelated, "matrix-op-binding-without-attempt").unwrap_err();
     assert_eq!(err.code, "OBJECT_SCOPE_DAMAGED");
     insert_operation(
         &db,
@@ -536,8 +555,8 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
         &json!({"outcome":"applied"}),
         "settled",
     );
-    let err = resolve_operation_read(&db, &unrelated, "matrix-op-attempt-without-task")
-        .unwrap_err();
+    let err =
+        resolve_operation_read(&db, &unrelated, "matrix-op-attempt-without-task").unwrap_err();
     assert_eq!(err.code, "OBJECT_SCOPE_DAMAGED");
     let unknown = ArtifactRecord {
         kind: "unknown-kind".to_owned(),
@@ -547,12 +566,14 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
         content_digest: model::digest(b"abc"),
         metadata: json!({}),
     };
-    let err = resolve_artifact_read(&db, &unrelated, &unknown, ArtifactReadLevel::Metadata)
-        .unwrap_err();
+    let err =
+        resolve_artifact_read(&db, &unrelated, &unknown, ArtifactReadLevel::Metadata).unwrap_err();
     assert_eq!(err.code, "OBJECT_SCOPE_DAMAGED");
-    assert_eq!(resolve_assembly_sources(&db, &unrelated, &[]).unwrap(), None);
+    assert_eq!(
+        resolve_assembly_sources(&db, &unrelated, &[]).unwrap(),
+        None
+    );
 }
-
 
 /// Authenticated Store boundary; the synchronous resolver fixtures above are
 /// intentionally kept separate from these publicly admitted facts.
@@ -609,11 +630,17 @@ mod connected_store {
             request["binding_id"] = json!(id);
             request["binding_generation"] = json!(generation);
         }
-        store.call(operator.clone(), "client.register".into(), request).await.unwrap();
-        let principal = store.authenticate(Credential {
-            client_id: client_id.into(),
-            token,
-        }).await.unwrap();
+        store
+            .call(operator.clone(), "client.register".into(), request)
+            .await
+            .unwrap();
+        let principal = store
+            .authenticate(Credential {
+                client_id: client_id.into(),
+                token,
+            })
+            .await
+            .unwrap();
         assert_eq!(principal.role, role);
         principal
     }
@@ -621,7 +648,8 @@ mod connected_store {
     // Same DataRoot/bootstrap/StoreOwner lifecycle as program_tests::start_store.
     // No worker/supervisor is launched: module replies below are fixture evidence.
     async fn start() -> Fixture {
-        let directory = std::env::temp_dir().join(format!("swarm-scope-public-{}", model::new_id()));
+        let directory =
+            std::env::temp_dir().join(format!("swarm-scope-public-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
         let root = DataRoot::acquire(&directory).unwrap();
         let credential = bootstrap_credential(&root.path).unwrap();
@@ -637,13 +665,43 @@ mod connected_store {
             owned_service: None,
             admission_policy: None,
         });
-        let owner = StoreOwner::start(root, Arc::new(config), credential.clone()).await.unwrap();
+        let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+            .await
+            .unwrap();
         let operator = owner.store.authenticate(credential).await.unwrap();
         assert_eq!(operator.role, Role::Operator);
-        let manager_a = register(&owner.store, &operator, "scope-manager-a", Role::Manager, None).await;
-        let manager_b = register(&owner.store, &operator, "scope-manager-b", Role::Manager, None).await;
-        let observer = register(&owner.store, &operator, "scope-observer", Role::Observer, None).await;
-        Fixture { owner, directory, operator, manager_a, manager_b, observer }
+        let manager_a = register(
+            &owner.store,
+            &operator,
+            "scope-manager-a",
+            Role::Manager,
+            None,
+        )
+        .await;
+        let manager_b = register(
+            &owner.store,
+            &operator,
+            "scope-manager-b",
+            Role::Manager,
+            None,
+        )
+        .await;
+        let observer = register(
+            &owner.store,
+            &operator,
+            "scope-observer",
+            Role::Observer,
+            None,
+        )
+        .await;
+        Fixture {
+            owner,
+            directory,
+            operator,
+            manager_a,
+            manager_b,
+            observer,
+        }
     }
 
     impl Fixture {
@@ -654,26 +712,41 @@ mod connected_store {
     }
 
     async fn call(store: &Store, principal: &Principal, method: &str, request: Value) -> Value {
-        store.call(principal.clone(), method.into(), request).await
+        store
+            .call(principal.clone(), method.into(), request)
+            .await
             .unwrap_or_else(|error| panic!("{method}: {error:?}"))
     }
 
-    async fn write(store: &Store, principal: &Principal, method: &str, mut request: Value) -> Value {
+    async fn write(
+        store: &Store,
+        principal: &Principal,
+        method: &str,
+        mut request: Value,
+    ) -> Value {
         request["client_request_id"] = json!(model::new_id());
         call(store, principal, method, request).await
     }
 
-    async fn denied(store: &Store, principal: &Principal, method: &str, request: Value, code: &str) {
-        let error = store.call(principal.clone(), method.into(), request).await.unwrap_err();
+    async fn denied(
+        store: &Store,
+        principal: &Principal,
+        method: &str,
+        request: Value,
+        code: &str,
+    ) {
+        let error = store
+            .call(principal.clone(), method.into(), request)
+            .await
+            .unwrap_err();
         assert_eq!(error.code, code, "{method}: {error:?}");
     }
 
     fn spec(label: &str) -> Value {
         // Reuse the current Task example; acceptance is absent, so this never
         // invents independent review/CheckRun evidence or acceptance.
-        let mut spec: Value = serde_json::from_str(include_str!(
-            "../../config/task.example.json"
-        )).unwrap();
+        let mut spec: Value =
+            serde_json::from_str(include_str!("../../config/task.example.json")).unwrap();
         spec["objective"] = json!(format!("Public scope fixture {label}"));
         spec
     }
@@ -684,7 +757,12 @@ mod connected_store {
         })).await
     }
 
-    async fn claim(store: &Store, manager: &Principal, task: &Value, binding: Option<&Value>) -> Value {
+    async fn claim(
+        store: &Store,
+        manager: &Principal,
+        task: &Value,
+        binding: Option<&Value>,
+    ) -> Value {
         let mut request = json!({
             "task_id":task["task_id"], "expected_revision":1,
             "start_owner":if binding.is_some() { "controller" } else { "native_manager" },
@@ -697,30 +775,62 @@ mod connected_store {
     }
 
     fn assert_closed_receipt(receipt: &Value) {
-        for field in ["diagnostic", "native_refs", "original_request", "effective_request", "caller_id"] {
-            assert!(receipt.get(field).is_none(), "{field} escaped Receipt: {receipt}");
+        for field in [
+            "diagnostic",
+            "native_refs",
+            "original_request",
+            "effective_request",
+            "caller_id",
+        ] {
+            assert!(
+                receipt.get(field).is_none(),
+                "{field} escaped Receipt: {receipt}"
+            );
         }
     }
 
     fn assert_closed_artifact(value: &Value) {
         assert!(value.get("relative_path").is_none());
         let metadata = value["metadata"].as_object().unwrap();
-        for field in ["source", "selector", "native_root_id", "native_scope_key", "normalized_result_origin"] {
-            assert!(!metadata.contains_key(field), "{field} escaped artifact projection: {value}");
+        for field in [
+            "source",
+            "selector",
+            "native_root_id",
+            "native_scope_key",
+            "normalized_result_origin",
+        ] {
+            assert!(
+                !metadata.contains_key(field),
+                "{field} escaped artifact projection: {value}"
+            );
         }
     }
 
     async fn assert_profile_is_not_object_authority(f: &Fixture) {
-        for method in ["task.get", "attempt.get", "operation.get", "operation.list", "artifact.read"] {
+        for method in [
+            "task.get",
+            "attempt.get",
+            "operation.get",
+            "operation.list",
+            "artifact.read",
+        ] {
             // Both callers can use this same frontend profile. The profile is
             // method inventory only; actual Store calls below decide object grants.
-            assert!(swarm_contracts::mcp_catalog::exposes_method(McpToolProfile::Observer, method));
+            assert!(swarm_contracts::mcp_catalog::exposes_method(
+                McpToolProfile::Observer,
+                method
+            ));
             for principal in [&f.operator, &f.observer] {
-                let authorization = call(
-                    &f.owner.store, principal, "mcp.authorization", json!({}),
-                ).await;
-                assert!(authorization["allowed_methods"].as_array().unwrap().iter()
-                    .any(|entry| entry == method), "{method}: {authorization}");
+                let authorization =
+                    call(&f.owner.store, principal, "mcp.authorization", json!({})).await;
+                assert!(
+                    authorization["allowed_methods"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry == method),
+                    "{method}: {authorization}"
+                );
             }
         }
     }
@@ -755,45 +865,90 @@ mod connected_store {
             denied(store, &f.manager_b, method, request.clone(), "NOT_FOUND").await;
             denied(store, &f.observer, method, request, "NOT_FOUND").await;
         }
-        let receipt = call(store, &f.manager_a, "operation.get",
-            json!({"operation_id":reused_claim["operation_id"]})).await;
+        let receipt = call(
+            store,
+            &f.manager_a,
+            "operation.get",
+            json!({"operation_id":reused_claim["operation_id"]}),
+        )
+        .await;
         assert_eq!(receipt["task_id"], a["task_id"]);
         assert_eq!(receipt["attempt_id"], attempt_a["attempt_id"]);
         assert_closed_receipt(&receipt);
-        let diagnostic = call(store, &f.operator, "operation.get",
-            json!({"operation_id":a["operation_id"]})).await;
+        let diagnostic = call(
+            store,
+            &f.operator,
+            "operation.get",
+            json!({"operation_id":a["operation_id"]}),
+        )
+        .await;
         assert_eq!(diagnostic["diagnostic"]["caller_id"], f.manager_a.client_id);
-        denied(store, &f.manager_b, "swarm.agent.inspect",
-            json!({"attempt_id":attempt_a["attempt_id"]}), "FORBIDDEN").await;
+        denied(
+            store,
+            &f.manager_b,
+            "swarm.agent.inspect",
+            json!({"attempt_id":attempt_a["attempt_id"]}),
+            "FORBIDDEN",
+        )
+        .await;
 
         let first = call(store, &f.manager_a, "operation.list", json!({"limit":2})).await;
-        let second = call(store, &f.manager_a, "operation.list",
-            json!({"limit":50,"after":first["next_after"]})).await;
-        let ids: Vec<&str> = first["items"].as_array().unwrap().iter()
+        let second = call(
+            store,
+            &f.manager_a,
+            "operation.list",
+            json!({"limit":50,"after":first["next_after"]}),
+        )
+        .await;
+        assert!(
+            first.get("filtered_count").is_none(),
+            "hidden rows are not counted in the public page: {first}"
+        );
+        assert!(
+            second.get("filtered_count").is_none(),
+            "hidden rows are not counted in the public page: {second}"
+        );
+        let ids: Vec<&str> = first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
             .chain(second["items"].as_array().unwrap())
             .map(|entry| {
                 assert_closed_receipt(entry);
                 entry["operation_id"].as_str().unwrap()
-            }).collect();
-        assert_eq!(ids, vec![
-            a["operation_id"].as_str().unwrap(),
-            attempt_a["operation_id"].as_str().unwrap(),
-            later_a["operation_id"].as_str().unwrap(),
-            later_attempt_a["operation_id"].as_str().unwrap(),
-            reused_a["operation_id"].as_str().unwrap(),
-            reused_claim["operation_id"].as_str().unwrap(),
-        ]);
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                a["operation_id"].as_str().unwrap(),
+                attempt_a["operation_id"].as_str().unwrap(),
+                later_a["operation_id"].as_str().unwrap(),
+                later_attempt_a["operation_id"].as_str().unwrap(),
+                reused_a["operation_id"].as_str().unwrap(),
+                reused_claim["operation_id"].as_str().unwrap(),
+            ]
+        );
         assert!(!ids.contains(&b["operation_id"].as_str().unwrap()));
         assert!(!ids.contains(&attempt_b["operation_id"].as_str().unwrap()));
         assert_eq!(second["has_newer"], false);
         let observer_list = call(store, &f.observer, "operation.list", json!({"limit":50})).await;
         assert_eq!(observer_list["items"], json!([]));
         let task_page = call(store, &f.manager_a, "task.list", json!({"limit":1})).await;
-        let next_task_page = call(store, &f.manager_a, "task.list",
-            json!({"limit":1,"after":task_page["next_after"]})).await;
+        let next_task_page = call(
+            store,
+            &f.manager_a,
+            "task.list",
+            json!({"limit":1,"after":task_page["next_after"]}),
+        )
+        .await;
         assert_eq!(task_page["items"][0]["task_id"], a["task_id"]);
         assert_eq!(next_task_page["items"][0]["task_id"], later_a["task_id"]);
         let delta = call(store, &f.manager_a, "report.delta", json!({"limit":50})).await;
+        assert!(
+            delta["projection"]["range"].get("filtered_count").is_none(),
+            "the linked delta cursor must not disclose how many foreign events it skipped: {delta}"
+        );
         let delta_json = model::canonical(&delta).unwrap();
         assert!(!delta_json.contains(b["task_id"].as_str().unwrap()));
         assert!(!delta_json.contains(b["operation_id"].as_str().unwrap()));
@@ -801,38 +956,234 @@ mod connected_store {
 
         // A genuinely rejected public admission retains only its exact caller's
         // receipt and must not grant that caller the foreign Task/Attempt.
-        denied(store, &f.manager_b, "task.claim", json!({
-            "client_request_id":"scope-b-foreign-claim",
-            "task_id":a["task_id"],"expected_revision":1,"start_owner":"native_manager",
-        }), "TASK_ALREADY_OWNED").await;
-        let rejected = call(store, &f.manager_b, "operation.list",
-            json!({"state":"rejected","limit":10})).await;
-        let rejection = rejected["items"].as_array().unwrap().iter().find(|entry|
-            entry["client_request_id"] == "scope-b-foreign-claim"
-        ).unwrap();
+        denied(
+            store,
+            &f.manager_b,
+            "task.claim",
+            json!({
+                "client_request_id":"scope-b-foreign-claim",
+                "task_id":a["task_id"],"expected_revision":1,"start_owner":"native_manager",
+            }),
+            "TASK_ALREADY_OWNED",
+        )
+        .await;
+        let rejected = call(
+            store,
+            &f.manager_b,
+            "operation.list",
+            json!({"state":"rejected","limit":10}),
+        )
+        .await;
+        let rejection = rejected["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["client_request_id"] == "scope-b-foreign-claim")
+            .unwrap();
         assert_closed_receipt(rejection);
         assert_eq!(rejection["state"], "rejected");
         assert!(rejection["task_id"].is_null());
-        denied(store, &f.observer, "operation.get",
-            json!({"operation_id":rejection["operation_id"]}), "NOT_FOUND").await;
-        denied(store, &f.manager_b, "task.get", json!({"task_id":a["task_id"]}), "NOT_FOUND").await;
+        denied(
+            store,
+            &f.observer,
+            "operation.get",
+            json!({"operation_id":rejection["operation_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "task.get",
+            json!({"task_id":a["task_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
 
         let dashboard = call(store, &f.observer, "swarm.dashboard", json!({})).await;
         assert_eq!(dashboard["coverage"], "aggregate_only");
         assert!(dashboard.get("queue").is_none());
 
-        let queue = call(store, &f.manager_b, "swarm.queue.get",
-            json!({"limit":10,"project_id":PROJECT})).await;
+        let queue = call(
+            store,
+            &f.manager_b,
+            "swarm.queue.get",
+            json!({"limit":10,"project_id":PROJECT}),
+        )
+        .await;
         let queue_items = queue["items"].as_array().unwrap();
-        let queue_has_foreign_task = queue_items.iter().any(|item| item["task_id"] == a["task_id"]);
-        let queue_has_own_task = queue_items.iter().any(|item| item["task_id"] == b["task_id"]);
-        f.close().await;
+        let queue_has_foreign_task = queue_items
+            .iter()
+            .any(|item| item["task_id"] == a["task_id"]);
+        let queue_has_own_task = queue_items
+            .iter()
+            .any(|item| item["task_id"] == b["task_id"]);
         assert!(queue_has_own_task, "{queue}");
         // PR51 row 1 requires this fleet visibility without exact object grants.
         // At bfdca09, fleet_read_scope/query_tasks owner-filter this queue; keep
         // this real boundary assertion visible for the parent's scoped gate.
-        assert!(queue_has_foreign_task,
-            "PR51 fleet queue contract unmet: Manager B cannot see Manager A's bounded queue item: {queue}");
+        assert!(
+            queue_has_foreign_task,
+            "PR51 fleet queue contract unmet: Manager B cannot see Manager A's bounded queue item: {queue}"
+        );
+
+        write(
+            store,
+            &f.operator,
+            "gm.handover",
+            json!({
+                "client_id":f.manager_b.client_id,
+            }),
+        )
+        .await;
+        let gm_task = call(
+            store,
+            &f.manager_b,
+            "task.get",
+            json!({"task_id":a["task_id"]}),
+        )
+        .await;
+        assert_eq!(gm_task["task_id"], a["task_id"]);
+        let gm_attempt = call(
+            store,
+            &f.manager_b,
+            "attempt.get",
+            json!({"attempt_id":attempt_a["attempt_id"]}),
+        )
+        .await;
+        assert_eq!(gm_attempt["attempt_id"], attempt_a["attempt_id"]);
+        write(
+            store,
+            &f.operator,
+            "gm.handover",
+            json!({
+                "client_id":f.manager_a.client_id,
+            }),
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "task.get",
+            json!({"task_id":a["task_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "attempt.get",
+            json!({"attempt_id":attempt_a["attempt_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_authenticated_released_and_stale_attempts_do_not_widen_task_reads() {
+        let f = start().await;
+        let store = &f.owner.store;
+        let task = create(store, &f.manager_a, "released-scope").await;
+        let first = claim(store, &f.manager_a, &task, None).await;
+        let first_attempt_id = first["attempt_id"].as_str().unwrap().to_owned();
+        call(
+            store,
+            &f.manager_a,
+            "attempt.get",
+            json!({"attempt_id":first_attempt_id}),
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "attempt.get",
+            json!({"attempt_id":first_attempt_id}),
+            "NOT_FOUND",
+        )
+        .await;
+
+        write(
+            store,
+            &f.manager_a,
+            "attempt.release",
+            json!({
+                "attempt_id":first_attempt_id,
+                "outcome":"superseded",
+                "reason":"Replace the retained attempt in the scope fixture.",
+                "assignment_closed":true,
+            }),
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_a,
+            "attempt.get",
+            json!({"attempt_id":first_attempt_id}),
+            "NOT_FOUND",
+        )
+        .await;
+
+        let replacement = claim(store, &f.manager_a, &task, None).await;
+        let replacement_id = replacement["attempt_id"].as_str().unwrap().to_owned();
+        assert_ne!(replacement_id, first_attempt_id);
+        call(
+            store,
+            &f.manager_a,
+            "attempt.get",
+            json!({"attempt_id":replacement_id}),
+        )
+        .await;
+        for attempt_id in [&first_attempt_id, &replacement_id] {
+            denied(
+                store,
+                &f.manager_b,
+                "attempt.get",
+                json!({"attempt_id":attempt_id}),
+                "NOT_FOUND",
+            )
+            .await;
+        }
+
+        write(
+            store,
+            &f.manager_a,
+            "attempt.release",
+            json!({
+                "attempt_id":replacement_id,
+                "outcome":"superseded",
+                "reason":"Close the current attempt before revision change.",
+                "assignment_closed":true,
+            }),
+        )
+        .await;
+        let revised = write(
+            store,
+            &f.operator,
+            "task.revise",
+            json!({
+                "task_id":task["task_id"],
+                "expected_revision":1,
+                "spec":spec("released-scope-revision-two"),
+            }),
+        )
+        .await;
+        assert_eq!(revised["revision"], 2);
+        for attempt_id in [&first_attempt_id, &replacement_id] {
+            let error = store
+                .call(
+                    f.manager_a.clone(),
+                    "attempt.get".into(),
+                    json!({"attempt_id":attempt_id}),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error.code.as_str(), "NOT_FOUND" | "OBJECT_SCOPE_DAMAGED"),
+                "stale Attempt retained a public grant: {error:?}"
+            );
+        }
+        f.close().await;
     }
 
     fn fixture_descriptor() -> ModuleDescriptor {
@@ -840,7 +1191,8 @@ mod connected_store {
         // distinct fixture identity so no vendor-specific decoder is selected.
         let mut value: Value = serde_json::from_str(include_str!(
             "../../../swarm-adapter-opencode/registration/descriptor.template.json"
-        )).unwrap();
+        ))
+        .unwrap();
         value["module_id"] = json!(MODULE_ID);
         value["artifact"] = json!({"artifact_id":ARTIFACT_ID,"version":"1","build_id":null});
         value["enabled"] = json!(true);
@@ -849,7 +1201,7 @@ mod connected_store {
         value["workspace_option"] = Value::Null;
         value["launch"]["executable"] = json!(std::env::current_exe().unwrap());
         value["launch"]["argv"] = json!([]);
-        value["capabilities"] = json!(["agent.open","agent.result","task.dispatch"]);
+        value["capabilities"] = json!(["agent.open", "agent.result", "task.dispatch"]);
         // No TaskPrompt required: use Store's typed dispatch context directly.
         value["command_schemas"] = json!([
             swarm_contracts::module_contract::runtime_command_schema(),
@@ -866,16 +1218,19 @@ mod connected_store {
         descriptor
     }
 
-    fn module_receipt(command: &RuntimeCommand, descriptor: &ModuleDescriptor) -> ModuleReceiptIdentity {
+    fn module_receipt(
+        command: &RuntimeCommand,
+        descriptor: &ModuleDescriptor,
+    ) -> ModuleReceiptIdentity {
         ModuleReceiptIdentity {
-            schema_version:1,
-            module_id:descriptor.module_id.clone(),
-            artifact:descriptor.artifact.clone(),
-            protocol:MODULE_PROTOCOL_V1,
-            binding_id:command.binding_id.clone(),
-            binding_generation:command.generation,
-            operation_id:command.operation_id.clone(),
-            input_sha256:command.input_sha256.clone().unwrap(),
+            schema_version: 1,
+            module_id: descriptor.module_id.clone(),
+            artifact: descriptor.artifact.clone(),
+            protocol: MODULE_PROTOCOL_V1,
+            binding_id: command.binding_id.clone(),
+            binding_generation: command.generation,
+            operation_id: command.operation_id.clone(),
+            input_sha256: command.input_sha256.clone().unwrap(),
         }
     }
 
@@ -883,99 +1238,178 @@ mod connected_store {
         // One admitted command per call; no native worker or polling campaign.
         let next = call(store, module, "module.next", json!({})).await;
         let command: RuntimeCommand = serde_json::from_value(next["command"].clone()).unwrap();
-        assert_eq!(command.operation_id, admission["operation_id"].as_str().unwrap());
+        assert_eq!(
+            command.operation_id,
+            admission["operation_id"].as_str().unwrap()
+        );
         command
     }
 
     async fn open_fixture_module(f: &Fixture, descriptor: &ModuleDescriptor) -> (Value, Principal) {
         let store = &f.owner.store;
-        let supervisor = store.authenticate(f.owner.module_supervisor_credential()).await.unwrap();
-        call(store, &supervisor, "module.descriptor.register",
-            json!({"descriptor":descriptor})).await;
+        let supervisor = store
+            .authenticate(f.owner.module_supervisor_credential())
+            .await
+            .unwrap();
+        call(
+            store,
+            &supervisor,
+            "module.descriptor.register",
+            json!({"descriptor":descriptor}),
+        )
+        .await;
         let catalog = call(store, &f.operator, "module.catalog.get", json!({})).await;
-        write(store, &f.operator, "module.route.select", json!({
-            "route_alias":ROUTE, "module_id":MODULE_ID, "artifact_id":ARTIFACT_ID,
-            "version":"1", "expected_catalog_revision":catalog["catalog_revision"],
-        })).await;
-        let open = write(store, &f.operator, "agent.open",
-            json!({"lane_id":"scope-page-lane","route":ROUTE})).await;
-        let module = register(store, &f.operator, "scope-page-module", Role::Module,
-            Some((open["binding_id"].as_str().unwrap(), 1))).await;
+        write(
+            store,
+            &f.operator,
+            "module.route.select",
+            json!({
+                "route_alias":ROUTE, "module_id":MODULE_ID, "artifact_id":ARTIFACT_ID,
+                "version":"1", "expected_catalog_revision":catalog["catalog_revision"],
+            }),
+        )
+        .await;
+        let open = write(
+            store,
+            &f.operator,
+            "agent.open",
+            json!({"lane_id":"scope-page-lane","route":ROUTE}),
+        )
+        .await;
+        let module = register(
+            store,
+            &f.operator,
+            "scope-page-module",
+            Role::Module,
+            Some((open["binding_id"].as_str().unwrap(), 1)),
+        )
+        .await;
         let claim = ModuleContractClaim::from_descriptor(descriptor, MODULE_PROTOCOL_V1).unwrap();
-        call(store, &module, "module.hello", json!({
-            "boot_id":"scope-page-boot", "module_artifact_id":ARTIFACT_ID,
-            "module_contract":claim,
-        })).await;
+        call(
+            store,
+            &module,
+            "module.hello",
+            json!({
+                "boot_id":"scope-page-boot", "module_artifact_id":ARTIFACT_ID,
+                "module_contract":claim,
+            }),
+        )
+        .await;
         let command = next_command(store, &module, &open).await;
-        call(store, &module, "module.outcome", json!({
-            "operation_id":command.operation_id, "outcome":"applied",
-            "native_root_id":"scope-fixture-root", "native_scope_key":"scope-fixture-namespace",
-            "details":{"module_receipt":module_receipt(&command, descriptor)},
-        })).await;
+        call(
+            store,
+            &module,
+            "module.outcome",
+            json!({
+                "operation_id":command.operation_id, "outcome":"applied",
+                "native_root_id":"scope-fixture-root", "native_scope_key":"scope-fixture-namespace",
+                "details":{"module_receipt":module_receipt(&command, descriptor)},
+            }),
+        )
+        .await;
         (open, module)
     }
 
     async fn dispatch_fixture(
-        f: &Fixture, descriptor: &ModuleDescriptor, binding: &Value, module: &Principal,
+        f: &Fixture,
+        descriptor: &ModuleDescriptor,
+        binding: &Value,
+        module: &Principal,
+        task_label: &str,
     ) -> Value {
         let store = &f.owner.store;
-        let task = create(store, &f.manager_a, "pages").await;
+        let task = create(store, &f.manager_a, task_label).await;
         let attempt = claim(store, &f.manager_a, &task, Some(binding)).await;
-        let dispatch = write(store, &f.manager_a, "task.dispatch", json!({
-            "attempt_id":attempt["attempt_id"], "text":"scope fixture dispatch; no vendor work",
-        })).await;
+        let dispatch = write(
+            store,
+            &f.manager_a,
+            "task.dispatch",
+            json!({
+                "attempt_id":attempt["attempt_id"], "text":"scope fixture dispatch; no vendor work",
+            }),
+        )
+        .await;
         let command = next_command(store, module, &dispatch).await;
-        let context: TaskDispatchContext = serde_json::from_value(
-            command.input["task_dispatch_context"].clone()
-        ).unwrap();
+        let context: TaskDispatchContext =
+            serde_json::from_value(command.input["task_dispatch_context"].clone()).unwrap();
         let receipt = module_receipt(&command, descriptor);
         let admission = TaskDispatchAdmissionReceipt {
-            schema_version:context.schema_version,
-            module_receipt:receipt.clone(),
-            operation_id:context.operation_id,
-            binding_id:context.binding_id,
-            binding_generation:context.binding_generation,
-            worker_boot_id:context.worker_boot_id,
-            attempt_id:context.attempt_id,
-            task_id:context.task_id,
-            task_revision:context.task_revision,
-            task_snapshot_sha256:context.task_snapshot_sha256,
-            source_text_sha256:context.source_text_sha256.clone(),
-            source_text_bytes:context.source_text_bytes,
-            native_payload_sha256:context.source_text_sha256,
-            native_payload_bytes:context.source_text_bytes,
-            native_input_id:Some("scope-fixture-input".into()),
+            schema_version: context.schema_version,
+            module_receipt: receipt.clone(),
+            operation_id: context.operation_id,
+            binding_id: context.binding_id,
+            binding_generation: context.binding_generation,
+            worker_boot_id: context.worker_boot_id,
+            attempt_id: context.attempt_id,
+            task_id: context.task_id,
+            task_revision: context.task_revision,
+            task_snapshot_sha256: context.task_snapshot_sha256,
+            source_text_sha256: context.source_text_sha256.clone(),
+            source_text_bytes: context.source_text_bytes,
+            native_payload_sha256: context.source_text_sha256,
+            native_payload_bytes: context.source_text_bytes,
+            native_input_id: Some("scope-fixture-input".into()),
         };
         admission.validate().unwrap();
-        call(store, module, "module.outcome", json!({
-            "operation_id":command.operation_id,"outcome":"applied",
-            "native_root_id":"scope-fixture-root","native_scope_key":"scope-fixture-namespace",
-            "native_input_id":"scope-fixture-input",
-            "details":{"module_receipt":receipt,"dispatch_admission":admission,
-                "completion_condition":"native_input_admitted","execution_complete":false,
-                "task_completion":"unknown"},
-        })).await;
-        let reused = write(store, &f.manager_a, "task.dispatch", json!({
-            "attempt_id":attempt["attempt_id"],"text":"scope fixture dispatch; no vendor work",
-        })).await;
+        call(
+            store,
+            module,
+            "module.outcome",
+            json!({
+                "operation_id":command.operation_id,"outcome":"applied",
+                "native_root_id":"scope-fixture-root","native_scope_key":"scope-fixture-namespace",
+                "native_input_id":"scope-fixture-input",
+                "details":{"module_receipt":receipt,"dispatch_admission":admission,
+                    "completion_condition":"native_input_admitted","execution_complete":false,
+                    "task_completion":"unknown"},
+            }),
+        )
+        .await;
+        let reused = write(
+            store,
+            &f.manager_a,
+            "task.dispatch",
+            json!({
+                "attempt_id":attempt["attempt_id"],"text":"scope fixture dispatch; no vendor work",
+            }),
+        )
+        .await;
         assert_eq!(reused["semantic_reuse"], true);
         assert_eq!(reused["start_operation_id"], dispatch["operation_id"]);
-        let reused_receipt = call(store, &f.manager_a, "operation.get",
-            json!({"operation_id":reused["operation_id"]})).await;
+        let reused_receipt = call(
+            store,
+            &f.manager_a,
+            "operation.get",
+            json!({"operation_id":reused["operation_id"]}),
+        )
+        .await;
         assert_eq!(reused_receipt["task_id"], task["task_id"]);
         assert_eq!(reused_receipt["attempt_id"], attempt["attempt_id"]);
         assert!(reused_receipt["binding_id"].is_null());
         assert!(reused_receipt["binding_generation"].is_null());
         assert_closed_receipt(&reused_receipt);
-        let exact_attempt = call(store, &f.manager_a, "attempt.get",
-            json!({"attempt_id":attempt["attempt_id"]})).await;
-        assert_eq!(exact_attempt["start_operation_id"], dispatch["operation_id"]);
+        let exact_attempt = call(
+            store,
+            &f.manager_a,
+            "attempt.get",
+            json!({"attempt_id":attempt["attempt_id"]}),
+        )
+        .await;
+        assert_eq!(
+            exact_attempt["start_operation_id"],
+            dispatch["operation_id"]
+        );
         dispatch
     }
 
     async fn publish_page(
-        f: &Fixture, descriptor: &ModuleDescriptor, binding: &Value, module: &Principal,
-        target: &Value, payload: &[u8], range: std::ops::Range<usize>,
+        f: &Fixture,
+        descriptor: &ModuleDescriptor,
+        binding: &Value,
+        module: &Principal,
+        target: &Value,
+        payload: &[u8],
+        range: std::ops::Range<usize>,
     ) -> String {
         let offset = range.start;
         let end = range.end;
@@ -986,38 +1420,43 @@ mod connected_store {
             "offset_bytes":offset,"length_bytes":end-offset,
         })).await;
         let command = next_command(store, module, &result).await;
-        let origin: NormalizedResultOriginContext = serde_json::from_value(
-            command.input["normalized_result_origin"].clone()
-        ).unwrap();
+        let origin: NormalizedResultOriginContext =
+            serde_json::from_value(command.input["normalized_result_origin"].clone()).unwrap();
         let source = NormalizedResultPageSource {
-            schema_id:swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID.into(),
-            schema_version:1,
+            schema_id: swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID.into(),
+            schema_version: 1,
             origin,
-            result_operation_id:command.operation_id.clone(),
-            result_input_sha256:command.input_sha256.clone().unwrap(),
-            result_module_receipt:module_receipt(&command, descriptor),
-            payload_sha256:model::digest(payload),
-            payload_bytes:payload.len() as u64,
-            native_response_identity:Some("scope-fixture-response".into()),
-            execution_complete:false,
-            task_completion:"unknown".into(),
-            native_replay:false,
+            result_operation_id: command.operation_id.clone(),
+            result_input_sha256: command.input_sha256.clone().unwrap(),
+            result_module_receipt: module_receipt(&command, descriptor),
+            payload_sha256: model::digest(payload),
+            payload_bytes: payload.len() as u64,
+            native_response_identity: Some("scope-fixture-response".into()),
+            execution_complete: false,
+            task_completion: "unknown".into(),
+            native_replay: false,
         };
         source.validate().unwrap();
         let page = ResultPage {
-            source:serde_json::to_value(source).unwrap(),
-            offset_bytes:offset as u64,
-            byte_length:(end-offset) as u64,
-            total_bytes:payload.len() as u64,
-            eof:end == payload.len(),
-            media_type:"text/plain".into(),
-            content_base64:STANDARD.encode(&payload[offset..end]),
-            page_sha256:model::digest(&payload[offset..end]),
+            source: serde_json::to_value(source).unwrap(),
+            offset_bytes: offset as u64,
+            byte_length: (end - offset) as u64,
+            total_bytes: payload.len() as u64,
+            eof: end == payload.len(),
+            media_type: "text/plain".into(),
+            content_base64: STANDARD.encode(&payload[offset..end]),
+            page_sha256: model::digest(&payload[offset..end]),
         };
         page.decode().unwrap();
-        let recorded = call(store, module, "module.result", json!({
-            "operation_id":command.operation_id,"page":page,
-        })).await;
+        let recorded = call(
+            store,
+            module,
+            "module.result",
+            json!({
+                "operation_id":command.operation_id,"page":page,
+            }),
+        )
+        .await;
         assert_eq!(recorded["recorded"], true);
         recorded["artifact_ref"].as_str().unwrap().to_owned()
     }
@@ -1026,38 +1465,68 @@ mod connected_store {
 
     async fn retained_inventory(store: &Store) -> RetainedInventory {
         // Observation only: no SQL seeds or mutation of authoritative objects.
-        store.run(|db| {
-            let operations = db.prepare(
-                "SELECT operation_id,method,state FROM operations ORDER BY operation_id"
-            )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let artifacts = db.prepare(
-                "SELECT artifact_id,relative_path FROM artifacts ORDER BY artifact_id"
-            )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((operations, artifacts))
-        }).await.unwrap()
+        store
+            .run(|db| {
+                let operations = db
+                    .prepare(
+                        "SELECT operation_id,method,state FROM operations ORDER BY operation_id",
+                    )?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let artifacts = db
+                    .prepare(
+                        "SELECT artifact_id,relative_path FROM artifacts ORDER BY artifact_id",
+                    )?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((operations, artifacts))
+            })
+            .await
+            .unwrap()
     }
 
     fn artifact_files(directory: &std::path::Path) -> BTreeSet<PathBuf> {
-        std::fs::read_dir(directory.join("artifacts")).unwrap()
-            .map(|entry| entry.unwrap().path()).collect()
+        std::fs::read_dir(directory.join("artifacts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
     }
 
     async fn denied_assembly_has_no_output(
-        f: &Fixture, principal: &Principal, refs: &[String], expected_error: &str,
+        f: &Fixture,
+        principal: &Principal,
+        refs: &[String],
+        expected_error: &str,
     ) {
         let store = &f.owner.store;
         let before = retained_inventory(store).await;
         let files_before = artifact_files(&f.directory);
         let request_id = format!("denied-assemble-{}", model::new_id());
-        denied(store, principal, "artifact.assemble", json!({
-            "client_request_id":request_id,"page_refs":refs,
-        }), expected_error).await;
+        denied(
+            store,
+            principal,
+            "artifact.assemble",
+            json!({
+                "client_request_id":request_id,"page_refs":refs,
+            }),
+            expected_error,
+        )
+        .await;
         let after = retained_inventory(store).await;
-        assert_eq!(after.1, before.1, "denied assembly registered an output artifact");
-        assert_eq!(artifact_files(&f.directory), files_before, "denied assembly published a file");
-        let added: Vec<_> = after.0.iter().filter(|row| !before.0.contains(row)).collect();
+        assert_eq!(
+            after.1, before.1,
+            "denied assembly registered an output artifact"
+        );
+        assert_eq!(
+            artifact_files(&f.directory),
+            files_before,
+            "denied assembly published a file"
+        );
+        let added: Vec<_> = after
+            .0
+            .iter()
+            .filter(|row| !before.0.contains(row))
+            .collect();
         if expected_error == "INVALID_PARAMS" {
             // Duplicate page_refs fail envelope validation before reservation.
             assert!(added.is_empty(), "invalid envelope reserved an Operation");
@@ -1067,11 +1536,21 @@ mod connected_store {
             assert_eq!(added.len(), 1);
             assert_eq!(added[0].1, "artifact.assemble");
             assert_eq!(added[0].2, "rejected");
-            let receipt = call(store, principal, "operation.list",
-                json!({"state":"rejected","limit":50})).await;
-            assert!(receipt["items"].as_array().unwrap().iter().any(|entry|
-                entry["client_request_id"] == request_id && entry["state"] == "rejected"
-            ));
+            let receipt = call(
+                store,
+                principal,
+                "operation.list",
+                json!({"state":"rejected","limit":50}),
+            )
+            .await;
+            assert!(
+                receipt["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["client_request_id"] == request_id
+                        && entry["state"] == "rejected")
+            );
         }
     }
 
@@ -1081,101 +1560,518 @@ mod connected_store {
         assert_profile_is_not_object_authority(&f).await;
         let descriptor = fixture_descriptor();
         let (binding, module) = open_fixture_module(&f, &descriptor).await;
-        let target = dispatch_fixture(&f, &descriptor, &binding, &module).await;
+        let store = &f.owner.store;
+        let target = dispatch_fixture(&f, &descriptor, &binding, &module, "pages").await;
+        let exact_family_request = json!({
+            "binding_id":binding["binding_id"],
+            "generation":binding["generation"],
+            "attempt_id":target["attempt_id"],
+            "after":0,
+            "limit":5,
+        });
+        let family = call(
+            store,
+            &f.manager_a,
+            "agent.family",
+            exact_family_request.clone(),
+        )
+        .await;
+        assert!(family.is_object());
+        denied(
+            store,
+            &f.manager_b,
+            "agent.family",
+            exact_family_request.clone(),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "agent.family",
+            exact_family_request,
+            "NOT_FOUND",
+        )
+        .await;
+
+        let attempt = call(
+            store,
+            &f.manager_a,
+            "attempt.get",
+            json!({"attempt_id":target["attempt_id"]}),
+        )
+        .await;
+        let participant_token = "scope-attempt-owner-token".to_owned();
+        write(
+            store,
+            &f.manager_a,
+            "coordination.participant.register",
+            json!({
+                "client_id":"scope-attempt-owner",
+                "token_hash":model::digest(participant_token.as_bytes()),
+                "task_id":attempt["task_id"],
+                "task_revision":attempt["task_revision"],
+                "attempt_id":target["attempt_id"],
+                "participation_basis":{"kind":"attempt_owner"},
+            }),
+        )
+        .await;
+        let participant = store
+            .authenticate(crate::model::Credential {
+                client_id: "scope-attempt-owner".into(),
+                token: participant_token,
+            })
+            .await
+            .unwrap();
         let payload = b"private result bytes from the exact admitted source";
         let split = 16;
-        let first = publish_page(&f, &descriptor, &binding, &module, &target, payload, 0..split).await;
-        let second = publish_page(&f, &descriptor, &binding, &module, &target, payload, split..payload.len()).await;
-        let store = &f.owner.store;
+        let first = publish_page(
+            &f,
+            &descriptor,
+            &binding,
+            &module,
+            &target,
+            payload,
+            0..split,
+        )
+        .await;
+        let second = publish_page(
+            &f,
+            &descriptor,
+            &binding,
+            &module,
+            &target,
+            payload,
+            split..payload.len(),
+        )
+        .await;
         for page in [&first, &second] {
             for principal in [&f.operator, &f.manager_a] {
-                let metadata = call(store, principal, "artifact.get",
-                    json!({"artifact_id":page})).await;
+                let metadata = call(
+                    store,
+                    principal,
+                    "artifact.get",
+                    json!({"artifact_id":page}),
+                )
+                .await;
                 assert_closed_artifact(&metadata);
-                let bytes = call(store, principal, "artifact.read",
-                    json!({"artifact_id":page,"length_bytes":65536})).await;
+                let bytes = call(
+                    store,
+                    principal,
+                    "artifact.read",
+                    json!({"artifact_id":page,"length_bytes":65536}),
+                )
+                .await;
                 assert_closed_artifact(&bytes);
                 assert!(bytes["content"].as_str().is_some());
             }
+            let participant_bytes = call(
+                store,
+                &participant,
+                "artifact.read",
+                json!({"artifact_id":page,"length_bytes":65536}),
+            )
+            .await;
+            assert_closed_artifact(&participant_bytes);
+            assert!(participant_bytes["content"].as_str().is_some());
             for principal in [&f.manager_b, &f.observer] {
-                denied(store, principal, "artifact.get", json!({"artifact_id":page}), "FORBIDDEN").await;
-                denied(store, principal, "artifact.read",
-                    json!({"artifact_id":page,"length_bytes":65536}), "FORBIDDEN").await;
+                denied(
+                    store,
+                    principal,
+                    "artifact.get",
+                    json!({"artifact_id":page}),
+                    "FORBIDDEN",
+                )
+                .await;
+                denied(
+                    store,
+                    principal,
+                    "artifact.read",
+                    json!({"artifact_id":page,"length_bytes":65536}),
+                    "FORBIDDEN",
+                )
+                .await;
             }
         }
-        denied_assembly_has_no_output(&f, &f.manager_b, &[first.clone(),second.clone()], "FORBIDDEN").await;
-        denied_assembly_has_no_output(&f, &f.manager_a, &[first.clone(),first.clone()], "INVALID_PARAMS").await;
-        denied_assembly_has_no_output(&f, &f.manager_a, &[second.clone(),first.clone()], "OBJECT_SCOPE_DAMAGED").await;
-        denied_assembly_has_no_output(&f, &f.manager_a, std::slice::from_ref(&first), "OBJECT_SCOPE_DAMAGED").await;
+        denied_assembly_has_no_output(
+            &f,
+            &f.manager_b,
+            &[first.clone(), second.clone()],
+            "FORBIDDEN",
+        )
+        .await;
+        denied_assembly_has_no_output(
+            &f,
+            &f.manager_a,
+            &[first.clone(), first.clone()],
+            "INVALID_PARAMS",
+        )
+        .await;
+        denied_assembly_has_no_output(
+            &f,
+            &f.manager_a,
+            &[second.clone(), first.clone()],
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        denied_assembly_has_no_output(
+            &f,
+            &f.manager_a,
+            std::slice::from_ref(&first),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+
+        // Both pages below are valid and readable to Manager A, but their
+        // retained dispatch/Attempt identities cannot be spliced together.
+        let foreign_target =
+            dispatch_fixture(&f, &descriptor, &binding, &module, "foreign-source").await;
+        let foreign_page = publish_page(
+            &f,
+            &descriptor,
+            &binding,
+            &module,
+            &foreign_target,
+            payload,
+            0..payload.len(),
+        )
+        .await;
+        let foreign_bytes = call(
+            store,
+            &f.manager_a,
+            "artifact.read",
+            json!({"artifact_id":foreign_page,"length_bytes":65536}),
+        )
+        .await;
+        assert_eq!(
+            foreign_bytes["content"],
+            std::str::from_utf8(payload).unwrap()
+        );
+        denied(
+            store,
+            &participant,
+            "artifact.read",
+            json!({"artifact_id":foreign_page,"length_bytes":65536}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied_assembly_has_no_output(
+            &f,
+            &f.manager_a,
+            &[first.clone(), foreign_page],
+            "ARTIFACT_SCOPE",
+        )
+        .await;
 
         // Operator assembles; Manager A can read through the sources, while the
         // unrelated Manager/Observer still cannot. Assembler is not ownership.
-        let assembly = write(store, &f.operator, "artifact.assemble", json!({
-            "page_refs":[first,second],"expected_sha256":model::digest(payload),
-        })).await;
-        let assembled_id = format!("assembled-{}", model::digest(
-            assembly["operation_id"].as_str().unwrap().as_bytes()
-        ));
+        let assembly = write(
+            store,
+            &f.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs":[first,second],"expected_sha256":model::digest(payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
         for principal in [&f.operator, &f.manager_a] {
-            let metadata = call(store, principal, "artifact.get",
-                json!({"artifact_id":assembled_id})).await;
+            let metadata = call(
+                store,
+                principal,
+                "artifact.get",
+                json!({"artifact_id":assembled_id}),
+            )
+            .await;
             assert_eq!(metadata["kind"], "native_result");
-            assert_eq!(metadata["grant"]["basis"],
-                if principal.role == Role::Operator { "local_operator" } else { "all_source_pages" });
+            assert_eq!(
+                metadata["grant"]["basis"],
+                if principal.role == Role::Operator {
+                    "local_operator"
+                } else {
+                    "all_source_pages"
+                }
+            );
             assert_closed_artifact(&metadata);
-            let bytes = call(store, principal, "artifact.read", json!({
-                "artifact_id":assembled_id,"offset_bytes":0,"length_bytes":65536,
-            })).await;
+            let bytes = call(
+                store,
+                principal,
+                "artifact.read",
+                json!({
+                    "artifact_id":assembled_id,"offset_bytes":0,"length_bytes":65536,
+                }),
+            )
+            .await;
             assert_eq!(bytes["content"], std::str::from_utf8(payload).unwrap());
             assert_closed_artifact(&bytes);
         }
         for principal in [&f.manager_b, &f.observer] {
-            denied(store, principal, "artifact.parts",
-                json!({"artifact_id":assembled_id}), "FORBIDDEN").await;
-            denied(store, principal, "artifact.read",
-                json!({"artifact_id":assembled_id,"length_bytes":65536}), "FORBIDDEN").await;
+            denied(
+                store,
+                principal,
+                "artifact.parts",
+                json!({"artifact_id":assembled_id}),
+                "FORBIDDEN",
+            )
+            .await;
+            denied(
+                store,
+                principal,
+                "artifact.read",
+                json!({"artifact_id":assembled_id,"length_bytes":65536}),
+                "FORBIDDEN",
+            )
+            .await;
         }
-        let parts = call(store, &f.manager_a, "artifact.parts",
-            json!({"artifact_id":assembled_id,"limit":1})).await;
+        let parts = call(
+            store,
+            &f.manager_a,
+            "artifact.parts",
+            json!({"artifact_id":assembled_id,"limit":1}),
+        )
+        .await;
         assert_eq!(parts["parts"][0]["artifact_ref"], first);
         assert_eq!(parts["next_after"], 1);
-        let remaining = call(store, &f.manager_a, "artifact.parts",
-            json!({"artifact_id":assembled_id,"limit":1,"after":parts["next_after"]})).await;
+        let remaining = call(
+            store,
+            &f.manager_a,
+            "artifact.parts",
+            json!({"artifact_id":assembled_id,"limit":1,"after":parts["next_after"]}),
+        )
+        .await;
         assert_eq!(remaining["parts"][0]["artifact_ref"], second);
         assert!(remaining["next_after"].is_null());
-        let prefix = call(store, &f.manager_a, "artifact.read",
-            json!({"artifact_id":assembled_id,"length_bytes":split})).await;
+        let prefix = call(
+            store,
+            &f.manager_a,
+            "artifact.read",
+            json!({"artifact_id":assembled_id,"length_bytes":split}),
+        )
+        .await;
         assert_eq!(prefix["eof"], false);
         assert_eq!(prefix["byte_length"], split);
 
         // An unrelated Manager can assemble only while an independent current-GM
         // source grant exists. Losing it leaves the caller receipt readable but
         // never turns the assembly request into ownership of source bytes.
-        write(store, &f.operator, "gm.handover", json!({
-            "client_id":f.manager_b.client_id,
-        })).await;
-        let gm_assembly = write(store, &f.manager_b, "artifact.assemble", json!({
-            "page_refs":[first,second],"expected_sha256":model::digest(payload),
-        })).await;
-        let gm_assembled_id = format!("assembled-{}", model::digest(
-            gm_assembly["operation_id"].as_str().unwrap().as_bytes()
-        ));
-        let gm_bytes = call(store, &f.manager_b, "artifact.read",
-            json!({"artifact_id":gm_assembled_id,"length_bytes":65536})).await;
+        write(
+            store,
+            &f.operator,
+            "gm.handover",
+            json!({
+                "client_id":f.manager_b.client_id,
+            }),
+        )
+        .await;
+        let gm_assembly = write(
+            store,
+            &f.manager_b,
+            "artifact.assemble",
+            json!({
+                "page_refs":[first,second],"expected_sha256":model::digest(payload),
+            }),
+        )
+        .await;
+        let gm_assembled_id = format!(
+            "assembled-{}",
+            model::digest(gm_assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        let gm_bytes = call(
+            store,
+            &f.manager_b,
+            "artifact.read",
+            json!({"artifact_id":gm_assembled_id,"length_bytes":65536}),
+        )
+        .await;
         assert_eq!(gm_bytes["content"], std::str::from_utf8(payload).unwrap());
-        write(store, &f.operator, "gm.handover", json!({
-            "client_id":f.manager_a.client_id,
-        })).await;
-        let former_gm_receipt = call(store, &f.manager_b, "operation.get",
-            json!({"operation_id":gm_assembly["operation_id"]})).await;
+        write(
+            store,
+            &f.operator,
+            "gm.handover",
+            json!({
+                "client_id":f.manager_a.client_id,
+            }),
+        )
+        .await;
+        let former_gm_receipt = call(
+            store,
+            &f.manager_b,
+            "operation.get",
+            json!({"operation_id":gm_assembly["operation_id"]}),
+        )
+        .await;
         assert_closed_receipt(&former_gm_receipt);
-        denied(store, &f.manager_b, "artifact.read",
-            json!({"artifact_id":gm_assembled_id,"length_bytes":65536}), "FORBIDDEN").await;
-        denied(store, &f.manager_b, "artifact.parts",
-            json!({"artifact_id":gm_assembled_id}), "FORBIDDEN").await;
-        let source_owner_bytes = call(store, &f.manager_a, "artifact.read",
-            json!({"artifact_id":gm_assembled_id,"length_bytes":65536})).await;
-        assert_eq!(source_owner_bytes["content"], std::str::from_utf8(payload).unwrap());
+        denied(
+            store,
+            &f.manager_b,
+            "artifact.read",
+            json!({"artifact_id":gm_assembled_id,"length_bytes":65536}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "artifact.parts",
+            json!({"artifact_id":gm_assembled_id}),
+            "FORBIDDEN",
+        )
+        .await;
+        let source_owner_bytes = call(
+            store,
+            &f.manager_a,
+            "artifact.read",
+            json!({"artifact_id":gm_assembled_id,"length_bytes":65536}),
+        )
+        .await;
+        assert_eq!(
+            source_owner_bytes["content"],
+            std::str::from_utf8(payload).unwrap()
+        );
+
+        let second_page_id = second.clone();
+        let (original_length, original_digest, original_metadata): (i64, String, String) =
+            store.run(move |db| {
+                Ok(db.query_row(
+                    "SELECT byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1",
+                    [second_page_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            }).await.unwrap();
+
+        // A publicly admitted overlapping page remains a damaged source and
+        // cannot be combined into a new artifact.
+        let overlap_page = second.clone();
+        store.run(move |db| {
+            let changed = db.execute(
+                "UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.offset_bytes',?2) WHERE artifact_id=?1",
+                params![overlap_page, split as i64 - 1],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        }).await.unwrap();
+        denied_assembly_has_no_output(
+            &f,
+            &f.manager_a,
+            &[first.clone(), second.clone()],
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        let restore_page = second.clone();
+        let restore_metadata = original_metadata.clone();
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE artifacts SET metadata_json=?2 WHERE artifact_id=?1",
+                    params![restore_page, restore_metadata],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let digest_page = second.clone();
+        let wrong_digest = model::digest(b"scope-fixture-corrupt-page-digest");
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE artifacts SET content_digest=?2 WHERE artifact_id=?1",
+                    params![digest_page, wrong_digest],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        denied(
+            store,
+            &f.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":second,"length_bytes":65536,
+            }),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        let restore_page = second.clone();
+        let restore_digest = original_digest.clone();
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE artifacts SET content_digest=?2 WHERE artifact_id=?1",
+                    params![restore_page, restore_digest],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let length_page = second.clone();
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE artifacts SET byte_length=?2 WHERE artifact_id=?1",
+                    params![length_page, original_length + 1],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        denied(
+            store,
+            &f.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":second,"length_bytes":65536,
+            }),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        let restore_page = second.clone();
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE artifacts SET byte_length=?2 WHERE artifact_id=?1",
+                    params![restore_page, original_length],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let generation_page = second.clone();
+        store.run(move |db| {
+            let changed = db.execute(
+                "UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.normalized_result_origin.binding_generation',2) WHERE artifact_id=?1",
+                [generation_page],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        }).await.unwrap();
+        denied(
+            store,
+            &f.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":second,"length_bytes":65536,
+            }),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        let restore_page = second.clone();
+        let restore_metadata = original_metadata;
+        store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE artifacts SET metadata_json=?2 WHERE artifact_id=?1",
+                    params![restore_page, restore_metadata],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         // SQL damages one existing public page only after the entire chain was
         // admitted and read. Even the verified Operator must fail provenance
@@ -1189,9 +2085,16 @@ mod connected_store {
             assert_eq!(changed, 1);
             Ok(())
         }).await.unwrap();
-        denied(store, &f.operator, "artifact.parts",
-            json!({"artifact_id":assembled_id}), "OBJECT_SCOPE_DAMAGED").await;
-        denied_assembly_has_no_output(&f, &f.operator, &[first,second], "OBJECT_SCOPE_DAMAGED").await;
+        denied(
+            store,
+            &f.operator,
+            "artifact.parts",
+            json!({"artifact_id":assembled_id}),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        denied_assembly_has_no_output(&f, &f.operator, &[first, second], "OBJECT_SCOPE_DAMAGED")
+            .await;
         f.close().await;
     }
 }
