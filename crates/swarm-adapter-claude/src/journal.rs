@@ -14,7 +14,7 @@ use swarm_contracts::{
     runtime::{ModuleReceiptIdentity, RuntimeOutcome},
 };
 use swarm_process::{
-    JsonlScanVerdict, private_permissions, remove_private_durable, replace_private_durable,
+    JsonlScanVerdict, private_permissions, remove_private_acknowledged, replace_private_durable,
     scan_jsonl, write_private_new,
 };
 
@@ -2791,7 +2791,7 @@ fn remove_exact_file(path: &Path) -> Result<()> {
                 "retention cleanup target is not an exact regular file",
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => {
             return Err(Error::new(
                 "ADAPTER_RETENTION_STATE",
@@ -2799,12 +2799,18 @@ fn remove_exact_file(path: &Path) -> Result<()> {
             ));
         }
     }
-    remove_private_durable(path).map(|_| ()).map_err(|_| {
+    let removal = remove_private_acknowledged(path).map_err(|_| {
         Error::new(
             "ADAPTER_RETENTION_STATE",
             "retention target cannot be removed",
         )
-    })
+    })?;
+    if removal.durability == swarm_process::RemovalDurability::Unknown {
+        eprintln!(
+            "Claude adapter cleanup durability is unknown; retained ACK/readback state remains authoritative"
+        );
+    }
+    Ok(())
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -2921,6 +2927,25 @@ pub fn digest_json(value: &Value) -> Result<String> {
 
 pub fn digest_bytes(bytes: &[u8]) -> String {
     hex_digest(bytes)
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn safe_diagnostic_code(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_uppercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        value
+    } else {
+        "ADAPTER_UNCERTAIN_AFTER_EFFECT_MARKER"
+    }
 }
 
 #[cfg(test)]
@@ -3152,24 +3177,5 @@ mod recovery_tests {
 
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn safe_diagnostic_code(value: &str) -> &str {
-    if !value.is_empty()
-        && value.len() <= 64
-        && value.as_bytes()[0].is_ascii_uppercase()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        value
-    } else {
-        "ADAPTER_UNCERTAIN_AFTER_EFFECT_MARKER"
     }
 }

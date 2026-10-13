@@ -104,7 +104,13 @@ fn retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_tar
         "operation_id":reconcile_id,
         "outcome":"applied",
         "native_scope_key":NATIVE_SCOPE,
-        "details":{"resolved":false,"native_replay":false}
+        "details":{
+            "module_receipt":reconcile_intent.module_receipt.clone(),
+            "target_operation_id":target_id,
+            "completion_condition":"native_readback_recorded",
+            "resolved":false,
+            "native_replay":false
+        }
     });
     journal.queue_outcome_value(&reconcile_outcome).unwrap();
     journal.acknowledge_outcome(&reconcile_outcome).unwrap();

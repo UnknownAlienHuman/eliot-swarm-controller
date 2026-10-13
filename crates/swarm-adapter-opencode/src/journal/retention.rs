@@ -4,7 +4,7 @@
 use super::{
     Error, HISTORY_LIMIT, Journal, Result, RetainedOperation, RetentionSummary, StateIdentity,
     inspect_retained_operation, operation_key, read_limited, read_operation_history_bytes,
-    remove_private_durable, replace_private_durable, summarize_retained_operation,
+    remove_private_acknowledged, replace_private_durable, summarize_retained_operation,
     write_private_new,
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::MutexGuard,
 };
+use swarm_process::RemovalDurability;
 
 const MAX_RETENTION_STEPS: usize = 32;
 const RETENTION_CURSOR_FILE: &str = "retention-cursor.json";
@@ -326,6 +327,7 @@ pub(super) fn reclaim_acknowledged(
     let step_limit = initial_work.min(MAX_RETENTION_STEPS);
     let mut visited = BTreeSet::new();
     let mut summary = RetentionSummary::default();
+    let mut removal_durability_unknown = false;
     while summary.examined < step_limit {
         let Some(key) = index.next_candidate(&visited) else {
             break;
@@ -386,9 +388,15 @@ pub(super) fn reclaim_acknowledged(
                 "operation journal changed during retention classification",
             ));
         }
-        match remove_private_durable(&operation.path) {
-            Ok(true) => summary.reclaimed += 1,
-            Ok(false) => {
+        match remove_private_acknowledged(&operation.path) {
+            Ok(outcome) if outcome.durability == RemovalDurability::Unknown => {
+                if outcome.removed {
+                    summary.reclaimed += 1;
+                }
+                removal_durability_unknown = true;
+            }
+            Ok(outcome) if outcome.removed => summary.reclaimed += 1,
+            Ok(_) => {
                 return Err(Error::new(
                     "ADAPTER_JOURNAL",
                     "acknowledged operation journal disappeared during retention",
@@ -412,6 +420,6 @@ pub(super) fn reclaim_acknowledged(
         index.cursor = Some(key);
         index.persist_cursor()?;
     }
-    summary.complete = index.queue.is_empty();
+    summary.complete = index.queue.is_empty() && !removal_durability_unknown;
     Ok(summary)
 }
