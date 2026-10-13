@@ -1186,7 +1186,7 @@ pub fn terminal_receipt_exists(data_dir: &Path, run_id: &str) -> Result<bool> {
 
 #[cfg(test)]
 #[path = "runner_durable_authority_tests.rs"]
-mod durable_authority_tests;
+pub(crate) mod durable_authority_tests;
 
 pub fn started_receipt_exists(data_dir: &Path, run_id: &str) -> Result<bool> {
     receipt_exists(&directory(data_dir, run_id)?.join("started.json"))
