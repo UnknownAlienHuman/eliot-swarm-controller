@@ -2572,14 +2572,21 @@ mod connected_store {
                 {
                     let task_id = if attempt_id == &attempt_a { &task_a } else { &task_b };
                     db.execute(
-                        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'check.run',?4,'{}',?5,?6,'settled','{}',1,1,1,1)",
+                        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'check.run',?4,?7,?5,?6,'queued','{}',1,1,1)",
                         params![
                             check_op,
                             &owner_id,
                             format!("check-request-{check_op}"),
-                            model::canonical(&json!({"client_request_id":format!("check-request-{check_op}")}))?,
+                            model::canonical(&json!({
+                                "client_request_id":format!("check-request-{check_op}"),
+                                "attempt_id":attempt_id,
+                                "candidate_ref":candidate,
+                                "profile_id":"scope-check-profile",
+                                "profile_revision":"1",
+                            }))?,
                             task_id,
                             attempt_id,
+                            model::canonical(&json!({"check_id":check_id}))?,
                         ],
                     )?;
                     db.execute(
@@ -2711,7 +2718,7 @@ mod connected_store {
             &reviewer,
             "check.get",
             json!({"check_id":check_b}),
-            "NOT_FOUND",
+            "FORBIDDEN",
         )
         .await;
         denied(
