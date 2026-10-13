@@ -1989,11 +1989,32 @@ async fn claim_legacy_v1_task_requires_explicit_revise_to_v2() {
         start_store_with_config("pr40-v2-claim-gate", Config::default()).await;
     let store = owner.store.clone();
     seed_clients(&store).await;
-    let (task_id, _attempt_id) = seed_retained_v1_attempt(&store, "pr40-v2-claim-gate", None).await;
+    // A retained, unowned V1 Task reaches the upgrade gate. The historical
+    // Attempt helper intentionally creates ownership and would stop earlier.
+    let task_id = model::new_id();
+    let seeded_task_id = task_id.clone();
+    store
+        .run(move |db| {
+            let mut spec = review_only_v2_spec();
+            spec["acceptance"] = json!({"required_check_profiles":[]});
+            spec["requirements"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("verification");
+            let typed: crate::model::TaskSpec = serde_json::from_value(spec.clone())?;
+            typed.validate_retained()?;
+            db.execute(
+                "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,'pr40-v2-claim-gate',1,'open',?2,1,1)",
+                params![seeded_task_id, model::canonical(&spec)?],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     let gm = principal("review-gm", Role::Manager);
     let err = store
         .call(
-            gm,
+            gm.clone(),
             "task.claim".into(),
             json!({
                 "client_request_id": model::new_id(),
@@ -2005,6 +2026,46 @@ async fn claim_legacy_v1_task_requires_explicit_revise_to_v2() {
         .await
         .expect_err("legacy V1 task claim must require revise to V2");
     assert_eq!(err.code, "TASK_ACCEPTANCE_POLICY_UPGRADE_REQUIRED");
+    let rejected_task_id = task_id.clone();
+    store
+        .run(move |db| {
+            let attempts: i64 = db.query_row(
+                "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
+                [rejected_task_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(attempts, 0, "the rejected claim must not create an Attempt");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .call(
+            gm.clone(),
+            "task.revise".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "task_id":task_id,
+                "expected_revision":1,
+                "spec":review_only_v2_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+    let claimed = store
+        .call(
+            gm,
+            "task.claim".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "task_id":task_id,
+                "expected_revision":2,
+                "owner_id":"review-gm",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed["task_revision"], 2);
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
