@@ -1554,14 +1554,27 @@ mod connected_store {
         }
     }
 
-    #[tokio::test]
-    async fn store_authenticated_result_pages_reads_parts_and_assembly_inherit_sources() {
-        // The monolithic debug future for this scenario exceeded the default
-        // Windows test-thread stack (STATUS_STACK_OVERFLOW, exit 0xc00000fd)
-        // while its smaller siblings passed. Heap-pin the scenario future so
-        // its across-await state lives on the heap; assertions and order are
-        // unchanged and no production code is touched.
-        Box::pin(async {
+    const PAGES_PAYLOAD: &[u8] = b"private result bytes from the exact admitted source";
+    const PAGES_SPLIT: usize = 16;
+
+    struct PagesSetup {
+        fixture: Fixture,
+        first: String,
+        second: String,
+        participant: Principal,
+        foreign_page: String,
+    }
+
+    // Shared authenticated setup for the result-page subscenarios below. The
+    // previous monolithic scenario future overflowed the default Windows
+    // test-thread stack in debug builds (0xc00000fd, still red after a
+    // heap-pin attempt: the oversized future is constructed on the stack).
+    // Each subscenario below runs this setup in its own Store so every
+    // scenario future stays small. Assertions and their order are preserved
+    // verbatim from the original scenario; no production code is touched.
+    // Parent baseline: the fleet/queue profile case passes; these scenarios
+    // are NOT_READY until the parent's targeted retry goes green.
+    async fn setup_result_pages() -> PagesSetup {
         let f = start().await;
         assert_profile_is_not_object_authority(&f).await;
         let descriptor = fixture_descriptor();
@@ -1629,16 +1642,14 @@ mod connected_store {
             })
             .await
             .unwrap();
-        let payload = b"private result bytes from the exact admitted source";
-        let split = 16;
         let first = publish_page(
             &f,
             &descriptor,
             &binding,
             &module,
             &target,
-            payload,
-            0..split,
+            PAGES_PAYLOAD,
+            0..PAGES_SPLIT,
         )
         .await;
         let second = publish_page(
@@ -1647,10 +1658,61 @@ mod connected_store {
             &binding,
             &module,
             &target,
-            payload,
-            split..payload.len(),
+            PAGES_PAYLOAD,
+            PAGES_SPLIT..PAGES_PAYLOAD.len(),
         )
         .await;
+        // Both pages below are valid and readable to Manager A, but their
+        // retained dispatch/Attempt identities cannot be spliced together.
+        let foreign_target =
+            dispatch_fixture(&f, &descriptor, &binding, &module, "foreign-source").await;
+        let foreign_page = publish_page(
+            &f,
+            &descriptor,
+            &binding,
+            &module,
+            &foreign_target,
+            PAGES_PAYLOAD,
+            0..PAGES_PAYLOAD.len(),
+        )
+        .await;
+        PagesSetup {
+            fixture: f,
+            first,
+            second,
+            participant,
+            foreign_page,
+        }
+    }
+
+    async fn assemble_pages(f: &Fixture, first: &str, second: &str) -> String {
+        let store = &f.owner.store;
+        // Operator assembles; Manager A can read through the sources, while the
+        // unrelated Manager/Observer still cannot. Assembler is not ownership.
+        let assembly = write(
+            store,
+            &f.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs":[first,second],"expected_sha256":model::digest(PAGES_PAYLOAD),
+            }),
+        )
+        .await;
+        format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        )
+    }
+
+    #[tokio::test]
+    async fn store_authenticated_result_pages_grants_and_denied_assemblies() {
+        let setup = setup_result_pages().await;
+        let f = &setup.fixture;
+        let store = &f.owner.store;
+        let first = setup.first.clone();
+        let second = setup.second.clone();
+        let participant = setup.participant.clone();
+        let foreign_page = setup.foreign_page.clone();
         for page in [&first, &second] {
             for principal in [&f.operator, &f.manager_a] {
                 let metadata = call(
@@ -1728,20 +1790,6 @@ mod connected_store {
         )
         .await;
 
-        // Both pages below are valid and readable to Manager A, but their
-        // retained dispatch/Attempt identities cannot be spliced together.
-        let foreign_target =
-            dispatch_fixture(&f, &descriptor, &binding, &module, "foreign-source").await;
-        let foreign_page = publish_page(
-            &f,
-            &descriptor,
-            &binding,
-            &module,
-            &foreign_target,
-            payload,
-            0..payload.len(),
-        )
-        .await;
         let foreign_bytes = call(
             store,
             &f.manager_a,
@@ -1751,7 +1799,7 @@ mod connected_store {
         .await;
         assert_eq!(
             foreign_bytes["content"],
-            std::str::from_utf8(payload).unwrap()
+            std::str::from_utf8(PAGES_PAYLOAD).unwrap()
         );
         denied(
             store,
@@ -1768,22 +1816,17 @@ mod connected_store {
             "ARTIFACT_SCOPE",
         )
         .await;
+        setup.fixture.close().await;
+    }
 
-        // Operator assembles; Manager A can read through the sources, while the
-        // unrelated Manager/Observer still cannot. Assembler is not ownership.
-        let assembly = write(
-            store,
-            &f.operator,
-            "artifact.assemble",
-            json!({
-                "page_refs":[first,second],"expected_sha256":model::digest(payload),
-            }),
-        )
-        .await;
-        let assembled_id = format!(
-            "assembled-{}",
-            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
-        );
+    #[tokio::test]
+    async fn store_authenticated_operator_assembly_inherits_sources() {
+        let setup = setup_result_pages().await;
+        let f = &setup.fixture;
+        let store = &f.owner.store;
+        let first = setup.first.clone();
+        let second = setup.second.clone();
+        let assembled_id = assemble_pages(f, &first, &second).await;
         for principal in [&f.operator, &f.manager_a] {
             let metadata = call(
                 store,
@@ -1811,7 +1854,10 @@ mod connected_store {
                 }),
             )
             .await;
-            assert_eq!(bytes["content"], std::str::from_utf8(payload).unwrap());
+            assert_eq!(
+                bytes["content"],
+                std::str::from_utf8(PAGES_PAYLOAD).unwrap()
+            );
             assert_closed_artifact(&bytes);
         }
         for principal in [&f.manager_b, &f.observer] {
@@ -1854,11 +1900,21 @@ mod connected_store {
             store,
             &f.manager_a,
             "artifact.read",
-            json!({"artifact_id":assembled_id,"length_bytes":split}),
+            json!({"artifact_id":assembled_id,"length_bytes":PAGES_SPLIT}),
         )
         .await;
         assert_eq!(prefix["eof"], false);
-        assert_eq!(prefix["byte_length"], split);
+        assert_eq!(prefix["byte_length"], PAGES_SPLIT);
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_authenticated_gm_assembly_and_former_gm_loss() {
+        let setup = setup_result_pages().await;
+        let f = &setup.fixture;
+        let store = &f.owner.store;
+        let first = setup.first.clone();
+        let second = setup.second.clone();
 
         // An unrelated Manager can assemble only while an independent current-GM
         // source grant exists. Losing it leaves the caller receipt readable but
@@ -1877,7 +1933,7 @@ mod connected_store {
             &f.manager_b,
             "artifact.assemble",
             json!({
-                "page_refs":[first,second],"expected_sha256":model::digest(payload),
+                "page_refs":[first,second],"expected_sha256":model::digest(PAGES_PAYLOAD),
             }),
         )
         .await;
@@ -1892,7 +1948,10 @@ mod connected_store {
             json!({"artifact_id":gm_assembled_id,"length_bytes":65536}),
         )
         .await;
-        assert_eq!(gm_bytes["content"], std::str::from_utf8(payload).unwrap());
+        assert_eq!(
+            gm_bytes["content"],
+            std::str::from_utf8(PAGES_PAYLOAD).unwrap()
+        );
         write(
             store,
             &f.operator,
@@ -1935,8 +1994,18 @@ mod connected_store {
         .await;
         assert_eq!(
             source_owner_bytes["content"],
-            std::str::from_utf8(payload).unwrap()
+            std::str::from_utf8(PAGES_PAYLOAD).unwrap()
         );
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_authenticated_damaged_page_metadata_fail_closed() {
+        let setup = setup_result_pages().await;
+        let f = &setup.fixture;
+        let store = &f.owner.store;
+        let first = setup.first.clone();
+        let second = setup.second.clone();
 
         let second_page_id = second.clone();
         let (original_length, original_digest, original_metadata): (i64, String, String) =
@@ -1954,7 +2023,7 @@ mod connected_store {
         store.run(move |db| {
             let changed = db.execute(
                 "UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.offset_bytes',?2) WHERE artifact_id=?1",
-                params![overlap_page, split as i64 - 1],
+                params![overlap_page, PAGES_SPLIT as i64 - 1],
             )?;
             assert_eq!(changed, 1);
             Ok(())
@@ -2078,6 +2147,17 @@ mod connected_store {
             })
             .await
             .unwrap();
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_authenticated_damaged_producer_breaks_parts_and_assembly() {
+        let setup = setup_result_pages().await;
+        let f = &setup.fixture;
+        let store = &f.owner.store;
+        let first = setup.first.clone();
+        let second = setup.second.clone();
+        let assembled_id = assemble_pages(f, &first, &second).await;
 
         // SQL damages one existing public page only after the entire chain was
         // admitted and read. Even the verified Operator must fail provenance
@@ -2101,8 +2181,6 @@ mod connected_store {
         .await;
         denied_assembly_has_no_output(&f, &f.operator, &[first, second], "OBJECT_SCOPE_DAMAGED")
             .await;
-        f.close().await;
-        })
-        .await;
+        setup.fixture.close().await;
     }
 }
