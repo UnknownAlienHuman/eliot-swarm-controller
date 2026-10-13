@@ -6943,6 +6943,8 @@ mod automation_transfer_tests;
 #[cfg(test)]
 mod capacity_tests;
 #[cfg(test)]
+mod contract_decision_public_tests;
+#[cfg(test)]
 mod core_failure_tests;
 #[cfg(test)]
 mod gm_automation_recovery_tests;

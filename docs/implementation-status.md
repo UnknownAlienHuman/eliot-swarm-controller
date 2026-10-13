@@ -142,7 +142,8 @@ writes remain readback-only. Goal Accepted/Applied outcomes require exact native
 admission; Rejected/Unknown outcomes retain errors without success evidence.
 Truthful terminal producer coverage remains limited to Codex/OpenCode.
 
-Contract `ratify/reject` is **not integrated or publicly exposed**. Frozen V1
+At this 2026-10-06 closeout, contract `ratify/reject` was not yet integrated.
+Current main now exposes the typed producer; focused public-path qualification remains tracked in PR #58. Frozen V1
 and incomplete private V2 candidates are preserved for continuation. I6 Git
 inspection, the remaining Thread lifecycle, cross-adapter Goal parity, broader
 automatic GitHub effects and native qualification remain unfinished. No further
