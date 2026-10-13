@@ -129,7 +129,7 @@ const fn mutation(
 /// classification plus the CLI's
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 pub static TOOLS: &[(bool, ToolSpec)] = &TOOL_ITEMS;
-static TOOL_ITEMS: [(bool, ToolSpec); 158] = [
+static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
     // Read-only methods.
     read(
         "swarm.tools.search",
