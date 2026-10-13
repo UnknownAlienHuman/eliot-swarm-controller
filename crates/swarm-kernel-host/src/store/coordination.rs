@@ -3726,15 +3726,66 @@ fn mailbox_position_key(scope: &str, recipient: &str, position: i64, operation_i
     )
 }
 
-/// One bounded sweep over existing legacy locators. The temporary checkpoint
-/// advances over every examined row, including damage, and is removed at the
-/// end of the range. Inserts, retires and checkpoint changes commit together.
+/// One bounded sweep over existing legacy locators. The scoped hint advances
+/// over every examined row and retains completion plus unresolved damage.
+/// Legacy locator changes invalidate the hint; evidence-only repairs explicitly
+/// discard it. Inserts, retires and hint changes commit together.
 /// The returned checkpoint means order is still unknown: no inbox items may
 /// be exposed. Remaining legacy rows are damage until a later sweep can
 /// normalize them; only validated v2 locators ever deliver messages.
 struct InboxNormalization {
     next: Option<String>,
     damaged: usize,
+}
+
+// Invalidate only a scoped legacy sweep affected by changed locator bytes.
+// These triggers retain no delivery index and cannot authorize an item. Ordinary
+// v2 writes and same-byte updates do not rearm known legacy poison. A repair to
+// Observation/Operation evidence or a v2 twin must also delete its scoped hint.
+fn install_mailbox_normalization_invalidation(tx: &Transaction<'_>) -> Result<()> {
+    // Mailbox keys are fixed namespace + scope + hex recipient + locator.
+    // Extract through the recipient colon, then use SQLite hex to address the
+    // same hint key as keys::key_component. Each event does point lookups only.
+    let hint = |row: &str| {
+        format!(
+            "'coordination:mailbox-normalization:'||lower(hex(substr({row}.key,1,\
+             21+instr(substr({row}.key,22),':')+\
+             instr(substr({row}.key,22+instr(substr({row}.key,22),':')),':'))))"
+        )
+    };
+    let old_hint = hint("OLD");
+    let new_hint = hint("NEW");
+    tx.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS mailbox_normalization_legacy_insert
+         AFTER INSERT ON meta WHEN NEW.key LIKE 'coordination:mailbox:%'
+         BEGIN
+           DELETE FROM meta
+           WHERE key={new_hint}
+             AND NEW.key>=json_extract(value_json,'$.prefix')
+             AND NEW.key<json_extract(value_json,'$.prefix')||'v';
+         END;
+         CREATE TRIGGER IF NOT EXISTS mailbox_normalization_legacy_delete
+         AFTER DELETE ON meta WHEN OLD.key LIKE 'coordination:mailbox:%'
+         BEGIN
+           DELETE FROM meta
+           WHERE key={old_hint}
+             AND OLD.key>=json_extract(value_json,'$.prefix')
+             AND OLD.key<json_extract(value_json,'$.prefix')||'v';
+         END;
+         CREATE TRIGGER IF NOT EXISTS mailbox_normalization_legacy_update
+         AFTER UPDATE OF key,value_json ON meta
+         WHEN (OLD.key LIKE 'coordination:mailbox:%' OR NEW.key LIKE 'coordination:mailbox:%')
+           AND (OLD.key<>NEW.key OR OLD.value_json<>NEW.value_json)
+         BEGIN
+           DELETE FROM meta
+           WHERE key IN ({old_hint},{new_hint})
+             AND ((OLD.key>=json_extract(value_json,'$.prefix')
+                   AND OLD.key<json_extract(value_json,'$.prefix')||'v')
+               OR (NEW.key>=json_extract(value_json,'$.prefix')
+                   AND NEW.key<json_extract(value_json,'$.prefix')||'v'));
+         END;"
+    ))?;
+    Ok(())
 }
 
 fn normalize_legacy_mailbox_indexes(
@@ -3750,6 +3801,32 @@ fn normalize_legacy_mailbox_indexes(
         "coordination:mailbox-normalization:{}",
         keys::key_component(&prefix),
     );
+    // Completion is a scheduling hint, not an ordering position. The reader
+    // still validates each v2 item against its exact retained Observation.
+    // Keep known unresolved damage visible without rewriting the hint on reads.
+    if let Some(record) = meta(db, &checkpoint_key)?
+        && record["state"] == "complete"
+    {
+        if record["prefix"].as_str() != Some(prefix.as_str()) {
+            return Err(Error::new(
+                "INBOX_INDEX_DAMAGED",
+                "completed mailbox sweep scope is invalid",
+            ));
+        }
+        let damaged = record["damaged_count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| {
+                Error::new(
+                    "INBOX_INDEX_DAMAGED",
+                    "completed mailbox sweep damage count is invalid",
+                )
+            })?;
+        return Ok(InboxNormalization {
+            next: None,
+            damaged,
+        });
+    }
     // Pure v2 mailboxes do not need a write transaction on every read.
     if !db.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key>=?1 AND key<?2) \
@@ -3763,6 +3840,7 @@ fn normalize_legacy_mailbox_indexes(
         });
     }
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    install_mailbox_normalization_invalidation(&tx)?;
     let checkpoint = meta(&tx, &checkpoint_key)?;
     let mut damaged = match checkpoint.as_ref() {
         None => 0,
@@ -3899,10 +3977,10 @@ fn normalize_legacy_mailbox_indexes(
     }
     let next = if rows.len() > bound as usize {
         let key = rows[bound as usize - 1].0.clone();
-        set_meta(&tx, &checkpoint_key, &json!({"after_key":key,"damaged_count":damaged}))?;
+        set_meta(&tx, &checkpoint_key, &json!({"prefix":prefix,"state":"pending", "after_key":key,"damaged_count":damaged}))?;
         Some(key)
     } else {
-        tx.execute("DELETE FROM meta WHERE key=?1", [&checkpoint_key])?;
+        set_meta(&tx, &checkpoint_key, &json!({"prefix":prefix,"state":"complete","after_key":null,"damaged_count":damaged}))?;
         None
     };
     tx.commit()?;

@@ -2154,7 +2154,9 @@ async fn coordination_inbox_withholds_items_until_more_than_64_legacy_rows_are_n
     assert_eq!(got, ids[51..].iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(tail["coverage"], "complete");
     owner.store.run(move |db| {
-        assert!(meta(db, &checkpoint_key)?.is_none());
+        let complete = meta(db, &checkpoint_key)?.unwrap();
+        assert_eq!(complete["state"], "complete");
+        assert_eq!(complete["damaged_count"], 0);
         Ok(())
     }).await.unwrap();
     owner.close().await.unwrap();
@@ -2165,7 +2167,7 @@ async fn coordination_inbox_withholds_items_until_more_than_64_legacy_rows_are_n
 async fn coordination_inbox_normalization_advances_past_damaged_legacy_prefix() {
     let (owner, directory, subject, sender, recipient) =
         start_inbox_participants("inbox-normalization-damage").await;
-    let (ids, _) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 2).await;
+    let (ids, _) = retain_reversed_legacy_inbox(&owner.store, &subject, &sender, &recipient, 6).await;
     let prefix = crate::coordination::mailbox_prefix(
         &crate::coordination::scope_id(&subject.task_id, 1, &subject.attempt_id).unwrap(),
         &recipient.client_id,
@@ -2185,20 +2187,71 @@ async fn coordination_inbox_normalization_advances_past_damaged_legacy_prefix() 
     assert_eq!(gap["items"], json!([]));
     assert_eq!(gap["next_after_key"], damaged[35]);
     assert!(gap["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "damaged_mailbox_indexes" && entry["count"] == 36));
-    // A new bounded damage sweep must preserve the delivery recovery cut.
-    let resumed_pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_key":gap["next_after_key"]})).await.unwrap();
-    assert_eq!(resumed_pending["items"], json!([]));
-    assert_eq!(resumed_pending["next_after_key"], gap["next_after_key"]);
-    let first = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_key":resumed_pending["next_after_key"]})).await.unwrap();
+    let checkpoint_key = format!("coordination:mailbox-normalization:{}", crate::coordination::key_component(&prefix));
+    let completed: (String, i64) = owner.store.run({
+        let checkpoint_key = checkpoint_key.clone();
+        move |db| {
+            let raw: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&checkpoint_key], |row| row.get(0))?;
+            let record: Value = serde_json::from_str(&raw)?;
+            assert_eq!(record["state"], "complete");
+            assert_eq!(record["damaged_count"], 70);
+            let changes = db.query_row("SELECT total_changes()", [], |row| row.get(0))?;
+            Ok((raw, changes))
+        }
+    }).await.unwrap();
+    // Retained poison stays a source gap, never a reason to restart the sweep.
+    let first = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_key":gap["next_after_key"]})).await.unwrap();
     assert_eq!(first["items"][0]["operation_id"], ids[0]);
-    // An Operation cursor also stays unchanged while normalization is pending.
-    let operation_pending = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":first["next_after"]})).await.unwrap();
-    assert_eq!(operation_pending["items"], json!([]));
-    assert_eq!(operation_pending["next_after"], ids[0]);
-    let second = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":1,"after_operation_id":operation_pending["next_after"]})).await.unwrap();
-    assert_eq!(second["items"][0]["operation_id"], ids[1]);
-    assert_eq!(second["coverage"], "partial");
-    assert!(second["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "legacy_mailbox_normalization_damage" && entry["count"] == 70));
+    let mut after = first["next_after"].clone();
+    for expected in ids.iter().skip(1) {
+        let page = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":after})).await.unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["operation_id"].as_str(), Some(expected.as_str()));
+        assert_eq!(page["coverage"], "partial");
+        assert!(page["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "legacy_mailbox_normalization_damage" && entry["count"] == 70));
+        assert!(!page["gaps"].as_array().unwrap().iter().any(|entry| entry["kind"] == "inbox_normalization_pending"));
+        after = page["next_after"].clone();
+    }
+    let empty = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":after})).await.unwrap();
+    assert_eq!(empty["items"], json!([]));
+    assert_eq!(empty["coverage"], "partial");
+    owner.store.run({
+        let checkpoint_key = checkpoint_key.clone();
+        move |db| {
+            let raw: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&checkpoint_key], |row| row.get(0))?;
+            let changes: i64 = db.query_row("SELECT total_changes()", [], |row| row.get(0))?;
+            assert_eq!((raw, changes), completed);
+            Ok(())
+        }
+    }).await.unwrap();
+    // Neither same-byte legacy updates nor new ordinary v2 deliveries rearm.
+    owner.store.run({
+        let key = damaged[0].clone();
+        let checkpoint_key = checkpoint_key.clone();
+        move |db| {
+            db.execute("UPDATE meta SET value_json=value_json WHERE key=?1", [&key])?;
+            assert_eq!(meta(db, &checkpoint_key)?.unwrap()["state"], "complete");
+            Ok(())
+        }
+    }).await.unwrap();
+    let sent = owner.store.call(sender, "coordination.send".into(), json!({"client_request_id":"v2-after-poison-completion","recipient":recipient.client_id,"body":{"fresh":true}})).await.unwrap();
+    let fresh = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":ids.last().unwrap()})).await.unwrap();
+    assert_eq!(fresh["items"][0]["operation_id"], sent["operation_id"]);
+    // A meaningful scoped legacy change does rearm exactly once.
+    owner.store.run({
+        let key = damaged[0].clone();
+        let checkpoint_key = checkpoint_key.clone();
+        move |db| {
+            set_meta(db, &key, &json!({"damaged":"changed"}))?;
+            assert!(meta(db, &checkpoint_key)?.is_none());
+            Ok(())
+        }
+    }).await.unwrap();
+    let rearmed = owner.store.call(recipient.clone(), "coordination.inbox".into(), json!({"limit":1,"after_operation_id":ids[0]})).await.unwrap();
+    assert_eq!(rearmed["items"], json!([]));
+    assert_eq!(rearmed["gaps"][0]["kind"], "inbox_normalization_pending");
+    let complete = owner.store.call(recipient, "coordination.inbox".into(), json!({"limit":1,"after_operation_id":ids[0]})).await.unwrap();
+    assert_eq!(complete["items"][0]["operation_id"], ids[1]);
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -2682,10 +2735,17 @@ async fn mailbox_mixed_legacy_v2_canonical_order_with_bounded_normalization() {
     owner
         .store
         .run({
+            let prefix = prefix.clone();
             move |db| {
                 db.execute(
                     "UPDATE meta SET value_json=?1 WHERE key=?2",
                     rusqlite::params![target_json, target_key],
+                )?;
+                // Evidence/twin repair explicitly invalidates only its scoped
+                // scheduling hint; it does not rewrite Operation authority.
+                db.execute(
+                    "DELETE FROM meta WHERE key=?1",
+                    [format!("coordination:mailbox-normalization:{}", crate::coordination::key_component(&prefix))],
                 )?;
                 Ok(())
             }
