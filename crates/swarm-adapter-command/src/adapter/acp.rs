@@ -3259,7 +3259,9 @@ fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Va
     }
     let snapshot = json!({"schema_version":1,"options":snapshots});
     if serde_json::to_vec(&snapshot)?.len() as u64 > MAX_RECORD_BYTES {
-        return Err(invalid("ACP config option snapshot exceeds its record bound"));
+        return Err(invalid(
+            "ACP config option snapshot exceeds its record bound",
+        ));
     }
     Ok(snapshot)
 }

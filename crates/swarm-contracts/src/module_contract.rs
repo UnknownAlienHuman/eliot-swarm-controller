@@ -490,7 +490,7 @@ mod tests {
         );
         assert!(value["artifact"].get("build_id").is_none());
         assert!(value["command_schemas"][0].get("sha256").is_none());
-        assert_eq!(descriptor.enabled, false);
+        assert!(!descriptor.enabled);
         assert!(descriptor.launch.executable_sha256.is_none());
     }
 

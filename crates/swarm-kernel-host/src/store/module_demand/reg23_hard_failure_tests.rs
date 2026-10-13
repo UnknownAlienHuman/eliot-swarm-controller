@@ -507,13 +507,12 @@ fn cursor_page_ignores_poisoned_future_page_scope() {
     let mut f = Fixture::new();
     f.add_binding("a-poison", true);
     f.add_binding("z-healthy", true);
-    f.db
-        .execute_batch(
-            "CREATE TRIGGER reg23_fail_poison_intent BEFORE INSERT ON owned_service_starts
+    f.db.execute_batch(
+        "CREATE TRIGGER reg23_fail_poison_intent BEFORE INSERT ON owned_service_starts
              WHEN NEW.binding_id='a-poison'
              BEGIN SELECT RAISE(ABORT,'reg23_poison_intent_failure'); END;",
-        )
-        .unwrap();
+    )
+    .unwrap();
     // The cursor excludes the poisoned open from the requested page, so the
     // page-local preparation must not touch that future-page subject.
     let cursor = module_demand::ModuleDemandCursor {
@@ -526,8 +525,7 @@ fn cursor_page_ignores_poisoned_future_page_scope() {
     assert_eq!(snapshot.demands[0].binding_id, "z-healthy");
     assert_eq!(f.intent_count(), 1);
     assert!(f.db.is_autocommit());
-    f.db
-        .execute_batch("DROP TRIGGER reg23_fail_poison_intent;")
+    f.db.execute_batch("DROP TRIGGER reg23_fail_poison_intent;")
         .unwrap();
     let full = f.pending().unwrap();
     assert_eq!(full.demands.len(), 2);
@@ -539,20 +537,18 @@ fn current_page_poison_aborts_page_and_rolls_back_earlier_intent() {
     let mut f = Fixture::new();
     f.add_binding("a-healthy", true);
     f.add_binding("z-poison", true);
-    f.db
-        .execute_batch(
-            "CREATE TRIGGER reg23_fail_poison_intent BEFORE INSERT ON owned_service_starts
+    f.db.execute_batch(
+        "CREATE TRIGGER reg23_fail_poison_intent BEFORE INSERT ON owned_service_starts
              WHEN NEW.binding_id='z-poison'
              BEGIN SELECT RAISE(ABORT,'reg23_poison_intent_failure'); END;",
-        )
-        .unwrap();
+    )
+    .unwrap();
     let error = f.pending().unwrap_err();
     assert_eq!(error.code, "STORE_ERROR");
     assert!(error.message.contains("reg23_poison_intent_failure"));
     assert_eq!(f.intent_count(), 0);
     assert!(f.db.is_autocommit());
-    f.db
-        .execute_batch("DROP TRIGGER reg23_fail_poison_intent;")
+    f.db.execute_batch("DROP TRIGGER reg23_fail_poison_intent;")
         .unwrap();
     let snapshot = f.pending().unwrap();
     assert_eq!(snapshot.demands.len(), 2);

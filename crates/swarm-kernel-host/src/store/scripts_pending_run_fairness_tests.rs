@@ -368,9 +368,8 @@ async fn reg142_install_cursor_counter(store: &Store) {
 async fn reg142_cursor_writes(store: &Store) -> i64 {
     store
         .run(|db| {
-            let count: i64 = db.query_row("SELECT n FROM reg142_cursor_writes", [], |row| {
-                row.get(0)
-            })?;
+            let count: i64 =
+                db.query_row("SELECT n FROM reg142_cursor_writes", [], |row| row.get(0))?;
             Ok(count)
         })
         .await
@@ -443,7 +442,9 @@ async fn reg142_single_subject_writes_no_loop() {
     assert_eq!(states.len(), 1);
     assert_eq!(states[0].run_state, "sending");
     assert_eq!(states[0].operation_state, "sending");
-    let cursor = pending_run_cursor(&owner.store).await.expect("cursor is set");
+    let cursor = pending_run_cursor(&owner.store)
+        .await
+        .expect("cursor is set");
     assert_eq!(cursor["run_id"].as_str(), Some(states[0].run_id.as_str()));
     assert_eq!(reg142_cursor_writes(&owner.store).await, 1);
 
@@ -489,9 +490,7 @@ async fn reg142_install_cursor_abort(store: &Store) {
 }
 
 async fn reg142_operation_result(store: &Store, operation_id: &str) -> String {
-    let sql = format!(
-        "SELECT result_json FROM operations WHERE operation_id = '{operation_id}'"
-    );
+    let sql = format!("SELECT result_json FROM operations WHERE operation_id = '{operation_id}'");
     store
         .run(move |db| {
             let raw: Option<String> = db.query_row(&sql, [], |row| row.get(0))?;
@@ -539,10 +538,14 @@ async fn reg142_failure_before_row1_keeps_previous_cursor() {
         .await
         .expect("retry converges after the fault is removed");
     let states = stored_run_states(&owner.store).await;
-    assert!(states
-        .iter()
-        .all(|run| run.run_state == "failed" && run.operation_state == "settled"));
-    let cursor = pending_run_cursor(&owner.store).await.expect("cursor is set");
+    assert!(
+        states
+            .iter()
+            .all(|run| run.run_state == "failed" && run.operation_state == "settled")
+    );
+    let cursor = pending_run_cursor(&owner.store)
+        .await
+        .expect("cursor is set");
     assert_eq!(cursor["run_id"].as_str(), Some(row2.run_id.as_str()));
 
     owner.close().await.expect("close Store");
@@ -605,7 +608,9 @@ async fn reg142_cursor_write_failure_keeps_subject_truth() {
         reg142_operation_result(&owner.store, &row1.operation_id).await,
         result1
     );
-    let cursor = pending_run_cursor(&owner.store).await.expect("cursor is set");
+    let cursor = pending_run_cursor(&owner.store)
+        .await
+        .expect("cursor is set");
     assert_eq!(cursor["run_id"].as_str(), Some(row2.run_id.as_str()));
 
     owner.close().await.expect("close Store");
@@ -674,12 +679,7 @@ async fn reg142_reopen(directory: &std::path::Path) -> StoreOwner {
         .expect("reopen Store")
 }
 
-async fn reg142_admit_many(
-    store: &Store,
-    manager: &Principal,
-    first_index: usize,
-    count: usize,
-) {
+async fn reg142_admit_many(store: &Store, manager: &Principal, first_index: usize, count: usize) {
     for index in first_index..first_index + count {
         let (_task_id, attempt_id) = create_current_task_attempt(store, manager, index).await;
         admit_script_run(store, manager, &attempt_id, index).await;
@@ -714,7 +714,9 @@ async fn reg142_row2_hard_failure_keeps_cursor_at_row1() {
         .expect_err("row 2 hard failure must propagate");
     assert_eq!(err.code, "STORE_ERROR");
 
-    let cursor = pending_run_cursor(&owner.store).await.expect("cursor is set");
+    let cursor = pending_run_cursor(&owner.store)
+        .await
+        .expect("cursor is set");
     assert_eq!(cursor["run_id"].as_str(), Some(row1.run_id.as_str()));
     assert_eq!(cursor["created_at_ms"].as_i64(), Some(row1.created_at_ms));
     assert_ne!(cursor["run_id"].as_str(), Some(row64.run_id.as_str()));
@@ -765,8 +767,14 @@ async fn reg142_row2_hard_failure_keeps_cursor_at_row1() {
         cursor["run_id"].as_str(),
         recovery_page.last().map(String::as_str)
     );
-    assert_eq!(reg142_incident_count(&reopened.store, &row1.run_id).await, 1);
-    assert_eq!(reg142_incident_count(&reopened.store, &row2.run_id).await, 1);
+    assert_eq!(
+        reg142_incident_count(&reopened.store, &row1.run_id).await,
+        1
+    );
+    assert_eq!(
+        reg142_incident_count(&reopened.store, &row2.run_id).await,
+        1
+    );
 
     reopened
         .store
@@ -775,9 +783,11 @@ async fn reg142_row2_hard_failure_keeps_cursor_at_row1() {
         .expect("drain pass processes the newer admissions");
     let states = stored_run_states(&reopened.store).await;
     assert_eq!(states.len(), ADMITTED_RUN_COUNT + 10);
-    assert!(states
-        .iter()
-        .all(|run| run.run_state == "failed" && run.operation_state == "settled"));
+    assert!(
+        states
+            .iter()
+            .all(|run| run.run_state == "failed" && run.operation_state == "settled")
+    );
     let last = states.last().expect("ordered states").clone();
     let cursor = pending_run_cursor(&reopened.store)
         .await
