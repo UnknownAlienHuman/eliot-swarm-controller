@@ -2175,6 +2175,15 @@ async fn open_session(
             "ACP effective model did not match the requested model; the retained session requires readback",
         ));
     }
+    let config_snapshot = session_config_options_snapshot(&options).map_err(|error| {
+        Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            format!(
+                "native ACP configuration options could not be retained: {}",
+                error.code
+            ),
+        )
+    })?;
     journal
         .save_session(&json!({
             "schema_version":1,
@@ -2188,7 +2197,8 @@ async fn open_session(
             "workspace":session.workspace,
             "requested_model":requested_model,
             "effective_model":requested_model,
-            "model_readback":readback,
+            "model_readback":requested_model,
+            "config_options":config_snapshot,
             "native_session_state":"open",
             "native_close_capability":session.close_supported,
             "agent_info":features.agent_info,
@@ -2304,13 +2314,23 @@ async fn restore_session(
             "ACP session/load failed; original TaskPrompt will not be replayed",
         )
     })?;
-    let readback = serde_json::to_value(loaded.config_options.unwrap_or_default())?;
+    let config_options = loaded.config_options.unwrap_or_default();
+    let readback = serde_json::to_value(&config_options)?;
     if !model_current_value_matches(&readback, &model_id) {
         return Err(Error::new(
             "RECOVERY_REQUIRED",
             "ACP session/load did not read back the retained exact model",
         ));
     }
+    let config_snapshot = session_config_options_snapshot(&config_options).map_err(|error| {
+        Error::new(
+            "RECOVERY_REQUIRED",
+            format!(
+                "ACP session/load configuration options could not be retained: {}",
+                error.code
+            ),
+        )
+    })?;
     journal.record_effect(
         command,
         "session/load",
@@ -2319,7 +2339,8 @@ async fn restore_session(
             "native_session_id":session_id,
             "native_root_id":session_id,
             "native_scope_key":session_id,
-            "model_readback":readback,
+            "model_readback":model_id.clone(),
+            "config_options":config_snapshot.clone(),
             "history_updates":capture.lock().map(|capture| capture.history_updates).unwrap_or(0),
             "native_replay":false
         }),
@@ -2349,7 +2370,8 @@ async fn restore_session(
     updated["native_close_capability"] = json!(close_supported);
     updated["agent_info"] = features.agent_info.clone().unwrap_or(Value::Null);
     updated["agent_capabilities"] = features.capabilities.clone();
-    updated["model_readback"] = readback;
+    updated["model_readback"] = json!(model_id.clone());
+    updated["config_options"] = config_snapshot;
     updated["family_departure_claimed"] = json!(false);
     journal.save_session(&updated)?;
     Ok(session)
@@ -3198,6 +3220,47 @@ async fn deliver_outcome(
     journal.acknowledge(&outcome.operation_id, &hash, ack)
 }
 
+fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Value> {
+    let mut snapshots = Vec::with_capacity(options.len());
+    for option in options {
+        let id = option.id.to_string();
+        let snapshot = match &option.kind {
+            SessionConfigKind::Select(select) => {
+                let allowed_value_ids = match &select.options {
+                    SessionConfigSelectOptions::Ungrouped(values) => values
+                        .iter()
+                        .map(|value| value.value.to_string())
+                        .collect::<Vec<_>>(),
+                    SessionConfigSelectOptions::Grouped(groups) => groups
+                        .iter()
+                        .flat_map(|group| group.options.iter())
+                        .map(|value| value.value.to_string())
+                        .collect::<Vec<_>>(),
+                    _ => return Err(invalid("ACP config option grouping is unsupported")),
+                };
+                json!({
+                    "id":id,
+                    "kind":"select",
+                    "allowed_value_ids":allowed_value_ids,
+                    "current_value_id":select.current_value.to_string()
+                })
+            }
+            SessionConfigKind::Boolean(boolean) => json!({
+                "id":id,
+                "kind":"boolean",
+                "current_value":boolean.current_value
+            }),
+            _ => return Err(invalid("ACP config option kind is unsupported")),
+        };
+        snapshots.push(snapshot);
+    }
+    let snapshot = json!({"schema_version":1,"options":snapshots});
+    if serde_json::to_vec(&snapshot)?.len() as u64 > MAX_RECORD_BYTES {
+        return Err(invalid("ACP config option snapshot exceeds its record bound"));
+    }
+    Ok(snapshot)
+}
+
 fn model_value_available(options: &Value, requested: &str) -> bool {
     options.as_array().is_some_and(|options| {
         options.iter().any(|option| {
@@ -3756,6 +3819,88 @@ mod tests {
             super::PermissionOptionKind::AllowOnce,
         )?;
         assert_eq!(journal_effect_count(&state, &once_command)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn config_option_snapshot_keeps_only_typed_ids_and_values() -> super::Result<()> {
+        let options: Vec<super::SessionConfigOption> = serde_json::from_value(json!([
+            {
+                "id":"model",
+                "name":"Model",
+                "category":"model",
+                "description":"display-only model label",
+                "type":"select",
+                "currentValue":"model-a",
+                "options":[
+                    {"value":"model-a","name":"Model A","description":"label A","_meta":{"vendor":"drop"}},
+                    {"value":"model-b","name":"Model B","_meta":{"vendor":"drop"}}
+                ],
+                "_meta":{"vendor":"drop"}
+            },
+            {
+                "id":"thought",
+                "name":"Thought level",
+                "category":"thought_level",
+                "type":"select",
+                "currentValue":"low",
+                "options":[
+                    {"group":"levels","name":"Levels","options":[
+                        {"value":"low","name":"Low","_meta":{"vendor":"drop"}},
+                        {"value":"high","name":"High"}
+                    ]}
+                ],
+                "_meta":{"vendor":"drop"}
+            },
+            {
+                "id":"fast-mode",
+                "name":"Fast mode",
+                "type":"boolean",
+                "currentValue":true,
+                "_meta":{"vendor":"drop"}
+            }
+        ]))?;
+        let snapshot = super::session_config_options_snapshot(&options)?;
+        assert_eq!(
+            snapshot,
+            json!({
+                "schema_version":1,
+                "options":[
+                    {
+                        "id":"model",
+                        "kind":"select",
+                        "allowed_value_ids":["model-a","model-b"],
+                        "current_value_id":"model-a"
+                    },
+                    {
+                        "id":"thought",
+                        "kind":"select",
+                        "allowed_value_ids":["low","high"],
+                        "current_value_id":"low"
+                    },
+                    {
+                        "id":"fast-mode",
+                        "kind":"boolean",
+                        "current_value":true
+                    }
+                ]
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_option_snapshot_respects_record_byte_bound() -> super::Result<()> {
+        let oversized_id = "x".repeat(MAX_RECORD_BYTES as usize);
+        let options = [super::SessionConfigOption::boolean(
+            oversized_id,
+            "toggle",
+            true,
+        )];
+        assert_error_code(
+            super::session_config_options_snapshot(&options),
+            "ADAPTER_EVIDENCE_INVALID",
+        );
         Ok(())
     }
 
