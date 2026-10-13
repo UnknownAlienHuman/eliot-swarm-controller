@@ -2581,7 +2581,7 @@ mod connected_store {
                             candidate,
                             format!("cache-{check_id}"),
                             format!("check-target:{check_id}"),
-                            "{"profile_id":"scope-check-profile","profile_revision":"1"}",
+                            r#"{"profile_id":"scope-check-profile","profile_revision":"1"}"#,
                         ],
                     )?;
                 }
