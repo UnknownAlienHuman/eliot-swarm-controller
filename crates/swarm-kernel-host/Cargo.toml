@@ -49,6 +49,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
+swarm-process = { path = "../swarm-process", features = ["test-support"] }
 swarm-mcp = { path = "../swarm-mcp" }
 swarm-antigravity-adapter = { path = "../../modules/antigravity-rust" }
 

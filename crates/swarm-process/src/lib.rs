@@ -11,6 +11,8 @@ pub mod jsonl;
 pub mod module_membership;
 pub mod module_owner;
 mod permissions;
+#[cfg(feature = "test-support")]
+pub use permissions::test_support;
 pub mod process_group;
 mod state_marker;
 

@@ -7482,3 +7482,7 @@ mod scripts_current_concilium_consumers;
 #[cfg(test)]
 #[path = "scripts_pending_run_fairness_tests.rs"]
 mod scripts_pending_run_fairness_tests;
+
+#[cfg(test)]
+#[path = "scripts_durable_publication_tests.rs"]
+mod scripts_durable_publication_tests;

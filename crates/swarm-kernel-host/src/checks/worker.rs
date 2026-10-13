@@ -2757,3 +2757,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(test)]
+#[path = "worker_durable_authority_tests.rs"]
+mod durable_authority_tests;

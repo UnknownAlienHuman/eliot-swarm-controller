@@ -6,6 +6,55 @@ use std::{
 };
 use swarm_contracts::error::{Error, Result};
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    use super::Result;
+    use std::{cell::RefCell, path::Path, rc::Rc};
+
+    type BarrierHook = Rc<dyn Fn(&Path) -> Result<()> + 'static>;
+
+    std::thread_local! {
+        static ACTIVE_BARRIER: RefCell<Option<BarrierHook>> = const { RefCell::new(None) };
+    }
+
+    /// Installs a barrier override on this thread until the returned fixture
+    /// guard is dropped. Separate tests and worker threads cannot race through
+    /// process-wide environment state.
+    #[must_use]
+    pub struct ScopedDurabilityBarrier {
+        previous: Option<BarrierHook>,
+    }
+
+    pub fn scoped_durability_barrier(
+        hook: impl Fn(&Path) -> Result<()> + 'static,
+    ) -> ScopedDurabilityBarrier {
+        let previous = ACTIVE_BARRIER
+            .with(|active| std::mem::replace(&mut *active.borrow_mut(), Some(Rc::new(hook))));
+        ScopedDurabilityBarrier { previous }
+    }
+
+    impl Drop for ScopedDurabilityBarrier {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            ACTIVE_BARRIER.with(|active| *active.borrow_mut() = previous);
+        }
+    }
+
+    pub(super) fn invoke(path: &Path) -> Option<Result<()>> {
+        let hook = ACTIVE_BARRIER.with(|active| active.borrow().clone());
+        hook.map(|hook| hook(path))
+    }
+}
+
+fn durability_barrier(path: &Path) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_support::invoke(path) {
+        return result;
+    }
+    sync_parent_directory(path)
+}
+
 /// Compare a retained regular-file handle with the current named file. Bytes,
 /// timestamps and length do not establish identity across atomic replacement.
 pub fn opened_regular_file_matches_path(file: &fs::File, path: &Path) -> Result<bool> {
@@ -93,7 +142,7 @@ pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
 /// before success. Windows uses a write-through move; this does not claim a
 /// Unix-equivalent parent-directory fsync.
 pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
-    write_private_new_with_barrier(path, data, sync_parent_directory)
+    write_private_new_with_barrier(path, data, durability_barrier)
 }
 
 fn write_private_new_with_barrier(
@@ -125,7 +174,7 @@ fn write_private_new_with_barrier(
 /// matching visible bytes alone never establish success. Other publication
 /// errors remain errors even if they left the target visible.
 pub fn write_private_exact(path: &Path, data: &[u8], maximum: u64) -> Result<()> {
-    write_private_exact_with_barrier(path, data, maximum, sync_parent_directory)
+    write_private_exact_with_barrier(path, data, maximum, durability_barrier)
 }
 
 fn write_private_exact_with_barrier(
@@ -154,7 +203,7 @@ fn write_private_exact_with_barrier(
 /// (opened for write access), with no claim of Unix directory-fsync equivalence.
 /// New Windows publication still uses the existing write-through move.
 pub fn read_private_durable(path: &Path, maximum: u64) -> Result<Vec<u8>> {
-    read_private_durable_with_barrier(path, maximum, None, sync_parent_directory)
+    read_private_durable_with_barrier(path, maximum, None, durability_barrier)
 }
 
 fn read_private_durable_with_barrier(
