@@ -2504,4 +2504,227 @@ mod connected_store {
         .await;
         f.close().await;
     }
+
+    // PR49 acceptance rows / PR51 row 4 CheckRun rows / PR52 evidence rows:
+    // the sponsored reviewer reads the exact assigned acceptance decision and
+    // CheckRun through public calls, while foreign, observer and unrelated
+    // callers stay outside scope. Retained rows are seeded directly like
+    // seed_review_subject does; no live admission is involved.
+    #[tokio::test]
+    async fn store_authenticated_acceptance_and_checkrun_reads_are_exact() {
+        let f = start().await;
+        let store = &f.owner.store;
+        let owner_id = f.manager_a.client_id.clone();
+        let subject = seed_review_subject(store, &owner_id, "evidence-a").await;
+        let foreign = seed_review_subject(store, &owner_id, "evidence-b").await;
+        let task_a = "task-review-evidence-a".to_owned();
+        let attempt_a = "attempt-review-evidence-a".to_owned();
+        let task_b = "task-review-evidence-b".to_owned();
+        let attempt_b = "attempt-review-evidence-b".to_owned();
+        let accept_a = "accept-op-evidence-a".to_owned();
+        let accept_b = "accept-op-evidence-b".to_owned();
+        let check_op_a = "check-op-evidence-a".to_owned();
+        let check_op_b = "check-op-evidence-b".to_owned();
+        let check_a = model::new_id();
+        let check_b = model::new_id();
+        let candidate_a = subject.candidate_ref.clone();
+        let candidate_b = foreign.candidate_ref.clone();
+        store
+            .run(move |db| {
+                for (accept_id, task_id, attempt_id) in
+                    [(&accept_a, &task_a, &attempt_a), (&accept_b, &task_b, &attempt_b)]
+                {
+                    let result = json!({
+                        "operation_id":accept_id,
+                        "outcome":"applied",
+                        "acceptance_operation_id":accept_id,
+                        "task_id":task_id,
+                        "attempt_id":attempt_id,
+                    });
+                    db.execute(
+                        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.accept',?4,'{}',?5,?6,'settled',?7,1,1,1,1)",
+                        params![
+                            accept_id,
+                            &owner_id,
+                            format!("accept-request-{accept_id}"),
+                            model::canonical(&json!({"client_request_id":format!("accept-request-{accept_id}")}))?,
+                            task_id,
+                            attempt_id,
+                            model::canonical(&result)?,
+                        ],
+                    )?;
+                }
+                for (check_id, check_op, attempt_id, candidate) in
+                    [
+                        (&check_a, &check_op_a, &attempt_a, &candidate_a),
+                        (&check_b, &check_op_b, &attempt_b, &candidate_b),
+                    ]
+                {
+                    let task_id = if attempt_id == &attempt_a { &task_a } else { &task_b };
+                    db.execute(
+                        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'check.run',?4,'{}',?5,?6,'settled','{}',1,1,1,1)",
+                        params![
+                            check_op,
+                            &owner_id,
+                            format!("check-request-{check_op}"),
+                            model::canonical(&json!({"client_request_id":format!("check-request-{check_op}")}))?,
+                            task_id,
+                            attempt_id,
+                        ],
+                    )?;
+                    db.execute(
+                        "INSERT INTO check_runs(check_id,operation_id,attempt_id,candidate_ref,cache_key,resource_key,spec_json,state,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',1)",
+                        params![
+                            check_id,
+                            check_op,
+                            attempt_id,
+                            candidate,
+                            format!("cache-{check_id}"),
+                            format!("check-target:{check_id}"),
+                            "{"profile_id":"scope-check-profile","profile_revision":"1"}",
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let reviewer_id = "scope-check-reviewer";
+        let reviewer_token = "scope-check-reviewer-token".to_owned();
+        let pending_scope = json!({
+            "review_assignment_id":null,
+            "task_id":task_a,
+            "attempt_id":attempt_a,
+            "task_revision":1,
+            "submission_ref":subject.submission_ref,
+            "candidate_ref":subject.candidate_ref,
+        });
+        write(
+            store,
+            &f.manager_a,
+            "coordination.participant.register",
+            json!({
+                "client_request_id":format!("register-{reviewer_id}"),
+                "client_id":reviewer_id,
+                "token_hash":model::digest(reviewer_token.as_bytes()),
+                "task_id":task_a,
+                "task_revision":1,
+                "attempt_id":attempt_a,
+                "participation_basis":{"kind":"sponsored_reviewer","review_scope":pending_scope},
+            }),
+        )
+        .await;
+        let assignment = write(
+            store,
+            &f.manager_a,
+            "review.assign",
+            json!({
+                "client_request_id":format!("assign-{reviewer_id}"),
+                "attempt_id":attempt_a,
+                "expected_revision":1,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "reviewer_client_id":reviewer_id,
+            }),
+        )
+        .await;
+        let assignment_id = assignment["review_assignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let reviewer = store
+            .authenticate(crate::model::Credential {
+                client_id: reviewer_id.into(),
+                token: reviewer_token,
+            })
+            .await
+            .unwrap();
+        let result = write(
+            store,
+            &reviewer,
+            "review.submit",
+            json!({
+                "client_request_id":format!("submit-{assignment_id}"),
+                "review_assignment_id":assignment_id,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "verdict":"pass",
+                "coverage":"complete",
+                "findings":[],
+                "evidence_refs":["evidence://review/r1"],
+            }),
+        )
+        .await;
+        assert_eq!(result["verdict"], "pass");
+
+        let acceptance = call(
+            store,
+            &reviewer,
+            "task.acceptance",
+            json!({"acceptance_operation_id":accept_a}),
+        )
+        .await;
+        assert_eq!(acceptance["outcome"], "applied");
+        assert_eq!(acceptance["acceptance_operation_id"], accept_a);
+        assert_eq!(acceptance["task_id"], task_a);
+        assert_eq!(acceptance["attempt_id"], attempt_a);
+        assert_eq!(acceptance["invalidated"], false);
+        let check = call(store, &reviewer, "check.get", json!({"check_id":check_a})).await;
+        assert_eq!(check["check_id"], check_a);
+        assert_eq!(check["operation_id"], check_op_a);
+        assert_eq!(check["attempt_id"], attempt_a);
+        assert_eq!(check["candidate_ref"], candidate_a);
+        assert_eq!(check["state"], "queued");
+
+        denied(
+            store,
+            &reviewer,
+            "task.acceptance",
+            json!({"acceptance_operation_id":accept_b}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &reviewer,
+            "check.get",
+            json!({"check_id":check_b}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "task.acceptance",
+            json!({"acceptance_operation_id":accept_a}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "check.get",
+            json!({"check_id":check_a}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "task.acceptance",
+            json!({"acceptance_operation_id":accept_a}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "check.get",
+            json!({"check_id":check_a}),
+            "NOT_FOUND",
+        )
+        .await;
+        f.close().await;
+    }
 }
