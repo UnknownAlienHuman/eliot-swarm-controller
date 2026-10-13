@@ -698,7 +698,7 @@ fn valid_reconcile_cursor(key: &str) -> bool {
     }
     let mut bytes = [0u8; 36];
     for index in 0..36 {
-        let Ok(byte) = u8::from_str_radix(&suffix[index..index + 2], 16) else {
+        let Ok(byte) = u8::from_str_radix(&suffix[index * 2..index * 2 + 2], 16) else {
             return false;
         };
         bytes[index] = byte;
