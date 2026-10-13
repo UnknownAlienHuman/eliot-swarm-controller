@@ -1250,8 +1250,13 @@ async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
     let ambiguous =
         retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
     assert_eq!(ambiguous["state"], "outcome_unknown");
-    let ambiguous_sent_at = ambiguous["sent_at_ms"].clone();
-    assert!(ambiguous_sent_at.is_number());
+    let ambiguous_sent_at = retained_forge_operations(&fixture.owner.store)
+        .await
+        .into_iter()
+        .find(|row| row.operation_id == operation_id)
+        .expect("the exact ambiguous effect owner remains retained")
+        .sent_at_ms;
+    assert!(ambiguous_sent_at.is_some());
     let ambiguous_result = ambiguous["result"].clone();
 
     // Rotate GM while the ambiguous effect is outstanding.
@@ -1334,7 +1339,15 @@ async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
     let continued_owner =
         retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
     assert_eq!(continued_owner["state"], "outcome_unknown");
-    assert_eq!(continued_owner["sent_at_ms"], ambiguous_sent_at);
+    assert_eq!(
+        retained_forge_operations(&fixture.owner.store)
+            .await
+            .into_iter()
+            .find(|row| row.operation_id == operation_id)
+            .unwrap()
+            .sent_at_ms,
+        ambiguous_sent_at
+    );
     assert_eq!(continued_owner["result"], ambiguous_result);
     assert_eq!(
         retained_effective_request(&fixture.owner.store, &operation_id).await,
@@ -1388,7 +1401,15 @@ async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
     let replayed_owner =
         retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
     assert_eq!(replayed_owner["state"], "outcome_unknown");
-    assert_eq!(replayed_owner["sent_at_ms"], ambiguous_sent_at);
+    assert_eq!(
+        retained_forge_operations(&fixture.owner.store)
+            .await
+            .into_iter()
+            .find(|row| row.operation_id == operation_id)
+            .unwrap()
+            .sent_at_ms,
+        ambiguous_sent_at
+    );
     assert_eq!(replayed_owner["result"], ambiguous_result);
 
     close_fixture(fixture).await;
