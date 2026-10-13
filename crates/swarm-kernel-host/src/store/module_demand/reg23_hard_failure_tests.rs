@@ -489,3 +489,72 @@ fn catalog_store_read_failure_stays_hard() {
     assert_eq!(error.code, "STORE_ERROR");
     assert!(f.db.is_autocommit());
 }
+
+#[test]
+fn empty_demand_returns_empty_snapshot_without_intents() {
+    let mut f = Fixture::new();
+    let snapshot = f.pending().unwrap();
+    assert!(snapshot.demands.is_empty());
+    assert!(snapshot.blocked.is_empty());
+    assert!(!snapshot.truncated);
+    assert!(snapshot.next_cursor.is_none());
+    assert_eq!(f.intent_count(), 0);
+    assert!(f.db.is_autocommit());
+}
+
+#[test]
+fn cursor_page_ignores_poisoned_future_page_scope() {
+    let mut f = Fixture::new();
+    f.add_binding("a-poison", true);
+    f.add_binding("z-healthy", true);
+    f.db
+        .execute_batch(
+            "CREATE TRIGGER reg23_fail_poison_intent BEFORE INSERT ON owned_service_starts
+             WHEN NEW.binding_id='a-poison'
+             BEGIN SELECT RAISE(ABORT,'reg23_poison_intent_failure'); END;",
+        )
+        .unwrap();
+    // The cursor excludes the poisoned open from the requested page, so the
+    // page-local preparation must not touch that future-page subject.
+    let cursor = module_demand::ModuleDemandCursor {
+        created_at_ms: 1,
+        operation_id: "a-poison-open".to_owned(),
+    };
+    let snapshot = module_demand::pending(&mut f.db, &f.config, Some(&cursor)).unwrap();
+    assert!(snapshot.blocked.is_empty(), "{:?}", snapshot.blocked);
+    assert_eq!(snapshot.demands.len(), 1);
+    assert_eq!(snapshot.demands[0].binding_id, "z-healthy");
+    assert_eq!(f.intent_count(), 1);
+    assert!(f.db.is_autocommit());
+    f.db
+        .execute_batch("DROP TRIGGER reg23_fail_poison_intent;")
+        .unwrap();
+    let full = f.pending().unwrap();
+    assert_eq!(full.demands.len(), 2);
+    assert_eq!(f.intent_count(), 2);
+}
+
+#[test]
+fn current_page_poison_aborts_page_and_rolls_back_earlier_intent() {
+    let mut f = Fixture::new();
+    f.add_binding("a-healthy", true);
+    f.add_binding("z-poison", true);
+    f.db
+        .execute_batch(
+            "CREATE TRIGGER reg23_fail_poison_intent BEFORE INSERT ON owned_service_starts
+             WHEN NEW.binding_id='z-poison'
+             BEGIN SELECT RAISE(ABORT,'reg23_poison_intent_failure'); END;",
+        )
+        .unwrap();
+    let error = f.pending().unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    assert!(error.message.contains("reg23_poison_intent_failure"));
+    assert_eq!(f.intent_count(), 0);
+    assert!(f.db.is_autocommit());
+    f.db
+        .execute_batch("DROP TRIGGER reg23_fail_poison_intent;")
+        .unwrap();
+    let snapshot = f.pending().unwrap();
+    assert_eq!(snapshot.demands.len(), 2);
+    assert_eq!(f.intent_count(), 2);
+}

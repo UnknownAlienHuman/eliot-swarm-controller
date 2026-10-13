@@ -14,7 +14,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::{
     module_catalog::ModuleDescriptor,
     module_command::{MODULE_DEMAND_METHODS, capability_satisfies, classify_runtime_command},
@@ -513,41 +513,67 @@ fn managed_owner_requires_custody(
     Ok(!family_departure_retained)
 }
 
+/// Unique owned-service scopes required by the exact current page.
+///
+/// Bounded replacement for the former all-queue owned-intent prepass: at most
+/// one indexed probe per unique page scope, so a future-page subject can never
+/// abort or delay the current page and repeated pages never rescan all queued
+/// state.
+fn page_owned_scopes(
+    db: &Connection,
+    candidates: &[OperationRow],
+) -> Result<BTreeSet<(String, i64)>> {
+    let mut scopes = BTreeSet::new();
+    for operation in candidates {
+        if operation.generation <= 0 {
+            continue;
+        }
+        let scope = (operation.binding_id.clone(), operation.generation);
+        if scopes.contains(&scope) {
+            continue;
+        }
+        let owned: bool = db.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM bindings AS b
+                 WHERE b.binding_id=?1 AND b.generation=?2
+                   AND b.released_at_ms IS NULL
+                   AND json_type(b.route_json,'$.owned_service')='object'
+                   AND json_type(b.state_json,'$.module_contract_selector')='object'
+                   AND EXISTS(
+                         SELECT 1 FROM operations AS o
+                         WHERE o.binding_id=b.binding_id
+                           AND o.binding_generation=b.generation
+                           AND o.method='agent.open' AND o.state='queued'
+                       )
+             )",
+            params![scope.0, scope.1],
+            |row| row.get(0),
+        )?;
+        if owned {
+            scopes.insert(scope);
+        }
+    }
+    Ok(scopes)
+}
+
 /// Retain one exact owned-service intent for each selected module opening
 /// before the demand page crosses the Store/process boundary. This is an
 /// idempotent Store write containing only route/Task/Attempt/lease facts; all
 /// filesystem reads and native effects remain outside the Store writer.
-fn prepare_owned_intents(
+/// Callers pass only the current page's scopes: a future-page subject must
+/// never abort the current page.
+fn prepare_owned_intents_for_scopes(
     tx: &rusqlite::Transaction<'_>,
     config: &Config,
+    scopes: &BTreeSet<(String, i64)>,
 ) -> Result<BTreeMap<(String, i64), String>> {
-    let candidates = {
-        let mut statement = tx.prepare(
-            "SELECT DISTINCT b.binding_id,b.generation
-             FROM bindings AS b
-             JOIN operations AS o
-               ON o.binding_id=b.binding_id AND o.binding_generation=b.generation
-             WHERE b.released_at_ms IS NULL
-               AND json_type(b.route_json,'$.owned_service')='object'
-               AND json_type(b.state_json,'$.module_contract_selector')='object'
-               AND o.method='agent.open' AND o.state='queued'",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if candidates.is_empty() {
-        return Ok(BTreeMap::new());
-    }
     let mut errors = BTreeMap::new();
-    for (binding_id, generation) in candidates {
+    for (binding_id, generation) in scopes {
         match launcher_owned_service::ensure_module_owned_service_intent(
             tx,
             config,
-            &binding_id,
-            generation,
+            binding_id,
+            *generation,
         ) {
             Ok(()) => {}
             // Only failures of this exact retained launch subject are blocks.
@@ -581,7 +607,7 @@ fn prepare_owned_intents(
                         | "WORKSPACE_UNREGISTERED"
                 ) =>
             {
-                errors.insert((binding_id, generation), error.code);
+                errors.insert((binding_id.clone(), *generation), error.code);
             }
             Err(error) => return Err(error),
         }
@@ -597,21 +623,52 @@ pub(super) fn pending(
     config: &Config,
     cursor: Option<&ModuleDemandCursor>,
 ) -> Result<ModuleDemandSnapshot> {
-    // Reserve intents and project demand on one Store snapshot. A hard error
-    // anywhere in the projection must not commit earlier owner reservations.
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let snapshot = pending_in_transaction(&tx, config, cursor)?;
-    tx.commit()?;
+    // Bounded read-only probe first: empty demand and pages without owned
+    // scopes must never acquire the IMMEDIATE writer reservation. The probe
+    // page only decides whether a writer is needed; a writer path always
+    // revalidates the exact current page under IMMEDIATE.
+    let read_tx = db.unchecked_transaction()?;
+    let (probe_candidates, probe_truncated, probe_next) = operation_candidates(&read_tx, cursor)?;
+    let probe_scopes = page_owned_scopes(&read_tx, &probe_candidates)?;
+    if probe_scopes.is_empty() {
+        let snapshot = pending_in_transaction(
+            &read_tx,
+            config,
+            probe_candidates,
+            probe_truncated,
+            probe_next,
+            &BTreeMap::new(),
+        )?;
+        read_tx.commit()?;
+        return Ok(snapshot);
+    }
+    read_tx.commit()?;
+    // Reserve only current-page intents and project the same revalidated page
+    // atomically, so a late hard failure rolls back only that page.
+    let write_tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (candidates, truncated, next_cursor) = operation_candidates(&write_tx, cursor)?;
+    let scopes = page_owned_scopes(&write_tx, &candidates)?;
+    let preparation_errors = prepare_owned_intents_for_scopes(&write_tx, config, &scopes)?;
+    let snapshot = pending_in_transaction(
+        &write_tx,
+        config,
+        candidates,
+        truncated,
+        next_cursor,
+        &preparation_errors,
+    )?;
+    write_tx.commit()?;
     Ok(snapshot)
 }
 
 fn pending_in_transaction(
-    db: &rusqlite::Transaction<'_>,
+    db: &Connection,
     config: &Config,
-    cursor: Option<&ModuleDemandCursor>,
+    candidates: Vec<OperationRow>,
+    truncated: bool,
+    next_cursor: Option<ModuleDemandCursor>,
+    preparation_errors: &BTreeMap<(String, i64), String>,
 ) -> Result<ModuleDemandSnapshot> {
-    let preparation_errors = prepare_owned_intents(db, config)?;
-    let (candidates, truncated, next_cursor) = operation_candidates(db, cursor)?;
     let mut output = ModuleDemandSnapshot {
         truncated,
         next_cursor,
