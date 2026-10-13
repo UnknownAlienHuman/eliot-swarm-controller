@@ -1202,10 +1202,14 @@ mod connected_store {
         value["launch"]["executable"] = json!(std::env::current_exe().unwrap());
         value["launch"]["argv"] = json!([]);
         value["capabilities"] = json!(["agent.open", "agent.result", "task.dispatch"]);
-        // No TaskPrompt required: use Store's typed dispatch context directly.
+        // Current production requires the exact TaskPrompt schema alongside the
+        // typed dispatch context and admission schemas for dispatch-capable
+        // bindings (TASK_PROMPT_CONTRACT_REQUIRED); the fixture declares the
+        // maintained producer schema, no bypass.
         value["command_schemas"] = json!([
             swarm_contracts::module_contract::runtime_command_schema(),
             swarm_contracts::module_contract::task_dispatch_context_schema(),
+            swarm_contracts::module_contract::task_prompt_schema(),
             swarm_contracts::module_contract::normalized_result_context_schema(),
         ]);
         value["event_schemas"] = json!([
