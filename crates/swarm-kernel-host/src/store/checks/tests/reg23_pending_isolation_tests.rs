@@ -2018,8 +2018,13 @@ async fn pending_cursor_write_failure_preserves_truth_and_converges_on_retry() {
         admit_pending(&fixture, "reg23-cursor-a", b"cursor write source a", "v1").await;
     let admitted_b =
         admit_pending(&fixture, "reg23-cursor-b", b"cursor write source b", "v1").await;
-    let row_a = admitted_a["check_id"].as_str().unwrap().to_owned();
-    let row_b = admitted_b["check_id"].as_str().unwrap().to_owned();
+    let mut ordered_ids = [
+        admitted_a["check_id"].as_str().unwrap().to_owned(),
+        admitted_b["check_id"].as_str().unwrap().to_owned(),
+    ];
+    ordered_ids.sort();
+    let row_a = ordered_ids[0].clone();
+    let row_b = ordered_ids[1].clone();
     mark_preflight_terminal(&fixture.owner.store, &row_a).await;
     mark_preflight_terminal(&fixture.owner.store, &row_b).await;
     fixture
