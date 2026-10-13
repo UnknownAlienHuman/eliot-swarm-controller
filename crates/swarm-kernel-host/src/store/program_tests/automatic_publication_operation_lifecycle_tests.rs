@@ -1220,6 +1220,169 @@ async fn rejected_automatic_publication_is_skipped_without_replay_at_consumer_bo
 }
 
 #[tokio::test]
+async fn unknown_effect_handover_fences_former_gm_and_continues_exact_owner() {
+    // Bound: stale_gm_publication_is_skipped_when_consumer_resumes proves the
+    // never-sent queued case settles stale_gm_epoch with no write, and
+    // queued_and_unknown_publications_stay_pending_without_replay proves
+    // queued/unknown fencing without rotation. Neither rotates GM under an
+    // already-sent ambiguous effect, so neither proves the former GM fenced
+    // nor the successor continuing the exact retained owner. This fixture
+    // proves exactly that combination through public Store calls only.
+    let fixture = accepted_publication_fixture("publication-unknown-handover").await;
+    let first_pass = reconcile_publication_fixture(&fixture).await.unwrap();
+    assert_eq!(first_pass["publication"]["processed"], 1);
+
+    let admitted_rows = retained_forge_operations(&fixture.owner.store).await;
+    let operation_id = automatic_operation_id(&admitted_rows);
+    assert_one_effect_operation(&admitted_rows, &operation_id);
+    let admitted = retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
+    assert_eq!(admitted["state"], "queued");
+    let immutable_effective_request =
+        retained_effective_request(&fixture.owner.store, &operation_id).await;
+    let admitted_epoch = immutable_effective_request["publication_intent"]["admitted_gm_epoch"]
+        .as_i64()
+        .expect("the retained immutable intent records the admitting GM epoch");
+
+    // Drive the admitted effect to already-sent ambiguity before rotation: the
+    // native effect may have crossed the write boundary, so unlike the
+    // never-sent queued case it must never settle stale_gm_epoch.
+    retain_ambiguous_publication_effect(&fixture.owner.store, &operation_id).await;
+    let ambiguous = retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
+    assert_eq!(ambiguous["state"], "outcome_unknown");
+    let ambiguous_sent_at = ambiguous["sent_at_ms"].clone();
+    assert!(ambiguous_sent_at.is_number());
+    let ambiguous_result = ambiguous["result"].clone();
+
+    // Rotate GM while the ambiguous effect is outstanding.
+    let handover = fixture
+        .owner
+        .store
+        .call(
+            fixture.manager.clone(),
+            "gm.handover".into(),
+            json!({
+                "client_request_id":format!("handover-unknown-effect-{}", model::new_id()),
+                "client_id":"review-owner-v2"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(handover["gm_epoch"].as_i64().unwrap() > admitted_epoch);
+    let successor = principal("review-owner-v2", Role::Manager);
+
+    // The former GM cannot replay the identical effect: admission fails at the
+    // current-GM authority gate before any slot logic runs, so no second
+    // effect Operation exists and the retained owner is untouched.
+    let former_replay = fixture
+        .owner
+        .store
+        .call(
+            fixture.manager.clone(),
+            "forge.publish_ref".into(),
+            manual_publication_request(
+                &fixture,
+                &format!("replay-unknown-effect-{}", model::new_id()),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(former_replay.code, "FORBIDDEN");
+    // A changed effect from the former GM is fenced at the same gate.
+    let mut changed =
+        manual_publication_request(&fixture, &format!("changed-unknown-effect-{}", model::new_id()));
+    changed["candidate_ref"] = json!("changed-candidate-ref");
+    let former_change = fixture
+        .owner
+        .store
+        .call(fixture.manager.clone(), "forge.publish_ref".into(), changed)
+        .await
+        .unwrap_err();
+    assert_eq!(former_change.code, "FORBIDDEN");
+    let fenced_rows = retained_forge_operations(&fixture.owner.store).await;
+    assert_one_effect_operation(&fenced_rows, &operation_id);
+
+    // The successor continues the exact retained owner: the identical
+    // admission coalesces to the outstanding ambiguous effect instead of
+    // dispatching new native work.
+    let continued = fixture
+        .owner
+        .store
+        .call(
+            successor.clone(),
+            "forge.publish_ref".into(),
+            manual_publication_request(
+                &fixture,
+                &format!("continue-unknown-effect-{}", model::new_id()),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued["coalesced"], true);
+    assert_eq!(continued["coalesced_to"], operation_id);
+    assert_eq!(continued["publication_may_have_started"], false);
+    let wrapper_id = continued["operation_id"].as_str().unwrap().to_owned();
+    assert_ne!(wrapper_id, operation_id);
+    let continued_rows = retained_forge_operations(&fixture.owner.store).await;
+    assert_eq!(continued_rows.len(), 2);
+    assert_one_effect_operation(&continued_rows, &operation_id);
+    let wrapper = retained_operation(&fixture.owner.store, &fixture.operator, &wrapper_id).await;
+    assert_eq!(wrapper["state"], "settled");
+    // The outstanding ambiguous owner is byte-identical: no replay, no change.
+    let continued_owner =
+        retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
+    assert_eq!(continued_owner["state"], "outcome_unknown");
+    assert_eq!(continued_owner["sent_at_ms"], ambiguous_sent_at);
+    assert_eq!(continued_owner["result"], ambiguous_result);
+    assert_eq!(
+        retained_effective_request(&fixture.owner.store, &operation_id).await,
+        immutable_effective_request
+    );
+
+    // Consumer resume performs readback-only continuation: the pending
+    // acceptance still names the exact owner, and a repeat pass adds nothing.
+    make_pending_publication_due(&fixture.owner.store, &fixture.accepted_operation_id).await;
+    let resumed = reconcile_publication_fixture(&fixture).await.unwrap();
+    assert_eq!(resumed["publication"]["processed"], 1);
+    let explanation = fixture
+        .owner
+        .store
+        .call(
+            successor.clone(),
+            "automation.config.explain".into(),
+            json!({
+                "owner_manager_id":"review-gm",
+                "project_id":PROJECT_ID,
+                "automation_id":AUTOMATION_ID
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explanation["publication"]["pending"].as_array().unwrap().len(), 1);
+    let recent = explanation["publication"]["recent"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(recent["publication_status"], "publication_readback_required");
+    assert_eq!(recent["operation_id"], operation_id);
+    assert_eq!(recent["operation_state"], "outcome_unknown");
+    assert_eq!(recent["publication_started"], true);
+    assert_eq!(recent["coalesced"], false);
+    make_pending_publication_due(&fixture.owner.store, &fixture.accepted_operation_id).await;
+    reconcile_publication_fixture(&fixture).await.unwrap();
+    let after = retained_forge_operations(&fixture.owner.store).await;
+    assert_eq!(after.len(), 2);
+    assert_one_effect_operation(&after, &operation_id);
+    let replayed_owner =
+        retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
+    assert_eq!(replayed_owner["state"], "outcome_unknown");
+    assert_eq!(replayed_owner["sent_at_ms"], ambiguous_sent_at);
+    assert_eq!(replayed_owner["result"], ambiguous_result);
+
+    close_fixture(fixture).await;
+}
+
+#[tokio::test]
 async fn stale_gm_publication_is_skipped_when_consumer_resumes() {
     let fixture = accepted_publication_fixture("publication-stale-gm-consumer-resume").await;
     let first_pass = reconcile_publication_fixture(&fixture).await.unwrap();
