@@ -784,40 +784,90 @@ async fn r35_late_predecessor_excluded_from_consumers() {
     register(store, s, &f1_id, &f1_token).await;
     register(store, s, &f2_id, &f2_token).await;
     register(store, s, &fx_id, &fx_token).await;
-    let (_f1, a1) = assign(store, s, &f1_id, &f1_token, "r35-late-assign-1", None).await;
-    let (f2, a2) = assign(store, s, &f2_id, &f2_token, "r35-late-assign-2", Some(&a1)).await;
-    let f1 = auth(store, &f1_id, &f1_token).await;
-    let late_op = submit(
+    let (f1, a1) = assign(store, s, &f1_id, &f1_token, "r35-late-assign-1", None).await;
+    let op1 = submit(
         store,
         &f1,
         s,
         &a1,
         "r35-late-submit-1",
-        "pass",
+        "changes_requested",
         "complete",
-        &[],
+        &findings_one(),
     )
     .await;
-    let late_view = review_get(store, manager(), &a1).await;
-    assert_eq!(late_view["result"]["verdict"], "pass");
-    assert_eq!(late_view["result"]["applicability"], "historical_candidate");
-    assert_eq!(late_view["current_slot"], false);
-    assert_eq!(late_view["current_candidate"], false);
-    let successor_view = review_get(store, manager(), &a2).await;
-    assert_eq!(successor_view["current_slot"], true);
-    let disposition = consume_disposition(store, &a1, &late_op).await;
-    assert_eq!(disposition["status"], "skipped");
-    assert_eq!(disposition["reason"], "historical_review_result");
-    assert_eq!(disposition["disposition_applied"], false);
-    let acceptance = consume_acceptance(store, &a1, &late_op).await;
-    assert_eq!(acceptance["status"], "skipped");
-    assert_eq!(acceptance["code"], "historical_review_result");
+    let manual = request_changes(store, s, &a1, &op1, "r35-late-request-changes").await;
+    assert_eq!(manual["applied"], true);
+    assert_eq!(manual["status"], "needs_correction");
+    let (f2, a2) = assign(store, s, &f2_id, &f2_token, "r35-late-assign-2", Some(&a1)).await;
+    // The predecessor result is retained but historically scoped: the live
+    // view no longer treats it as the current candidate.
+    let old_view = review_get(store, manager(), &a1).await;
+    assert_eq!(old_view["result"]["verdict"], "changes_requested");
+    assert_eq!(old_view["result"]["applicability"], "current_candidate");
+    assert_eq!(old_view["current_slot"], false);
+    assert_eq!(old_view["current_candidate"], false);
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
+    // A late result for the retired assignment cannot even be retained: the
+    // live slot gate refuses the submit.
+    let late = store
+        .call(
+            f1,
+            "review.submit".into(),
+            json!({
+                "client_request_id": "r35-late-submit-2",
+                "review_assignment_id": a1,
+                "submission_ref": s.2,
+                "candidate_ref": s.3,
+                "verdict": "pass",
+                "coverage": "complete",
+                "findings": [],
+                "evidence_refs": ["evidence://review/r35"],
+            }),
+        )
+        .await
+        .expect_err("late predecessor result must be refused");
+    assert_eq!(late.code.as_str(), "STALE_REVIEW_ASSIGNMENT");
+    // Acceptance resolves the live slot pointer, so the predecessor cause
+    // is not canonical acceptance evidence.
+    let acceptance = consume_acceptance(store, &a1, &op1).await;
+    assert_eq!(acceptance["status"], "not_canonical_result_event");
     assert_eq!(acceptance["task_accepted"], false);
-    let repair = consume_repair(store, &a1, &late_op).await;
+    // Repair resolves live finding provenance against a resultless
+    // successor, so the predecessor cause cannot become package input.
+    let repair = consume_repair(store, &a1, &op1).await;
     assert_eq!(repair["status"], "skipped");
-    assert_eq!(repair["reason"], "historical_review_result");
+    assert_eq!(repair["reason"], "selected_finding_is_no_longer_actionable");
+    // Feedback resolves live finding provenance, so the predecessor cause
+    // cannot authorize feedback again.
+    let stale_assignment = a1.clone();
+    let stale_result = op1.clone();
+    let feedback_error = store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            let entry =
+                crate::automation::config::load_entry(&tx, MANAGER_ID, PROJECT_ID, AUTOMATION_ID)?
+                    .unwrap();
+            let result = super::automation_disposition::consume_review_result_for_entry(
+                &tx,
+                &Config::default(),
+                &entry,
+                &stale_assignment,
+                &stale_result,
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+        .expect_err("superseded feedback authority must fail");
+    assert_eq!(feedback_error.code.as_str(), "REVIEW_FINDING_NOT_FOUND");
     let predecessor = review_get(store, f2, &a1).await;
-    assert_eq!(predecessor["result"]["verdict"], "pass");
+    assert_eq!(predecessor["result"]["verdict"], "changes_requested");
+    assert_eq!(predecessor["current_slot"], false);
     let fx = auth(store, &fx_id, &fx_token).await;
     let forbidden = store
         .call(fx, "review.get".into(), json!({"review_assignment_id": a1}))
