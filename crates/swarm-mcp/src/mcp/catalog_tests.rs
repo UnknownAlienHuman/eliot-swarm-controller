@@ -3,7 +3,163 @@ use super::{
     list_tools_page, search_catalog,
 };
 use crate::config::McpToolProfile;
+use sha2::Digest;
 use swarm_contracts::mcp_catalog::{ToolAudience, metadata_for};
+
+#[test]
+fn catalog_direct_schema_bytes_and_profile_membership_match() {
+    use swarm_contracts::mcp_catalog::{
+        TOOL_METADATA, input_schema, input_schema_bytes, mutation_requires_caller_request_id,
+        output_schema, output_schema_bytes, tool_name,
+    };
+
+    let profiles = [
+        McpToolProfile::Observer,
+        McpToolProfile::Reviewer,
+        McpToolProfile::Participant,
+        McpToolProfile::AssignedReviewer,
+        McpToolProfile::Manager,
+        McpToolProfile::Gm,
+        McpToolProfile::Full,
+    ];
+    let authorization = AuthorizationRevision {
+        value: "catalog-parity-v1",
+        basis: AuthorizationBasis::AuthenticatedStoreScope,
+    };
+    for profile in profiles {
+        // Expose all presentation entries while preserving the hard profile.
+        let mut surface = Surface::role_default(profile);
+        surface.legacy_full = true;
+        let mut expected: Vec<_> = TOOL_METADATA
+            .iter()
+            .filter(|entry| super::profiles::exposes_method(profile, entry.method))
+            .collect();
+        expected.sort_by(|left, right| super::metadata_order(left, right));
+        let mut listed = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = list_tools_page(
+                profile,
+                &surface,
+                cursor.as_deref(),
+                authorization,
+                |_, _| true,
+            )
+            .expect("profile catalog page");
+            listed.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(listed.len(), expected.len(), "{profile:?} membership");
+        for (tool, entry) in listed.iter().zip(expected) {
+            let (read_only, spec) = super::find_spec(entry.method).expect("ToolSpec");
+            let required = mutation_requires_caller_request_id(profile, spec.method, *read_only);
+            let wire = serde_json::to_value(tool).expect("wire tool");
+            assert_eq!(wire["name"], tool_name(spec.method), "method order");
+            assert_eq!(wire["description"], spec.description);
+            let input = input_schema_bytes(spec, *read_only, required).expect("cached input");
+            let catalog_input = serde_json::to_vec(&wire["inputSchema"]).expect("catalog input");
+            assert_eq!(catalog_input, input.as_ref(), "{} {profile:?}", spec.method);
+            assert_eq!(
+                serde_json::to_vec(input_schema(spec, *read_only, required).as_ref())
+                    .expect("direct input"),
+                input.as_ref()
+            );
+            assert_eq!(
+                super::hex_digest(&super::Sha256::digest(&catalog_input)),
+                super::hex_digest(&super::Sha256::digest(input.as_ref()))
+            );
+            match output_schema_bytes(spec.method).expect("cached output") {
+                Some(output) => {
+                    assert_eq!(
+                        serde_json::to_vec(&wire["outputSchema"]).expect("catalog output"),
+                        output.as_ref()
+                    );
+                    assert_eq!(
+                        serde_json::to_vec(
+                            output_schema(spec.method).expect("direct output").as_ref()
+                        )
+                        .expect("direct output bytes"),
+                        output.as_ref()
+                    );
+                    assert_ne!(input.as_ref(), output.as_ref(), "input/output slots");
+                }
+                None => assert!(wire.get("outputSchema").is_none()),
+            }
+            // Restricted profiles share one required-ID variant. Full's
+            // optional-ID compatibility variant is an intentional distinction.
+            if profile != McpToolProfile::Full {
+                let full_required = mutation_requires_caller_request_id(
+                    McpToolProfile::Full,
+                    spec.method,
+                    *read_only,
+                );
+                if required == full_required {
+                    let full = super::super::tool_from_spec(*read_only, spec, full_required);
+                    assert_eq!(
+                        serde_json::to_value(full).expect("full wire")["inputSchema"],
+                        wire["inputSchema"]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn warm_catalog_rechecks_live_membership_and_rejects_unknown_exact_method() {
+    let profile = McpToolProfile::Full;
+    let surface = Surface::role_default(profile);
+    let request = SearchRequest {
+        query: "task.create",
+        purpose: None,
+        task_id: Some("task-parity"),
+        exact_method: Some("task.create"),
+        loaded_catalog_revision: None,
+        max_results: 1,
+    };
+    let authorization = AuthorizationRevision {
+        value: "same-revision",
+        basis: AuthorizationBasis::AuthenticatedStoreScope,
+    };
+    let allowed = search_catalog(profile, &surface, request, authorization, |_, _| true)
+        .expect("cold discovery");
+    assert_eq!(allowed.matches.len(), 1);
+    for _ in 0..3 {
+        let mut checked = false;
+        let denied = search_catalog(
+            profile,
+            &surface,
+            request,
+            authorization,
+            |method, context| {
+                assert_eq!(context, Some("task-parity"));
+                checked |= method == "task.create";
+                method != "task.create"
+            },
+        )
+        .expect("warm discovery checks current membership");
+        assert!(checked);
+        assert!(denied.matches.is_empty());
+        assert_ne!(allowed.catalog_revision, denied.catalog_revision);
+    }
+    let unknown = search_catalog(
+        profile,
+        &surface,
+        SearchRequest {
+            query: "unknown.method",
+            exact_method: Some("unknown.method"),
+            ..request
+        },
+        authorization,
+        |_, _| true,
+    )
+    .expect("unknown exact method is a miss");
+    assert!(unknown.matches.is_empty());
+    assert!(Surface::configured(profile, Some("unknown-profile"), &[], &[]).is_err());
+}
 
 #[test]
 fn published_pr_description_effect_is_manual_and_manager_scoped() {

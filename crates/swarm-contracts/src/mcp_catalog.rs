@@ -76,6 +76,8 @@ pub struct ToolSpec {
     input_schema_bytes_cache: [OnceLock<std::result::Result<Arc<[u8]>, String>>; 2],
     output_schema_cache: OnceLock<Option<Arc<JsonObject>>>,
     output_schema_bytes_cache: OnceLock<std::result::Result<Option<Arc<[u8]>>, String>>,
+    #[cfg(test)]
+    factory_counts: [std::sync::atomic::AtomicUsize; 6],
 }
 
 const fn read(
@@ -95,6 +97,8 @@ const fn read(
             input_schema_bytes_cache: [OnceLock::new(), OnceLock::new()],
             output_schema_cache: OnceLock::new(),
             output_schema_bytes_cache: OnceLock::new(),
+            #[cfg(test)]
+            factory_counts: [const { std::sync::atomic::AtomicUsize::new(0) }; 6],
         },
     )
 }
@@ -115,6 +119,8 @@ const fn mutation(
             input_schema_bytes_cache: [OnceLock::new(), OnceLock::new()],
             output_schema_cache: OnceLock::new(),
             output_schema_bytes_cache: OnceLock::new(),
+            #[cfg(test)]
+            factory_counts: [const { std::sync::atomic::AtomicUsize::new(0) }; 6],
         },
     )
 }
@@ -2174,10 +2180,11 @@ pub fn input_schema(
     request_id_required: bool,
 ) -> Arc<JsonObject> {
     let cache_index = usize::from(request_id_required);
-    Arc::clone(
-        spec.input_schema_cache[cache_index]
-            .get_or_init(|| build_input_schema(spec, read_only, request_id_required)),
-    )
+    Arc::clone(spec.input_schema_cache[cache_index].get_or_init(|| {
+        #[cfg(test)]
+        spec.factory_counts[cache_index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        build_input_schema(spec, read_only, request_id_required)
+    }))
 }
 
 pub fn input_schema_bytes(
@@ -2189,6 +2196,8 @@ pub fn input_schema_bytes(
     let schema = input_schema(spec, read_only, request_id_required);
     spec.input_schema_bytes_cache[cache_index]
         .get_or_init(|| {
+            #[cfg(test)]
+            spec.factory_counts[cache_index + 2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             serde_json::to_vec(schema.as_ref())
                 .map(Arc::<[u8]>::from)
                 .map_err(|error| error.to_string())
@@ -4071,8 +4080,16 @@ fn message_actor_schema() -> Value {
 
 pub fn output_schema(method: &str) -> Option<Arc<JsonObject>> {
     let (_, spec) = find_tool_spec(method)?;
+    output_schema_for_spec(spec)
+}
+
+fn output_schema_for_spec(spec: &ToolSpec) -> Option<Arc<JsonObject>> {
     spec.output_schema_cache
-        .get_or_init(|| build_output_schema(method))
+        .get_or_init(|| {
+            #[cfg(test)]
+            spec.factory_counts[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            build_output_schema(spec.method)
+        })
         .clone()
 }
 
@@ -4080,12 +4097,20 @@ pub fn output_schema_bytes(method: &str) -> std::result::Result<Option<Arc<[u8]>
     let Some((_, spec)) = find_tool_spec(method) else {
         return Ok(None);
     };
+    output_schema_bytes_for_spec(spec)
+}
+
+fn output_schema_bytes_for_spec(spec: &ToolSpec) -> std::result::Result<Option<Arc<[u8]>>, String> {
     spec.output_schema_bytes_cache
-        .get_or_init(|| match output_schema(method) {
-            Some(schema) => serde_json::to_vec(schema.as_ref())
-                .map(|bytes| Some(Arc::<[u8]>::from(bytes)))
-                .map_err(|error| error.to_string()),
-            None => Ok(None),
+        .get_or_init(|| {
+            #[cfg(test)]
+            spec.factory_counts[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match output_schema_for_spec(spec) {
+                Some(schema) => serde_json::to_vec(schema.as_ref())
+                    .map(|bytes| Some(Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| error.to_string()),
+                None => Ok(None),
+            }
         })
         .clone()
 }
@@ -7514,6 +7539,10 @@ pub fn launch_profile_surface(
         "manual_tools": suggested.exact_manual_methods,
     }))
 }
+
+#[cfg(test)]
+#[path = "mcp_catalog_cache_tests.rs"]
+mod cache_tests;
 
 #[cfg(test)]
 mod task_mcp_schema_tests {
