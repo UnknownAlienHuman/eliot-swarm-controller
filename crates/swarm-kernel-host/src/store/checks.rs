@@ -258,11 +258,13 @@ impl Store {
             baseline_reason,
         } = snapshot;
         let pending_context = context_fingerprint.clone();
-        let pending_resolution = move || CheckPlanResolution {
+        let pending_resolution = move |stage: &'static str| CheckPlanResolution {
             context_fingerprint: pending_context.clone(),
             result: Err(Error::new(
                 "CHECK_PROBE_CLEANUP_PENDING",
-                "an input probe remains in Store custody for a conflicting or unidentified check target",
+                format!(
+                    "an input probe remains in Store custody for a conflicting or unidentified check target; stage={stage}"
+                ),
             )),
             cache_hit: None,
         };
@@ -274,7 +276,7 @@ impl Store {
             .reserve_probe_resolution(incoming_resource.as_deref())
             .await
         else {
-            return Ok(pending_resolution());
+            return Ok(pending_resolution("resource_reservation"));
         };
         let has_baseline_record = baseline_record.is_some();
         let data_dir = self.data_dir.clone();
@@ -304,7 +306,7 @@ impl Store {
             .pin_probe_resolution_scope(&probe_resolution, scope.as_ref())
             .await
         {
-            return Ok(pending_resolution());
+            return Ok(pending_resolution("workspace_scope_pin"));
         }
         let baseline_reason = baseline_reason.or_else(|| {
             (has_baseline_record && baseline.is_none())
@@ -352,7 +354,7 @@ impl Store {
             Err(error) => (Err(error), false),
         };
         if install_conflict {
-            return Ok(pending_resolution());
+            return Ok(pending_resolution("probe_owner_install"));
         }
         if prepared.is_ok()
             && self
@@ -360,7 +362,7 @@ impl Store {
                 .probe_cleanup_conflicts(resolved_scope.as_ref())
                 .await
         {
-            return Ok(pending_resolution());
+            return Ok(pending_resolution("post_resolution_custody"));
         }
         let (result, cache_hit) = match prepared {
             Ok(prepared) if prepared.resolved_inputs["cache_reusable"] == true => {
@@ -391,7 +393,7 @@ impl Store {
                 .probe_cleanup_conflicts(resolved_scope.as_ref())
                 .await
         {
-            return Ok(pending_resolution());
+            return Ok(pending_resolution("post_cache_custody"));
         }
         Ok(CheckPlanResolution {
             context_fingerprint,
