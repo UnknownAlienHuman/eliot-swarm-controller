@@ -3508,10 +3508,10 @@ mod connected_store {
         f.close().await;
     }
     // PR51 row 4 tail: the sponsored reviewer keeps only its exact assigned
-    // submission/review evidence. task.get/attempt.get/swarm.agent.inspect are
-    // method-denied FORBIDDEN for participants (ParticipantAccess::None);
-    // operation.get is CoordinationRead so the foreign submit op stays
-    // object-denied NOT_FOUND. Observer/B keep object NOT_FOUND.
+    // submission/review evidence and bounded submission receipt. task.get,
+    // attempt.get and swarm.agent.inspect are method-denied FORBIDDEN for
+    // participants (ParticipantAccess::None); an unrelated submit operation
+    // stays object-denied NOT_FOUND. Observer/B keep object NOT_FOUND.
     // This also closes the unrelated swarm.agent.inspect denial row.
     #[tokio::test]
     async fn store_authenticated_sponsored_reviewer_rest_graph_and_inspect_denied() {
@@ -3519,6 +3519,12 @@ mod connected_store {
         let store = &f.owner.store;
         let owner_id = f.manager_a.client_id.clone();
         let subject = seed_review_subject(store, &owner_id, "tail-rest").await;
+        let unrelated_suffix = "tail-rest-unrelated";
+        let unrelated_owner_id = f.manager_b.client_id.clone();
+        let unrelated_subject =
+            seed_review_subject(store, &unrelated_owner_id, unrelated_suffix).await;
+        assert_ne!(subject.submission_ref, unrelated_subject.submission_ref);
+        let unrelated_operation_id = format!("submit-op-{unrelated_suffix}");
         let reviewer_id = "scope-tail-reviewer";
         let reviewer_token = "scope-tail-reviewer-token".to_owned();
         let pending_scope = json!({
@@ -3577,6 +3583,33 @@ mod connected_store {
         )
         .await;
         assert_eq!(view["assignment"]["reviewer_client_id"], reviewer_id);
+        let own_submission_receipt = call(
+            store,
+            &reviewer,
+            "operation.get",
+            json!({"operation_id":"submit-op-tail-rest"}),
+        )
+        .await;
+        assert_eq!(own_submission_receipt["method"], "task.submit");
+        assert_eq!(
+            own_submission_receipt["operation_id"],
+            "submit-op-tail-rest"
+        );
+        assert_eq!(own_submission_receipt["task_id"], "task-review-tail-rest");
+        assert_eq!(
+            own_submission_receipt["attempt_id"],
+            "attempt-review-tail-rest"
+        );
+        assert_eq!(own_submission_receipt["result"]["outcome"], "applied");
+        assert_eq!(
+            own_submission_receipt["result"]["submission_ref"],
+            subject.submission_ref
+        );
+        assert_eq!(
+            own_submission_receipt["result"]["candidate_ref"],
+            subject.candidate_ref
+        );
+        assert!(own_submission_receipt.get("diagnostic").is_none());
         denied(
             store,
             &reviewer,
@@ -3597,7 +3630,7 @@ mod connected_store {
             store,
             &reviewer,
             "operation.get",
-            json!({"operation_id": "submit-op-tail-rest"}),
+            json!({"operation_id": unrelated_operation_id}),
             "NOT_FOUND",
         )
         .await;
