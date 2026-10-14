@@ -6,9 +6,8 @@ authenticated local IPC, plus a GitHub-side repository check. It mirrors the
 semantics of the Rust `swarm-client` crate exactly where they matter:
 
 - Endpoint discovery: Unix -> `<canonical data-dir>/control.sock`
-  (socket path must fit in 100 bytes); Windows ->
-  `\\\\.\\pipe\\eliot-swarm-<first 16 bytes of SHA-256 of the lowercased
-  canonical path, hex>`.
+  (socket path must fit in 100 bytes). Windows endpoint discovery and
+  named-pipe transport are explicitly unsupported here; use the `swarm` CLI.
 - Wire format: one JSON-RPC 2.0 object per line, frames bounded by
   `max_frame_bytes` (default 1 MiB).
 - The first exchange on a connection is `client.hello` with the credential
@@ -40,7 +39,6 @@ anywhere except the local IPC handshake it belongs to.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import socket
@@ -78,15 +76,17 @@ def outcome_unknown(message: str) -> ConnectorError:
 
 
 # --------------------------------------------------------------------------
-# Endpoint discovery (mirrors swarm-client/src/endpoint.rs)
+# Unix endpoint discovery (mirrors swarm-client/src/endpoint.rs)
 # --------------------------------------------------------------------------
 
-def windows_pipe_suffix(canonical_path: str) -> str:
-    digest = hashlib.sha256(canonical_path.lower().encode("utf-8")).digest()
-    return digest[:16].hex()
-
-
 def ipc_endpoint(data_dir: str) -> str:
+    if os.name == "nt":
+        raise ConnectorError(
+            "HOST_UNAVAILABLE",
+            "Windows endpoint discovery and named-pipe transport are not "
+            "supported by this connector; use the `swarm` CLI on Windows",
+            EXIT_HOST_UNAVAILABLE,
+        )
     canonical = os.path.realpath(os.path.abspath(data_dir))
     if not os.path.isdir(canonical):
         raise ConnectorError(
@@ -94,8 +94,6 @@ def ipc_endpoint(data_dir: str) -> str:
             f"data directory does not exist: {data_dir}",
             EXIT_HOST_UNAVAILABLE,
         )
-    if os.name == "nt":
-        return r"\\.\pipe\eliot-swarm-" + windows_pipe_suffix(canonical)
     path = os.path.join(canonical, "control.sock")
     if len(os.fsencode(path)) > 100:
         raise ConnectorError(
@@ -118,8 +116,7 @@ class _LineSocket:
         self._limit = limit
         self._buf = bytearray()
 
-    def send_line(self, line: str) -> None:
-        data = (line + "\n").encode("utf-8")
+    def send_line(self, data: bytes) -> None:
         if len(data) - 1 > self._limit:
             raise ConnectorError(
                 "FRAME_TOO_LARGE",
@@ -143,7 +140,10 @@ class _LineSocket:
                 del self._buf[: idx + 1]
                 if len(raw) > self._limit:
                     raise outcome_unknown("reply exceeded the frame bound")
-                return raw.decode("utf-8", "strict")
+                try:
+                    return raw.decode("utf-8", "strict")
+                except UnicodeDecodeError as exc:
+                    raise outcome_unknown("reply was not valid UTF-8") from exc
             if len(self._buf) > self._limit:
                 raise outcome_unknown("reply exceeded the frame bound")
             try:
@@ -163,8 +163,8 @@ def _open_stream(endpoint: str) -> socket.socket:
     if os.name == "nt":
         raise ConnectorError(
             "HOST_UNAVAILABLE",
-            "named-pipe transport is not implemented in this connector; "
-            "run on the host's Unix socket or use the `swarm` CLI on Windows",
+            "Windows endpoint discovery and named-pipe transport are not "
+            "supported by this connector; use the `swarm` CLI on Windows",
             EXIT_HOST_UNAVAILABLE,
         )
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -180,6 +180,34 @@ def _open_stream(endpoint: str) -> socket.socket:
             EXIT_HOST_UNAVAILABLE,
         )
     return sock
+
+
+def _encode_json_frame(value: object, limit: int) -> bytes:
+    try:
+        line = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        data = line.encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ConnectorError(
+            "INVALID_PARAMS",
+            "request contains values that cannot be represented as JSON",
+            EXIT_USAGE,
+        ) from exc
+    if len(data) > limit:
+        raise ConnectorError(
+            "FRAME_TOO_LARGE",
+            "use smaller pages or artifact ranges",
+            EXIT_FRAME_TOO_LARGE,
+        )
+    return data + b"\n"
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"unsupported JSON constant: {value}")
 
 
 # --------------------------------------------------------------------------
@@ -225,18 +253,29 @@ class SwarmClient:
                 EXIT_HOST_UNAVAILABLE,
             )
         request_id = str(uuid.uuid4())
-        line = json.dumps(
+        data = _encode_json_frame(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-            separators=(",", ":"),
+            self._limit,
         )
         # From here until a well-formed, matched reply arrives, any failure
         # leaves the outcome unknown. Never retry inside this method.
+        try:
+            self._io._sock.settimeout(WRITE_TIMEOUT_SECONDS)
+        except OSError as exc:
+            raise ConnectorError(
+                "HOST_UNAVAILABLE",
+                "local IPC write could not be configured; no request was sent",
+                EXIT_HOST_UNAVAILABLE,
+            ) from exc
         self._usable = False
-        self._io.send_line(line)
-        self._io._sock.settimeout(READ_TIMEOUT_SECONDS)
+        self._io.send_line(data)
+        try:
+            self._io._sock.settimeout(READ_TIMEOUT_SECONDS)
+        except OSError as exc:
+            raise outcome_unknown("reply could not be read") from exc
         frame = self._io.read_line()
         try:
-            response = json.loads(frame)
+            response = json.loads(frame, parse_constant=_reject_json_constant)
         except ValueError:
             raise outcome_unknown("reply was malformed")
         if (
@@ -245,14 +284,16 @@ class SwarmClient:
             or response.get("jsonrpc") != "2.0"
         ):
             raise outcome_unknown("reply could not be matched to the request")
-        error = response.get("error")
-        if error is not None:
+        if "error" in response:
+            error = response["error"]
             data = error.get("data") if isinstance(error, dict) else None
             stable_code = data.get("code") if isinstance(data, dict) else None
+            error_code = error.get("code") if isinstance(error, dict) else None
             if (
                 "result" in response
                 or not isinstance(error, dict)
-                or not isinstance(error.get("code"), int)
+                or type(error_code) is not int
+                or not -(1 << 63) <= error_code < (1 << 63)
                 or not isinstance(error.get("message"), str)
                 or not isinstance(stable_code, str)
                 or not stable_code
@@ -323,11 +364,22 @@ def repo_check(repo: str) -> dict:
                 EXIT_HOST_UNAVAILABLE,
             )
 
+    def get_all(path: str) -> list:
+        items = []
+        page = 1
+        while True:
+            separator = "&" if "?" in path else "?"
+            batch = get(f"{path}{separator}per_page=100&page={page}")
+            items.extend(batch)
+            if len(batch) < 100:
+                return items
+            page += 1
+
     info = get(f"/repos/{repo}")
     branch = get(f"/repos/{repo}/branches/{info['default_branch']}")
     runs = get(f"/repos/{repo}/actions/runs?per_page=1")
-    pulls = get(f"/repos/{repo}/pulls?state=open&per_page=100")
-    issues = get(f"/repos/{repo}/issues?state=open&per_page=100")
+    pulls = get_all(f"/repos/{repo}/pulls?state=open")
+    issues = get_all(f"/repos/{repo}/issues?state=open")
     latest = runs["workflow_runs"][0] if runs.get("workflow_runs") else None
     return {
         "repo": info["full_name"],
@@ -349,20 +401,23 @@ def repo_check(repo: str) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Selftest: an in-process fake host speaking the real wire protocol
+# Selftest: a portable socketpair fake host speaking the real wire protocol
 # --------------------------------------------------------------------------
 
-def _fake_host(server: socket.socket, mode: str, seen: list) -> None:
-    conn, _ = server.accept()
-    with conn, server:
+def _fake_host(
+    conn: socket.socket, mode: str, seen: list, wire: list[bytes] | None = None
+) -> None:
+    with conn:
         buf = b""
-        for _ in range(2):
+        for index in range(3 if mode == "rpc-error-then-ok" else 2):
             while b"\n" not in buf:
                 chunk = conn.recv(65536)
                 if not chunk:
                     return
                 buf += chunk
             line, buf = buf.split(b"\n", 1)
+            if wire is not None:
+                wire.append(line)
             request = json.loads(line)
             seen.append(request)
             if request["method"] == "client.hello":
@@ -370,9 +425,42 @@ def _fake_host(server: socket.socket, mode: str, seen: list) -> None:
             elif mode == "garbage":
                 conn.sendall(b"this is not json\n")
                 return
+            elif mode == "invalid-utf8":
+                conn.sendall(b"\xff\n")
+                return
+            elif mode == "nan":
+                conn.sendall(
+                    b'{"jsonrpc":"2.0","id":'
+                    + json.dumps(request["id"]).encode("ascii")
+                    + b',"result":NaN}\n'
+                )
+                return
+            elif mode == "timeout":
+                return
             elif mode == "wrong-id":
                 reply = {"jsonrpc": "2.0", "id": "someone-else", "result": {}}
-            elif mode == "rpc-error":
+            elif mode in ("bool-error-code", "overflow-error-code", "null-error-result"):
+                if mode == "null-error-result":
+                    reply = {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": None,
+                        "result": {},
+                    }
+                else:
+                    code = True if mode == "bool-error-code" else 1 << 63
+                    reply = {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": {
+                            "code": code,
+                            "message": "malformed peer error",
+                            "data": {"code": "FORBIDDEN"},
+                        },
+                    }
+            elif mode == "rpc-error" or (
+                mode == "rpc-error-then-ok" and index == 1
+            ):
                 reply = {
                     "jsonrpc": "2.0",
                     "id": request["id"],
@@ -388,7 +476,65 @@ def _fake_host(server: socket.socket, mode: str, seen: list) -> None:
                     "id": request["id"],
                     "result": {"method": request["method"], "params": request["params"]},
                 }
-            conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            conn.sendall(
+                (json.dumps(reply, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+                    "utf-8"
+                )
+            )
+
+
+class _ObservedSocket:
+    """Socketpair wrapper for deterministic timeout and framing checks."""
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        *,
+        fail_send_number: int | None = None,
+        timeout_after_send_number: int | None = None,
+    ):
+        self._sock = sock
+        self.fail_send_number = fail_send_number
+        self.timeout_after_send_number = timeout_after_send_number
+        self.send_count = 0
+        self.timeout_values = []
+        self.events = []
+        self.current_timeout = None
+
+    def settimeout(self, value):
+        self.current_timeout = value
+        self.timeout_values.append(value)
+        self.events.append(("timeout", value))
+        self._sock.settimeout(value)
+
+    def sendall(self, data: bytes):
+        self.send_count += 1
+        self.events.append(("send", self.current_timeout))
+        if self.send_count == self.fail_send_number:
+            raise socket.timeout("offline simulated write timeout")
+        self._sock.sendall(data)
+
+    def recv(self, size: int) -> bytes:
+        self.events.append(("recv", self.current_timeout))
+        if (
+            self.timeout_after_send_number is not None
+            and self.send_count >= self.timeout_after_send_number
+        ):
+            raise socket.timeout("offline simulated read timeout")
+        return self._sock.recv(size)
+
+    def close(self):
+        self._sock.close()
+
+
+def _selftest_client(sock, credential: dict, limit: int = MAX_FRAME_BYTES):
+    """Use the real client state machine over a socketpair, not OS IPC."""
+    client = SwarmClient.__new__(SwarmClient)
+    client._limit = limit
+    client._io = _LineSocket(sock, limit)
+    client._usable = True
+    client._exchange("client.hello", credential)
+    return client
 
 
 def selftest() -> int:
@@ -397,16 +543,27 @@ def selftest() -> int:
     def record(name: str, ok: bool, detail: str = ""):
         checks.append((name, ok, detail))
 
-    record(
-        "windows pipe suffix is sha256 prefix",
-        windows_pipe_suffix(r"C:\Swarm\Data")
-        == hashlib.sha256(r"c:\swarm\data".encode()).digest()[:16].hex(),
-    )
-
     with tempfile.TemporaryDirectory() as tmp:
+        if os.name == "nt":
+            try:
+                ipc_endpoint(tmp)
+                record("Windows endpoint discovery is explicitly unsupported", False)
+            except ConnectorError as exc:
+                record(
+                    "Windows endpoint discovery is explicitly unsupported",
+                    exc.code == "HOST_UNAVAILABLE",
+                )
+        else:
+            record(
+                "Unix endpoint uses canonical control.sock path",
+                ipc_endpoint(tmp)
+                == os.path.join(os.path.realpath(tmp), "control.sock"),
+            )
+
         cred_path = os.path.join(tmp, "cred.json")
+        credential = {"client_id": "operator", "token": "secret"}
         with open(cred_path, "w", encoding="utf-8") as fh:
-            json.dump({"client_id": "operator", "token": "secret"}, fh)
+            json.dump(credential, fh)
         record(
             "credential shape enforced",
             load_credential(cred_path)["client_id"] == "operator",
@@ -419,55 +576,280 @@ def selftest() -> int:
         except ConnectorError:
             record("credential extra field rejected", True)
         with open(cred_path, "w", encoding="utf-8") as fh:
-            json.dump({"client_id": "operator", "token": "secret"}, fh)
+            json.dump(credential, fh)
 
         for mode, name in [
             ("ok", "hello + call roundtrip"),
             ("rpc-error", "stable RPC error code surfaces"),
             ("garbage", "garbage reply is OUTCOME_UNKNOWN"),
+            ("invalid-utf8", "invalid UTF-8 reply is OUTCOME_UNKNOWN"),
             ("wrong-id", "mismatched id is OUTCOME_UNKNOWN"),
+            ("bool-error-code", "boolean error code is malformed"),
+            ("overflow-error-code", "out-of-range error code is malformed"),
+            ("null-error-result", "present null error is malformed"),
+            ("nan", "non-standard NaN reply is malformed"),
         ]:
-            data_dir = os.path.join(tmp, f"host-{mode}")
-            os.mkdir(data_dir)
+            client_sock, host_sock = socket.socketpair()
             seen: list = []
-            # Bind and listen in this thread so the endpoint is ready
-            # before the client makes its single connection attempt.
-            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(os.path.join(data_dir, "control.sock"))
-            server.listen(1)
+            wire: list[bytes] = []
             thread = threading.Thread(
                 target=_fake_host,
-                args=(server, mode, seen),
+                args=(host_sock, mode, seen, wire),
                 daemon=True,
             )
             thread.start()
+            observed = _ObservedSocket(client_sock) if mode == "ok" else client_sock
+            client = _selftest_client(observed, credential)
             try:
-                result = do_call(
-                    data_dir, cred_path, "host.status", {"probe": True}
-                )
+                result = client.request("host.status", {"probe": True})
                 record(name, mode == "ok" and result["method"] == "host.status")
-                record(
-                    "hello carried the credential",
-                    seen[0]["method"] == "client.hello"
-                    and seen[0]["params"]["client_id"] == "operator",
-                )
             except ConnectorError as exc:
                 if mode == "rpc-error":
                     record(name, exc.code == "FORBIDDEN" and exc.exit_code == EXIT_RPC_ERROR)
-                elif mode in ("garbage", "wrong-id"):
+                elif mode not in ("ok", "rpc-error"):
                     record(name, exc.code == "OUTCOME_UNKNOWN")
                 else:
                     record(name, False, str(exc))
-            thread.join(timeout=5)
-
-        try:
-            do_call(tmp + "-missing", cred_path, "host.status", {})
-            record("missing data dir is HOST_UNAVAILABLE", False)
-        except ConnectorError as exc:
             record(
-                "missing data dir is HOST_UNAVAILABLE",
-                exc.exit_code == EXIT_HOST_UNAVAILABLE,
+                "hello carried the local credential",
+                seen[0]["method"] == "client.hello"
+                and seen[0]["params"] == credential,
             )
+            if mode == "ok":
+                record(
+                    "write/read timeouts reset around each frame",
+                    observed.timeout_values
+                    == [
+                        WRITE_TIMEOUT_SECONDS,
+                        READ_TIMEOUT_SECONDS,
+                        WRITE_TIMEOUT_SECONDS,
+                        READ_TIMEOUT_SECONDS,
+                    ]
+                    and [value for event, value in observed.events if event == "send"]
+                    == [WRITE_TIMEOUT_SECONDS, WRITE_TIMEOUT_SECONDS]
+                    and sum(event == "recv" for event, _ in observed.events) >= 2
+                    and all(
+                        value == READ_TIMEOUT_SECONDS
+                        for event, value in observed.events
+                        if event == "recv"
+                    ),
+                )
+            if mode not in ("ok", "rpc-error"):
+                try:
+                    client.request("host.status", {"retry": True})
+                    poisoned = False
+                except ConnectorError as exc:
+                    poisoned = exc.code == "DISCONNECTED"
+                record(f"{mode} leaves no reusable connection", poisoned)
+            client_sock.close()
+            thread.join(timeout=5)
+            record(f"{mode} fake host completed", not thread.is_alive())
+
+        client_sock, host_sock = socket.socketpair()
+        seen = []
+        wire = []
+        thread = threading.Thread(
+            target=_fake_host,
+            args=(host_sock, "rpc-error-then-ok", seen, wire),
+            daemon=True,
+        )
+        thread.start()
+        client = _selftest_client(client_sock, credential)
+        try:
+            client.request("task.create", {})
+            rpc_error_surfaces = False
+        except ConnectorError as exc:
+            rpc_error_surfaces = exc.code == "FORBIDDEN" and client._usable
+        following = client.request("host.status", {})
+        client_sock.close()
+        thread.join(timeout=5)
+        record(
+            "valid RPC error leaves the matched connection usable",
+            rpc_error_surfaces
+            and following["method"] == "host.status"
+            and not thread.is_alive(),
+        )
+
+        # A socketpair exercises the client framing/state machine portably;
+        # it does not qualify Unix listener setup or Windows Named Pipes.
+        client_sock, host_sock = socket.socketpair()
+        seen = []
+        wire: list[bytes] = []
+        thread = threading.Thread(
+            target=_fake_host, args=(host_sock, "ok", seen, wire), daemon=True
+        )
+        thread.start()
+        client = _selftest_client(client_sock, credential)
+        cjk = "界" * 200_000
+        result = client.request("host.status", {"text": cjk})
+        client_sock.close()
+        thread.join(timeout=10)
+        record(
+            "200,000 CJK characters fit as compact UTF-8",
+            result["params"]["text"] == cjk
+            and len(wire[1]) <= MAX_FRAME_BYTES
+            and b"\\u754c" not in wire[1]
+            and not thread.is_alive(),
+        )
+
+        client_sock, host_sock = socket.socketpair()
+        seen = []
+        wire = []
+        thread = threading.Thread(
+            target=_fake_host, args=(host_sock, "ok", seen, wire), daemon=True
+        )
+        thread.start()
+        client = _selftest_client(client_sock, credential, limit=256)
+        try:
+            client.request("host.status", {"value": float("nan")})
+            nan_rejected = False
+        except ConnectorError as exc:
+            nan_rejected = exc.code == "INVALID_PARAMS" and client._usable
+        try:
+            client.request("host.status", {"value": "x" * 512})
+            oversized_rejected = False
+        except ConnectorError as exc:
+            oversized_rejected = exc.code == "FRAME_TOO_LARGE" and client._usable
+        result = client.request("host.status", {})
+        client_sock.close()
+        thread.join(timeout=5)
+        record(
+            "invalid JSON and oversized requests are rejected before write",
+            nan_rejected
+            and oversized_rejected
+            and result["method"] == "host.status"
+            and [request["method"] for request in seen]
+            == ["client.hello", "host.status"]
+            and not thread.is_alive(),
+        )
+
+        client_sock, host_sock = socket.socketpair()
+        seen = []
+        wire = []
+        thread = threading.Thread(
+            target=_fake_host, args=(host_sock, "timeout", seen, wire), daemon=True
+        )
+        thread.start()
+        observed = _ObservedSocket(client_sock, timeout_after_send_number=2)
+        client = _selftest_client(observed, credential)
+        try:
+            client.request("host.status", {})
+            read_timeout_unknown = False
+        except ConnectorError as exc:
+            read_timeout_unknown = exc.code == "OUTCOME_UNKNOWN"
+        try:
+            client.request("host.status", {})
+            read_retry_refused = False
+        except ConnectorError as exc:
+            read_retry_refused = exc.code == "DISCONNECTED"
+        observed.close()
+        thread.join(timeout=5)
+        record(
+            "read timeout poisons and refuses an implicit retry",
+            read_timeout_unknown
+            and read_retry_refused
+            and observed.timeout_values
+            == [WRITE_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS] * 2
+            and not thread.is_alive(),
+        )
+
+        client_sock, host_sock = socket.socketpair()
+        seen = []
+        wire = []
+        thread = threading.Thread(
+            target=_fake_host, args=(host_sock, "ok", seen, wire), daemon=True
+        )
+        thread.start()
+        observed = _ObservedSocket(client_sock, fail_send_number=2)
+        client = _selftest_client(observed, credential)
+        try:
+            client.request("host.status", {})
+            write_timeout_unknown = False
+        except ConnectorError as exc:
+            write_timeout_unknown = exc.code == "OUTCOME_UNKNOWN"
+        try:
+            client.request("host.status", {})
+            write_retry_refused = False
+        except ConnectorError as exc:
+            write_retry_refused = exc.code == "DISCONNECTED"
+        observed.close()
+        thread.join(timeout=5)
+        record(
+            "write timeout poisons and refuses an implicit retry",
+            write_timeout_unknown
+            and write_retry_refused
+            and observed.timeout_values
+            == [WRITE_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, WRITE_TIMEOUT_SECONDS]
+            and len(seen) == 1
+            and not thread.is_alive(),
+        )
+
+        # The repository count check stays offline while exercising all pages.
+        import urllib.parse
+        from unittest.mock import patch
+
+        class _Response:
+            def __init__(self, payload):
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return self.payload
+
+        api_pages = []
+
+        def fake_urlopen(request, timeout):
+            parsed = urllib.parse.urlsplit(request.full_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            page = int(query.get("page", ["1"])[0])
+            api_pages.append((parsed.path, page))
+            if parsed.path == "/repos/example/project":
+                payload = {
+                    "full_name": "example/project",
+                    "default_branch": "main",
+                    "pushed_at": "2026-10-14T00:00:00Z",
+                }
+            elif parsed.path.endswith("/branches/main"):
+                payload = {"commit": {"sha": "fixture-sha"}}
+            elif parsed.path.endswith("/actions/runs"):
+                payload = {"workflow_runs": []}
+            elif parsed.path.endswith("/pulls"):
+                payload = (
+                    [{"number": i} for i in range(100)]
+                    if page == 1
+                    else [{"number": 100}, {"number": 101}]
+                    if page == 2
+                    else []
+                )
+            elif parsed.path.endswith("/issues"):
+                payload = (
+                    [
+                        {"pull_request": {}} if i == 0 else {"number": i}
+                        for i in range(100)
+                    ]
+                    if page == 1
+                    else [{"number": 100}, {"number": 101}, {"pull_request": {}}]
+                    if page == 2
+                    else []
+                )
+            else:
+                raise AssertionError(f"unexpected GitHub URL: {request.full_url}")
+            return _Response(payload)
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            repo_state = repo_check("example/project")
+        record(
+            "repo-check counts every pull and issue page",
+            repo_state["open_pull_requests"] == 102
+            and repo_state["open_issues"] == 101
+            and ("/repos/example/project/pulls", 2) in api_pages
+            and ("/repos/example/project/issues", 2) in api_pages,
+        )
 
     failed = [c for c in checks if not c[1]]
     for name, ok, detail in checks:

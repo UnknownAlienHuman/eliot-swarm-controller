@@ -8,30 +8,33 @@ database, a network listener, or a second writer path.
 `swarm_connector.py` is a single Python file, standard library only. It is a
 faithful port of the `swarm-client` semantics that matter to a client:
 
-- **Endpoint discovery** identical to `crates/swarm-client/src/endpoint.rs`:
-  Unix `<canonical data-dir>/control.sock` (100-byte socket-path bound);
-  Windows `\\.\pipe\eliot-swarm-<SHA-256 prefix of the lowercased canonical
-  path>`. (The pipe *name* is derived on every platform; the pipe transport
-  itself is Windows-only and left to the `swarm` CLI — this connector speaks
-  the Unix socket transport and says so instead of failing obscurely.)
+- **Endpoint discovery**: Unix
+  `<canonical data-dir>/control.sock` (100-byte socket-path bound). Windows
+  endpoint discovery and Named Pipe transport are explicitly unsupported by
+  this connector; use the `swarm` CLI. Python's Windows path normalization can
+  differ from Rust's canonical disk and UNC path representation, so this
+  connector does not claim to derive the Rust pipe name.
 - **Handshake**: the first exchange is `client.hello` with the credential
   object `{"client_id", "token"}` — the exact shape of
   `swarm-contracts::Credential` (unknown fields are rejected on both sides).
-- **Framing**: one JSON-RPC 2.0 object per line, 1 MiB frame bound,
-  15 s write timeout, 60 s reply timeout — the `IpcConfig` defaults.
-- **No blind retries**: a failed write, a missing/malformed reply, or a reply
-  whose `id` does not match is `OUTCOME_UNKNOWN`. The request may have been
-  applied; inspect the original operation before retrying. A failed
-  connection is poisoned and never reused. Each CLI invocation opens exactly
-  one connection.
+- **Framing**: one JSON-RPC 2.0 object per line, compact UTF-8 bytes with a
+  1 MiB frame bound, 15 s write timeout per frame, and a 60 s reply timeout —
+  the `IpcConfig` defaults. Invalid outbound JSON is rejected before writing.
+- **No blind retries**: a failed write, a missing reply, invalid UTF-8/JSON,
+  unsupported JSON constants, or a mismatched response is `OUTCOME_UNKNOWN`.
+  Malformed error envelopes (including non-`i64` error codes) also poison the
+  connection. The request may have been applied; inspect the original
+  operation before retrying. Each CLI invocation opens exactly one connection.
 - **Errors**: application failures surface the stable code from
   `error.data.code` (exit 5). Other exit codes: 2 usage, 3 host unavailable,
   4 handshake failed, 6 outcome unknown, 7 frame too large.
+- **Repository counts**: `repo-check` follows all pages of open pull requests
+  and issues before reporting totals.
 
 ## Usage
 
 ```sh
-# Offline protocol selftest (fake host, real wire format) — 9 checks
+# Offline socketpair protocol selftest (real framing; no Named Pipe qualification)
 python3 tools/muse-connector/swarm_connector.py selftest
 
 # Where would the host for this data directory listen?
