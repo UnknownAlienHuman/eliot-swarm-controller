@@ -3,8 +3,8 @@
 //! Fixtures admit through the same Store task/attempt/check path as the
 //! pending-isolation suite; SQL writes are limited to explicit
 //! retained-state fault injection. The new `check.acknowledge_held` method,
-//! the quarantine-first `check.get` read and the `operation.get` held
-//! evidence are all exercised through public `Store::call`.
+//! and the quarantine-first `check.get` read are exercised through public
+//! `Store::call`.
 use super::*;
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -97,19 +97,6 @@ async fn spec_digest(store: &Store, check_id: &str) -> String {
         .unwrap();
     model::digest(raw.as_bytes())
 }
-async fn operation_id_of(store: &Store, check_id: &str) -> String {
-    let id = check_id.to_owned();
-    store
-        .run(move |db| {
-            Ok(db.query_row(
-                "SELECT operation_id FROM check_runs WHERE check_id=?1",
-                [id],
-                |row| row.get(0),
-            )?)
-        })
-        .await
-        .unwrap()
-}
 async fn write(store: &Store, principal: &Principal, method: &str, mut value: Value) -> Value {
     value["client_request_id"] = json!(model::new_id());
     store
@@ -174,6 +161,13 @@ async fn held_check_get_reports_invalid_json_quarantine() {
         .await
         .unwrap();
     assert!(selected.is_empty(), "damaged subject yields no Work");
+    let quarantine_meta_key = quarantine_key(&check_id);
+    let before = fixture
+        .owner
+        .store
+        .run(move |db| meta(db, &quarantine_meta_key))
+        .await
+        .unwrap();
     let readback = read_check(&fixture.owner.store, &fixture.principal, &check_id).await;
     assert_eq!(readback["check_id"], json!(&check_id));
     assert_eq!(readback["state"], json!("queued"));
@@ -187,7 +181,10 @@ async fn held_check_get_reports_invalid_json_quarantine() {
     );
     assert_eq!(readback["reconciliation"]["field"], json!("spec"));
     assert_eq!(readback["reconciliation"]["reason"], json!("invalid_json"));
-    assert_eq!(readback["reconciliation"]["held"], json!(false));
+    assert_eq!(readback["reconciliation"]["held"], json!(true));
+    assert_eq!(readback["reconciliation"]["acknowledged"], json!(false));
+    assert_eq!(readback["resource_released"], Value::Null);
+    assert_eq!(readback["custody"], json!("unknown"));
     assert!(
         readback.get("profile_id").is_none(),
         "sanitized view exposes no spec fields"
@@ -195,6 +192,26 @@ async fn held_check_get_reports_invalid_json_quarantine() {
     assert_eq!(
         readback["reconciliation"]["source_digest"],
         json!(spec_digest(&fixture.owner.store, &check_id).await)
+    );
+    for _ in 0..10 {
+        assert!(
+            pending_page(&fixture.owner.store, fixture.directory.clone())
+                .await
+                .unwrap()
+                .is_empty(),
+            "unchanged quarantine remains outside the active Work page"
+        );
+    }
+    let quarantine_meta_key = quarantine_key(&check_id);
+    let after = fixture
+        .owner
+        .store
+        .run(move |db| meta(db, &quarantine_meta_key))
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "held polling leaves quarantine evidence unchanged"
     );
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
@@ -220,7 +237,8 @@ async fn held_check_get_reports_malformed_field_quarantine() {
         readback["reconciliation"]["reason"],
         json!("invalid_subject_shape")
     );
-    assert_eq!(readback["reconciliation"]["held"], json!(false));
+    assert_eq!(readback["reconciliation"]["held"], json!(true));
+    assert_eq!(readback["reconciliation"]["acknowledged"], json!(false));
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
 }
@@ -244,7 +262,7 @@ async fn held_poison_leaves_active_page_capacity() {
     let healthy_id = healthy["check_id"].as_str().unwrap().to_owned();
     mark_sending(&fixture.owner.store, &healthy_id).await;
     let mut seen = std::collections::BTreeSet::new();
-    for _ in 0..4 {
+    for _ in 0..10 {
         let page = pending_page(&fixture.owner.store, fixture.directory.clone())
             .await
             .unwrap();
@@ -313,6 +331,7 @@ async fn acknowledge_held_cas_matrix() {
     );
     let readback = read_check(&fixture.owner.store, &operator, &check_id).await;
     assert_eq!(readback["reconciliation"]["held"], json!(true));
+    assert_eq!(readback["reconciliation"]["acknowledged"], json!(true));
     assert_eq!(
         readback["state"],
         json!("queued"),
@@ -360,15 +379,14 @@ async fn acknowledge_held_changed_source_conflicts() {
         .unwrap();
     let first_digest = spec_digest(&fixture.owner.store, &check_id).await;
     damage_profile_shape(&fixture.owner.store, &check_id).await;
-    // The changed row leaves the active page silently: no Work is admitted
-    // under stale quarantine. The conflict still fails closed on every
-    // explicit touch below.
-    let held_back = pending_page(&fixture.owner.store, fixture.directory.clone())
+    // The bounded held-lineage check preserves the pending identity conflict
+    // before exclusion can hide the changed source from the active page.
+    let pending_conflict = pending_page(&fixture.owner.store, fixture.directory.clone())
         .await
-        .unwrap();
-    assert!(
-        held_back.is_empty(),
-        "changed source is held, never selected"
+        .unwrap_err();
+    assert_eq!(
+        pending_conflict.code,
+        "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
     );
     let conflict_read = fixture
         .owner
@@ -393,6 +411,107 @@ async fn acknowledge_held_changed_source_conflicts() {
     assert_eq!(
         conflicted.code,
         "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
+    );
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}
+
+#[tokio::test]
+async fn held_read_and_ack_reject_changed_operation_lineage() {
+    let fixture = fixture().await;
+    let operator = fixture.principal.clone();
+    let admitted = admit_held(
+        &fixture,
+        "held-operation-lineage",
+        b"held operation lineage",
+    )
+    .await;
+    let check_id = admitted["check_id"].as_str().unwrap().to_owned();
+    let operation_id = admitted["operation_id"].as_str().unwrap().to_owned();
+    mark_sending(&fixture.owner.store, &check_id).await;
+    damage_spec_json(&fixture.owner.store, &check_id).await;
+    pending_page(&fixture.owner.store, fixture.directory.clone())
+        .await
+        .unwrap();
+    let query_id = operation_id.clone();
+    let original_request: String = fixture
+        .owner
+        .store
+        .run(move |db| {
+            Ok(db.query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [query_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    fixture
+        .owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET original_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, "{\"mutated\":true}"],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let read_error = fixture
+        .owner
+        .store
+        .call(
+            operator.clone(),
+            "check.get".to_owned(),
+            json!({"check_id": &check_id}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        read_error.code,
+        "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
+    );
+    let source_digest = spec_digest(&fixture.owner.store, &check_id).await;
+    let ack_error = fixture
+        .owner
+        .store
+        .call(
+            operator,
+            "check.acknowledge_held".to_owned(),
+            json!({
+                "client_request_id": model::new_id(),
+                "check_id": &check_id,
+                "expected_source_digest": source_digest,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(ack_error.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
+    fixture
+        .owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE operations SET original_request_json=?2 WHERE operation_id=?1",
+                    params![operation_id, original_request],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap()
+            .is_empty(),
+        "restored exact lineage stays held outside active Work"
     );
     fixture.owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture.directory).unwrap();
@@ -469,6 +588,7 @@ async fn reopen_held_never_relaunches() {
         json!("quarantined")
     );
     assert_eq!(readback["reconciliation"]["held"], json!(true));
+    assert_eq!(readback["reconciliation"]["acknowledged"], json!(true));
     assert_eq!(
         reopened.store.check_child_custody_count().await,
         0,
@@ -483,58 +603,4 @@ async fn reopen_held_never_relaunches() {
     );
     reopened.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
-}
-#[tokio::test]
-async fn operation_get_reports_held_disposition() {
-    let fixture = fixture().await;
-    let operator = fixture.principal.clone();
-    let admitted = admit_held(&fixture, "held-operation", b"held operation source").await;
-    let check_id = admitted["check_id"].as_str().unwrap().to_owned();
-    mark_sending(&fixture.owner.store, &check_id).await;
-    damage_spec_json(&fixture.owner.store, &check_id).await;
-    pending_page(&fixture.owner.store, fixture.directory.clone())
-        .await
-        .unwrap();
-    let operation_id = operation_id_of(&fixture.owner.store, &check_id).await;
-    let projection = fixture
-        .owner
-        .store
-        .call(
-            operator.clone(),
-            "operation.get".to_owned(),
-            json!({"operation_id": &operation_id}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(projection["method"], json!("check.run"));
-    assert_eq!(
-        projection["reconciliation"]["disposition"],
-        json!("quarantined")
-    );
-    assert_eq!(
-        projection["reconciliation"]["code"],
-        json!("CHECK_SPEC_SUBJECT_CORRUPT")
-    );
-    assert_eq!(projection["reconciliation"]["held"], json!(false));
-    let digest = spec_digest(&fixture.owner.store, &check_id).await;
-    write(
-        &fixture.owner.store,
-        &operator,
-        "check.acknowledge_held",
-        json!({"check_id": check_id, "expected_source_digest": digest}),
-    )
-    .await;
-    let reread = fixture
-        .owner
-        .store
-        .call(
-            operator,
-            "operation.get".to_owned(),
-            json!({"operation_id": &operation_id}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(reread["reconciliation"]["held"], json!(true));
-    fixture.owner.close().await.unwrap();
-    std::fs::remove_dir_all(fixture.directory).unwrap();
 }

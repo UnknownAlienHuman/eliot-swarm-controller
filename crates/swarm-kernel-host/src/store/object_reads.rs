@@ -122,14 +122,6 @@ pub(super) fn current_operation(
         operation["native_dispatch_capability_readback"] =
             super::launcher_dispatch::current_dispatch_capability_readback(db, config, id);
     }
-    // A check.run operation whose CheckRun carries retained quarantine
-    // evidence reports its bounded held disposition; the grant above
-    // already bounds who may see it.
-    if operation["method"] == "check.run" {
-        if let Some(reconciliation) = super::checks::operation_quarantine_view(db, id)? {
-            operation["reconciliation"] = reconciliation;
-        }
-    }
     Ok(operation)
 }
 
@@ -214,8 +206,7 @@ pub(super) fn check(db: &Connection, p: &Principal, v: &Value) -> Result<Value> 
         )
         .optional()?
         .ok_or_else(|| Error::new("NOT_FOUND", "unknown CheckRun"))?;
-    let identity =
-        object_scope::identity_for_attempt(db, &attempt_id)?.ok_or_else(missing)?;
+    let identity = object_scope::identity_for_attempt(db, &attempt_id)?.ok_or_else(missing)?;
     let operation = operations::get_operation(db, &operation_id)?;
     if operation["method"] != "check.run"
         || operation["attempt_id"].as_str() != Some(attempt_id.as_str())

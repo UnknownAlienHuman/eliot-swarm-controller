@@ -1536,7 +1536,9 @@ fn read_quarantine_for_held(
             "CheckRun has no retained quarantine evidence",
         ));
     };
-    if record.identity.check_id != check_id
+    let current_identity = read_subject_identity(tx, check_id)?;
+    if record.identity != current_identity
+        || record.identity.check_id != check_id
         || record.identity.operation_id != operation_id
         || record.identity.attempt_id != attempt_id
         || record.identity.check_spec_sha256 != model::digest(spec_json.as_bytes())
@@ -1610,21 +1612,9 @@ pub(super) fn acknowledge_held(
         ));
     }
     let now = model::now_ms()?;
-    match meta(tx, &held_key(check))? {
-        Some(existing) => {
-            let held: HeldRecord = serde_json::from_value(existing).map_err(|_| {
-                Error::new(
-                    "CHECK_HELD_RECORD_CORRUPT",
-                    "retained held inventory record cannot be decoded",
-                )
-            })?;
-            validate_held_record(&held, check)?;
-            if held.source_digest != source_digest {
-                return Err(Error::new(
-                    "CHECK_HELD_RECORD_CORRUPT",
-                    "retained held inventory no longer matches the quarantine identity",
-                ));
-            }
+    match load_held_record(tx, check)? {
+        Some(held) => {
+            validate_held_matches_quarantine(&held, &record)?;
             if held.acknowledged {
                 return Ok(
                     json!({"operation_id":id,"check_id":check,"acknowledged":true,"coalesced":true,"held":true,"state":state,"source_digest":source_digest,"ack_operation_id":held.ack_operation_id}),
@@ -1683,117 +1673,88 @@ pub(super) fn held_projection(
     let Some(record) = load_quarantine_record(db, check_id)? else {
         return Ok(None);
     };
-    let row: Option<(String, String, String)> = db
-        .query_row(
-            "SELECT state, candidate_ref, spec_json FROM check_runs WHERE check_id=?1",
-            [check_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((state, candidate_ref, spec_json)) = row else {
-        return Err(Error::new("NOT_FOUND", "unknown CheckRun"));
-    };
-    if record.identity.check_id != check_id
-        || record.identity.operation_id != operation_id
-        || record.identity.attempt_id != attempt_id
-        || record.identity.check_spec_sha256 != model::digest(spec_json.as_bytes())
+    let current_identity = read_subject_identity(db, check_id)?;
+    if record.identity != current_identity
+        || current_identity.operation_id != operation_id
+        || current_identity.attempt_id != attempt_id
     {
         return Err(Error::new(
             "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
             "retained quarantine identity no longer matches the CheckRun source",
         ));
     }
-    let held = match meta(db, &held_key(check_id))? {
-        None => false,
-        Some(value) => {
-            let held: HeldRecord = serde_json::from_value(value).map_err(|_| {
-                Error::new(
-                    "CHECK_HELD_RECORD_CORRUPT",
-                    "retained held inventory record cannot be decoded",
-                )
-            })?;
-            validate_held_record(&held, check_id)?;
-            held.acknowledged
-        }
+    let row: Option<(
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+        Option<i64>,
+    )> = db
+        .query_row(
+            "SELECT state, cached_from_check_id, resource_key, resource_claimed_at_ms, resource_released_at_ms, coverage_json, result_ref, exit_code FROM check_runs WHERE check_id=?1",
+            [check_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        state,
+        cached_from,
+        resource_key,
+        resource_claimed_at_ms,
+        resource_released_at_ms,
+        coverage_json,
+        result_ref,
+        exit_code,
+    )) = row
+    else {
+        return Err(Error::new("NOT_FOUND", "unknown CheckRun"));
     };
+    let held = load_held_record(db, check_id)?;
+    if let Some(held) = &held {
+        validate_held_matches_quarantine(held, &record)?;
+    }
+    let coverage: Value = serde_json::from_str(&coverage_json)?;
+    let resource_released = resource_released_at_ms
+        .map(|_| Value::Bool(true))
+        .unwrap_or(Value::Null);
     Ok(Some(json!({
         "check_id": check_id,
         "operation_id": operation_id,
         "attempt_id": attempt_id,
-        "candidate_ref": candidate_ref,
+        "candidate_ref": current_identity.candidate_ref,
+        "cached_from": cached_from,
         "state": state,
+        "resource_key": resource_key,
+        "resource_claimed_at_ms": resource_claimed_at_ms,
+        "resource_released_at_ms": resource_released_at_ms,
+        "coverage": coverage,
+        "result_ref": result_ref,
+        "exit_code": exit_code,
+        "resource_released": resource_released,
+        "custody": "unknown",
         "reconciliation": {
             "disposition": "quarantined",
             "code": record.code,
             "field": record.field,
             "reason": record.reason,
             "source_digest": record.identity.check_spec_sha256,
-            "held": held,
+            "held": true,
+            "acknowledged": held.as_ref().is_some_and(|record| record.acknowledged),
         },
-    })))
-}
-/// Bounded quarantine evidence for an operation projection. Attached only
-/// when the operation produced a CheckRun with retained quarantine
-/// evidence; a changed source reports its conflict instead of guessing.
-pub(super) fn operation_quarantine_view(
-    db: &Connection,
-    operation_id: &str,
-) -> Result<Option<Value>> {
-    let check_id: Option<String> = db
-        .query_row(
-            "SELECT check_id FROM check_runs WHERE operation_id=?1",
-            [operation_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(check_id) = check_id else {
-        return Ok(None);
-    };
-    let Some(record) = load_quarantine_record(db, &check_id)? else {
-        return Ok(None);
-    };
-    let spec_json: Option<String> = db
-        .query_row(
-            "SELECT spec_json FROM check_runs WHERE check_id=?1",
-            [&check_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let unchanged = spec_json
-        .as_deref()
-        .is_some_and(|spec| model::digest(spec.as_bytes()) == record.identity.check_spec_sha256);
-    let held = match meta(db, &held_key(&check_id))? {
-        None => false,
-        Some(value) => {
-            let held: HeldRecord = serde_json::from_value(value).map_err(|_| {
-                Error::new(
-                    "CHECK_HELD_RECORD_CORRUPT",
-                    "retained held inventory record cannot be decoded",
-                )
-            })?;
-            validate_held_record(&held, &check_id)?;
-            held.acknowledged
-        }
-    };
-    if unchanged {
-        return Ok(Some(json!({
-            "disposition": "quarantined",
-            "code": record.code,
-            "field": record.field,
-            "reason": record.reason,
-            "source_digest": record.identity.check_spec_sha256,
-            "held": held,
-            "identity_conflict": false,
-        })));
-    }
-    Ok(Some(json!({
-        "disposition": "quarantined",
-        "code": "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT",
-        "field": record.field,
-        "reason": record.reason,
-        "source_digest": record.identity.check_spec_sha256,
-        "held": held,
-        "identity_conflict": true,
     })))
 }
 fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value) -> Result<bool> {
@@ -2385,7 +2346,7 @@ fn pending_subject_count(tx: &Transaction<'_>) -> Result<i64> {
 
 enum PendingSubjectOutcome {
     Applied(Box<Work>),
-    AlreadyQuarantined,
+    AlreadyQuarantined(Box<PendingQuarantineEvidence>),
     Quarantined {
         identity: Box<PendingSubjectIdentity>,
         field: &'static str,
@@ -2594,8 +2555,8 @@ fn select_pending_page(
     Ok((ids, cycle))
 }
 
-fn read_subject_identity(tx: &Transaction<'_>, check_id: &str) -> Result<PendingSubjectIdentity> {
-    let identity: Option<PendingSubjectIdentity> = tx
+fn read_subject_identity(db: &Connection, check_id: &str) -> Result<PendingSubjectIdentity> {
+    let identity: Option<PendingSubjectIdentity> = db
         .query_row(
             "SELECT c.check_id,c.operation_id,c.attempt_id,c.candidate_ref,c.cache_key,c.resource_key,c.created_at_ms,c.spec_json,o.caller_id,o.client_request_id,o.method,o.original_request_json,o.effective_request_json,o.task_id,o.attempt_id,o.binding_id,o.binding_generation,a.attempt_id,a.task_id,a.task_revision,a.task_snapshot_json,a.owner_id,a.start_owner,a.start_operation_id,a.binding_id,a.binding_generation,t.task_id,t.project_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id JOIN attempts a ON a.attempt_id=c.attempt_id JOIN tasks t ON t.task_id=a.task_id WHERE c.check_id=?1",
             [check_id],
@@ -2701,6 +2662,53 @@ fn validate_held_record(record: &HeldRecord, check_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn held_record_for_quarantine(quarantine: &PendingQuarantineEvidence) -> HeldRecord {
+    HeldRecord {
+        schema_version: HELD_SCHEMA,
+        check_id: quarantine.identity.check_id.clone(),
+        quarantine_code: quarantine.code.clone(),
+        quarantine_field: quarantine.field.clone(),
+        quarantine_reason: quarantine.reason.clone(),
+        source_digest: quarantine.identity.check_spec_sha256.clone(),
+        acknowledged: false,
+        acknowledged_by: None,
+        acknowledged_at_ms: None,
+        ack_operation_id: None,
+    }
+}
+
+fn load_held_record(db: &Connection, check_id: &str) -> Result<Option<HeldRecord>> {
+    let Some(value) = meta(db, &held_key(check_id))? else {
+        return Ok(None);
+    };
+    let record: HeldRecord = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "CHECK_HELD_RECORD_CORRUPT",
+            "retained held inventory record cannot be decoded",
+        )
+    })?;
+    validate_held_record(&record, check_id)?;
+    Ok(Some(record))
+}
+
+fn validate_held_matches_quarantine(
+    held: &HeldRecord,
+    quarantine: &PendingQuarantineEvidence,
+) -> Result<()> {
+    if held.check_id != quarantine.identity.check_id
+        || held.quarantine_code != quarantine.code
+        || held.quarantine_field != quarantine.field
+        || held.quarantine_reason != quarantine.reason
+        || held.source_digest != quarantine.identity.check_spec_sha256
+    {
+        return Err(Error::new(
+            "CHECK_HELD_RECORD_CORRUPT",
+            "retained held inventory record differs from its quarantine evidence",
+        ));
+    }
+    Ok(())
+}
+
 fn valid_pending_damage(field: &str, reason: &str) -> bool {
     matches!(
         (field, reason),
@@ -2759,6 +2767,39 @@ fn read_pending_quarantine(
         ));
     }
     Ok(Some(record))
+}
+
+/// Check a bounded prefix of indexed held rows for stale lineage before the
+/// selector excludes them. This preserves the existing hard conflict for a
+/// changed source without returning unchanged quarantines to the active page
+/// or scanning an unbounded cycle.
+fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<()> {
+    let mut statement = tx.prepare(
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?1",
+    )?;
+    let check_ids = statement
+        .query_map(params![MAX_PENDING_PAGE as i64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for check_id in check_ids {
+        let identity = read_subject_identity(tx, &check_id)?;
+        let quarantine = read_pending_quarantine(tx, &check_id, &identity)?.ok_or_else(|| {
+            Error::new(
+                "CHECK_HELD_RECORD_CORRUPT",
+                "held inventory record has no retained quarantine evidence",
+            )
+        })?;
+        let held = load_held_record(tx, &check_id)?.ok_or_else(|| {
+            Error::new(
+                "CHECK_HELD_RECORD_CORRUPT",
+                "held inventory record disappeared during validation",
+            )
+        })?;
+        validate_held_matches_quarantine(&held, &quarantine)?;
+    }
+    Ok(())
 }
 
 fn decode_pending_row(
@@ -2820,7 +2861,7 @@ fn materialize_pending_subject(
                     // Unchanged deterministic damage stays stable across polls and
                     // restarts: no occurrence/last_seen rewrite and no writer churn.
                     // A changed digest or classification remains a hard conflict.
-                    return Ok(PendingSubjectOutcome::AlreadyQuarantined);
+                    return Ok(PendingSubjectOutcome::AlreadyQuarantined(Box::new(record)));
                 }
                 SubjectMaterialization::Decoded(_) | SubjectMaterialization::Damaged { .. } => {
                     return Err(Error::new(
@@ -2847,9 +2888,9 @@ fn materialize_pending_subject(
             tx.execute_batch(&format!("RELEASE SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}"))?;
             Ok(PendingSubjectOutcome::Applied(work))
         }
-        Ok(PendingSubjectOutcome::AlreadyQuarantined) => {
+        Ok(already @ PendingSubjectOutcome::AlreadyQuarantined(_)) => {
             tx.execute_batch(&format!("RELEASE SAVEPOINT {PENDING_SUBJECT_SAVEPOINT}"))?;
-            Ok(PendingSubjectOutcome::AlreadyQuarantined)
+            Ok(already)
         }
         Ok(quarantined @ PendingSubjectOutcome::Quarantined { .. }) => {
             rollback_pending_subject(tx)?;
@@ -2892,18 +2933,7 @@ fn retain_pending_quarantine(
     // so the unchanged poison leaves the generic active page without a
     // second scheduler or queue table. It starts unacknowledged; only the
     // explicit acknowledgement flips it, never the quarantine itself.
-    let held = HeldRecord {
-        schema_version: HELD_SCHEMA,
-        check_id: record.identity.check_id.clone(),
-        quarantine_code: record.code.clone(),
-        quarantine_field: record.field.clone(),
-        quarantine_reason: record.reason.clone(),
-        source_digest: record.identity.check_spec_sha256.clone(),
-        acknowledged: false,
-        acknowledged_by: None,
-        acknowledged_at_ms: None,
-        ack_operation_id: None,
-    };
+    let held = held_record_for_quarantine(&record);
     validate_held_record(&held, &record.identity.check_id)?;
     set_meta(tx, &held_key(&record.identity.check_id), &json!(&held))?;
     Ok(())
@@ -2928,22 +2958,33 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
     // quarantine dispositions upgrade the same transaction atomically.
     let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let cursor = read_pending_cursor(&tx)?;
+    validate_bounded_held_quarantines(&tx)?;
     let (ids, cycle) = select_pending_page(&tx, cursor.as_deref())?;
     let mut work = Vec::with_capacity(ids.len());
     let mut last_id = None;
-    let mut quarantined_new = false;
+    let mut pending_metadata_written = false;
     for check_id in ids {
         last_id = Some(check_id.clone());
         match materialize_pending_subject(&tx, &check_id, root.clone())? {
             PendingSubjectOutcome::Applied(item) => work.push(*item),
-            PendingSubjectOutcome::AlreadyQuarantined => {}
+            PendingSubjectOutcome::AlreadyQuarantined(quarantine) => {
+                match load_held_record(&tx, &check_id)? {
+                    Some(held) => validate_held_matches_quarantine(&held, &quarantine)?,
+                    None => {
+                        let held = held_record_for_quarantine(&quarantine);
+                        validate_held_record(&held, &check_id)?;
+                        set_meta(&tx, &held_key(&check_id), &json!(&held))?;
+                        pending_metadata_written = true;
+                    }
+                }
+            }
             PendingSubjectOutcome::Quarantined {
                 identity,
                 field,
                 reason,
             } => {
                 retain_pending_quarantine(&tx, *identity, field, reason, model::now_ms()?)?;
-                quarantined_new = true;
+                pending_metadata_written = true;
             }
         }
     }
@@ -2954,7 +2995,7 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
         // evidence, or stay read-only when nothing changed.
         if let Some(check_id) = last_id {
             let cursor_unchanged = cursor.as_deref() == Some(check_id.as_str());
-            if quarantined_new || !cursor_unchanged {
+            if pending_metadata_written || !cursor_unchanged {
                 set_meta(&tx, PENDING_CURSOR_KEY, &json!(check_id))?;
                 match &selection.cycle {
                     Some(snapshot) if snapshot.cut.as_str() == check_id.as_str() => {
@@ -2986,7 +3027,7 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
             // remain): keep the cursor and cycle untouched and read-only.
             return Ok(selection);
         }
-    } else if quarantined_new {
+    } else if pending_metadata_written {
         // New quarantine evidence commits even though healthy Work is also
         // returned. The subject cursor and cycle cut stay untouched here:
         // unexamined healthy Work is never marked visited.
@@ -4592,12 +4633,12 @@ mod tests {
     use super::*;
     #[path = "check_child_departure_durable_tests.rs"]
     mod check_child_departure_durable_tests;
+    #[path = "check_held_tests.rs"]
+    mod check_held_tests;
     #[path = "check_launch_fact_durable_tests.rs"]
     mod check_launch_fact_durable_tests;
     #[path = "check_launch_unknown_durable_tests.rs"]
     mod check_launch_unknown_durable_tests;
-    #[path = "check_held_tests.rs"]
-    mod check_held_tests;
     #[path = "reg23_pending_isolation_tests.rs"]
     mod reg23_pending_isolation_tests;
     use crate::{
