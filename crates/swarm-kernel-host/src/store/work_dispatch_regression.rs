@@ -777,7 +777,8 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         workspace_option: None,
         owned_service: None,
         admission_policy: Some(RouteAdmissionPolicy {
-            max_concurrent_roots: 1,
+            // Admit all eight fixtures before the explicit damaged-ledger Hold.
+            max_concurrent_roots: 8,
         }),
     };
     let hold_route_value = serde_json::to_value(&hold_route).unwrap();
