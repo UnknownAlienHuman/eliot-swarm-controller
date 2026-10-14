@@ -1016,6 +1016,7 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
     let mut db = fixture_db();
     db.execute_batch(WORKSPACE_SCHEMA).unwrap();
     db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    db.execute_batch(PROVIDER_CONDITION_SCHEMA).unwrap();
 
     let mut route_value = serde_json::to_value(root_admission_route()).unwrap();
     route_value["native_options"]["account_id"] = json!("provider-account");
