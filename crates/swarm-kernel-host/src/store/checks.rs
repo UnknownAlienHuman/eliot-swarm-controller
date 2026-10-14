@@ -269,13 +269,13 @@ impl Store {
         // The resource is known before reading candidate bytes; the exact
         // workspace scope is checked again after source verification.
         let incoming_resource = inputs::ProbeCleanupScope::resource_for_profile(&profile);
-        if self
+        let Some(probe_resolution) = self
             .check_child_custody
-            .probe_cleanup_resource_conflicts(incoming_resource.as_deref())
+            .reserve_probe_resolution(incoming_resource.as_deref())
             .await
-        {
+        else {
             return Ok(pending_resolution());
-        }
+        };
         let has_baseline_record = baseline_record.is_some();
         let data_dir = self.data_dir.clone();
         let verified_sources = self
@@ -299,9 +299,9 @@ impl Store {
             }
         };
         let scope = inputs::ProbeCleanupScope::for_candidate(&profile, &candidate);
-        if self
+        if !self
             .check_child_custody
-            .probe_cleanup_conflicts(scope.as_ref())
+            .pin_probe_resolution_scope(&probe_resolution, scope.as_ref())
             .await
         {
             return Ok(pending_resolution());
@@ -312,8 +312,12 @@ impl Store {
         });
         let resolved_context = context_fingerprint.clone();
         let resolved_scope = scope.clone();
+        let blocking_resolution = probe_resolution.clone();
         let result = self
             .file_io(move |_files| {
+                // Cancellation of the awaiting request must not make this
+                // resource available while its blocking probe is still running.
+                let _resolution = blocking_resolution;
                 let (resolved, cleanup_owner) =
                     inputs::resolve_with_cleanup(&profile, &candidate, baseline.as_ref());
                 let prepared = resolved.and_then(|mut resolved| {
@@ -3390,7 +3394,16 @@ pub(super) struct CheckChildCustody {
     git_cleanup_owners: std::sync::Arc<tokio::sync::Mutex<Vec<GitCleanupOwner>>>,
     git_cleanup_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
     probe_cleanup_owners: std::sync::Arc<tokio::sync::Mutex<Vec<ProbeCleanupOwner>>>,
-    probe_cleanup_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    probe_cleanup_operation:
+        std::sync::Arc<tokio::sync::Mutex<Vec<std::sync::Weak<ProbeResolutionReservation>>>>,
+}
+
+/// A live preflight uses the same short custody critical section as cleanup
+/// installation. Weak entries disappear when both the async caller and its
+/// blocking probe release the reservation; no asynchronous Drop is needed.
+struct ProbeResolutionReservation {
+    resource: String,
+    scope: std::sync::OnceLock<inputs::ProbeCleanupScope>,
 }
 
 impl CheckChildCustody {
@@ -3443,17 +3456,73 @@ impl CheckChildCustody {
         owners.iter().any(|owner| owner.conflicts_with(incoming))
     }
 
-    async fn probe_cleanup_resource_conflicts(&self, incoming_resource: Option<&str>) -> bool {
-        let _operation = self.probe_cleanup_operation.lock().await;
+    async fn reserve_probe_resolution(
+        &self,
+        incoming_resource: Option<&str>,
+    ) -> Option<std::sync::Arc<ProbeResolutionReservation>> {
+        let incoming_resource = incoming_resource?;
+        let mut resolutions = self.probe_cleanup_operation.lock().await;
+        resolutions.retain(|reservation| reservation.strong_count() > 0);
         let mut owners = self.probe_cleanup_owners.lock().await;
-        // The resource-only snapshot runs before candidate source reads.
         owners.retain_mut(|owner| {
             owner.poll();
             owner.is_pending()
         });
-        owners
+        if owners
             .iter()
-            .any(|owner| owner.conflicts_with_resource(incoming_resource))
+            .any(|owner| owner.conflicts_with_resource(Some(incoming_resource)))
+            || resolutions
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|reservation| reservation.resource == incoming_resource)
+        {
+            return None;
+        }
+        let reservation = std::sync::Arc::new(ProbeResolutionReservation {
+            resource: incoming_resource.to_owned(),
+            scope: std::sync::OnceLock::new(),
+        });
+        resolutions.push(std::sync::Arc::downgrade(&reservation));
+        Some(reservation)
+    }
+
+    async fn pin_probe_resolution_scope(
+        &self,
+        reservation: &std::sync::Arc<ProbeResolutionReservation>,
+        incoming: Option<&inputs::ProbeCleanupScope>,
+    ) -> bool {
+        let Some(incoming) = incoming else {
+            return false;
+        };
+        let mut resolutions = self.probe_cleanup_operation.lock().await;
+        resolutions.retain(|reservation| reservation.strong_count() > 0);
+        if reservation.resource != incoming.resource
+            || resolutions
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|other| {
+                    !std::sync::Arc::ptr_eq(&other, reservation)
+                        && (other.resource == incoming.resource
+                            || other
+                                .scope
+                                .get()
+                                .is_some_and(|scope| scope.overlaps(incoming)))
+                })
+        {
+            return false;
+        }
+        let mut owners = self.probe_cleanup_owners.lock().await;
+        owners.retain_mut(|owner| {
+            owner.poll();
+            owner.is_pending()
+        });
+        if owners
+            .iter()
+            .any(|owner| owner.conflicts_with(Some(incoming)))
+        {
+            return false;
+        }
+        reservation.scope.set(incoming.clone()).is_ok()
     }
 
     async fn reap_probe_cleanup_owners(&self) {
@@ -4024,7 +4093,15 @@ impl Store {
             .lock()
             .await
             .len();
-        check_children + git_helpers + input_probes
+        let resolutions = self
+            .check_child_custody
+            .probe_cleanup_operation
+            .lock()
+            .await
+            .iter()
+            .filter(|reservation| reservation.strong_count() > 0)
+            .count();
+        check_children + git_helpers + input_probes + resolutions
     }
 
     async fn check_child_is_owned(&self, check_id: &str) -> bool {
@@ -4818,6 +4895,142 @@ mod tests {
         time::Duration,
     };
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn probe_resolution_reservations_hold_conflicts_until_both_owners_depart() {
+        let custody = CheckChildCustody::default();
+        assert!(custody.reserve_probe_resolution(None).await.is_none());
+        let first = custody
+            .reserve_probe_resolution(Some("checks-a"))
+            .await
+            .unwrap();
+        let first_scope = inputs::ProbeCleanupScope {
+            resource: "checks-a".into(),
+            workspace_identity: json!({"workspace":"a"}),
+        };
+        assert!(
+            custody
+                .pin_probe_resolution_scope(&first, Some(&first_scope))
+                .await
+        );
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-a"))
+                .await
+                .is_none()
+        );
+
+        let independent = custody
+            .reserve_probe_resolution(Some("checks-b"))
+            .await
+            .unwrap();
+        let conflicting_workspace = inputs::ProbeCleanupScope {
+            resource: "checks-b".into(),
+            workspace_identity: first_scope.workspace_identity.clone(),
+        };
+        assert!(
+            !custody
+                .pin_probe_resolution_scope(&independent, Some(&conflicting_workspace))
+                .await
+        );
+        let independent_scope = inputs::ProbeCleanupScope {
+            resource: "checks-b".into(),
+            workspace_identity: json!({"workspace":"b"}),
+        };
+        assert!(
+            custody
+                .pin_probe_resolution_scope(&independent, Some(&independent_scope))
+                .await
+        );
+
+        let blocking_owner = first.clone();
+        drop(first);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-a"))
+                .await
+                .is_none()
+        );
+        drop(blocking_owner);
+        let replacement = custody
+            .reserve_probe_resolution(Some("checks-a"))
+            .await
+            .unwrap();
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-b"))
+                .await
+                .is_none()
+        );
+        drop(replacement);
+        drop(independent);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-b"))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_probe_resolution_io_overlaps_and_remains_in_store_custody() {
+        let fixture = fixture().await;
+        let custody = &fixture.owner.store.check_child_custody;
+        let first = custody
+            .reserve_probe_resolution(Some("checks-a"))
+            .await
+            .unwrap();
+        let second = custody
+            .reserve_probe_resolution(Some("checks-b"))
+            .await
+            .unwrap();
+        assert_eq!(fixture.owner.store.check_child_custody_count().await, 2);
+        let started = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        let overlap =
+            |reservation: Arc<ProbeResolutionReservation>,
+             started: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>| {
+                move |_files: ArtifactFiles| {
+                    let _reservation = reservation;
+                    let (count, changed) = &*started;
+                    let mut count = count.lock().unwrap();
+                    *count += 1;
+                    changed.notify_all();
+                    let (count, _) = changed
+                        .wait_timeout_while(count, Duration::from_secs(2), |count| *count < 2)
+                        .unwrap();
+                    if *count != 2 {
+                        return Err(Error::new(
+                            "TEST_PROBE_SERIALIZED",
+                            "independent I/O did not overlap",
+                        ));
+                    }
+                    Ok(())
+                }
+            };
+        let (a, b) = tokio::join!(
+            fixture
+                .owner
+                .store
+                .file_io(overlap(first.clone(), started.clone())),
+            fixture
+                .owner
+                .store
+                .file_io(overlap(second.clone(), started)),
+        );
+        a.unwrap();
+        b.unwrap();
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-a"))
+                .await
+                .is_none()
+        );
+        drop(first);
+        assert_eq!(fixture.owner.store.check_child_custody_count().await, 1);
+        drop(second);
+        assert_eq!(fixture.owner.store.check_child_custody_count().await, 0);
+        fixture.owner.close().await.unwrap();
+    }
 
     struct Fixture {
         directory: PathBuf,
