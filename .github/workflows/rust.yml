@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe]
 permissions:
   contents: read
 jobs:
@@ -886,6 +886,14 @@ jobs:
               'store_start_decision_reads_legacy_receipts_and_rejects_ambiguity',
               'store_allow_rejects_a_reparse_decision_path_without_changing_its_target',
               'uncertain_allow_equal_retry_requires_durable_decision_identity'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+          } elseif ($env:QUALIFICATION -ceq 'focused-probe') {
+            foreach ($case in @(
+              'probe_custody_keeps_nested_family_and_capture_until_exact_departure',
+              'real_probe_owner_blocks_only_conflicting_preflight_until_exact_family_departure',
+              'execution_paths_for_layout_selects_exact_legacy_and_compact_paths'
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
