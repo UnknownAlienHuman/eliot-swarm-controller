@@ -116,15 +116,14 @@ fn cached_assembly_parts(
     let cache_key = cache_epoch
         .map(|epoch| assembly_part_cache_key(record, epoch))
         .transpose()?;
-    if let Some(cache_key) = cache_key.as_ref() {
-        if let Ok(mut cache) = assembly_part_cache().lock() {
-            if let Some(index) = cache.iter().position(|entry| entry.key == *cache_key) {
-                let entry = cache.remove(index).expect("located cache entry");
-                let parts = Arc::clone(&entry.parts);
-                cache.push_back(entry);
-                return Ok(parts);
-            }
-        }
+    if let Some(cache_key) = cache_key.as_ref()
+        && let Ok(mut cache) = assembly_part_cache().lock()
+        && let Some(index) = cache.iter().position(|entry| entry.key == *cache_key)
+    {
+        let entry = cache.remove(index).expect("located cache entry");
+        let parts = Arc::clone(&entry.parts);
+        cache.push_back(entry);
+        return Ok(parts);
     }
 
     let part_values = record.metadata["parts"]

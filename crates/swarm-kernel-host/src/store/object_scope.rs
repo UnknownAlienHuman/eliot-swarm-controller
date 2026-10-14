@@ -314,9 +314,9 @@ fn cached_assembly_entry(
     let Ok(mut cache) = assembly_read_cache().lock() else {
         return None;
     };
-    let Some(index) = cache.iter().position(|entry| entry.guard.matches(snapshot)) else {
-        return None;
-    };
+    let index = cache
+        .iter()
+        .position(|entry| entry.guard.matches(snapshot))?;
     let entry = cache.remove(index).expect("located cache entry");
     let record = Arc::clone(&entry.record);
     let proof = Arc::clone(&entry.proof);
@@ -363,7 +363,7 @@ pub(super) fn assembly_read_cache_epoch(
 
 fn estimated_source_proof_bytes(sources: &[NativeResultSource]) -> usize {
     sources.iter().fold(
-        size_of::<Vec<NativeResultSource>>() + sources.len() * size_of::<NativeResultSource>(),
+        size_of::<Vec<NativeResultSource>>() + std::mem::size_of_val(sources),
         |total, source| {
             total
                 .saturating_add(source.producer_operation_id.len())
@@ -380,8 +380,7 @@ fn estimated_source_proof_bytes(sources: &[NativeResultSource]) -> usize {
 
 fn estimated_distinct_tasks_bytes(tasks: &[Option<TaskGraphIdentity>]) -> usize {
     tasks.iter().fold(
-        size_of::<Vec<Option<TaskGraphIdentity>>>()
-            + tasks.len() * size_of::<Option<TaskGraphIdentity>>(),
+        size_of::<Vec<Option<TaskGraphIdentity>>>() + std::mem::size_of_val(tasks),
         |total, task| {
             total.saturating_add(task.as_ref().map_or(0, |identity| {
                 identity.project_id.len()
@@ -2151,12 +2150,12 @@ fn assembled_result_sources(
     snapshot: Option<&super::results::AssemblyReadCacheSnapshot>,
     shared_record: Option<&Arc<ArtifactRecord>>,
 ) -> Result<Arc<AssemblyProof>> {
-    if let Some(snapshot) = snapshot {
-        if let Some(proof) = cached_assembly_proof(record, snapshot)? {
-            #[cfg(test)]
-            count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 1, 0);
-            return Ok(proof);
-        }
+    if let Some(snapshot) = snapshot
+        && let Some(proof) = cached_assembly_proof(record, snapshot)?
+    {
+        #[cfg(test)]
+        count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 1, 0);
+        return Ok(proof);
     }
     let operation_id = bounded_text(&record.metadata, "assembly_operation_id")
         .ok_or_else(|| identity_damaged("assembled result has no exact assembly Operation"))?;
@@ -2483,7 +2482,12 @@ fn resolve_artifact_read_inner(
     if principal.role == Role::Module {
         return Ok(None);
     }
-    match artifact_domain_identity_with_cache(db, record, snapshot, shared_record)? {
+    let domain = if snapshot.is_none() && shared_record.is_none() {
+        artifact_domain_identity(db, record)?
+    } else {
+        artifact_domain_identity_with_cache(db, record, snapshot, shared_record)?
+    };
+    match domain {
         ArtifactDomainIdentity::Task {
             identity,
             producer_operation_id,
