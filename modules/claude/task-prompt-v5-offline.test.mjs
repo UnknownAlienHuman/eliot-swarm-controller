@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { applySdkMessage, createStreamState, snapshot } from './stream.mjs';
 import {
   CLAUDE_TASK_PROMPT_ARTIFACT_ID,
@@ -180,3 +182,81 @@ test('bridge.5 rejects altered or legacy snapshot input and admission without th
 
   assert.equal(context.operation_id, command.operation_id);
 });
+const connectedFixtureDir = process.env.ELIOT_TASK_PROMPT_V5_FIXTURE_DIR;
+if (connectedFixtureDir) {
+  test('Rust Store TaskPrompt v1 crosses into Claude bridge.5 consumer helpers unchanged and correlates echo UUID', async () => {
+    const envelopeBytes = await readFile(join(connectedFixtureDir, 'envelope.json'));
+    const dispatch = JSON.parse(await readFile(join(connectedFixtureDir, 'dispatch.json'), 'utf8'));
+    assert.equal(sha256(envelopeBytes), dispatch.expected_envelope_json_sha256);
+
+    const envelope = JSON.parse(envelopeBytes.toString('utf8'));
+    const command = {
+      ...dispatch.command,
+      input: { ...dispatch.command.input, task_prompt: envelope },
+    };
+    const taskPrompt = taskPromptFor(command, dispatch.bootId);
+    assert.strictEqual(taskPrompt.envelope, envelope);
+
+    const queued = [];
+    const nativeInput = enqueueTaskPrompt(
+      taskPrompt,
+      { push: message => queued.push(message) },
+      dispatch.inputId,
+      dispatch.nativeRootId,
+    );
+    assert.deepEqual(queued, [nativeInput]);
+    assert.deepEqual(nativeInput, {
+      type: 'user',
+      message: { role: 'user', content: envelope.prompt },
+      parent_tool_use_id: null,
+      uuid: dispatch.inputId,
+      session_id: dispatch.nativeRootId,
+    });
+    const nativeBytes = Buffer.from(nativeInput.message.content, 'utf8');
+    assert.deepEqual(nativeBytes, Buffer.from(envelope.prompt, 'utf8'));
+    assert.equal(nativeBytes.length, envelope.prompt_bytes);
+    assert.equal(sha256(nativeBytes), envelope.prompt_sha256);
+
+    const nativeFrame = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: dispatch.nativeRootId,
+      uuid: 'task-prompt-v5-offline-result-frame',
+      result_index: 0,
+      user_message_uuid: dispatch.inputId,
+      user_message_uuids: [dispatch.inputId],
+      result: 'offline fixture result',
+    };
+    const state = createStreamState();
+    applySdkMessage(state, {
+      type: 'system',
+      subtype: 'init',
+      session_id: dispatch.nativeRootId,
+      model: 'offline-fixture',
+      uuid: 'task-prompt-v5-offline-init-frame',
+    });
+    applySdkMessage(state, nativeFrame);
+    const execution = snapshot(state).input_executions[0];
+    assert.equal(execution.native_input_id, dispatch.inputId);
+    assert.equal(execution.native_session_id, dispatch.nativeRootId);
+    assert.equal(execution.result_frame_uuid, nativeFrame.uuid);
+
+    const admission = taskDispatchAdmission(command, taskPrompt, {
+      moduleContract: dispatch.moduleContract,
+      bootId: dispatch.bootId,
+      inputId: dispatch.inputId,
+      nativeRootId: dispatch.nativeRootId,
+      nativeFrame,
+    });
+    assert.equal(admission.operation_id, dispatch.command.operation_id);
+    assert.equal(admission.binding_id, dispatch.command.binding_id);
+    assert.equal(admission.binding_generation, dispatch.command.generation);
+    assert.equal(admission.worker_boot_id, dispatch.bootId);
+    assert.equal(admission.native_payload_sha256, envelope.prompt_sha256);
+    assert.equal(admission.native_payload_bytes, envelope.prompt_bytes);
+    assert.equal(admission.native_input_id, dispatch.inputId);
+
+    await writeFile(join(connectedFixtureDir, 'admission.json'), JSON.stringify(admission));
+  });
+}
