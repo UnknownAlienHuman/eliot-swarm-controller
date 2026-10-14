@@ -1921,3 +1921,601 @@ async fn issue99_negative_old_delivery_not_rerouted() {
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+async fn publish_carrier_contract_card(
+    owner: &StoreOwner,
+    participant: &Principal,
+    contract_key: &str,
+    request_id: &str,
+) {
+    owner
+        .store
+        .call(
+            participant.clone(),
+            "coordination.contract_card.publish".into(),
+            json!({
+                "client_request_id":request_id,
+                "contract_key":contract_key,
+                "fields":{
+                    "role":"carrier",
+                    "paths":[format!("src/{contract_key}.rs")],
+                    "interfaces":[format!("carrier contract {contract_key}")],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+async fn publish_work_term_card(
+    owner: &StoreOwner,
+    participant: &Principal,
+    path: &str,
+    symbol: &str,
+    interface: &str,
+    request_id: &str,
+) {
+    owner
+        .store
+        .call(
+            participant.clone(),
+            "coordination.work_card.publish".into(),
+            json!({
+                "client_request_id":request_id,
+                "fields":{
+                    "paths":[path],
+                    "symbols":[symbol],
+                    "interfaces":[interface],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+async fn propose_accept_shared_scope(
+    owner: &StoreOwner,
+    participant: &Principal,
+    subject: &ReviewSubject,
+    label: &str,
+    path: &str,
+    symbol: &str,
+    interface: &str,
+) {
+    let scope = owner
+        .store
+        .call(
+            participant.clone(),
+            "code.scope.propose".into(),
+            json!({
+                "client_request_id":format!("{label}-propose"),
+                "task_id":subject.task_id.clone(),
+                "task_revision":1,
+                "attempt_id":subject.attempt_id.clone(),
+                "mode":"exclusive_edit",
+                "paths":[path],
+                "symbols":[symbol],
+                "interfaces":[interface],
+                "baseline_candidate_ref":"advisory-public-baseline",
+                "reason":format!("exact shared seam {label}"),
+            }),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            principal("review-owner-v2", Role::Manager),
+            "code.scope.accept".into(),
+            json!({
+                "client_request_id":format!("{label}-accept"),
+                "scope_intent_id":scope["scope_intent_id"],
+                "expected_state_revision":scope["state_revision"],
+                "proposal_digest":scope["digest"],
+                "reason":format!("accept exact shared seam {label}"),
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn issue99_reviewer_cross_task_via_contract_uses_each_owners_current_context() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-reviewer-xtask").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-reviewer-xtask-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let manager = principal("review-owner-v2", Role::Manager);
+    let (reviewer, _) = assign_sponsored_reviewer(
+        &owner.store,
+        manager,
+        &source_subject,
+        "issue99-reviewer-xtask-reviewer",
+        "issue99-reviewer-xtask-token",
+    )
+    .await;
+    let consumer = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-reviewer-xtask-consumer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-reviewer-xtask-contract";
+    publish_producer_contract_card(
+        &owner,
+        &reviewer,
+        contract_key,
+        "issue99-reviewer-xtask-publish-reviewer",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &consumer,
+        contract_key,
+        "issue99-reviewer-xtask-publish-consumer",
+    )
+    .await;
+    let found = owner
+        .store
+        .call(
+            reviewer.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], consumer.client_id);
+    assert_eq!(
+        found["items"][0]["context"]["task_id"],
+        target_subject.task_id
+    );
+    assert_eq!(
+        found["items"][0]["match"]["relation"]["kind"],
+        "contract_key"
+    );
+    let asked = owner
+        .store
+        .call(
+            reviewer.clone(),
+            "coordination.consult".into(),
+            json!({
+                "client_request_id":"issue99-reviewer-xtask-ask",
+                "target":{"contract_key":contract_key},
+                "field":"assumptions",
+                "question_kind":"assumption_check",
+                "question":"Which implementation assumption applies?",
+                "why_needed":"The exact contract card has no current assumption value.",
+                "expected_answer":"one_fact",
+                "blocking":false,
+                "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+                "evidence_refs":[],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asked["status"], "asked");
+    assert_eq!(asked["recipient"], consumer.client_id);
+    assert_eq!(asked["source_context"]["task_id"], source_subject.task_id);
+    assert_eq!(asked["target_context"]["task_id"], target_subject.task_id);
+    let inbox = owner
+        .store
+        .call(
+            consumer.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox["task_id"], target_subject.task_id);
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["items"][0]["operation_id"], asked["operation_id"]);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_carrier_role_cross_task_cell_uses_each_owners_current_context() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-carrier-xtask").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-carrier-xtask-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let producer = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-carrier-xtask-producer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let carrier = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-carrier-xtask-carrier",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-carrier-xtask-contract";
+    publish_producer_contract_card(
+        &owner,
+        &producer,
+        contract_key,
+        "issue99-carrier-xtask-publish-producer",
+    )
+    .await;
+    publish_carrier_contract_card(
+        &owner,
+        &carrier,
+        contract_key,
+        "issue99-carrier-xtask-publish-carrier",
+    )
+    .await;
+    let found = owner
+        .store
+        .call(
+            producer.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], carrier.client_id);
+    assert_eq!(
+        found["items"][0]["match"]["relation"]["kind"],
+        "contract_key"
+    );
+    let first_cell = sync_offer(
+        &owner,
+        &producer,
+        contract_key,
+        "issue99-carrier-xtask-sync-producer",
+        vec![],
+    )
+    .await;
+    let second_cell = sync_offer(
+        &owner,
+        &carrier,
+        contract_key,
+        "issue99-carrier-xtask-sync-carrier",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        first_cell["cell"]["cell_id"],
+        second_cell["cell"]["cell_id"]
+    );
+    let task_revision_set = second_cell["cell"]["facts"]["task_revision_set"]
+        .as_array()
+        .unwrap();
+    assert_eq!(task_revision_set.len(), 2);
+    assert!(
+        task_revision_set
+            .iter()
+            .any(|item| item["task_id"] == source_subject.task_id)
+    );
+    assert!(
+        task_revision_set
+            .iter()
+            .any(|item| item["task_id"] == target_subject.task_id)
+    );
+    assert_eq!(
+        second_cell["cell"]["facts"]["member_basis_set"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let carrier_constraints = second_cell["cell"]["facts"]["carrier_constraints"]
+        .as_array()
+        .unwrap();
+    assert_eq!(carrier_constraints.len(), 1);
+    assert_eq!(carrier_constraints[0]["client_id"], carrier.client_id);
+    owner
+        .store
+        .call(
+            producer.clone(),
+            "coordination.integration.ack".into(),
+            ack_request(
+                &second_cell["cell"],
+                &source_subject,
+                "issue99-carrier-xtask-ack-producer",
+            ),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            carrier.clone(),
+            "coordination.integration.ack".into(),
+            ack_request(
+                &second_cell["cell"],
+                &target_subject,
+                "issue99-carrier-xtask-ack-carrier",
+            ),
+        )
+        .await
+        .unwrap();
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_task_dependency_cross_task_delivery_uses_each_owners_current_context() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-task-dependency").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-task-dependency-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source_task_id = source_subject.task_id.clone();
+    let dep_task_id = target_subject.task_id.clone();
+    owner
+        .store
+        .run(move |db| {
+            let raw: String = db.query_row(
+                "SELECT spec_json FROM tasks WHERE task_id=?1",
+                [&source_task_id],
+                |row| row.get(0),
+            )?;
+            let mut spec: Value = serde_json::from_str(&raw)?;
+            spec["dependencies"] = json!([{
+                "task_id":dep_task_id,
+                "required_revision":1,
+                "required_phase":"implementation",
+            }]);
+            db.execute(
+                "UPDATE tasks SET spec_json=?2 WHERE task_id=?1",
+                params![source_task_id, model::canonical(&spec)?],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-task-dependency-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-task-dependency-target",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let found = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"related_task_id":target_subject.task_id,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target.client_id);
+    assert_eq!(
+        found["items"][0]["context"]["task_id"],
+        target_subject.task_id
+    );
+    assert_eq!(
+        found["items"][0]["match"]["relation"]["kind"],
+        "task_dependency"
+    );
+    assert_eq!(
+        found["items"][0]["match"]["relation"]["direction"],
+        "source_depends_on_target"
+    );
+    let sent = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"issue99-task-dependency-send",
+                "recipient":target.client_id,
+                "body":{"fact":"dependency delivery"},
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["recipient"], target.client_id);
+    let inbox = owner
+        .store
+        .call(
+            target.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox["task_id"], target_subject.task_id);
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["items"][0]["operation_id"], sent["operation_id"]);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_accepted_scope_path_symbol_interface_cross_task_uses_each_owners_current_context() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-accepted-scope").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-accepted-scope-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-accepted-scope-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-accepted-scope-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let path = "src/issue99-shared-seam.rs";
+    let symbol = "Issue99SharedSeam";
+    let interface = "issue99-shared-seam-v1";
+    publish_work_term_card(
+        &owner,
+        &source,
+        path,
+        symbol,
+        interface,
+        "issue99-accepted-scope-publish-source",
+    )
+    .await;
+    publish_work_term_card(
+        &owner,
+        &target,
+        path,
+        symbol,
+        interface,
+        "issue99-accepted-scope-publish-target",
+    )
+    .await;
+    propose_accept_shared_scope(
+        &owner,
+        &source,
+        &source_subject,
+        "issue99-accepted-scope-source",
+        path,
+        symbol,
+        interface,
+    )
+    .await;
+    propose_accept_shared_scope(
+        &owner,
+        &target,
+        &target_subject,
+        "issue99-accepted-scope-target",
+        path,
+        symbol,
+        interface,
+    )
+    .await;
+    let by_path = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"path":path,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_path["items"].as_array().unwrap().len(), 1);
+    assert_eq!(by_path["items"][0]["client_id"], target.client_id);
+    assert_eq!(
+        by_path["items"][0]["context"]["task_id"],
+        target_subject.task_id
+    );
+    assert_eq!(
+        by_path["items"][0]["match"]["relation"]["kind"],
+        "accepted_scope_overlap"
+    );
+    assert_eq!(
+        by_path["items"][0]["match"]["relation"]["term_kind"],
+        "path"
+    );
+    assert_eq!(
+        by_path["items"][0]["match"]["relation"]["term"],
+        path
+    );
+    let by_symbol = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"symbol":symbol,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_symbol["items"].as_array().unwrap().len(), 1);
+    assert_eq!(by_symbol["items"][0]["client_id"], target.client_id);
+    assert_eq!(
+        by_symbol["items"][0]["match"]["relation"]["kind"],
+        "accepted_scope_overlap"
+    );
+    assert_eq!(
+        by_symbol["items"][0]["match"]["relation"]["term_kind"],
+        "symbol"
+    );
+    let by_interface = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"interface":interface,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_interface["items"].as_array().unwrap().len(), 1);
+    assert_eq!(by_interface["items"][0]["client_id"], target.client_id);
+    assert_eq!(
+        by_interface["items"][0]["match"]["relation"]["kind"],
+        "accepted_scope_overlap"
+    );
+    assert_eq!(
+        by_interface["items"][0]["match"]["relation"]["term_kind"],
+        "interface"
+    );
+    let sent = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"issue99-accepted-scope-send",
+                "recipient":target.client_id,
+                "body":{"fact":"scope overlap delivery"},
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["recipient"], target.client_id);
+    let inbox = owner
+        .store
+        .call(
+            target.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox["task_id"], target_subject.task_id);
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["items"][0]["operation_id"], sent["operation_id"]);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
