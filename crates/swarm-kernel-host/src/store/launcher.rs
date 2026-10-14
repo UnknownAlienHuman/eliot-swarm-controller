@@ -3972,24 +3972,180 @@ pub(crate) fn opening_actor_for_open(
 
 /// Bounded host selector. Unknown launches are selected for readback only;
 /// callers must inspect the retained manifest phase before acting.
-pub(super) fn pending_launches(db: &Connection, limit: i64) -> Result<Vec<String>> {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct LaunchReconcileKey {
+    pub updated_at_ms: i64,
+    pub operation_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingLaunch {
+    pub operation_id: String,
+    pub cursor: LaunchReconcileKey,
+}
+
+pub(super) fn pending_launch_ceiling(db: &Connection) -> Result<Option<LaunchReconcileKey>> {
+    db.query_row(
+        "SELECT updated_at_ms,operation_id FROM operations \
+         WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
+           AND json_extract(effective_request_json,'$.launch_manifest.state') \
+             IN ('pending_workspace','awaiting_binding','awaiting_capability', \
+                 'awaiting_participant_credential','outcome_unknown') \
+         ORDER BY updated_at_ms DESC,operation_id DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(LaunchReconcileKey {
+                updated_at_ms: row.get(0)?,
+                operation_id: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(super) fn pending_launches(
+    db: &Connection,
+    limit: i64,
+    after: Option<&LaunchReconcileKey>,
+    through: &LaunchReconcileKey,
+) -> Result<Vec<PendingLaunch>> {
     if !(1..=16).contains(&limit) {
         return Err(Error::invalid(
             "pending launch limit must be from 1 through 16",
         ));
     }
     let mut statement = db.prepare(
-        "SELECT operation_id FROM operations \
+        "SELECT updated_at_ms,operation_id FROM operations \
          WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
            AND json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
                  'awaiting_participant_credential','outcome_unknown') \
-         ORDER BY updated_at_ms,operation_id LIMIT ?1",
+           AND (?1 IS NULL OR updated_at_ms>?1 OR (updated_at_ms=?1 AND operation_id>?2)) \
+           AND (updated_at_ms<?3 OR (updated_at_ms=?3 AND operation_id<=?4)) \
+         ORDER BY updated_at_ms,operation_id LIMIT ?5",
     )?;
     statement
-        .query_map([limit], |row| row.get::<_, String>(0))?
+        .query_map(
+            params![
+                after.map(|key| key.updated_at_ms),
+                after.map(|key| key.operation_id.as_str()),
+                through.updated_at_ms,
+                through.operation_id,
+                limit,
+            ],
+            |row| {
+                Ok(PendingLaunch {
+                    cursor: LaunchReconcileKey {
+                        updated_at_ms: row.get(0)?,
+                        operation_id: row.get(1)?,
+                    },
+                    operation_id: row.get(1)?,
+                })
+            },
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Stable semantic projection for separating actual launch progress from a
+/// candidate that was examined and left held. Admission refresh metadata and
+/// row timestamps are intentionally excluded because those are not progress.
+pub(super) fn launch_reconciliation_snapshot(db: &Connection, operation_id: &str) -> Result<Value> {
+    let (
+        state,
+        task_id,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        native_refs,
+        effective_raw,
+        result_raw,
+    ): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+    ) = db.query_row(
+        "SELECT state,task_id,attempt_id,binding_id,binding_generation,native_refs_json, \
+                effective_request_json,result_json \
+         FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+        [operation_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let mut effective: Value = serde_json::from_str(&effective_raw)?;
+    if let Some(manifest) = effective
+        .get_mut("launch_manifest")
+        .and_then(Value::as_object_mut)
+    {
+        manifest.remove("current_route_admission");
+    }
+    let mut result: Value = result_raw
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if let Some(result) = result.as_object_mut() {
+        result.remove("current_route_admission");
+    }
+
+    let mut leases = db.prepare(
+        "SELECT lease_id,registration_id,registration_generation,project_id,task_id, \
+                task_revision,attempt_id,plan_digest,owner_client_id,allowed_paths_json, \
+                allowed_symbols_json,baseline_commit,branch_ref,worktree_handle,workspace_path, \
+                clean_state_json,generation,binding_digest,state \
+         FROM workspace_leases WHERE operation_id=?1 ORDER BY lease_id",
+    )?;
+    let lease_rows = leases.query_map([operation_id], |row| {
+        Ok(json!([
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, String>(13)?,
+            row.get::<_, String>(14)?,
+            row.get::<_, String>(15)?,
+            row.get::<_, i64>(16)?,
+            row.get::<_, String>(17)?,
+            row.get::<_, String>(18)?,
+        ]))
+    })?;
+    let leases = lease_rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(json!({
+        "state":state,
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+        "native_refs":native_refs,
+        "effective_request":effective,
+        "result":result,
+        "workspace_leases":leases,
+    }))
 }
 
 /// Turn a Host-side workspace failure into a stable launch receipt. The

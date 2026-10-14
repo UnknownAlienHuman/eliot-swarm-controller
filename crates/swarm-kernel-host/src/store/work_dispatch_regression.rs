@@ -179,7 +179,7 @@ async fn register_manager_with_credential(
     (principal, credential)
 }
 
-async fn select_regression_descriptor(store: &Store, manager: &Principal) {
+async fn select_regression_descriptor(store: &Store, manager: &Principal, route_alias: &str) {
     let mut template = ModuleContractTemplate::codex_rust_controller_v5().unwrap();
     template.module_id = ModuleId::new("regression-runtime").unwrap();
     template.artifact.artifact_id = ArtifactId::new("regression-artifact").unwrap();
@@ -219,7 +219,7 @@ async fn select_regression_descriptor(store: &Store, manager: &Principal) {
         manager,
         "module.route.select",
         json!({
-            "route_alias":"regression-route",
+            "route_alias":route_alias,
             "module_id":"regression-runtime",
             "artifact_id":"regression-artifact",
             "version":"5",
@@ -227,6 +227,80 @@ async fn select_regression_descriptor(store: &Store, manager: &Principal) {
         }),
     )
     .await;
+}
+
+async fn seed_unknown_launch(
+    store: &Store,
+    operator: &Principal,
+    manager: &Principal,
+    project_id: &str,
+    route_alias: &str,
+    ordinal: usize,
+) -> String {
+    let task = write(
+        store,
+        operator,
+        "task.create",
+        json!({
+            "project_id":project_id,
+            "spec":{
+                "objective":format!("Retain bounded launch candidate {ordinal}"),
+                "phase":"implementation",
+                "requirements":[{"id":"R1","statement":"Keep this unrelated launch independently valid"}],
+                "scope":{"initial_paths":["src/target.rs"]},
+                "owner_policy_id":OWNER_POLICY_V1_ID,
+            }
+        }),
+    )
+    .await;
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let mut request = json!({
+        "task_id":task_id,
+        "expected_task_revision":1,
+        "route":route_alias,
+        "agent_profile":"workspace-admission-agent",
+        "mcp_profile":"work-participant",
+        "mcp_surface":"participant-core",
+        "workspace_policy":"manager_owned_worktree",
+        "requested_model":null,
+        "requested_effort":null,
+        "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+        "stop_conditions":[],
+        "purpose":"implementation",
+    });
+    let preview = store
+        .call(
+            manager.clone(),
+            "swarm.launch.preview".to_owned(),
+            request.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["hard_blocks"], json!([]), "{preview}");
+    request["client_request_id"] = json!(format!("launch-fairness-{ordinal}-{}", model::new_id()));
+    request["plan_digest"] = preview["plan_digest"].clone();
+    let receipt = store
+        .call(manager.clone(), "swarm.launch".to_owned(), request)
+        .await
+        .unwrap();
+    assert_eq!(receipt["launch_state"], "pending_workspace", "{receipt}");
+    let operation_id = receipt["operation_id"].as_str().unwrap().to_owned();
+    let failure_id = operation_id.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            super::launcher::fail_launch(
+                &tx,
+                &failure_id,
+                "workspace_effect_unknown",
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    operation_id
 }
 
 #[tokio::test]
@@ -237,7 +311,7 @@ async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot
 
     // Automatic admission requires the same exact trusted route selection as
     // manual launch. This fixture never executes the descriptor's placeholder.
-    select_regression_descriptor(&owner.store, &manager).await;
+    select_regression_descriptor(&owner.store, &manager, "regression-route").await;
 
     write(
         &owner.store,
@@ -515,6 +589,7 @@ fn run_fixture_git(git: &Path, repository: &Path, hooks: &Path, args: &[&str]) -
 async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace() {
     const PROJECT_ID: &str = "workspace-admission-regression";
     const ROUTE_ALIAS: &str = "workspace-admission-opencode";
+    const DUMMY_ROUTE_ALIAS: &str = "workspace-admission-fairness-dummy";
     const SERVICE_ID: &str = "workspace-admission-service";
     const CANONICAL_REPOSITORY: &str = "github.com/owner/workspace-admission";
     const REMOTE_URL: &str = "https://github.com/owner/workspace-admission.git";
@@ -622,6 +697,16 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         },
     );
     config.routes.push(route);
+    config.routes.push(Route {
+        alias: DUMMY_ROUTE_ALIAS.to_owned(),
+        runtime: "regression-runtime".to_owned(),
+        module_artifact_id: "regression-artifact".to_owned(),
+        enabled: true,
+        native_options: json!({}),
+        workspace_option: None,
+        owned_service: None,
+        admission_policy: None,
+    });
     config.mcp.profiles.insert(
         "work-participant".to_owned(),
         McpProfileConfig {
@@ -635,12 +720,13 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
 
     let root = DataRoot::acquire(&data_directory).expect("acquire isolated Store root");
     let credential = bootstrap_credential(&root.path).expect("create local Operator credential");
-    let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+    let config = Arc::new(config);
+    let owner = StoreOwner::start(root, config.clone(), credential.clone())
         .await
         .expect("start Store with the exact Forge and workspace mappings");
     let operator = owner
         .store
-        .authenticate(credential)
+        .authenticate(credential.clone())
         .await
         .expect("authenticate local Operator");
     owner
@@ -649,7 +735,9 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         .await
         .expect("retain the configured workspace registration");
 
-    let manager = register_manager(&owner.store, &operator, "workspace-admission-manager").await;
+    let (manager, manager_credential) =
+        register_manager_with_credential(&owner.store, &operator, "workspace-admission-manager")
+            .await;
     write(
         &owner.store,
         &operator,
@@ -657,6 +745,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         json!({"client_id":manager.client_id}),
     )
     .await;
+    select_regression_descriptor(&owner.store, &manager, DUMMY_ROUTE_ALIAS).await;
     let task = write(
         &owner.store,
         &operator,
@@ -726,6 +815,52 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     assert_eq!(recent["disposition"], "admitted", "{recent}");
     let operation_id = recent["operation_id"].as_str().unwrap().to_owned();
 
+    // Nine independently valid launch receipts are converted through the
+    // real failure helper into exact Unknown/no-ticket readback cases: eight
+    // precede the target and one remains as its unprocessed tail. Their
+    // unrelated route keeps the target's root-capacity admission independent.
+    let mut unknown_ids = Vec::with_capacity(9);
+    for ordinal in 0..9 {
+        unknown_ids.push(
+            seed_unknown_launch(
+                &owner.store,
+                &operator,
+                &manager,
+                PROJECT_ID,
+                DUMMY_ROUTE_ALIAS,
+                ordinal,
+            )
+            .await,
+        );
+    }
+    let tail_id = unknown_ids.pop().expect("the tenth candidate is the tail");
+    unknown_ids.sort();
+    let target_id_for_order = operation_id.clone();
+    let tail_id_for_order = tail_id.clone();
+    let ordered_unknown_ids = unknown_ids.clone();
+    owner
+        .store
+        .run(move |db| {
+            let base = model::now_ms()?.saturating_sub(100_000);
+            for operation_id in ordered_unknown_ids {
+                db.execute(
+                    "UPDATE operations SET updated_at_ms=?2 WHERE operation_id=?1",
+                    rusqlite::params![operation_id, base],
+                )?;
+            }
+            db.execute(
+                "UPDATE operations SET updated_at_ms=?2 WHERE operation_id=?1",
+                rusqlite::params![target_id_for_order, base.saturating_add(1)],
+            )?;
+            db.execute(
+                "UPDATE operations SET updated_at_ms=?2 WHERE operation_id=?1",
+                rusqlite::params![tail_id_for_order, 9_000_000_000_000_000_000i64],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
     // The trigger fires only when this exact operation's real Git evidence is
     // committed as a held lease. The malformed exact-scope ledger is a
     // deterministic damaged-capacity fault, not a fabricated provider fact.
@@ -751,6 +886,38 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         .unwrap();
 
     let progress = owner.store.reconcile_launches_once().await.unwrap();
+    assert_eq!(progress["examined"], 8, "{progress}");
+    assert_eq!(progress["progressed"], 0, "{progress}");
+    assert_eq!(progress["held"], 8, "{progress}");
+    assert_eq!(progress["outcome_unknown"], 0, "{progress}");
+    let selected_cursor = owner
+        .store
+        .run(|db| {
+            let value = super::meta(db, "launcher:reconcile_launches:v1:cursor")?
+                .expect("the considered page persists its cursor");
+            Ok(value["after"]["operation_id"].as_str().unwrap().to_owned())
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected_cursor, *unknown_ids.last().unwrap());
+
+    let cursor_failure = format!(
+        "CREATE TRIGGER launch_cursor_checkpoint_hard_failure \
+         BEFORE INSERT ON meta \
+         WHEN NEW.key='launcher:reconcile_launches:v1:cursor' \
+           AND json_extract(NEW.value_json,'$.after.operation_id')='{operation_id}' \
+         BEGIN SELECT RAISE(ABORT,'fixture cursor checkpoint failure'); END;"
+    );
+    owner
+        .store
+        .run(move |db| {
+            db.execute_batch(&cursor_failure)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let hard_failure = owner.store.reconcile_launches_once().await.unwrap_err();
+    assert!(!hard_failure.code.is_empty(), "{hard_failure}");
     let operation = owner
         .store
         .call(
@@ -760,17 +927,39 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         )
         .await
         .unwrap();
-    assert_eq!(
-        progress["progressed"], 1,
-        "progress={progress}; operation={operation}"
-    );
-    assert_eq!(
-        progress["outcome_unknown"], 0,
-        "progress={progress}; operation={operation}"
-    );
     assert_eq!(operation["state"], "queued");
     assert_eq!(operation["binding_id"], Value::Null);
     assert_eq!(operation["attempt_id"], Value::Null);
+    let tail_id_for_check = tail_id.clone();
+    let cursor_after_failure = owner
+        .store
+        .run(move |db| {
+            let cursor = super::meta(db, "launcher:reconcile_launches:v1:cursor")?
+                .expect("hard checkpoint failure preserves the prior cursor");
+            let (state, effective_raw, lease_count): (String, String, i64) = db.query_row(
+                "SELECT state,effective_request_json, \
+                        (SELECT COUNT(*) FROM workspace_leases WHERE operation_id=?1) \
+                 FROM operations WHERE operation_id=?1",
+                [&tail_id_for_check],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let effective: Value = serde_json::from_str(&effective_raw)?;
+            Ok(json!({
+                "after":cursor["after"]["operation_id"],
+                "tail_state":state,
+                "tail_manifest_state":effective["launch_manifest"]["state"],
+                "tail_lease_count":lease_count,
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(cursor_after_failure["after"], *unknown_ids.last().unwrap());
+    assert_eq!(cursor_after_failure["tail_state"], "outcome_unknown");
+    assert_eq!(
+        cursor_after_failure["tail_manifest_state"],
+        "outcome_unknown"
+    );
+    assert_eq!(cursor_after_failure["tail_lease_count"], 0);
 
     let task_id_for_readback = task_id.clone();
     let operation_id_for_readback = operation_id.clone();
@@ -888,6 +1077,106 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         PathBuf::from(retained["workspace_path"].as_str().unwrap()).starts_with(&workspace_root)
     );
 
+    let capacity_key = format!("capacity:{}", scope_key.as_str());
+    owner
+        .store
+        .run(move |db| {
+            db.execute_batch(
+                "DROP TRIGGER workspace_admission_capacity_damage; \
+                 DROP TRIGGER launch_cursor_checkpoint_hard_failure;",
+            )?;
+            db.execute("DELETE FROM meta WHERE key=?1", [capacity_key])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    owner.close().await.unwrap();
+
+    // The saved scan ceiling and last considered tuple survive a real Store
+    // restart. The next pass resumes at the ninth valid launch and reaches the
+    // existing held-lease path, which performs one native open admission.
+    let root = DataRoot::acquire(&data_directory).expect("reacquire Store root after close");
+    let owner = StoreOwner::start(root, config.clone(), credential)
+        .await
+        .expect("reopen Store with the same local authority and workspace mapping");
+    let manager = owner
+        .store
+        .authenticate(manager_credential)
+        .await
+        .expect("reauthenticate the retained launch actor");
+    let resumed = owner.store.reconcile_launches_once().await.unwrap();
+    assert_eq!(resumed["examined"], 2, "{resumed}");
+    assert_eq!(resumed["progressed"], 1, "{resumed}");
+    assert_eq!(resumed["held"], 1, "{resumed}");
+    assert_eq!(resumed["outcome_unknown"], 0, "{resumed}");
+    let admitted = owner
+        .store
+        .call(
+            manager.clone(),
+            "operation.get".to_owned(),
+            json!({"operation_id":operation_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted["state"], "queued", "{admitted}");
+    assert!(admitted["attempt_id"].as_str().is_some(), "{admitted}");
+    assert!(admitted["binding_id"].as_str().is_some(), "{admitted}");
+    let task_id_for_admission = task_id.clone();
+    let operation_id_for_admission = operation_id.clone();
+    let admitted_counts = owner
+        .store
+        .run(move |db| {
+            let attempts: i64 = db.query_row(
+                "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
+                [&task_id_for_admission],
+                |row| row.get(0),
+            )?;
+            let bindings: i64 = db.query_row(
+                "SELECT COUNT(*) FROM bindings WHERE lane_id=( \
+                   SELECT 'launch-' || lease_id FROM workspace_leases WHERE operation_id=?1)",
+                [&operation_id_for_admission],
+                |row| row.get(0),
+            )?;
+            let open_children: i64 = db.query_row(
+                "SELECT COUNT(*) FROM operations WHERE method='agent.open' \
+                 AND prerequisite_operation_id=?1",
+                [&operation_id_for_admission],
+                |row| row.get(0),
+            )?;
+            Ok(json!({"attempts":attempts,"bindings":bindings,"open_children":open_children}))
+        })
+        .await
+        .unwrap();
+    assert_eq!(admitted_counts["attempts"], 1, "{admitted_counts}");
+    assert_eq!(admitted_counts["bindings"], 1, "{admitted_counts}");
+    assert_eq!(admitted_counts["open_children"], 1, "{admitted_counts}");
+
+    // The exhausted scan wraps over the eight no-op Unknown rows. A following
+    // pass can revisit the admitted launch without creating another child.
+    let wrapped = owner.store.reconcile_launches_once().await.unwrap();
+    assert_eq!(wrapped["examined"], 8, "{wrapped}");
+    assert_eq!(wrapped["held"], 8, "{wrapped}");
+    let after_wrap = owner.store.reconcile_launches_once().await.unwrap();
+    assert!(
+        after_wrap["examined"].as_u64().unwrap() <= 8,
+        "{after_wrap}"
+    );
+    let operation_id_for_wrap = operation_id.clone();
+    let open_children_after_wrap = owner
+        .store
+        .run(move |db| {
+            db.query_row(
+                "SELECT COUNT(*) FROM operations WHERE method='agent.open' \
+                 AND prerequisite_operation_id=?1",
+                [&operation_id_for_wrap],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(open_children_after_wrap, 1);
+
     owner.close().await.unwrap();
     std::fs::remove_dir_all(fixture_root).unwrap();
 }
@@ -900,7 +1189,7 @@ async fn work_dispatch_pending_rechecks_rotate_across_restart_and_reject_changed
     let (owner, directory, operator, operator_credential) = start_store().await;
     let (manager, manager_credential) =
         register_manager_with_credential(&owner.store, &operator, "fairness-manager").await;
-    select_regression_descriptor(&owner.store, &manager).await;
+    select_regression_descriptor(&owner.store, &manager, "regression-route").await;
     write(
         &owner.store,
         &operator,

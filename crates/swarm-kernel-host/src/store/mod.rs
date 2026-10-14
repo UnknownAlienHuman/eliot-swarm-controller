@@ -1199,206 +1199,223 @@ impl Store {
     /// One bounded host worker. The Store retains intent before Git work,
     /// joins the preparation, then commits verified facts before native open.
     pub(crate) async fn reconcile_launches_once(&self) -> Result<Value> {
-        let ids = self
-            .run(move |db| launcher::pending_launches(db, 8))
+        let batch = self
+            .run(move |db| next_launch_reconcile_batch(db, 8))
             .await?;
+        let Some(scan_cursor) = batch.cursor else {
+            self.changed.send_modify(|n| *n = n.wrapping_add(1));
+            return Ok(json!({"examined":0,"progressed":0,"held":0,"outcome_unknown":0}));
+        };
+        let mut examined = 0usize;
         let mut progressed = 0usize;
+        let mut held = 0usize;
         let mut unknown = 0usize;
-        for operation_id in ids {
-            let config = self.config.clone();
-            let intent = operation_id.clone();
-            let prepared = self.run(move |db| {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let actor = launcher::launch_actor(&tx, &intent)?;
-                let raw: String = tx.query_row("SELECT effective_request_json FROM operations WHERE operation_id=?1", [&intent], |row| row.get(0))?;
-                let effective: Value = serde_json::from_str(&raw)?;
-                let phase = effective["launch_manifest"]["state"].as_str().unwrap_or("");
-                let unknown_workspace = phase == "outcome_unknown"
-                    && effective["launch_manifest"]["failure"]["code"] == "workspace_effect_unknown";
-                if phase != "pending_workspace" && !unknown_workspace {
-                    launcher::reconcile_launch(&tx, &config, &intent, model::now_ms()?)?;
-                    tx.commit()?;
-                    return Ok(None);
-                }
-                if !unknown_workspace {
-                    let admission = launcher::current_launch_admission(&tx, &intent, &config)?;
-                    launcher::retain_launch_admission(&tx, &intent, &admission, model::now_ms()?)?;
-                    match admission.decision {
-                        provider_conditions::RouteAdmissionDecision::Admit => {}
-                        provider_conditions::RouteAdmissionDecision::Hold { .. } => {
-                            tx.commit()?;
-                            return Ok(None);
-                        }
-                        provider_conditions::RouteAdmissionDecision::Unavailable { .. } => {
-                            launcher::fail_launch(&tx, &intent, "route_admission_unavailable", model::now_ms()?)?;
-                            tx.commit()?;
-                            return Ok(None);
-                        }
-                    }
-                }
-                if let Some(held) = workspace::held_lease_for_operation(&tx, &intent)? {
-                    launcher::launch_after_workspace_held(&tx, &actor, &config, &intent, &held, model::now_ms()?)?;
-                    tx.commit()?;
-                    return Ok(None);
-                }
-                let ticket = workspace::pending_lease_for_operation(&tx, &config, &intent)?;
-                let (plan, reservation, registration, readback_only) = if let Some(ticket) = ticket {
-                    if ticket.state == "preparing" {
-                        tx.execute("UPDATE workspace_leases SET state='outcome_unknown',updated_at_ms=?2 WHERE lease_id=?1 AND state='preparing'", params![ticket.reservation.lease_id,model::now_ms()?])?;
-                    }
-                    (ticket.plan,ticket.reservation,ticket.registration,true)
-                } else {
-                    if unknown_workspace {
+        for candidate in batch.candidates {
+            let operation_id = candidate.operation_id;
+            let before_id = operation_id.clone();
+            let before = self
+                .run(move |db| launcher::launch_reconciliation_snapshot(db, &before_id))
+                .await?;
+            let mut candidate_unknown = false;
+            'candidate: {
+                let config = self.config.clone();
+                let intent = operation_id.clone();
+                let prepared = self.run(move |db| {
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let actor = launcher::launch_actor(&tx, &intent)?;
+                    let raw: String = tx.query_row("SELECT effective_request_json FROM operations WHERE operation_id=?1", [&intent], |row| row.get(0))?;
+                    let effective: Value = serde_json::from_str(&raw)?;
+                    let phase = effective["launch_manifest"]["state"].as_str().unwrap_or("");
+                    let unknown_workspace = phase == "outcome_unknown"
+                        && effective["launch_manifest"]["failure"]["code"] == "workspace_effect_unknown";
+                    if phase != "pending_workspace" && !unknown_workspace {
+                        launcher::reconcile_launch(&tx, &config, &intent, model::now_ms()?)?;
                         tx.commit()?;
                         return Ok(None);
                     }
-                    let plan = launcher::launch_workspace_plan(&tx, &actor, &intent, &config)?;
-                    let reservation = workspace::reserve_lease_for_launch(&tx, &actor, &plan, model::now_ms()?)?;
-                    let registration = workspace::get_registration(&tx, &plan.project_id, &config)?;
-                    (plan,reservation,registration,false)
-                };
-                tx.commit()?;
-                Ok(Some(LaunchWorkspaceWork { actor, plan, registration, reservation, readback_only }))
-            }).await;
-            let work = match prepared {
-                Ok(Some(work)) => work,
-                Ok(None) => {
-                    progressed += 1;
-                    continue;
-                }
-                Err(error) => {
-                    let closed_admission =
-                        self.record_launch_failure(operation_id, error.code).await?;
-                    if closed_admission {
-                        progressed += 1;
-                    } else {
-                        unknown += 1;
-                    }
-                    continue;
-                }
-            };
-            let config = self.config.clone();
-            let fs_work = work.reservation.clone();
-            let fs_registration = work.registration.clone();
-            let fs_plan = work.plan.clone();
-            let readback_only = work.readback_only;
-            let evidence = self
-                .workspace_git_io(
-                    &work.plan.project_id,
-                    &work.reservation.branch_ref,
-                    move |git| {
-                        let project =
-                            config
-                                .forge
-                                .projects
-                                .get(&fs_plan.project_id)
-                                .ok_or_else(|| {
-                                    Error::new(
-                                        "WORKSPACE_UNREGISTERED",
-                                        "launch project mapping is unavailable",
-                                    )
-                                })?;
-                        if readback_only {
-                            crate::workspace::reconcile_workspace(
-                                git,
-                                &config.forge,
-                                project,
-                                &fs_registration,
-                                &fs_work,
-                                &fs_plan,
-                            )
-                        } else {
-                            crate::workspace::prepare_lease(
-                                git,
-                                &config.forge,
-                                project,
-                                &fs_registration,
-                                &fs_work,
-                                &fs_plan,
-                            )
-                            .map(|workspace| workspace.evidence().clone())
+                    if !unknown_workspace {
+                        let admission = launcher::current_launch_admission(&tx, &intent, &config)?;
+                        launcher::retain_launch_admission(&tx, &intent, &admission, model::now_ms()?)?;
+                        match admission.decision {
+                            provider_conditions::RouteAdmissionDecision::Admit => {}
+                            provider_conditions::RouteAdmissionDecision::Hold { .. } => {
+                                tx.commit()?;
+                                return Ok(None);
+                            }
+                            provider_conditions::RouteAdmissionDecision::Unavailable { .. } => {
+                                launcher::fail_launch(&tx, &intent, "route_admission_unavailable", model::now_ms()?)?;
+                                tx.commit()?;
+                                return Ok(None);
+                            }
                         }
-                    },
-                )
-                .await;
-            let evidence = match evidence {
-                Ok(evidence) => evidence,
-                Err(error) => {
-                    let closed_admission =
-                        self.record_launch_failure(operation_id, error.code).await?;
-                    if closed_admission {
-                        progressed += 1;
-                    } else {
-                        unknown += 1;
                     }
-                    continue;
-                }
-            };
-            let config = self.config.clone();
-            let intent = operation_id.clone();
-            let result = self
-                .run(move |db| {
-                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let actor = launcher::launch_actor(&tx, &intent)?;
-                    if !actor.same_authority_identity(&work.actor) {
-                        return Err(Error::new(
-                            "STALE_LAUNCH",
-                            "launch actor changed during workspace preparation",
-                        ));
+                    if let Some(held) = workspace::held_lease_for_operation(&tx, &intent)? {
+                        launcher::launch_after_workspace_held(&tx, &actor, &config, &intent, &held, model::now_ms()?)?;
+                        tx.commit()?;
+                        return Ok(None);
                     }
-                    let lease = if work.readback_only {
-                        workspace::reconcile_lease_for_launch(
-                            &tx,
-                            &actor,
-                            &work.registration,
-                            &work.reservation,
-                            &work.plan,
-                            &evidence,
-                            model::now_ms()?,
-                        )?
+                    let ticket = workspace::pending_lease_for_operation(&tx, &config, &intent)?;
+                    let (plan, reservation, registration, readback_only) = if let Some(ticket) = ticket {
+                        if ticket.state == "preparing" {
+                            tx.execute("UPDATE workspace_leases SET state='outcome_unknown',updated_at_ms=?2 WHERE lease_id=?1 AND state='preparing'", params![ticket.reservation.lease_id,model::now_ms()?])?;
+                        }
+                        (ticket.plan,ticket.reservation,ticket.registration,true)
                     } else {
-                        workspace::commit_lease_for_launch(
-                            &tx,
-                            &actor,
-                            &work.registration,
-                            &work.reservation,
-                            &work.plan,
-                            &evidence,
-                            model::now_ms()?,
-                        )?
+                        if unknown_workspace {
+                            tx.commit()?;
+                            return Ok(None);
+                        }
+                        let plan = launcher::launch_workspace_plan(&tx, &actor, &intent, &config)?;
+                        let reservation = workspace::reserve_lease_for_launch(&tx, &actor, &plan, model::now_ms()?)?;
+                        let registration = workspace::get_registration(&tx, &plan.project_id, &config)?;
+                        (plan,reservation,registration,false)
                     };
-                    // Filesystem proof survives a later admission failure.
-                    // Native reservations use a fresh transaction and recheck
-                    // current authority and route immediately before admission.
                     tx.commit()?;
-                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let result = launcher::launch_after_workspace_held(
-                        &tx,
-                        &actor,
-                        &config,
-                        &intent,
-                        &lease,
-                        model::now_ms()?,
-                    )?;
-                    tx.commit()?;
-                    Ok(result)
-                })
-                .await;
-            match result {
-                Ok(_) => progressed += 1,
-                Err(error) => {
-                    let closed_admission =
-                        self.record_launch_failure(operation_id, error.code).await?;
-                    if closed_admission {
-                        progressed += 1;
-                    } else {
-                        unknown += 1;
+                    Ok(Some(LaunchWorkspaceWork { actor, plan, registration, reservation, readback_only }))
+                }).await;
+                let work = match prepared {
+                    Ok(Some(work)) => work,
+                    Ok(None) => break 'candidate,
+                    Err(error) => {
+                        candidate_unknown = !self
+                            .record_launch_failure(operation_id.clone(), error.code)
+                            .await?;
+                        break 'candidate;
                     }
+                };
+                let config = self.config.clone();
+                let fs_work = work.reservation.clone();
+                let fs_registration = work.registration.clone();
+                let fs_plan = work.plan.clone();
+                let readback_only = work.readback_only;
+                let evidence = self
+                    .workspace_git_io(
+                        &work.plan.project_id,
+                        &work.reservation.branch_ref,
+                        move |git| {
+                            let project =
+                                config.forge.projects.get(&fs_plan.project_id).ok_or_else(
+                                    || {
+                                        Error::new(
+                                            "WORKSPACE_UNREGISTERED",
+                                            "launch project mapping is unavailable",
+                                        )
+                                    },
+                                )?;
+                            if readback_only {
+                                crate::workspace::reconcile_workspace(
+                                    git,
+                                    &config.forge,
+                                    project,
+                                    &fs_registration,
+                                    &fs_work,
+                                    &fs_plan,
+                                )
+                            } else {
+                                crate::workspace::prepare_lease(
+                                    git,
+                                    &config.forge,
+                                    project,
+                                    &fs_registration,
+                                    &fs_work,
+                                    &fs_plan,
+                                )
+                                .map(|workspace| workspace.evidence().clone())
+                            }
+                        },
+                    )
+                    .await;
+                let evidence = match evidence {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        candidate_unknown = !self
+                            .record_launch_failure(operation_id.clone(), error.code)
+                            .await?;
+                        break 'candidate;
+                    }
+                };
+                let config = self.config.clone();
+                let intent = operation_id.clone();
+                let result = self
+                    .run(move |db| {
+                        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let actor = launcher::launch_actor(&tx, &intent)?;
+                        if !actor.same_authority_identity(&work.actor) {
+                            return Err(Error::new(
+                                "STALE_LAUNCH",
+                                "launch actor changed during workspace preparation",
+                            ));
+                        }
+                        let lease = if work.readback_only {
+                            workspace::reconcile_lease_for_launch(
+                                &tx,
+                                &actor,
+                                &work.registration,
+                                &work.reservation,
+                                &work.plan,
+                                &evidence,
+                                model::now_ms()?,
+                            )?
+                        } else {
+                            workspace::commit_lease_for_launch(
+                                &tx,
+                                &actor,
+                                &work.registration,
+                                &work.reservation,
+                                &work.plan,
+                                &evidence,
+                                model::now_ms()?,
+                            )?
+                        };
+                        // Filesystem proof survives a later admission failure.
+                        // Native reservations use a fresh transaction and recheck
+                        // current authority and route immediately before admission.
+                        tx.commit()?;
+                        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let result = launcher::launch_after_workspace_held(
+                            &tx,
+                            &actor,
+                            &config,
+                            &intent,
+                            &lease,
+                            model::now_ms()?,
+                        )?;
+                        tx.commit()?;
+                        Ok(result)
+                    })
+                    .await;
+                if let Err(error) = result {
+                    candidate_unknown = !self
+                        .record_launch_failure(operation_id.clone(), error.code)
+                        .await?;
                 }
+            }
+            let after_id = operation_id.clone();
+            let after_cursor = LaunchReconcileCursor {
+                after: Some(candidate.cursor),
+                through: scan_cursor.through.clone(),
+            };
+            let after = self
+                .run(move |db| {
+                    let snapshot = launcher::launch_reconciliation_snapshot(db, &after_id)?;
+                    write_launch_reconcile_cursor(db, &after_cursor)?;
+                    Ok(snapshot)
+                })
+                .await?;
+            examined += 1;
+            if candidate_unknown {
+                unknown += 1;
+            }
+            if before == after {
+                held += 1;
+            } else {
+                progressed += 1;
             }
         }
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(json!({"progressed":progressed,"outcome_unknown":unknown}))
+        Ok(
+            json!({"examined":examined,"progressed":progressed,"held":held,"outcome_unknown":unknown}),
+        )
     }
 
     async fn record_launch_failure(&self, operation_id: String, safe_code: String) -> Result<bool> {
@@ -3709,6 +3726,116 @@ pub(super) fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> 
     db.execute("INSERT INTO meta(key,value_json) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", params![key,model::canonical(value)?])?;
     Ok(())
 }
+
+const LAUNCH_RECONCILE_CURSOR_META_KEY: &str = "launcher:reconcile_launches:v1:cursor";
+
+#[derive(Clone)]
+struct LaunchReconcileCursor {
+    after: Option<launcher::LaunchReconcileKey>,
+    through: launcher::LaunchReconcileKey,
+}
+
+struct LaunchReconcileBatch {
+    cursor: Option<LaunchReconcileCursor>,
+    candidates: Vec<launcher::PendingLaunch>,
+}
+
+fn parse_launch_reconcile_key(value: &Value) -> Result<launcher::LaunchReconcileKey> {
+    let updated_at_ms = value["updated_at_ms"].as_i64().ok_or_else(|| {
+        Error::new(
+            "LAUNCH_CURSOR_CORRUPT",
+            "launch cursor timestamp is invalid",
+        )
+    })?;
+    let operation_id = value["operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_CURSOR_CORRUPT",
+                "launch cursor operation id is invalid",
+            )
+        })?
+        .to_owned();
+    Ok(launcher::LaunchReconcileKey {
+        updated_at_ms,
+        operation_id,
+    })
+}
+
+fn read_launch_reconcile_cursor(db: &Connection) -> Result<Option<LaunchReconcileCursor>> {
+    let Some(value) = meta(db, LAUNCH_RECONCILE_CURSOR_META_KEY)? else {
+        return Ok(None);
+    };
+    let after = match value.get("after") {
+        Some(value) if value.is_null() => None,
+        Some(value) => Some(parse_launch_reconcile_key(value)?),
+        None => {
+            return Err(Error::new(
+                "LAUNCH_CURSOR_CORRUPT",
+                "launch cursor has no after key",
+            ));
+        }
+    };
+    let through = value
+        .get("through")
+        .map(parse_launch_reconcile_key)
+        .transpose()?
+        .ok_or_else(|| Error::new("LAUNCH_CURSOR_CORRUPT", "launch cursor has no scan ceiling"))?;
+    Ok(Some(LaunchReconcileCursor { after, through }))
+}
+
+fn write_launch_reconcile_cursor(db: &Connection, cursor: &LaunchReconcileCursor) -> Result<()> {
+    set_meta(
+        db,
+        LAUNCH_RECONCILE_CURSOR_META_KEY,
+        &json!({"after":cursor.after,"through":cursor.through}),
+    )
+}
+
+fn next_launch_reconcile_batch(db: &Connection, limit: i64) -> Result<LaunchReconcileBatch> {
+    if let Some(cursor) = read_launch_reconcile_cursor(db)? {
+        let candidates =
+            launcher::pending_launches(db, limit, cursor.after.as_ref(), &cursor.through)?;
+        if !candidates.is_empty() {
+            return Ok(LaunchReconcileBatch {
+                cursor: Some(cursor),
+                candidates,
+            });
+        }
+    }
+
+    let Some(through) = launcher::pending_launch_ceiling(db)? else {
+        db.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [LAUNCH_RECONCILE_CURSOR_META_KEY],
+        )?;
+        return Ok(LaunchReconcileBatch {
+            cursor: None,
+            candidates: Vec::new(),
+        });
+    };
+    let cursor = LaunchReconcileCursor {
+        after: None,
+        through,
+    };
+    let candidates = launcher::pending_launches(db, limit, None, &cursor.through)?;
+    if candidates.is_empty() {
+        db.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [LAUNCH_RECONCILE_CURSOR_META_KEY],
+        )?;
+        return Ok(LaunchReconcileBatch {
+            cursor: None,
+            candidates,
+        });
+    }
+    Ok(LaunchReconcileBatch {
+        cursor: Some(cursor),
+        candidates,
+    })
+}
+
 /// Add a known, source-pinned extension without adopting unrelated existing tables.
 fn install_schema_extension(
     tx: &Transaction<'_>,
