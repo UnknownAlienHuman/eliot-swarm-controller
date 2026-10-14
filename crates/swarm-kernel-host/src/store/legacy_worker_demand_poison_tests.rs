@@ -72,7 +72,7 @@ async fn legacy_demand_poison_reaches_existing_check_and_launch_isolators() {
     owner.store.run(move |db| {
         let quarantined: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
-            [format!("checks:pending:v1:quarantine:{retained_check_id}")],
+            [format!("checks:pending:v1:quarantine:{}", model::digest(retained_check_id.as_bytes()))],
             |row| row.get(0),
         )?;
         assert!(quarantined);
