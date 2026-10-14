@@ -249,44 +249,73 @@ impl Store {
                 });
             }
         };
-        let context_fingerprint = snapshot.context_fingerprint.clone();
-        let _probe_operation_guard = self
+        let CheckPlanInputs {
+            context_fingerprint,
+            project_id,
+            profile,
+            candidate: candidate_record,
+            baseline: baseline_record,
+            baseline_reason,
+        } = snapshot;
+        let pending_context = context_fingerprint.clone();
+        let pending_resolution = move || CheckPlanResolution {
+            context_fingerprint: pending_context.clone(),
+            result: Err(Error::new(
+                "CHECK_PROBE_CLEANUP_PENDING",
+                "an input probe remains in Store custody for a conflicting or unidentified check target",
+            )),
+            cache_hit: None,
+        };
+        // The resource is known before reading candidate bytes; the exact
+        // workspace scope is checked again after source verification.
+        let incoming_resource = inputs::ProbeCleanupScope::resource_for_profile(&profile);
+        if self
             .check_child_custody
-            .probe_cleanup_operation
-            .lock()
-            .await;
-        self.check_child_custody.reap_probe_cleanup_owners().await;
-        if !self
-            .check_child_custody
-            .probe_cleanup_owners
-            .lock()
+            .probe_cleanup_resource_conflicts(incoming_resource.as_deref())
             .await
-            .is_empty()
         {
-            return Ok(CheckPlanResolution {
-                context_fingerprint,
-                result: Err(Error::new(
-                    "CHECK_PROBE_CLEANUP_PENDING",
-                    "an earlier input probe remains in exact Store custody",
-                )),
-                cache_hit: None,
-            });
+            return Ok(pending_resolution());
         }
-        let resolved_context = context_fingerprint.clone();
+        let has_baseline_record = baseline_record.is_some();
         let data_dir = self.data_dir.clone();
-        let result = self
+        let verified_sources = self
             .file_io(move |files| {
-                let candidate = source::verified_content(&files, &data_dir, &snapshot.candidate)?;
-                let baseline = match snapshot.baseline.as_ref() {
+                let candidate = source::verified_content(&files, &data_dir, &candidate_record)?;
+                let baseline = match baseline_record.as_ref() {
                     Some(record) => source::verified_content(&files, &data_dir, record).ok(),
                     None => None,
                 };
-                let baseline_reason = snapshot.baseline_reason.or_else(|| {
-                    (snapshot.baseline.is_some() && baseline.is_none())
-                        .then(|| "baseline_source_unverified".to_owned())
+                Ok((candidate, baseline))
+            })
+            .await;
+        let (candidate, baseline) = match verified_sources {
+            Ok(sources) => sources,
+            Err(error) => {
+                return Ok(CheckPlanResolution {
+                    context_fingerprint: context_fingerprint.clone(),
+                    result: Err(error),
+                    cache_hit: None,
                 });
+            }
+        };
+        let scope = inputs::ProbeCleanupScope::for_candidate(&profile, &candidate);
+        if self
+            .check_child_custody
+            .probe_cleanup_conflicts(scope.as_ref())
+            .await
+        {
+            return Ok(pending_resolution());
+        }
+        let baseline_reason = baseline_reason.or_else(|| {
+            (has_baseline_record && baseline.is_none())
+                .then(|| "baseline_source_unverified".to_owned())
+        });
+        let resolved_context = context_fingerprint.clone();
+        let resolved_scope = scope.clone();
+        let result = self
+            .file_io(move |_files| {
                 let (resolved, cleanup_owner) =
-                    inputs::resolve_with_cleanup(&snapshot.profile, &candidate, baseline.as_ref());
+                    inputs::resolve_with_cleanup(&profile, &candidate, baseline.as_ref());
                 let prepared = resolved.and_then(|mut resolved| {
                     if let Some(reason) = baseline_reason {
                         resolved.add_widening_reason(&reason)?;
@@ -294,11 +323,11 @@ impl Store {
                     let scope_plan = serde_json::to_value(&resolved.scope_plan)?;
                     Ok(PreparedCheckPlan {
                         context_fingerprint: resolved_context,
-                        project_id: snapshot.project_id,
+                        project_id: project_id,
                         resolved_inputs: resolved.resolved_inputs,
                         scope_plan,
                         input_fingerprint: resolved.input_fingerprint,
-                        reproducible: snapshot.profile.reproducible,
+                        reproducible: profile.reproducible,
                     })
                 });
                 Ok((prepared, cleanup_owner))
@@ -308,8 +337,22 @@ impl Store {
             Ok((prepared, owner)) => (prepared, owner),
             Err(error) => (Err(error), None),
         };
-        if let Some(owner) = cleanup_owner {
-            self.check_child_custody.retain_probe_cleanup(owner).await;
+        let install_conflict = if let Some(mut owner) = cleanup_owner {
+            owner.set_scope(resolved_scope.clone());
+            self.check_child_custody.retain_probe_cleanup(owner).await
+        } else {
+            false
+        };
+        if install_conflict {
+            return Ok(pending_resolution());
+        }
+        if matches!(&prepared, Ok(_))
+            && self
+                .check_child_custody
+                .probe_cleanup_conflicts(resolved_scope.as_ref())
+                .await
+        {
+            return Ok(pending_resolution());
         }
         let (result, cache_hit) = match prepared {
             Ok(prepared) if prepared.resolved_inputs["cache_reusable"] == true => {
@@ -334,6 +377,14 @@ impl Store {
             Ok(prepared) => (Ok(prepared), None),
             Err(error) => (Err(error), None),
         };
+        if result.is_ok()
+            && self
+                .check_child_custody
+                .probe_cleanup_conflicts(resolved_scope.as_ref())
+                .await
+        {
+            return Ok(pending_resolution());
+        }
         Ok(CheckPlanResolution {
             context_fingerprint,
             result,
@@ -3361,10 +3412,48 @@ impl CheckChildCustody {
         });
     }
 
-    async fn retain_probe_cleanup(&self, owner: ProbeCleanupOwner) {
-        if owner.is_pending() {
-            self.probe_cleanup_owners.lock().await.push(owner);
+    async fn retain_probe_cleanup(&self, mut owner: ProbeCleanupOwner) -> bool {
+        let _operation = self.probe_cleanup_operation.lock().await;
+        owner.poll();
+        if !owner.is_pending() {
+            return false;
         }
+        let scope = owner.scope().cloned();
+        let mut owners = self.probe_cleanup_owners.lock().await;
+        owners.retain_mut(|retained| {
+            retained.poll();
+            retained.is_pending()
+        });
+        let conflict = owners
+            .iter()
+            .any(|retained| retained.conflicts_with(scope.as_ref()));
+        owners.push(owner);
+        conflict
+    }
+
+    async fn probe_cleanup_conflicts(&self, incoming: Option<&inputs::ProbeCleanupScope>) -> bool {
+        let _operation = self.probe_cleanup_operation.lock().await;
+        let mut owners = self.probe_cleanup_owners.lock().await;
+        // This guard covers only custody polling/classification; preflight work
+        // runs after it drops.
+        owners.retain_mut(|owner| {
+            owner.poll();
+            owner.is_pending()
+        });
+        owners.iter().any(|owner| owner.conflicts_with(incoming))
+    }
+
+    async fn probe_cleanup_resource_conflicts(&self, incoming_resource: Option<&str>) -> bool {
+        let _operation = self.probe_cleanup_operation.lock().await;
+        let mut owners = self.probe_cleanup_owners.lock().await;
+        // The resource-only snapshot runs before candidate source reads.
+        owners.retain_mut(|owner| {
+            owner.poll();
+            owner.is_pending()
+        });
+        owners
+            .iter()
+            .any(|owner| owner.conflicts_with_resource(incoming_resource))
     }
 
     async fn reap_probe_cleanup_owners(&self) {

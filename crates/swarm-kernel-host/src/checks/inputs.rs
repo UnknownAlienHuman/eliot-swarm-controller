@@ -125,8 +125,72 @@ struct ProbeResponse {
 
 /// Custody retained by Store when an input-probe helper or its response pipe
 /// outlives the bounded foreground phase.
+/// Exact check-target identity retained with probe cleanup custody.
+///
+/// Resource is the warm-target isolation key (`check-inputs/<resource>`), and
+/// workspace identity is the exact profile/candidate namespace. Shared resources
+/// conflict even when profile IDs differ. An absent scope is unidentified and
+/// fails closed. Child custody is released only after poll proves departure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeCleanupScope {
+    pub resource: String,
+    pub workspace_identity: Value,
+}
+
+impl ProbeCleanupScope {
+    pub(crate) fn resource_for_profile(profile: &CheckProfile) -> Option<String> {
+        let resource = profile.resource.to_ascii_lowercase();
+        if resource.is_empty() || resource.len() > 100 {
+            return None;
+        }
+        Some(resource)
+    }
+
+    pub(crate) fn for_candidate(
+        profile: &CheckProfile,
+        candidate: &VerifiedSource,
+    ) -> Option<Self> {
+        let resource = Self::resource_for_profile(profile)?;
+        if profile.profile_id.is_empty() || profile.profile_revision.trim().is_empty() {
+            return None;
+        }
+        let workspace_identity = execution_workspace_identity(profile, candidate).ok()?;
+        Some(Self {
+            resource,
+            workspace_identity,
+        })
+    }
+
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        self.resource == other.resource || self.workspace_identity == other.workspace_identity
+    }
+}
+
+/// True when incoming must stay held behind retained. Unknown scope on either
+/// side (damaged/unidentified) fails closed and holds.
+pub(crate) fn probe_scopes_conflict(
+    retained: Option<&ProbeCleanupScope>,
+    incoming: Option<&ProbeCleanupScope>,
+) -> bool {
+    match (retained, incoming) {
+        (Some(a), Some(b)) => a.overlaps(b),
+        _ => true,
+    }
+}
+
+pub(crate) fn probe_resource_conflicts(
+    retained: Option<&ProbeCleanupScope>,
+    incoming_resource: Option<&str>,
+) -> bool {
+    match (retained, incoming_resource) {
+        (Some(retained), Some(incoming)) => retained.resource == incoming,
+        _ => true,
+    }
+}
+
 pub(crate) struct ProbeCleanupOwner {
     custody: ProbeHelperCustody,
+    scope: Option<ProbeCleanupScope>,
 }
 
 impl ProbeCleanupOwner {
@@ -136,6 +200,31 @@ impl ProbeCleanupOwner {
 
     pub(crate) fn is_pending(&self) -> bool {
         !self.custody.cleanup_complete
+    }
+
+    pub(crate) fn scope(&self) -> Option<&ProbeCleanupScope> {
+        self.scope.as_ref()
+    }
+
+    pub(crate) fn set_scope(&mut self, scope: Option<ProbeCleanupScope>) {
+        self.scope = scope;
+    }
+
+    /// True when this pending owner holds incoming. Non-pending owners never
+    /// hold; unknown scope on either side holds (fail-closed). Actual Child,
+    /// pipe and family custody is released only via poll-proven departure.
+    pub(crate) fn conflicts_with(&self, incoming: Option<&ProbeCleanupScope>) -> bool {
+        if !self.is_pending() {
+            return false;
+        }
+        probe_scopes_conflict(self.scope.as_ref(), incoming)
+    }
+
+    pub(crate) fn conflicts_with_resource(&self, incoming: Option<&str>) -> bool {
+        if !self.is_pending() {
+            return false;
+        }
+        probe_resource_conflicts(self.scope.as_ref(), incoming)
     }
 }
 
@@ -1156,7 +1245,13 @@ fn command_output_with_cleanup(
                 ),
             );
             temp_guard.preserve();
-            return (Err(error), Some(ProbeCleanupOwner { custody }));
+            return (
+                Err(error),
+                Some(ProbeCleanupOwner {
+                    custody,
+                    scope: None,
+                }),
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -2671,6 +2766,45 @@ mod tests {
                 assert!(paths.insert(descriptor), "descriptor namespace collision");
             }
         }
+    }
+
+    #[test]
+    fn probe_cleanup_scope_holds_overlapping_or_unidentified_targets_only() {
+        let base_profile = profile(true);
+        let candidate = source(&model::digest(b"candidate-content"), "artifact-a");
+        let retained = ProbeCleanupScope::for_candidate(&base_profile, &candidate).unwrap();
+        assert_eq!(
+            retained.workspace_identity,
+            execution_workspace_identity(&base_profile, &candidate).unwrap()
+        );
+
+        let mut other_profile_same_resource = base_profile.clone();
+        other_profile_same_resource.profile_id = "other-profile".into();
+        let same_resource =
+            ProbeCleanupScope::for_candidate(&other_profile_same_resource, &candidate).unwrap();
+        assert!(retained.overlaps(&same_resource));
+
+        let mut independent_profile = base_profile.clone();
+        independent_profile.resource = "other-checks".into();
+        let independent =
+            ProbeCleanupScope::for_candidate(&independent_profile, &candidate).unwrap();
+        assert!(!retained.overlaps(&independent));
+
+        let same_workspace_different_resource = ProbeCleanupScope {
+            resource: "other-checks".into(),
+            workspace_identity: retained.workspace_identity.clone(),
+        };
+        assert!(retained.overlaps(&same_workspace_different_resource));
+        assert!(!probe_scopes_conflict(Some(&retained), Some(&independent)));
+        assert!(probe_scopes_conflict(None, Some(&retained)));
+        assert!(probe_scopes_conflict(Some(&retained), None));
+        assert!(!probe_resource_conflicts(
+            Some(&retained),
+            Some("other-checks")
+        ));
+        assert!(probe_resource_conflicts(Some(&retained), Some("checks")));
+        assert!(probe_resource_conflicts(None, Some("other-checks")));
+        assert!(probe_resource_conflicts(Some(&retained), None));
     }
 
     #[test]
