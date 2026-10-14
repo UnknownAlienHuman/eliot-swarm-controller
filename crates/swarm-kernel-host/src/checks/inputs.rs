@@ -37,6 +37,12 @@ const PROBE_MAX_CLEANUP_REQUESTS: u8 = 3;
 const PROBE_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const PROBE_HELPER_WAIT_GRACE: Duration = Duration::from_secs(45);
 const PROBE_HELPER_RESPONSE_FILE: &str = "helper-response.capture";
+#[cfg(test)]
+const PROBE_CUSTODY_CONTROL_ENV: &str = "ELIOT_PROBE_CUSTODY_CONTROL_DIR";
+#[cfg(test)]
+const PROBE_CUSTODY_FIXTURE_GRACE_ENV: &str = "ELIOT_PROBE_CUSTODY_FIXTURE_GRACE";
+#[cfg(test)]
+const PROBE_CUSTODY_MEMBER_OBSERVED_FILE: &str = "helper-live-member-observed.json";
 pub(crate) const PROBE_STDOUT_CAPTURE_FILE: &str = "probe-stdout.capture";
 pub(crate) const PROBE_STDERR_CAPTURE_FILE: &str = "probe-stderr.capture";
 #[cfg(test)]
@@ -1575,10 +1581,42 @@ impl ProbeOwner {
     }
 }
 
+#[cfg(test)]
+fn record_probe_custody_member_observed_for_test(
+    owner: &ProbeOwner,
+    direct_child_exit_code: Option<i32>,
+) {
+    if std::env::var(PROBE_CUSTODY_FIXTURE_GRACE_ENV).as_deref() != Ok("nested") {
+        return;
+    }
+    let Some(control) = std::env::var_os(PROBE_CUSTODY_CONTROL_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(control).join(PROBE_CUSTODY_MEMBER_OBSERVED_FILE);
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("write exact probe-family observation receipt: {error}"),
+    };
+    let receipt = json!({
+        "probe_group_identity": owner.group.identity,
+        "direct_child_exit_code": direct_child_exit_code,
+        "group_member_observed_after_direct_exit": true,
+    });
+    file.write_all(
+        model::canonical(&receipt)
+            .expect("encode probe-family observation receipt")
+            .as_bytes(),
+    )
+    .expect("persist probe-family observation receipt");
+    file.sync_all()
+        .expect("sync probe-family observation receipt");
+}
+
 fn probe_initial_cleanup_grace() -> Duration {
     #[cfg(test)]
     if std::env::var("HOOK_GIT_PROBE_FIXTURE_MODE").as_deref() == Ok("descendant")
-        || std::env::var("ELIOT_PROBE_CUSTODY_FIXTURE_GRACE").as_deref() == Ok("nested")
+        || std::env::var(PROBE_CUSTODY_FIXTURE_GRACE_ENV).as_deref() == Ok("nested")
     {
         return Duration::from_secs(2);
     }
@@ -1859,7 +1897,13 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
         stderr_capture.poll();
         output_limited |= stdout_capture.truncated() || stderr_capture.truncated();
         match owner.group.children_empty() {
-            Ok(empty) => had_descendants |= !empty,
+            Ok(empty) => {
+                had_descendants |= !empty;
+                #[cfg(test)]
+                if !empty {
+                    record_probe_custody_member_observed_for_test(&owner, exit_status.code());
+                }
+            }
             Err(error) => membership_diagnostic = Some(cleanup_error_diagnostic(&error)),
         }
         if release_probe_owner_once(&mut owner)
@@ -3164,7 +3208,6 @@ pub(crate) mod tests {
     }
 
     const PROBE_CUSTODY_REQUEST_ENV: &str = "ELIOT_PROBE_CUSTODY_REQUEST";
-    const PROBE_CUSTODY_CONTROL_ENV: &str = "ELIOT_PROBE_CUSTODY_CONTROL_DIR";
     const PROBE_CUSTODY_TARGET_ENV: &str = "ELIOT_PROBE_CUSTODY_TARGET_ENTRY";
     const PROBE_CUSTODY_DESCENDANT_ENV: &str = "ELIOT_PROBE_CUSTODY_DESCENDANT_ENTRY";
 
@@ -3559,6 +3602,30 @@ pub(crate) mod tests {
             .to_owned();
         assert!(
             !departed_empty(&family_identity, &family_token).expect("observe live helper family")
+        );
+        let member_observed_path = probe_custody_file(&control, PROBE_CUSTODY_MEMBER_OBSERVED_FILE);
+        assert!(
+            wait_probe_custody_file(&member_observed_path, Duration::from_secs(5)),
+            "real helper observes its native family nonempty after direct-child exit"
+        );
+        let member_observed: Value =
+            serde_json::from_slice(&fs::read(member_observed_path).expect("read helper receipt"))
+                .expect("decode helper receipt");
+        assert_eq!(
+            member_observed["probe_group_identity"], family_identity,
+            "the helper receipt is tied to the retained native-family identity"
+        );
+        assert_eq!(
+            member_observed["group_member_observed_after_direct_exit"],
+            true
+        );
+        assert_eq!(member_observed["direct_child_exit_code"], 0);
+        assert_eq!(
+            crate::platform::process_group::process_birth_identity(descendant_pid)
+                .expect("observe exact descendant after helper observation")
+                .as_ref(),
+            Some(&descendant_identity),
+            "the exact descendant remains live when the helper observes its family"
         );
         assert!(
             owner.is_pending(),
