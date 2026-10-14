@@ -36,9 +36,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -60,6 +62,145 @@ const ACK_ATTEMPTS: usize = 4;
 const ACK_BACKOFF_MS: [u64; ACK_ATTEMPTS] = [100, 250, 500, 1000];
 const IDLE_POLL_MS: u64 = 500;
 const JOURNAL_RETENTION_RETRY_MS: u64 = 10_000;
+const STARTUP_RECOVERY_TICK_MS: u64 = 250;
+
+enum StartupPoll<T> {
+    ModuleNext(T),
+    RecoveryTick,
+}
+
+async fn wait_for_module_next_or_recovery<F: Future>(
+    next: Pin<&mut F>,
+    recovery_tick: &mut tokio::time::Interval,
+    recovery_enabled: bool,
+) -> StartupPoll<F::Output> {
+    tokio::select! {
+        result = next => StartupPoll::ModuleNext(result),
+        _ = recovery_tick.tick(), if recovery_enabled => StartupPoll::RecoveryTick,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StartupRecoveryStep {
+    WaitingForInventory,
+    Progressed,
+    Complete,
+    Blocked,
+}
+
+struct StartupRecovery {
+    inventory: Option<tokio::task::JoinHandle<Result<()>>>,
+    blocked: bool,
+}
+
+impl StartupRecovery {
+    fn start(journal: Arc<Journal>) -> Result<Self> {
+        let inventory = if journal.startup_inventory_required()? {
+            Some(tokio::task::spawn_blocking(move || {
+                journal.prepare_startup_inventory()
+            }))
+        } else {
+            None
+        };
+        Ok(Self {
+            inventory,
+            blocked: false,
+        })
+    }
+
+    async fn advance(
+        &mut self,
+        journal: &Journal,
+        recovery_sample: &mut Vec<journal::OperationRecoveryState>,
+        recovery_count: &mut usize,
+    ) -> StartupRecoveryStep {
+        if self.blocked {
+            return StartupRecoveryStep::Blocked;
+        }
+        if journal.startup_recovery_complete() {
+            return StartupRecoveryStep::Complete;
+        }
+        if let Some(inventory) = self.inventory.as_ref()
+            && !inventory.is_finished()
+        {
+            return StartupRecoveryStep::WaitingForInventory;
+        }
+        if let Some(inventory) = self.inventory.take() {
+            match inventory.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "OpenCode startup name inventory remains incomplete: {}",
+                        error.code
+                    );
+                    self.blocked = true;
+                    return StartupRecoveryStep::Blocked;
+                }
+                Err(_) => {
+                    eprintln!("OpenCode startup name inventory worker failed");
+                    self.blocked = true;
+                    return StartupRecoveryStep::Blocked;
+                }
+            }
+        }
+        match journal.recover_outbox() {
+            Ok(window) => {
+                *recovery_count = recovery_count.saturating_add(window.len());
+                let remaining = 32usize.saturating_sub(recovery_sample.len());
+                recovery_sample.extend(window.into_iter().take(remaining));
+            }
+            Err(error) => {
+                // Damage and storage uncertainty hold the index closed. Keep
+                // servicing exact Operation reads; never clear custody or
+                // authorize a retry because census progress failed.
+                eprintln!(
+                    "OpenCode startup journal recovery remains incomplete: {}",
+                    error.code
+                );
+                self.blocked = true;
+                return StartupRecoveryStep::Blocked;
+            }
+        }
+        if journal.startup_recovery_complete() {
+            StartupRecoveryStep::Complete
+        } else {
+            StartupRecoveryStep::Progressed
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_poll_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_ticks_keep_an_inflight_module_next_available() {
+        let mut recovery_tick = tokio::time::interval(Duration::from_millis(5));
+        recovery_tick.tick().await;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut module_next = Box::pin(async move { receive.await.unwrap() });
+
+        assert!(matches!(
+            wait_for_module_next_or_recovery(module_next.as_mut(), &mut recovery_tick, true).await,
+            StartupPoll::RecoveryTick
+        ));
+        assert!(send.send("agent.reconcile").is_ok());
+
+        let response = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let StartupPoll::ModuleNext(response) =
+                    wait_for_module_next_or_recovery(module_next.as_mut(), &mut recovery_tick, true)
+                        .await
+                {
+                    break response;
+                }
+            }
+        })
+        .await
+        .expect("the retained module.next future must complete");
+        assert_eq!(response, "agent.reconcile");
+    }
+}
 
 struct HostSession<'a> {
     config: &'a AdapterConfig,
@@ -85,19 +226,19 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     } = bootstrap;
     config.validate()?;
     let route_sha256 = digest_json(&serde_json::to_value(&config.native_options)?)?;
-    let journal = Journal::open(
+    let journal = Arc::new(Journal::open(
         &config.state_dir,
         &config.binding_id,
         config.generation,
         &config.native_options.scope_key(),
         &route_sha256,
-    )?;
-    // Before hello, visit at most one sparse durable-closure window. Cold or
-    // invalidated legacy state is recovered after hello in resumable windows.
-    // The command loop remains behind that recovery gate, so no operation can
-    // run while an unscanned or damaged tail is still in custody.
+    )?);
+    // Before hello, visit at most one sparse durable-closure window. A cold
+    // legacy name census starts on a blocking worker and never gates service
+    // polling; exact requested-operation reads remain available meanwhile.
     let mut journal_recovery = journal.recover_outbox_before_hello()?;
     let mut journal_recovery_count = journal_recovery.len();
+    let mut startup_recovery = StartupRecovery::start(journal.clone())?;
     let mut native_owner = native_owner::NativeOwnerController::new(config.owned_native.clone());
 
     // The verified owner and boot identity come from the per-scope helper.
@@ -140,62 +281,6 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     };
     let run_result = async {
         host.hello_retry().await?;
-
-        while !journal.startup_recovery_complete() {
-            let window = journal.recover_outbox()?;
-            journal_recovery_count += window.len();
-            let sample_capacity = 32usize.saturating_sub(journal_recovery.len());
-            journal_recovery.extend(window.into_iter().take(sample_capacity));
-            eprintln!(
-                "OpenCode startup recovery continues after hello at its bounded scan window"
-            );
-        }
-        if let Some(root) = journal.native_root_for_hello(
-            &config.binding_id,
-            config.generation,
-            &scope,
-        )? {
-            host.set_root_hint(&root)?;
-        }
-        let startup_scan = journal.startup_scan_counts();
-        eprintln!(
-            "OpenCode startup recovery scan: operation_names={}, parsed_bodies={}, bytes={}, outbox_entries={}, unresolved={}",
-            startup_scan.operations_listed,
-            startup_scan.operation_bodies_parsed,
-            startup_scan.operation_bytes_read,
-            startup_scan.outbox_entries_scanned,
-            startup_scan.unresolved_found,
-        );
-
-        if !journal_recovery.is_empty() {
-            let entries = journal_recovery.iter().take(32).map(|recovered| json!({
-                "operation_key":recovered.operation_key,
-                "operation_id":recovered.operation_id,
-                "native_effect_unknown":recovered.history.recovery_unknown(),
-                "torn_tail":recovered.history.torn_tail_evidence.as_ref().map(|tail| json!({
-                    "valid_prefix_bytes":tail.valid_prefix_bytes,
-                    "tail_sha256":tail.tail_sha256,
-                    "tail_bytes":tail.tail_bytes,
-                })),
-                "native_replay_permitted":false,
-            })).collect::<Vec<_>>();
-            let event_id = uuid::Uuid::new_v4().to_string();
-            journal.queue_observation(&event_id, json!({
-                "event_id":event_id,
-                "state":{
-                    "boot_id":boot_id,
-                    "native_scope_key":scope,
-                    "journal_recovery":{
-                        "count":journal_recovery_count,
-                        "entries":entries,
-                        "coverage":if journal.startup_recovery_complete() {"complete"} else {"partial"},
-                        "native_replay_permitted":false,
-                    },
-                },
-            }))?;
-            flush_outbox(&host).await?;
-        }
-
         if let Some(probe) = native_probe {
             let event_id = uuid::Uuid::new_v4().to_string();
             let observation = json!({
@@ -210,55 +295,141 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                 }
             });
             journal.queue_observation(&event_id, observation)?;
-            flush_outbox(&host).await?;
         }
 
-        flush_outbox(&host).await?;
-        attempt_journal_retention(&host);
         let mut next_retention_retry = TokioInstant::now()
             + Duration::from_millis(JOURNAL_RETENTION_RETRY_MS);
+        let mut recovery_tick = tokio::time::interval_at(
+            TokioInstant::now() + Duration::from_millis(STARTUP_RECOVERY_TICK_MS),
+            Duration::from_millis(STARTUP_RECOVERY_TICK_MS),
+        );
+        let mut module_next = Box::pin(host.call("module.next", json!({})));
+        let mut root_checked = false;
+        let mut retention_started = false;
+        let mut recovery_report_queued = false;
+        let mut recovery_window_advanced = false;
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
-            let response = tokio::select! {
+            let event = tokio::select! {
                 signal = &mut ctrl_c => {
                     signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
                     break;
                 }
-                result = host.call("module.next", json!({})) => result?,
+                event = wait_for_module_next_or_recovery(
+                    module_next.as_mut(),
+                    &mut recovery_tick,
+                    !recovery_window_advanced
+                        && !startup_recovery.blocked
+                        && !journal.startup_recovery_complete(),
+                ) => event,
             };
-            let command_value = response.get("command").ok_or_else(|| {
-                Error::new(
-                    "HOST_COMMAND_SCHEMA",
-                    "module.next response lacks command state",
-                )
-            })?;
-            if !command_value.is_null() {
-                let command: RuntimeCommand =
-                    serde_json::from_value(command_value.clone()).map_err(|_| {
-                        Error::new(
-                            "HOST_COMMAND_SCHEMA",
-                            "module command does not match the shared contract",
-                        )
-                    })?;
-                verify_command_scope(host.config, &command, host.claim)?;
-                handle_command(&host, &command, &mut native_owner).await?;
+            if let StartupPoll::ModuleNext(result) = event {
+                recovery_window_advanced = false;
+                let response = result?;
+                let command_value = response.get("command").ok_or_else(|| {
+                    Error::new(
+                        "HOST_COMMAND_SCHEMA",
+                        "module.next response lacks command state",
+                    )
+                })?;
+                if !command_value.is_null() {
+                    let command: RuntimeCommand =
+                        serde_json::from_value(command_value.clone()).map_err(|_| {
+                            Error::new(
+                                "HOST_COMMAND_SCHEMA",
+                                "module command does not match the shared contract",
+                            )
+                        })?;
+                    verify_command_scope(host.config, &command, host.claim)?;
+                    handle_command(&host, &command, &mut native_owner).await?;
+                } else {
+                    sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+                }
+                // The first module.next is issued immediately after hello.
+                // Recovery ticks keep this same RPC pinned and process exact
+                // command reads before advancing another body window.
                 flush_outbox(&host).await?;
-            } else {
-                sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+                module_next = Box::pin(host.call("module.next", json!({})));
+
+                // A failed module.next may have admitted work before its response was
+                // lost. It is intentionally not retried on this boot; startup recovery
+                // will make that Operation unknown and offer readback-only reconcile.
+                if host.retention_retry_pending.load(Ordering::Acquire)
+                    && TokioInstant::now() >= next_retention_retry
+                {
+                    attempt_journal_retention(&host);
+                    next_retention_retry =
+                        TokioInstant::now() + Duration::from_millis(JOURNAL_RETENTION_RETRY_MS);
+                }
             }
-            // Check only after module.next returns; never cancel an in-flight RPC
-            // to run maintenance while the adapter is waiting for work.
-            if host.retention_retry_pending.load(Ordering::Acquire)
-                && TokioInstant::now() >= next_retention_retry
+
+            let step = startup_recovery
+                .advance(
+                    &journal,
+                    &mut journal_recovery,
+                    &mut journal_recovery_count,
+                )
+                .await;
+            if !matches!(step, StartupRecoveryStep::WaitingForInventory) {
+                recovery_window_advanced = true;
+            }
+            if matches!(step, StartupRecoveryStep::Complete) {
+                if !root_checked {
+                    if let Some(root) = journal.native_root_for_hello(
+                        &config.binding_id,
+                        config.generation,
+                        &scope,
+                    )? {
+                        host.set_root_hint(&root)?;
+                    }
+                    let startup_scan = journal.startup_scan_counts();
+                    eprintln!(
+                        "OpenCode startup recovery scan: operation_names={}, parsed_bodies={}, bytes={}, outbox_entries={}, unresolved={}",
+                        startup_scan.operations_listed,
+                        startup_scan.operation_bodies_parsed,
+                        startup_scan.operation_bytes_read,
+                        startup_scan.outbox_entries_scanned,
+                        startup_scan.unresolved_found,
+                    );
+                    root_checked = true;
+                }
+                if !retention_started {
+                    attempt_journal_retention(&host);
+                    retention_started = true;
+                }
+            }
+            if !recovery_report_queued
+                && !journal_recovery.is_empty()
+                && matches!(step, StartupRecoveryStep::Complete | StartupRecoveryStep::Blocked)
             {
-                attempt_journal_retention(&host);
-                next_retention_retry =
-                    TokioInstant::now() + Duration::from_millis(JOURNAL_RETENTION_RETRY_MS);
+                let entries = journal_recovery.iter().take(32).map(|recovered| json!({
+                    "operation_key":recovered.operation_key,
+                    "operation_id":recovered.operation_id,
+                    "native_effect_unknown":recovered.history.recovery_unknown(),
+                    "torn_tail":recovered.history.torn_tail_evidence.as_ref().map(|tail| json!({
+                        "valid_prefix_bytes":tail.valid_prefix_bytes,
+                        "tail_sha256":tail.tail_sha256,
+                        "tail_bytes":tail.tail_bytes,
+                    })),
+                    "native_replay_permitted":false,
+                })).collect::<Vec<_>>();
+                let event_id = uuid::Uuid::new_v4().to_string();
+                journal.queue_observation(&event_id, json!({
+                    "event_id":event_id,
+                    "state":{
+                        "boot_id":boot_id,
+                        "native_scope_key":scope,
+                        "journal_recovery":{
+                            "count":journal_recovery_count,
+                            "entries":entries,
+                            "coverage":if journal.startup_recovery_complete() {"complete"} else {"partial"},
+                            "native_replay_permitted":false,
+                        },
+                    },
+                }))?;
+                recovery_report_queued = true;
             }
-            // A failed module.next may have admitted work before its response was
-            // lost. It is intentionally not retried on this boot; startup recovery
-            // will make that Operation unknown and offer readback-only reconcile.
         }
         Ok(())
     }
@@ -2712,6 +2883,10 @@ where
 }
 
 fn attempt_journal_retention(host: &HostSession<'_>) {
+    if !host.journal.startup_recovery_complete() {
+        host.retention_retry_pending.store(true, Ordering::Release);
+        return;
+    }
     let queue_drained = match host.journal.reclaim_acknowledged(
         &host.config.binding_id,
         host.config.generation,

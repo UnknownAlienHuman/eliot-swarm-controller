@@ -143,6 +143,9 @@ pub(super) struct RetentionIndex {
     /// Safe legacy candidates are rediscovered in one legacy convergence
     /// after a crash until the bounded reclamation queue drains.
     legacy_reclamation_pending: bool,
+    /// Distinguishes the completed legacy census on this handle from a fresh
+    /// handle that still needs to rebuild its volatile reclamation queue.
+    legacy_scan_complete_this_handle: bool,
     startup_complete: bool,
 }
 
@@ -190,6 +193,7 @@ impl RetentionIndex {
             classified_names: BTreeSet::new(),
             steady_seen: BTreeSet::new(),
             legacy_reclamation_pending: saved.legacy_reclamation_pending,
+            legacy_scan_complete_this_handle: false,
             startup_complete,
         }
     }
@@ -208,6 +212,7 @@ impl RetentionIndex {
         self.references_unknown = false;
         // A fresh recovery scan must prove coverage again before deletion.
         self.scan_incomplete = true;
+        self.legacy_scan_complete_this_handle = false;
         self.classified_names.clear();
         self.steady_seen.clear();
         if self.startup_complete && !self.legacy_reclamation_pending {
@@ -776,6 +781,7 @@ pub(super) fn store_startup_progress(
     if complete {
         if index.references_unknown {
             index.scan_incomplete = true;
+            index.legacy_scan_complete_this_handle = legacy;
             index.persist_cursor()?;
             return Err(Error::new(
                 "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
@@ -794,7 +800,14 @@ pub(super) fn store_startup_progress(
         if legacy {
             index.startup_names = None;
             index.classified_names.clear();
-            index.scan_incomplete = false;
+            index.legacy_scan_complete_this_handle = true;
+            // A legacy census may have overlapped a write-ahead address memo
+            // that was appended after its name snapshot. Keep recovery open
+            // until the existing sparse closure has read every such address.
+            index.scan_incomplete = !index
+                .durable_unresolved
+                .iter()
+                .all(|key| index.steady_seen.contains(key));
         } else {
             index.scan_incomplete = !index
                 .durable_unresolved
@@ -873,6 +886,16 @@ pub(super) fn legacy_reclamation_pending(journal: &Journal) -> Result<bool> {
     Ok(lock_index(journal)?.legacy_reclamation_pending)
 }
 
+pub(super) fn legacy_scan_complete_this_handle(journal: &Journal) -> Result<bool> {
+    Ok(lock_index(journal)?.legacy_scan_complete_this_handle)
+}
+
+pub(super) fn startup_inventory_required(journal: &Journal) -> Result<bool> {
+    let index = lock_index(journal)?;
+    Ok(!index.startup_complete
+        || (index.legacy_reclamation_pending && !index.legacy_scan_complete_this_handle))
+}
+
 pub(super) fn steady_window_keys(journal: &Journal, budget: usize) -> Result<Vec<String>> {
     let index = lock_index(journal)?;
     Ok(index
@@ -907,12 +930,11 @@ pub(super) fn startup_has_unknown_addresses(journal: &Journal) -> Result<bool> {
 pub(super) fn note_operation_append(journal: &Journal, memo: OperationAddressMemo) -> Result<()> {
     let mut index = lock_index(journal)?;
     index.ensure_address_closure(memo)?;
+    // The per-operation memo is the write-ahead address for this append.
+    // Keep the legacy traversal cursor and cached name snapshot intact; after
+    // the census, the existing durable closure reads this exact key. Rewinding
+    // the whole inventory here lets steady command traffic starve convergence.
     if !index.startup_complete {
-        // A new file can sort before the saved cursor. Restart the incomplete
-        // inventory from the beginning so it cannot be skipped after a crash.
-        index.startup_cursor = None;
-        index.startup_names = None;
-        index.classified_names.clear();
         index.scan_incomplete = true;
     }
     index.persist_cursor()?;

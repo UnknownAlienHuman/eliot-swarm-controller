@@ -507,9 +507,9 @@ fn startup_recovery_bounds_large_history_and_resumes_sparse_tail() {
     assert_eq!(cursor["version"].as_u64(), Some(3));
 }
 
-/// Cold legacy inventory is deferred until after hello; the durable cursor
-/// resumes a bounded body window, and an append during incomplete recovery
-/// invalidates that cursor before the new operation is written.
+/// Cold legacy inventory is prepared off the service loop; body classification
+/// remains windowed, while a write-ahead memo preserves cursor progress and
+/// makes an append visible to the later exact-closure pass.
 #[test]
 fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     let root = FixtureRoot::new();
@@ -519,6 +519,10 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     for index in 0..64 {
         write_acknowledged_reply(&journal, &format!("cold-legacy-{index:03}"), None);
     }
+    let unresolved_id = "cold-legacy-unresolved";
+    journal
+        .write_intent(&fixture_intent(unresolved_id, "agent.reply"))
+        .unwrap();
     let address_dir = root.0.join(retention::ADDRESS_CHECKPOINT_DIR);
     for entry in fs::read_dir(&address_dir).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
@@ -532,8 +536,19 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     assert_eq!(before_hello.operations_listed, 0);
     assert_eq!(before_hello.operation_bodies_parsed, 0);
     assert!(!journal.startup_recovery_complete());
+    let targeted = journal.load(unresolved_id).unwrap();
+    assert_eq!(
+        targeted.intent.as_ref().unwrap().operation_id,
+        unresolved_id
+    );
+    assert!(targeted.recovery_unknown());
+    assert!(!targeted.native_replay_permitted());
 
-    // The first post-hello recovery pass classifies one fixed-size window.
+    // Preparing all names reads metadata only. The service can poll while
+    // this work runs; a body window remains capped at 32 entries.
+    journal.prepare_startup_inventory().unwrap();
+    assert_eq!(journal.startup_scan_counts().operations_listed, 65);
+    assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 0);
     let first = journal.recover_outbox().unwrap();
     assert!(first.len() <= 32);
     assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 32);
@@ -546,8 +561,8 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     assert!(saved_cursor.is_some());
     drop(journal);
 
-    // Restart first restores the cursor. The append then resets it before its
-    // intent is written, so the sorted inventory cannot skip the new key.
+    // Restart first restores the cursor. An append preserves that traversal
+    // position; its existing address memo is read after the legacy census.
     let journal =
         Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
     assert_eq!(
@@ -559,13 +574,25 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
             .map(str::to_owned),
         saved_cursor
     );
+    journal.prepare_startup_inventory().unwrap();
     let appended_id = "cold-legacy-appended-after-restart";
+    let cursor_before_append = journal
+        .retention
+        .lock()
+        .unwrap()
+        .startup_cursor_for_test()
+        .map(str::to_owned);
     journal
         .write_intent(&fixture_intent(appended_id, "agent.reply"))
         .unwrap();
     assert_eq!(
-        journal.retention.lock().unwrap().startup_cursor_for_test(),
-        None
+        journal
+            .retention
+            .lock()
+            .unwrap()
+            .startup_cursor_for_test()
+            .map(str::to_owned),
+        cursor_before_append
     );
 
     let first_after_append = journal.recover_outbox().unwrap();
@@ -574,7 +601,12 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     assert!(second_after_append.len() <= 32);
     let final_after_append = journal.recover_outbox().unwrap();
     assert!(final_after_append.len() <= 32);
-    assert!(journal.startup_recovery_complete());
+    assert!(
+        journal.startup_recovery_complete(),
+        "recovery remains incomplete: scan={:?}, cursor={:?}",
+        journal.startup_scan_counts(),
+        journal.retention.lock().unwrap().startup_cursor_for_test()
+    );
     assert!(
         first_after_append
             .iter()

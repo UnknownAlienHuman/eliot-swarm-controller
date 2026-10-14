@@ -796,6 +796,12 @@ impl Journal {
             .unwrap_or(false)
     }
 
+    /// Whether startup needs a legacy name census before it can serve the
+    /// retained sparse closure. This is a metadata-only decision.
+    pub fn startup_inventory_required(&self) -> Result<bool> {
+        retention::startup_inventory_required(self)
+    }
+
     /// Use only the already-durable sparse closure before hello. A cold or
     /// invalidated legacy inventory is deliberately left for bounded recovery
     /// after hello, so discovering old names cannot delay the handshake.
@@ -806,6 +812,25 @@ impl Journal {
             return Ok(Vec::new());
         }
         self.recover_outbox()
+    }
+
+    /// Enumerate legacy operation names without classifying their bodies.
+    /// Owned startup runs this on a blocking worker so a cold directory cannot
+    /// hold the module service loop before or between `module.next` polls.
+    pub fn prepare_startup_inventory(&self) -> Result<()> {
+        if retention::durable_startup_complete(self)?
+            && (!retention::legacy_reclamation_pending(self)?
+                || retention::legacy_scan_complete_this_handle(self)?)
+        {
+            return Ok(());
+        }
+        if retention::cached_startup_names(self)?.is_some() {
+            return Ok(());
+        }
+        let (names, invalid) = self.list_operation_names()?;
+        self.scan_listed
+            .fetch_add(names.len() as u64 + invalid as u64, Ordering::Relaxed);
+        retention::remember_startup_names(self, names, invalid)
     }
 
     /// Sorted valid operation keys plus a count of unnameable entries.
@@ -885,7 +910,8 @@ impl Journal {
         let window: Vec<String>;
         let mut legacy_names: Option<Vec<String>> = None;
         if retention::durable_startup_complete(self)?
-            && !retention::legacy_reclamation_pending(self)?
+            && (!retention::legacy_reclamation_pending(self)?
+                || retention::legacy_scan_complete_this_handle(self)?)
         {
             window = self.steady_recovery_window()?;
         } else {
@@ -912,8 +938,17 @@ impl Journal {
                 retention::mark_startup_classified(self, name)?;
             }
             let path = self.operations.join(format!("{name}.jsonl"));
-            ensure_regular(&path, "operation journal")?;
-            let observed_bytes = read_limited(&path, HISTORY_LIMIT)?;
+            if ensure_regular(&path, "operation journal").is_err() {
+                retention::mark_damaged(self)?;
+                continue;
+            }
+            let observed_bytes = match read_limited(&path, HISTORY_LIMIT) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    retention::mark_damaged(self)?;
+                    continue;
+                }
+            };
             self.scan_bodies.fetch_add(1, Ordering::Relaxed);
             self.scan_bytes
                 .fetch_add(observed_bytes.len() as u64, Ordering::Relaxed);
@@ -969,6 +1004,9 @@ impl Journal {
                     // full scan that steady state never performs.
                     self.check_native_root_identity(&operation)?;
                     retention::register_operation(self, operation)?;
+                    if legacy_names.is_some() {
+                        retention::mark_steady_visited(self, name)?;
+                    }
                 }
                 Err(_) => retention::mark_damaged(self)?,
             }

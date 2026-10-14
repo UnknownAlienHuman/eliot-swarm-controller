@@ -60,24 +60,24 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     let config = host_config.clone().with_native_options(native_options);
     config.validate()?;
     let route_sha256 = digest_json(&serde_json::to_value(&config.native_options)?)?;
-    let journal = OperationJournal::open(
+    let journal = std::sync::Arc::new(OperationJournal::open(
         &config.state_dir,
         &config.binding_id,
         config.generation,
         &config.native_options.scope_key(),
         &route_sha256,
-    )?;
-    while !journal.startup_recovery_complete()? {
-        let recovered = journal.recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")?;
-        eprintln!("Claude startup journal recovery classified {recovered} entries");
-    }
+    )?);
+    let inventory_journal = std::sync::Arc::clone(&journal);
+    let mut startup_inventory = Some(tokio::task::spawn_blocking(move || {
+        inventory_journal.prepare_startup_inventory()
+    }));
+    let mut startup_recovery_blocked = false;
     let interactions = InteractionJournal::open(
         &config.state_dir,
         &config.binding_id,
         config.generation,
         &config.native_options.scope_key(),
     )?;
-    interactions.recover_stale(&journal)?;
     let bridge_path = sdk_harness::materialize(&config.sdk_harness_dir)?;
     let (frame_tx, mut frame_rx) = mpsc::channel::<HarnessFrame>(MAX_FRAMES);
     let mut harness: Option<NativeHarness> = None;
@@ -89,6 +89,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut frames_closed = false;
+    let mut stale_interactions_recovered = false;
 
     loop {
         flush_outbox(&mut link, &journal, &interactions).await?;
@@ -185,6 +186,61 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     }
                 } else {
                     sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+                }
+            }
+        }
+
+        if !stale_interactions_recovered {
+            match interactions.recover_stale(&journal) {
+                Ok(()) => stale_interactions_recovered = true,
+                Err(error) => {
+                    // A damaged callback stays held for exact request readback;
+                    // it must not keep module.next behind a full-history gate.
+                    eprintln!(
+                        "Claude stale callback recovery remains incomplete: {}",
+                        error.code
+                    );
+                    stale_interactions_recovered = true;
+                }
+            }
+        }
+
+        if !startup_recovery_blocked {
+            if let Some(inventory) = startup_inventory.as_ref()
+                && inventory.is_finished()
+            {
+                let inventory = startup_inventory.take().expect("finished inventory handle");
+                match inventory.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "Claude startup name inventory remains incomplete: {}",
+                            error.code
+                        );
+                        startup_recovery_blocked = true;
+                    }
+                    Err(_) => {
+                        eprintln!("Claude startup name inventory worker failed");
+                        startup_recovery_blocked = true;
+                    }
+                }
+            }
+            if !startup_recovery_blocked {
+                match journal.try_recover_startup_window_for_boot(
+                    "ADAPTER_RESTART_AFTER_EFFECT_MARKER",
+                    &boot_id,
+                ) {
+                    Ok(Some(recovered)) if recovered > 0 => {
+                        eprintln!("Claude startup journal recovery classified {recovered} entries");
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "Claude startup journal recovery remains incomplete: {}",
+                            error.code
+                        );
+                        startup_recovery_blocked = true;
+                    }
                 }
             }
         }

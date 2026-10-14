@@ -95,6 +95,17 @@ impl OperationState {
     }
 }
 
+fn is_current_boot_unknown(state: &OperationState, current_boot_id: Option<&str>) -> bool {
+    state.recovery_unknown()
+        && current_boot_id.is_some_and(|boot_id| {
+            state
+                .intent
+                .as_ref()
+                .and_then(|intent| intent["bridge_boot_id"].as_str())
+                == Some(boot_id)
+        })
+}
+
 pub struct OperationJournal {
     root: PathBuf,
     retention_root: PathBuf,
@@ -357,7 +368,9 @@ impl OperationJournal {
             digest: None,
             outbox_sequence: None,
         };
-        self.invalidate_startup_recovery_for_append()?;
+        // The startup cursor is traversal-only. A live append is already tied
+        // to the exact Store Operation ID and the next boot reopens a completed
+        // census; do not rewind an incomplete legacy walk on every new command.
         self.register_references_for_intent(operation_id, intent)?;
         if method == "task.dispatch" {
             self.write_boot_dispatch_marker(operation_id, receipt, intent, None, None)?;
@@ -781,10 +794,95 @@ impl OperationJournal {
         Ok(self.read_retention_state()?.startup_complete)
     }
 
+    /// Build the existing in-memory sorted name snapshot without holding the
+    /// startup-write lock. Owned startup runs this metadata walk on a blocking
+    /// worker; operation bodies are still classified in bounded service-loop
+    /// windows.
+    pub fn prepare_startup_inventory(&self) -> Result<()> {
+        if self.read_retention_state()?.startup_complete {
+            return Ok(());
+        }
+        {
+            let cached = self.startup_names.lock().map_err(|_| {
+                Error::new(
+                    "ADAPTER_RETENTION_STATE",
+                    "startup inventory cache is unavailable",
+                )
+            })?;
+            if cached.is_some() {
+                return Ok(());
+            }
+        }
+        let names = self.list_operation_names()?;
+        let mut cached = self.startup_names.lock().map_err(|_| {
+            Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "startup inventory cache is unavailable",
+            )
+        })?;
+        if cached.is_none() {
+            *cached = Some(names);
+        }
+        Ok(())
+    }
+
+    pub fn startup_inventory_ready(&self) -> Result<bool> {
+        if self.startup_recovery_complete()? {
+            return Ok(true);
+        }
+        Ok(self
+            .startup_names
+            .lock()
+            .map_err(|_| {
+                Error::new(
+                    "ADAPTER_RETENTION_STATE",
+                    "startup inventory cache is unavailable",
+                )
+            })?
+            .is_some())
+    }
+
+    /// Service-loop variant: never enumerate the full directory inline. A
+    /// cold exact operation read remains available while the name worker runs.
+    pub fn try_recover_startup_window_for_boot(
+        &self,
+        diagnostic_code: &str,
+        current_boot_id: &str,
+    ) -> Result<Option<usize>> {
+        if self.startup_recovery_complete()? {
+            return Ok(Some(0));
+        }
+        if !self.startup_inventory_ready()? {
+            return Ok(None);
+        }
+        self.recover_startup_window_inner(diagnostic_code, Some(current_boot_id))
+            .map(Some)
+    }
+
     /// Classify one bounded legacy window and persist its last key once. A
     /// crash may revisit at most 32 operations; migration writes are idempotent
     /// and effect markers are never replayed.
+    #[cfg(test)]
     pub fn recover_startup_window(&self, diagnostic_code: &str) -> Result<usize> {
+        self.prepare_startup_inventory()?;
+        self.recover_startup_window_inner(diagnostic_code, None)
+    }
+
+    #[cfg(test)]
+    pub fn recover_startup_window_for_boot(
+        &self,
+        diagnostic_code: &str,
+        current_boot_id: &str,
+    ) -> Result<usize> {
+        self.prepare_startup_inventory()?;
+        self.recover_startup_window_inner(diagnostic_code, Some(current_boot_id))
+    }
+
+    fn recover_startup_window_inner(
+        &self,
+        diagnostic_code: &str,
+        current_boot_id: Option<&str>,
+    ) -> Result<usize> {
         let _startup_guard = self.startup_lock.lock().map_err(|_| {
             Error::new(
                 "ADAPTER_RETENTION_STATE",
@@ -796,27 +894,31 @@ impl OperationJournal {
         if state.startup_complete {
             return Ok(0);
         }
-        let names = {
-            let mut cached = self.startup_names.lock().map_err(|_| {
+        let names = self
+            .startup_names
+            .lock()
+            .map_err(|_| {
                 Error::new(
                     "ADAPTER_RETENTION_STATE",
                     "startup inventory cache is unavailable",
                 )
+            })?
+            .clone()
+            .ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_STARTUP_INVENTORY_PENDING",
+                    "legacy operation names have not been prepared",
+                )
             })?;
-            if cached.is_none() {
-                *cached = Some(self.list_operation_names()?);
-            }
-            cached.clone().unwrap_or_default()
-        };
         let start = state.startup_cursor.as_deref().map_or(0, |cursor| {
             names.partition_point(|name| name.as_str() <= cursor)
         });
         let end = start.saturating_add(MAX_CURSOR_STEPS).min(names.len());
         for name in &names[start..end] {
             if state.migration_complete {
-                self.recover_legacy_operation(name, diagnostic_code)?;
+                self.recover_legacy_operation(name, diagnostic_code, current_boot_id)?;
             } else {
-                self.migrate_legacy_operation(name, diagnostic_code)?;
+                self.migrate_legacy_operation(name, diagnostic_code, current_boot_id)?;
             }
         }
         let mut progress = self.read_retention_state()?;
@@ -935,7 +1037,12 @@ impl OperationJournal {
         Ok(names)
     }
 
-    fn recover_legacy_operation(&self, name: &str, diagnostic_code: &str) -> Result<()> {
+    fn recover_legacy_operation(
+        &self,
+        name: &str,
+        diagnostic_code: &str,
+        current_boot_id: Option<&str>,
+    ) -> Result<()> {
         let path = self.root.join(format!("{name}.jsonl"));
         let state = match ensure_regular(&path).and_then(|()| self.read_path(&path, None)) {
             Ok(state) => state,
@@ -951,10 +1058,18 @@ impl OperationJournal {
         if state.torn_tail_evidence.is_some() {
             self.note_deferred_damage()?;
         }
+        if is_current_boot_unknown(&state, current_boot_id) {
+            return Ok(());
+        }
         self.recover_uncertain_state(&state, diagnostic_code)
     }
 
-    fn migrate_legacy_operation(&self, name: &str, diagnostic_code: &str) -> Result<()> {
+    fn migrate_legacy_operation(
+        &self,
+        name: &str,
+        diagnostic_code: &str,
+        current_boot_id: Option<&str>,
+    ) -> Result<()> {
         let path = self.root.join(format!("{name}.jsonl"));
         let state = match ensure_regular(&path).and_then(|()| self.read_path(&path, None)) {
             Ok(state) => state,
@@ -1023,20 +1138,10 @@ impl OperationJournal {
             // authoritative custody evidence for this operation.
             self.note_deferred_damage()?;
         }
+        if is_current_boot_unknown(&state, current_boot_id) {
+            return Ok(());
+        }
         self.recover_uncertain_state(&state, diagnostic_code)
-    }
-
-    fn invalidate_startup_recovery_for_append(&self) -> Result<()> {
-        let mut state = self.read_retention_state()?;
-        state.startup_complete = false;
-        state.startup_cursor = None;
-        *self.startup_names.lock().map_err(|_| {
-            Error::new(
-                "ADAPTER_RETENTION_STATE",
-                "startup inventory cache is unavailable",
-            )
-        })? = None;
-        self.write_retention_state(&state)
     }
 
     fn recover_uncertain_state(&self, state: &OperationState, diagnostic_code: &str) -> Result<()> {
@@ -3216,6 +3321,21 @@ mod recovery_tests {
             .unwrap();
         let torn_bytes = std::fs::read(&torn_path).unwrap();
 
+        // The service-loop variant never lists names inline. A requested
+        // operation remains directly readable while cold inventory is absent.
+        assert_eq!(
+            journal
+                .try_recover_startup_window_for_boot(
+                    "ADAPTER_RESTART_AFTER_EFFECT_MARKER",
+                    "boot-current"
+                )
+                .unwrap(),
+            None
+        );
+        let targeted = journal.get("legacy-window-063").unwrap().unwrap();
+        assert!(targeted.recovery_unknown());
+        assert!(!targeted.native_replay_permitted());
+
         assert_eq!(
             journal
                 .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
@@ -3245,30 +3365,56 @@ mod recovery_tests {
 
         let appended_id = "legacy-window-appended-after-restart";
         let appended_receipt = make_receipt(appended_id);
+        let cursor_before_append = journal.read_retention_state().unwrap().startup_cursor;
         journal
             .write_intent(
                 appended_id,
                 &appended_receipt,
                 "agent.reply",
-                &json!({"kind":"appended"}),
+                &json!({"kind":"appended","bridge_boot_id":"boot-current"}),
             )
             .unwrap();
-        assert_eq!(journal.read_retention_state().unwrap().startup_cursor, None);
+        assert_eq!(
+            journal.read_retention_state().unwrap().startup_cursor,
+            cursor_before_append
+        );
         assert_eq!(
             journal
-                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .recover_startup_window_for_boot(
+                    "ADAPTER_RESTART_AFTER_EFFECT_MARKER",
+                    "boot-current"
+                )
+                .unwrap(),
+            1
+        );
+        assert!(journal.startup_recovery_complete().unwrap());
+        let appended_live = journal.get(appended_id).unwrap().unwrap();
+        assert!(appended_live.recovery_unknown());
+        assert!(appended_live.outcome.is_none());
+        assert!(!appended_live.native_replay_permitted());
+        drop(journal);
+
+        // A restart makes the exact saved operation eligible for recovery;
+        // direct ID lookup preserves custody even before its scan window.
+        let journal = open();
+        let appended_after_restart = journal.get(appended_id).unwrap().unwrap();
+        assert!(appended_after_restart.recovery_unknown());
+        assert!(!appended_after_restart.native_replay_permitted());
+        assert_eq!(
+            journal
+                .recover_startup_window_for_boot("ADAPTER_RESTART_AFTER_EFFECT_MARKER", "boot-next")
                 .unwrap(),
             MAX_CURSOR_STEPS
         );
         assert_eq!(
             journal
-                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .recover_startup_window_for_boot("ADAPTER_RESTART_AFTER_EFFECT_MARKER", "boot-next")
                 .unwrap(),
             MAX_CURSOR_STEPS
         );
         assert_eq!(
             journal
-                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .recover_startup_window_for_boot("ADAPTER_RESTART_AFTER_EFFECT_MARKER", "boot-next")
                 .unwrap(),
             2
         );
@@ -3288,8 +3434,8 @@ mod recovery_tests {
         assert!(!torn.native_replay_permitted());
         assert_eq!(std::fs::read(&torn_path).unwrap(), torn_bytes);
 
-        // A new effect marker written after startup completion invalidates the
-        // per-boot cursor before append; restart then recovers it in windows.
+        // A new live intent does not rewind completed traversal. The next boot
+        // resets the per-boot scan and recovers the exact operation in windows.
         let runtime_id = "legacy-window-appended-after-completion";
         let runtime_receipt = make_receipt(runtime_id);
         journal
@@ -3300,7 +3446,7 @@ mod recovery_tests {
                 &json!({"kind":"runtime-append"}),
             )
             .unwrap();
-        assert!(!journal.startup_recovery_complete().unwrap());
+        assert!(journal.startup_recovery_complete().unwrap());
         assert_eq!(journal.read_retention_state().unwrap().startup_cursor, None);
         drop(journal);
 
