@@ -31,11 +31,18 @@ on:
     # Intentionally no path filter: the scoped classifier must see tests/**,
     # tools/**, Justfile, workflow changes, documentation, and newly added paths.
   workflow_dispatch:
+    inputs:
+      qualification:
+        description: Qualification scope
+        type: choice
+        default: full
+        options: [full, focused-recovery]
 permissions:
   contents: read
 jobs:
   scope:
     name: Classify changed paths and package ownership
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification != 'focused-recovery'
     runs-on: ubuntu-latest
     outputs:
       docs_changed: ${{ steps.classify.outputs.docs_changed }}
@@ -386,7 +393,7 @@ jobs:
   build:
     name: Full existing qualification (manual only)
     needs: scope
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.qualification != 'focused-recovery'
     strategy:
       fail-fast: false
       matrix:
@@ -561,3 +568,80 @@ jobs:
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-kernel-host.exe
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor.exe
+
+  focused-recovery:
+    name: Focused journal and probe runtime qualification
+    if: github.event_name == 'workflow_dispatch' && inputs.qualification == 'focused-recovery'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --no-self-update
+          rustc --version
+          cargo --version
+      - name: Record exact source
+        shell: pwsh
+        run: |
+          & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Source: $env:GITHUB_SHA; OS: $env:RUNNER_OS"
+      - name: Provision temporary libclang for rusqlite bindgen
+        shell: pwsh
+        run: |
+          if ($IsWindows) {
+            $version = '20.1.8'
+            $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+            $installDir = Join-Path $env:RUNNER_TEMP "llvm-$version"
+            $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+            Invoke-WebRequest -Uri $uri -OutFile $installer
+            $expectedHash = '3197846A2B19063687DD56E93E34CD941E3548D907F23A6131571321BDF9FE7B'
+            $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+            if ($actualHash -cne $expectedHash) { throw 'LLVM installer SHA-256 mismatch.' }
+            if (Test-Path -LiteralPath $installDir) { throw 'Temporary LLVM install directory must be fresh.' }
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -WindowStyle Hidden -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "LLVM installer failed with exit code $($process.ExitCode)." }
+            $libclangDir = Join-Path $installDir 'bin'
+            if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
+              throw 'The official LLVM installation did not provide libclang.dll.'
+            }
+          } else {
+            & sudo apt-get update
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & sudo apt-get install --yes --no-install-recommends libclang-dev
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $libclang = Get-ChildItem -Path '/usr/lib/llvm-*/lib/libclang.so' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $libclang) { throw 'The libclang development package did not provide libclang.so.' }
+            $libclangDir = $libclang.DirectoryName
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclangDir" -Encoding utf8
+      - name: Run focused runtime cohorts and reject empty selections
+        shell: pwsh
+        run: |
+          $targetDir = Join-Path $env:RUNNER_TEMP 'eliot-focused-recovery-target'
+          function Invoke-FocusedCohort([string]$Package, [string]$Filter, [int]$Expected = 0) {
+            $listing = @(& cargo test --locked --package $Package --lib --target-dir $targetDir $Filter -- --list)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $selected = @($listing | Where-Object { $_ -match ': test$' })
+            if ($selected.Count -eq 0 -or ($Expected -gt 0 -and $selected.Count -ne $Expected)) {
+              throw "Unexpected test selection for ${Package}/${Filter}: $($selected.Count); expected $Expected (nonzero)."
+            }
+            & cargo test --locked --package $Package --lib --target-dir $targetDir $Filter -- --nocapture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "PASS: ${Package}/${Filter}: $($selected.Count) tests on $env:RUNNER_OS"
+          }
+          Invoke-FocusedCohort 'swarm-adapter-opencode' 'journal65_parity_tests' 5
+          Invoke-FocusedCohort 'swarm-adapter-claude' 'journal65_parity_tests' 4
+          Invoke-FocusedCohort 'swarm-process' 'permissions::publication_tests'
+          Invoke-FocusedCohort 'swarm-kernel-host' 'probe_resolution_reservations_hold_conflicts_until_both_owners_depart' 1
+          Invoke-FocusedCohort 'swarm-kernel-host' 'independent_probe_resolution_io_overlaps_and_remains_in_store_custody' 1
