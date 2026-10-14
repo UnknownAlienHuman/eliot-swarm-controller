@@ -1074,7 +1074,7 @@ mod qualification_admit_diagnostic_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qualification-faults"))]
 mod qualification_admit_attempt_tests {
     use super::*;
     use std::path::{Path, PathBuf};

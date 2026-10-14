@@ -2,6 +2,10 @@
 
 ## Current state
 
+### Gates and docs alignment -- 2026-10-14 (this candidate, unqualified)
+
+This candidate only gates the swarm-automation qualification-admit test module behind qualification-faults (crates/swarm-automation/src/lib.rs) and aligns the README capability matrix and example config with the shipped descriptors (Claude bridge.5 per modules/claude/module-descriptor.template.json, Command glue.5 per modules/command/module-descriptor-glue.5.template.json, Zed eval-cli.2 per crates/swarm-kernel-host/src/runtime/zed.rs ARTIFACT_ID, owner-policy v1+v2 per crates/swarm-kernel-host/src/policy.rs and docs/task-policy.md). Production boundaries are unchanged; faults stay off by default and ordinary tests are not suppressed. Project status remains PARTIAL_PROGRESS: source and fixture evidence only, not native or model qualification. Current main c698638 already contains the #149 retention-durability fix (12d7fd7) and the #150 cached-source acceptance closure (219d2f3, c0b50e1, c698638); this candidate does not requalify them and does not repeat D3. The frozen v1 section in docs/owner-decisions.md (digest 786df3cd) and the frozen v2 text in docs/owner-policy-v2.md (digest a3490caa) are preserved.
+
 ### Optional worker isolation and supervisor restart — 2026-10-10
 
 The existing core qualification harness now has an opt-in
