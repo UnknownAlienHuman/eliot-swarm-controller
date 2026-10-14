@@ -80,6 +80,14 @@ struct IndexedParticipantPage {
     last_scanned_key: Option<String>,
 }
 
+struct ContractCardsPage {
+    items: Vec<Value>,
+    next_after: Option<String>,
+    next_scan_cursor: Option<String>,
+    coverage: &'static str,
+    gaps: Value,
+}
+
 #[derive(Clone)]
 enum PeerSelector {
     Term(keys::TermKind, String),
@@ -3557,29 +3565,6 @@ fn read_scope(db: &Connection, principal: &Principal, value: &Value) -> Result<S
     manager_scope(db, principal, task_id, task_revision, attempt_id)
 }
 
-fn indexed_cards(
-    db: &Connection,
-    scope_id: &str,
-    term_kind: keys::TermKind,
-    term: &str,
-    card_kind: Option<&str>,
-    after_client_id: Option<&str>,
-    raw_limit: i64,
-) -> Result<IndexedCardPage> {
-    indexed_relevance_cards(
-        db,
-        Some(scope_id),
-        term_kind,
-        term,
-        card_kind,
-        IndexPageRequest {
-            after_client_id,
-            after_scan_key: None,
-            raw_limit,
-        },
-    )
-}
-
 fn indexed_cards_after_scan(
     db: &Connection,
     scope_id: &str,
@@ -4683,7 +4668,7 @@ fn card_get(
         ));
     }
     let limit = keys::parse_page(value.get("limit"), 20)?;
-    let (items, next_after, next_scan_cursor, coverage, gaps) = contract_cards_for_term(
+    let page = contract_cards_for_term(
         db,
         &scope,
         &principal.client_id,
@@ -4697,11 +4682,11 @@ fn card_get(
     )?;
     Ok(json!({
         "contract_key":contract_key,
-        "items":items,
-        "next_after":next_after,
-        "next_scan_cursor":next_scan_cursor,
-        "coverage":coverage,
-        "gaps":gaps,
+        "items":page.items,
+        "next_after":page.next_after,
+        "next_scan_cursor":page.next_scan_cursor,
+        "coverage":page.coverage,
+        "gaps":page.gaps,
     }))
 }
 
@@ -4974,13 +4959,7 @@ fn contract_cards_for_term(
     limit: i64,
     cursor: IndexCursor<'_>,
     fields: Option<&Value>,
-) -> Result<(
-    Vec<Value>,
-    Option<String>,
-    Option<String>,
-    &'static str,
-    Value,
-)> {
+) -> Result<ContractCardsPage> {
     validate_identifier(contract_key, "contract_key", 256)?;
     let is_participant = scope.client_id.is_some();
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
@@ -5147,13 +5126,13 @@ fn contract_cards_for_term(
     if let Some(gap) = migration_gap {
         gaps.push(gap);
     }
-    Ok((
+    Ok(ContractCardsPage {
         items,
-        if partial { last } else { None },
+        next_after: if partial { last } else { None },
         next_scan_cursor,
-        if partial { "partial" } else { "complete" },
-        Value::Array(gaps),
-    ))
+        coverage: if partial { "partial" } else { "complete" },
+        gaps: Value::Array(gaps),
+    })
 }
 
 fn context_get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
