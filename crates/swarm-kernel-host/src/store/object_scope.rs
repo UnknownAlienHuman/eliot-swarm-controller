@@ -27,6 +27,11 @@ use crate::error::{Error, Result};
 use crate::model::{self, Principal, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, VecDeque},
+    mem::size_of,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 #[cfg(test)]
 #[path = "object_scope_review_tests.rs"]
@@ -40,7 +45,7 @@ mod scope_public_matrix_tests;
 /// `project_id`/`task_id` are always present so an unclaimed Task keeps a resolvable
 /// identity; revision, Attempt and binding pair refine it only when the retained
 /// object actually carries them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TaskGraphIdentity {
     pub(crate) project_id: String,
     pub(crate) task_id: String,
@@ -166,6 +171,34 @@ pub(crate) struct ArtifactReadGrant {
     pub(crate) basis: ArtifactReadBasis,
 }
 
+/// Database identity used to invalidate cached immutable assembly proofs.
+/// `total_changes` catches writes through the Store connection; `data_version`
+/// catches commits made through another connection to the same SQLite database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArtifactCacheEpoch {
+    connection_id: usize,
+    total_changes: u64,
+    data_version: i64,
+}
+
+impl ArtifactCacheEpoch {
+    pub(crate) fn token(self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.connection_id, self.total_changes, self.data_version
+        )
+    }
+}
+
+pub(crate) fn artifact_cache_epoch(db: &Connection) -> Result<ArtifactCacheEpoch> {
+    let data_version = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    Ok(ArtifactCacheEpoch {
+        connection_id: db as *const Connection as usize,
+        total_changes: db.total_changes(),
+        data_version,
+    })
+}
+
 /// One authorized artifact plus the grant that authorized it, handed downstream
 /// instead of reopening identity from an artifact id.
 #[derive(Debug, Clone)]
@@ -213,7 +246,211 @@ pub(crate) enum ArtifactDomainIdentity {
     Script,
     /// Every retained source page for a native result. An assembled artifact
     /// inherits all of these exact page identities; its assembler is not owner.
-    NativeResult(Vec<NativeResultSource>),
+    NativeResult(Arc<Vec<NativeResultSource>>),
+}
+
+const MAX_ASSEMBLY_READ_CACHE_ENTRIES: usize = 32;
+const MAX_ASSEMBLY_READ_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ASSEMBLY_READ_CACHE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssemblyReadCacheKey {
+    epoch: ArtifactCacheEpoch,
+    artifact_id: String,
+    relative_path: String,
+    byte_length: u64,
+    content_digest: String,
+    assembly_operation_id: String,
+}
+
+struct AssemblyReadCacheEntry {
+    key: AssemblyReadCacheKey,
+    record: Arc<ArtifactRecord>,
+    sources: Arc<Vec<NativeResultSource>>,
+    bytes: usize,
+}
+
+static ASSEMBLY_READ_CACHE: OnceLock<Mutex<VecDeque<AssemblyReadCacheEntry>>> = OnceLock::new();
+
+fn assembly_read_cache() -> &'static Mutex<VecDeque<AssemblyReadCacheEntry>> {
+    ASSEMBLY_READ_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn assembly_read_cache_key(
+    epoch: ArtifactCacheEpoch,
+    record: &ArtifactRecord,
+) -> Result<AssemblyReadCacheKey> {
+    let assembly_operation_id = bounded_text(&record.metadata, "assembly_operation_id")
+        .ok_or_else(|| identity_damaged("assembled result has no exact assembly Operation"))?;
+    Ok(AssemblyReadCacheKey {
+        epoch,
+        artifact_id: record.artifact_id.clone(),
+        relative_path: record.relative_path.clone(),
+        byte_length: record.byte_length,
+        content_digest: record.content_digest.clone(),
+        assembly_operation_id,
+    })
+}
+
+fn cached_assembly_sources(
+    epoch: ArtifactCacheEpoch,
+    record: &ArtifactRecord,
+) -> Result<Option<Arc<Vec<NativeResultSource>>>> {
+    let key = assembly_read_cache_key(epoch, record)?;
+    let Ok(mut cache) = assembly_read_cache().lock() else {
+        return Ok(None);
+    };
+    cache.retain(|entry| {
+        entry.key.epoch.connection_id != epoch.connection_id || entry.key.epoch == epoch
+    });
+    let Some(index) = cache.iter().position(|entry| entry.key == key) else {
+        return Ok(None);
+    };
+    let entry = cache.remove(index).expect("located cache entry");
+    let sources = Arc::clone(&entry.sources);
+    cache.push_back(entry);
+    Ok(Some(sources))
+}
+
+/// Return a parsed assembled ArtifactRecord only when its complete immutable
+/// source proof was validated in this unchanged database epoch.
+pub(crate) fn cached_assembled_artifact(
+    epoch: ArtifactCacheEpoch,
+    artifact_id: &str,
+) -> Option<Arc<ArtifactRecord>> {
+    let Ok(mut cache) = assembly_read_cache().lock() else {
+        return None;
+    };
+    cache.retain(|entry| {
+        entry.key.epoch.connection_id != epoch.connection_id || entry.key.epoch == epoch
+    });
+    let index = cache
+        .iter()
+        .position(|entry| entry.key.epoch == epoch && entry.key.artifact_id == artifact_id)?;
+    let entry = cache.remove(index)?;
+    let record = Arc::clone(&entry.record);
+    cache.push_back(entry);
+    Some(record)
+}
+
+fn estimated_source_proof_bytes(sources: &[NativeResultSource]) -> usize {
+    sources.iter().fold(
+        size_of::<Vec<NativeResultSource>>() + sources.len() * size_of::<NativeResultSource>(),
+        |total, source| {
+            total
+                .saturating_add(source.producer_operation_id.len())
+                .saturating_add(source.target_operation_id.len())
+                .saturating_add(source.task_identity.as_ref().map_or(0, |identity| {
+                    identity.project_id.len()
+                        + identity.task_id.len()
+                        + identity.attempt_id.as_deref().map_or(0, str::len)
+                        + identity.binding_id.as_deref().map_or(0, str::len)
+                }))
+        },
+    )
+}
+
+fn cache_assembly_sources(
+    epoch: ArtifactCacheEpoch,
+    record: &ArtifactRecord,
+    sources: Arc<Vec<NativeResultSource>>,
+) -> Result<()> {
+    let key = assembly_read_cache_key(epoch, record)?;
+    let key_bytes = key
+        .artifact_id
+        .len()
+        .saturating_add(key.relative_path.len())
+        .saturating_add(key.content_digest.len())
+        .saturating_add(key.assembly_operation_id.len());
+    let record_bytes = serde_json::to_vec(record)?.len();
+    let bytes = record_bytes
+        .saturating_add(key_bytes)
+        .saturating_add(estimated_source_proof_bytes(&sources));
+    if bytes > MAX_ASSEMBLY_READ_CACHE_ENTRY_BYTES {
+        return Ok(());
+    }
+    let mut cache = match assembly_read_cache().lock() {
+        Ok(cache) => cache,
+        Err(_) => return Ok(()),
+    };
+    cache.retain(|entry| {
+        (entry.key.epoch.connection_id != epoch.connection_id || entry.key.epoch == epoch)
+            && entry.key != key
+    });
+    let mut total_bytes = cache
+        .iter()
+        .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
+    while cache.len() >= MAX_ASSEMBLY_READ_CACHE_ENTRIES
+        || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_READ_CACHE_BYTES
+    {
+        let Some(removed) = cache.pop_front() else {
+            return Ok(());
+        };
+        total_bytes = total_bytes.saturating_sub(removed.bytes);
+    }
+    cache.push_back(AssemblyReadCacheEntry {
+        key,
+        record: Arc::new(record.clone()),
+        sources,
+        bytes,
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssemblySourceLoadCounts {
+    pub(crate) source_artifact_point_loads: u64,
+    pub(crate) producer_target_operation_point_loads: u64,
+    pub(crate) source_resolutions: u64,
+    pub(crate) immutable_proof_cache_hits: u64,
+    pub(crate) current_scope_grant_checks: u64,
+}
+
+#[cfg(test)]
+static ASSEMBLY_SOURCE_LOAD_COUNTS: OnceLock<Mutex<HashMap<String, AssemblySourceLoadCounts>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn reset_assembly_source_load_counts(artifact_id: &str) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        counts.insert(artifact_id.to_owned(), AssemblySourceLoadCounts::default());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assembly_source_load_counts(artifact_id: &str) -> AssemblySourceLoadCounts {
+    ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|counts| counts.get(artifact_id).copied())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn count_assembly_source_loads(
+    artifact_id: &str,
+    source_artifacts: u64,
+    producer_target_operations: u64,
+    source_resolutions: u64,
+    cache_hits: u64,
+    scope_grant_checks: u64,
+) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        let counts = counts.entry(artifact_id.to_owned()).or_default();
+        counts.source_artifact_point_loads += source_artifacts;
+        counts.producer_target_operation_point_loads += producer_target_operations;
+        counts.source_resolutions += source_resolutions;
+        counts.immutable_proof_cache_hits += cache_hits;
+        counts.current_scope_grant_checks += scope_grant_checks;
+    }
 }
 
 fn identity_damaged(message: &str) -> Error {
@@ -1194,6 +1431,7 @@ fn check_run_identity(db: &Connection, check_id: &str) -> Result<Option<TaskEvid
 pub(crate) fn artifact_domain_identity(
     db: &Connection,
     record: &ArtifactRecord,
+    epoch: ArtifactCacheEpoch,
 ) -> Result<ArtifactDomainIdentity> {
     match record.kind.as_str() {
         "task_submission" => {
@@ -1220,11 +1458,11 @@ pub(crate) fn artifact_domain_identity(
                 artifact_kind: record.kind.clone(),
             })
         }
-        "native_result_page" => Ok(ArtifactDomainIdentity::NativeResult(vec![
+        "native_result_page" => Ok(ArtifactDomainIdentity::NativeResult(Arc::new(vec![
             native_page_source(db, record)?,
-        ])),
+        ]))),
         "native_result" => Ok(ArtifactDomainIdentity::NativeResult(
-            assembled_result_sources(db, record)?,
+            assembled_result_sources(db, record, epoch)?,
         )),
         "script_bundle" | "script_result" | "script_output" => {
             // Script identity and historical scope are owned by the existing
@@ -1715,7 +1953,13 @@ fn native_page_source(db: &Connection, record: &ArtifactRecord) -> Result<Native
 fn assembled_result_sources(
     db: &Connection,
     record: &ArtifactRecord,
-) -> Result<Vec<NativeResultSource>> {
+    epoch: ArtifactCacheEpoch,
+) -> Result<Arc<Vec<NativeResultSource>>> {
+    if let Some(sources) = cached_assembly_sources(epoch, record)? {
+        #[cfg(test)]
+        count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 1, 0);
+        return Ok(sources);
+    }
     let operation_id = bounded_text(&record.metadata, "assembly_operation_id")
         .ok_or_else(|| identity_damaged("assembled result has no exact assembly Operation"))?;
     let operation = load_operation(db, &operation_id)?
@@ -1765,6 +2009,8 @@ fn assembled_result_sources(
                 "assembly part order differs from its retained request",
             ));
         }
+        #[cfg(test)]
+        count_assembly_source_loads(&record.artifact_id, 1, 0, 0, 0, 0);
         let page = match super::results::get(db, page_id) {
             Ok(page) => page,
             Err(error) if error.code == "NOT_FOUND" => {
@@ -1777,6 +2023,8 @@ fn assembled_result_sources(
                 "assembly source is not a native result page",
             ));
         }
+        #[cfg(test)]
+        count_assembly_source_loads(&record.artifact_id, 0, 2, 1, 0, 0);
         let source = native_page_source(db, &page)?;
         let identity = assembly_identity(&page)?;
         let comparison = identity_comparison_key(&identity);
@@ -1822,6 +2070,8 @@ fn assembled_result_sources(
             "assembled page manifest does not cover the retained result length",
         ));
     }
+    let sources = Arc::new(sources);
+    cache_assembly_sources(epoch, record, Arc::clone(&sources))?;
     Ok(sources)
 }
 
@@ -1921,20 +2171,31 @@ fn task_artifact_grant(
     )
 }
 
-fn native_source_grant(
+fn task_read_artifact_grant(
     db: &Connection,
     principal: &Principal,
-    source: &NativeResultSource,
+    identity: &TaskGraphIdentity,
     requested: ArtifactReadLevel,
 ) -> Result<Option<ArtifactReadGrant>> {
-    if let Some(identity) = source.task_identity.as_ref()
-        && let Some(grant) = resolve_task_read(db, principal, identity, TaskReadLevel::Evidence)?
-    {
+    if let Some(grant) = resolve_task_read(db, principal, identity, TaskReadLevel::Evidence)? {
         let basis = basis_for_task_grant(grant.basis);
         return Ok(Some(ArtifactReadGrant {
             level: artifact_level_for_relation(principal, requested, basis),
             basis,
         }));
+    }
+    Ok(None)
+}
+
+fn native_source_grant(
+    db: &Connection,
+    principal: &Principal,
+    source: &NativeResultSource,
+    task_grant: Option<ArtifactReadGrant>,
+    requested: ArtifactReadLevel,
+) -> Result<Option<ArtifactReadGrant>> {
+    if let Some(grant) = task_grant {
+        return Ok(Some(grant));
     }
     if let Some(grant) = exact_operation_artifact_grant(
         db,
@@ -1964,10 +2225,21 @@ pub(crate) fn resolve_artifact_read(
     record: &ArtifactRecord,
     requested: ArtifactReadLevel,
 ) -> Result<Option<ArtifactReadGrant>> {
+    let epoch = artifact_cache_epoch(db)?;
+    resolve_artifact_read_at_epoch(db, principal, record, requested, epoch)
+}
+
+pub(crate) fn resolve_artifact_read_at_epoch(
+    db: &Connection,
+    principal: &Principal,
+    record: &ArtifactRecord,
+    requested: ArtifactReadLevel,
+    epoch: ArtifactCacheEpoch,
+) -> Result<Option<ArtifactReadGrant>> {
     if principal.role == Role::Module {
         return Ok(None);
     }
-    match artifact_domain_identity(db, record)? {
+    match artifact_domain_identity(db, record, epoch)? {
         ArtifactDomainIdentity::Task {
             identity,
             producer_operation_id,
@@ -2002,8 +2274,27 @@ pub(crate) fn resolve_artifact_read(
             }
             let mut minimum = requested;
             let mut page_basis = None;
-            for source in &sources {
-                let Some(grant) = native_source_grant(db, principal, source, requested)? else {
+            let mut task_grants: HashMap<TaskGraphIdentity, Option<ArtifactReadGrant>> =
+                HashMap::new();
+            for source in sources.iter() {
+                let task_grant = if let Some(identity) = source.task_identity.as_ref() {
+                    if !task_grants.contains_key(identity) {
+                        #[cfg(test)]
+                        if record.kind == "native_result" {
+                            count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 0, 1);
+                        }
+                        task_grants.insert(
+                            identity.clone(),
+                            task_read_artifact_grant(db, principal, identity, requested)?,
+                        );
+                    }
+                    task_grants.get(identity).copied().flatten()
+                } else {
+                    None
+                };
+                let Some(grant) =
+                    native_source_grant(db, principal, source, task_grant, requested)?
+                else {
                     return Ok(None);
                 };
                 minimum = minimum.min(grant.level);
@@ -2039,6 +2330,7 @@ pub(crate) fn resolve_assembly_sources(
     if records.is_empty() {
         return Ok(None);
     }
+    let epoch = artifact_cache_epoch(db)?;
     let mut offset = 0u64;
     let mut total = None;
     let mut identity_key: Option<Value> = None;
@@ -2046,8 +2338,13 @@ pub(crate) fn resolve_assembly_sources(
         if record.kind != "native_result_page" {
             return Err(identity_damaged("assembly source is not a result page"));
         }
-        let Some(grant) =
-            resolve_artifact_read(db, principal, record, ArtifactReadLevel::Assemble)?
+        let Some(grant) = resolve_artifact_read_at_epoch(
+            db,
+            principal,
+            record,
+            ArtifactReadLevel::Assemble,
+            epoch,
+        )?
         else {
             return Ok(None);
         };

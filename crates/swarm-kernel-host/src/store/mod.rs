@@ -1969,6 +1969,9 @@ impl Store {
         if method == "artifact.read" {
             return self.read_artifact(principal, params).await;
         }
+        if method == "artifact.parts" {
+            return self.artifact_parts(principal, params).await;
+        }
         if method == "doctor.inspect" {
             // Read-only diagnostics over already recorded facts. The database
             // side runs on the DB thread like every read; the filesystem side
@@ -3199,7 +3202,7 @@ impl Store {
         if length == 0 || length > MAX_PAGE_BYTES as u64 {
             return Err(Error::invalid("length_bytes must be 1..65536"));
         }
-        let record = self
+        let (record, epoch) = self
             .run(move |db| {
                 let p = current_principal(db, principal)?;
                 if p.role == Role::Module {
@@ -3208,24 +3211,136 @@ impl Store {
                         "module cannot inspect other results",
                     ));
                 }
-                let artifact = results::get(db, &id)?;
-                let grant = object_scope::resolve_artifact_read(
+                let epoch = object_scope::artifact_cache_epoch(db)?;
+                let artifact = match object_scope::cached_assembled_artifact(epoch, &id) {
+                    Some(artifact) => artifact,
+                    None => Arc::new(results::get(db, &id)?),
+                };
+                let _grant = object_scope::resolve_artifact_read_at_epoch(
                     db,
                     &p,
                     &artifact,
                     object_scope::ArtifactReadLevel::Bytes,
+                    epoch,
                 )?
                 .ok_or_else(object_scope::unauthorized_artifact)?;
-                Ok(object_scope::AuthorizedArtifact {
-                    record: artifact,
-                    grant,
-                })
+                let after = object_scope::artifact_cache_epoch(db)?;
+                if after != epoch {
+                    return Err(Error::new(
+                        "ARTIFACT_DAMAGED",
+                        "artifact sources changed during range authorization",
+                    ));
+                }
+                Ok((artifact, epoch))
             })
             .await?;
         self.file_io(move |files| {
-            let mut response = files.read(&record.record, offset, length as usize)?;
-            response["metadata"] = results::project_metadata(&record.record);
+            let mut response = if record.kind == "native_result" {
+                files.read_assembled_at_epoch(
+                    &record,
+                    offset,
+                    length as usize,
+                    Some(&epoch.token()),
+                )?
+            } else {
+                files.read(&record, offset, length as usize)?
+            };
+            response["metadata"] = results::project_metadata(&record);
             Ok(response)
+        })
+        .await
+    }
+    async fn artifact_parts(&self, principal: Principal, params: Value) -> Result<Value> {
+        model::fields(&params, &["artifact_id", "after", "limit"])?;
+        let id = model::text(&params, "artifact_id")?.to_owned();
+        let (limit, after) = page(&params)?;
+        let after = usize::try_from(after)
+            .map_err(|_| Error::invalid("part offset exceeds platform range"))?;
+        self.run(move |db| {
+            let p = current_principal(db, principal)?;
+            let epoch = object_scope::artifact_cache_epoch(db)?;
+            let artifact = match object_scope::cached_assembled_artifact(epoch, &id) {
+                Some(artifact) => artifact,
+                None => Arc::new(results::get(db, &id)?),
+            };
+            if artifact.kind != "native_result" {
+                return Err(Error::invalid("artifact is not an assembled result"));
+            }
+            if object_scope::resolve_artifact_read_at_epoch(
+                db,
+                &p,
+                &artifact,
+                object_scope::ArtifactReadLevel::Metadata,
+                epoch,
+            )?
+            .is_none()
+            {
+                return Err(object_scope::unauthorized_artifact());
+            }
+            let list = artifact.metadata["parts"]
+                .as_array()
+                .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "missing segment manifest"))?;
+            if after > list.len() {
+                return Err(Error::invalid("part offset exceeds manifest"));
+            }
+            let end = list.len().min(after.saturating_add(limit as usize));
+            let mut visible_parts = Vec::with_capacity(end - after);
+            for part in &list[after..end] {
+                let page_id = part
+                    .get("artifact_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new("ARTIFACT_DAMAGED", "part has no artifact reference")
+                    })?;
+                let offset_bytes = part
+                    .get("offset_bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part offset is malformed"))?;
+                let byte_length = part
+                    .get("byte_length")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part length is malformed"))?;
+                let sha256 = part
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part digest is malformed"))?;
+                let page = results::get(db, page_id)?;
+                if page.kind != "native_result_page" {
+                    return Err(Error::new(
+                        "ARTIFACT_DAMAGED",
+                        "assembled part is not a native result page",
+                    ));
+                }
+                if object_scope::resolve_artifact_read_at_epoch(
+                    db,
+                    &p,
+                    &page,
+                    object_scope::ArtifactReadLevel::Bytes,
+                    epoch,
+                )?
+                .is_none()
+                {
+                    return Err(object_scope::unauthorized_artifact());
+                }
+                visible_parts.push(json!({
+                    "artifact_ref":page_id,
+                    "offset_bytes":offset_bytes,
+                    "byte_length":byte_length,
+                    "sha256":sha256,
+                }));
+            }
+            if object_scope::artifact_cache_epoch(db)? != epoch {
+                return Err(Error::new(
+                    "ARTIFACT_DAMAGED",
+                    "artifact sources changed during parts authorization",
+                ));
+            }
+            Ok(json!({
+                "artifact_id":artifact.artifact_id,
+                "parts":visible_parts,
+                "part_count":list.len(),
+                "next_after":if end < list.len() { Some(end) } else { None },
+            }))
         })
         .await
     }

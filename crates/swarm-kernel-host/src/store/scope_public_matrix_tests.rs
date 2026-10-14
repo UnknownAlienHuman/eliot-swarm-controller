@@ -17,7 +17,8 @@
 use super::super::{SCHEMA, SCRIPT_SCHEMA, WORKSPACE_SCHEMA, set_meta};
 use super::{
     ArtifactReadBasis, ArtifactReadLevel, OperationReadBasis, OperationReadLevel,
-    TaskGraphIdentity, TaskReadBasis, TaskReadLevel, identity_for_attempt, resolve_artifact_read,
+    TaskGraphIdentity, TaskReadBasis, TaskReadLevel, assembly_source_load_counts,
+    identity_for_attempt, reset_assembly_source_load_counts, resolve_artifact_read,
     resolve_assembly_sources, resolve_operation_read, resolve_task_read,
 };
 use crate::{
@@ -1723,6 +1724,115 @@ mod connected_store {
         )
     }
 
+    struct ReadCostPagesSetup {
+        fixture: Fixture,
+        payload: Vec<u8>,
+        page_refs: Vec<String>,
+    }
+
+    async fn setup_read_cost_pages(page_count: usize) -> ReadCostPagesSetup {
+        assert!(page_count >= 2);
+        let fixture = start().await;
+        let descriptor = fixture_descriptor();
+        let (binding, module) = open_fixture_module(&fixture, &descriptor).await;
+        let target =
+            dispatch_fixture(&fixture, &descriptor, &binding, &module, "range-read-cost").await;
+        let page_bytes = crate::artifacts::MAX_PAGE_BYTES;
+        let payload = vec![b'r'; page_count * page_bytes];
+        let mut page_refs = Vec::with_capacity(page_count);
+        for index in 0..page_count {
+            let start = index * page_bytes;
+            page_refs.push(
+                publish_page(
+                    &fixture,
+                    &descriptor,
+                    &binding,
+                    &module,
+                    &target,
+                    &payload,
+                    start..start + page_bytes,
+                )
+                .await,
+            );
+        }
+        ReadCostPagesSetup {
+            fixture,
+            payload,
+            page_refs,
+        }
+    }
+
+    async fn measure_repeated_assembled_ranges(page_count: usize) -> (u64, u64, u64, u64) {
+        let setup = setup_read_cost_pages(page_count).await;
+        let store = &setup.fixture.owner.store;
+        let assembly = write(
+            store,
+            &setup.fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs":setup.page_refs.clone(),
+                "expected_sha256":model::digest(&setup.payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        reset_assembly_source_load_counts(&assembled_id);
+        let first = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(first["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        let warm = assembly_source_load_counts(&assembled_id);
+        assert_eq!(warm.source_artifact_point_loads, page_count as u64);
+        assert_eq!(
+            warm.producer_target_operation_point_loads,
+            (page_count * 2) as u64
+        );
+        assert_eq!(warm.source_resolutions, page_count as u64);
+        assert_eq!(warm.immutable_proof_cache_hits, 0);
+        assert_eq!(warm.current_scope_grant_checks, 1);
+
+        reset_assembly_source_load_counts(&assembled_id);
+        for _ in 0..64 {
+            let read = call(
+                store,
+                &setup.fixture.manager_a,
+                "artifact.read",
+                json!({
+                    "artifact_id":assembled_id,
+                    "offset_bytes":0,
+                    "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+                }),
+            )
+            .await;
+            assert_eq!(read["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+            assert_eq!(read["eof"], false);
+        }
+        let repeated = assembly_source_load_counts(&assembled_id);
+        assert_eq!(repeated.source_artifact_point_loads, 0);
+        assert_eq!(repeated.producer_target_operation_point_loads, 0);
+        assert_eq!(repeated.source_resolutions, 0);
+        assert_eq!(repeated.immutable_proof_cache_hits, 64);
+        assert_eq!(repeated.current_scope_grant_checks, 64);
+        setup.fixture.close().await;
+        (
+            warm.source_artifact_point_loads,
+            warm.producer_target_operation_point_loads,
+            repeated.source_artifact_point_loads + repeated.producer_target_operation_point_loads,
+            repeated.current_scope_grant_checks,
+        )
+    }
+
     #[tokio::test]
     async fn store_authenticated_result_pages_grants_and_denied_assemblies() {
         let setup = setup_result_pages().await;
@@ -1925,6 +2035,14 @@ mod connected_store {
         assert_eq!(prefix["eof"], false);
         assert_eq!(prefix["byte_length"], PAGES_SPLIT);
         setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_assembled_range_reads_reuse_bounded_source_proof() {
+        let small = measure_repeated_assembled_ranges(2).await;
+        let large = measure_repeated_assembled_ranges(32).await;
+        assert_eq!(small, (2, 4, 0, 64));
+        assert_eq!(large, (32, 64, 0, 64));
     }
 
     #[tokio::test]

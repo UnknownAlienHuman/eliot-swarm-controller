@@ -10,8 +10,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    mem::size_of,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +60,147 @@ pub struct ResultPart {
     pub offset_bytes: u64,
     pub byte_length: u64,
     pub sha256: String,
+}
+
+const MAX_ASSEMBLY_PART_CACHE_ENTRIES: usize = 32;
+const MAX_ASSEMBLY_PART_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssemblyPartCacheKey {
+    cache_epoch: String,
+    artifact_id: String,
+    relative_path: String,
+    byte_length: u64,
+    content_digest: String,
+    part_count: u64,
+}
+
+struct AssemblyPartCacheEntry {
+    key: AssemblyPartCacheKey,
+    parts: Arc<Vec<ResultPart>>,
+    bytes: usize,
+}
+
+static ASSEMBLY_PART_CACHE: OnceLock<Mutex<VecDeque<AssemblyPartCacheEntry>>> = OnceLock::new();
+
+fn assembly_part_cache() -> &'static Mutex<VecDeque<AssemblyPartCacheEntry>> {
+    ASSEMBLY_PART_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn assembly_part_cache_key(
+    record: &ArtifactRecord,
+    cache_epoch: &str,
+) -> Result<AssemblyPartCacheKey> {
+    let part_count = record.metadata["part_count"]
+        .as_u64()
+        .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part count is missing"))?;
+    Ok(AssemblyPartCacheKey {
+        cache_epoch: cache_epoch.to_owned(),
+        artifact_id: record.artifact_id.clone(),
+        relative_path: record.relative_path.clone(),
+        byte_length: record.byte_length,
+        content_digest: record.content_digest.clone(),
+        part_count,
+    })
+}
+
+fn cached_assembly_parts(
+    record: &ArtifactRecord,
+    cache_epoch: Option<&str>,
+) -> Result<Arc<Vec<ResultPart>>> {
+    let expected_part_count = record.metadata["part_count"]
+        .as_u64()
+        .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part count is missing"))?;
+    let cache_key = cache_epoch
+        .map(|epoch| assembly_part_cache_key(record, epoch))
+        .transpose()?;
+    if let Some(key) = cache_key.as_ref()
+        && let Ok(mut cache) = assembly_part_cache().lock()
+    {
+        cache.retain(|entry| {
+            entry.key.artifact_id != key.artifact_id || entry.key.cache_epoch == key.cache_epoch
+        });
+        if let Some(index) = cache.iter().position(|entry| &entry.key == key) {
+            let entry = cache.remove(index).expect("located cache entry");
+            let parts = Arc::clone(&entry.parts);
+            cache.push_back(entry);
+            return Ok(parts);
+        }
+    }
+
+    let parts: Vec<ResultPart> = serde_json::from_value(record.metadata["parts"].clone())?;
+    if parts.is_empty()
+        || expected_part_count != parts.len() as u64
+        || key
+            .as_ref()
+            .is_some_and(|key| key.part_count != parts.len() as u64)
+        || record.metadata["sha256"] != record.content_digest
+    {
+        return Err(Error::new(
+            "ARTIFACT_DAMAGED",
+            "assembly manifest does not cover stored content",
+        ));
+    }
+    let mut end = 0u64;
+    for part in &parts {
+        if part.offset_bytes != end
+            || part.byte_length > MAX_PAGE_BYTES as u64
+            || (part.byte_length == 0 && !(parts.len() == 1 && record.byte_length == 0))
+        {
+            return Err(Error::new(
+                "ARTIFACT_DAMAGED",
+                "invalid assembly segment manifest",
+            ));
+        }
+        end = end
+            .checked_add(part.byte_length)
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "segment overflow"))?;
+    }
+    if end != record.byte_length {
+        return Err(Error::new(
+            "ARTIFACT_DAMAGED",
+            "assembly manifest does not cover stored content",
+        ));
+    }
+    let parts = Arc::new(parts);
+    if let Some(key) = cache_key {
+        let bytes = parts.iter().fold(
+            size_of::<Vec<ResultPart>>() + parts.len() * size_of::<ResultPart>(),
+            |total, part| {
+                total
+                    .saturating_add(part.artifact_ref.len())
+                    .saturating_add(part.sha256.len())
+            },
+        );
+        let bytes = bytes
+            .saturating_add(key.cache_epoch.len())
+            .saturating_add(key.artifact_id.len())
+            .saturating_add(key.relative_path.len())
+            .saturating_add(key.content_digest.len());
+        if bytes <= MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES
+            && let Ok(mut cache) = assembly_part_cache().lock()
+        {
+            cache.retain(|entry| entry.key.artifact_id != key.artifact_id);
+            let mut total_bytes = cache
+                .iter()
+                .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
+            while cache.len() >= MAX_ASSEMBLY_PART_CACHE_ENTRIES
+                || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_PART_CACHE_BYTES
+            {
+                let Some(removed) = cache.pop_front() else {
+                    return Ok(parts);
+                };
+                total_bytes = total_bytes.saturating_sub(removed.bytes);
+            }
+            cache.push_back(AssemblyPartCacheEntry {
+                key,
+                parts: Arc::clone(&parts),
+                bytes,
+            });
+        }
+    }
+    Ok(parts)
 }
 
 fn number(value: &Value, key: &str) -> Result<u64> {
@@ -356,26 +500,23 @@ impl ArtifactFiles {
         offset: u64,
         length: usize,
     ) -> Result<Value> {
-        let parts: Vec<ResultPart> = serde_json::from_value(record.metadata["parts"].clone())?;
-        let mut end = 0u64;
-        for part in &parts {
-            if part.offset_bytes != end
-                || part.byte_length > MAX_PAGE_BYTES as u64
-                || (part.byte_length == 0 && !(parts.len() == 1 && record.byte_length == 0))
-            {
-                return Err(Error::new(
-                    "ARTIFACT_DAMAGED",
-                    "invalid assembly segment manifest",
-                ));
-            }
-            end = end
-                .checked_add(part.byte_length)
-                .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "segment overflow"))?;
+        self.read_assembled_at_epoch(record, offset, length, None)
+    }
+
+    pub(crate) fn read_assembled_at_epoch(
+        &self,
+        record: &ArtifactRecord,
+        offset: u64,
+        length: usize,
+        cache_epoch: Option<&str>,
+    ) -> Result<Value> {
+        if length == 0 || length > MAX_PAGE_BYTES || offset > record.byte_length {
+            return Err(Error::invalid(
+                "artifact range is outside the retained content",
+            ));
         }
-        if parts.is_empty()
-            || end != record.byte_length
-            || record.metadata["sha256"] != record.content_digest
-        {
+        let parts = cached_assembly_parts(record, cache_epoch)?;
+        if record.metadata["sha256"] != record.content_digest {
             return Err(Error::new(
                 "ARTIFACT_DAMAGED",
                 "assembly manifest does not cover stored content",
@@ -386,9 +527,14 @@ impl ArtifactFiles {
         let mut bytes = Vec::with_capacity(length);
         // Verify only touched segments against their committed hashes. Sequential
         // export rehashes each content segment once, not the whole file per range.
-        for part in &parts {
+        let first_touched =
+            parts.partition_point(|part| part.offset_bytes + part.byte_length <= offset);
+        for part in &parts[first_touched..] {
             let end = part.offset_bytes + part.byte_length;
-            if end <= offset || part.offset_bytes >= requested_end {
+            if part.offset_bytes >= requested_end {
+                break;
+            }
+            if end <= offset {
                 continue;
             }
             file.seek(SeekFrom::Start(part.offset_bytes))?;
