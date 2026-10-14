@@ -1278,20 +1278,20 @@ fn bucket_condition_source_is_current(
     ) else {
         return Ok(false);
     };
-    let raw: Option<(String, String)> = db
+    let raw: Option<String> = db
         .query_row(
-            "SELECT state_json,bridge_boot_id FROM bindings WHERE binding_id=?1 AND generation=?2",
+            "SELECT state_json FROM bindings WHERE binding_id=?1 AND generation=?2",
             params![binding_id, generation],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
-    let Some((state_json, bridge_boot_id)) = raw else {
+    let Some(state_json) = raw else {
         return Ok(false);
     };
-    if bridge_boot_id != retained.source_epoch {
+    let state: Value = serde_json::from_str(&state_json)?;
+    if state["bridge_boot_id"].as_str() != Some(retained.source_epoch.as_str()) {
         return Ok(false);
     }
-    let state: Value = serde_json::from_str(&state_json)?;
     if state["native_usage"]["boot_id"] != retained.source_epoch {
         return Ok(false);
     }
