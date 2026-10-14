@@ -4213,6 +4213,7 @@ mod tests {
         directory: PathBuf,
         owner: StoreOwner,
         principal: Principal,
+        writer: Principal,
         config: Arc<Config>,
     }
 
@@ -4248,10 +4249,28 @@ mod tests {
             .await
             .unwrap();
         let principal = owner.store.authenticate(credential).await.unwrap();
+        let writer = Principal {
+            link_id: model::new_id(),
+            client_id: "cache-writer".into(),
+            role: Role::Manager,
+        };
+        let writer_id = writer.client_id.clone();
+        owner
+            .store
+            .run(move |db| {
+                super::set_meta(
+                    db,
+                    &format!("client:{writer_id}"),
+                    &json!({"role":Role::Manager,"disabled":false}),
+                )
+            })
+            .await
+            .unwrap();
         Fixture {
             directory,
             owner,
             principal,
+            writer,
             config,
         }
     }
@@ -4295,6 +4314,63 @@ mod tests {
                     "client_request_id":model::new_id(),
                     "task_id":task_id,
                     "expected_revision":1,
+                }),
+            )
+            .await
+            .unwrap();
+        let attempt_id = claim["attempt_id"].as_str().unwrap().to_owned();
+        (task_id, attempt_id)
+    }
+
+    async fn create_acceptance_attempt(
+        fixture: &Fixture,
+        project_id: &str,
+        profile_revision: Option<&str>,
+        baseline_candidate_ref: Option<&str>,
+    ) -> (String, String) {
+        let check_profiles = profile_revision
+            .map(|revision| json!([{"profile_id":"strict","profile_revision":revision}]))
+            .unwrap_or_else(|| json!([]));
+        let mut spec = json!({
+            "acceptance":{"schema_id":"swarm.acceptance_policy","schema_version":2},
+            "objective":"Exercise verified CheckRunner admission",
+            "phase":"verification",
+            "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
+            "requirements":[{
+                "id":"R1",
+                "statement":"Preserve source identity and process evidence",
+                "verification":{"review_required":true,"check_profiles":check_profiles},
+            }],
+        });
+        if let Some(reference) = baseline_candidate_ref {
+            spec["baseline_candidate_ref"] = json!(reference);
+        }
+        let task = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.create".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "project_id":project_id,
+                    "spec":spec,
+                }),
+            )
+            .await
+            .unwrap();
+        let task_id = task["task_id"].as_str().unwrap().to_owned();
+        let claim = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.claim".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "task_id":task_id,
+                    "expected_revision":1,
+                    "owner_id":fixture.writer.client_id.clone(),
                 }),
             )
             .await
@@ -4353,92 +4429,154 @@ mod tests {
         record
     }
 
-    async fn accept_source(
+    async fn submit_candidate(
         fixture: &Fixture,
-        task_id: &str,
         attempt_id: &str,
         candidate: &ArtifactRecord,
-    ) -> String {
-        let acceptance_id = model::new_id();
-        let submission_doc = json!({
-            "version":1,
-            "task_id":task_id,
-            "attempt_id":attempt_id,
-            "task_revision":1,
-            "candidate_ref":candidate.artifact_id,
-            "candidate_sha256":candidate.content_digest,
-            "candidate_byte_length":candidate.byte_length,
-        });
-        let (submission, bytes) =
-            ArtifactFiles::submission(&acceptance_id, &submission_doc).unwrap();
-        ArtifactFiles::new(&fixture.directory)
-            .unwrap()
-            .publish(&submission, &bytes)
-            .unwrap();
-        let acceptance_operation = acceptance_id.clone();
-        let task = task_id.to_owned();
-        let attempt = attempt_id.to_owned();
-        let candidate_ref = candidate.artifact_id.clone();
-        let candidate_digest = candidate.content_digest.clone();
-        let submission_ref = submission.artifact_id.clone();
-        let reviewer = fixture.principal.client_id.clone();
-        fixture
+    ) -> (String, i64, String) {
+        let submitted = fixture
             .owner
             .store
-            .run(move |db| {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                artifact(&tx, &submission)?;
-                let now = model::now_ms()?;
-                let result = json!({
-                    "operation_id":acceptance_operation,
-                    "acceptance_operation_id":acceptance_operation,
-                    "outcome":"applied",
-                    "task_id":task,
-                    "attempt_id":attempt,
-                    "task_revision":1,
-                    "phase":"verification",
-                    "submission_ref":submission_ref,
-                    "candidate_ref":candidate_ref,
-                    "reviewer_id":reviewer,
-                    "source_checkout_verified":true,
-                    "task_accepted":true,
-                });
-                tx.execute(
-                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.accept','{}','{}',?4,?5,'settled',?6,?7,?7,?7,?7)",
-                    params![acceptance_operation, reviewer, format!("accept-{acceptance_operation}"), task, attempt, model::canonical(&result)?, now],
-                )?;
-                tx.execute(
-                    "UPDATE attempts SET state='accepted',submission_ref=?2,candidate_ref=?3,updated_at_ms=?4 WHERE attempt_id=?1",
-                    params![attempt, submission_ref, candidate_ref, now],
-                )?;
-                tx.execute(
-                    "UPDATE tasks SET state='accepted',accepted_attempt_id=?2,accepted_operation_id=?3,accepted_revision=1,accepted_phase='verification',accepted_candidate_ref=?4,updated_at_ms=?5 WHERE task_id=?1",
-                    params![task, attempt, acceptance_operation, candidate_ref, now],
-                )?;
-                let stored: String = tx.query_row(
-                    "SELECT content_digest FROM artifacts WHERE artifact_id=?1",
-                    [&candidate_ref],
-                    |row| row.get(0),
-                )?;
-                if stored != candidate_digest {
-                    return Err(Error::conflict("accepted candidate digest changed in fixture"));
-                }
-                tx.commit()?;
-                Ok(acceptance_operation)
-            })
+            .call(
+                fixture.writer.clone(),
+                "task.submit".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "attempt_id":attempt_id,
+                    "expected_revision":1,
+                    "expected_submission_ref":null,
+                    "candidate_ref":candidate.artifact_id,
+                    "summary":"Submit the exact retained source candidate.",
+                    "claims":[],
+                }),
+            )
             .await
+            .unwrap();
+        let submission_operation_id = submitted["operation_id"].as_str().unwrap().to_owned();
+        let submit_operation = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "operation.get".into(),
+                json!({"operation_id":submission_operation_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_operation["result"]["outcome"], "applied");
+        let submission_ref = submit_operation["result"]["submission_ref"]
+            .as_str()
             .unwrap()
+            .to_owned();
+        let submission = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.submission".into(),
+                json!({"submission_ref":submission_ref}),
+            )
+            .await
+            .unwrap();
+        let feedback_cursor = submission["latest_feedback_observation_id"]
+            .as_i64()
+            .unwrap();
+        (submission_ref, feedback_cursor, submission_operation_id)
     }
 
-    async fn invalidate_acceptance(fixture: &Fixture, operation_id: &str) {
+    fn acceptance_request(
+        attempt_id: &str,
+        submission_ref: &str,
+        candidate_ref: &str,
+        feedback_cursor: i64,
+        check_ids: &[String],
+    ) -> Value {
+        json!({
+            "client_request_id":model::new_id(),
+            "attempt_id":attempt_id,
+            "expected_revision":1,
+            "submission_ref":submission_ref,
+            "candidate_ref":candidate_ref,
+            "expected_feedback_observation_id":feedback_cursor,
+            "reason":"The frozen requirement evidence supports this exact candidate.",
+            "reviews":[{
+                "requirement_id":"R1",
+                "rationale":"The retained candidate addresses R1.",
+                "evidence":[candidate_ref],
+            }],
+            "check_ids":check_ids,
+        })
+    }
+
+    async fn accept_source(
+        fixture: &Fixture,
+        attempt_id: &str,
+        candidate: &ArtifactRecord,
+        check_ids: &[String],
+    ) -> String {
+        let (submission_ref, feedback_cursor, _) =
+            submit_candidate(fixture, attempt_id, candidate).await;
+        let receipt = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.accept".into(),
+                acceptance_request(
+                    attempt_id,
+                    &submission_ref,
+                    &candidate.artifact_id,
+                    feedback_cursor,
+                    check_ids,
+                ),
+            )
+            .await
+            .unwrap();
+        let acceptance_operation_id = receipt["operation_id"].as_str().unwrap().to_owned();
+        let acceptance = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "operation.get".into(),
+                json!({"operation_id":acceptance_operation_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            acceptance["result"]["outcome"], "applied",
+            "public task.accept result: {acceptance}"
+        );
+        acceptance_operation_id
+    }
+
+    async fn set_check_operation_id(fixture: &Fixture, check_id: &str, operation_id: &str) {
+        let check_id = check_id.to_owned();
         let operation_id = operation_id.to_owned();
         fixture
             .owner
             .store
             .run(move |db| {
                 db.execute(
-                    "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:acceptance',?1,?2,'task.acceptance_invalidated','{}',?3)",
-                    params![format!("invalidate:{operation_id}"), operation_id, model::now_ms()?],
+                    "UPDATE check_runs SET operation_id=?2 WHERE check_id=?1",
+                    params![check_id, operation_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn set_cached_from(fixture: &Fixture, check_id: &str, source_check_id: &str) {
+        let check_id = check_id.to_owned();
+        let source_check_id = source_check_id.to_owned();
+        fixture
+            .owner
+            .store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE check_runs SET cached_from_check_id=?2 WHERE check_id=?1",
+                    params![check_id, source_check_id],
                 )?;
                 Ok(())
             })
@@ -4815,12 +4953,17 @@ mod tests {
         let fixture = fixture().await;
         let content = b"same captured source for every cache admission";
 
-        let (origin_task, origin_attempt) = create_attempt(&fixture, "cache-project", None).await;
+        let (origin_task, origin_attempt) =
+            create_acceptance_attempt(&fixture, "cache-project", Some("v1"), None).await;
         let origin_source = source_snapshot(&fixture, &origin_task, &origin_attempt, content).await;
         let original = admit_check(&fixture, &origin_attempt, &origin_source, "v1").await;
         assert_eq!(original["state"], "queued");
         let original_check = original["check_id"].as_str().unwrap().to_owned();
         let original_operation = original["operation_id"].as_str().unwrap().to_owned();
+        assert_ne!(
+            original_check, original_operation,
+            "CheckRunID and OperationID are separate identities"
+        );
         run_check_process(&fixture, &original_check).await;
         let original_status = fixture
             .owner
@@ -4834,15 +4977,26 @@ mod tests {
             .unwrap();
         assert_eq!(original_status["operation_id"], original_operation);
         assert_eq!(original_status["state"], "passed");
-        let origin_acceptance =
-            accept_source(&fixture, &origin_task, &origin_attempt, &origin_source).await;
+        let origin_acceptance = accept_source(
+            &fixture,
+            &origin_attempt,
+            &origin_source,
+            std::slice::from_ref(&original_check),
+        )
+        .await;
 
-        let (cached_task, cached_attempt) = create_attempt(&fixture, "cache-project", None).await;
+        let (cached_task, cached_attempt) =
+            create_acceptance_attempt(&fixture, "cache-project", Some("v1"), None).await;
         let cached_source = source_snapshot(&fixture, &cached_task, &cached_attempt, content).await;
         let cached = admit_check(&fixture, &cached_attempt, &cached_source, "v1").await;
         assert_eq!(cached["cached"], true);
         assert_eq!(cached["cached_from_check_id"], original_check);
         let cached_check = cached["check_id"].as_str().unwrap().to_owned();
+        let cached_operation = cached["operation_id"].as_str().unwrap().to_owned();
+        assert_ne!(
+            cached_check, cached_operation,
+            "cached CheckRunID and OperationID are separate identities"
+        );
         let cached_status = fixture
             .owner
             .store
@@ -4859,11 +5013,137 @@ mod tests {
         assert!(cached_status["resource_claimed_at_ms"].is_null());
         assert!(cached_status["resource_released_at_ms"].is_null());
 
-        // A passing cached row cannot itself become a cache origin, even when
-        // its candidate is later accepted and the first origin is invalidated.
-        let _cached_acceptance =
-            accept_source(&fixture, &cached_task, &cached_attempt, &cached_source).await;
-        invalidate_acceptance(&fixture, &origin_acceptance).await;
+        let (cached_submission, cached_feedback_cursor, _) =
+            submit_candidate(&fixture, &cached_attempt, &cached_source).await;
+        let cached_acceptance_receipt = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.accept".into(),
+                acceptance_request(
+                    &cached_attempt,
+                    &cached_submission,
+                    &cached_source.artifact_id,
+                    cached_feedback_cursor,
+                    std::slice::from_ref(&cached_check),
+                ),
+            )
+            .await
+            .unwrap();
+        let cached_acceptance_id = cached_acceptance_receipt["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let cached_acceptance = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "operation.get".into(),
+                json!({"operation_id":cached_acceptance_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_acceptance["result"]["outcome"], "applied",
+            "real task.accept must consume the legitimate cache hit: {cached_acceptance}"
+        );
+        assert_eq!(
+            cached_acceptance["result"]["check_ids"],
+            json!([cached_check])
+        );
+
+        let (refusal_task, refusal_attempt) =
+            create_acceptance_attempt(&fixture, "cache-project", Some("v1"), None).await;
+        let refusal_source =
+            source_snapshot(&fixture, &refusal_task, &refusal_attempt, content).await;
+        let refusal_admission =
+            admit_check(&fixture, &refusal_attempt, &refusal_source, "v1").await;
+        assert_eq!(refusal_admission["cached"], true);
+        let refusal_check = refusal_admission["check_id"].as_str().unwrap().to_owned();
+        let (refusal_submission, refusal_feedback_cursor, refusal_submit_operation) =
+            submit_candidate(&fixture, &refusal_attempt, &refusal_source).await;
+
+        // The schema requires a retained Operation reference. Pointing the
+        // source CheckRun at a different, existing task.submit Operation is a
+        // mismatched source Operation and must not consume the cached run.
+        set_check_operation_id(&fixture, &original_check, &refusal_submit_operation).await;
+        let mismatched_source_operation = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.accept".into(),
+                acceptance_request(
+                    &refusal_attempt,
+                    &refusal_submission,
+                    &refusal_source.artifact_id,
+                    refusal_feedback_cursor,
+                    std::slice::from_ref(&refusal_check),
+                ),
+            )
+            .await
+            .expect_err("cached acceptance rejects a source CheckRun/Operation mismatch");
+        assert_eq!(mismatched_source_operation.code, "CHECK_NOT_READY");
+        set_check_operation_id(&fixture, &original_check, &original_operation).await;
+
+        // A cache hit whose source is another cache row would form a chain;
+        // acceptance must continue to require the direct original process.
+        set_cached_from(&fixture, &refusal_check, &cached_check).await;
+        let chained_cache = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.accept".into(),
+                acceptance_request(
+                    &refusal_attempt,
+                    &refusal_submission,
+                    &refusal_source.artifact_id,
+                    refusal_feedback_cursor,
+                    std::slice::from_ref(&refusal_check),
+                ),
+            )
+            .await
+            .expect_err("cached acceptance rejects a chained cache source");
+        assert_eq!(chained_cache.code, "CHECK_NOT_READY");
+        set_cached_from(&fixture, &refusal_check, &original_check).await;
+
+        let invalidated = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.invalidate_acceptance".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "acceptance_operation_id":origin_acceptance,
+                    "reason":"Revoke the source acceptance used to authorize cache reuse.",
+                    "evidence":[original_check],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalidated["invalidated"], true);
+        let revoked_source = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.accept".into(),
+                acceptance_request(
+                    &refusal_attempt,
+                    &refusal_submission,
+                    &refusal_source.artifact_id,
+                    refusal_feedback_cursor,
+                    std::slice::from_ref(&refusal_check),
+                ),
+            )
+            .await
+            .expect_err("cached acceptance rejects a revoked source acceptance");
+        assert_eq!(revoked_source.code, "CHECK_NOT_READY");
+
         let (chain_task, chain_attempt) = create_attempt(&fixture, "cache-project", None).await;
         let chain_source = source_snapshot(&fixture, &chain_task, &chain_attempt, content).await;
         let after_invalidation = admit_check(&fixture, &chain_attempt, &chain_source, "v1").await;
@@ -4880,7 +5160,7 @@ mod tests {
         // process-passed origin is verified separately below; deleting one
         // output and tampering with another must turn that candidate into a miss.
         let (second_origin_task, second_origin_attempt) =
-            create_attempt(&fixture, "cache-project", None).await;
+            create_acceptance_attempt(&fixture, "cache-project", Some("v2"), None).await;
         let second_origin_source = source_snapshot(
             &fixture,
             &second_origin_task,
@@ -4898,12 +5178,13 @@ mod tests {
         assert_eq!(second_original["state"], "queued");
         let second_check = second_original["check_id"].as_str().unwrap().to_owned();
         let second_operation = second_original["operation_id"].as_str().unwrap().to_owned();
+        assert_ne!(second_check, second_operation);
         run_check_process(&fixture, &second_check).await;
         let _second_acceptance = accept_source(
             &fixture,
-            &second_origin_task,
             &second_origin_attempt,
             &second_origin_source,
+            std::slice::from_ref(&second_check),
         )
         .await;
         let outputs = output_paths(&fixture, &second_operation).await;
@@ -5009,7 +5290,7 @@ mod tests {
     async fn accepted_baseline_is_frozen_consumed_and_revocation_stales_admission() {
         let fixture = fixture().await;
         let (baseline_task, baseline_attempt) =
-            create_attempt(&fixture, "baseline-project", None).await;
+            create_acceptance_attempt(&fixture, "baseline-project", None, None).await;
         let baseline_source = source_snapshot(
             &fixture,
             &baseline_task,
@@ -5025,13 +5306,8 @@ mod tests {
         .unwrap()
         .content_sha256;
         assert_ne!(baseline_content_sha256, baseline_source.content_digest);
-        let baseline_acceptance = accept_source(
-            &fixture,
-            &baseline_task,
-            &baseline_attempt,
-            &baseline_source,
-        )
-        .await;
+        let baseline_acceptance =
+            accept_source(&fixture, &baseline_attempt, &baseline_source, &[]).await;
 
         let (target_task, target_attempt) = create_attempt(
             &fixture,
@@ -5160,7 +5436,22 @@ mod tests {
             stale_resolution.result.as_ref().unwrap().resolved_inputs["baseline_content_sha256"],
             baseline_content_sha256
         );
-        invalidate_acceptance(&fixture, &baseline_acceptance).await;
+        let invalidated = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.invalidate_acceptance".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "acceptance_operation_id":baseline_acceptance,
+                    "reason":"Revoke the accepted baseline before stale admission.",
+                    "evidence":[baseline_source.artifact_id],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalidated["invalidated"], true);
         let config = fixture.config.clone();
         let principal = fixture.principal.clone();
         let error = fixture

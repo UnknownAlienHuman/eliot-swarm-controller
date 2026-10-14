@@ -420,15 +420,15 @@ fn evidence(
             // Input identity is stable across Tasks/Attempts, so the full spec
             // JSON is intentionally not required to match.
             let source = model::text(&c, "cached_from")?;
-            let source_row: Option<(String, String, String, Option<String>)> = db
+            let source_row: Option<(String, String, String, Option<String>, String)> = db
                 .query_row(
-                    "SELECT s.candidate_ref,s.spec_json,s.coverage_json,s.process_identity_json FROM check_runs s JOIN check_runs c ON c.check_id=?1 WHERE s.check_id=?2 AND s.cached_from_check_id IS NULL AND s.state='passed' AND s.exit_code=0 AND s.resource_released_at_ms IS NOT NULL AND s.cache_key=c.cache_key AND s.result_ref=c.result_ref AND s.coverage_json=c.coverage_json AND json_extract(s.spec_json,'$.cache_policy')='reusable' AND json_extract(s.spec_json,'$.reproducible')=1 AND json_extract(s.spec_json,'$.input_fingerprint')=json_extract(c.spec_json,'$.input_fingerprint') AND json_extract(s.spec_json,'$.resolved_inputs')=json_extract(c.spec_json,'$.resolved_inputs') AND json_extract(s.spec_json,'$.scope_plan')=json_extract(c.spec_json,'$.scope_plan') AND EXISTS(SELECT 1 FROM operations op WHERE op.operation_id=s.operation_id AND op.method='check.run' AND op.state='settled' AND json_extract(op.result_json,'$.outcome')='applied' AND json_extract(op.result_json,'$.state')='passed' AND json_extract(op.result_json,'$.exit_code')=0 AND json_extract(op.result_json,'$.source_checkout_verified')=1 AND json_extract(op.result_json,'$.cached') IS NULL AND json_extract(op.result_json,'$.cached_from_check_id') IS NULL AND json_extract(op.result_json,'$.check_id')=s.check_id AND json_extract(op.result_json,'$.result_ref')=s.result_ref))",
+                "SELECT s.candidate_ref,s.spec_json,s.coverage_json,s.process_identity_json,s.operation_id FROM check_runs s JOIN check_runs c ON c.check_id=?1 WHERE s.check_id=?2 AND s.cached_from_check_id IS NULL AND s.state='passed' AND s.exit_code=0 AND s.resource_released_at_ms IS NOT NULL AND s.cache_key=c.cache_key AND s.result_ref=c.result_ref AND s.coverage_json=c.coverage_json AND json_extract(s.spec_json,'$.cache_policy')='reusable' AND json_extract(s.spec_json,'$.reproducible')=1 AND json_extract(s.spec_json,'$.input_fingerprint')=json_extract(c.spec_json,'$.input_fingerprint') AND json_extract(s.spec_json,'$.resolved_inputs')=json_extract(c.spec_json,'$.resolved_inputs') AND json_extract(s.spec_json,'$.scope_plan')=json_extract(c.spec_json,'$.scope_plan') AND EXISTS(SELECT 1 FROM operations op WHERE op.operation_id=s.operation_id AND op.method='check.run' AND op.state='settled' AND json_extract(op.result_json,'$.outcome')='applied' AND json_extract(op.result_json,'$.state')='passed' AND json_extract(op.result_json,'$.exit_code')=0 AND json_extract(op.result_json,'$.source_checkout_verified')=1 AND json_extract(op.result_json,'$.cached') IS NULL AND json_extract(op.result_json,'$.cached_from_check_id') IS NULL AND json_extract(op.result_json,'$.check_id')=s.check_id AND json_extract(op.result_json,'$.result_ref')=s.result_ref))",
                     params![id, source],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .optional()?;
             let source_candidate_ref = source_row.as_ref().map(|row| row.0.clone());
-            if let Some((_, spec_raw, coverage_raw, process_raw)) = source_row.as_ref() {
+            if let Some((_, spec_raw, coverage_raw, process_raw, _)) = source_row.as_ref() {
                 let source_spec: Value = serde_json::from_str(spec_raw)?;
                 let source_profile: CheckProfile =
                     serde_json::from_value(source_spec["profile"].clone()).map_err(|_| {
@@ -470,11 +470,18 @@ fn evidence(
                 )
                 .map_err(acceptance_validation_error)?;
             }
-            let original = operations::get_operation(db, source)?;
+            // cached_from is the original CheckRunID. Its Operation has a
+            // separate ID, retained on the source CheckRun row.
+            let source_operation_id = source_row
+                .as_ref()
+                .map(|row| row.4.as_str())
+                .ok_or_else(|| Error::new("CHECK_NOT_READY", "cached process source is missing"))?;
+            let original = operations::get_operation(db, source_operation_id)?;
             swarm_kernel::acceptance::validate_cached_operation(
                 source_candidate_ref.is_some(),
                 &original,
                 &op,
+                // Keep the CheckRunID as the validator's source identity.
                 source,
             )
             .map_err(acceptance_validation_error)?;
