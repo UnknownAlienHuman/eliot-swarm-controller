@@ -186,16 +186,20 @@ fn run_process(
     match result {
         Ok(output) => Ok(output),
         Err(error) if job.empty => Err(confirmed_cleanup_error(error)),
-        Err(error) => match job.terminate_and_join() {
-            Ok(()) => Err(confirmed_cleanup_error(error)),
-            Err(cleanup_error) => Err(Error::new(
-                "FORGE_GIT_TREE_TERMINATION",
-                format!(
-                    "post-spawn Git operation failed ({}) and process-tree cleanup is unconfirmed ({})",
-                    error.code, cleanup_error.code
-                ),
-            )),
-        },
+        Err(error) => {
+            #[cfg(test)]
+            eprintln!("forge_git_post_spawn_failed error={error}");
+            match job.terminate_and_join() {
+                Ok(()) => Err(confirmed_cleanup_error(error)),
+                Err(cleanup_error) => Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    format!(
+                        "post-spawn Git operation failed ({}) and process-tree cleanup is unconfirmed ({})",
+                        error.code, cleanup_error.code
+                    ),
+                )),
+            }
+        }
     }
 }
 
@@ -569,11 +573,14 @@ impl Job {
     fn wait_until_empty(&mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.active_processes()? == 0 {
+            let active = self.active_processes()?;
+            if active == 0 {
                 self.empty = true;
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                #[cfg(test)]
+                eprintln!("forge_git_job_cleanup_deadline active_processes={active}");
                 return Err(Error::new(
                     "FORGE_GIT_TREE_TERMINATION",
                     "Git process tree did not stop before the cleanup deadline",

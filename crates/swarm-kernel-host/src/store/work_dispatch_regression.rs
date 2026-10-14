@@ -1404,6 +1404,13 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
                 "failure":retained["launch_manifest"]["failure"],
                 "progress":retained["launch_manifest"]["progress"],
                 "route_admission":retained["launch_manifest"]["current_route_admission"],
+                "retained_failure":super::meta(db, &format!("launcher:failure:{diagnostic_id}"))?,
+                "workspace_lease":rusqlite::OptionalExtension::optional(db.query_row(
+                    "SELECT json_object('state',state,'clean_state',json(clean_state_json),\
+                     'attempt_id',attempt_id) FROM workspace_leases WHERE operation_id=?1",
+                    [&diagnostic_id],
+                    |row| row.get::<_, String>(0),
+                ))?.map(|raw| serde_json::from_str::<Value>(&raw)).transpose()?,
             }))
         })
         .await

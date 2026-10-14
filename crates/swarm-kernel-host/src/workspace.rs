@@ -1059,14 +1059,29 @@ fn ensure_path_absent(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg_attr(test, track_caller)]
 fn git_text(
     git: &mut ForgeGitRun,
     config: &ForgeConfig,
     project: &ForgeProject,
     args: &[String],
 ) -> Result<String> {
-    let output = git.run(config, project, args)?;
+    #[cfg(test)]
+    let call_site = std::panic::Location::caller();
+    let result = git.run(config, project, args);
+    #[cfg(test)]
+    if let Err(error) = &result {
+        eprintln!("workspace_git_helper_failed call_site={call_site} error={error}");
+    }
+    let output = result?;
     if output.timed_out || output.stdout_truncated || !output.status.success() {
+        #[cfg(test)]
+        eprintln!(
+            "workspace_git_helper_inexact call_site={call_site} exit_code={:?} timed_out={} stdout_truncated={}",
+            output.status.code(),
+            output.timed_out,
+            output.stdout_truncated
+        );
         return Err(Error::new(
             "WORKSPACE_GIT_UNKNOWN",
             "bounded Git inspection did not complete with an exact result",

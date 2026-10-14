@@ -1282,6 +1282,8 @@ impl Store {
                     Ok(Some(work)) => work,
                     Ok(None) => break 'candidate,
                     Err(error) => {
+                        #[cfg(test)]
+                        eprintln!("launch_workspace_intent_failed error={error}");
                         self.record_launch_failure(operation_id.clone(), error.code)
                             .await?;
                         break 'candidate;
@@ -1332,6 +1334,8 @@ impl Store {
                 let evidence = match evidence {
                     Ok(evidence) => evidence,
                     Err(error) => {
+                        #[cfg(test)]
+                        eprintln!("launch_workspace_git_io_failed error={error}");
                         self.record_launch_failure(operation_id.clone(), error.code)
                             .await?;
                         break 'candidate;
@@ -1388,6 +1392,10 @@ impl Store {
                     })
                     .await;
                 if let Err(error) = result {
+                    #[cfg(test)]
+                    eprintln!(
+                        "launch_verified_workspace_commit_or_final_gate_failed error={error}"
+                    );
                     self.record_launch_failure(operation_id.clone(), error.code)
                         .await?;
                 }
