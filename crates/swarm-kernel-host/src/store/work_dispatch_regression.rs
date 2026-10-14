@@ -1696,3 +1696,299 @@ async fn work_dispatch_pending_rechecks_rotate_across_restart_and_reject_changed
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(test)]
+mod detached_preview_authority_qualification {
+    use super::*;
+
+    fn public_preview_request(task_id: &str, expected_task_revision: i64) -> Value {
+        json!({
+            "task_id":task_id,
+            "expected_task_revision":expected_task_revision,
+            "route":"regression-route",
+            "agent_profile":"workspace-admission-agent",
+            "mcp_profile":"work-participant",
+            "mcp_surface":"participant-core",
+            "workspace_policy":"manager_owned_worktree",
+            "requested_model":null,
+            "requested_effort":null,
+            "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+            "stop_conditions":[],
+            "purpose":"implementation",
+        })
+    }
+
+    async fn public_preview(store: &Store, manager: &Principal, request: Value) -> Value {
+        store
+            .call(manager.clone(), "swarm.launch.preview".to_owned(), request)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_detached_public_preview_cannot_replace_launch_authority() {
+        let (owner, directory, operator, _) = start_store().await;
+        let manager = register_manager(&owner.store, &operator, "preview-authority-manager").await;
+        select_regression_descriptor(&owner.store, &manager, "regression-route").await;
+        write(
+            &owner.store,
+            &operator,
+            "gm.handover",
+            json!({"client_id":manager.client_id}),
+        )
+        .await;
+
+        let mut dependencies = Vec::new();
+        for index in 0..64 {
+            let phase = format!("phase-{index}-{}", "p".repeat(4_096));
+            let dependency = write(
+                &owner.store,
+                &operator,
+                "task.create",
+                json!({"project_id":"preview-authority-project","spec":{
+                    "objective":"Retained accepted dependency for the preview fixture",
+                    "phase":phase,
+                    "requirements":[{"id":"R1","statement":"Accepted fixture dependency"}],
+                    "owner_policy_id":OWNER_POLICY_V1_ID,
+                }}),
+            )
+            .await;
+            let dependency_task_id = dependency["task_id"].as_str().unwrap().to_owned();
+            dependencies.push(json!({
+                "task_id":dependency_task_id,
+                "required_revision":1,
+                "required_phase":phase,
+            }));
+            // The planner consumes retained original acceptance facts. Seed
+            // those facts; this fixture does not qualify task.accept itself.
+            let caller_id = operator.client_id.clone();
+            owner.store.run(move |db| {
+                let acceptance_id = model::new_id();
+                let result = json!({
+                    "outcome":"applied",
+                    "acceptance_operation_id":acceptance_id,
+                    "task_id":dependency_task_id,
+                    "task_revision":1,
+                    "phase":phase,
+                });
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) \
+                     VALUES(?1,?2,?1,'task.accept','{}','{}',?3,'settled',?4,1,1,1,1)",
+                    rusqlite::params![acceptance_id,caller_id,dependency_task_id,model::canonical(&result)?],
+                )?;
+                // A newer Task revision preserves the pinned historical
+                // acceptance; no incomplete current acceptance anchor is set.
+                db.execute("UPDATE tasks SET revision=2,updated_at_ms=2 WHERE task_id=?1",[dependency_task_id])?;
+                Ok(())
+            }).await.unwrap();
+        }
+        let spec = json!({
+            "objective":"Keep private launch authority independent of preview size",
+            "phase":"implementation",
+            "requirements":[{"id":"R1","statement":"Retain exact Task authority"}],
+            "dependencies":dependencies.clone(),
+            "scope":{"initial_paths":["src/launch-authority.rs"]},
+            "owner_policy_id":OWNER_POLICY_V1_ID,
+        });
+        let task = write(
+            &owner.store,
+            &operator,
+            "task.create",
+            json!({"project_id":"preview-authority-project","spec":spec}),
+        )
+        .await;
+        let task_id = task["task_id"].as_str().unwrap().to_owned();
+        let original_request = public_preview_request(&task_id, 1);
+
+        let preview = public_preview(&owner.store, &manager, original_request.clone()).await;
+        assert_eq!(preview["hard_blocks"], json!([]), "{preview}");
+        assert_eq!(preview["authority_projection"], "detached", "{preview}");
+        assert_eq!(
+            preview["context_detached"]["status"], "detached",
+            "{preview}"
+        );
+        assert!(
+            preview["context_detached"]["serialized_bytes"]
+                .as_u64()
+                .is_some_and(
+                    |bytes| bytes as usize > super::super::projection::MAX_SERIALIZED_BYTES
+                ),
+            "fixture did not exceed the full-preview byte boundary: {preview}"
+        );
+        assert!(
+            model::canonical(&preview).unwrap().len()
+                <= super::super::projection::MAX_SERIALIZED_BYTES,
+            "detached public preview exceeded its byte boundary"
+        );
+        for omitted_authority_field in ["candidate_scope", "workspace", "route", "mcp"] {
+            assert!(
+                preview.get(omitted_authority_field).is_none(),
+                "detached presentation unexpectedly included {omitted_authority_field}"
+            );
+        }
+
+        let preview_task_id = task_id.clone();
+        let launch_count_after_preview = owner
+            .store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='swarm.launch' AND task_id=?1",
+                    [preview_task_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            launch_count_after_preview, 0,
+            "preview retained a launch Operation"
+        );
+
+        let changed_spec = json!({
+            "objective":"Revised source fact for the complete private launch authority",
+            "phase":"implementation",
+            "requirements":[{
+                "id":"R1",
+                "statement":"Retain exact Task authority",
+            }],
+            "dependencies":dependencies,
+            "scope":{"initial_paths":["src/launch-authority.rs"]},
+            "owner_policy_id":OWNER_POLICY_V1_ID,
+        });
+        write(
+            &owner.store,
+            &operator,
+            "task.revise",
+            json!({"task_id":task_id,"expected_revision":1,"spec":changed_spec}),
+        )
+        .await;
+
+        let stale_request_id = format!("pr74-stale-preview-{}", model::new_id());
+        let mut stale_launch = original_request;
+        stale_launch["client_request_id"] = json!(stale_request_id);
+        stale_launch["plan_digest"] = preview["plan_digest"].clone();
+        let stale_error = owner
+            .store
+            .call(manager.clone(), "swarm.launch".to_owned(), stale_launch)
+            .await
+            .expect_err("changed Task authority must invalidate the detached preview digest");
+        assert_eq!(stale_error.code, "STALE_LAUNCH_PLAN", "{stale_error}");
+
+        let manager_id = manager.client_id.clone();
+        let stale_request_id_for_query = stale_request_id.clone();
+        let stale_operation = owner
+            .store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT state,task_id,attempt_id,effective_request_json,result_json FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+                    rusqlite::params![manager_id, stale_request_id_for_query],
+                    |row| Ok((row.get::<_, String>(0)?,row.get::<_, Option<String>>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        // Public writes retain their rejected receipt outside the effect
+        // savepoint. Digest drift must retain no admitted launch authority.
+        assert_eq!(stale_operation.0, "rejected");
+        assert_eq!(stale_operation.1, None);
+        assert_eq!(stale_operation.2, None);
+        let stale_effective: Value = serde_json::from_str(&stale_operation.3).unwrap();
+        let stale_result: Value = serde_json::from_str(&stale_operation.4).unwrap();
+        assert_eq!(stale_result["code"], "STALE_LAUNCH_PLAN");
+        assert_eq!(stale_effective["receipt"]["ok"], false);
+        assert!(stale_effective.get("launch_manifest").is_none());
+        assert!(stale_effective.get("launch_plan_authority").is_none());
+
+        let fresh_request = public_preview_request(&task_id, 2);
+        let fresh_preview = public_preview(&owner.store, &manager, fresh_request.clone()).await;
+        assert_eq!(
+            fresh_preview["authority_projection"], "detached",
+            "{fresh_preview}"
+        );
+        assert_ne!(fresh_preview["plan_digest"], preview["plan_digest"]);
+
+        let mut launch_request = fresh_request;
+        launch_request["client_request_id"] =
+            json!(format!("pr74-fresh-preview-{}", model::new_id()));
+        launch_request["plan_digest"] = fresh_preview["plan_digest"].clone();
+        let receipt = owner
+            .store
+            .call(manager.clone(), "swarm.launch".to_owned(), launch_request)
+            .await
+            .unwrap();
+        assert_eq!(receipt["launch_state"], "pending_workspace", "{receipt}");
+
+        let operation_id = receipt["operation_id"].as_str().unwrap().to_owned();
+        let retained = owner
+            .store
+            .run(move |db| {
+                db.query_row(
+                    "SELECT state,task_id,attempt_id,effective_request_json FROM operations WHERE operation_id=?1",
+                    [operation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained.0, "queued");
+        assert_eq!(retained.1, task_id);
+        let effective: Value = serde_json::from_str(&retained.3).unwrap();
+        let manifest = &effective["launch_manifest"];
+        let authority = &effective["launch_plan_authority"];
+
+        assert_eq!(manifest["plan_digest"], fresh_preview["plan_digest"]);
+        assert_eq!(manifest["request"], authority["requested_plan_facts"]);
+        assert_eq!(manifest["runtime"]["route"], authority["route"]);
+        assert_eq!(manifest["mcp"], authority["mcp"]);
+        assert_eq!(
+            manifest["task"]["candidate_scope"],
+            authority["candidate_scope"]
+        );
+        assert_eq!(
+            manifest["workspace"]["policy"],
+            authority["workspace"]["policy"]
+        );
+        assert_eq!(manifest["task"]["task_id"], authority["task"]["task_id"]);
+        assert_eq!(
+            manifest["task"]["project_id"],
+            authority["task"]["project_id"]
+        );
+        assert_eq!(
+            manifest["task"]["observed_revision"],
+            authority["task"]["revision"]
+        );
+        assert_eq!(
+            manifest["task"]["expected_revision"],
+            authority["task"]["expected_revision"]
+        );
+        assert_eq!(
+            manifest["task"]["attempt_action"],
+            authority["attempt_action"]
+        );
+        assert_eq!(
+            manifest["task"]["attempt_id"],
+            authority["current_attempt"]["attempt_id"]
+        );
+        assert_eq!(authority["route"]["alias"], "regression-route");
+        assert_eq!(authority["mcp"]["profile_name"], "work-participant");
+        assert_eq!(authority["workspace"]["policy"], "manager_owned_worktree");
+        assert_eq!(
+            retained.2,
+            manifest["task"]["attempt_id"].as_str().map(str::to_owned)
+        );
+        assert_eq!(manifest["runtime"]["native_effect"], "not_attempted");
+
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
