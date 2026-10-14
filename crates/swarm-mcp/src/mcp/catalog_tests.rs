@@ -466,3 +466,157 @@ fn manager_discovers_manual_github_effect_and_lists_it_only_after_explicit_loadi
         "loaded manager surface lists the closed mutation schema"
     );
 }
+
+#[test]
+fn catalog_v1_framing_and_intentional_drift_receipt() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use swarm_contracts::mcp_catalog::{
+        find_tool_spec, input_schema_bytes, mutation_requires_caller_request_id,
+        output_schema_bytes, tool_name,
+    };
+
+    const AUTHORIZED_DOMAIN: &str = "eliot-mcp-authorized-catalog-v1";
+    const SURFACE_DOMAIN: &str = "eliot-mcp-surface-view-v1";
+
+    let drifted = metadata_for("attempt.bind_producer").expect("bind_producer metadata");
+    let mut probe = *drifted;
+    probe.required_input_fields = &[];
+    let mut first = super::Sha256::new();
+    super::digest_metadata(&mut first, drifted);
+    let first = first.finalize();
+    let mut second = super::Sha256::new();
+    super::digest_metadata(&mut second, &probe);
+    let second = second.finalize();
+    assert_eq!(
+        super::hex_digest(&first),
+        super::hex_digest(&second),
+        "required_input_fields must not affect V1 digest"
+    );
+
+    let (_, bind_spec) = find_tool_spec("attempt.bind_producer").expect("bind_producer spec");
+    assert_eq!(
+        drifted.required_input_fields, bind_spec.required,
+        "bind_producer inputs match executable ToolSpec"
+    );
+    assert_eq!(
+        drifted.purpose,
+        "Associate an already observed native producer run with one exact Attempt."
+    );
+    assert_eq!(
+        drifted.required_context,
+        [
+            "current Attempt manager authority",
+            "already observed exact producer evidence"
+        ]
+    );
+    assert_ne!(
+        drifted.purpose,
+        "Bind an attempt to an exact producer binding generation."
+    );
+
+    let handover = metadata_for("gm.handover").expect("handover metadata");
+    let (_, handover_spec) = find_tool_spec("gm.handover").expect("handover spec");
+    assert_eq!(handover.required_input_fields, handover_spec.required);
+    assert_eq!(handover.required_input_fields, ["client_id"]);
+    assert_eq!(
+        handover.purpose,
+        "Designate one registered eligible client as the current GM under the application epoch rules."
+    );
+    assert_ne!(
+        handover.purpose,
+        "Transfer the local manager lease through the guarded handover path."
+    );
+
+    let (_, send_spec) = find_tool_spec("coordination.send").expect("send spec");
+    assert_eq!(
+        send_spec.description,
+        "Deliver a bounded non-null JSON body to one active Participant only when an exact current peer relation authorizes the separately revalidated source and target Task/revision/Attempt contexts; this is typed coordination, not raw mailbox access."
+    );
+    assert_ne!(
+        send_spec.description,
+        "Deliver a bounded non-null JSON body to one active Participant in the same current Task/Attempt scope; this is typed coordination, not raw mailbox access."
+    );
+    let send_meta = metadata_for("coordination.send").expect("send metadata");
+    assert_eq!(
+        send_meta.purpose,
+        "Send one bounded typed coordination delivery to an active peer whose separately validated current Task/Attempt has an exact peer relation with the sender's current Task/Attempt."
+    );
+    assert_eq!(
+        send_meta.required_context,
+        [
+            "recipient",
+            "non-null JSON body <= 8 KiB",
+            "authenticated current source and target contexts; exact current peer relation"
+        ]
+    );
+
+    let profile = McpToolProfile::Observer;
+    let method = "swarm.tools.search";
+    let metadata = metadata_for(method).expect("stable metadata");
+    let (read_only, spec) = find_tool_spec(method).expect("stable spec");
+    assert_eq!(
+        spec.description,
+        "Search the caller's authorized MCP catalog by goal, purpose, or exact tool name. Returns metadata and a safe surface/reconnect recommendation only; it never executes a selected method."
+    );
+    let request_id = mutation_requires_caller_request_id(profile, spec.method, *read_only);
+    assert!(!request_id, "read keeps one input variant");
+    let input = input_schema_bytes(spec, *read_only, request_id).expect("stable input bytes");
+    let output = output_schema_bytes(method).expect("stable output lookup");
+    assert!(output.is_none(), "stable method has no output schema");
+
+    let revision = "pr40-receipt-v1";
+    let mut preimage = Vec::new();
+    let mut frame = |value: &[u8]| {
+        preimage.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(value);
+    };
+    frame(AUTHORIZED_DOMAIN.as_bytes());
+    frame(super::profile_name(profile).as_bytes());
+    frame(revision.as_bytes());
+    frame(b"");
+    frame(metadata.method.as_bytes());
+    frame(metadata.group.as_str().as_bytes());
+    frame(metadata.load_tier.as_str().as_bytes());
+    frame(metadata.purpose.as_bytes());
+    frame(metadata.when_to_use.as_bytes());
+    frame(metadata.result_policy.as_bytes());
+    for audience in metadata.audiences {
+        frame(audience.as_str().as_bytes());
+    }
+    for term in metadata.search_terms {
+        frame(term.as_bytes());
+    }
+    for context in metadata.required_context {
+        frame(context.as_bytes());
+    }
+    frame(tool_name(method).as_bytes());
+    frame(spec.description.as_bytes());
+    frame(input.as_ref());
+    frame(&[]);
+
+    let expected = super::hex_digest(&super::Sha256::digest(&preimage));
+    let actual = super::hex_digest(
+        &super::digest_entries(profile, revision, "", &[metadata]).expect("one-entry digest"),
+    );
+    assert_eq!(expected, actual, "V1 preimage framing preserved");
+
+    let mut surface = Surface::role_default(McpToolProfile::Full);
+    surface.legacy_full = true;
+    let authorization = AuthorizationRevision {
+        value: "pr40-receipt-v1",
+        basis: AuthorizationBasis::AuthenticatedStoreScope,
+    };
+    let page = list_tools_page(
+        McpToolProfile::Full,
+        &surface,
+        None,
+        authorization,
+        |_, _| true,
+    )
+    .expect("first catalog page");
+    let cursor = page.next_cursor.expect("legacy surface pages");
+    let raw = URL_SAFE_NO_PAD.decode(&cursor).expect("cursor decodes");
+    assert_eq!(raw.len(), 73, "cursor stays 73 bytes");
+    assert_eq!(raw[0], 1, "cursor stays version 1");
+    assert_eq!(SURFACE_DOMAIN, "eliot-mcp-surface-view-v1");
+}
