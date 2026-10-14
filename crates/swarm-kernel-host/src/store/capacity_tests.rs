@@ -1156,7 +1156,7 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
 
     let (state, result_json): (String, String) = db
         .query_row(
-            "SELECT state,result_json FROM operations \\
+            "SELECT state,result_json FROM operations \
              WHERE caller_id=?1 AND client_request_id=?2 AND method='agent.open'",
             params![operator_id, "provider-condition-open"],
             |row| Ok((row.get(0)?, row.get(1)?)),
