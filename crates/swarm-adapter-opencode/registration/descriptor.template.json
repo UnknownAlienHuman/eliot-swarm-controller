@@ -31,7 +31,6 @@
   "command_schemas": [
     {"schema_id": "swarm.native_mcp_command", "version": "2"},
     {"schema_id": "swarm.normalized_result_context", "version": "1"},
-    {"schema_id": "swarm.opencode_loop_step_command", "version": "1"},
     {"schema_id": "swarm.opencode_reply_command", "version": "1"},
     {"schema_id": "swarm.runtime_command", "version": "1"},
     {"schema_id": "swarm.task_dispatch_context", "version": "1"},
@@ -59,7 +58,6 @@
     "native.mcp.install",
     "native.mcp.observe",
     "native.mcp.read",
-    "native.opencode.loop_step",
     "task.dispatch"
   ],
   "lifecycle": "owned_service",

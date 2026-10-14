@@ -21,7 +21,7 @@ const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
 const NATIVE_OPTIONS_SCHEMA_SHA256: &str =
     "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e";
 const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "3";
-const CAPABILITIES: [&str; 13] = [
+const CAPABILITIES: [&str; 12] = [
     "agent.background",
     "agent.open",
     "agent.reconcile",
@@ -33,13 +33,11 @@ const CAPABILITIES: [&str; 13] = [
     "native.mcp.install",
     "native.mcp.observe",
     "native.mcp.read",
-    "native.opencode.loop_step",
     "task.dispatch",
 ];
-const COMMAND_SCHEMAS: [(&str, &str); 7] = [
+const COMMAND_SCHEMAS: [(&str, &str); 6] = [
     ("swarm.native_mcp_command", "2"),
     ("swarm.normalized_result_context", "1"),
-    ("swarm.opencode_loop_step_command", "1"),
     ("swarm.opencode_reply_command", "1"),
     ("swarm.runtime_command", "1"),
     ("swarm.task_dispatch_context", "1"),
@@ -359,6 +357,15 @@ fn absolute_config_path_value(value: String) -> Result<PathBuf> {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn loop_step_is_not_advertised_without_a_supported_internal_caller() {
+        assert!(!CAPABILITIES.contains(&"native.opencode.loop_step"));
+        assert!(!COMMAND_SCHEMAS.contains(&("swarm.opencode_loop_step_command", "1")));
+        let descriptor = include_str!("../registration/descriptor.template.json");
+        assert!(!descriptor.contains("native.opencode.loop_step"));
+        assert!(!descriptor.contains("swarm.opencode_loop_step_command"));
+    }
 
     fn command_schemas(native_mcp_version: &str) -> Vec<SchemaDescriptor> {
         COMMAND_SCHEMAS

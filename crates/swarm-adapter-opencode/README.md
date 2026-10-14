@@ -2,11 +2,11 @@
 
 `eliot-opencode-v2.rust-http.1@0.5.0` is the standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@3` (SHA-256 `070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt bytes. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
 
-The descriptor declares `agent.open`, `task.dispatch`, `agent.send/next_turn`, `native.opencode.loop_step`, `agent.reply`, `agent.background`, `agent.refresh`, `agent.reconcile`, and `agent.result`, along with the four `native.mcp.*` commands. Loop-step is a vendor command with its own `swarm.opencode_loop_step_command@1` schema; ordinary `agent.send/next_turn` remains native queue delivery. Reply commands use `swarm.opencode_reply_command@1`. Unknown OpenCode-native methods stay unsupported.
+The descriptor declares agent.open, task.dispatch, agent.send/next_turn, agent.reply, agent.background, agent.refresh, agent.reconcile, and agent.result, along with the four native.mcp.* commands. Unknown OpenCode-native methods stay unsupported. This artifact does not declare native.opencode.loop_step because no supported internal producer exists.
 
-The owner-approved current continuation caller remains the host agent.goal action continue: it names the exact goal revision and objective and admits one deterministic queue input.
-native.opencode.loop_step is a separate internal RuntimeCommand, not another MCP or CLI control; it carries the caller request ID and exact binding generation and emits one steer input.
-Ordinary agent.send/next_turn stays queue-only. A lost loop-step POST remains unknown and reconciliation uses exact readback without replay; no terminal event or timer starts another input.
+The owner-approved human/current-GM continuation remains the host agent.goal action continue. It admits one deterministic queue input and is not a loop-step producer.
+No supported internal Manager or automation producer for native.opencode.loop_step exists in this source baseline. The OpenCode adapter no longer advertises the capability or command schema, and new input submissions fail closed with UNSUPPORTED_CAPABILITY. No MCP or CLI command is added.
+The adapter retains the loop-step delivery mapping only for exact readback of previously retained intents; uncertain prior POSTs remain unknown and are never replayed.
 
 The descriptor opts into `swarm.native_mcp_command@2`. Native MCP observe commands carry an explicit `installed_server` purpose for C8 install readback or `assigned_session` for the C7 assignment observation. Assigned-session readback is pinned to OpenCode 2.0.7, uses location-scoped GETs for the MCP list and exact assigned session, and returns only bounded identity/status facts with server errors and integration IDs removed or hashed. Other command and event schemas remain at version 1.
 
@@ -20,7 +20,7 @@ The example model is the exact selected route inclusionai/ling-3.1-flash: `provi
 
 ## Native history and controls
 
-Queue and loop-step inputs share the durable admission/readback path but persist distinct native deliveries. The adapter records intent before POST, never replays a possibly-sent request, and uses bounded session history to distinguish admission, promotion, and terminal step evidence. A history gap or missing exact event remains unknown.
+Queue sends use the durable admission/readback path and persist their exact native delivery identity. The adapter retains loop-step delivery recognition only to reconcile previously retained intents; it does not admit new loop-step submissions. History gaps and uncertain prior POSTs remain unknown.
 
 Questions and permissions are read from the current pending endpoints and projected as bounded typed observations. Replies bind the exact current request fingerprint. Generic permission replies allow only `once` and `reject`; `always` is unsupported. Lost reply responses reconcile from complete contiguous durable history and exact reply payload digests. Permission feedback text is not exposed by that history, so a reject carrying feedback remains unknown after a lost response.
 

@@ -309,14 +309,12 @@ impl NativeClient {
         options: &NativeOptions,
         root: &str,
     ) -> Result<String> {
+        ensure_new_input_supported(&command.method)?;
         if command.method == "agent.send" && command.input["delivery"] != "next_turn" {
             return Err(Error::new(
                 "UNSUPPORTED_EXACT_TURN_STEER",
                 "agent.send supports only next_turn on OpenCode's native queue",
             ));
-        }
-        if command.method == "native.opencode.loop_step" {
-            validate_loop_step_command(command)?;
         }
         if command.method == "task.dispatch"
             && let Some(packet) = command.input.get("launch_dispatch_packet")
@@ -1725,7 +1723,18 @@ pub fn intent_for(
     })
 }
 
+fn ensure_new_input_supported(method: &str) -> Result<()> {
+    if method == "native.opencode.loop_step" {
+        return Err(Error::new(
+            "UNSUPPORTED_CAPABILITY",
+            "OpenCode loop-step is unavailable without a supported internal caller",
+        ));
+    }
+    Ok(())
+}
+
 pub fn input_payload(command: &RuntimeCommand, input_id: &str, prompt_text: &str) -> Result<Value> {
+    ensure_new_input_supported(&command.method)?;
     let delivery = native_delivery_for_method(&command.method).ok_or_else(|| {
         Error::new(
             "UNSUPPORTED_CAPABILITY",
@@ -1740,40 +1749,14 @@ pub fn input_payload(command: &RuntimeCommand, input_id: &str, prompt_text: &str
     }))
 }
 
+/// Retain loop-step delivery identity for exact readback of previously admitted intents.
+/// New loop-step submissions are rejected by ensure_new_input_supported.
 pub fn native_delivery_for_method(method: &str) -> Option<&'static str> {
     match method {
         "task.dispatch" | "agent.send" => Some("queue"),
         "native.opencode.loop_step" => Some("steer"),
         _ => None,
     }
-}
-
-fn validate_loop_step_command(command: &RuntimeCommand) -> Result<()> {
-    strict_fields(
-        &command.input,
-        &["client_request_id", "binding_id", "generation", "text"],
-    )?;
-    if command
-        .input
-        .as_object()
-        .is_none_or(|input| input.len() != 4)
-        || command.input["client_request_id"]
-            .as_str()
-            .is_none_or(|id| {
-                id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control)
-            })
-        || command.input["binding_id"].as_str() != Some(command.binding_id.as_str())
-        || command.input["generation"].as_i64() != Some(command.generation)
-        || command.input["text"]
-            .as_str()
-            .is_none_or(|text| text.trim().is_empty() || text.len() > 65_536)
-    {
-        return Err(Error::new(
-            "INVALID_OPENCODE_LOOP_STEP",
-            "loop-step input must contain a bounded caller request id, exact binding generation, and nonempty text",
-        ));
-    }
-    Ok(())
 }
 
 pub fn prompt(command: &RuntimeCommand) -> Result<String> {
@@ -2364,6 +2347,53 @@ mod catalog_readiness_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[tokio::test]
+    async fn loop_step_submission_fails_before_native_io_and_retains_historical_readback() {
+        let directory = std::env::current_dir().unwrap();
+        let options = NativeOptions {
+            service_id: "loop-step-deactivated-fixture".into(),
+            connection_file: directory.join("unused-connection.json"),
+            directory: directory.clone(),
+            model: ModelRef {
+                id: "step-5-preview-free".into(),
+                provider_id: "opencode".into(),
+                variant: "high".into(),
+            },
+        };
+        let client = NativeClient {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint: reqwest::Url::parse("http://127.0.0.1:9/").unwrap(),
+            pid: 1,
+            version: "2.0.7".into(),
+        };
+        let command = RuntimeCommand {
+            operation_id: "loop-step-fixture".into(),
+            method: "native.opencode.loop_step".into(),
+            created_at_ms: 1,
+            binding_id: "fixture-binding".into(),
+            generation: 1,
+            native_root_id: Some(root_id("fixture-binding", 1)),
+            route: json!({}),
+            input: json!({
+                "client_request_id":"request-1",
+                "binding_id":"fixture-binding",
+                "generation":1,
+                "text":"one step"
+            }),
+            input_sha256: None,
+            target_input_sha256: None,
+        };
+
+        let error = client
+            .preflight_send(&command, &options, command.native_root_id.as_deref().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "UNSUPPORTED_CAPABILITY");
+        let payload = input_payload(&command, "msg_swarm_fixture", "one step").unwrap_err();
+        assert_eq!(payload.code, "UNSUPPORTED_CAPABILITY");
+        assert_eq!(native_delivery_for_method("native.opencode.loop_step"), Some("steer"));
+    }
 
     async fn catalog_fixture(
         responses: Vec<Value>,
