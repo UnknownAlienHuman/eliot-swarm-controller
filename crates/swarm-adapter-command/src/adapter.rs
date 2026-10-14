@@ -1352,7 +1352,6 @@ fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
             "agent.open"
                 | "task.dispatch"
                 | "agent.send"
-                | "agent.configure"
                 | "agent.refresh"
                 | "agent.reconcile"
                 | "agent.reply"

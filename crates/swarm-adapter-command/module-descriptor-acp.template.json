@@ -42,7 +42,6 @@
     "maximum": { "major": 1, "minor": 0 }
   },
   "capabilities": [
-    "agent.configure",
     "agent.open",
     "agent.reconcile",
     "agent.refresh",

@@ -153,8 +153,7 @@ fn command_capabilities_match(claim: &ModuleContractClaim, profile: Profile) -> 
         "native.command.release_evidence",
         "task.dispatch",
     ];
-    const ACP_V1: [&str; 9] = [
-        "agent.configure",
+    const ACP_V1: [&str; 8] = [
         "agent.open",
         "agent.reconcile",
         "agent.refresh",
@@ -164,8 +163,7 @@ fn command_capabilities_match(claim: &ModuleContractClaim, profile: Profile) -> 
         "native.command.cancel_turn",
         "task.dispatch",
     ];
-    const ACP_V1_CLOSE: [&str; 10] = [
-        "agent.configure",
+    const ACP_V1_CLOSE: [&str; 9] = [
         "agent.open",
         "agent.reconcile",
         "agent.refresh",
@@ -465,4 +463,57 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use swarm_contracts::module_contract::ModuleContractClaim;
+
+    use super::{ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION, Profile, command_capabilities_match};
+
+    fn claim(capabilities: Value) -> ModuleContractClaim {
+        serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":"runtime.command",
+            "artifact":{
+                "artifact_id":ACP_ARTIFACT_ID,
+                "version":ACP_ARTIFACT_VERSION,
+                "build_id":null
+            },
+            "protocol":{"major":1,"minor":0},
+            "capabilities":capabilities,
+            "config_schema":null,
+            "command_schemas":[],
+            "event_schemas":[]
+        }))
+        .expect("fixture contract claim is valid")
+    }
+
+    #[test]
+    fn pr44_command_acp_descriptor_deactivates_configure_and_host_rejects_the_old_set() {
+        let descriptor: Value =
+            serde_json::from_str(include_str!("../module-descriptor-acp.template.json"))
+                .expect("ACP descriptor template parses");
+        let capabilities = descriptor["capabilities"]
+            .as_array()
+            .expect("ACP descriptor declares capabilities")
+            .clone();
+        assert!(!capabilities.contains(&json!("agent.configure")));
+        assert!(command_capabilities_match(
+            &claim(json!(capabilities)),
+            Profile::AcpV1
+        ));
+
+        let mut old_capabilities = descriptor["capabilities"]
+            .as_array()
+            .expect("ACP descriptor declares capabilities")
+            .clone();
+        old_capabilities.push(json!("agent.configure"));
+        old_capabilities.sort_by_key(|value| value.to_string());
+        assert!(!command_capabilities_match(
+            &claim(json!(old_capabilities)),
+            Profile::AcpV1
+        ));
+    }
 }

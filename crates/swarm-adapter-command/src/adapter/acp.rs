@@ -196,6 +196,14 @@ struct SessionRestoreContext<'a> {
     capture: &'a Arc<Mutex<Capture>>,
 }
 
+struct RestoreIdentity {
+    session_text: String,
+    session_id: SessionId,
+    workspace: PathBuf,
+    model_id: String,
+    owner_operation_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedOutputCapture {
@@ -876,6 +884,7 @@ pub(super) async fn run(
             ));
         }
         expected_route = Some(link.route.clone());
+        validate_acp_route(&link.route)?;
 
         let mut reconnect_required = false;
         for (outcome, hash) in journal.pending_outcomes()? {
@@ -1045,39 +1054,8 @@ pub(super) async fn run(
                 .name("eliot-command-acp")
                 .on_receive_notification(
                     async move |notification: SessionNotification, _connection| {
-                        if let Ok(bytes) = serde_json::to_vec(&notification)
-                            && let Ok(mut capture) = notification_capture.lock()
-                        {
-                            let capture = &mut *capture;
-                            if capture.native_session_id.as_deref()
-                                != Some(notification.session_id.to_string().as_str())
-                            {
-                                capture.protocol_error = Some(
-                                    "ACP update named a different session".to_owned(),
-                                );
-                                return Ok(());
-                            }
-                            capture.updates = capture.updates.saturating_add(1);
-                            if capture.history_replaying {
-                                capture.history_updates = capture.history_updates.saturating_add(1);
-                            } else if let Some(text) = update_text(&notification.update) {
-                                append_capture(
-                                    &mut capture.output,
-                                    &mut capture.output_total_bytes,
-                                    &mut capture.output_truncated,
-                                    text.as_bytes(),
-                                    MAX_CAPTURE_BYTES,
-                                );
-                            }
-                            if let Some(event) = compact_tool_event(&notification.update) {
-                                retain_bounded_event(&mut capture.tool_events, event);
-                                if let Some(child) = native_agent_child(&notification.update) {
-                                    retain_bounded_event(&mut capture.agent_children, child);
-                                }
-                            }
-                            if bytes.len() > MAX_CAPTURE_BYTES {
-                                capture.protocol_error = Some("ACP notification exceeded capture bound".to_owned());
-                            }
+                        if let Ok(mut capture) = notification_capture.lock() {
+                            capture_session_notification(&mut capture, &notification);
                         }
                         Ok(())
                     },
@@ -1270,7 +1248,7 @@ pub(super) async fn run(
                     }
                 }
             }
-            let snapshot = capture
+            let mut snapshot = capture
                 .lock()
                 .map(|capture| {
                     json!({
@@ -1289,16 +1267,11 @@ pub(super) async fn run(
                             "protocol_error":capture.protocol_error,
                             "session_updates":capture.updates,
                             "native_session_id":capture.native_session_id,
-                            "native_child_identity":capture.native_child_identity,
-                            "direct_child_exit_observed":child_exit.observed,
-                            "direct_child_exit_code":child_exit.exit_code,
-                            "direct_child_kill_requested":child_exit.kill_requested,
-                            "cleanup_pending":child_exit.cleanup_pending,
-                            "family_departure_claimed":false,
-                            "owner_family_departure_required":true
+                            "native_child_identity":capture.native_child_identity
                         })
                 })
                 .unwrap_or(Value::Null);
+            add_family_custody_facts(&mut snapshot, &child_exit);
             if let Some(command) = active_operation
                 .lock()
                 .map_err(|_| invalid("ACP active-operation lock is poisoned"))?
@@ -1406,6 +1379,71 @@ async fn initialize(
         agent_info,
         capabilities,
     })
+}
+
+fn begin_history_replay(capture: &mut Capture, session_id: &str) {
+    capture.native_session_id = Some(session_id.to_owned());
+    capture.history_replaying = true;
+}
+
+fn finish_history_replay(capture: &mut Capture) {
+    capture.history_replaying = false;
+}
+
+fn capture_session_notification(capture: &mut Capture, notification: &SessionNotification) {
+    let Ok(bytes) = serde_json::to_vec(notification) else {
+        return;
+    };
+    let session_id = notification.session_id.to_string();
+    if capture.native_session_id.as_deref() != Some(session_id.as_str()) {
+        capture.protocol_error = Some("ACP update named a different session".to_owned());
+        return;
+    }
+    capture.updates = capture.updates.saturating_add(1);
+    if capture.history_replaying {
+        capture.history_updates = capture.history_updates.saturating_add(1);
+    } else if let Some(text) = update_text(&notification.update) {
+        append_capture(
+            &mut capture.output,
+            &mut capture.output_total_bytes,
+            &mut capture.output_truncated,
+            text.as_bytes(),
+            MAX_CAPTURE_BYTES,
+        );
+    }
+    if let Some(event) = compact_tool_event(&notification.update) {
+        retain_bounded_event(&mut capture.tool_events, event);
+        if let Some(child) = native_agent_child(&notification.update) {
+            retain_bounded_event(&mut capture.agent_children, child);
+        }
+    }
+    if bytes.len() > MAX_CAPTURE_BYTES {
+        capture.protocol_error = Some("ACP notification exceeded capture bound".to_owned());
+    }
+}
+
+fn add_family_custody_facts(snapshot: &mut Value, child_exit: &DirectChildExit) {
+    let Some(fields) = snapshot.as_object_mut() else {
+        return;
+    };
+    fields.insert(
+        "direct_child_exit_observed".to_owned(),
+        json!(child_exit.observed),
+    );
+    fields.insert(
+        "direct_child_exit_code".to_owned(),
+        json!(child_exit.exit_code),
+    );
+    fields.insert(
+        "direct_child_kill_requested".to_owned(),
+        json!(child_exit.kill_requested),
+    );
+    fields.insert(
+        "cleanup_pending".to_owned(),
+        json!(child_exit.cleanup_pending),
+    );
+    fields.insert("family_departure_claimed".to_owned(), json!(false));
+    fields.insert("owner_family_departure_required".to_owned(), json!(true));
 }
 
 struct DirectChildExit {
@@ -1771,31 +1809,6 @@ async fn process_command(
             };
             Ok(vec![outcome])
         }
-        "agent.configure" => {
-            let session = context
-                .session
-                .as_ref()
-                .ok_or_else(|| Error::new("NATIVE_SESSION_MISSING", "ACP session is not open"))?;
-            if session.closed {
-                return Err(Error::new("NATIVE_SESSION_CLOSED", "ACP session is closed"));
-            }
-            let settings = &command.input["settings"];
-            if settings["modelId"].as_str() != Some(session.model_id.as_str()) {
-                return Err(Error::new(
-                    "CONFIGURATION_UNSUPPORTED",
-                    "ACP model changes require a new route and verified session readback",
-                ));
-            }
-            Ok(vec![applied_in_session(
-                command,
-                session,
-                json!({
-                    "configuration":"unchanged_route_model_verified",
-                    "native_session_id":session.id,
-                    "task_completion":"unknown"
-                }),
-            )])
-        }
         "agent.refresh" => {
             if let Some(session) = context.session.as_ref() {
                 Ok(vec![applied_in_session(
@@ -2144,18 +2157,23 @@ async fn open_session(
             )
         })?;
     let mut options = opened.config_options.clone().unwrap_or_default();
-    let advertised = serde_json::to_value(&options)?;
-    if !model_value_available(&advertised, requested_model) {
+    if !model_value_available(&options, requested_model) {
         return Err(Error::new(
             "ACP_SESSION_OPEN_UNKNOWN",
-            "ACP created a session but did not advertise the exact routed model; the retained session requires readback",
+            "ACP created a session but did not advertise one unambiguous typed option with the exact routed model value; the retained session requires readback",
         ));
     }
-    if !model_current_value_matches(&advertised, requested_model) {
+    if !model_current_value_matches(&options, requested_model) {
+        let option_id = model_config_option_id(&options, requested_model).ok_or_else(|| {
+            Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP model option identity is ambiguous; the retained session requires readback",
+            )
+        })?;
         let configured = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
-                "model",
+                option_id,
                 SessionConfigOptionValue::value_id(requested_model.to_owned()),
             ))
             .block_task()
@@ -2168,8 +2186,7 @@ async fn open_session(
             })?;
         options = configured.config_options;
     }
-    let readback = serde_json::to_value(&options)?;
-    if !model_current_value_matches(&readback, requested_model) {
+    if !model_current_value_matches(&options, requested_model) {
         return Err(Error::new(
             "ACP_SESSION_OPEN_UNKNOWN",
             "ACP effective model did not match the requested model; the retained session requires readback",
@@ -2217,6 +2234,118 @@ async fn open_session(
     Ok(session)
 }
 
+fn validate_restore_identity(
+    saved: &Value,
+    binding_id: &str,
+    generation: i64,
+    route: &Value,
+    load_session_supported: bool,
+) -> Result<RestoreIdentity> {
+    let session_text = saved["native_session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid("retained ACP session has no native ID"))?;
+    if saved["schema_version"] != 1
+        || saved["artifact_id"] != ACP_ARTIFACT_ID
+        || saved["binding_id"] != binding_id
+        || saved["binding_generation"].as_i64() != Some(generation)
+        || saved["native_root_id"] != session_text
+        || saved["native_scope_key"] != session_text
+        || saved["native_session_state"] == "closed"
+    {
+        return Err(Error::new(
+            "RECOVERY_REQUIRED",
+            "retained ACP session identity is closed or differs from this exact binding",
+        ));
+    }
+    if !load_session_supported {
+        return Err(Error::new(
+            "RECOVERY_REQUIRED",
+            "ACP agent does not advertise session/load; no replacement session or prompt replay is allowed",
+        ));
+    }
+    let session_id: SessionId = serde_json::from_value(json!(session_text))
+        .map_err(|_| invalid("retained ACP session ID is malformed"))?;
+    let workspace = PathBuf::from(
+        saved["workspace"]
+            .as_str()
+            .ok_or_else(|| invalid("retained ACP session omitted its workspace"))?,
+    );
+    let route_workspace = route["native_options"]["workspaceRoot"]
+        .as_str()
+        .filter(|value| Path::new(value).is_absolute())
+        .ok_or_else(|| Error::new("WORKSPACE_INVALID", "route workspaceRoot is invalid"))?;
+    if !workspace.is_absolute()
+        || fs::canonicalize(&workspace)? != fs::canonicalize(route_workspace)?
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "retained ACP session workspace differs from the immutable binding route",
+        ));
+    }
+    let model_id = command_model(route)
+        .filter(|model| saved["requested_model"] == *model)
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "retained ACP session model differs from the immutable binding route",
+            )
+        })?
+        .to_owned();
+    let owner_operation_id = saved["operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid("retained ACP session omitted its owner Operation"))?
+        .to_owned();
+    Ok(RestoreIdentity {
+        session_text: session_text.to_owned(),
+        session_id,
+        workspace,
+        model_id,
+        owner_operation_id,
+    })
+}
+
+async fn load_retained_session(
+    connection: &ConnectionTo<Agent>,
+    capture: &Arc<Mutex<Capture>>,
+    session_text: &str,
+    session_id: &SessionId,
+    workspace: &Path,
+) -> Result<LoadSessionResponse> {
+    {
+        let mut capture = capture.lock().map_err(|_| {
+            Error::new(
+                "RECOVERY_REQUIRED",
+                "ACP capture state unavailable before session/load",
+            )
+        })?;
+        begin_history_replay(&mut capture, session_text);
+    }
+    let loaded = connection
+        .send_request(LoadSessionRequest::new(
+            session_id.clone(),
+            workspace.to_path_buf(),
+        ))
+        .block_task()
+        .await;
+    {
+        let mut capture = capture.lock().map_err(|_| {
+            Error::new(
+                "RECOVERY_REQUIRED",
+                "ACP capture state unavailable after session/load",
+            )
+        })?;
+        finish_history_replay(&mut capture);
+    }
+    loaded.map_err(|_| {
+        Error::new(
+            "RECOVERY_REQUIRED",
+            "ACP session/load failed; original TaskPrompt will not be replayed",
+        )
+    })
+}
+
 async fn restore_session(
     context: SessionRestoreContext<'_>,
     command: &RuntimeCommand,
@@ -2230,57 +2359,19 @@ async fn restore_session(
         features,
         capture,
     } = context;
-    let session_text = saved["native_session_id"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| invalid("retained ACP session has no native ID"))?;
-    if saved["schema_version"] != 1
-        || saved["artifact_id"] != ACP_ARTIFACT_ID
-        || saved["binding_id"] != link.binding_id
-        || saved["binding_generation"].as_i64() != Some(link.generation)
-        || saved["native_root_id"] != session_text
-        || saved["native_scope_key"] != session_text
-        || saved["native_session_state"] == "closed"
-    {
-        return Err(Error::new(
-            "RECOVERY_REQUIRED",
-            "retained ACP session identity is closed or differs from this exact binding",
-        ));
-    }
-    if !features.load_session_supported {
-        return Err(Error::new(
-            "RECOVERY_REQUIRED",
-            "ACP agent does not advertise session/load; no replacement session or prompt replay is allowed",
-        ));
-    }
-    let session_id: SessionId = serde_json::from_value(json!(session_text))
-        .map_err(|_| invalid("retained ACP session ID is malformed"))?;
-    let workspace = PathBuf::from(
-        saved["workspace"]
-            .as_str()
-            .ok_or_else(|| invalid("retained ACP session omitted its workspace"))?,
-    );
-    let route_workspace = link.route["native_options"]["workspaceRoot"]
-        .as_str()
-        .filter(|value| Path::new(value).is_absolute())
-        .ok_or_else(|| Error::new("WORKSPACE_INVALID", "route workspaceRoot is invalid"))?;
-    if !workspace.is_absolute()
-        || fs::canonicalize(&workspace)? != fs::canonicalize(route_workspace)?
-    {
-        return Err(Error::new(
-            "NATIVE_IDENTITY_MISMATCH",
-            "retained ACP session workspace differs from the immutable binding route",
-        ));
-    }
-    let model_id = command_model(&link.route)
-        .filter(|model| saved["requested_model"] == *model)
-        .ok_or_else(|| {
-            Error::new(
-                "NATIVE_IDENTITY_MISMATCH",
-                "retained ACP session model differs from the immutable binding route",
-            )
-        })?
-        .to_owned();
+    let RestoreIdentity {
+        session_text,
+        session_id,
+        workspace,
+        model_id,
+        owner_operation_id,
+    } = validate_restore_identity(
+        &saved,
+        &link.binding_id,
+        link.generation,
+        &link.route,
+        features.load_session_supported,
+    )?;
     journal.record_effect(
         command,
         "session/load",
@@ -2294,29 +2385,14 @@ async fn restore_session(
             "native_replay":false
         }),
     )?;
-    if let Ok(mut capture) = capture.lock() {
-        capture.native_session_id = Some(session_text.to_owned());
-        capture.history_replaying = true;
-    }
-    let loaded = connection
-        .send_request(LoadSessionRequest::new(
-            session_id.clone(),
-            workspace.clone(),
-        ))
-        .block_task()
-        .await;
-    if let Ok(mut capture) = capture.lock() {
-        capture.history_replaying = false;
-    }
-    let loaded = loaded.map_err(|_| {
-        Error::new(
-            "RECOVERY_REQUIRED",
-            "ACP session/load failed; original TaskPrompt will not be replayed",
-        )
-    })?;
+    let loaded =
+        load_retained_session(connection, capture, &session_text, &session_id, &workspace).await?;
+    let history_updates = capture
+        .lock()
+        .map_err(|_| Error::new("RECOVERY_REQUIRED", "ACP history capture state unavailable"))?
+        .history_updates;
     let config_options = loaded.config_options.unwrap_or_default();
-    let readback = serde_json::to_value(&config_options)?;
-    if !model_current_value_matches(&readback, &model_id) {
+    if !model_current_value_matches(&config_options, &model_id) {
         return Err(Error::new(
             "RECOVERY_REQUIRED",
             "ACP session/load did not read back the retained exact model",
@@ -2341,7 +2417,7 @@ async fn restore_session(
             "native_scope_key":session_id,
             "model_readback":model_id.clone(),
             "config_options":config_snapshot.clone(),
-            "history_updates":capture.lock().map(|capture| capture.history_updates).unwrap_or(0),
+            "history_updates":history_updates,
             "native_replay":false
         }),
     )?;
@@ -2352,11 +2428,6 @@ async fn restore_session(
             .capabilities
             .iter()
             .any(|capability| capability.as_str() == "native.command.close_session");
-    let owner_operation_id = saved["operation_id"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| invalid("retained ACP session omitted its owner Operation"))?
-        .to_owned();
     let session = ActiveSession {
         id: session_id,
         owner_operation_id,
@@ -3266,32 +3337,52 @@ fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Va
     Ok(snapshot)
 }
 
-fn model_value_available(options: &Value, requested: &str) -> bool {
-    options.as_array().is_some_and(|options| {
-        options.iter().any(|option| {
-            option["id"] == "model"
-                && option
-                    .get("options")
-                    .and_then(Value::as_array)
-                    .is_some_and(|values| {
-                        values.iter().any(|value| {
-                            value["value"] == requested
-                                || value["value"]["id"] == requested
-                                || value["id"] == requested
-                        })
-                    })
-        })
-    })
+fn model_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    requested: &str,
+) -> Option<&'a SessionConfigOption> {
+    let mut candidates = options.iter().filter(|option| {
+        let category_is_model_candidate = matches!(
+            option.category.as_ref(),
+            None | Some(SessionConfigOptionCategory::Model)
+                | Some(SessionConfigOptionCategory::Other(_))
+        );
+        if !category_is_model_candidate {
+            return false;
+        }
+        let SessionConfigKind::Select(select) = &option.kind else {
+            return false;
+        };
+        match &select.options {
+            SessionConfigSelectOptions::Ungrouped(values) => values
+                .iter()
+                .any(|value| value.value.to_string() == requested),
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .any(|value| value.value.to_string() == requested),
+            _ => false,
+        }
+    });
+    let option = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(option)
 }
 
-fn model_current_value_matches(options: &Value, requested: &str) -> bool {
-    options.as_array().is_some_and(|options| {
-        options.iter().any(|option| {
-            option["id"] == "model"
-                && (option["currentValue"] == requested
-                    || option["currentValue"]["value"] == requested
-                    || option["currentValue"]["id"] == requested)
-        })
+fn model_config_option_id(options: &[SessionConfigOption], requested: &str) -> Option<String> {
+    model_config_option(options, requested).map(|option| option.id.to_string())
+}
+
+fn model_value_available(options: &[SessionConfigOption], requested: &str) -> bool {
+    model_config_option(options, requested).is_some()
+}
+
+fn model_current_value_matches(options: &[SessionConfigOption], requested: &str) -> bool {
+    model_config_option(options, requested).is_some_and(|option| {
+        matches!(&option.kind, SessionConfigKind::Select(select)
+            if select.current_value.to_string() == requested)
     })
 }
 
@@ -3299,6 +3390,37 @@ fn command_model(route: &Value) -> Option<&str> {
     route["native_options"]["modelId"]
         .as_str()
         .filter(|model| !model.trim().is_empty() && model.trim() == *model && model.len() <= 256)
+}
+
+fn validate_acp_route(route: &Value) -> Result<()> {
+    let options = route["native_options"]
+        .as_object()
+        .ok_or_else(|| Error::new("CONFIGURATION_UNSUPPORTED", "ACP route options are missing"))?;
+    if options
+        .keys()
+        .any(|key| !matches!(key.as_str(), "workspaceRoot" | "modelId"))
+    {
+        return Err(Error::new(
+            "CONFIGURATION_UNSUPPORTED",
+            "Command ACP routes support workspaceRoot and modelId only; effort and mode are unavailable",
+        ));
+    }
+    if options["workspaceRoot"]
+        .as_str()
+        .is_none_or(|workspace| !Path::new(workspace).is_absolute())
+    {
+        return Err(Error::new(
+            "WORKSPACE_INVALID",
+            "Command ACP route requires an absolute workspaceRoot",
+        ));
+    }
+    if command_model(route).is_none() {
+        return Err(Error::new(
+            "COMMAND_MODEL_REQUIRED",
+            "Command ACP route requires an exact modelId",
+        ));
+    }
+    Ok(())
 }
 
 fn update_text(update: &SessionUpdate) -> Option<&str> {
@@ -3428,7 +3550,7 @@ fn acp_state(
                 "refresh":"exact_session_and_capture_readback",
                 "send":"next_turn_only",
                 "steer":"unavailable",
-                "configure":"route_model_immutable_after_verified_open",
+                "configure":"unavailable",
                 "reply":"exact_live_permission_fingerprint_and_one_time_native_option",
                 "close":if close_supported {"advertised_session_close_with_response"} else {"unavailable"},
                 "recover":"exact_session_load_if_advertised; no_prompt_replay",
@@ -3656,8 +3778,26 @@ fn invalid(message: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
+    use agent_client_protocol::{
+        Channel, Client, RawJsonRpcMessage, RawJsonRpcParams, TransportBatch, TransportFrame,
+        schema::{
+            ProtocolVersion,
+            v1::{
+                AgentCapabilities, ContentBlock, ContentChunk, InitializeResponse,
+                LoadSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
+                SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
+                TextContent,
+            },
+        },
+    };
+    use futures::StreamExt as _;
     use serde_json::{Value, json};
     use swarm_contracts::{
         EffectOutcome, RuntimeCommand, RuntimeOutcome,
@@ -3666,7 +3806,11 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use super::{AcpJournal, PreparedAcpDispatch, acp_prompt, digest};
+    use super::{
+        AcpJournal, PreparedAcpDispatch, acp_prompt, add_family_custody_facts,
+        capture_session_notification, digest, load_retained_session, stop_direct_child,
+        validate_acp_route, validate_restore_identity,
+    };
 
     struct TestState {
         state_dir: PathBuf,
@@ -3789,6 +3933,470 @@ mod tests {
         })
     }
 
+    fn restore_command() -> RuntimeCommand {
+        let mut command = permission_reply_command();
+        command.method = "agent.open".to_owned();
+        command
+    }
+
+    fn retained_session_fixture(state: &TestState) -> Value {
+        json!({
+            "schema_version":1,
+            "artifact_id":super::ACP_ARTIFACT_ID,
+            "binding_id":"binding-fixture",
+            "binding_generation":1,
+            "operation_id":"op-retained-open",
+            "native_session_id":"session-retained",
+            "native_root_id":"session-retained",
+            "native_scope_key":"session-retained",
+            "workspace":state.state_dir,
+            "requested_model":"fixture-model",
+            "native_session_state":"open"
+        })
+    }
+
+    fn restore_route(state: &TestState) -> Value {
+        json!({
+            "native_options":{
+                "workspaceRoot":state.state_dir,
+                "modelId":"fixture-model"
+            }
+        })
+    }
+
+    #[test]
+    fn pr44_command_acp_route_rejects_effort_and_mode_instead_of_ignoring_them() {
+        let workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        let route = json!({"native_options":{"workspaceRoot":workspace,"modelId":"fixture-model"}});
+        assert!(validate_acp_route(&route).is_ok());
+
+        let mut effort = route.clone();
+        effort["native_options"]["effort"] = json!("high");
+        assert_eq!(
+            validate_acp_route(&effort).unwrap_err().code,
+            "CONFIGURATION_UNSUPPORTED"
+        );
+
+        let mut mode = route.clone();
+        mode["native_options"]["mode"] = json!("plan");
+        assert_eq!(
+            validate_acp_route(&mode).unwrap_err().code,
+            "CONFIGURATION_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn pr44_command_acp_restore_identity_requires_exact_binding_workspace_and_model_before_effects()
+    -> super::Result<()> {
+        let state = TestState::new()?;
+        let saved = retained_session_fixture(&state);
+        state.journal.save_session(&saved)?;
+        let route = restore_route(&state);
+
+        let identity = validate_restore_identity(&saved, "binding-fixture", 1, &route, true)?;
+        assert_eq!(identity.session_text, "session-retained");
+        assert_eq!(identity.session_id.to_string(), "session-retained");
+        assert_eq!(identity.model_id, "fixture-model");
+
+        assert_error_code(
+            validate_restore_identity(&saved, "other-binding", 1, &route, true),
+            "RECOVERY_REQUIRED",
+        );
+        assert_error_code(
+            validate_restore_identity(&saved, "binding-fixture", 1, &route, false),
+            "RECOVERY_REQUIRED",
+        );
+        let mut changed_model = route.clone();
+        changed_model["native_options"]["modelId"] = json!("other-model");
+        assert_error_code(
+            validate_restore_identity(&saved, "binding-fixture", 1, &changed_model, true),
+            "NATIVE_IDENTITY_MISMATCH",
+        );
+        assert_eq!(state.journal.read_session()?, Some(saved));
+        assert_eq!(journal_effect_count(&state, &restore_command())?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pr44_command_acp_restore_intent_coalesces_and_changed_target_conflicts() -> super::Result<()>
+    {
+        let state = TestState::new()?;
+        let command = restore_command();
+        let target = json!({
+            "native_session_id":"session-retained",
+            "native_root_id":"session-retained",
+            "native_scope_key":"session-retained",
+            "native_replay":false
+        });
+        state
+            .journal
+            .record_effect(&command, "session/load", "intent", target.clone())?;
+        state
+            .journal
+            .record_effect(&command, "session/load", "intent", target)?;
+        assert_eq!(journal_effect_count(&state, &command)?, 1);
+
+        assert_error_code(
+            state.journal.record_effect(
+                &command,
+                "session/load",
+                "intent",
+                json!({
+                    "native_session_id":"different-session",
+                    "native_root_id":"different-session",
+                    "native_scope_key":"different-session",
+                    "native_replay":false
+                }),
+            ),
+            "ADAPTER_EVIDENCE_CONFLICT",
+        );
+        assert_eq!(journal_effect_count(&state, &command)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_family_stays_unknown_after_direct_child_exit() {
+        let owner = tokio::process::Command::new(
+            std::env::current_exe().expect("test executable path is available"),
+        )
+        .args([
+            "--exact",
+            "adapter::acp::tests::acp_family_fixture_owner",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("isolated owner helper starts");
+        let output = tokio::time::timeout(Duration::from_secs(8), owner.wait_with_output())
+            .await
+            .expect("isolated owner helper finishes within its bound")
+            .expect("isolated owner helper exit is observable");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("acp_family_fixture_owner ... ok"),
+            "isolated helper ran the exact family fixture"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawned only by the bounded ACP process-family fixture"]
+    async fn acp_family_fixture_owner() {
+        let token = format!("pr44-acp-family-{}", Uuid::new_v4());
+        let group = swarm_process::Group::enter_module(&token)
+            .expect("isolated fixture obtains its own process family");
+        let mut direct_child = tokio::process::Command::new(
+            std::env::current_exe().expect("test executable path is available"),
+        )
+        .args([
+            "--exact",
+            "adapter::acp::tests::acp_family_fixture_direct_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("fixture ACP child starts");
+        let status = tokio::time::timeout(Duration::from_secs(3), direct_child.wait())
+            .await
+            .expect("fixture ACP child exits within its bound")
+            .expect("fixture ACP child exit is observable");
+        assert!(status.success());
+
+        let direct_exit = stop_direct_child(&mut direct_child).await;
+        assert!(direct_exit.observed);
+        let mut receipt = json!({});
+        add_family_custody_facts(&mut receipt, &direct_exit);
+        assert_eq!(receipt["direct_child_exit_observed"], true);
+        assert_eq!(receipt["family_departure_claimed"], false);
+        assert_eq!(receipt["owner_family_departure_required"], true);
+        assert!(
+            !group
+                .children_empty()
+                .expect("exact fixture family is observable"),
+            "the controlled grandchild outlives its direct ACP wrapper"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(
+            group
+                .children_empty()
+                .expect("exact fixture family remains observable")
+        );
+        group
+            .disarm()
+            .expect("fixture owner disarms only after family departure");
+    }
+
+    #[test]
+    #[ignore = "spawned only by the bounded ACP process-family fixture"]
+    fn acp_family_fixture_direct_child() {
+        let grandchild = std::process::Command::new(
+            std::env::current_exe().expect("test executable path is available"),
+        )
+        .args([
+            "--exact",
+            "adapter::acp::tests::acp_family_fixture_grandchild",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("controlled fixture grandchild starts");
+        drop(grandchild);
+    }
+
+    #[test]
+    #[ignore = "spawned only by the bounded ACP process-family fixture"]
+    fn acp_family_fixture_grandchild() {
+        std::thread::sleep(Duration::from_millis(1200));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_restore_routes_pre_response_history_to_the_retained_session() {
+        let session_id = SessionId::new("session-retained");
+        let peer_session_id = session_id.clone();
+        let session_text = session_id.to_string();
+        let workspace = std::env::temp_dir().join("swarm-command-acp-restore-fixture");
+        let client_workspace = workspace.clone();
+        let peer_workspace = workspace.clone();
+        let capture = Arc::new(Mutex::new(super::Capture::default()));
+        let notification_capture = Arc::clone(&capture);
+        let load_capture = Arc::clone(&capture);
+        let (transport, mut peer) = Channel::duplex();
+
+        let client = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _connection| {
+                    if let Ok(mut capture) = notification_capture.lock() {
+                        capture_session_notification(&mut capture, &notification);
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(transport, async move |connection| {
+                let features = super::initialize(&connection).await?;
+                assert!(features.load_session_supported);
+                let loaded = load_retained_session(
+                    &connection,
+                    &load_capture,
+                    &session_text,
+                    &session_id,
+                    &client_workspace,
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                let options = loaded.config_options.unwrap_or_default();
+                assert!(super::model_current_value_matches(
+                    &options,
+                    "fixture-model"
+                ));
+                Ok(())
+            });
+
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(initialize))) =
+                peer.rx.next().await
+            else {
+                panic!("expected ACP initialize request")
+            };
+            assert_eq!(initialize.method.as_ref(), "initialize");
+            let initialize_response = InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::new().load_session(true));
+            peer.tx
+                .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
+                    initialize.id,
+                    Ok(serde_json::to_value(initialize_response)
+                        .expect("initialize response serializes")),
+                )))
+                .expect("client accepts initialize response");
+
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(load))) =
+                peer.rx.next().await
+            else {
+                panic!("expected exact session/load request")
+            };
+            assert_eq!(load.method.as_ref(), "session/load");
+            let Some(RawJsonRpcParams::Object(params)) = load.params else {
+                panic!("session/load parameters are an object")
+            };
+            assert_eq!(params["sessionId"], "session-retained");
+            assert_eq!(params["cwd"], peer_workspace.to_string_lossy().as_ref());
+
+            let notification = SessionNotification::new(
+                peer_session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new("replayed history"),
+                ))),
+            );
+            let update = RawJsonRpcMessage::notification(
+                "session/update".to_owned(),
+                serde_json::to_value(notification).expect("history notification serializes"),
+            )
+            .expect("history notification is valid JSON-RPC");
+            let response = RawJsonRpcMessage::response(
+                load.id,
+                Ok(
+                    serde_json::to_value(LoadSessionResponse::new().config_options(vec![
+                        SessionConfigOption::select(
+                            "command-model-choice",
+                            "Model",
+                            "fixture-model",
+                            vec![SessionConfigSelectOption::new(
+                                "fixture-model",
+                                "Fixture Model",
+                            )],
+                        )
+                        .category(SessionConfigOptionCategory::Model),
+                    ]))
+                    .expect("load response serializes"),
+                ),
+            );
+            let batch = TransportBatch::from_messages([update, response])
+                .expect("pre-response replay batch is non-empty");
+            peer.tx
+                .unbounded_send(TransportFrame::Batch(batch))
+                .expect("client accepts replay before load response");
+
+            let mut later_requests = Vec::new();
+            while let Some(frame) = peer.rx.next().await {
+                if let TransportFrame::Single(RawJsonRpcMessage::Request(request)) = frame {
+                    later_requests.push(request.method);
+                }
+            }
+            assert!(
+                later_requests.is_empty(),
+                "restore sent another ACP request"
+            );
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("ACP restore fixture timed out")
+        .expect("ACP restore fixture failed");
+
+        let capture = capture.lock().expect("capture lock remains usable");
+        assert_eq!(
+            capture.native_session_id.as_deref(),
+            Some("session-retained")
+        );
+        assert_eq!(capture.history_updates, 1);
+        assert_eq!(capture.output_total_bytes, 0);
+        assert!(capture.output.is_empty());
+        assert!(!capture.history_replaying);
+        assert!(capture.protocol_error.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_restore_failure_does_not_fallback_or_replay() {
+        let session_id = SessionId::new("session-retained");
+        let peer_session_id = session_id.clone();
+        let session_text = session_id.to_string();
+        let workspace = std::env::temp_dir().join("swarm-command-acp-failed-restore-fixture");
+        let capture = Arc::new(Mutex::new(super::Capture::default()));
+        let notification_capture = Arc::clone(&capture);
+        let load_capture = Arc::clone(&capture);
+        let (transport, mut peer) = Channel::duplex();
+
+        let client = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _connection| {
+                    if let Ok(mut capture) = notification_capture.lock() {
+                        capture_session_notification(&mut capture, &notification);
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(transport, async move |connection| {
+                let features = super::initialize(&connection).await?;
+                assert!(features.load_session_supported);
+                let error = load_retained_session(
+                    &connection,
+                    &load_capture,
+                    &session_text,
+                    &session_id,
+                    &workspace,
+                )
+                .await
+                .expect_err("failed native load cannot create a replacement session");
+                assert_eq!(error.code, "RECOVERY_REQUIRED");
+                Ok(())
+            });
+
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(initialize))) =
+                peer.rx.next().await
+            else {
+                panic!("expected ACP initialize request")
+            };
+            let initialize_response = InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::new().load_session(true));
+            peer.tx
+                .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
+                    initialize.id,
+                    Ok(serde_json::to_value(initialize_response)
+                        .expect("initialize response serializes")),
+                )))
+                .expect("client accepts initialize response");
+
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(load))) =
+                peer.rx.next().await
+            else {
+                panic!("expected exact session/load request")
+            };
+            assert_eq!(load.method.as_ref(), "session/load");
+            let Some(RawJsonRpcParams::Object(params)) = load.params else {
+                panic!("session/load parameters are an object")
+            };
+            assert_eq!(params["sessionId"], peer_session_id.to_string());
+            peer.tx
+                .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
+                    load.id,
+                    Err(agent_client_protocol::Error::invalid_params()),
+                )))
+                .expect("client accepts failed load response");
+
+            let mut later_requests = Vec::new();
+            while let Some(frame) = peer.rx.next().await {
+                if let TransportFrame::Single(RawJsonRpcMessage::Request(request)) = frame {
+                    later_requests.push(request.method);
+                }
+            }
+            assert!(
+                later_requests.is_empty(),
+                "failed restore attempted a fallback request"
+            );
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("failed ACP restore fixture timed out")
+        .expect("failed ACP restore fixture failed");
+
+        let capture = capture.lock().expect("capture lock remains usable");
+        assert_eq!(
+            capture.native_session_id.as_deref(),
+            Some("session-retained")
+        );
+        assert!(!capture.history_replaying);
+        assert!(capture.output.is_empty());
+    }
+
     #[test]
     fn persistent_permission_rejects_before_once_only_intent() -> super::Result<()> {
         let state = TestState::new()?;
@@ -3828,10 +4436,11 @@ mod tests {
     }
 
     #[test]
-    fn config_option_snapshot_keeps_only_typed_ids_and_values() -> super::Result<()> {
+    fn pr44_command_acp_config_option_snapshot_keeps_typed_values_and_resolves_model_id()
+    -> super::Result<()> {
         let options: Vec<super::SessionConfigOption> = serde_json::from_value(json!([
             {
-                "id":"model",
+                "id":"command-model-choice",
                 "name":"Model",
                 "category":"model",
                 "description":"display-only model label",
@@ -3867,12 +4476,40 @@ mod tests {
         ]))?;
         let snapshot = super::session_config_options_snapshot(&options)?;
         assert_eq!(
+            super::model_config_option_id(&options, "model-a").as_deref(),
+            Some("command-model-choice")
+        );
+        assert!(super::model_value_available(&options, "model-a"));
+        assert!(super::model_current_value_matches(&options, "model-a"));
+        assert!(!super::model_current_value_matches(&options, "model-b"));
+        let untagged = vec![SessionConfigOption::select(
+            "provider-specific-model-option",
+            "Model",
+            "model-a",
+            vec![SessionConfigSelectOption::new("model-a", "Model A")],
+        )];
+        assert_eq!(
+            super::model_config_option_id(&untagged, "model-a").as_deref(),
+            Some("provider-specific-model-option")
+        );
+        let mut ambiguous = untagged.clone();
+        ambiguous.push(
+            SessionConfigOption::select(
+                "custom-option",
+                "Custom",
+                "model-a",
+                vec![SessionConfigSelectOption::new("model-a", "Same value")],
+            )
+            .category(SessionConfigOptionCategory::Other("custom".to_owned())),
+        );
+        assert!(super::model_config_option_id(&ambiguous, "model-a").is_none());
+        assert_eq!(
             snapshot,
             json!({
                 "schema_version":1,
                 "options":[
                     {
-                        "id":"model",
+                        "id":"command-model-choice",
                         "kind":"select",
                         "allowed_value_ids":["model-a","model-b"],
                         "current_value_id":"model-a"
