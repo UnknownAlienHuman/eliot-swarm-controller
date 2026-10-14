@@ -616,15 +616,6 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
               throw 'The official LLVM installation did not provide libclang.dll.'
             }
-          } elseif ($env:QUALIFICATION -ceq 'focused-isolation') {
-            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'legacy_worker_demand_poison_tests' -Expected 4 -ExpectedNames @(
-              'legacy_demand_poison_reaches_existing_check_and_launch_isolators',
-              'legacy_demand_quarantined_launch_is_stable_and_changed_bytes_reactivate',
-              'legacy_demand_corrupt_entry_and_route_activate_only_existing_owners',
-              'legacy_demand_valid_bits_and_actual_schema_failure_remain_distinct'
-            )
-            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'store_authenticated_task_list_delta_bounded_gap_tail_recovery' -Expected 1 -ExpectedNames @('store_authenticated_task_list_delta_bounded_gap_tail_recovery')
-            Invoke-FocusedCohort -Package 'swarm-script-worker' -Filter 'script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256' -Expected 1 -ExpectedNames @('script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256')
           } else {
             & sudo apt-get update
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -741,6 +732,15 @@ jobs:
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'unknown_effect_handover_fences_former_gm_and_continues_exact_owner' -Expected 1 -ExpectedNames @('unknown_effect_handover_fences_former_gm_and_continues_exact_owner')
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 're_promoted_gm_does_not_make_an_old_queued_epoch_current_again' -Expected 1 -ExpectedNames @('re_promoted_gm_does_not_make_an_old_queued_epoch_current_again')
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'attempt_control_requires_current_gm_scope_and_exact_live_attempt' -Expected 1 -ExpectedNames @('attempt_control_requires_current_gm_scope_and_exact_live_attempt')
+          } elseif ($env:QUALIFICATION -ceq 'focused-isolation') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'legacy_worker_demand_poison_tests' -Expected 4 -ExpectedNames @(
+              'legacy_demand_poison_reaches_existing_check_and_launch_isolators',
+              'legacy_demand_quarantined_launch_is_stable_and_changed_bytes_reactivate',
+              'legacy_demand_corrupt_entry_and_route_activate_only_existing_owners',
+              'legacy_demand_valid_bits_and_actual_schema_failure_remain_distinct'
+            )
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'store_authenticated_task_list_delta_bounded_gap_tail_recovery' -Expected 1 -ExpectedNames @('store_authenticated_task_list_delta_bounded_gap_tail_recovery')
+            Invoke-FocusedCohort -Package 'swarm-script-worker' -Filter 'script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256' -Expected 1 -ExpectedNames @('script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256')
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
