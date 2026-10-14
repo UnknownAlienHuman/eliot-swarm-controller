@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision]
 permissions:
   contents: read
 jobs:
@@ -845,6 +845,7 @@ jobs:
             }
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "ScriptWorker SHA-256: $workerHash"
             foreach ($case in @(
+              'attempt_release_fresh_request_noop_retains_public_operation_task_scope',
               'script_run_missing_row_cannot_grant_repointed_task_and_caller_replay_survives',
               'malformed_public_operation_relations_fail_closed',
               'generic_operation_get_list_delta_bound_relations_and_hide_private_decision_text',
@@ -865,6 +866,29 @@ jobs:
               'schema_cache_exact_cold_and_warm_factory_counts',
               'schema_cache_registry_cold_and_warm_cost_is_bounded_by_static_slots'
             )
+          } elseif ($env:QUALIFICATION -ceq 'focused-start-decision') {
+            foreach ($case in @('exact_publication_failure_stays_unknown_until_retry_barrier_succeeds', 'concurrent_same_bytes_cannot_skip_its_own_barrier')) {
+              Invoke-FocusedCohort -Package 'swarm-process' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            if ($IsWindows) {
+              Invoke-FocusedCohort -Package 'swarm-process' -Filter 'windows_write_through_publication_and_existing_exact_convergence' -Expected 1 -ExpectedNames @('windows_write_through_publication_and_existing_exact_convergence')
+            }
+            Invoke-FocusedCohort -Package 'swarm-script-worker' -Filter 'publication_failure_fault_fixture' -Expected 3 -ExpectedNames @(
+              'writer_error_does_not_release_pending_or_unknown_family_custody',
+              'concurrent_public_decisions_reopen_one_winner_and_conflict_without_overwrite',
+              'same_semantic_decision_retry_preserves_first_durable_bytes'
+            )
+            foreach ($case in @(
+              'store_allow_keeps_visible_decision_unknown_before_plan_materialization',
+              'concurrent_worker_reader_cannot_bypass_inflight_allow_barrier',
+              'store_deny_keeps_visible_decision_unknown_until_retry_barrier',
+              'store_allow_and_deny_race_retains_one_decision_across_reopen',
+              'store_start_decision_reads_legacy_receipts_and_rejects_ambiguity',
+              'store_allow_rejects_a_reparse_decision_path_without_changing_its_target',
+              'uncertain_allow_equal_retry_requires_durable_decision_identity'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
