@@ -1061,9 +1061,8 @@ fn launch_document_text<'a>(
     value: &'a Value,
     key: &str,
 ) -> Result<&'a str> {
-    text_at(value, key).map_err(|error| {
+    text_at(value, key).inspect_err(|_| {
         damage_context.record_operation_request();
-        error
     })
 }
 
@@ -1072,9 +1071,8 @@ fn launch_document_positive(
     value: &Value,
     key: &str,
 ) -> Result<i64> {
-    positive_at(value, key).map_err(|error| {
+    positive_at(value, key).inspect_err(|_| {
         damage_context.record_operation_request();
-        error
     })
 }
 
@@ -1493,7 +1491,8 @@ pub(crate) fn current_mcp_launch_snapshot(
     config: &Config,
     operation_id: &str,
 ) -> Result<NativeMcpLaunchSnapshot> {
-    current_mcp_launch_snapshot_for_tools(db, config, operation_id).map_err(|failure| failure.error)
+    current_mcp_launch_snapshot_for_tools(db, config, operation_id)
+        .map_err(|failure| *failure.error)
 }
 
 pub(super) fn current_mcp_launch_snapshot_for_tools(
@@ -1569,7 +1568,8 @@ pub(crate) fn revalidate_mcp_launch_snapshot(
     config: &Config,
     snapshot: &NativeMcpLaunchSnapshot,
 ) -> Result<()> {
-    revalidate_mcp_launch_snapshot_for_tools(db, config, snapshot).map_err(|failure| failure.error)
+    revalidate_mcp_launch_snapshot_for_tools(db, config, snapshot)
+        .map_err(|failure| *failure.error)
 }
 
 pub(super) fn revalidate_mcp_launch_snapshot_for_tools(
@@ -2056,14 +2056,14 @@ pub(super) struct LauncherDamageEvidence {
 
 #[derive(Debug, Clone)]
 pub(super) struct LauncherFactsFailure {
-    pub(super) error: Error,
+    pub(super) error: Box<Error>,
     pub(super) damage: Option<LauncherDamageEvidence>,
 }
 
 impl From<Error> for LauncherFactsFailure {
     fn from(error: Error) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             damage: None,
         }
     }
@@ -2094,7 +2094,7 @@ impl LauncherFactsDamageContext {
 
     fn failure(&mut self, error: Error) -> LauncherFactsFailure {
         LauncherFactsFailure {
-            error,
+            error: Box::new(error),
             damage: self.damage.take(),
         }
     }

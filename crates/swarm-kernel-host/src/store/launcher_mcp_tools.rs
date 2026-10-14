@@ -144,7 +144,7 @@ impl Store {
             Ok(facts) => facts,
             Err(failure) => {
                 *launch_facts_failure = Some(failure.clone());
-                return Err(failure.error);
+                return Err(*failure.error);
             }
         };
 
@@ -526,7 +526,7 @@ impl Store {
                     {
                         false
                     }
-                    Err(failure) => return Err(failure.error),
+                    Err(failure) => return Err(*failure.error),
                 },
             };
             let stale_error = error_code
@@ -3117,7 +3117,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 if isolate_tools_launch_facts_failure(tx, &operation_id, &failure, now)? {
                     continue;
                 }
-                return Err(failure.error);
+                return Err(*failure.error);
             }
         };
 
