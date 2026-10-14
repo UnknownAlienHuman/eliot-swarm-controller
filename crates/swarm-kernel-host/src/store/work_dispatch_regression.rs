@@ -302,7 +302,7 @@ async fn seed_unknown_launch(
         .unwrap();
     operation_id
 }
- 
+
 /// Seed a pending-workspace launch that stays route-held: its isolated
 /// hold scope is pre-damaged (`capacity:<hold-scope>` = `{}`), so every
 /// examination retains admission (refreshing `updated_at_ms`) and holds
@@ -1039,11 +1039,30 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         })
         .await
         .unwrap();
-    assert_eq!(hold_stamps_before.as_array().unwrap().len(), 8, "{hold_stamps_before}");
-    assert_eq!(hold_stamps_after.as_array().unwrap().len(), 8, "{hold_stamps_after}");
-    for (before, after) in hold_stamps_before.as_array().unwrap().iter().zip(hold_stamps_after.as_array().unwrap()) {
-        assert_eq!(before["operation_id"], after["operation_id"], "{before} {after}");
-        assert_eq!(before["created_at_ms"], after["created_at_ms"], "immutable creation order never moves {before} {after}");
+    assert_eq!(
+        hold_stamps_before.as_array().unwrap().len(),
+        8,
+        "{hold_stamps_before}"
+    );
+    assert_eq!(
+        hold_stamps_after.as_array().unwrap().len(),
+        8,
+        "{hold_stamps_after}"
+    );
+    for (before, after) in hold_stamps_before
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(hold_stamps_after.as_array().unwrap())
+    {
+        assert_eq!(
+            before["operation_id"], after["operation_id"],
+            "{before} {after}"
+        );
+        assert_eq!(
+            before["created_at_ms"], after["created_at_ms"],
+            "immutable creation order never moves {before} {after}"
+        );
         assert!(
             after["updated_at_ms"].as_i64().unwrap() > before["updated_at_ms"].as_i64().unwrap(),
             "route-held admission refresh must move updated_at_ms {before} {after}"
@@ -1056,13 +1075,23 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
                 .expect("the considered page persists its cursor");
             Ok((
                 value["after"]["operation_id"].as_str().unwrap().to_owned(),
-                value["through"]["operation_id"].as_str().unwrap().to_owned(),
+                value["through"]["operation_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
             ))
         })
         .await
         .unwrap();
-    assert_eq!(selected_cursor.0, *hold_ids.last().unwrap(), "{selected_cursor:?}");
-    assert_eq!(selected_cursor.1, tail_id, "immutable ceiling still reaches the future tail");
+    assert_eq!(
+        selected_cursor.0,
+        *hold_ids.last().unwrap(),
+        "{selected_cursor:?}"
+    );
+    assert_eq!(
+        selected_cursor.1, tail_id,
+        "immutable ceiling still reaches the future tail"
+    );
 
     let cursor_failure = format!(
         "CREATE TRIGGER launch_cursor_checkpoint_hard_failure \

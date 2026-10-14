@@ -4059,6 +4059,16 @@ pub(super) fn pending_launches(
 /// candidate that was examined and left held. Admission refresh metadata and
 /// row timestamps are intentionally excluded because those are not progress.
 pub(super) fn launch_reconciliation_snapshot(db: &Connection, operation_id: &str) -> Result<Value> {
+    type LaunchSnapshotRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+    );
     let (
         state,
         task_id,
@@ -4068,16 +4078,7 @@ pub(super) fn launch_reconciliation_snapshot(db: &Connection, operation_id: &str
         native_refs,
         effective_raw,
         result_raw,
-    ): (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        String,
-        String,
-        Option<String>,
-    ) = db.query_row(
+    ): LaunchSnapshotRow = db.query_row(
         "SELECT state,task_id,attempt_id,binding_id,binding_generation,native_refs_json, \
                 effective_request_json,result_json \
          FROM operations WHERE operation_id=?1 AND method='swarm.launch'",

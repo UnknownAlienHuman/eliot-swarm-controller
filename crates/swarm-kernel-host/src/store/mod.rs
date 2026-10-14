@@ -3776,7 +3776,10 @@ fn parse_launch_reconcile_key(value: &Value) -> Result<launcher::LaunchReconcile
 fn delete_launch_reconcile_cursors(db: &Connection) -> Result<()> {
     db.execute(
         "DELETE FROM meta WHERE key IN (?1,?2)",
-        params![LAUNCH_RECONCILE_CURSOR_META_KEY, LAUNCH_RECONCILE_CURSOR_META_KEY_V1],
+        params![
+            LAUNCH_RECONCILE_CURSOR_META_KEY,
+            LAUNCH_RECONCILE_CURSOR_META_KEY_V1
+        ],
     )?;
     Ok(())
 }
@@ -3797,7 +3800,9 @@ fn read_launch_reconcile_cursor(db: &Connection) -> Result<Option<LaunchReconcil
             .get("through")
             .map(parse_launch_reconcile_key)
             .transpose()?
-            .ok_or_else(|| Error::new("LAUNCH_CURSOR_CORRUPT", "launch cursor has no scan ceiling"))?;
+            .ok_or_else(|| {
+                Error::new("LAUNCH_CURSOR_CORRUPT", "launch cursor has no scan ceiling")
+            })?;
         return Ok(Some(LaunchReconcileCursor { after, through }));
     }
     // Delivered old unpublished cursor: a leftover v1 cursor from the
