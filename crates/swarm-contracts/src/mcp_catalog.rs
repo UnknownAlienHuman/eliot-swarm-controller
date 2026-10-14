@@ -359,6 +359,8 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
             f("task_id", S),
             f("task_revision", I),
             f("attempt_id", S),
+            f("related_task_id", SN),
+            f("participant_id", SN),
             f("contract_key", S),
             f("path", S),
             f("symbol", S),
@@ -366,6 +368,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
             f("fields", A),
             f("limit", I),
             f("after_client_id", S),
+            f("after_scan_cursor", SN),
         ],
         &[],
     ),
@@ -411,6 +414,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
             f("attempt_id", S),
             f("limit", I),
             f("after_client_id", S),
+            f("after_scan_cursor", SN),
         ],
         &[],
     ),
@@ -426,6 +430,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
             f("attempt_id", S),
             f("limit", I),
             f("after_client_id", S),
+            f("after_scan_cursor", SN),
         ],
         &["contract_key"],
     ),
@@ -440,6 +445,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
             f("attempt_id", S),
             f("limit", I),
             f("after_client_id", S),
+            f("after_scan_cursor", SN),
         ],
         &["contract_key"],
     ),
@@ -3254,6 +3260,12 @@ fn refine_coordination_input_schema(method: &str, schema: &mut Value) {
             properties["after_message_seq"] =
                 json!({"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64});
             properties["limit"] = coordination_optional_page_limit_schema();
+        }
+        "coordination.peer.find"
+        | "coordination.work_card.list"
+        | "coordination.contract_card.get"
+        | "coordination.contract_card.list" => {
+            properties["after_scan_cursor"] = json!({"type":["string","null"],"minLength":1,"maxLength":16384,"pattern":"^coordination-scan-v1:","description":"Opaque caller-scoped scan position from next_scan_cursor; choose this or after_client_id, not both. Store enforces the UTF-8 byte limit and exact selector/caller scope."});
         }
         "coordination.thread.list" => {
             properties["task_id"] = coordination_id_schema();

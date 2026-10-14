@@ -813,7 +813,8 @@ async fn issue99_peer_find_advances_after_filtered_task_and_global_pages() {
                     "contract",
                     &contract_key_for_seed,
                 );
-                insert.execute(params![key, "{malformed"])?;
+                // Invalid index structure still obeys meta's JSON constraint.
+                insert.execute(params![key, "{}"])?;
             }
             drop(insert);
             let target_key = crate::coordination::global_relevance_key(
@@ -998,6 +999,16 @@ async fn issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards() {
     )
     .await;
 
+    for index in 0..101 {
+        publish_producer_contract_card(
+            &owner,
+            &source,
+            &format!("000-issue99-prefix-noise-{index:03}"),
+            &format!("issue99-prefix-noise-publish-{index:03}"),
+        )
+        .await;
+    }
+
     let source_id = source.client_id.clone();
     let contract_key_for_seed = contract_key.to_owned();
     owner
@@ -1009,17 +1020,6 @@ async fn issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards() {
                 scope.scope_id,
                 crate::coordination::key_component(&source_id),
             );
-            let mut insert = db.prepare("INSERT INTO meta(key,value_json) VALUES(?1,?2)")?;
-            for index in 0..101 {
-                let identity = format!("000-issue99-prefix-noise-{index:03}");
-                let key = format!("{prefix}{}", crate::coordination::key_component(&identity));
-                let dangling = format!("coordination:card:missing-issue99-prefix-{index:03}");
-                insert.execute(params![
-                    key,
-                    model::canonical(&json!({"card_key":dangling}))?
-                ])?;
-            }
-            drop(insert);
             let seam_key = format!(
                 "{prefix}{}",
                 crate::coordination::key_component(&contract_key_for_seed)
