@@ -162,7 +162,7 @@ async fn review_dispatch_explanation(fixture: &PublicationFixture, automation_id
         .owner
         .store
         .call(
-            fixture.manager.clone(),
+            principal("review-owner-v2", Role::Manager),
             "automation.config.explain".to_owned(),
             json!({"project_id":"fixture","automation_id":automation_id}),
         )
