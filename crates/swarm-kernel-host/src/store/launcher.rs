@@ -76,6 +76,13 @@ pub(super) fn route_admission(
     binding: Option<&Value>,
     exclude_operation_id: Option<&str>,
 ) -> Result<provider_conditions::RouteAdmissionProjection> {
+    let now_ms = model::now_ms()?;
+    if !route.enabled {
+        // A disabled route has no capacity or provider-state authority to
+        // inspect. Preserve the disabled decision even if either roster is
+        // damaged or the supplied binding cannot be decoded.
+        return provider_conditions::check_route(db, route, None, None, now_ms);
+    }
     let exclude_binding = binding
         .map(|binding| {
             Ok::<_, Error>((
@@ -89,7 +96,7 @@ pub(super) fn route_admission(
     } else {
         Some(0)
     };
-    provider_conditions::check_route(db, route, binding, root_claims, model::now_ms()?)
+    provider_conditions::check_route(db, route, binding, root_claims, now_ms)
 }
 
 pub(super) fn require_route_admission(

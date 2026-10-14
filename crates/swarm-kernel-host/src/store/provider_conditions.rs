@@ -854,6 +854,11 @@ pub(super) fn check_route(
     root_claims: Option<u32>,
     now_ms: i64,
 ) -> Result<RouteAdmissionProjection> {
+    if !route.enabled {
+        // Route state outranks binding parsing and retained provider facts.
+        // The launcher also avoids reading the root roster for this case.
+        return route_admission(db, route, None, root_claims, now_ms);
+    }
     let route_value = serde_json::to_value(route)?;
     let scope = match binding {
         Some(binding) => Some(scope_for_binding(binding)?),

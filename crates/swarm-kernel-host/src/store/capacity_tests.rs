@@ -573,6 +573,40 @@ fn assert_root_admission_unknown(db: &Connection, route: &crate::config::Route) 
     ));
 }
 
+#[test]
+fn provider_route_disabled_short_circuits_root_roster_and_binding_reads() {
+    // Disabled route state must remain authoritative when neither the
+    // capacity nor provider-condition schema can be read.
+    let db = Connection::open_in_memory().unwrap();
+    let mut route = root_admission_route();
+    route.enabled = false;
+    let malformed_binding = json!({"binding_id":"disabled-route-binding","generation":0});
+
+    let admission = launcher::route_admission(
+        &db,
+        &route,
+        Some(&malformed_binding),
+        Some("disabled-route-operation"),
+    )
+    .expect("disabled routes do not depend on roster or binding reads");
+
+    assert!(matches!(
+        admission.decision,
+        provider_conditions::RouteAdmissionDecision::Unavailable { ref code }
+            if code == "ROUTE_DISABLED_OR_MISSING"
+    ));
+    assert_eq!(
+        admission.condition,
+        provider_conditions::ConditionProjection::ConditionUnobserved
+    );
+    assert_eq!(
+        admission.root_limit,
+        provider_conditions::RootLimitProjection::CapacityUnknown {
+            max_concurrent_roots: 2
+        }
+    );
+}
+
 fn insert_retained_root_claim_operation(
     db: &Connection,
     route: &crate::config::Route,
@@ -927,20 +961,6 @@ fn public_agent_open_is_rejected_at_the_exact_root_limit_before_binding() {
     db.execute_batch(WORKSPACE_SCHEMA).unwrap();
     db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
     let route = root_admission_route();
-    insert_task(&db, "task-placeholder");
-
-    for operation_id in ["public-root-claim-1", "public-root-claim-2"] {
-        let admission = serde_json::to_value(
-            launcher::route_admission(&db, &route, None, Some(operation_id)).unwrap(),
-        )
-        .unwrap();
-        insert_retained_root_claim_operation(&db, &route, operation_id, admission);
-    }
-    assert_eq!(
-        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
-        Some(2)
-    );
-
     let operator_id = "public-root-limit-operator";
     db.execute(
         "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
@@ -963,10 +983,129 @@ fn public_agent_open_is_rejected_at_the_exact_root_limit_before_binding() {
         read_scope_principal(operator_id, crate::model::Role::Operator),
     )
     .unwrap();
+    let mut other_route = route.clone();
+    other_route.alias = "oc-other".to_owned();
     let config = Config {
-        routes: vec![route.clone()],
+        routes: vec![route.clone(), other_route],
         ..Config::default()
     };
+
+    let mut first_binding_id = None;
+    for (index, (client_request_id, lane_id)) in [
+        ("public-root-reservation-1", "public-root-lane-1"),
+        ("public-root-reservation-2", "public-root-lane-2"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = json!({
+            "client_request_id":client_request_id,
+            "lane_id":lane_id,
+            "route":"oc"
+        });
+        let opened = super::mutate(&mut db, &principal, "agent.open", &request, &config)
+            .expect("each public root reservation fits below the configured limit");
+        assert_eq!(opened["state"], "queued");
+        if index == 0 {
+            first_binding_id = opened["binding_id"].as_str().map(str::to_owned);
+        }
+        assert_eq!(
+            capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+            Some(index as u32 + 1),
+            "the Store API retains each exact public root reservation"
+        );
+    }
+
+    db.execute_batch(PROVIDER_CONDITION_SCHEMA).unwrap();
+    let first_binding_id = first_binding_id.expect("the first public open returns its binding");
+    db.execute(
+        "UPDATE bindings SET state='ready', \
+         state_json=json_set(state_json,'$.connection','connected') \
+         WHERE binding_id=?1 AND generation=1",
+        [&first_binding_id],
+    )
+    .unwrap();
+    let current_binding = operations::get_binding(&db, &first_binding_id, 1).unwrap();
+    let current_admission =
+        runtime::binding_route_admission(&db, &current_binding, Some(&config), None).unwrap();
+    assert_eq!(
+        current_admission.root_limit,
+        provider_conditions::RootLimitProjection::WithinLimit {
+            max_concurrent_roots: 2,
+            current_claims: 1,
+        },
+        "only the current binding is excluded from the two-root roster"
+    );
+    assert!(matches!(
+        current_admission.decision,
+        provider_conditions::RouteAdmissionDecision::Admit
+    ));
+    let dispatch_attempt_id = "public-root-dispatch-attempt";
+    let dispatch_task_id = "public-root-dispatch-task";
+    insert_attempt(
+        &db,
+        dispatch_attempt_id,
+        dispatch_task_id,
+        &first_binding_id,
+        "reserved",
+        json!([]),
+    );
+    db.execute(
+        "UPDATE attempts SET owner_id=?2,task_snapshot_json=?3 WHERE attempt_id=?1",
+        params![
+            dispatch_attempt_id,
+            operator_id,
+            model::canonical(&json!({"revision":1,"brief":{},"spec":{}})).unwrap()
+        ],
+    )
+    .unwrap();
+    let dispatch_request = json!({
+        "client_request_id":"public-root-task-dispatch",
+        "attempt_id":dispatch_attempt_id,
+        "text":"dispatch on the existing root"
+    });
+    super::mutate(
+        &mut db,
+        &principal,
+        "task.dispatch",
+        &dispatch_request,
+        &config,
+    )
+    .expect("Task dispatch excludes only its existing root binding at the limit");
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(2),
+        "a Task dispatch on one binding does not add a root claim"
+    );
+
+    let conflicting_request = json!({
+        "client_request_id":"public-root-reservation-1",
+        "lane_id":"public-root-conflicting-lane",
+        "route":"oc-other"
+    });
+    let conflict = super::mutate(
+        &mut db,
+        &principal,
+        "agent.open",
+        &conflicting_request,
+        &config,
+    )
+    .expect_err("a changed route cannot reuse the first root reservation identity");
+    assert_eq!(conflict.code, "REQUEST_ID_CONFLICT");
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(2),
+        "the conflicting request does not shadow or replace a retained root"
+    );
+    let conflicting_bindings: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM bindings WHERE lane_id='public-root-conflicting-lane'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(conflicting_bindings, 0);
+
     let request = json!({
         "client_request_id":"public-root-limit-open",
         "lane_id":"public-root-limit-lane",
@@ -1008,6 +1147,17 @@ fn public_agent_open_is_rejected_at_the_exact_root_limit_before_binding() {
         capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
         Some(2),
         "the rejected public receipt did not add a root claim"
+    );
+    let retained_opens: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE caller_id=?1 AND method='agent.open'",
+            [operator_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained_opens, 3,
+        "the conflict did not reserve a new Operation"
     );
 }
 
@@ -1185,6 +1335,64 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
         capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
         Some(1),
         "the unavailable public receipt did not add a root claim"
+    );
+
+    let attempt_id = "provider-condition-dispatch-attempt";
+    let task_id = "provider-condition-dispatch-task";
+    insert_attempt(
+        &db,
+        attempt_id,
+        task_id,
+        "provider-condition-source",
+        "reserved",
+        json!([]),
+    );
+    db.execute(
+        "UPDATE attempts SET owner_id=?2 WHERE attempt_id=?1",
+        params![attempt_id, operator_id],
+    )
+    .unwrap();
+    let dispatch_request = json!({
+        "client_request_id":"provider-condition-task-dispatch",
+        "attempt_id":attempt_id,
+        "text":"must remain unstarted while the provider requires authentication"
+    });
+    let dispatch_error = super::mutate(
+        &mut db,
+        &principal,
+        "task.dispatch",
+        &dispatch_request,
+        &config,
+    )
+    .expect_err("Task dispatch must share the current provider route gate");
+    assert_eq!(dispatch_error.code, "ROUTE_ADMISSION_UNAVAILABLE");
+    assert_eq!(dispatch_error.message, "AUTH_REQUIRED");
+
+    let (dispatch_state, dispatch_result): (String, String) = db
+        .query_row(
+            "SELECT state,result_json FROM operations \
+             WHERE caller_id=?1 AND client_request_id='provider-condition-task-dispatch' \
+               AND method='task.dispatch'",
+            [operator_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(dispatch_state, "rejected");
+    let dispatch_result: Value = serde_json::from_str(&dispatch_result).unwrap();
+    assert_eq!(dispatch_result["code"], "ROUTE_ADMISSION_UNAVAILABLE");
+    assert_eq!(dispatch_result["message"], "AUTH_REQUIRED");
+    let start_operation: Option<String> = db
+        .query_row(
+            "SELECT start_operation_id FROM attempts WHERE attempt_id=?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(start_operation, None);
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(1),
+        "the rejected Task operation is not a new root claim"
     );
 }
 fn insert_runtime_state_observation(
