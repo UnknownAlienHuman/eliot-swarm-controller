@@ -4097,6 +4097,11 @@ pub(super) fn launch_reconciliation_snapshot(db: &Connection, operation_id: &str
         },
     )?;
     let mut effective: Value = serde_json::from_str(&effective_raw)?;
+    let launch_state = effective
+        .get("launch_manifest")
+        .and_then(|manifest| manifest.get("state"))
+        .cloned()
+        .unwrap_or(Value::Null);
     if let Some(manifest) = effective
         .get_mut("launch_manifest")
         .and_then(Value::as_object_mut)
@@ -4145,6 +4150,7 @@ pub(super) fn launch_reconciliation_snapshot(db: &Connection, operation_id: &str
 
     Ok(json!({
         "state":state,
+        "launch_state":launch_state,
         "task_id":task_id,
         "attempt_id":attempt_id,
         "binding_id":binding_id,

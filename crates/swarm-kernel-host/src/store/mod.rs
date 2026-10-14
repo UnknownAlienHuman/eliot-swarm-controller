@@ -1216,7 +1216,6 @@ impl Store {
             let before = self
                 .run(move |db| launcher::launch_reconciliation_snapshot(db, &before_id))
                 .await?;
-            let mut candidate_unknown = false;
             'candidate: {
                 let config = self.config.clone();
                 let intent = operation_id.clone();
@@ -1277,8 +1276,7 @@ impl Store {
                     Ok(Some(work)) => work,
                     Ok(None) => break 'candidate,
                     Err(error) => {
-                        candidate_unknown = !self
-                            .record_launch_failure(operation_id.clone(), error.code)
+                        self.record_launch_failure(operation_id.clone(), error.code)
                             .await?;
                         break 'candidate;
                     }
@@ -1328,8 +1326,7 @@ impl Store {
                 let evidence = match evidence {
                     Ok(evidence) => evidence,
                     Err(error) => {
-                        candidate_unknown = !self
-                            .record_launch_failure(operation_id.clone(), error.code)
+                        self.record_launch_failure(operation_id.clone(), error.code)
                             .await?;
                         break 'candidate;
                     }
@@ -1385,8 +1382,7 @@ impl Store {
                     })
                     .await;
                 if let Err(error) = result {
-                    candidate_unknown = !self
-                        .record_launch_failure(operation_id.clone(), error.code)
+                    self.record_launch_failure(operation_id.clone(), error.code)
                         .await?;
                 }
             }
@@ -1403,7 +1399,7 @@ impl Store {
                 })
                 .await?;
             examined += 1;
-            if candidate_unknown {
+            if after["state"] == "outcome_unknown" || after["launch_state"] == "outcome_unknown" {
                 unknown += 1;
             }
             if before == after {
@@ -1418,7 +1414,7 @@ impl Store {
         )
     }
 
-    async fn record_launch_failure(&self, operation_id: String, safe_code: String) -> Result<bool> {
+    async fn record_launch_failure(&self, operation_id: String, safe_code: String) -> Result<()> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = model::now_ms()?;
@@ -1516,7 +1512,7 @@ impl Store {
             )?;
             launcher::fail_launch(&tx, &operation_id, failure, now)?;
             tx.commit()?;
-            Ok(closed_admission)
+            Ok(())
         })
         .await
     }

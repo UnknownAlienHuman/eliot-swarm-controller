@@ -1309,11 +1309,39 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         .authenticate(manager_credential)
         .await
         .expect("reauthenticate the retained launch actor");
+    let admission_operation_id = operation_id.clone();
+    let admission_config = config.clone();
+    let resumed_admission = owner
+        .store
+        .run(move |db| {
+            let admission = super::launcher::current_launch_admission(
+                db,
+                &admission_operation_id,
+                &admission_config,
+            )?;
+            Ok(serde_json::to_value(admission)?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed_admission["decision"]["decision"], "admit",
+        "fresh route admission before resumed launch: {resumed_admission}"
+    );
+    assert_eq!(
+        resumed_admission["root_limit"]["status"], "within_limit",
+        "fresh root capacity before resumed launch: {resumed_admission}"
+    );
+    assert_eq!(
+        resumed_admission["root_limit"]["current_claims"], 0,
+        "the already-admitted target excludes its own root claim: {resumed_admission}"
+    );
     let resumed = owner.store.reconcile_launches_once().await.unwrap();
     assert_eq!(resumed["examined"], 2, "{resumed}");
     assert_eq!(resumed["progressed"], 1, "{resumed}");
     assert_eq!(resumed["held"], 1, "{resumed}");
-    assert_eq!(resumed["outcome_unknown"], 0, "{resumed}");
+    // The unchanged unknown tail is counted in both independent dimensions:
+    // it was held this pass and remains persisted as outcome_unknown.
+    assert_eq!(resumed["outcome_unknown"], 1, "{resumed}");
     let admitted = owner
         .store
         .call(
