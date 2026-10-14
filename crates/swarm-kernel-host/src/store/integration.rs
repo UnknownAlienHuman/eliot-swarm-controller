@@ -118,6 +118,17 @@ fn sync_integration(
             "contract-card relevance page does not match the authenticated Task/Attempt scope",
         ));
     }
+    if page["coverage"] != "complete" || page["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+    {
+        return Ok(json!({
+            "operation_id":operation_id,
+            "status":"unknown_coverage",
+            "coverage":"partial",
+            "gaps":page["gaps"],
+            "delivery_created":false,
+            "cell":null,
+        }));
+    }
     let mut members = current_members(&page, &request.contract_key)?;
     let caller = members
         .iter()
@@ -1428,6 +1439,9 @@ pub(super) fn current_peer_cell_relation(
     target_context: &Value,
     contract: Option<(keys::TermKind, String)>,
 ) -> Result<Option<Value>> {
+    if super::coordination::legacy_index_backfill_gap(db)?.is_some() {
+        return Ok(None);
+    }
     let Some(source_id) = source_context
         .pointer("/actor/client_id")
         .and_then(Value::as_str)

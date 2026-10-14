@@ -1056,7 +1056,7 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
     ),
     mutation(
         "coordination.send",
-        "Deliver a bounded non-null JSON body to one active Participant in the same current Task/Attempt scope; this is typed coordination, not raw mailbox access.",
+        "Deliver a bounded non-null JSON body to one active Participant only when an exact current peer relation authorizes the separately revalidated source and target Task/revision/Attempt contexts; this is typed coordination, not raw mailbox access.",
         &[f("recipient", S), f("body", "non_null_json")],
         &["recipient", "body"],
     ),
@@ -6390,8 +6390,8 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ParticipantCoordination,
         PARTICIPANT_ONLY_AUDIENCES,
         Core,
-        "Send one bounded typed coordination delivery to an active peer in the same current Task/Attempt.",
-        "Use for explicit peer-to-peer coordination after confirming recipient identity and current scope.",
+        "Send one bounded typed coordination delivery to an active peer whose separately validated current Task/Attempt has an exact peer relation with the sender's current Task/Attempt.",
+        "Use for explicit peer-to-peer coordination after the Store validates both current endpoint contexts and their exact relation.",
         &[
             "coordination",
             "send",
@@ -6403,7 +6403,7 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &[
             "recipient",
             "non-null JSON body <= 8 KiB",
-            "authenticated current scope"
+            "authenticated current source and target contexts; exact current peer relation"
         ],
         "One durable addressed delivery; no method passthrough or native effect."
     ),

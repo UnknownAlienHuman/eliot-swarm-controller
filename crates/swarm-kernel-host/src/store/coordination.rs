@@ -46,7 +46,15 @@ struct IndexedCard {
     client_id: String,
     card_kind: String,
     identity: String,
+    scope_id: Option<String>,
+    card_revision: Option<i64>,
     valid_index: bool,
+}
+
+struct IndexedCardPage {
+    cards: Vec<IndexedCard>,
+    has_more: bool,
+    stale_entries: usize,
 }
 
 #[derive(Clone)]
@@ -181,7 +189,7 @@ pub(super) fn list_current_contract_participants(
     }
     let caller = load_current_scope(db, principal)?;
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (indexed, more) = indexed_global_cards(
+    let indexed = indexed_global_cards(
         db,
         keys::TermKind::Contract,
         contract_key,
@@ -190,9 +198,9 @@ pub(super) fn list_current_contract_participants(
         scan_limit,
     )?;
     let mut items = Vec::new();
-    let mut stale = 0usize;
+    let mut stale = indexed.stale_entries;
     let mut overflow = false;
-    for index in indexed {
+    for index in indexed.cards {
         if !index.valid_index {
             stale += 1;
             continue;
@@ -223,6 +231,8 @@ pub(super) fn list_current_contract_participants(
             || card["task_revision"] != member.task["revision"]
             || card["attempt_id"] != member.attempt["attempt_id"]
             || card["card_kind"] != "contract"
+            || index.scope_id.as_deref() != Some(member.scope_id.as_str())
+            || index.card_revision != card["card_revision"].as_i64()
         {
             stale += 1;
             continue;
@@ -259,12 +269,23 @@ pub(super) fn list_current_contract_participants(
             "card":card,
         }));
     }
-    let incomplete = more || overflow || stale > 0;
+    let migration_gap = legacy_index_backfill_gap(db)?;
+    let incomplete = indexed.has_more || overflow || stale > 0 || migration_gap.is_some();
+    let mut gaps = Vec::new();
+    if stale > 0 {
+        gaps.push(json!({"kind":"stale_or_corrupt_contract_relevance","count":stale}));
+    }
+    if indexed.has_more || overflow {
+        gaps.push(json!({"kind":"bounded_contract_relevance","more":indexed.has_more || overflow}));
+    }
+    if let Some(gap) = migration_gap {
+        gaps.push(gap);
+    }
     Ok(json!({
         "scope_id":caller.scope_id,
         "task_id":caller.task["task_id"],"task_revision":caller.task["revision"],"attempt_id":caller.attempt["attempt_id"],
         "items":items,"coverage":if incomplete { "partial" } else { "complete" },
-        "gaps":if incomplete { json!([{"kind":"bounded_or_stale_contract_relevance","stale_entries":stale,"more":more || overflow}]) } else { json!([]) },
+        "gaps":gaps,
     }))
 }
 
@@ -287,7 +308,7 @@ pub(super) fn list_current_contract_participants_for_manager(
     }
     let caller = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (indexed, more) = indexed_global_cards(
+    let indexed = indexed_global_cards(
         db,
         keys::TermKind::Contract,
         contract_key,
@@ -297,9 +318,9 @@ pub(super) fn list_current_contract_participants_for_manager(
     )?;
     let mut candidates = Vec::<(ScopeData, Value)>::new();
     let mut seen = BTreeSet::new();
-    let mut stale = 0usize;
+    let mut stale = indexed.stale_entries;
     let mut overflow = false;
-    for index in indexed {
+    for index in indexed.cards {
         if !index.valid_index {
             stale = stale.saturating_add(1);
             continue;
@@ -329,6 +350,8 @@ pub(super) fn list_current_contract_participants_for_manager(
             || card["task_revision"] != member.task["revision"]
             || card["attempt_id"] != member.attempt["attempt_id"]
             || card["card_kind"] != "contract"
+            || index.scope_id.as_deref() != Some(member.scope_id.as_str())
+            || index.card_revision != card["card_revision"].as_i64()
             || !matches!(
                 card.pointer("/fields/role").and_then(Value::as_str),
                 Some("producer" | "consumer" | "carrier")
@@ -371,7 +394,18 @@ pub(super) fn list_current_contract_participants_for_manager(
             }))
         })
         .collect::<Result<Vec<_>>>()?;
-    let incomplete = more || overflow || stale > 0;
+    let migration_gap = legacy_index_backfill_gap(db)?;
+    let incomplete = indexed.has_more || overflow || stale > 0 || migration_gap.is_some();
+    let mut gaps = Vec::new();
+    if stale > 0 {
+        gaps.push(json!({"kind":"stale_or_corrupt_contract_relevance","count":stale}));
+    }
+    if indexed.has_more || overflow {
+        gaps.push(json!({"kind":"bounded_contract_relevance","more":indexed.has_more || overflow}));
+    }
+    if let Some(gap) = migration_gap {
+        gaps.push(gap);
+    }
     Ok(json!({
         "scope_id":caller.scope_id,
         "task_id":caller.task["task_id"],
@@ -379,7 +413,7 @@ pub(super) fn list_current_contract_participants_for_manager(
         "attempt_id":caller.attempt["attempt_id"],
         "items":items,
         "coverage":if incomplete { "partial" } else { "complete" },
-        "gaps":if incomplete { json!([{"kind":"bounded_or_stale_contract_relevance","stale_entries":stale,"more":more || overflow}]) } else { json!([]) },
+        "gaps":gaps,
     }))
 }
 
@@ -2822,6 +2856,401 @@ fn card_owner_key(scope: &str, client_id: &str, card_kind: &str, identity: &str)
     )
 }
 
+/// Advance one bounded page of the namespace-level legacy directory repair.
+/// The cursor walks canonical registrations and current-card records only;
+/// every candidate is revalidated against its own current Task, Attempt,
+/// participant actor and grant before a derived index is written.
+pub(super) fn reconcile_legacy_index_backfill(tx: &Transaction<'_>) -> Result<()> {
+    let mut marker = match meta(tx, keys::LEGACY_INDEX_BACKFILL_KEY)? {
+        Some(marker) => marker,
+        None => json!({
+            "version":1,
+            "phase":"participants",
+            "after_key":null,
+            "scanned":0,
+            "anomaly_count":0,
+            "scan_complete":false,
+            "complete":false,
+            "coverage":"partial",
+        }),
+    };
+    if marker["version"] != 1 {
+        return Err(Error::new(
+            "COORDINATION_INDEX_MARKER_DAMAGED",
+            "legacy coordination index marker has an unsupported version",
+        ));
+    }
+    if marker["scanned"].as_u64().is_none() || marker["anomaly_count"].as_u64().is_none() {
+        return Err(Error::new(
+            "COORDINATION_INDEX_MARKER_DAMAGED",
+            "legacy coordination index marker has invalid counters",
+        ));
+    }
+    if marker["scan_complete"] == true {
+        return Ok(());
+    }
+    let phase = marker["phase"].as_str().ok_or_else(|| {
+        Error::new(
+            "COORDINATION_INDEX_MARKER_DAMAGED",
+            "legacy coordination index marker has no phase",
+        )
+    })?;
+    let (prefix, upper) = match phase {
+        "participants" => ("client:", "client;"),
+        "cards" => ("coordination:card:", "coordination:card;"),
+        _ => {
+            return Err(Error::new(
+                "COORDINATION_INDEX_MARKER_DAMAGED",
+                "legacy coordination index marker has an unsupported phase",
+            ));
+        }
+    };
+    let after = marker
+        .get("after_key")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if after.as_deref().is_some_and(|key| !key.starts_with(prefix)) {
+        return Err(Error::new(
+            "COORDINATION_INDEX_MARKER_DAMAGED",
+            "legacy coordination index cursor is outside its namespace",
+        ));
+    }
+    let rows: Vec<(String, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT key,value_json FROM meta \
+             WHERE key>=?1 AND key<?2 AND (?3 IS NULL OR key>?3) \
+             ORDER BY key LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![prefix, upper, after, keys::LEGACY_INDEX_BACKFILL_BATCH + 1],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let has_more = rows.len() as i64 > keys::LEGACY_INDEX_BACKFILL_BATCH;
+    let page = rows
+        .iter()
+        .take(keys::LEGACY_INDEX_BACKFILL_BATCH as usize)
+        .collect::<Vec<_>>();
+    for (key, raw) in &page {
+        marker["scanned"] = json!(
+            marker["scanned"]
+                .as_u64()
+                .unwrap_or_default()
+                .saturating_add(1)
+        );
+        match phase {
+            "participants" => backfill_participant_task_hint(tx, key, raw, &mut marker)?,
+            "cards" => backfill_current_card_hints(tx, key, raw, &mut marker)?,
+            _ => unreachable!("the phase was validated above"),
+        }
+    }
+    if has_more {
+        marker["after_key"] = page
+            .last()
+            .map(|(key, _)| json!(key))
+            .unwrap_or(Value::Null);
+    } else if phase == "participants" {
+        marker["phase"] = json!("cards");
+        marker["after_key"] = Value::Null;
+    } else {
+        marker["phase"] = json!("complete");
+        marker["after_key"] = Value::Null;
+        marker["scan_complete"] = json!(true);
+        let complete = marker["anomaly_count"].as_u64() == Some(0);
+        marker["complete"] = json!(complete);
+        marker["coverage"] = json!(if complete { "complete" } else { "partial" });
+    }
+    set_meta(tx, keys::LEGACY_INDEX_BACKFILL_KEY, &marker)
+}
+
+pub(super) fn legacy_index_backfill_status(db: &Connection) -> Result<Value> {
+    Ok(
+        meta(db, keys::LEGACY_INDEX_BACKFILL_KEY)?.unwrap_or_else(|| {
+            json!({
+                "version":1,
+                "phase":"participants",
+                "scanned":0,
+                "anomaly_count":0,
+                "scan_complete":false,
+                "complete":false,
+                "coverage":"partial",
+            })
+        }),
+    )
+}
+
+pub(super) fn legacy_index_backfill_gap(db: &Connection) -> Result<Option<Value>> {
+    let status = legacy_index_backfill_status(db)?;
+    if status["version"] == 1
+        && status["phase"] == "complete"
+        && status["scan_complete"] == true
+        && status["complete"] == true
+        && status["coverage"] == "complete"
+        && status["anomaly_count"].as_u64() == Some(0)
+        && status["scanned"].as_u64().is_some()
+        && status["after_key"].is_null()
+    {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "kind":"legacy_coordination_index_backfill",
+        "phase":status["phase"],
+        "anomaly_count":status["anomaly_count"],
+    })))
+}
+
+fn backfill_participant_task_hint(
+    tx: &Transaction<'_>,
+    key: &str,
+    raw: &str,
+    marker: &mut Value,
+) -> Result<()> {
+    let client_id = key.strip_prefix("client:").unwrap_or_default();
+    let registration: Value = match serde_json::from_str(raw) {
+        Ok(registration) => registration,
+        Err(_) => {
+            mark_legacy_index_anomaly(marker);
+            return Ok(());
+        }
+    };
+    if client_id.is_empty() {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    }
+    let role: Role = match serde_json::from_value(registration["role"].clone()) {
+        Ok(role) => role,
+        Err(_) => {
+            mark_legacy_index_anomaly(marker);
+            return Ok(());
+        }
+    };
+    if role != Role::Participant {
+        return Ok(());
+    }
+    let Some(disabled) = registration["disabled"].as_bool() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    if disabled {
+        return Ok(());
+    }
+    match load_current_scope_for_client(tx, client_id) {
+        Ok(scope) => {
+            if scope.client_id.as_deref() != Some(client_id) {
+                mark_legacy_index_anomaly(marker);
+                return Ok(());
+            }
+            let task_id = scope.task["task_id"].as_str().unwrap_or_default();
+            let task_revision = scope.task["revision"].as_i64().unwrap_or_default();
+            let attempt_id = scope.attempt["attempt_id"].as_str().unwrap_or_default();
+            let Some(grant_revision) = scope.registration["grant_revision"]
+                .as_i64()
+                .filter(|revision| *revision > 0)
+            else {
+                mark_legacy_index_anomaly(marker);
+                return Ok(());
+            };
+            let index_key = keys::participant_task_key(task_id, client_id);
+            let expected = json!({
+                "client_id":client_id,
+                "task_id":task_id,
+                "task_revision":task_revision,
+                "attempt_id":attempt_id,
+                "grant_revision":grant_revision,
+            });
+            mark_if_derived_hint_differs(tx, marker, &index_key, &expected)?;
+            set_meta(tx, &index_key, &expected)
+        }
+        Err(error) if is_legacy_projection_damage(&error) => {
+            mark_legacy_index_anomaly(marker);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn backfill_current_card_hints(
+    tx: &Transaction<'_>,
+    key: &str,
+    raw: &str,
+    marker: &mut Value,
+) -> Result<()> {
+    let card: Value = match serde_json::from_str(raw) {
+        Ok(card) => card,
+        Err(_) => {
+            mark_legacy_index_anomaly(marker);
+            return Ok(());
+        }
+    };
+    match card["state"].as_str() {
+        Some("current") => {}
+        Some("withdrawn") => return Ok(()),
+        _ => {
+            mark_legacy_index_anomaly(marker);
+            return Ok(());
+        }
+    }
+    let Some(client_id) = card["client_id"].as_str() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(card_kind) = card["card_kind"].as_str() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(identity) = card["identity"].as_str() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(task_id) = card["task_id"].as_str() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(task_revision) = card["task_revision"].as_i64().filter(|value| *value > 0) else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(attempt_id) = card["attempt_id"].as_str() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(card_revision) = card["card_revision"].as_i64().filter(|value| *value > 0) else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(material_digest) = card["material_digest"].as_str() else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    let Some(fields) = card.get("fields").filter(|fields| fields.is_object()) else {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    };
+    if !matches!(card_kind, "work" | "contract")
+        || (card_kind == "work" && identity != "work")
+        || (card_kind == "contract" && validate_identifier(identity, "contract_key", 256).is_err())
+        || keys::validate_card_fields(card_kind, fields).is_err()
+        || model::digest(model::canonical(fields)?.as_bytes()) != material_digest
+    {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    }
+    let scope = match load_current_scope_for_client(tx, client_id) {
+        Ok(scope) => scope,
+        Err(error) if is_legacy_projection_damage(&error) => {
+            mark_legacy_index_anomaly(marker);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if scope.client_id.as_deref() != Some(client_id)
+        || scope.task["task_id"] != task_id
+        || scope.task["revision"] != task_revision
+        || scope.attempt["attempt_id"] != attempt_id
+    {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    }
+    let scope_id = scope.scope_id;
+    if key != keys::card_key(&scope_id, card_kind, identity, client_id) {
+        mark_legacy_index_anomaly(marker);
+        return Ok(());
+    }
+    inspect_card_index_hints(
+        tx,
+        marker,
+        &scope_id,
+        client_id,
+        card_kind,
+        identity,
+        card_revision,
+        fields,
+    )?;
+    write_relevance_indexes(
+        tx,
+        &scope_id,
+        client_id,
+        card_kind,
+        identity,
+        card_revision,
+        fields,
+    )
+}
+
+fn inspect_card_index_hints(
+    tx: &Transaction<'_>,
+    marker: &mut Value,
+    scope_id: &str,
+    client_id: &str,
+    card_kind: &str,
+    identity: &str,
+    card_revision: i64,
+    fields: &Value,
+) -> Result<()> {
+    let indexed_fields = indexable_card_fields(fields, card_kind, identity);
+    for (term_kind, terms) in keys::indexed_terms(&indexed_fields, card_kind) {
+        for term in terms {
+            let local_key =
+                keys::relevance_key(scope_id, term_kind, &term, client_id, card_kind, identity);
+            let local_value = json!({
+                "client_id":client_id,
+                "card_kind":card_kind,
+                "identity":identity,
+                "term_kind":term_kind.as_str(),
+                "term":term,
+                "card_revision":card_revision,
+            });
+            mark_if_derived_hint_differs(tx, marker, &local_key, &local_value)?;
+
+            let global_key =
+                keys::global_relevance_key(term_kind, &term, client_id, card_kind, identity);
+            let global_value = json!({
+                "client_id":client_id,
+                "scope_id":scope_id,
+                "card_kind":card_kind,
+                "identity":identity,
+                "term_kind":term_kind.as_str(),
+                "term":term,
+                "card_revision":card_revision,
+            });
+            mark_if_derived_hint_differs(tx, marker, &global_key, &global_value)?;
+        }
+    }
+    Ok(())
+}
+
+fn mark_if_derived_hint_differs(
+    tx: &Transaction<'_>,
+    marker: &mut Value,
+    key: &str,
+    expected: &Value,
+) -> Result<()> {
+    let raw: Option<String> = tx
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if let Some(raw) = raw {
+        match serde_json::from_str::<Value>(&raw) {
+            Ok(value) if value == *expected => {}
+            _ => mark_legacy_index_anomaly(marker),
+        }
+    }
+    Ok(())
+}
+
+fn mark_legacy_index_anomaly(marker: &mut Value) {
+    let count = marker["anomaly_count"].as_u64().unwrap_or_default();
+    marker["anomaly_count"] = json!(count.saturating_add(1));
+}
+
+fn is_legacy_projection_damage(error: &Error) -> bool {
+    is_stale_watch_authority(error)
+        || matches!(error.code.as_str(), "INVALID_PARAMS" | "STORE_INVARIANT")
+}
+
 fn indexable_card_fields(fields: &Value, card_kind: &str, identity: &str) -> Value {
     if card_kind != "contract" {
         return fields.clone();
@@ -2932,7 +3361,7 @@ fn indexed_cards(
     card_kind: Option<&str>,
     after_client_id: Option<&str>,
     raw_limit: i64,
-) -> Result<(Vec<IndexedCard>, bool)> {
+) -> Result<IndexedCardPage> {
     let prefix = keys::relevance_prefix(scope_id, term_kind, term);
     let upper = format!("{prefix}g");
     let lower = match after_client_id {
@@ -2944,43 +3373,60 @@ fn indexed_cards(
         None => prefix,
     };
     let comparison = if after_client_id.is_some() { ">" } else { ">=" };
-    let raw: Vec<String> = if let Some(card_kind) = card_kind {
-        let sql = format!(
-            "SELECT value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 \
-             AND json_extract(value_json,'$.card_kind')=?3 ORDER BY key LIMIT ?4"
-        );
-        let mut statement = db.prepare(&sql)?;
-        statement
-            .query_map(params![lower, upper, card_kind, raw_limit + 1], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<_, _>>()?
-    } else {
-        let sql = format!(
-            "SELECT value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
-        );
-        let mut statement = db.prepare(&sql)?;
-        statement
-            .query_map(params![lower, upper, raw_limit + 1], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<_, _>>()?
-    };
+    let sql = format!(
+        "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    );
+    let mut statement = db.prepare(&sql)?;
+    let raw: Vec<(String, String)> = statement
+        .query_map(params![lower, upper, raw_limit + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
     let has_more = raw.len() as i64 > raw_limit;
-    let cards = raw
-        .iter()
-        .take(raw_limit as usize)
-        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
-        .filter_map(|value| {
-            Some(IndexedCard {
-                client_id: value.get("client_id")?.as_str()?.to_owned(),
-                card_kind: value.get("card_kind")?.as_str()?.to_owned(),
-                identity: value.get("identity")?.as_str()?.to_owned(),
-                valid_index: true,
-            })
-        })
-        .collect();
-    Ok((cards, has_more))
+    let mut cards = Vec::new();
+    let mut stale_entries = 0usize;
+    for (key, raw) in raw.iter().take(raw_limit as usize) {
+        let value: Value = match serde_json::from_str(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                stale_entries = stale_entries.saturating_add(1);
+                continue;
+            }
+        };
+        let (Some(client_id), Some(found_kind), Some(identity), Some(card_revision)) = (
+            value.get("client_id").and_then(Value::as_str),
+            value.get("card_kind").and_then(Value::as_str),
+            value.get("identity").and_then(Value::as_str),
+            value
+                .get("card_revision")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0),
+        ) else {
+            stale_entries = stale_entries.saturating_add(1);
+            continue;
+        };
+        if card_kind.is_some_and(|expected| expected != found_kind) {
+            continue;
+        }
+        let expected_key =
+            keys::relevance_key(scope_id, term_kind, term, client_id, found_kind, identity);
+        let valid_index = key == &expected_key
+            && value["term_kind"] == term_kind.as_str()
+            && value["term"] == term;
+        cards.push(IndexedCard {
+            client_id: client_id.to_owned(),
+            card_kind: found_kind.to_owned(),
+            identity: identity.to_owned(),
+            scope_id: None,
+            card_revision: Some(card_revision),
+            valid_index,
+        });
+    }
+    Ok(IndexedCardPage {
+        cards,
+        has_more,
+        stale_entries,
+    })
 }
 
 /// Query only the exact-term cross-Task index. Every entry is checked against
@@ -2992,7 +3438,7 @@ fn indexed_global_cards(
     card_kind: Option<&str>,
     after_client_id: Option<&str>,
     raw_limit: i64,
-) -> Result<(Vec<IndexedCard>, bool)> {
+) -> Result<IndexedCardPage> {
     let prefix = keys::global_relevance_prefix(term_kind, term);
     let upper = format!("{prefix}g");
     let lower = match after_client_id {
@@ -3004,49 +3450,68 @@ fn indexed_global_cards(
         None => prefix.clone(),
     };
     let comparison = if after_client_id.is_some() { ">" } else { ">=" };
-    let raw: Vec<(String, String)> = if let Some(card_kind) = card_kind {
-        let sql = format!(
-            "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 \
-             AND json_extract(value_json,'$.card_kind')=?3 ORDER BY key LIMIT ?4"
-        );
-        let mut statement = db.prepare(&sql)?;
-        statement
-            .query_map(params![lower, upper, card_kind, raw_limit + 1], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?
-    } else {
-        let sql = format!(
-            "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
-        );
-        let mut statement = db.prepare(&sql)?;
-        statement
-            .query_map(params![lower, upper, raw_limit + 1], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?
-    };
+    let sql = format!(
+        "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    );
+    let mut statement = db.prepare(&sql)?;
+    let raw: Vec<(String, String)> = statement
+        .query_map(params![lower, upper, raw_limit + 1], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
     let has_more = raw.len() as i64 > raw_limit;
-    let cards = raw
-        .iter()
-        .take(raw_limit as usize)
-        .filter_map(|(key, raw)| Some((key, serde_json::from_str::<Value>(raw).ok()?)))
-        .filter_map(|(key, value)| {
-            let client_id = value.get("client_id")?.as_str()?.to_owned();
-            let card_kind = value.get("card_kind")?.as_str()?.to_owned();
-            let identity = value.get("identity")?.as_str()?.to_owned();
-            Some(IndexedCard {
-                valid_index: *key
-                    == keys::global_relevance_key(
-                        term_kind, term, &client_id, &card_kind, &identity,
-                    ),
-                client_id,
-                card_kind,
-                identity,
-            })
-        })
-        .collect();
-    Ok((cards, has_more))
+    let mut cards = Vec::new();
+    let mut stale_entries = 0usize;
+    for (key, raw) in raw.iter().take(raw_limit as usize) {
+        let value: Value = match serde_json::from_str(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                stale_entries = stale_entries.saturating_add(1);
+                continue;
+            }
+        };
+        let (
+            Some(client_id),
+            Some(found_kind),
+            Some(identity),
+            Some(scope_id),
+            Some(card_revision),
+        ) = (
+            value.get("client_id").and_then(Value::as_str),
+            value.get("card_kind").and_then(Value::as_str),
+            value.get("identity").and_then(Value::as_str),
+            value.get("scope_id").and_then(Value::as_str),
+            value
+                .get("card_revision")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0),
+        )
+        else {
+            stale_entries = stale_entries.saturating_add(1);
+            continue;
+        };
+        if card_kind.is_some_and(|expected| expected != found_kind) {
+            continue;
+        }
+        let expected_key =
+            keys::global_relevance_key(term_kind, term, client_id, found_kind, identity);
+        let valid_index = key == &expected_key
+            && value["term_kind"] == term_kind.as_str()
+            && value["term"] == term;
+        cards.push(IndexedCard {
+            client_id: client_id.to_owned(),
+            card_kind: found_kind.to_owned(),
+            identity: identity.to_owned(),
+            scope_id: Some(scope_id.to_owned()),
+            card_revision: Some(card_revision),
+            valid_index,
+        });
+    }
+    Ok(IndexedCardPage {
+        cards,
+        has_more,
+        stale_entries,
+    })
 }
 
 fn indexed_task_participants(
@@ -3054,7 +3519,7 @@ fn indexed_task_participants(
     task_id: &str,
     after_client_id: Option<&str>,
     raw_limit: i64,
-) -> Result<(Vec<String>, bool)> {
+) -> Result<(Vec<String>, bool, usize)> {
     let prefix = keys::participant_task_prefix(task_id);
     let upper = format!("{prefix}g");
     let lower = match after_client_id {
@@ -3076,16 +3541,62 @@ fn indexed_task_participants(
         })?
         .collect::<std::result::Result<_, _>>()?;
     let has_more = rows.len() as i64 > raw_limit;
-    let items = rows
-        .iter()
-        .take(raw_limit as usize)
-        .filter_map(|(key, raw)| {
-            let entry: Value = serde_json::from_str(raw).ok()?;
-            let client_id = entry.get("client_id")?.as_str()?.to_owned();
-            (key == &keys::participant_task_key(task_id, &client_id)).then_some(client_id)
-        })
-        .collect();
-    Ok((items, has_more))
+    let mut items = Vec::new();
+    let mut stale_entries = 0usize;
+    for (key, raw) in rows.iter().take(raw_limit as usize) {
+        let entry: Value = match serde_json::from_str(raw) {
+            Ok(entry) => entry,
+            Err(_) => {
+                stale_entries = stale_entries.saturating_add(1);
+                continue;
+            }
+        };
+        let (
+            Some(client_id),
+            Some(index_task_id),
+            Some(task_revision),
+            Some(attempt_id),
+            Some(grant_revision),
+        ) = (
+            entry.get("client_id").and_then(Value::as_str),
+            entry.get("task_id").and_then(Value::as_str),
+            entry
+                .get("task_revision")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0),
+            entry.get("attempt_id").and_then(Value::as_str),
+            entry
+                .get("grant_revision")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0),
+        )
+        else {
+            stale_entries = stale_entries.saturating_add(1);
+            continue;
+        };
+        if index_task_id != task_id || key != &keys::participant_task_key(task_id, client_id) {
+            stale_entries = stale_entries.saturating_add(1);
+            continue;
+        }
+        let scope = match load_current_scope_for_client(db, client_id) {
+            Ok(scope) => scope,
+            Err(error) if is_legacy_projection_damage(&error) => {
+                stale_entries = stale_entries.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if scope.task["task_id"] != task_id
+            || scope.task["revision"] != task_revision
+            || scope.attempt["attempt_id"] != attempt_id
+            || scope.registration["grant_revision"] != grant_revision
+        {
+            stale_entries = stale_entries.saturating_add(1);
+            continue;
+        }
+        items.push(client_id.to_owned());
+    }
+    Ok((items, has_more, stale_entries))
 }
 
 pub(super) fn scope_context(scope: &ScopeData) -> Value {
@@ -3898,17 +4409,18 @@ fn card_list(
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_client_id")?;
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (cards, index_more) = if principal.role == Role::Participant {
-        indexed_global_cards(
+    let (cards, index_more, index_stale) = if principal.role == Role::Participant {
+        let page = indexed_global_cards(
             db,
             term_kind,
             &term,
             Some(card_kind),
             after.as_deref(),
             scan_limit,
-        )?
+        )?;
+        (page.cards, page.has_more, page.stale_entries)
     } else {
-        indexed_cards(
+        let page = indexed_cards(
             db,
             &scope.scope_id,
             term_kind,
@@ -3916,10 +4428,12 @@ fn card_list(
             Some(card_kind),
             after.as_deref(),
             limit,
-        )?
+        )?;
+        (page.cards, page.has_more, page.stale_entries)
     };
+    let migration_gap = legacy_index_backfill_gap(db)?;
     let mut items = Vec::new();
-    let mut stale = 0usize;
+    let mut stale = index_stale;
     let mut last = None;
     let mut has_more_peers = false;
     for indexed in cards {
@@ -3960,6 +4474,11 @@ fn card_list(
             || card["task_revision"] != participant.task["revision"]
             || card["attempt_id"] != participant.attempt["attempt_id"]
             || card["client_id"] != indexed.client_id
+            || indexed
+                .scope_id
+                .as_deref()
+                .is_some_and(|scope_id| scope_id != participant.scope_id)
+            || indexed.card_revision != card["card_revision"].as_i64()
         {
             stale = stale.saturating_add(1);
             continue;
@@ -3986,13 +4505,26 @@ fn card_list(
         }
         items.push(project_card(&card, value.get("fields"))?);
     }
-    let partial = index_more || stale > 0 || has_more_peers;
+    let partial = index_more || stale > 0 || has_more_peers || migration_gap.is_some();
+    let mut gaps = Vec::new();
+    if stale > 0 {
+        gaps.push(json!({"kind":"stale_or_corrupt_card_index_entries","count":stale}));
+    }
+    if index_more {
+        gaps.push(json!({"kind":"more_indexed_cards","count":null}));
+    }
+    if has_more_peers {
+        gaps.push(json!({"kind":"more_relevant_peers","count":null}));
+    }
+    if let Some(gap) = migration_gap {
+        gaps.push(gap);
+    }
     Ok(json!({
         "items":items,
         "selector":{"kind":term_kind.as_str(),"value":term},
         "next_after":if partial { last } else { None },
         "coverage":if partial { "partial" } else { "complete" },
-        "gaps":if stale > 0 { json!([{"kind":"stale_card_index_entries","count":stale}]) } else if index_more { json!([{"kind":"more_indexed_cards","count":null}]) } else { json!([]) },
+        "gaps":gaps,
     }))
 }
 
@@ -4044,17 +4576,18 @@ fn contract_cards_for_term(
     let after = keys::optional_cursor(&after_value, "after_client_id")?;
     let is_participant = scope.client_id.is_some();
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (cards, index_more) = if is_participant {
-        indexed_global_cards(
+    let (cards, index_more, index_stale) = if is_participant {
+        let page = indexed_global_cards(
             db,
             keys::TermKind::Contract,
             contract_key,
             Some("contract"),
             after.as_deref(),
             scan_limit,
-        )?
+        )?;
+        (page.cards, page.has_more, page.stale_entries)
     } else {
-        indexed_cards(
+        let page = indexed_cards(
             db,
             &scope.scope_id,
             keys::TermKind::Contract,
@@ -4062,10 +4595,11 @@ fn contract_cards_for_term(
             Some("contract"),
             after.as_deref(),
             limit,
-        )?
+        )?;
+        (page.cards, page.has_more, page.stale_entries)
     };
     let mut items = Vec::new();
-    let mut stale = 0usize;
+    let mut stale = index_stale;
     let mut last = None;
     let mut has_more = false;
     for indexed in cards {
@@ -4101,6 +4635,11 @@ fn contract_cards_for_term(
             || card["task_revision"] != participant.task["revision"]
             || card["attempt_id"] != participant.attempt["attempt_id"]
             || card["identity"] != contract_key
+            || indexed
+                .scope_id
+                .as_deref()
+                .is_some_and(|scope_id| scope_id != participant.scope_id)
+            || indexed.card_revision != card["card_revision"].as_i64()
         {
             stale = stale.saturating_add(1);
             continue;
@@ -4130,18 +4669,26 @@ fn contract_cards_for_term(
         }
         items.push(project_card(&card, fields)?);
     }
-    let partial = index_more || stale > 0 || has_more;
+    let migration_gap = legacy_index_backfill_gap(db)?;
+    let partial = index_more || stale > 0 || has_more || migration_gap.is_some();
+    let mut gaps = Vec::new();
+    if stale > 0 {
+        gaps.push(json!({"kind":"stale_or_corrupt_card_index_entries","count":stale}));
+    }
+    if index_more {
+        gaps.push(json!({"kind":"more_indexed_cards","count":null}));
+    }
+    if has_more {
+        gaps.push(json!({"kind":"more_relevant_peers","count":null}));
+    }
+    if let Some(gap) = migration_gap {
+        gaps.push(gap);
+    }
     Ok((
         items,
         if partial { last } else { None },
         if partial { "partial" } else { "complete" },
-        if stale > 0 {
-            json!([{"kind":"stale_card_index_entries","count":stale}])
-        } else if index_more {
-            json!([{"kind":"more_indexed_cards","count":null}])
-        } else {
-            json!([])
-        },
+        Value::Array(gaps),
     ))
 }
 
@@ -4292,8 +4839,8 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
     // neighborhood. Candidate grants and both endpoint contexts are always
     // revalidated before any card is projected.
     let scan_limit = keys::MAX_INBOX_SCAN;
-    let (cards, index_more, selector) = if let Some((kind, term)) = term {
-        let (cards, more) = if principal.role == Role::Participant {
+    let (cards, index_more, index_stale, selector) = if let Some((kind, term)) = term {
+        let page = if principal.role == Role::Participant {
             indexed_global_cards(db, kind, &term, None, after.as_deref(), scan_limit)?
         } else {
             indexed_cards(
@@ -4306,9 +4853,14 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
                 scan_limit,
             )?
         };
-        (cards, more, PeerSelector::Term(kind, term))
+        (
+            page.cards,
+            page.has_more,
+            page.stale_entries,
+            PeerSelector::Term(kind, term),
+        )
     } else if let Some(task_id) = related_task {
-        let (clients, more) =
+        let (clients, more, stale) =
             indexed_task_participants(db, &task_id, after.as_deref(), scan_limit)?;
         (
             clients
@@ -4317,10 +4869,13 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
                     client_id,
                     card_kind: "work".to_owned(),
                     identity: "work".to_owned(),
+                    scope_id: None,
+                    card_revision: None,
                     valid_index: true,
                 })
                 .collect(),
             more,
+            stale,
             PeerSelector::Task(task_id),
         )
     } else {
@@ -4330,15 +4885,19 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
                 client_id: client_id.clone(),
                 card_kind: "work".to_owned(),
                 identity: "work".to_owned(),
+                scope_id: None,
+                card_revision: None,
                 valid_index: true,
             }],
             false,
+            0,
             PeerSelector::Participant(client_id),
         )
     };
+    let migration_gap = legacy_index_backfill_gap(db)?;
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut stale = 0usize;
+    let mut stale = index_stale;
     let mut last = None;
     let mut has_more_peers = false;
     for indexed in cards {
@@ -4387,8 +4946,21 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
             &indexed.identity,
             &indexed.client_id,
         )?;
+        if matches!(&selector, PeerSelector::Term(_, _)) && card.is_none() {
+            stale = stale.saturating_add(1);
+            continue;
+        }
         let card = match card {
             Some(card) if matches!(&selector, PeerSelector::Term(_, _)) => {
+                if indexed.card_revision != card["card_revision"].as_i64()
+                    || indexed
+                        .scope_id
+                        .as_deref()
+                        .is_some_and(|scope_id| scope_id != candidate.scope_id.as_str())
+                {
+                    stale = stale.saturating_add(1);
+                    continue;
+                }
                 let Some((kind, term)) = relation_term(Some(&selector)) else {
                     unreachable!()
                 };
@@ -4437,7 +5009,20 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
             "card":card.as_ref().map(|card| project_card(card, value.get("fields"))).transpose()?,
         }));
     }
-    let partial = index_more || stale > 0 || has_more_peers;
+    let partial = index_more || stale > 0 || has_more_peers || migration_gap.is_some();
+    let mut gaps = Vec::new();
+    if stale > 0 {
+        gaps.push(json!({"kind":"stale_or_corrupt_relevance_entries","count":stale}));
+    }
+    if index_more {
+        gaps.push(json!({"kind":"relevance_scan_bound","count":null}));
+    }
+    if has_more_peers {
+        gaps.push(json!({"kind":"more_relevant_peers","count":null}));
+    }
+    if let Some(gap) = migration_gap {
+        gaps.push(gap);
+    }
     Ok(json!({
         "items":items,
         "selector":{"kind":selector_kind(&selector),"value":selector_value(&selector)},
@@ -4446,7 +5031,7 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
         "attempt_id":scope.attempt["attempt_id"],
         "next_after":if partial { last } else { None },
         "coverage":if partial { "partial" } else { "complete" },
-        "gaps":if stale > 0 { json!([{"kind":"stale_card_index_entries","count":stale}]) } else if index_more { json!([{"kind":"relevance_scan_bound","count":null}]) } else if has_more_peers { json!([{"kind":"more_relevant_peers","count":null}]) } else { json!([]) },
+        "gaps":gaps,
     }))
 }
 
@@ -5960,8 +6545,18 @@ fn consult(
     principal.require_participant()?;
     let request = keys::parse_consult_request(value)?;
     let sender = load_current_scope(tx, principal)?;
-    let (cards, index_more, stale) = consult_matching_cards(tx, &sender, &request)?;
-    if index_more || stale > 0 {
+    let (cards, index_more, stale, migration_gap) = consult_matching_cards(tx, &sender, &request)?;
+    if index_more || stale > 0 || migration_gap.is_some() {
+        let mut gaps = Vec::new();
+        if index_more {
+            gaps.push(json!({"kind":"consult_relevance_scan_bound","count":null}));
+        }
+        if stale > 0 {
+            gaps.push(json!({"kind":"stale_or_corrupt_consult_card_index_entries","count":stale}));
+        }
+        if let Some(gap) = migration_gap {
+            gaps.push(gap);
+        }
         return scoped_consult_result(
             tx,
             operation_id,
@@ -5973,10 +6568,7 @@ fn consult(
                 "field":request.field,
                 "delivery_created":false,
                 "coverage":"partial",
-                "gaps":[{
-                    "kind":if index_more { "consult_relevance_scan_bound" } else { "stale_consult_card_index_entries" },
-                    "count":if index_more { Value::Null } else { json!(stale) },
-                }],
+                "gaps":gaps,
             }),
         );
     }
@@ -6254,9 +6846,9 @@ fn consult_matching_cards(
     db: &Connection,
     sender: &ScopeData,
     request: &keys::ConsultRequest,
-) -> Result<(Vec<ConsultCardMatch>, bool, usize)> {
+) -> Result<(Vec<ConsultCardMatch>, bool, usize, Option<Value>)> {
     let raw_limit = keys::MAX_INBOX_SCAN;
-    let (indexed_cards, index_more) = indexed_global_cards(
+    let page = indexed_global_cards(
         db,
         request.target_kind,
         &request.target_value,
@@ -6265,8 +6857,8 @@ fn consult_matching_cards(
         raw_limit,
     )?;
     let mut cards = Vec::new();
-    let mut stale = 0usize;
-    for indexed in indexed_cards {
+    let mut stale = page.stale_entries;
+    for indexed in page.cards {
         if !indexed.valid_index {
             stale = stale.saturating_add(1);
             continue;
@@ -6299,6 +6891,8 @@ fn consult_matching_cards(
             || card["attempt_id"] != participant.attempt["attempt_id"]
             || card["card_kind"] != indexed.card_kind
             || card["identity"] != indexed.identity
+            || indexed.scope_id.as_deref() != Some(participant.scope_id.as_str())
+            || indexed.card_revision != card["card_revision"].as_i64()
         {
             stale = stale.saturating_add(1);
             continue;
@@ -6331,7 +6925,7 @@ fn consult_matching_cards(
             card,
         });
     }
-    Ok((cards, index_more, stale))
+    Ok((cards, page.has_more, stale, legacy_index_backfill_gap(db)?))
 }
 
 fn consult_candidates(matches: &[&ConsultCardMatch]) -> Value {

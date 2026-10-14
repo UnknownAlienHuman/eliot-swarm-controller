@@ -7,8 +7,10 @@ use serde_json::{Value, json};
 const PRODUCER_ASSIGNMENT_A: &str = "integration-producer-a";
 const PRODUCER_ASSIGNMENT_B: &str = "integration-producer-b";
 
-async fn start_integration_fixture(label: &str) -> (StoreOwner, PathBuf, ReviewSubject) {
-    let (owner, directory, _) = start_store(label).await;
+async fn start_integration_fixture(
+    label: &str,
+) -> (StoreOwner, PathBuf, ReviewSubject, Credential) {
+    let (owner, directory, credential) = start_store(label).await;
     seed_clients(&owner.store).await;
     let subject = seed_subject(
         &owner.store,
@@ -18,7 +20,45 @@ async fn start_integration_fixture(label: &str) -> (StoreOwner, PathBuf, ReviewS
         false,
     )
     .await;
-    (owner, directory, subject)
+    owner.store.reconcile_watches_once().await.unwrap();
+    owner.store.reconcile_watches_once().await.unwrap();
+    (owner, directory, subject, credential)
+}
+
+async fn erase_legacy_coordination_indexes(store: &Store) {
+    store
+        .run(|db| {
+            db.execute(
+                "DELETE FROM meta WHERE key>=?1 AND key<?2",
+                params![
+                    crate::coordination::participant_task_namespace_prefix(),
+                    "coordination:participant-task;",
+                ],
+            )?;
+            db.execute(
+                "DELETE FROM meta WHERE key>=?1 AND key<?2",
+                params![
+                    crate::coordination::global_relevance_namespace_prefix(),
+                    "coordination:relevance-global;",
+                ],
+            )?;
+            db.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [crate::coordination::LEGACY_INDEX_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn reopen_integration_store(directory: &PathBuf, credential: Credential) -> StoreOwner {
+    let root = DataRoot::acquire(directory).unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = root.path.clone();
+    StoreOwner::start(root, Arc::new(config), credential)
+        .await
+        .unwrap()
 }
 
 async fn register_integration_participant(
@@ -247,7 +287,7 @@ async fn start_assumptions_fixture(
     label: &str,
     participant_count: usize,
 ) -> (StoreOwner, PathBuf, Vec<Principal>, String) {
-    let (owner, directory, subject) = start_integration_fixture(label).await;
+    let (owner, directory, subject, _) = start_integration_fixture(label).await;
     let contract_key = format!("integration-assumptions-{label}");
     let mut participants = Vec::with_capacity(participant_count);
     for index in 0..participant_count {
@@ -274,7 +314,8 @@ fn assumption_batch(start: usize, count: usize) -> Vec<String> {
 
 #[tokio::test]
 async fn participation_basis_change_invalidates_cell_material_identity() {
-    let (owner, directory, subject) = start_integration_fixture("integration-basis-identity").await;
+    let (owner, directory, subject, _) =
+        start_integration_fixture("integration-basis-identity").await;
     seed_two_live_producer_assignments(&owner, &subject).await;
     let participant = register_integration_participant(
         &owner,
@@ -456,7 +497,7 @@ async fn participation_basis_change_invalidates_cell_material_identity() {
 
 #[tokio::test]
 async fn agreement_get_marks_stale_cell_not_current() {
-    let (owner, directory, subject) =
+    let (owner, directory, subject, _) =
         start_integration_fixture("integration-current-pointer").await;
     let first_participant = register_integration_participant(
         &owner,
@@ -652,7 +693,7 @@ async fn cell_assumptions_at_forty_items_has_no_omission_gap() {
 
 #[tokio::test]
 async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context() {
-    let (owner, directory, source_subject) =
+    let (owner, directory, source_subject, _) =
         start_integration_fixture("issue99-cross-task-source").await;
     let target_subject = seed_subject(
         &owner.store,
@@ -971,6 +1012,447 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
         .unwrap();
     assert_eq!(moved_inbox["task_id"], unrelated_subject.task_id);
     assert!(moved_inbox["items"].as_array().unwrap().is_empty());
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn bounded_legacy_index_backfill_recovers_peers_and_cell_members_after_reopen() {
+    let (owner, directory, source_subject, credential) =
+        start_integration_fixture("issue99-legacy-backfill-source").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-legacy-backfill-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-legacy-backfill-source-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let same_task_peer = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-legacy-backfill-same-task-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-legacy-backfill-target-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-legacy-backfill-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-legacy-backfill-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-legacy-backfill-publish-target",
+    )
+    .await;
+    let first_cell = sync_offer(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-legacy-backfill-sync-source",
+        vec![],
+    )
+    .await;
+    let second_cell = sync_requirement(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-legacy-backfill-sync-target",
+    )
+    .await;
+    assert_eq!(
+        first_cell["cell"]["cell_id"],
+        second_cell["cell"]["cell_id"]
+    );
+    assert_eq!(
+        second_cell["cell"]["facts"]["member_basis_set"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    erase_legacy_coordination_indexes(&owner.store).await;
+    owner.close().await.unwrap();
+    let owner = reopen_integration_store(&directory, credential).await;
+    let initial_status = owner
+        .store
+        .run(|db| crate::store::coordination::legacy_index_backfill_status(db))
+        .await
+        .unwrap();
+    assert_eq!(initial_status["complete"], false);
+
+    let before_grant_page = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"related_task_id":source_subject.task_id,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_grant_page["coverage"], "partial");
+    assert!(before_grant_page["items"].as_array().unwrap().is_empty());
+
+    owner.store.reconcile_watches_once().await.unwrap();
+    let pending_status = owner
+        .store
+        .run(|db| crate::store::coordination::legacy_index_backfill_status(db))
+        .await
+        .unwrap();
+    assert_eq!(pending_status["phase"], "cards");
+    assert_eq!(pending_status["complete"], false);
+    let task_peers = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"related_task_id":source_subject.task_id,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(task_peers["coverage"], "partial");
+    assert_eq!(task_peers["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        task_peers["items"][0]["client_id"],
+        same_task_peer.client_id
+    );
+
+    let pending_consult = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.consult".into(),
+            json!({
+                "client_request_id":"issue99-legacy-backfill-pending-consult",
+                "target":{"contract_key":contract_key},
+                "field":"interfaces",
+                "question_kind":"contract_shape",
+                "question":"Which interface is current?",
+                "why_needed":"Resolve the exact current card owner.",
+                "expected_answer":"one_fact",
+                "blocking":false,
+                "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+                "evidence_refs":[],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending_consult["status"], "unknown_coverage");
+    assert_eq!(pending_consult["delivery_created"], false);
+
+    owner.store.reconcile_watches_once().await.unwrap();
+    let complete_status = owner
+        .store
+        .run(|db| crate::store::coordination::legacy_index_backfill_status(db))
+        .await
+        .unwrap();
+    assert_eq!(complete_status["complete"], true);
+    let found = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target.client_id);
+
+    let source_id = source.client_id.clone();
+    let target_id = target.client_id.clone();
+    let contract_key = contract_key.to_owned();
+    let cell_relation = owner
+        .store
+        .run(move |db| {
+            let source_scope =
+                crate::store::coordination::load_current_scope_for_client(db, &source_id)?;
+            let target_scope =
+                crate::store::coordination::load_current_scope_for_client(db, &target_id)?;
+            crate::store::integration::current_peer_cell_relation(
+                db,
+                &crate::store::coordination::scope_context(&source_scope),
+                &crate::store::coordination::scope_context(&target_scope),
+                Some((crate::coordination::TermKind::Contract, contract_key)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(cell_relation.unwrap()["kind"], "active_integration_cell");
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_index_migration_keeps_wrong_actor_and_stale_card_coverage_partial() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-legacy-index-corruption").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-legacy-index-corruption-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-legacy-index-corruption-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let same_task_peer = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-legacy-index-corruption-same-task",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-legacy-index-corruption-target-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-legacy-index-corruption-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-legacy-index-corruption-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-legacy-index-corruption-publish-target",
+    )
+    .await;
+    erase_legacy_coordination_indexes(&owner.store).await;
+
+    let same_task_id = same_task_peer.client_id.clone();
+    let target_id = target.client_id.clone();
+    let source_task_id = source_subject.task_id.clone();
+    let source_attempt_id = source_subject.attempt_id.clone();
+    let target_task_id = target_subject.task_id.clone();
+    let target_attempt_id = target_subject.attempt_id.clone();
+    let contract_key_for_seed = contract_key.to_owned();
+    owner
+        .store
+        .run(move |db| {
+            let task_key =
+                crate::coordination::participant_task_key(&source_task_id, &same_task_id);
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    task_key,
+                    model::canonical(&json!({
+                        "client_id":"oldActor",
+                        "task_id":&source_task_id,
+                        "task_revision":1,
+                        "attempt_id":&source_attempt_id,
+                        "grant_revision":1,
+                    }))?,
+                ],
+            )?;
+            let stale_actor_task_key =
+                crate::coordination::participant_task_key(&source_task_id, "oldActor");
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    stale_actor_task_key,
+                    model::canonical(&json!({
+                        "client_id":"oldActor",
+                        "task_id":&source_task_id,
+                        "task_revision":1,
+                        "attempt_id":&source_attempt_id,
+                        "grant_revision":1,
+                    }))?,
+                ],
+            )?;
+            let wrong_card_revision_key = crate::coordination::global_relevance_key(
+                crate::coordination::TermKind::Contract,
+                &contract_key_for_seed,
+                &target_id,
+                "contract",
+                &contract_key_for_seed,
+            );
+            let target_scope_id =
+                crate::coordination::scope_id(&target_task_id, 1, &target_attempt_id)?;
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    wrong_card_revision_key,
+                    model::canonical(&json!({
+                        "client_id":&target_id,
+                        "scope_id":&target_scope_id,
+                        "card_kind":"contract",
+                        "identity":&contract_key_for_seed,
+                        "term_kind":"contract",
+                        "term":&contract_key_for_seed,
+                        "card_revision":999,
+                    }))?,
+                ],
+            )?;
+            let stale_actor_card_key = crate::coordination::global_relevance_key(
+                crate::coordination::TermKind::Contract,
+                &contract_key_for_seed,
+                "oldActor",
+                "contract",
+                &contract_key_for_seed,
+            );
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    stale_actor_card_key,
+                    model::canonical(&json!({
+                        "client_id":"oldActor",
+                        "scope_id":"stale-scope",
+                        "card_kind":"contract",
+                        "identity":&contract_key_for_seed,
+                        "term_kind":"contract",
+                        "term":&contract_key_for_seed,
+                        "card_revision":1,
+                    }))?,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let stale_before_repair = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_before_repair["coverage"], "partial");
+    assert!(stale_before_repair["items"].as_array().unwrap().is_empty());
+    assert!(
+        stale_before_repair["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["client_id"] != "oldActor")
+    );
+
+    owner.store.reconcile_watches_once().await.unwrap();
+    owner.store.reconcile_watches_once().await.unwrap();
+    let status = owner
+        .store
+        .run(|db| crate::store::coordination::legacy_index_backfill_status(db))
+        .await
+        .unwrap();
+    assert_eq!(status["scan_complete"], true);
+    assert_eq!(status["complete"], false);
+    assert_eq!(status["coverage"], "partial");
+
+    let task_peers = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"related_task_id":source_subject.task_id,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(task_peers["coverage"], "partial");
+    assert_eq!(task_peers["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        task_peers["items"][0]["client_id"],
+        same_task_peer.client_id
+    );
+    assert!(
+        task_peers["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["client_id"] != "oldActor")
+    );
+
+    let target_id = target.client_id.clone();
+    let found = owner
+        .store
+        .call(
+            source,
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "partial");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target_id);
+    assert!(
+        found["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["client_id"] != "oldActor")
+    );
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_index_backfill_propagates_derived_write_failure() {
+    let (owner, directory, subject, _) =
+        start_integration_fixture("issue99-legacy-index-write-failure").await;
+    let participant = register_integration_participant(
+        &owner,
+        &subject,
+        "issue99-legacy-index-write-failure-participant",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    erase_legacy_coordination_indexes(&owner.store).await;
+    owner
+        .store
+        .run(|db| {
+            db.execute_batch(
+                "CREATE TRIGGER fail_legacy_coordination_index_insert \
+                 BEFORE INSERT ON meta \
+                 WHEN NEW.key GLOB 'coordination:participant-task:*' \
+                 BEGIN SELECT RAISE(ABORT, 'fixture persistence failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = owner.store.reconcile_watches_once().await.unwrap_err();
+    assert_eq!(error.code, "STORE_ERROR");
+    assert_ne!(participant.client_id, "oldActor");
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();

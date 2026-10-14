@@ -1694,10 +1694,13 @@ impl Store {
     }
 
     /// Scoped watches share the host reconciler. Notification headers are
-    /// passive facts and never enqueue native work.
+    /// passive facts and never enqueue native work. The same bounded pass
+    /// advances legacy coordination directory projections without a Task,
+    /// participant-roster or per-query full scan.
     pub(crate) async fn reconcile_watches_once(&self) -> Result<Value> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            coordination::reconcile_legacy_index_backfill(&tx)?;
             let result = coordination_watch::reconcile(&tx, 32, model::now_ms()?)?;
             tx.commit()?;
             Ok(result)
@@ -3396,6 +3399,20 @@ fn initialize_database(
             tx,
             &format!("client:{}", credential.client_id),
             &json!({"role":"operator","token_hash":model::digest(credential.token.as_bytes()),"disabled":false}),
+        )?;
+        set_meta(
+            tx,
+            crate::coordination::LEGACY_INDEX_BACKFILL_KEY,
+            &json!({
+                "version":1,
+                "phase":"complete",
+                "after_key":null,
+                "scanned":0,
+                "anomaly_count":0,
+                "scan_complete":true,
+                "complete":true,
+                "coverage":"complete",
+            }),
         )?;
     } else {
         let local_operator = meta(tx, LOCAL_OPERATOR_CLIENT_ID_KEY)?;

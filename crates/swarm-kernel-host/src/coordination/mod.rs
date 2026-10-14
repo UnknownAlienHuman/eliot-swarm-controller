@@ -21,6 +21,12 @@ pub const MAX_CARD_BYTES: usize = 32 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_PAGE_SIZE: i64 = 50;
 pub const MAX_INBOX_SCAN: i64 = 1000;
+/// Durable cursor for the bounded repair of legacy participant and card
+/// directory rows. The version is part of the namespace so future projection
+/// changes can start a distinct migration without treating old coverage as
+/// current.
+pub(crate) const LEGACY_INDEX_BACKFILL_KEY: &str = "coordination:derived-index-backfill:v1";
+pub(crate) const LEGACY_INDEX_BACKFILL_BATCH: i64 = 64;
 pub(crate) const MAX_LIST_SCAN_CURSOR_BYTES: usize = 16 * 1024;
 const LIST_SCAN_CURSOR_PREFIX: &str = "coordination-scan-v1:";
 
@@ -592,6 +598,10 @@ pub(crate) fn participant_task_prefix(task_id: &str) -> String {
     format!("coordination:participant-task:{}:", key_component(task_id))
 }
 
+pub(crate) fn participant_task_namespace_prefix() -> &'static str {
+    "coordination:participant-task:"
+}
+
 pub(crate) fn participant_task_key(task_id: &str, client_id: &str) -> String {
     format!(
         "{}{client}",
@@ -645,6 +655,10 @@ pub(crate) fn global_relevance_prefix(kind: TermKind, term: &str) -> String {
         kind.as_str(),
         key_component(term)
     )
+}
+
+pub(crate) fn global_relevance_namespace_prefix() -> &'static str {
+    "coordination:relevance-global:"
 }
 
 pub(crate) fn card_key(scope: &str, card_kind: &str, identity: &str, client_id: &str) -> String {
