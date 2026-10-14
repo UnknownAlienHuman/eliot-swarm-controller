@@ -1518,14 +1518,20 @@ async fn issue99_negative_no_relation_send_forbidden() {
         )
         .await
         .unwrap();
-    assert!(found["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|item| item["client_id"] != unrelated.client_id));
+    assert!(
+        found["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["client_id"] != unrelated.client_id)
+    );
     let unrelated_inbox = owner
         .store
-        .call(unrelated.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .call(
+            unrelated.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
         .await
         .unwrap();
     assert_eq!(unrelated_inbox["task_id"], unrelated_subject.task_id);
@@ -1590,16 +1596,24 @@ async fn issue99_negative_forged_revision_ack_stale() {
         "issue99-negative-forged-sync-target",
     )
     .await;
-    assert_eq!(first_cell["cell"]["cell_id"], second_cell["cell"]["cell_id"]);
+    assert_eq!(
+        first_cell["cell"]["cell_id"],
+        second_cell["cell"]["cell_id"]
+    );
     let mut forged = ack_request(
         &second_cell["cell"],
         &source_subject,
         "issue99-negative-forged-ack",
     );
-    forged["expected_state_revision"] = json!(second_cell["cell"]["state_revision"].as_i64().unwrap_or(0) + 99);
+    forged["expected_state_revision"] =
+        json!(second_cell["cell"]["state_revision"].as_i64().unwrap_or(0) + 99);
     let denied = owner
         .store
-        .call(source.clone(), "coordination.integration.ack".into(), forged)
+        .call(
+            source.clone(),
+            "coordination.integration.ack".into(),
+            forged,
+        )
         .await
         .unwrap_err();
     assert_eq!(denied.code, "STALE_REVISION");
@@ -1608,7 +1622,11 @@ async fn issue99_negative_forged_revision_ack_stale() {
         .call(
             source.clone(),
             "coordination.integration.ack".into(),
-            ack_request(&second_cell["cell"], &source_subject, "issue99-negative-forged-ack-source"),
+            ack_request(
+                &second_cell["cell"],
+                &source_subject,
+                "issue99-negative-forged-ack-source",
+            ),
         )
         .await
         .unwrap();
@@ -1617,7 +1635,11 @@ async fn issue99_negative_forged_revision_ack_stale() {
         .call(
             target.clone(),
             "coordination.integration.ack".into(),
-            ack_request(&second_cell["cell"], &target_subject, "issue99-negative-forged-ack-target"),
+            ack_request(
+                &second_cell["cell"],
+                &target_subject,
+                "issue99-negative-forged-ack-target",
+            ),
         )
         .await
         .unwrap();
@@ -1764,7 +1786,11 @@ async fn issue99_negative_retry_consult_no_second_delivery() {
     });
     let asked = owner
         .store
-        .call(source.clone(), "coordination.consult".into(), ask_request.clone())
+        .call(
+            source.clone(),
+            "coordination.consult".into(),
+            ask_request.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(asked["status"], "asked");
@@ -1779,7 +1805,11 @@ async fn issue99_negative_retry_consult_no_second_delivery() {
     assert_eq!(retried["delivery_id"], asked["delivery_id"]);
     let inbox = owner
         .store
-        .call(target.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .call(
+            target.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
         .await
         .unwrap();
     assert_eq!(inbox["task_id"], target_subject.task_id);
@@ -1858,7 +1888,11 @@ async fn issue99_negative_old_delivery_not_rerouted() {
     assert_eq!(asked["target_context"]["task_id"], target_subject.task_id);
     let before_move = owner
         .store
-        .call(target.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .call(
+            target.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
         .await
         .unwrap();
     assert_eq!(before_move["task_id"], target_subject.task_id);
@@ -2359,7 +2393,8 @@ async fn issue99_task_dependency_cross_task_delivery_uses_each_owners_current_co
 }
 
 #[tokio::test]
-async fn issue99_accepted_scope_path_symbol_interface_cross_task_uses_each_owners_current_context() {
+async fn issue99_accepted_scope_path_symbol_interface_cross_task_uses_each_owners_current_context()
+{
     let (owner, directory, source_subject, _) =
         start_integration_fixture("issue99-accepted-scope").await;
     let target_subject = seed_subject(
@@ -2448,10 +2483,7 @@ async fn issue99_accepted_scope_path_symbol_interface_cross_task_uses_each_owner
         by_path["items"][0]["match"]["relation"]["term_kind"],
         "path"
     );
-    assert_eq!(
-        by_path["items"][0]["match"]["relation"]["term"],
-        path
-    );
+    assert_eq!(by_path["items"][0]["match"]["relation"]["term"], path);
     let by_symbol = owner
         .store
         .call(
