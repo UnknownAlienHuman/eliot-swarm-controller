@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation]
 permissions:
   contents: read
 jobs:
@@ -571,7 +571,7 @@ jobs:
 
   focused:
     name: Focused Rust qualification
-    if: github.event_name == 'workflow_dispatch' && (inputs.qualification == 'focused-recovery' || inputs.qualification == 'focused-store' || inputs.qualification == 'focused-publication')
+    if: github.event_name == 'workflow_dispatch' && startsWith(inputs.qualification, 'focused-')
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -616,6 +616,15 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
               throw 'The official LLVM installation did not provide libclang.dll.'
             }
+          } elseif ($env:QUALIFICATION -ceq 'focused-isolation') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'legacy_worker_demand_poison_tests' -Expected 4 -ExpectedNames @(
+              'legacy_demand_poison_reaches_existing_check_and_launch_isolators',
+              'legacy_demand_quarantined_launch_is_stable_and_changed_bytes_reactivate',
+              'legacy_demand_corrupt_entry_and_route_activate_only_existing_owners',
+              'legacy_demand_valid_bits_and_actual_schema_failure_remain_distinct'
+            )
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'store_authenticated_task_list_delta_bounded_gap_tail_recovery' -Expected 1 -ExpectedNames @('store_authenticated_task_list_delta_bounded_gap_tail_recovery')
+            Invoke-FocusedCohort -Package 'swarm-script-worker' -Filter 'script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256' -Expected 1 -ExpectedNames @('script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256')
           } else {
             & sudo apt-get update
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
