@@ -56,6 +56,7 @@ struct PendingRun {
     sent_at_ms: Option<i64>,
     started_at_ms: Option<i64>,
     worker_identity_json: Option<String>,
+    diagnostic_code: Option<String>,
 }
 
 const SCRIPT_WORKER_OBSERVATION_TIMEOUT_MS: i64 =
@@ -2096,6 +2097,25 @@ impl Store {
                         self.mark_unknown(&pending, code).await?;
                     }
                 }
+                "outcome_unknown"
+                    if pending.diagnostic_code.as_deref()
+                        == Some("PRIVATE_FILE_DURABILITY_UNKNOWN")
+                        && observed.process_control_failure.is_none() =>
+                {
+                    if let Some(ready) = observed.ready.as_ref() {
+                        match self.retry_acknowledged_allow(&pending, &work, ready).await {
+                            Ok(true) => self
+                                .changed
+                                .send_modify(|revision| *revision = revision.wrapping_add(1)),
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.record_run_error(&pending, error.clone()).await?;
+                                self.mark_unknown(&pending, &error.code).await?;
+                            }
+                        }
+                    }
+                }
+                "native_accepted" | "outcome_unknown" => {}
                 _ => {}
             }
             self.advance_fairness_cursor_to_captured(&captured).await?;
@@ -2139,6 +2159,42 @@ impl Store {
                     "script denial publication returned without a retained decision",
                 )),
             },
+        }
+    }
+
+    /// Resume the post-acknowledgement start handoff after a prior Allow write
+    /// or durability barrier returned an uncertain result. A retry is safe
+    /// only while the live ready receipt exactly matches the worker identity
+    /// already committed by `acknowledge_worker`; the decision reader must
+    /// also confirm the current immutable decision before Allow is retried.
+    /// This path never launches another worker.
+    async fn retry_acknowledged_allow(
+        &self,
+        pending: &PendingRun,
+        work: &runner::Work,
+        ready: &Value,
+    ) -> Result<bool> {
+        if !acknowledged_worker_matches_ready(pending, ready) {
+            return Err(Error::new(
+                "SCRIPT_WORKER_IDENTITY_DAMAGED",
+                "live ready receipt differs from the Store-acknowledged worker identity",
+            ));
+        }
+
+        let decision_work = work.clone();
+        let decision = self
+            .file_io(move |_| runner::start_decision(&decision_work))
+            .await?;
+        match runner::start_decision_allows_start(&decision)? {
+            Some(false) => Ok(false),
+            None | Some(true) => {
+                let allow_work = work.clone();
+                self.file_io(move |_| runner::allow(&allow_work)).await?;
+                let retained = pending.clone();
+                self.run(move |db| restore_acknowledged_start(db, &retained))
+                    .await?;
+                Ok(true)
+            }
         }
     }
 
@@ -2857,6 +2913,7 @@ struct PendingRunRow {
     sent_at_ms: Option<i64>,
     started_at_ms: Option<i64>,
     worker_identity_json: Option<String>,
+    diagnostic_code: Option<String>,
 }
 
 impl PendingRunRow {
@@ -2877,6 +2934,7 @@ impl PendingRunRow {
             sent_at_ms: self.sent_at_ms,
             started_at_ms: self.started_at_ms,
             worker_identity_json: self.worker_identity_json.clone(),
+            diagnostic_code: self.diagnostic_code.clone(),
         }
     }
 }
@@ -2955,12 +3013,14 @@ fn pending_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingRunRow> {
         sent_at_ms: row.get(5)?,
         started_at_ms: row.get(6)?,
         worker_identity_json: row.get(7)?,
+        diagnostic_code: row.get(8)?,
     })
 }
 
 const PENDING_RUN_QUERY: &str = "
         SELECT r.run_id,r.created_at_ms,r.operation_id,o.state,
-               r.work_digest,o.sent_at_ms,r.started_at_ms,r.process_identity_json
+               r.work_digest,o.sent_at_ms,r.started_at_ms,r.process_identity_json,
+               json_extract(o.result_json,'$.diagnostic_code')
           FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id
          WHERE r.state IN ('queued','sending','running','reconciling','outcome_unknown')
            AND (?1 IS NULL OR r.created_at_ms>?2 OR (r.created_at_ms=?2 AND r.run_id>?3))
@@ -2987,6 +3047,7 @@ fn selected_pending_run_key(db: &Connection, run_id: &str) -> Result<Option<Pend
                 sent_at_ms: None,
                 started_at_ms: None,
                 worker_identity_json: None,
+                diagnostic_code: None,
             })
         })
         .optional()?;
@@ -3105,6 +3166,14 @@ fn completion_matches_retained_worker(
             && identity["token"] == completion.token
             && identity["process"] == completion.process
     })
+}
+
+fn acknowledged_worker_matches_ready(pending: &PendingRun, ready: &Value) -> bool {
+    pending
+        .worker_identity_json
+        .as_deref()
+        .and_then(|identity| serde_json::from_str::<Value>(identity).ok())
+        .is_some_and(|identity| &identity == ready)
 }
 
 fn observe(
@@ -4010,6 +4079,61 @@ fn mark_unknown(db: &mut Connection, run_id: &str, code: &str) -> Result<()> {
     mark_unknown_tx(&tx, run_id, code, model::now_ms()?)?;
     tx.commit()?;
     Ok(())
+}
+
+fn restore_acknowledged_start(db: &mut Connection, pending: &PendingRun) -> Result<bool> {
+    let Some(expected_identity) = pending.worker_identity_json.as_deref() else {
+        return Err(Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "uncertain ScriptRun has no acknowledged worker identity",
+        ));
+    };
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let retained: Option<(String, String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT r.operation_id,r.state,o.state,r.process_identity_json \
+             FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id \
+             WHERE r.run_id=?1",
+            [&pending.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((operation_id, run_state, operation_state, identity_json)) = retained else {
+        return Err(Error::new("NOT_FOUND", "script run is not registered"));
+    };
+    if operation_id != pending.operation_id {
+        return Err(Error::conflict(
+            "uncertain ScriptRun changed its acknowledged Operation",
+        ));
+    }
+    if run_state != "outcome_unknown" || operation_state != "outcome_unknown" {
+        tx.commit()?;
+        return Ok(false);
+    }
+    if identity_json.as_deref() != Some(expected_identity) {
+        return Err(Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "uncertain ScriptRun differs from its acknowledged worker identity",
+        ));
+    }
+    let now = model::now_ms()?;
+    let run_changed = tx.execute(
+        "UPDATE script_runs SET state='running' \
+         WHERE run_id=?1 AND state='outcome_unknown' AND process_identity_json=?2",
+        params![pending.run_id, expected_identity],
+    )?;
+    let operation_changed = tx.execute(
+        "UPDATE operations SET state='native_accepted',result_json=NULL,updated_at_ms=?2 \
+         WHERE operation_id=?1 AND state='outcome_unknown'",
+        params![pending.operation_id, now],
+    )?;
+    if run_changed != 1 || operation_changed != 1 {
+        return Err(Error::conflict(
+            "uncertain ScriptRun changed while its durable Allow was restored",
+        ));
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 fn mark_unknown_tx(tx: &Transaction<'_>, run_id: &str, code: &str, now: i64) -> Result<()> {
@@ -6473,6 +6597,7 @@ mod script_trigger_admission_isolation_tests {
                     let raw: String = db.query_row(
                         "SELECT json_object(\
                          'run_id',r.run_id,'operation_id',r.operation_id,\
+                         'caller_id',o.caller_id,\
                          'run_state',r.state,'operation_state',o.state,\
                          'task_id',r.task_id,'task_revision',r.task_revision,\
                          'attempt_id',r.attempt_id,'operation_task_id',o.task_id,\
@@ -6608,6 +6733,7 @@ mod script_trigger_admission_isolation_tests {
         let queued = public_cancellation_snapshot(&owner.store, &run_id).await;
         assert_eq!(queued["run"]["run_state"], "queued");
         assert_eq!(queued["run"]["operation_state"], "queued");
+        assert_eq!(queued["run"]["caller_id"], manager.client_id);
         assert_eq!(queued["run"]["task_id"], task_id);
         assert_eq!(queued["run"]["task_revision"], 1);
         assert_eq!(queued["run"]["attempt_id"], attempt_id);
@@ -6799,6 +6925,23 @@ mod script_trigger_admission_isolation_tests {
                 .expect("original admission replay retains the same Run and Operation"),
             admission
         );
+        let replay_caller = manager.client_id.clone();
+        let (replayed_operations, replayed_runs) = owner
+            .store
+            .run(move |db| {
+                let counts = db.query_row(
+                    "SELECT COUNT(DISTINCT o.operation_id),COUNT(r.run_id) \
+                     FROM operations o LEFT JOIN script_runs r ON r.operation_id=o.operation_id \
+                     WHERE o.caller_id=?1 AND o.client_request_id='reg23-script-cancel-run' \
+                       AND o.method='script.run'",
+                    [replay_caller],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?;
+                Ok(counts)
+            })
+            .await
+            .expect("read the exact public ScriptRun admission after replay");
+        assert_eq!((replayed_operations, replayed_runs), (1, 1));
         let repeated = owner
             .store
             .call(
@@ -7486,3 +7629,7 @@ mod scripts_pending_run_fairness_tests;
 #[cfg(test)]
 #[path = "scripts_durable_publication_tests.rs"]
 mod scripts_durable_publication_tests;
+
+#[cfg(test)]
+#[path = "scripts_start_decision_tests.rs"]
+mod scripts_start_decision_tests;
