@@ -13,9 +13,9 @@ use crate::{
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
-use super::super::{
-    automation_work_dispatch as work_dispatch, launcher as store_launcher, projection,
-};
+#[cfg(not(debug_assertions))]
+use super::super::projection;
+use super::super::{automation_work_dispatch as work_dispatch, launcher as store_launcher};
 
 fn public_preview_request(task_id: &str, expected_task_revision: i64) -> Value {
     json!({

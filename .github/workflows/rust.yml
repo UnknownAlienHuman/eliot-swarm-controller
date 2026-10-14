@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access]
 permissions:
   contents: read
 jobs:
@@ -754,6 +754,29 @@ jobs:
               'pr74_remaining_c_irreducible_minimum_is_rejected_in_release_before_effects',
               'pr74_remaining_d_malformed_retained_history_stays_damaged_at_effect_gate'
             ) -Release
+          } elseif ($env:QUALIFICATION -ceq 'focused-access') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'scope_public_matrix_tests' -Expected 20 -ExpectedNames @(
+              'store_authenticated_profiles_fleet_queue_and_exact_object_grants',
+              'store_authenticated_released_and_stale_attempts_do_not_widen_task_reads',
+              'store_authenticated_result_pages_grants_and_denied_assemblies',
+              'store_authenticated_operator_assembly_inherits_sources',
+              'store_assembled_range_reads_reuse_bounded_source_proof',
+              'store_assembled_grant_loop_is_distinct_bounded',
+              'store_assembled_parts_limit_one_on_32',
+              'store_assembled_unrelated_write_preserves_proof',
+              'store_assembled_warm_manifest_mutation_invalidates_record_and_proof',
+              'store_assembled_warm_producer_mutation_invalidates_proof',
+              'store_assembled_warm_revocation_and_tamper_negative',
+              'store_authenticated_gm_assembly_and_former_gm_loss',
+              'store_authenticated_damaged_page_metadata_fail_closed',
+              'store_authenticated_damaged_producer_breaks_parts_and_assembly',
+              'store_authenticated_reviewer_submission_evidence_is_exact',
+              'store_authenticated_acceptance_and_checkrun_reads_are_exact',
+              'store_authenticated_coalesced_dispatch_hides_binding_from_foreign',
+              'store_authenticated_sponsored_reviewer_rest_graph_and_inspect_denied',
+              'store_authenticated_task_list_delta_filter_and_partial_page',
+              'store_authenticated_task_list_delta_bounded_gap_tail_recovery'
+            )
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
