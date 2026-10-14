@@ -1077,17 +1077,31 @@ async fn r35_retired_unanswered_reviewer_has_no_current_grants_before_its_late_r
         review_get(store, manager(), &a2).await["current_slot"],
         true
     );
-    // Current-scope grants must deny the retired reviewer. The manager stays the
-    // contrast: the same calls from the manager succeed.
+    // Exact historical assignment readback remains available after retirement.
+    // It must not turn into a current-slot or unrelated-assignment grant.
+    let historical = review_get(store, f1.clone(), &a1).await;
+    assert_eq!(historical["current_slot"], false);
+    assert_eq!(historical["assignment"]["review_assignment_id"], a1);
+    assert_eq!(historical["result"], serde_json::Value::Null);
+    let unrelated = store
+        .call(
+            f1.clone(),
+            "review.get".into(),
+            json!({"review_assignment_id":a2}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unrelated.code, "FORBIDDEN");
+    // Current context and list authority remain unavailable in this window.
     for (name, call) in [
-        ("review.get", json!({"review_assignment_id":a1})),
+        ("swarm.review.context", json!({"review_assignment_id":a1})),
         ("review.list", json!({})),
     ] {
         let denied = store.call(f1.clone(), name.into(), call).await;
         match denied {
-            Err(error) => assert_eq!(
-                error.code, "FORBIDDEN",
-                "{name} must deny the retired reviewer"
+            Err(error) => assert!(
+                matches!(error.code.as_str(), "FORBIDDEN" | "STALE_REVIEW_ASSIGNMENT"),
+                "{name} must deny the retired reviewer: {error:?}"
             ),
             Ok(_) => panic!("{name} must not grant the retired reviewer current scope"),
         }
