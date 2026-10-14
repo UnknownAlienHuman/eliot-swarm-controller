@@ -82,6 +82,28 @@ fn write_acknowledged_reply(journal: &Journal, operation_id: &str, resolved: Opt
         .unwrap();
 }
 
+fn write_acknowledged_reply_with_root(journal: &Journal, operation_id: &str, root_id: &str) {
+    let mut intent = fixture_intent(operation_id, "agent.reply");
+    intent.native_root_id = Some(root_id.to_owned());
+    journal.write_intent(&intent).unwrap();
+    let outcome = json!({
+        "operation_id":operation_id,
+        "outcome":"applied",
+        "native_scope_key":NATIVE_SCOPE,
+        "native_root_id":root_id,
+        "details":{}
+    });
+    journal.queue_outcome_value(&outcome).unwrap();
+    journal.acknowledge_outcome(&outcome).unwrap();
+    journal
+        .remove_pending(
+            &journal
+                .outbox
+                .join(format!("outcome-{}.json", operation_key(operation_id))),
+        )
+        .unwrap();
+}
+
 fn operation_path(root: &Path, operation_id: &str) -> PathBuf {
     root.join("operations")
         .join(format!("{}.jsonl", operation_key(operation_id)))
@@ -134,8 +156,8 @@ fn retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_tar
         .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
         .unwrap();
     assert_eq!(first.examined, 32);
-    assert!((31..=32).contains(&first.reclaimed));
-    assert!(!first.complete);
+    assert!((31..=32).contains(&first.namespace_removed));
+    assert!(!first.queue_drained);
     assert!(
         safe_ids
             .iter()
@@ -168,10 +190,10 @@ fn retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_tar
     let second = reopened
         .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
         .unwrap();
-    assert_eq!(second.examined, 35 - first.reclaimed);
-    assert_eq!(second.reclaimed, 34 - first.reclaimed);
-    assert!(!second.complete);
-    assert_eq!(first.reclaimed + second.reclaimed, 34);
+    assert_eq!(second.examined, 35 - first.namespace_removed);
+    assert_eq!(second.namespace_removed, 34 - first.namespace_removed);
+    assert!(!second.queue_drained);
+    assert_eq!(first.namespace_removed + second.namespace_removed, 34);
 
     for operation_id in safe_ids {
         assert!(!operation_path(&root.0, &operation_id).exists());
@@ -181,5 +203,154 @@ fn retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_tar
     assert_eq!(
         reopened.load(reconcile_id).unwrap().outcome.unwrap()["details"]["resolved"],
         false
+    );
+}
+
+#[test]
+fn retention_keeps_unknown_removal_across_empty_pass_and_reopen() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+
+    let operation_id = "retention-unknown-removal";
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    write_acknowledged_reply_with_root(&journal, operation_id, &root_id);
+    assert!(journal.recover_outbox().unwrap().is_empty());
+
+    let operation_path = operation_path(&root.0, operation_id);
+    let outbox_path = journal
+        .outbox
+        .join(format!("outcome-{}.json", operation_key(operation_id)));
+    let acknowledged = journal.load(operation_id).unwrap();
+    assert_eq!(
+        acknowledged.acknowledged_sha256.as_deref(),
+        acknowledged.outcome_sha256.as_deref()
+    );
+    let first = super::retention::reclaim_acknowledged_with_remover(
+        &journal,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        |path| {
+            let cursor_bytes = fs::read(root.0.join("retention-cursor.json")).unwrap();
+            let cursor: serde_json::Value = serde_json::from_slice(&cursor_bytes).unwrap();
+            assert_eq!(cursor["removal_durability_unknown"].as_bool(), Some(true));
+            let outcome = swarm_process::remove_private_acknowledged(path)?;
+            Ok(swarm_process::RemovalOutcome {
+                removed: outcome.removed,
+                durability: swarm_process::RemovalDurability::Unknown,
+            })
+        },
+    )
+    .unwrap();
+
+    assert_eq!(first.namespace_removed, 1);
+    assert!(first.queue_drained);
+    assert!(first.durability_unknown);
+    assert!(!operation_path.exists());
+    assert!(!outbox_path.exists());
+    assert_eq!(
+        journal
+            .native_root_checkpoint_for_hello(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap()
+            .as_deref(),
+        Some(root_id.as_str())
+    );
+    drop(journal);
+
+    let reopened =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert!(
+        reopened
+            .retention
+            .lock()
+            .unwrap()
+            .removal_durability_unknown_for_test()
+    );
+    assert!(reopened.recover_outbox().unwrap().is_empty());
+    let second = reopened
+        .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+        .unwrap();
+
+    assert_eq!(second.examined, 0);
+    assert_eq!(second.namespace_removed, 0);
+    assert!(second.queue_drained);
+    assert!(second.durability_unknown);
+    assert!(!operation_path.exists());
+    assert!(!outbox_path.exists());
+    assert_eq!(
+        reopened
+            .native_root_checkpoint_for_hello(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap()
+            .as_deref(),
+        Some(root_id.as_str())
+    );
+}
+
+#[test]
+fn retention_legacy_or_corrupt_cursor_never_means_confirmed_removal() {
+    let legacy_cursor = serde_json::to_vec(&json!({
+        "version":1,
+        "binding_id":BINDING_ID,
+        "generation":GENERATION,
+        "native_scope_key":NATIVE_SCOPE,
+        "route_sha256":ROUTE_SHA256,
+        "cursor":null
+    }))
+    .unwrap();
+
+    let legacy_root = FixtureRoot::new();
+    let journal = Journal::open(
+        &legacy_root.0,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        ROUTE_SHA256,
+    )
+    .unwrap();
+    drop(journal);
+    fs::write(legacy_root.0.join("retention-cursor.json"), legacy_cursor).unwrap();
+    let reopened = Journal::open(
+        &legacy_root.0,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        ROUTE_SHA256,
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .retention
+            .lock()
+            .unwrap()
+            .removal_durability_unknown_for_test()
+    );
+    drop(reopened);
+
+    let corrupt_root = FixtureRoot::new();
+    let journal = Journal::open(
+        &corrupt_root.0,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        ROUTE_SHA256,
+    )
+    .unwrap();
+    drop(journal);
+    fs::write(corrupt_root.0.join("retention-cursor.json"), b"{not-json").unwrap();
+    let reopened = Journal::open(
+        &corrupt_root.0,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        ROUTE_SHA256,
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .retention
+            .lock()
+            .unwrap()
+            .removal_durability_unknown_for_test()
     );
 }

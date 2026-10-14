@@ -2677,22 +2677,27 @@ where
 }
 
 fn attempt_journal_retention(host: &HostSession<'_>) {
-    let complete = match host.journal.reclaim_acknowledged(
+    let queue_drained = match host.journal.reclaim_acknowledged(
         &host.config.binding_id,
         host.config.generation,
         &host.config.native_options.scope_key(),
     ) {
         Ok(summary) => {
-            if summary.reclaimed > 0 {
+            if summary.namespace_removed > 0 {
                 eprintln!(
-                    "OpenCode acknowledged journal retention reclaimed {} operation(s)",
-                    summary.reclaimed
+                    "OpenCode acknowledged journal retention removed {} operation(s) from the namespace",
+                    summary.namespace_removed
                 );
             }
-            if !summary.complete {
+            if !summary.queue_drained {
                 eprintln!("OpenCode journal retention deferred at its bounded delete batch");
             }
-            summary.complete
+            if summary.durability_unknown {
+                eprintln!(
+                    "OpenCode journal removal durability remains unknown after namespace work"
+                );
+            }
+            summary.queue_drained
         }
         Err(error) => {
             eprintln!(
@@ -2703,7 +2708,7 @@ fn attempt_journal_retention(host: &HostSession<'_>) {
         }
     };
     host.retention_retry_pending
-        .store(!complete, Ordering::Release);
+        .store(!queue_drained, Ordering::Release);
 }
 
 fn remember_root_from_outcome(

@@ -1,25 +1,26 @@
 // Queue entries and reverse references are volatile projections of validated
-// operation journals. The only persisted value is a traversal cursor; it never
-// supplies receipt, ACK, reference, or deletion authority.
+// operation journals. Persisted state contains traversal progress and a
+// bounded removal-durability uncertainty bit; neither supplies receipt, ACK,
+// reference, or deletion authority.
 use super::{
     Error, HISTORY_LIMIT, Journal, Result, RetainedOperation, RetentionSummary, StateIdentity,
     inspect_retained_operation, operation_key, read_limited, read_operation_history_bytes,
-    remove_private_acknowledged, replace_private_durable, summarize_retained_operation,
-    write_private_new,
+    replace_private_durable, summarize_retained_operation, write_private_new,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     ops::Bound::{Excluded, Unbounded},
     path::{Path, PathBuf},
     sync::MutexGuard,
 };
-use swarm_process::RemovalDurability;
+use swarm_process::{RemovalDurability, RemovalOutcome, remove_private_acknowledged};
 
 const MAX_RETENTION_STEPS: usize = 32;
 const RETENTION_CURSOR_FILE: &str = "retention-cursor.json";
-const RETENTION_CURSOR_VERSION: u32 = 1;
+const RETENTION_CURSOR_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +31,14 @@ struct RetentionCursor {
     native_scope_key: String,
     route_sha256: String,
     cursor: Option<String>,
+    #[serde(default)]
+    removal_durability_unknown: Option<bool>,
+}
+
+#[derive(Default)]
+struct LoadedRetentionCursor {
+    cursor: Option<String>,
+    removal_durability_unknown: bool,
 }
 
 #[derive(Clone)]
@@ -47,22 +56,24 @@ pub(super) struct RetentionIndex {
     queue: BTreeSet<String>,
     ready: bool,
     references_unknown: bool,
+    removal_durability_unknown: bool,
 }
 
 impl RetentionIndex {
     pub(super) fn open(root: &Path, identity: &StateIdentity) -> Self {
         let cursor_path = root.join(RETENTION_CURSOR_FILE);
-        let cursor = read_cursor(&cursor_path, identity);
+        let saved = read_cursor(&cursor_path, identity);
         Self {
             cursor_path,
             identity: identity.clone(),
-            cursor,
+            cursor: saved.cursor,
             entries: BTreeMap::new(),
             operation_keys: BTreeMap::new(),
             reverse_references: BTreeMap::new(),
             queue: BTreeSet::new(),
             ready: false,
             references_unknown: false,
+            removal_durability_unknown: saved.removal_durability_unknown,
         }
     }
 
@@ -188,6 +199,7 @@ impl RetentionIndex {
             native_scope_key: self.identity.native_scope_key.clone(),
             route_sha256: self.identity.route_sha256.clone(),
             cursor: self.cursor.clone(),
+            removal_durability_unknown: Some(self.removal_durability_unknown),
         }
     }
 
@@ -213,16 +225,31 @@ impl RetentionIndex {
     pub(super) fn cursor_for_test(&self) -> Option<&str> {
         self.cursor.as_deref()
     }
+
+    #[cfg(test)]
+    pub(super) fn removal_durability_unknown_for_test(&self) -> bool {
+        self.removal_durability_unknown
+    }
 }
 
-fn read_cursor(path: &Path, identity: &StateIdentity) -> Option<String> {
-    if !path.exists() || super::ensure_regular(path, "retention cursor").is_err() {
-        return None;
+fn read_cursor(path: &Path, identity: &StateIdentity) -> LoadedRetentionCursor {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LoadedRetentionCursor::default();
+        }
+        Err(_) => return untrusted_cursor(),
+        Ok(_) => {}
     }
-    let bytes = read_limited(path, 1024).ok()?;
-    let saved: RetentionCursor = serde_json::from_slice(&bytes).ok()?;
-    if saved.version != RETENTION_CURSOR_VERSION
-        || saved.binding_id != identity.binding_id
+    if super::ensure_regular(path, "retention cursor").is_err() {
+        return untrusted_cursor();
+    }
+    let Ok(bytes) = read_limited(path, 1024) else {
+        return untrusted_cursor();
+    };
+    let Ok(saved) = serde_json::from_slice::<RetentionCursor>(&bytes) else {
+        return untrusted_cursor();
+    };
+    if saved.binding_id != identity.binding_id
         || saved.generation != identity.generation
         || saved.native_scope_key != identity.native_scope_key
         || saved.route_sha256 != identity.route_sha256
@@ -231,9 +258,31 @@ fn read_cursor(path: &Path, identity: &StateIdentity) -> Option<String> {
             .as_deref()
             .is_some_and(|key| !valid_operation_key(key))
     {
-        return None;
+        return untrusted_cursor();
     }
-    saved.cursor
+    match (saved.version, saved.removal_durability_unknown) {
+        // Version 1 predates persisted removal dispositions. Its cursor is
+        // still safe traversal progress, but it cannot prove no Unknown result
+        // was forgotten by the earlier consumer.
+        (1, _) => LoadedRetentionCursor {
+            cursor: saved.cursor,
+            removal_durability_unknown: true,
+        },
+        (RETENTION_CURSOR_VERSION, Some(removal_durability_unknown)) => LoadedRetentionCursor {
+            cursor: saved.cursor,
+            removal_durability_unknown,
+        },
+        // An existing malformed, incomplete, or future cursor must never be
+        // interpreted as a clean durability disposition.
+        _ => untrusted_cursor(),
+    }
+}
+
+fn untrusted_cursor() -> LoadedRetentionCursor {
+    LoadedRetentionCursor {
+        cursor: None,
+        removal_durability_unknown: true,
+    }
 }
 
 fn valid_operation_key(key: &str) -> bool {
@@ -297,6 +346,22 @@ pub(super) fn reclaim_acknowledged(
     generation: i64,
     scope: &str,
 ) -> Result<RetentionSummary> {
+    reclaim_acknowledged_with_remover(
+        journal,
+        binding_id,
+        generation,
+        scope,
+        remove_private_acknowledged,
+    )
+}
+
+pub(super) fn reclaim_acknowledged_with_remover(
+    journal: &Journal,
+    binding_id: &str,
+    generation: i64,
+    scope: &str,
+    remove: impl Fn(&Path) -> Result<RemovalOutcome>,
+) -> Result<RetentionSummary> {
     if binding_id != journal.identity.binding_id
         || generation != journal.identity.generation
         || scope != journal.identity.native_scope_key
@@ -316,9 +381,8 @@ pub(super) fn reclaim_acknowledged(
     }
     if index.references_unknown {
         return Ok(RetentionSummary {
-            reclaimed: 0,
-            examined: 0,
-            complete: false,
+            durability_unknown: index.removal_durability_unknown,
+            ..RetentionSummary::default()
         });
     }
     index.persist_cursor()?;
@@ -327,7 +391,6 @@ pub(super) fn reclaim_acknowledged(
     let step_limit = initial_work.min(MAX_RETENTION_STEPS);
     let mut visited = BTreeSet::new();
     let mut summary = RetentionSummary::default();
-    let mut removal_durability_unknown = false;
     while summary.examined < step_limit {
         let Some(key) = index.next_candidate(&visited) else {
             break;
@@ -388,20 +451,14 @@ pub(super) fn reclaim_acknowledged(
                 "operation journal changed during retention classification",
             ));
         }
-        match remove_private_acknowledged(&operation.path) {
-            Ok(outcome) if outcome.durability == RemovalDurability::Unknown => {
-                if outcome.removed {
-                    summary.reclaimed += 1;
-                }
-                removal_durability_unknown = true;
-            }
-            Ok(outcome) if outcome.removed => summary.reclaimed += 1,
-            Ok(_) => {
-                return Err(Error::new(
-                    "ADAPTER_JOURNAL",
-                    "acknowledged operation journal disappeared during retention",
-                ));
-            }
+        // Publish uncertainty before unlinking. A crash after namespace
+        // removal but before its returned disposition is recorded can then
+        // only leave a conservative Unknown marker, never a false confirmation.
+        let previous_durability_unknown = index.removal_durability_unknown;
+        index.removal_durability_unknown = true;
+        index.persist_cursor()?;
+        let outcome = match remove(&operation.path) {
+            Ok(outcome) => outcome,
             Err(remove_error) => {
                 if let Err(restore_error) = replace_private_durable(&operation.path, &current_bytes)
                 {
@@ -413,13 +470,29 @@ pub(super) fn reclaim_acknowledged(
                         ),
                     ));
                 }
+                index.removal_durability_unknown = previous_durability_unknown;
+                if let Err(cursor_error) = index.persist_cursor() {
+                    return Err(Error::new(
+                        "ADAPTER_RETENTION_STATE",
+                        format!(
+                            "journal removal failed ({}) and uncertainty rollback could not be persisted ({})",
+                            remove_error.code, cursor_error.code
+                        ),
+                    ));
+                }
                 return Err(remove_error);
             }
+        };
+        if outcome.removed {
+            summary.namespace_removed += 1;
         }
+        index.removal_durability_unknown =
+            previous_durability_unknown || outcome.durability == RemovalDurability::Unknown;
         index.remove_operation(&key);
         index.cursor = Some(key);
         index.persist_cursor()?;
     }
-    summary.complete = index.queue.is_empty() && !removal_durability_unknown;
+    summary.queue_drained = index.queue.is_empty();
+    summary.durability_unknown = index.removal_durability_unknown;
     Ok(summary)
 }

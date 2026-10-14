@@ -169,9 +169,14 @@ pub struct OperationRecoveryState {
 
 #[derive(Debug, Default)]
 pub struct RetentionSummary {
-    pub reclaimed: usize,
+    /// Files removed from the namespace during this pass. Durability is
+    /// reported separately because removal may be unconfirmed.
+    pub namespace_removed: usize,
     pub examined: usize,
-    pub complete: bool,
+    /// Whether no queued namespace candidates remain to be examined.
+    pub queue_drained: bool,
+    /// Persistent conservative disposition for any unconfirmed removal.
+    pub durability_unknown: bool,
 }
 
 #[derive(Clone)]
