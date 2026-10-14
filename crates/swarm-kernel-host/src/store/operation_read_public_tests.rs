@@ -1,15 +1,23 @@
 use super::super::{Store, StoreOwner};
 use crate::{
-    config::Config,
+    config::{Config, McpProfileConfig, McpToolProfile, Route, RouteAdmissionPolicy},
+    forge::ForgeProject,
     model::{self, Credential, Principal},
     platform::{DataRoot, bootstrap_credential},
+    policy::OWNER_POLICY_V1_ID,
+    workspace::WorkspaceProjectConfig,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rusqlite::params;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 const PROJECT: &str = "operation-read-bounded-public";
 const OPERATION_POSITION_STREAM: &str = "controller:read-position:operation";
+const RELATION_PROJECT: &str = "operation-read-retained-relations";
+const RELATION_ROUTE: &str = "operation-read-relation-route";
+const SCRIPT_PROJECT: &str = "operation-read-script-relations";
+const SCRIPT_ID: &str = "operation_read_relation_script";
 
 struct Fixture {
     owner: StoreOwner,
@@ -37,6 +45,170 @@ async fn start() -> Fixture {
         manager_a,
         manager_b,
     }
+}
+
+fn git_executable() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join(if cfg!(windows) { "git.exe" } else { "git" }))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
+        .expect("Git is available for the isolated workspace fixture")
+}
+
+async fn start_relation_fixture() -> Fixture {
+    let directory = std::env::temp_dir().join(format!(
+        "swarm-operation-read-relations-{}",
+        model::new_id()
+    ));
+    let repository = directory.join("repository");
+    let workspace_root = directory.join("workspaces");
+    let data_directory = directory.join("store");
+    for path in [&repository, &workspace_root, &data_directory] {
+        std::fs::create_dir_all(path).expect("create isolated relation fixture directory");
+    }
+    let repository = std::fs::canonicalize(repository).expect("canonicalize fixture repository");
+    let workspace_root =
+        std::fs::canonicalize(workspace_root).expect("canonicalize fixture workspaces");
+    let root = DataRoot::acquire(&data_directory).expect("acquire relation fixture Store root");
+    let credential = bootstrap_credential(&root.path).expect("bootstrap local Operator");
+    let mut config = Config::default();
+    config.storage.data_dir = root.path.clone();
+    config.forge.enabled = true;
+    config.forge.git_executable = git_executable();
+    let connection_file = directory.join("unused-connection.json");
+    config.forge.projects.insert(
+        RELATION_PROJECT.to_owned(),
+        ForgeProject {
+            canonical_repository: format!("github.com/owner/{RELATION_PROJECT}"),
+            repository_path: repository.clone(),
+            remote_name: "origin".to_owned(),
+            policy_revision: OWNER_POLICY_V1_ID.to_owned(),
+            target_refs: vec!["refs/heads/main".to_owned()],
+        },
+    );
+    config.workspace.projects.insert(
+        RELATION_PROJECT.to_owned(),
+        WorkspaceProjectConfig {
+            allowed_roots: vec![workspace_root],
+        },
+    );
+    config.routes.push(Route {
+        admission_policy: Some(RouteAdmissionPolicy {
+            max_concurrent_roots: 1,
+        }),
+        workspace_option: None,
+        owned_service: None,
+        alias: RELATION_ROUTE.to_owned(),
+        runtime: "opencode_v2".to_owned(),
+        module_artifact_id: "eliot-opencode-v2.http.2".to_owned(),
+        enabled: true,
+        native_options: json!({
+            "service_id":"operation-read-relation-service",
+            "connection_file":connection_file,
+            "expected_version":"1",
+            "directory":repository,
+            "model":{"id":"m1","providerID":"prov-a","variant":"v"},
+        }),
+    });
+    config.mcp.profiles.insert(
+        "operation-read-participant".to_owned(),
+        McpProfileConfig {
+            tool_profile: McpToolProfile::Participant,
+            expected_client_id: "operation-read-participant-template".to_owned(),
+            surface: Some("participant-core".to_owned()),
+            deferred_groups: Vec::new(),
+            manual_tools: Vec::new(),
+        },
+    );
+    config.scripts.executor =
+        Some(super::super::o6_taskless_path_fixture::store_only_script_executor_pin());
+    let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+        .await
+        .expect("start relation fixture Store");
+    let operator = owner
+        .store
+        .authenticate(credential)
+        .await
+        .expect("authenticate relation fixture Operator");
+    owner
+        .store
+        .initialize_workspace_authority()
+        .await
+        .expect("retain the isolated workspace registration");
+    let manager_a = register_manager(&owner.store, &operator, "operation-read-relation-a").await;
+    let manager_b = register_manager(&owner.store, &operator, "operation-read-relation-b").await;
+    owner
+        .store
+        .call(
+            operator,
+            "gm.handover".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "client_id":manager_a.client_id,
+            }),
+        )
+        .await
+        .expect("handover current-GM authority through Store");
+    Fixture {
+        owner,
+        directory,
+        manager_a,
+        manager_b,
+    }
+}
+
+fn relation_task_spec(label: &str) -> Value {
+    json!({
+        "objective":format!("Operation read relation fixture {label}"),
+        "phase":"implementation",
+        "requirements":[{"id":"R1","statement":"Retain exact operation relations"}],
+        "scope":{"initial_paths":["src/target.rs"]},
+        "owner_policy_id":OWNER_POLICY_V1_ID,
+    })
+}
+
+async fn create_relation_task(
+    store: &Store,
+    manager: &Principal,
+    project_id: &str,
+    label: &str,
+) -> Value {
+    call(
+        store,
+        manager,
+        "task.create",
+        json!({
+            "client_request_id":model::new_id(),
+            "project_id":project_id,
+            "origin_key":format!("operation-read-relation-{label}-{}", model::new_id()),
+            "spec":relation_task_spec(label),
+        }),
+    )
+    .await
+}
+
+fn powershell_path() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" }))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
+        .expect("pwsh is available for validating the Store-only ScriptRun fixture")
+}
+
+fn relation_script_bundle() -> Value {
+    json!({
+        "script_id":SCRIPT_ID,
+        "interpreter_kind":"powershell",
+        "interpreter_path":powershell_path(),
+        "entrypoint":"main.ps1",
+        "argv":[],
+        "trust":"trusted_local",
+        "inherit_environment":[],
+        "controller_effects":[],
+        "input_schema":{"type":"object","properties":{},"required":[],"additional_properties":true},
+        "result_schema":{"type":"null"},
+        "files":[{"path":"main.ps1","content_base64":STANDARD.encode(b"Write-Output {}")}],
+    })
 }
 
 impl Fixture {
@@ -456,5 +628,276 @@ async fn store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and
         recovered,
         "report.delta cursor skipped the first later visible Operation"
     );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn malformed_public_operation_relations_fail_closed() {
+    let f = start_relation_fixture().await;
+    let store = &f.owner.store;
+
+    let script_task = create_relation_task(store, &f.manager_b, SCRIPT_PROJECT, "script").await;
+    let script_attempt = claim(store, &f.manager_b, &script_task).await;
+    call(
+        store,
+        &f.manager_b,
+        "script.register",
+        json!({
+            "client_request_id":model::new_id(),
+            "bundle":relation_script_bundle(),
+        }),
+    )
+    .await;
+    call(
+        store,
+        &f.manager_b,
+        "script.activate",
+        json!({
+            "client_request_id":model::new_id(),
+            "script_id":SCRIPT_ID,
+            "revision":1,
+        }),
+    )
+    .await;
+    let script_run = call(
+        store,
+        &f.manager_b,
+        "script.run",
+        json!({
+            "client_request_id":model::new_id(),
+            "script_id":SCRIPT_ID,
+            "expected_script_revision":1,
+            "attempt_id":script_attempt["attempt_id"],
+            "expected_task_revision":script_task["revision"],
+            "input":{},
+        }),
+    )
+    .await;
+    let script_operation_id = script_run["operation_id"].as_str().unwrap().to_owned();
+
+    let launch_task = create_relation_task(store, &f.manager_a, RELATION_PROJECT, "launch").await;
+    let launch_attempt = claim(store, &f.manager_a, &launch_task).await;
+    let task_b = create_relation_task(store, &f.manager_b, SCRIPT_PROJECT, "unrelated").await;
+    let task_b_attempt = claim(store, &f.manager_b, &task_b).await;
+    let changes = json!([{
+        "automation_id":"operation-read-work-dispatch",
+        "expected_revision":0,
+        "include_existing":true,
+        "patch":{
+            "enabled":true,
+            "steps":["work_dispatch"],
+            "work_dispatch":{
+                "route":RELATION_ROUTE,
+                "agent_profile":"operation-read-agent",
+                "mcp_profile":"operation-read-participant",
+                "mcp_surface":"participant-core",
+                "workspace_policy":"manager_owned_worktree",
+                "requested_model":null,
+                "requested_effort":null,
+                "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+                "stop_conditions":[],
+                "purpose":"implementation",
+            },
+        },
+    }]);
+    let preview = call(
+        store,
+        &f.manager_a,
+        "automation.config.preview",
+        json!({"project_id":RELATION_PROJECT,"changes":changes}),
+    )
+    .await;
+    assert_eq!(preview["valid"], true, "{preview}");
+    let applied = call(
+        store,
+        &f.manager_a,
+        "automation.config.apply",
+        json!({
+            "client_request_id":model::new_id(),
+            "project_id":RELATION_PROJECT,
+            "changes":changes,
+            "preview_digest":preview["plan_sha256"],
+        }),
+    )
+    .await;
+    let admitted = applied["work_dispatch"][0]["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["task_id"] == launch_task["task_id"])
+        .unwrap_or_else(|| panic!("the retained Task source was not dispatched: {applied}"));
+    assert_eq!(admitted["disposition"], "admitted");
+    let launch_operation_id = admitted["operation_id"].as_str().unwrap().to_owned();
+
+    let launch_for_readback = launch_operation_id.clone();
+    let config = f.owner.store.config.clone();
+    let (lease_id, link_key, original_link) = store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let actor = super::super::launcher::launch_actor(&tx, &launch_for_readback)?;
+            let plan = super::super::launcher::launch_workspace_plan(
+                &tx,
+                &actor,
+                &launch_for_readback,
+                &config,
+            )?;
+            super::super::workspace::reserve_lease_for_launch(
+                &tx,
+                &actor,
+                &plan,
+                model::now_ms()?,
+            )?;
+            let lease: String = tx.query_row(
+                "SELECT lease_id FROM workspace_leases WHERE operation_id=?1",
+                [&launch_for_readback],
+                |row| row.get(0),
+            )?;
+            let link_json: String = tx.query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [format!(
+                    "work-dispatch:v1:operation-link:{launch_for_readback}"
+                )],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok((
+                lease,
+                format!("work-dispatch:v1:operation-link:{launch_for_readback}"),
+                link_json,
+            ))
+        })
+        .await
+        .expect("Store admitted the exact workspace lease and retained launch link");
+
+    let parent = call(
+        store,
+        &f.manager_a,
+        "operation.get",
+        json!({"operation_id":launch_operation_id}),
+    )
+    .await;
+    assert_eq!(parent["method"], "swarm.launch");
+    let lease_for_damage = lease_id.clone();
+    let other_manager = f.manager_b.client_id.clone();
+    let changed = store
+        .run(move |db| {
+            Ok(db.execute(
+                "UPDATE workspace_leases SET owner_client_id=?1 WHERE lease_id=?2",
+                params![other_manager, lease_for_damage],
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    let damaged_workspace = store
+        .call(
+            f.manager_b.clone(),
+            "operation.get".into(),
+            json!({"operation_id":launch_operation_id}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(damaged_workspace.code, "NOT_FOUND");
+    let lease_for_restore = lease_id.clone();
+    let owner_id = f.manager_a.client_id.clone();
+    store
+        .run(move |db| {
+            Ok(db.execute(
+                "UPDATE workspace_leases SET owner_client_id=?1 WHERE lease_id=?2",
+                params![owner_id, lease_for_restore],
+            )?)
+        })
+        .await
+        .unwrap();
+
+    let changed_link_key = link_key.clone();
+    let changed_task_id = task_b["task_id"].as_str().unwrap().to_owned();
+    let changed = store
+        .run(move |db| {
+            Ok(db.execute(
+                "UPDATE meta SET value_json=json_set(value_json,'$.record.task_id',?1) WHERE key=?2",
+                params![changed_task_id, changed_link_key],
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    let damaged_on_behalf = store
+        .call(
+            f.manager_a.clone(),
+            "operation.get".into(),
+            json!({"operation_id":launch_operation_id}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            damaged_on_behalf.code.as_str(),
+            "AUTOMATION_LINK_CORRUPT" | "AUTOMATION_RECORD_CORRUPT"
+        ),
+        "{damaged_on_behalf:?}"
+    );
+    let link_key_for_restore = link_key.clone();
+    store
+        .run(move |db| {
+            Ok(db.execute(
+                "UPDATE meta SET value_json=?1 WHERE key=?2",
+                params![original_link, link_key_for_restore],
+            )?)
+        })
+        .await
+        .unwrap();
+
+    let launch_for_damage = launch_operation_id.clone();
+    let other_task = task_b["task_id"].as_str().unwrap().to_owned();
+    let other_attempt = task_b_attempt["attempt_id"].as_str().unwrap().to_owned();
+    let changed = store
+        .run(move |db| {
+            Ok(db.execute(
+                "UPDATE operations SET task_id=?1,attempt_id=?2 WHERE operation_id=?3",
+                params![other_task, other_attempt, launch_for_damage],
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    let damaged_launch = store
+        .call(
+            f.manager_b.clone(),
+            "operation.get".into(),
+            json!({"operation_id":launch_operation_id}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            damaged_launch.code.as_str(),
+            "AUTOMATION_LINK_CORRUPT" | "AUTOMATION_RECORD_CORRUPT"
+        ),
+        "{damaged_launch:?}"
+    );
+
+    let launch_for_script_damage = script_operation_id.clone();
+    let launch_task_id = launch_task["task_id"].as_str().unwrap().to_owned();
+    let launch_attempt_id = launch_attempt["attempt_id"].as_str().unwrap().to_owned();
+    let changed = store
+        .run(move |db| {
+            Ok(db.execute(
+                "UPDATE operations SET task_id=?1,attempt_id=?2 WHERE operation_id=?3",
+                params![launch_task_id, launch_attempt_id, launch_for_script_damage],
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    let damaged_script = store
+        .call(
+            f.manager_a.clone(),
+            "operation.get".into(),
+            json!({"operation_id":script_operation_id}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(damaged_script.code, "OBJECT_SCOPE_DAMAGED");
     f.close().await;
 }

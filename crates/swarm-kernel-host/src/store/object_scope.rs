@@ -1058,6 +1058,7 @@ fn operation_task_identity(
     db: &Connection,
     operation: &OperationRow,
 ) -> Result<Option<TaskGraphIdentity>> {
+    verify_script_run_operation_identity(db, operation)?;
     match (
         operation.task_id.as_deref(),
         operation.attempt_id.as_deref(),
@@ -1096,6 +1097,48 @@ fn operation_task_identity(
             }
             Ok(Some(identity))
         }
+    }
+}
+
+/// A ScriptRun's retained Task/Attempt is authoritative only when its Operation
+/// columns still name the exact same retained run. Exact callers have already
+/// received their bounded receipt before this relation is considered.
+fn verify_script_run_operation_identity(db: &Connection, operation: &OperationRow) -> Result<()> {
+    if operation.method != "script.run" {
+        return Ok(());
+    }
+    let retained: Option<(Option<String>, Option<i64>, Option<String>)> = db
+        .query_row(
+            "SELECT task_id,task_revision,attempt_id FROM script_runs WHERE operation_id=?1",
+            [&operation.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((task_id, task_revision, attempt_id)) = retained else {
+        // Rejected admissions can retain a caller receipt without creating a
+        // ScriptRun. Their ordinary Operation Task/Attempt relation still applies.
+        return Ok(());
+    };
+    if operation.task_id != task_id || operation.attempt_id != attempt_id {
+        return Err(identity_damaged(
+            "script.run Operation differs from its exact retained ScriptRun",
+        ));
+    }
+    match (task_id.as_deref(), task_revision, attempt_id.as_deref()) {
+        (None, None, None) => Ok(()),
+        (Some(task_id), Some(task_revision), Some(attempt_id)) => {
+            let identity = identity_for_attempt(db, attempt_id)?
+                .ok_or_else(|| identity_damaged("ScriptRun Attempt is not retained"))?;
+            if identity.task_id != task_id || identity.task_revision != Some(task_revision) {
+                return Err(identity_damaged(
+                    "ScriptRun Task revision differs from its exact retained Attempt",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(identity_damaged(
+            "ScriptRun has a partial retained Task/Attempt identity",
+        )),
     }
 }
 
@@ -1361,6 +1404,22 @@ pub(crate) fn resolve_operation_read(
         Ok(false) => {}
         Err(error) if known_scope_denial(&error) => {}
         Err(error) => return Err(error),
+    }
+    // Technical Operations must prove a retained on-behalf or launch-child
+    // relation before their Task columns can grant a Manager read. Otherwise a
+    // damaged link can be bypassed by a still-coherent (but unrelated) Task pair.
+    if operation.caller_id == crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        let retained_on_behalf =
+            crate::automation::authorization::any_on_behalf_operation_link(db, operation_id)?
+                .is_some();
+        let retained_launch_parent = if retained_on_behalf {
+            false
+        } else {
+            super::launch_child_parent(db, operation_id)?.is_some()
+        };
+        if !retained_on_behalf && !retained_launch_parent {
+            return Ok(None);
+        }
     }
     let identity = operation_task_identity(db, &operation)?;
     if retained_launch_attempt_owner(db, principal, &operation, identity.as_ref())? {
