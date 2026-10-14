@@ -1073,9 +1073,9 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
     let source_epoch = "provider-condition-boot";
     let native_usage = json!({"boot_id":source_epoch,"snapshot":snapshot.clone()});
     db.execute(
-        "UPDATE bindings SET bridge_boot_id=?2, \\
-         state_json=json_set(state_json,'$.bridge_boot_id',?2,'$.connection','connected', \\
-                             '$.native_usage',json(?3)) \\
+        "UPDATE bindings SET bridge_boot_id=?2, \
+         state_json=json_set(state_json,'$.bridge_boot_id',?2,'$.connection','connected', \
+                             '$.native_usage',json(?3)) \
          WHERE binding_id=?1 AND generation=1",
         params![
             "provider-condition-source",
