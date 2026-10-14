@@ -16,7 +16,7 @@ import { prepareQuery } from './prepared-query.mjs';
 import {
   createStreamState, applySdkMessage, noteStreamEnd, noteStreamFailure, snapshot,
 } from './stream.mjs';
-import { streamEndedSendOutcome } from './pending-outcome.mjs';
+import { firstNativeQueryUnknownOutcome, streamEndedSendOutcome } from './pending-outcome.mjs';
 import { createFirstQueryControl } from './first-query-control.mjs';
 
 assert.equal(typeof startup, 'function', 'pinned SDK must export startup()');
@@ -369,6 +369,12 @@ function messageById(snap, id) {
       );
     }
   }
+  const initial = firstNativeQueryUnknownOutcome({ initialTaskDispatch: true }, 'exact-boot');
+  assert.equal(initial.outcome, 'unknown');
+  assert.equal(initial.details.diagnostic_code, 'FIRST_NATIVE_QUERY_UNKNOWN');
+  assert.equal(initial.details.initial_task_dispatch, true);
+  assert.equal(initial.details.bridge_boot_id, 'exact-boot');
+  assert.equal(initial.native_root_id, undefined);
   console.log('PASS stream-loss-outcomes: EOF and lost response remain unknown without UUID admission or replay');
 }
 
