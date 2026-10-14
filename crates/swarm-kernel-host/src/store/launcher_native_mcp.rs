@@ -1034,12 +1034,75 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
     Ok(ClaimOutcome::Idle(next_retry_at(tx, now)?))
 }
 
+fn launcher_meta_for_facts(
+    db: &Connection,
+    key: &str,
+    damage_context: &mut LauncherFactsDamageContext,
+) -> Result<Option<Value>> {
+    let raw: Option<String> = db
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&raw) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            damage_context.record_meta_source(key, &raw);
+            Err(error.into())
+        }
+    }
+}
+
+fn launch_document_text<'a>(
+    damage_context: &mut LauncherFactsDamageContext,
+    value: &'a Value,
+    key: &str,
+) -> Result<&'a str> {
+    text_at(value, key).map_err(|error| {
+        damage_context.record_operation_request();
+        error
+    })
+}
+
+fn launch_document_positive(
+    damage_context: &mut LauncherFactsDamageContext,
+    value: &Value,
+    key: &str,
+) -> Result<i64> {
+    positive_at(value, key).map_err(|error| {
+        damage_context.record_operation_request();
+        error
+    })
+}
+
 fn validate_launch_snapshot(
     db: &Connection,
     row: &LaunchRow,
     manifest: &Value,
     config: &Config,
     phase: LaunchSnapshotPhase<'_>,
+) -> Result<LaunchSnapshot> {
+    let mut damage_context = LauncherFactsDamageContext::default();
+    validate_launch_snapshot_with_damage_context(
+        db,
+        row,
+        manifest,
+        config,
+        phase,
+        &mut damage_context,
+    )
+}
+
+fn validate_launch_snapshot_with_damage_context(
+    db: &Connection,
+    row: &LaunchRow,
+    manifest: &Value,
+    config: &Config,
+    phase: LaunchSnapshotPhase<'_>,
+    damage_context: &mut LauncherFactsDamageContext,
 ) -> Result<LaunchSnapshot> {
     let expected_progress = match phase {
         LaunchSnapshotPhase::PreDispatch | LaunchSnapshotPhase::DispatchNotStarted => "not_started",
@@ -1063,14 +1126,17 @@ fn validate_launch_snapshot(
         }
     };
     let current_gm = super::gm::authority_facts(db)?;
-    let local_operator = meta(db, "local_operator_client_id")?.unwrap_or(Value::Null);
-    let task_id = text_at(&manifest["task"], "task_id")?;
-    let task_revision = positive_at(&manifest["task"], "observed_revision")?;
-    let attempt_id = text_at(&manifest["task"], "attempt_id")?;
+    let local_operator = launcher_meta_for_facts(db, "local_operator_client_id", damage_context)?
+        .unwrap_or(Value::Null);
+    let task_id = launch_document_text(damage_context, &manifest["task"], "task_id")?;
+    let task_revision =
+        launch_document_positive(damage_context, &manifest["task"], "observed_revision")?;
+    let attempt_id = launch_document_text(damage_context, &manifest["task"], "attempt_id")?;
     let task = tasks::get_task(db, task_id)?;
     let attempt = tasks::get_attempt(db, attempt_id)?;
-    let binding_id = text_at(&manifest["binding"], "binding_id")?;
-    let binding_generation = positive_at(&manifest["binding"], "generation")?;
+    let binding_id = launch_document_text(damage_context, &manifest["binding"], "binding_id")?;
+    let binding_generation =
+        launch_document_positive(damage_context, &manifest["binding"], "generation")?;
     let owner_id = text_at(&attempt, "owner_id")?;
     if matches!(phase, LaunchSnapshotPhase::PreDispatch) {
         actor.require_bound_launch_attempt(
@@ -1110,15 +1176,31 @@ fn validate_launch_snapshot(
         return Err(stale_readback());
     }
 
-    let client_id = text_at(&manifest["participant"], "client_id")?.to_owned();
-    let credential_ref = text_at(&manifest["participant"], "credential_ref")?.to_owned();
-    let profile_config_ref = text_at(&manifest["participant"], "profile_config_ref")?.to_owned();
-    let registration_operation_id =
-        text_at(&manifest["participant"], "registration_operation_id")?.to_owned();
-    let grant_revision = positive_at(&manifest["participant"], "grant_revision")?;
-    let profile_name = text_at(&manifest["request"], "mcp_profile")?.to_owned();
-    let surface = text_at(&manifest["request"], "mcp_surface")?.to_owned();
-    let registration = meta(db, &format!("client:{client_id}"))?.ok_or_else(stale_readback)?;
+    let client_id =
+        launch_document_text(damage_context, &manifest["participant"], "client_id")?.to_owned();
+    let credential_ref =
+        launch_document_text(damage_context, &manifest["participant"], "credential_ref")?
+            .to_owned();
+    let profile_config_ref = launch_document_text(
+        damage_context,
+        &manifest["participant"],
+        "profile_config_ref",
+    )?
+    .to_owned();
+    let registration_operation_id = launch_document_text(
+        damage_context,
+        &manifest["participant"],
+        "registration_operation_id",
+    )?
+    .to_owned();
+    let grant_revision =
+        launch_document_positive(damage_context, &manifest["participant"], "grant_revision")?;
+    let profile_name =
+        launch_document_text(damage_context, &manifest["request"], "mcp_profile")?.to_owned();
+    let surface =
+        launch_document_text(damage_context, &manifest["request"], "mcp_surface")?.to_owned();
+    let registration = launcher_meta_for_facts(db, &format!("client:{client_id}"), damage_context)?
+        .ok_or_else(stale_readback)?;
     let basis = json!({
         "kind":"attempt_owner",
         "assignment_id":Value::Null,
@@ -1228,7 +1310,7 @@ fn validate_launch_snapshot(
     }
 
     let current_authority_facts = json!({
-        "actor":launch_actor_facts(db, &actor)?,
+        "actor":launch_actor_facts(db, &actor, damage_context)?,
         "local_operator_client_id":local_operator,
         "gm":{
             "client_id":current_gm["client_id"],
@@ -1357,15 +1439,23 @@ fn validate_launch_snapshot(
     })
 }
 
-fn launch_actor_facts(db: &Connection, actor: &launcher::LaunchActor) -> Result<Value> {
+fn launch_actor_facts(
+    db: &Connection,
+    actor: &launcher::LaunchActor,
+    damage_context: &mut LauncherFactsDamageContext,
+) -> Result<Value> {
     let role = match actor.role() {
         Role::Manager => "manager",
         Role::Operator => "operator",
         _ => return Err(stale_readback()),
     };
     let direct_registration = if let Some(principal) = actor.direct_principal() {
-        let registration =
-            meta(db, &format!("client:{}", principal.client_id))?.ok_or_else(stale_readback)?;
+        let registration = launcher_meta_for_facts(
+            db,
+            &format!("client:{}", principal.client_id),
+            damage_context,
+        )?
+        .ok_or_else(stale_readback)?;
         let registered_role: Role =
             serde_json::from_value(registration["role"].clone()).map_err(|_| stale_readback())?;
         if registration["disabled"] == true || registered_role != principal.role {
@@ -1403,20 +1493,33 @@ pub(crate) fn current_mcp_launch_snapshot(
     config: &Config,
     operation_id: &str,
 ) -> Result<NativeMcpLaunchSnapshot> {
+    current_mcp_launch_snapshot_for_tools(db, config, operation_id).map_err(|failure| failure.error)
+}
+
+pub(super) fn current_mcp_launch_snapshot_for_tools(
+    db: &Connection,
+    config: &Config,
+    operation_id: &str,
+) -> std::result::Result<NativeMcpLaunchSnapshot, LauncherFactsFailure> {
     if operation_id.is_empty()
         || operation_id.len() > 256
         || operation_id.bytes().any(|byte| byte.is_ascii_control())
     {
-        return Err(Error::invalid("launch Operation ID is invalid"));
+        return Err(Error::invalid("launch Operation ID is invalid").into());
     }
-    let (row, manifest) = load_launch_manifest(db, operation_id)?;
-    let snapshot = validate_launch_snapshot(
+    let mut damage_context = LauncherFactsDamageContext::default();
+    let (row, manifest) =
+        load_launch_manifest_with_damage_context(db, operation_id, &mut damage_context)
+            .map_err(|error| damage_context.failure(error))?;
+    let snapshot = validate_launch_snapshot_with_damage_context(
         db,
         &row,
         &manifest,
         config,
         LaunchSnapshotPhase::PreDispatch,
-    )?;
+        &mut damage_context,
+    )
+    .map_err(|error| damage_context.failure(error))?;
     let identity_digest = launch_identity_digest(&snapshot)?;
     Ok(NativeMcpLaunchSnapshot {
         snapshot,
@@ -1466,14 +1569,32 @@ pub(crate) fn revalidate_mcp_launch_snapshot(
     config: &Config,
     snapshot: &NativeMcpLaunchSnapshot,
 ) -> Result<()> {
-    let current = current_mcp_launch_snapshot(db, config, &snapshot.snapshot.operation_id)?;
+    revalidate_mcp_launch_snapshot_for_tools(db, config, snapshot).map_err(|failure| failure.error)
+}
+
+pub(super) fn revalidate_mcp_launch_snapshot_for_tools(
+    db: &Connection,
+    config: &Config,
+    snapshot: &NativeMcpLaunchSnapshot,
+) -> std::result::Result<(), LauncherFactsFailure> {
+    let current =
+        current_mcp_launch_snapshot_for_tools(db, config, &snapshot.snapshot.operation_id)?;
     if current.identity_digest != snapshot.identity_digest {
-        return Err(stale_readback());
+        return Err(stale_readback().into());
     }
     Ok(())
 }
 
 fn load_launch_manifest(db: &Connection, operation_id: &str) -> Result<(LaunchRow, Value)> {
+    let mut damage_context = LauncherFactsDamageContext::default();
+    load_launch_manifest_with_damage_context(db, operation_id, &mut damage_context)
+}
+
+fn load_launch_manifest_with_damage_context(
+    db: &Connection,
+    operation_id: &str,
+    damage_context: &mut LauncherFactsDamageContext,
+) -> Result<(LaunchRow, Value)> {
     let row = db.query_row(
         "SELECT operation_id,caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,effective_request_json \
          FROM operations WHERE operation_id=?1",
@@ -1492,7 +1613,15 @@ fn load_launch_manifest(db: &Connection, operation_id: &str) -> Result<(LaunchRo
             })
         },
     )?;
-    let effective: Value = serde_json::from_str(&row.effective_request_json)?;
+    damage_context.operation_request_digest =
+        Some(model::digest(row.effective_request_json.as_bytes()));
+    let effective: Value = match serde_json::from_str(&row.effective_request_json) {
+        Ok(effective) => effective,
+        Err(error) => {
+            damage_context.record_operation_request();
+            return Err(error.into());
+        }
+    };
     let manifest = effective
         .get("launch_manifest")
         .cloned()
@@ -1920,6 +2049,58 @@ pub(super) enum LauncherDamageSource {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct LauncherDamageEvidence {
+    pub(super) source: LauncherDamageSource,
+    pub(super) source_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LauncherFactsFailure {
+    pub(super) error: Error,
+    pub(super) damage: Option<LauncherDamageEvidence>,
+}
+
+impl From<Error> for LauncherFactsFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            damage: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LauncherFactsDamageContext {
+    operation_request_digest: Option<String>,
+    damage: Option<LauncherDamageEvidence>,
+}
+
+impl LauncherFactsDamageContext {
+    fn record_operation_request(&mut self) {
+        if let Some(source_digest) = self.operation_request_digest.clone() {
+            self.damage = Some(LauncherDamageEvidence {
+                source: LauncherDamageSource::OperationRequest,
+                source_digest,
+            });
+        }
+    }
+
+    fn record_meta_source(&mut self, key: &str, raw: &str) {
+        self.damage = Some(LauncherDamageEvidence {
+            source: LauncherDamageSource::MetaKey(key.to_owned()),
+            source_digest: model::digest(raw.as_bytes()),
+        });
+    }
+
+    fn failure(&mut self, error: Error) -> LauncherFactsFailure {
+        LauncherFactsFailure {
+            error,
+            damage: self.damage.take(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LauncherCorruptSweepCursor {
     ceiling_operation_id: String,
     after_operation_id: Option<String>,
@@ -1956,6 +2137,37 @@ pub(super) fn quarantine_launch_damage(
     source: LauncherDamageSource,
     now_ms: i64,
 ) -> Result<String> {
+    let (source_pointer, raw) = launcher_damage_source_raw(tx, operation_id, source)?;
+    quarantine_launch_subject(
+        tx,
+        operation_id,
+        &source_pointer,
+        model::digest(raw.as_bytes()),
+        now_ms,
+    )
+}
+
+pub(super) fn quarantine_launch_damage_evidence(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    evidence: LauncherDamageEvidence,
+    now_ms: i64,
+) -> Result<String> {
+    let (source_pointer, raw) = launcher_damage_source_raw(tx, operation_id, evidence.source)?;
+    let source_digest = model::digest(raw.as_bytes());
+    if source_digest != evidence.source_digest {
+        return Err(Error::conflict(
+            "launcher damage source changed before quarantine",
+        ));
+    }
+    quarantine_launch_subject(tx, operation_id, &source_pointer, source_digest, now_ms)
+}
+
+fn launcher_damage_source_raw(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    source: LauncherDamageSource,
+) -> Result<(String, String)> {
     let (source_pointer, raw) = match source {
         LauncherDamageSource::OperationRequest => {
             let raw: Option<String> = tx
@@ -1982,13 +2194,7 @@ pub(super) fn quarantine_launch_damage(
             "damaged launcher source disappeared before quarantine",
         )
     })?;
-    quarantine_launch_subject(
-        tx,
-        operation_id,
-        &source_pointer,
-        model::digest(raw.as_bytes()),
-        now_ms,
-    )
+    Ok((source_pointer, raw))
 }
 
 /// Persist typed quarantine for one malformed launch subject and return the

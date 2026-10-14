@@ -503,3 +503,143 @@ fn corrupt_head_row_is_quarantined_without_aborting_the_next_launch() {
     assert_eq!(retained, "{corrupt");
     tx.commit().unwrap();
 }
+
+#[test]
+fn corrupt_participant_metadata_is_quarantined_with_its_raw_digest_and_scan_continues() {
+    const PARTICIPANT_ID: &str = "legacy-scope-participant";
+    const NEXT_OPERATION: &str = "native-mcp-tools-poison-next";
+    const CORRUPT_RAW: &str = "{broken participant registration";
+
+    let mut db = changed_participant_registration_db();
+    let raw_effective: String = db
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [LAUNCH_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut effective: Value = serde_json::from_str(&raw_effective).unwrap();
+    effective["launch_manifest"]["native_mcp_readback"] = json!({"state":"observed_partial"});
+    let launch_effective = model::canonical(&effective).unwrap();
+    db.execute(
+        "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+        params![LAUNCH_ID, launch_effective],
+    )
+    .unwrap();
+
+    let participant_key = format!("client:{PARTICIPANT_ID}");
+    db.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    db.execute(
+        "UPDATE meta SET value_json=?2 WHERE key=?1",
+        params![participant_key, CORRUPT_RAW],
+    )
+    .unwrap();
+    db.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
+
+    let next_effective = model::canonical(&json!({"launch_manifest":{
+        "state":"awaiting_native_mcp",
+        "runtime":{"dispatch_permitted":false},
+        "progress":{"task_dispatch":"not_started"},
+        "native_mcp_readback":{"state":"observed_partial"},
+    }}))
+    .unwrap();
+    db.execute(
+        "INSERT INTO operations(
+             operation_id,caller_id,client_request_id,method,original_request_json,
+             effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+         ) VALUES(?1,'manager',?2,'swarm.launch','{}',?3,'queued',1,1,1)",
+        params![
+            NEXT_OPERATION,
+            format!("{NEXT_OPERATION}-request"),
+            next_effective
+        ],
+    )
+    .unwrap();
+    let schedule_key = format!(
+        "launcher:native_mcp_tools:supervisor:v1:{}",
+        model::digest(NEXT_OPERATION.as_bytes())
+    );
+    let waiting_schedule = json!({
+        "schema_version":1,
+        "kind":"launcher_native_mcp_tools_supervisor",
+        "operation_id":NEXT_OPERATION,
+        "launch_identity_digest":"",
+        "state":"retry_wait",
+        "claim_generation":0,
+        "started_at_ms":null,
+        "next_retry_at_ms":200,
+        "finished_at_ms":null,
+        "failure_attempts":0,
+        "last_error_code":null,
+    });
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+        params![schedule_key, model::canonical(&waiting_schedule).unwrap()],
+    )
+    .unwrap();
+
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let next_retry_at = super::super::launcher_mcp_tools::claim_next_tools_idle_deadline_for_test(
+        &tx,
+        100,
+        &Config::default(),
+    )
+    .unwrap();
+    assert_eq!(next_retry_at, Some(200));
+
+    let quarantine_count: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM meta WHERE key LIKE ?1",
+            [format!("{}%", LAUNCHER_QUARANTINE_PREFIX)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(quarantine_count, 1);
+    let (quarantine_key, quarantine_json): (String, String) = tx
+        .query_row(
+            "SELECT key,value_json FROM meta WHERE key LIKE ?1",
+            [format!("{}%", LAUNCHER_QUARANTINE_PREFIX)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let source_pointer = format!("meta:{participant_key}");
+    let source_digest = model::digest(CORRUPT_RAW.as_bytes());
+    let evidence = launcher_damage_evidence(LAUNCH_ID, &source_pointer, source_digest.clone());
+    let expected_key = quarantine_record_key(LAUNCHER_QUARANTINE_PREFIX, &evidence).unwrap();
+    assert_eq!(quarantine_key, expected_key);
+    let quarantine: Value = serde_json::from_str(&quarantine_json).unwrap();
+    assert_eq!(quarantine["evidence"]["source_pointer"], source_pointer);
+    assert_eq!(quarantine["evidence"]["source_digest"], source_digest);
+
+    let retained_meta: String = tx
+        .query_row(
+            "SELECT value_json FROM meta WHERE key=?1",
+            [&participant_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_meta, CORRUPT_RAW);
+    let retained_launch: String = tx
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [LAUNCH_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_launch, launch_effective);
+    let retained_schedule: String = tx
+        .query_row(
+            "SELECT value_json FROM meta WHERE key=?1",
+            [&schedule_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let retained_schedule: Value = serde_json::from_str(&retained_schedule).unwrap();
+    assert_eq!(retained_schedule["state"], "retry_wait");
+    assert_eq!(retained_schedule["next_retry_at_ms"], 200);
+    tx.commit().unwrap();
+}

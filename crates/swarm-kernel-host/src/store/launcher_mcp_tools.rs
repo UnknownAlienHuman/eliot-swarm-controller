@@ -107,14 +107,21 @@ impl Store {
         self.changed
             .send_modify(|revision| *revision = revision.wrapping_add(1));
 
+        let mut launch_facts_failure = None;
         let progress = self
-            .advance_native_mcp_tools_once(&claim.operation_id)
+            .advance_native_mcp_tools_once(&claim.operation_id, &mut launch_facts_failure)
             .await;
         let now = model::now_ms()?;
         let error_code = progress.as_ref().err().map(|error| error.code.clone());
         let progress_value = progress.ok();
         let result = self
-            .finish_tools_claim(&claim, error_code, progress_value, now)
+            .finish_tools_claim(
+                &claim,
+                error_code,
+                progress_value,
+                launch_facts_failure,
+                now,
+            )
             .await?;
         self.changed
             .send_modify(|revision| *revision = revision.wrapping_add(1));
@@ -123,12 +130,23 @@ impl Store {
 
     /// Advance one claimed exact launch. This inner method is not a scheduler
     /// entrypoint; all host callers must pass through the durable due claim.
-    async fn advance_native_mcp_tools_once(&self, launch_operation_id: &str) -> Result<Value> {
+    async fn advance_native_mcp_tools_once(
+        &self,
+        launch_operation_id: &str,
+        launch_facts_failure: &mut Option<launcher_native_mcp::LauncherFactsFailure>,
+    ) -> Result<Value> {
         let operation_id = launch_operation_id.to_owned();
         let config = self.config.clone();
-        let facts = self
-            .run(move |db| load_launch_facts(db, &config, &operation_id))
+        let facts_result = self
+            .run(move |db| Ok(load_launch_facts(db, &config, &operation_id)))
             .await?;
+        let facts = match facts_result {
+            Ok(facts) => facts,
+            Err(failure) => {
+                *launch_facts_failure = Some(failure.clone());
+                return Err(failure.error);
+            }
+        };
 
         let (credential, first_principal, assignment, prepared) =
             self.prepare_install(&facts).await?;
@@ -456,10 +474,12 @@ impl Store {
         claim: &ToolsClaim,
         error_code: Option<String>,
         progress: Option<Value>,
+        launch_facts_failure: Option<launcher_native_mcp::LauncherFactsFailure>,
         now: i64,
     ) -> Result<Value> {
         let claim = claim.clone();
         let config = self.config.clone();
+        let launch_facts_failure = launch_facts_failure.clone();
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let key = supervisor_key(&claim.operation_id);
@@ -480,11 +500,34 @@ impl Store {
                 }));
             }
 
-            let current = match load_launch_facts(&tx, &config, &claim.operation_id) {
-                Ok(current) if current.identity_digest == claim.identity_digest => true,
-                Ok(_) => false,
-                Err(error) if is_stale_scope_code(&error.code) => false,
-                Err(error) => return Err(error),
+            let current = match launch_facts_failure {
+                Some(failure) if is_stale_scope_code(&failure.error.code) => false,
+                Some(failure)
+                    if isolate_tools_launch_facts_failure(
+                        &tx,
+                        &claim.operation_id,
+                        &failure,
+                        now,
+                    )? =>
+                {
+                    false
+                }
+                _ => match load_launch_facts(&tx, &config, &claim.operation_id) {
+                    Ok(current) if current.identity_digest == claim.identity_digest => true,
+                    Ok(_) => false,
+                    Err(failure) if is_stale_scope_code(&failure.error.code) => false,
+                    Err(failure)
+                        if isolate_tools_launch_facts_failure(
+                            &tx,
+                            &claim.operation_id,
+                            &failure,
+                            now,
+                        )? =>
+                    {
+                        false
+                    }
+                    Err(failure) => return Err(failure.error),
+                },
             };
             let stale_error = error_code
                 .as_ref()
@@ -1833,12 +1876,17 @@ async fn connect_native_service(facts: &LaunchFacts) -> Result<Service> {
     }
 }
 
-fn load_launch_facts(db: &Connection, config: &Config, operation_id: &str) -> Result<LaunchFacts> {
+fn load_launch_facts(
+    db: &Connection,
+    config: &Config,
+    operation_id: &str,
+) -> std::result::Result<LaunchFacts, launcher_native_mcp::LauncherFactsFailure> {
     if operation_id.is_empty() || operation_id.len() > 256 {
-        return Err(Error::invalid("launch Operation ID is invalid"));
+        return Err(Error::invalid("launch Operation ID is invalid").into());
     }
-    let snapshot = launcher_native_mcp::current_mcp_launch_snapshot(db, config, operation_id)?;
-    launcher_native_mcp::revalidate_mcp_launch_snapshot(db, config, &snapshot)?;
+    let snapshot =
+        launcher_native_mcp::current_mcp_launch_snapshot_for_tools(db, config, operation_id)?;
+    launcher_native_mcp::revalidate_mcp_launch_snapshot_for_tools(db, config, &snapshot)?;
     Ok(LaunchFacts {
         operation_id: snapshot.launch_operation_id().to_owned(),
         identity_digest: snapshot.identity_digest()?,
@@ -2900,6 +2948,22 @@ fn isolate_tools_candidate(
     Ok(false)
 }
 
+fn isolate_tools_launch_facts_failure(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    failure: &launcher_native_mcp::LauncherFactsFailure,
+    now_ms: i64,
+) -> Result<bool> {
+    if failure.error.code != "INVALID_PARAMS" {
+        return Ok(false);
+    }
+    let Some(evidence) = failure.damage.clone() else {
+        return Ok(false);
+    };
+    launcher_native_mcp::quarantine_launch_damage_evidence(tx, operation_id, evidence, now_ms)?;
+    Ok(true)
+}
+
 /// Retain a visible stale hold for one C8 subject, replacing only the
 /// supervisor marker. The damaged private record and launch row stay
 /// untouched for forensics; a corrupt marker is replaced, never repaired.
@@ -3038,28 +3102,22 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         }
         let facts = match load_launch_facts(tx, config, &operation_id) {
             Ok(facts) => facts,
-            Err(error) if error.code == "STALE_LAUNCH" => {
+            Err(failure) if failure.error.code == "STALE_LAUNCH" => {
                 if let Some(deadline) = defer_stale_launch(tx, &operation_id, now)? {
                     next_retry_at_ms =
                         Some(next_retry_at_ms.map_or(deadline, |current| current.min(deadline)));
                 }
                 continue;
             }
-            Err(error) if is_stale_scope_code(&error.code) => {
-                mark_tools_stale(tx, &operation_id, &error.code, now)?;
+            Err(failure) if is_stale_scope_code(&failure.error.code) => {
+                mark_tools_stale(tx, &operation_id, &failure.error.code, now)?;
                 continue;
             }
-            Err(error) => {
-                if isolate_tools_candidate(
-                    tx,
-                    &operation_id,
-                    launcher_native_mcp::LauncherDamageSource::OperationRequest,
-                    &error,
-                    now,
-                )? {
+            Err(failure) => {
+                if isolate_tools_launch_facts_failure(tx, &operation_id, &failure, now)? {
                     continue;
                 }
-                return Err(error);
+                return Err(failure.error);
             }
         };
 
@@ -3283,6 +3341,20 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         set_meta(tx, SUPERVISOR_CURSOR_KEY, &json!(operation_id))?;
     }
     Ok(ToolsClaimOutcome::Idle(next_retry_at_ms))
+}
+
+#[cfg(test)]
+pub(super) fn claim_next_tools_idle_deadline_for_test(
+    tx: &Transaction<'_>,
+    now: i64,
+    config: &Config,
+) -> Result<Option<i64>> {
+    match claim_next_tools(tx, now, config)? {
+        ToolsClaimOutcome::Idle(next_retry_at_ms) => Ok(next_retry_at_ms),
+        ToolsClaimOutcome::Claimed(_) => Err(record_error(
+            "fixture unexpectedly claimed a native MCP launch",
+        )),
+    }
 }
 
 fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Result<Option<i64>> {
@@ -4661,6 +4733,7 @@ mod failure_event_tests {
                     "observer_state":"not_started",
                     "dispatch_permitted":false,
                 })),
+                None,
                 20_000,
             )
             .await
