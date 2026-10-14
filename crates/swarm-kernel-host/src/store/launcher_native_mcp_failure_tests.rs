@@ -599,11 +599,11 @@ fn corrupt_participant_metadata_is_quarantined_with_its_raw_digest_and_scan_cont
         )
         .unwrap();
     assert_eq!(quarantine_count, 1);
-    let (quarantine_key, quarantine_json): (String, String) = tx
+    let quarantine_key: String = tx
         .query_row(
-            "SELECT key,value_json FROM meta WHERE key LIKE ?1",
+            "SELECT key FROM meta WHERE key LIKE ?1",
             [format!("{}%", LAUNCHER_QUARANTINE_PREFIX)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .unwrap();
     let source_pointer = format!("meta:{participant_key}");
@@ -611,7 +611,11 @@ fn corrupt_participant_metadata_is_quarantined_with_its_raw_digest_and_scan_cont
     let evidence = launcher_damage_evidence(LAUNCH_ID, &source_pointer, source_digest.clone());
     let expected_key = quarantine_record_key(LAUNCHER_QUARANTINE_PREFIX, &evidence).unwrap();
     assert_eq!(quarantine_key, expected_key);
-    let quarantine: Value = serde_json::from_str(&quarantine_json).unwrap();
+    let quarantine =
+        crate::automation::config::read_record(&tx, &quarantine_key, "launcher quarantine fixture")
+            .unwrap()
+            .expect("sealed quarantine record is retained");
+    assert_eq!(quarantine["code"], LAUNCHER_RECORD_CORRUPT_CODE);
     assert_eq!(quarantine["evidence"]["source_pointer"], source_pointer);
     assert_eq!(quarantine["evidence"]["source_digest"], source_digest);
 
