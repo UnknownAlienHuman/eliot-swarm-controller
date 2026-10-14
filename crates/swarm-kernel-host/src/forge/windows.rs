@@ -62,8 +62,19 @@ pub(super) fn run_git(
     project: &ForgeProject,
     args: &[String],
 ) -> Result<GitOutput> {
+    // Git uses its CRT image path for installation/config lookup. A verbatim
+    // path breaks that lookup in the native engine. Use an ordinary absolute
+    // spelling only after proving it names the exact configured regular file.
+    let executable = crate::workspace::git_path_argument(&config.git_executable)?;
+    let configured_file = std::fs::File::open(&config.git_executable)?;
+    if !swarm_process::opened_regular_file_matches_path(&configured_file, Path::new(&executable))? {
+        return Err(Error::new(
+            "FORGE_GIT_START",
+            "normalized Git executable does not identify the configured file",
+        ));
+    }
     let mut argv = vec![
-        config.git_executable.as_os_str().to_owned(),
+        OsString::from(executable.as_str()),
         OsString::from("--no-optional-locks"),
         OsString::from("--no-replace-objects"),
         OsString::from("-c"),
@@ -78,7 +89,7 @@ pub(super) fn run_git(
 
     let environment = env::vars_os().collect::<Vec<_>>();
     run_process(
-        config.git_executable.as_os_str(),
+        OsStr::new(&executable),
         &argv,
         &project.repository_path,
         environment,
@@ -792,6 +803,37 @@ mod tests {
     use std::process::{Command, Stdio};
 
     const CHILD_MODE: &str = "ELIOT_FORGE_DESCENDANT_TEST";
+
+    #[test]
+    fn normalized_git_image_rejects_a_different_regular_file_before_spawn() {
+        let directory = env::temp_dir().join(format!("swarm-git-image-{}", crate::model::new_id()));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let ordinary = directory.join("git.exe");
+        let verbatim = directory.join("git.exe.");
+        std::fs::write(&ordinary, b"ordinary file must never be executed").unwrap();
+        std::fs::write(&verbatim, b"exact configured verbatim file").unwrap();
+        let config = ForgeConfig {
+            git_executable: verbatim.clone(),
+            ..ForgeConfig::default()
+        };
+        let project = ForgeProject {
+            canonical_repository: "github.com/fixture/git-image".into(),
+            repository_path: directory.clone(),
+            remote_name: "origin".into(),
+            policy_revision: "fixture-v1".into(),
+            target_refs: vec!["refs/heads/main".into()],
+        };
+        let error = run_git(&config, &project, &["version".into()]).unwrap_err();
+        assert_eq!(error.code, "FORGE_GIT_START", "{error}");
+        assert_eq!(
+            error.message,
+            "normalized Git executable does not identify the configured file"
+        );
+        std::fs::remove_file(verbatim).unwrap();
+        std::fs::remove_file(ordinary).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn windows_argv_uses_crt_backslash_and_quote_rules() {

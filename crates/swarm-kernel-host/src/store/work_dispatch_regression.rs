@@ -875,11 +875,25 @@ async fn manual_launch_final_gate_rejects_new_provider_condition_before_workspac
 
 fn fixture_git_executable() -> PathBuf {
     let name = if cfg!(windows) { "git.exe" } else { "git" };
-    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+    let git = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
-        .and_then(|candidate| candidate.canonicalize().ok())
-        .expect("Git executable is available for the configured Forge mapping")
+        .expect("Git executable is available for the configured Forge mapping");
+    // Exercise the configured native engine on Windows. The cmd/bin launcher
+    // normalizes its own child argv and would hide a verbatim argv[0] defect.
+    #[cfg(windows)]
+    let git = git
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|root| {
+            ["ucrt64", "mingw64"]
+                .into_iter()
+                .map(|runtime| root.join(runtime).join("bin/git.exe"))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or(git);
+    git.canonicalize()
+        .expect("canonical Git executable is available for the configured Forge mapping")
 }
 
 fn run_fixture_git(git: &Path, repository: &Path, hooks: &Path, args: &[&str]) -> String {
@@ -931,6 +945,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         std::fs::canonicalize(workspace_root).expect("canonicalize fixture workspace root");
 
     let git = fixture_git_executable();
+    eprintln!("workspace_fixture_git_executable={}", git.display());
     run_fixture_git(&git, &repository, &empty_hooks, &["init", "--quiet"]);
     run_fixture_git(
         &git,

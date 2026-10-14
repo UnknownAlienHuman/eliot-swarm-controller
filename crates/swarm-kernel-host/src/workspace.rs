@@ -1164,7 +1164,7 @@ fn admit_git_metadata_paths(_repository_path: &Path, _workspace_git_path: &str) 
 /// Convert only Windows extended-length disk and UNC paths for Git argv.
 /// Filesystem checks and persisted lease paths keep their canonical form.
 #[cfg(windows)]
-fn git_path_argument(path: &Path) -> Result<String> {
+pub(crate) fn git_path_argument(path: &Path) -> Result<String> {
     use std::path::Prefix;
 
     let original = path_string(path)?;
