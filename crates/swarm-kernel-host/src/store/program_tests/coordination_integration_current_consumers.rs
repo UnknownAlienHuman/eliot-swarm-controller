@@ -719,8 +719,14 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
     assert_eq!(found["coverage"], "complete");
     assert_eq!(found["items"].as_array().unwrap().len(), 1);
     assert_eq!(found["items"][0]["client_id"], target.client_id);
-    assert_eq!(found["items"][0]["context"]["task_id"], target_subject.task_id);
-    assert_eq!(found["items"][0]["match"]["relation"]["kind"], "contract_key");
+    assert_eq!(
+        found["items"][0]["context"]["task_id"],
+        target_subject.task_id
+    );
+    assert_eq!(
+        found["items"][0]["match"]["relation"]["kind"],
+        "contract_key"
+    );
 
     let ready_answer = owner
         .store
@@ -759,7 +765,11 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
     });
     let asked = owner
         .store
-        .call(source.clone(), "coordination.consult".into(), ask_request.clone())
+        .call(
+            source.clone(),
+            "coordination.consult".into(),
+            ask_request.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(asked["status"], "asked");
@@ -776,13 +786,20 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
 
     let inbox = owner
         .store
-        .call(target.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .call(
+            target.clone(),
+            "coordination.inbox".into(),
+            json!({"limit":10}),
+        )
         .await
         .unwrap();
     assert_eq!(inbox["task_id"], target_subject.task_id);
     assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
     assert_eq!(inbox["items"][0]["operation_id"], asked["operation_id"]);
-    assert_eq!(inbox["items"][0]["body"]["schema"], "eliot.coordination.consult.v1");
+    assert_eq!(
+        inbox["items"][0]["body"]["schema"],
+        "eliot.coordination.consult.v1"
+    );
 
     let unrelated_send = owner
         .store
@@ -813,20 +830,41 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
         "issue99-cross-task-sync-consumer",
     )
     .await;
-    assert_eq!(first_cell["cell"]["cell_id"], second_cell["cell"]["cell_id"]);
+    assert_eq!(
+        first_cell["cell"]["cell_id"],
+        second_cell["cell"]["cell_id"]
+    );
     let task_revision_set = second_cell["cell"]["facts"]["task_revision_set"]
         .as_array()
         .unwrap();
     assert_eq!(task_revision_set.len(), 2);
-    assert!(task_revision_set.iter().any(|item| item["task_id"] == source_subject.task_id));
-    assert!(task_revision_set.iter().any(|item| item["task_id"] == target_subject.task_id));
-    assert_eq!(second_cell["cell"]["facts"]["member_basis_set"].as_array().unwrap().len(), 2);
+    assert!(
+        task_revision_set
+            .iter()
+            .any(|item| item["task_id"] == source_subject.task_id)
+    );
+    assert!(
+        task_revision_set
+            .iter()
+            .any(|item| item["task_id"] == target_subject.task_id)
+    );
+    assert_eq!(
+        second_cell["cell"]["facts"]["member_basis_set"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     owner
         .store
         .call(
             source.clone(),
             "coordination.integration.ack".into(),
-            ack_request(&second_cell["cell"], &source_subject, "issue99-cross-task-ack-producer"),
+            ack_request(
+                &second_cell["cell"],
+                &source_subject,
+                "issue99-cross-task-ack-producer",
+            ),
         )
         .await
         .unwrap();
@@ -835,7 +873,11 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
         .call(
             target.clone(),
             "coordination.integration.ack".into(),
-            ack_request(&second_cell["cell"], &target_subject, "issue99-cross-task-ack-consumer"),
+            ack_request(
+                &second_cell["cell"],
+                &target_subject,
+                "issue99-cross-task-ack-consumer",
+            ),
         )
         .await
         .unwrap();
@@ -853,7 +895,10 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
         .await
         .unwrap();
     assert_eq!(agreed_cell["current"], true);
-    assert_eq!(agreed_cell["positions"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        agreed_cell["positions"]["items"].as_array().unwrap().len(),
+        2
+    );
     let foreign_read = owner
         .store
         .call(
@@ -879,7 +924,10 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
         .store
         .run(move |db| {
             let key = format!("client:{target_client_id}");
-            let raw: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| row.get(0))?;
+            let raw: String =
+                db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
+                    row.get(0)
+                })?;
             let mut registration: Value = serde_json::from_str(&raw)?;
             registration["task_id"] = json!(new_task_id);
             registration["task_revision"] = json!(1);
@@ -891,7 +939,10 @@ async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context
             )?;
             db.execute(
                 "DELETE FROM meta WHERE key=?1",
-                [crate::coordination::participant_task_key(&old_task_id, &target_client_id)],
+                [crate::coordination::participant_task_key(
+                    &old_task_id,
+                    &target_client_id,
+                )],
             )?;
             db.execute(
                 "INSERT OR REPLACE INTO meta(key,value_json) VALUES(?1,?2)",

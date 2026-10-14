@@ -196,7 +196,13 @@ pub(super) fn list_current_contract_participants(
             }
             Err(error) => return Err(error),
         };
-        let Some(card) = current_card(db, &member.scope_id, "contract", &index.identity, &index.client_id)?
+        let Some(card) = current_card(
+            db,
+            &member.scope_id,
+            "contract",
+            &index.identity,
+            &index.client_id,
+        )?
         else {
             stale += 1;
             continue;
@@ -219,7 +225,10 @@ pub(super) fn list_current_contract_participants(
                 db,
                 &caller,
                 &member,
-                Some(&PeerSelector::Term(keys::TermKind::Contract, contract_key.to_owned())),
+                Some(&PeerSelector::Term(
+                    keys::TermKind::Contract,
+                    contract_key.to_owned(),
+                )),
             )?
         };
         let Some(relation) = relation else {
@@ -300,7 +309,8 @@ pub(super) fn list_current_contract_participants_for_manager(
             "contract",
             contract_key,
             &index.client_id,
-        )? else {
+        )?
+        else {
             stale = stale.saturating_add(1);
             continue;
         };
@@ -2839,13 +2849,8 @@ fn write_relevance_indexes(
                     "card_revision":revision,
                 }),
             )?;
-            let global_key = keys::global_relevance_key(
-                term_kind,
-                &term,
-                client_id,
-                card_kind,
-                identity,
-            );
+            let global_key =
+                keys::global_relevance_key(term_kind, &term, client_id, card_kind, identity);
             set_meta(
                 tx,
                 &global_key,
@@ -2884,11 +2889,7 @@ fn remove_relevance_indexes(
             tx.execute(
                 "DELETE FROM meta WHERE key=?1",
                 [keys::global_relevance_key(
-                    term_kind,
-                    &term,
-                    client_id,
-                    card_kind,
-                    identity,
+                    term_kind, &term, client_id, card_kind, identity,
                 )],
             )?;
         }
@@ -2986,7 +2987,11 @@ fn indexed_global_cards(
     let prefix = keys::global_relevance_prefix(term_kind, term);
     let upper = format!("{prefix}g");
     let lower = match after_client_id {
-        Some(client_id) => format!("{}{client}:~", prefix, client = keys::key_component(client_id)),
+        Some(client_id) => format!(
+            "{}{client}:~",
+            prefix,
+            client = keys::key_component(client_id)
+        ),
         None => prefix.clone(),
     };
     let comparison = if after_client_id.is_some() { ">" } else { ">=" };
@@ -3022,13 +3027,9 @@ fn indexed_global_cards(
             let card_kind = value.get("card_kind")?.as_str()?.to_owned();
             let identity = value.get("identity")?.as_str()?.to_owned();
             Some(IndexedCard {
-                valid_index: key
+                valid_index: *key
                     == keys::global_relevance_key(
-                        term_kind,
-                        term,
-                        &client_id,
-                        &card_kind,
-                        &identity,
+                        term_kind, term, &client_id, &card_kind, &identity,
                     ),
                 client_id,
                 card_kind,
@@ -3048,7 +3049,11 @@ fn indexed_task_participants(
     let prefix = keys::participant_task_prefix(task_id);
     let upper = format!("{prefix}g");
     let lower = match after_client_id {
-        Some(client_id) => format!("{}{client}", prefix, client = keys::key_component(client_id)),
+        Some(client_id) => format!(
+            "{}{client}",
+            prefix,
+            client = keys::key_component(client_id)
+        ),
         None => prefix.clone(),
     };
     let comparison = if after_client_id.is_some() { ">" } else { ">=" };
@@ -3122,13 +3127,20 @@ fn relation_selector_matches(relation: &Value, selector: Option<&PeerSelector>) 
 }
 
 fn task_dependency_relation(source: &ScopeData, target: &ScopeData) -> Option<Value> {
-    let source_dependencies = source.task.pointer("/spec/dependencies").and_then(Value::as_array);
-    if let Some(dependency) = source_dependencies.into_iter().flatten().find(|dependency| {
-        dependency.get("task_id") == target.task.get("task_id")
-            && dependency.get("required_revision") == target.task.get("revision")
-            && dependency.get("required_phase").and_then(Value::as_str)
-                == target.task.pointer("/spec/phase").and_then(Value::as_str)
-    }) {
+    let source_dependencies = source
+        .task
+        .pointer("/spec/dependencies")
+        .and_then(Value::as_array);
+    if let Some(dependency) = source_dependencies
+        .into_iter()
+        .flatten()
+        .find(|dependency| {
+            dependency.get("task_id") == target.task.get("task_id")
+                && dependency.get("required_revision") == target.task.get("revision")
+                && dependency.get("required_phase").and_then(Value::as_str)
+                    == target.task.pointer("/spec/phase").and_then(Value::as_str)
+        })
+    {
         return Some(json!({
             "kind":"task_dependency",
             "direction":"source_depends_on_target",
@@ -3141,7 +3153,10 @@ fn task_dependency_relation(source: &ScopeData, target: &ScopeData) -> Option<Va
             "required_phase":dependency["required_phase"],
         }));
     }
-    let target_dependencies = target.task.pointer("/spec/dependencies").and_then(Value::as_array);
+    let target_dependencies = target
+        .task
+        .pointer("/spec/dependencies")
+        .and_then(Value::as_array);
     target_dependencies
         .into_iter()
         .flatten()
@@ -3176,9 +3191,8 @@ fn scope_cards(db: &Connection, scope: &ScopeData, card_kind: &str) -> Result<Ve
         keys::key_component(client_id)
     );
     let upper = format!("{prefix}g");
-    let mut statement = db.prepare(
-        "SELECT value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 101",
-    )?;
+    let mut statement =
+        db.prepare("SELECT value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 101")?;
     let owners: Vec<String> = statement
         .query_map(params![prefix, upper], |row| row.get(0))?
         .collect::<std::result::Result<_, _>>()?;
@@ -3335,9 +3349,13 @@ fn accepted_scope_relation_for_terms(
         target.attempt["attempt_id"].as_str().unwrap_or_default(),
     )?;
     if source_scopes["coverage"] != "complete"
-        || source_scopes["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+        || source_scopes["gaps"]
+            .as_array()
+            .is_none_or(|gaps| !gaps.is_empty())
         || target_scopes["coverage"] != "complete"
-        || target_scopes["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+        || target_scopes["gaps"]
+            .as_array()
+            .is_none_or(|gaps| !gaps.is_empty())
     {
         return Ok(None);
     }
@@ -3459,7 +3477,9 @@ fn pending_coordination_relation(
     target: &ScopeData,
     selector: Option<&PeerSelector>,
 ) -> Result<Option<Value>> {
-    let (Some(source_id), Some(target_id)) = (source.client_id.as_deref(), target.client_id.as_deref()) else {
+    let (Some(source_id), Some(target_id)) =
+        (source.client_id.as_deref(), target.client_id.as_deref())
+    else {
         return Ok(None);
     };
     let Some(pending) = meta(db, &pending_peer_relation_key(source_id, target_id))? else {
@@ -3468,10 +3488,10 @@ fn pending_coordination_relation(
     let source_context = scope_context(source);
     let target_context = scope_context(target);
     for ask in pending["asks"].as_array().into_iter().flatten() {
-        let exact_direction = ask["source_context"] == source_context
-            && ask["target_context"] == target_context;
-        let reverse_direction = ask["source_context"] == target_context
-            && ask["target_context"] == source_context;
+        let exact_direction =
+            ask["source_context"] == source_context && ask["target_context"] == target_context;
+        let reverse_direction =
+            ask["source_context"] == target_context && ask["target_context"] == source_context;
         if !(exact_direction || reverse_direction) {
             continue;
         }
@@ -3538,7 +3558,10 @@ fn current_peer_relation(
         return Ok(Some(scope));
     }
     if matches!(selector, None | Some(PeerSelector::Participant(_)))
-        || matches!(selector, Some(PeerSelector::Term(keys::TermKind::Contract, _)))
+        || matches!(
+            selector,
+            Some(PeerSelector::Term(keys::TermKind::Contract, _))
+        )
     {
         if let Some(cell) = super::integration::current_peer_cell_relation(
             db,
@@ -3567,9 +3590,15 @@ fn sponsored_review_relation(source: &ScopeData, target: &ScopeData) -> Option<V
         return None;
     }
     let review = if source.registration["participation_basis"]["kind"] == "sponsored_reviewer" {
-        (&source.registration["participation_basis"]["review_scope"], source)
+        (
+            &source.registration["participation_basis"]["review_scope"],
+            source,
+        )
     } else if target.registration["participation_basis"]["kind"] == "sponsored_reviewer" {
-        (&target.registration["participation_basis"]["review_scope"], target)
+        (
+            &target.registration["participation_basis"]["review_scope"],
+            target,
+        )
     } else {
         return None;
     };
@@ -3908,7 +3937,8 @@ fn card_list(
             &indexed.card_kind,
             &indexed.identity,
             &indexed.client_id,
-        )? else {
+        )?
+        else {
             stale = stale.saturating_add(1);
             continue;
         };
@@ -4053,7 +4083,8 @@ fn contract_cards_for_term(
             "contract",
             contract_key,
             &indexed.client_id,
-        )? else {
+        )?
+        else {
             stale = stale.saturating_add(1);
             continue;
         };
@@ -4254,14 +4285,7 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
     let scan_limit = keys::MAX_INBOX_SCAN;
     let (cards, index_more, selector) = if let Some((kind, term)) = term {
         let (cards, more) = if principal.role == Role::Participant {
-            indexed_global_cards(
-                db,
-                kind,
-                &term,
-                None,
-                after.as_deref(),
-                scan_limit,
-            )?
+            indexed_global_cards(db, kind, &term, None, after.as_deref(), scan_limit)?
         } else {
             indexed_cards(
                 db,
@@ -4275,12 +4299,8 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
         };
         (cards, more, PeerSelector::Term(kind, term))
     } else if let Some(task_id) = related_task {
-        let (clients, more) = indexed_task_participants(
-            db,
-            &task_id,
-            after.as_deref(),
-            scan_limit,
-        )?;
+        let (clients, more) =
+            indexed_task_participants(db, &task_id, after.as_deref(), scan_limit)?;
         (
             clients
                 .into_iter()
@@ -4332,8 +4352,8 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
             }
             Err(error) => return Err(error),
         };
-        let manager_local_term = principal.role != Role::Participant
-            && matches!(&selector, PeerSelector::Term(_, _));
+        let manager_local_term =
+            principal.role != Role::Participant && matches!(&selector, PeerSelector::Term(_, _));
         if manager_local_term && candidate.scope_id != scope.scope_id {
             continue;
         }
@@ -4360,8 +4380,11 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
         )?;
         let card = match card {
             Some(card) if matches!(&selector, PeerSelector::Term(_, _)) => {
-                let Some((kind, term)) = relation_term(Some(&selector)) else { unreachable!() };
-                let fields = indexable_card_fields(&card["fields"], &indexed.card_kind, &indexed.identity);
+                let Some((kind, term)) = relation_term(Some(&selector)) else {
+                    unreachable!()
+                };
+                let fields =
+                    indexable_card_fields(&card["fields"], &indexed.card_kind, &indexed.identity);
                 if !keys::indexed_terms(&fields, &indexed.card_kind)
                     .get(&kind)
                     .is_some_and(|terms| terms.contains(term))
@@ -5209,9 +5232,17 @@ fn delivery_matches_scope(result: &Value, scope: &ScopeData, recipient: &str) ->
         && envelope["target_context"]["actor"]["participation_basis"]
             == scope.registration["participation_basis"]
         && envelope["target_context"]["binding_id"]
-            == scope.registration.get("binding_id").cloned().unwrap_or(Value::Null)
+            == scope
+                .registration
+                .get("binding_id")
+                .cloned()
+                .unwrap_or(Value::Null)
         && envelope["target_context"]["binding_generation"]
-            == scope.registration.get("binding_generation").cloned().unwrap_or(Value::Null)
+            == scope
+                .registration
+                .get("binding_generation")
+                .cloned()
+                .unwrap_or(Value::Null)
         && envelope["source_context"]["actor"]["client_id"] == result["sender"]
         && envelope["source_context"]["task_id"] == result["task_id"]
         && envelope["source_context"]["task_revision"] == result["task_revision"]
@@ -5239,25 +5270,23 @@ fn retained_relation_matches_delivery(
     let target_context = &envelope["target_context"];
     if envelope["schema"] != "eliot.coordination.message.v2"
         || target_context != &scope_context(target)
-        || target_context.pointer("/actor/client_id").and_then(Value::as_str) != Some(recipient)
-        || source_context.pointer("/actor/client_id").and_then(Value::as_str) != Some(sender)
-        || !retained_relation_contexts_match(
-            &envelope["relation"],
-            source_context,
-            target_context,
-        )
+        || target_context
+            .pointer("/actor/client_id")
+            .and_then(Value::as_str)
+            != Some(recipient)
+        || source_context
+            .pointer("/actor/client_id")
+            .and_then(Value::as_str)
+            != Some(sender)
+        || !retained_relation_contexts_match(&envelope["relation"], source_context, target_context)
     {
         return Ok(false);
     }
     let ask_id = envelope["body"]["ask_id"].as_str();
     match load_current_scope_for_client(db, sender) {
-        Ok(source) if scope_context(&source) == *source_context => relation_snapshot_current(
-            db,
-            &source,
-            target,
-            &envelope["relation"],
-            ask_id,
-        ),
+        Ok(source) if scope_context(&source) == *source_context => {
+            relation_snapshot_current(db, &source, target, &envelope["relation"], ask_id)
+        }
         // The receipt remains pinned to the source context that was validated
         // at send time. A later assignment or grant change cannot redirect it.
         Ok(_) => Ok(true),
@@ -5330,10 +5359,16 @@ fn retained_relation_contexts_match(
             };
             relation["review_assignment_id"].as_str().is_some()
                 && ((relation["reviewer_client_id"]
-                    == source_context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                    == source_context
+                        .pointer("/actor/client_id")
+                        .cloned()
+                        .unwrap_or(Value::Null)
                     && review_context(source_context))
                     || (relation["reviewer_client_id"]
-                        == target_context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                        == target_context
+                            .pointer("/actor/client_id")
+                            .cloned()
+                            .unwrap_or(Value::Null)
                         && review_context(target_context)))
                 && source_context["task_id"] == target_context["task_id"]
                 && source_context["task_revision"] == target_context["task_revision"]
@@ -5341,7 +5376,11 @@ fn retained_relation_contexts_match(
         }
         Some("contract_key") => {
             let card_matches = |card: &Value, context: &Value| {
-                card["client_id"] == context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                card["client_id"]
+                    == context
+                        .pointer("/actor/client_id")
+                        .cloned()
+                        .unwrap_or(Value::Null)
                     && card["task_id"] == context["task_id"]
                     && card["task_revision"] == context["task_revision"]
                     && card["attempt_id"] == context["attempt_id"]
@@ -5363,7 +5402,9 @@ fn retained_relation_contexts_match(
         Some("accepted_scope_overlap") => {
             let scope_ref_valid = |scope: &Value, context: &Value| {
                 scope["scope_intent_id"].as_str().is_some()
-                    && scope["state_revision"].as_i64().is_some_and(|revision| revision > 0)
+                    && scope["state_revision"]
+                        .as_i64()
+                        .is_some_and(|revision| revision > 0)
                     && scope["digest"].as_str().is_some_and(|digest| {
                         digest.len() == 64
                             && digest
@@ -5371,22 +5412,30 @@ fn retained_relation_contexts_match(
                                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                     })
                     && scope["owner_client_id"]
-                        == context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                        == context
+                            .pointer("/actor/client_id")
+                            .cloned()
+                            .unwrap_or(Value::Null)
             };
             relation["term"].as_str().is_some()
-                && matches!(relation["term_kind"].as_str(), Some("path" | "symbol" | "interface"))
+                && matches!(
+                    relation["term_kind"].as_str(),
+                    Some("path" | "symbol" | "interface")
+                )
                 && scope_ref_valid(&relation["source_scope"], source_context)
                 && scope_ref_valid(&relation["target_scope"], target_context)
         }
         Some("active_integration_cell") => {
             let tuple_matches = |context: &Value| {
-                relation["task_revision_set"].as_array().is_some_and(|tuples| {
-                    tuples.iter().any(|tuple| {
-                        tuple["task_id"] == context["task_id"]
-                            && tuple["task_revision"] == context["task_revision"]
-                            && tuple["attempt_id"] == context["attempt_id"]
+                relation["task_revision_set"]
+                    .as_array()
+                    .is_some_and(|tuples| {
+                        tuples.iter().any(|tuple| {
+                            tuple["task_id"] == context["task_id"]
+                                && tuple["task_revision"] == context["task_revision"]
+                                && tuple["attempt_id"] == context["attempt_id"]
+                        })
                     })
-                })
             };
             relation["cell_id"].as_str().is_some()
                 && relation["contract_key"].as_str().is_some()
@@ -5825,8 +5874,12 @@ fn remember_or_resolve_coordination(
 ) -> Result<()> {
     let source_context = &envelope["source_context"];
     let target_context = &envelope["target_context"];
-    let source_id = source_context.pointer("/actor/client_id").and_then(Value::as_str);
-    let target_id = target_context.pointer("/actor/client_id").and_then(Value::as_str);
+    let source_id = source_context
+        .pointer("/actor/client_id")
+        .and_then(Value::as_str);
+    let target_id = target_context
+        .pointer("/actor/client_id")
+        .and_then(Value::as_str);
     let (Some(source_id), Some(target_id)) = (source_id, target_id) else {
         return Err(Error::new(
             "STORE_INVARIANT",
@@ -5841,7 +5894,9 @@ fn remember_or_resolve_coordination(
         let asks = record
             .get_mut("asks")
             .and_then(Value::as_array_mut)
-            .ok_or_else(|| Error::new("STORE_INVARIANT", "pending coordination index is malformed"))?;
+            .ok_or_else(|| {
+                Error::new("STORE_INVARIANT", "pending coordination index is malformed")
+            })?;
         let candidate = json!({
             "ask_id":ask_id,
             "source_context":source_context,
@@ -5868,7 +5923,9 @@ fn remember_or_resolve_coordination(
         let asks = record
             .get_mut("asks")
             .and_then(Value::as_array_mut)
-            .ok_or_else(|| Error::new("STORE_INVARIANT", "pending coordination index is malformed"))?;
+            .ok_or_else(|| {
+                Error::new("STORE_INVARIANT", "pending coordination index is malformed")
+            })?;
         asks.retain(|ask| {
             !(ask["ask_id"] == ask_id
                 && ask["source_context"] == *target_context
@@ -5934,7 +5991,10 @@ fn consult(
             .or_insert(*candidate);
     }
     if field_matches_by_owner.len() == 1
-        && field_matches_by_owner.values().next().is_some_and(|facts| facts.len() == 1)
+        && field_matches_by_owner
+            .values()
+            .next()
+            .is_some_and(|facts| facts.len() == 1)
     {
         let candidate = *field_matches_by_owner
             .values()
@@ -6219,7 +6279,8 @@ fn consult_matching_cards(
             &indexed.card_kind,
             &indexed.identity,
             &indexed.client_id,
-        )? else {
+        )?
+        else {
             stale = stale.saturating_add(1);
             continue;
         };
@@ -6233,7 +6294,8 @@ fn consult_matching_cards(
             stale = stale.saturating_add(1);
             continue;
         }
-        let indexed_fields = indexable_card_fields(&card["fields"], &indexed.card_kind, &indexed.identity);
+        let indexed_fields =
+            indexable_card_fields(&card["fields"], &indexed.card_kind, &indexed.identity);
         let exact_term = keys::indexed_terms(&indexed_fields, &indexed.card_kind)
             .get(&request.target_kind)
             .is_some_and(|terms| terms.contains(&request.target_value));

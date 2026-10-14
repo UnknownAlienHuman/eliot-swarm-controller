@@ -118,10 +118,7 @@ fn sync_integration(
             "contract-card relevance page does not match the authenticated Task/Attempt scope",
         ));
     }
-    let mut members = current_members(
-        &page,
-        &request.contract_key,
-    )?;
+    let mut members = current_members(&page, &request.contract_key)?;
     let caller = members
         .iter()
         .find(|member| member.client_id == principal.client_id)
@@ -166,8 +163,8 @@ fn sync_integration(
         .as_ref()
         .and_then(|pointer| pointer.get("cell_id"))
         .and_then(Value::as_str);
-    let previous_cell_key = previous_id
-        .map(|cell_id| cell_record_key(&cell_scope_id, &request.contract_key, cell_id));
+    let previous_cell_key =
+        previous_id.map(|cell_id| cell_record_key(&cell_scope_id, &request.contract_key, cell_id));
     let previous_cell = previous_cell_key
         .as_deref()
         .map(|key| meta(tx, key))
@@ -216,7 +213,8 @@ fn sync_integration(
         "member_identity_set":member_identity_set,
     }))?;
 
-    let contribution_key = contribution_key(&cell_scope_id, &request.contract_key, &principal.client_id);
+    let contribution_key =
+        contribution_key(&cell_scope_id, &request.contract_key, &principal.client_id);
     let prior = meta(tx, &contribution_key)?;
     let prior_is_current = prior.as_ref().is_some_and(|prior| {
         prior["scope_id"] == cell_scope_id
@@ -286,8 +284,13 @@ fn sync_integration(
     if coverage != "complete" && gaps.is_empty() {
         gaps.push(json!({"kind":"contract_participant_relevance_incomplete"}));
     }
-    let cell_facts =
-        collect_cell_facts(tx, &members, &cell_scope_id, &request.contract_key, operation_id)?;
+    let cell_facts = collect_cell_facts(
+        tx,
+        &members,
+        &cell_scope_id,
+        &request.contract_key,
+        operation_id,
+    )?;
     gaps.extend(cell_facts.gaps.clone());
     let canonical_sources = canonical_sources(&members, &mut gaps);
     if gaps
@@ -475,7 +478,15 @@ fn sync_integration(
         &global_current_index_key,
         &json!({"cell_id":cell_id,"scope_id":cell_scope_id,"contract_key":request.contract_key,"cell_record_key":cell_record_key,"membership_digest":membership_digest}),
     )?;
-    write_current_peer_cell_indexes(tx, &members, &request.contract_key, &cell_scope_id, &cell_id, &cell_record_key, &membership_digest)?;
+    write_current_peer_cell_indexes(
+        tx,
+        &members,
+        &request.contract_key,
+        &cell_scope_id,
+        &cell_id,
+        &cell_record_key,
+        &membership_digest,
+    )?;
     super::coordination::attach_operation_scope(tx, operation_id, task_id, attempt_id, attempt)?;
 
     let next_action = match state {
@@ -508,7 +519,6 @@ fn integration_ack(
     principal.require_participant()?;
     let request = wire::AckRequest::parse(value)?;
     let scope = super::coordination::current_scope(tx, principal)?;
-    let scope_id = text_at(&scope, &["scope_id"], "current scope id")?;
     let task_id = text_at(&scope, &["task", "task_id"], "current Task id")?;
     let task_revision = int_at(&scope, &["task", "revision"], "current Task revision")?;
     let attempt_id = text_at(&scope, &["attempt", "attempt_id"], "current Attempt id")?;
@@ -522,13 +532,7 @@ fn integration_ack(
         ));
     }
     let location = cell_location(tx, &request.cell_id)?;
-    if !cell_location_contains_task(
-        &location,
-        task_id,
-        task_revision,
-        attempt_id,
-    )
-    {
+    if !cell_location_contains_task(&location, task_id, task_revision, attempt_id) {
         return Err(Error::new(
             "NOT_FOUND",
             "integration cell is outside the authenticated exact Task/Attempt scope",
@@ -676,8 +680,7 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
         &request.task_id,
         request.task_revision,
         &request.attempt_id,
-    )
-    {
+    ) {
         return Err(Error::new(
             "NOT_FOUND",
             "integration cell does not match the requested Task/Attempt scope",
@@ -756,13 +759,12 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
         request.after_position_revision,
         request.limit,
     )?;
-    let current_pointer =
-        current_cell_pointer(db, scope_id, contract_key)?.ok_or_else(|| {
-            Error::new(
-                "STORE_INVARIANT",
-                "retained integration cell lacks its authoritative current pointer",
-            )
-        })?;
+    let current_pointer = current_cell_pointer(db, scope_id, contract_key)?.ok_or_else(|| {
+        Error::new(
+            "STORE_INVARIANT",
+            "retained integration cell lacks its authoritative current pointer",
+        )
+    })?;
     let current_cell_id = text_at(&current_pointer, &["cell_id"], "current cell id")?;
     let current_record_key = text_at(
         &current_pointer,
@@ -770,7 +772,8 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
         "current cell record key",
     )?;
     let pointer_scope_id = text_at(&current_pointer, &["scope_id"], "current cell scope id")?;
-    let expected_current_record_key = cell_record_key(pointer_scope_id, contract_key, current_cell_id);
+    let expected_current_record_key =
+        cell_record_key(pointer_scope_id, contract_key, current_cell_id);
     if current_record_key != expected_current_record_key.as_str() {
         return Err(Error::new(
             "STORE_INVARIANT",
@@ -1012,7 +1015,9 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
         let context = &member["context"];
         let (Some(task_id), Some(task_revision), Some(attempt_id)) = (
             context["task_id"].as_str(),
-            context["task_revision"].as_i64().filter(|revision| *revision > 0),
+            context["task_revision"]
+                .as_i64()
+                .filter(|revision| *revision > 0),
             context["attempt_id"].as_str(),
         ) else {
             reasons.insert("affected_owner_task_context_missing".to_owned());
@@ -1038,9 +1043,12 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
             .get(&tuple)
             .and_then(|evidence| evidence["items"].as_array())
         {
-            scopes.extend(owner_scopes.iter().filter(|scope| {
-                scope["owner_client_id"].as_str() == Some(client_id)
-            }).cloned());
+            scopes.extend(
+                owner_scopes
+                    .iter()
+                    .filter(|scope| scope["owner_client_id"].as_str() == Some(client_id))
+                    .cloned(),
+            );
         }
     }
     let mut required_by_owner = BTreeMap::<String, BTreeSet<(String, String)>>::new();
@@ -1088,7 +1096,7 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
         }
     }
     let mut scope_refs = BTreeMap::<String, Value>::new();
-    let mut unrepresented = BTreeSet::new();
+    let mut unrepresented = BTreeSet::<String>::new();
     let mut unknown_dimensions = BTreeSet::new();
     let mut scopes_by_owner = BTreeMap::<String, Vec<&Value>>::new();
     for scope in &scopes {
@@ -1126,6 +1134,7 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
             continue;
         };
         let Some(owner_scopes) = scopes_by_owner.get(client_id) else {
+            unrepresented.insert(client_id.to_owned());
             reasons.insert("affected_owner_scope_missing".to_owned());
             continue;
         };
@@ -1135,10 +1144,15 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
                 && scope["task_id"].as_str()
                     == member.pointer("/context/task_id").and_then(Value::as_str)
                 && scope["task_revision"].as_i64()
-                    == member.pointer("/context/task_revision").and_then(Value::as_i64)
+                    == member
+                        .pointer("/context/task_revision")
+                        .and_then(Value::as_i64)
                 && scope["attempt_id"].as_str()
-                    == member.pointer("/context/attempt_id").and_then(Value::as_str)
+                    == member
+                        .pointer("/context/attempt_id")
+                        .and_then(Value::as_str)
         }) {
+            unrepresented.insert(client_id.to_owned());
             reasons.insert("affected_owner_scope_basis_stale".to_owned());
             continue;
         }
@@ -1153,6 +1167,7 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
                     .any(|scope| scope_covers_term(scope, term))
             })
         {
+            unrepresented.insert(client_id.to_owned());
             reasons.insert("affected_scope_does_not_cover_exact_integration_terms".to_owned());
             continue;
         }
@@ -1420,10 +1435,16 @@ pub(super) fn current_peer_cell_relation(
     target_context: &Value,
     contract: Option<(keys::TermKind, String)>,
 ) -> Result<Option<Value>> {
-    let Some(source_id) = source_context.pointer("/actor/client_id").and_then(Value::as_str) else {
+    let Some(source_id) = source_context
+        .pointer("/actor/client_id")
+        .and_then(Value::as_str)
+    else {
         return Ok(None);
     };
-    let Some(target_id) = target_context.pointer("/actor/client_id").and_then(Value::as_str) else {
+    let Some(target_id) = target_context
+        .pointer("/actor/client_id")
+        .and_then(Value::as_str)
+    else {
         return Ok(None);
     };
     let candidates: Vec<Value> = if let Some((kind, contract_key)) = contract {
@@ -1506,16 +1527,18 @@ pub(super) fn current_peer_cell_relation(
             };
             let scope = match super::coordination::load_current_scope_for_client(db, client_id) {
                 Ok(scope) => scope,
-                Err(error) if matches!(
-                    error.code.as_str(),
-                    "FORBIDDEN"
-                        | "NOT_FOUND"
-                        | "UNAUTHORIZED"
-                        | "STALE_PARTICIPANT"
-                        | "STALE_REVISION"
-                        | "PARTICIPANT_NOT_ASSIGNED"
-                        | "STALE_REVIEW_ASSIGNMENT"
-                ) => {
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "FORBIDDEN"
+                            | "NOT_FOUND"
+                            | "UNAUTHORIZED"
+                            | "STALE_PARTICIPANT"
+                            | "STALE_REVISION"
+                            | "PARTICIPANT_NOT_ASSIGNED"
+                            | "STALE_REVIEW_ASSIGNMENT"
+                    ) =>
+                {
                     all_members_current = false;
                     break;
                 }
@@ -1544,8 +1567,7 @@ pub(super) fn current_peer_cell_relation(
                         card.pointer("/fields/role").and_then(Value::as_str),
                         Some("producer" | "consumer" | "carrier")
                     )
-            })
-            else {
+            }) else {
                 all_members_current = false;
                 break;
             };
@@ -1554,11 +1576,14 @@ pub(super) fn current_peer_cell_relation(
                 all_members_current = false;
                 break;
             };
-            let Some(card_material_digest) = card.get("material_digest").and_then(Value::as_str) else {
+            let Some(card_material_digest) = card.get("material_digest").and_then(Value::as_str)
+            else {
                 all_members_current = false;
                 break;
             };
-            let stored = stored_card_facts.iter().find(|fact| fact["client_id"] == client_id);
+            let stored = stored_card_facts
+                .iter()
+                .find(|fact| fact["client_id"] == client_id);
             if stored.is_none_or(|fact| {
                 fact["role"] != role
                     || fact["card_revision"] != card_revision
@@ -1602,7 +1627,11 @@ pub(super) fn current_peer_cell_relation(
         }
         let exact_member = |context: &Value| {
             members.iter().any(|member| {
-                member["client_id"] == context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                member["client_id"]
+                    == context
+                        .pointer("/actor/client_id")
+                        .cloned()
+                        .unwrap_or(Value::Null)
                     && member["context"] == *context
                     && member.pointer("/participation_basis")
                         == context.pointer("/actor/participation_basis")
@@ -1632,14 +1661,22 @@ fn write_current_peer_cell_indexes(
 ) -> Result<()> {
     for left in 0..members.len() {
         for right in (left + 1)..members.len() {
-            let key = peer_cell_pair_key(&members[left].client_id, &members[right].client_id, contract_key);
-            set_meta(tx, &key, &json!({
-                "cell_id":cell_id,
-                "scope_id":scope_id,
-                "contract_key":contract_key,
-                "cell_record_key":cell_record_key,
-                "membership_digest":membership_digest,
-            }))?;
+            let key = peer_cell_pair_key(
+                &members[left].client_id,
+                &members[right].client_id,
+                contract_key,
+            );
+            set_meta(
+                tx,
+                &key,
+                &json!({
+                    "cell_id":cell_id,
+                    "scope_id":scope_id,
+                    "contract_key":contract_key,
+                    "cell_record_key":cell_record_key,
+                    "membership_digest":membership_digest,
+                }),
+            )?;
         }
     }
     Ok(())
@@ -1728,11 +1765,13 @@ fn task_revision_set_contains(
     task_revision: i64,
     attempt_id: &str,
 ) -> bool {
-    set.as_array().is_some_and(|items| items.iter().any(|item| {
-        item["task_id"] == task_id
-            && item["task_revision"] == task_revision
-            && item["attempt_id"] == attempt_id
-    }))
+    set.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["task_id"] == task_id
+                && item["task_revision"] == task_revision
+                && item["attempt_id"] == attempt_id
+        })
+    })
 }
 
 fn cell_location_contains_task(
@@ -1757,10 +1796,7 @@ fn cell_location_contains_task(
     }
 }
 
-fn current_members(
-    page: &Value,
-    contract_key: &str,
-) -> Result<Vec<Member>> {
+fn current_members(page: &Value, contract_key: &str) -> Result<Vec<Member>> {
     let items = page
         .get("items")
         .and_then(Value::as_array)
@@ -1850,9 +1886,11 @@ fn task_revision_set(members: &[Member]) -> Vec<Value> {
         let task_id = member.context["task_id"].as_str().unwrap_or_default();
         let revision = member.context["task_revision"].as_i64().unwrap_or_default();
         let attempt_id = member.context["attempt_id"].as_str().unwrap_or_default();
-        tuples.entry((task_id.to_owned(), revision, attempt_id.to_owned())).or_insert_with(|| {
-            json!({"task_id":task_id,"task_revision":revision,"attempt_id":attempt_id})
-        });
+        tuples
+            .entry((task_id.to_owned(), revision, attempt_id.to_owned()))
+            .or_insert_with(
+                || json!({"task_id":task_id,"task_revision":revision,"attempt_id":attempt_id}),
+            );
     }
     tuples.into_values().collect()
 }
@@ -2576,9 +2614,7 @@ fn current_cell_freshness(
         {
             return Ok(CellFreshness::Changed);
         }
-        if principal.role == Role::Participant
-            && item.get("participation_basis") != Some(basis)
-        {
+        if principal.role == Role::Participant && item.get("participation_basis") != Some(basis) {
             return Ok(CellFreshness::Changed);
         }
         let Some(card_revision) = card.get("card_revision").and_then(Value::as_i64) else {
@@ -2644,9 +2680,11 @@ fn task_revision_set_from_contexts(contexts: &[Value]) -> Vec<Value> {
         let task_id = context["task_id"].as_str().unwrap_or_default();
         let revision = context["task_revision"].as_i64().unwrap_or_default();
         let attempt_id = context["attempt_id"].as_str().unwrap_or_default();
-        tuples.entry((task_id.to_owned(), revision, attempt_id.to_owned())).or_insert_with(|| {
-            json!({"task_id":task_id,"task_revision":revision,"attempt_id":attempt_id})
-        });
+        tuples
+            .entry((task_id.to_owned(), revision, attempt_id.to_owned()))
+            .or_insert_with(
+                || json!({"task_id":task_id,"task_revision":revision,"attempt_id":attempt_id}),
+            );
     }
     tuples.into_values().collect()
 }
@@ -2665,10 +2703,7 @@ fn unknown_cell_summary(contract_key: &str, cell: &Value, gap_kind: &str) -> Val
     })
 }
 
-fn retained_sync_operation_matches(
-    db: &Connection,
-    cell: &Value,
-) -> Result<bool> {
+fn retained_sync_operation_matches(db: &Connection, cell: &Value) -> Result<bool> {
     let Some(operation_id) = cell.get("operation_id").and_then(Value::as_str) else {
         return Ok(false);
     };
