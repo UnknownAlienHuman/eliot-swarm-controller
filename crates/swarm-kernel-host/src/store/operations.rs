@@ -2631,6 +2631,17 @@ pub(super) fn open(
 /// The admitted launcher may be a direct authenticated Manager or a verified
 /// WorkDispatch actor. Both routes use the same held-lease and reserved-open
 /// checks; only their typed identity/Task authorization differs.
+/// This one-transaction projection was captured before the parent launch's
+/// Attempt ID is written and is bound to that launch, lease, and configured
+/// route so the open path cannot substitute another admission.
+pub(super) struct LaunchOpenAdmission {
+    pub(super) parent_operation_id: String,
+    pub(super) lease_id: String,
+    pub(super) lease_generation: i64,
+    pub(super) configured_route_sha256: String,
+    pub(super) projection: super::provider_conditions::RouteAdmissionProjection,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn open_for_launch_for_actor(
     tx: &Transaction<'_>,
@@ -2641,6 +2652,7 @@ pub(super) fn open_for_launch_for_actor(
     now: i64,
     lease_id: &str,
     lease_generation: i64,
+    launch_admission: &LaunchOpenAdmission,
 ) -> Result<Value> {
     let (caller_id, effective_manager_id) = match actor {
         super::launcher::LaunchActor::Direct(p) => {
@@ -2759,7 +2771,27 @@ pub(super) fn open_for_launch_for_actor(
         ));
     }
     let route_alias = model::text(v, "route")?;
-    let mut route = config.route(route_alias)?.clone();
+    let configured_route = config.route(route_alias)?.clone();
+    let configured_route_json = serde_json::to_value(&configured_route)?;
+    let configured_route_sha256 = format!(
+        "sha256:{}",
+        model::digest(model::canonical(&configured_route_json)?.as_bytes())
+    );
+    if launch_admission.parent_operation_id != parent_operation_id
+        || launch_admission.lease_id != lease_id
+        || launch_admission.lease_generation != lease_generation
+        || launch_admission.configured_route_sha256 != configured_route_sha256
+        || !matches!(
+            &launch_admission.projection.decision,
+            super::provider_conditions::RouteAdmissionDecision::Admit
+        )
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "prechecked route admission is not bound to this launch, lease, and configured route",
+        ));
+    }
+    let mut route = configured_route;
     let selected_descriptor = super::module_handshake::descriptor_for_new_binding(
         tx,
         effective_manager_id,
@@ -2809,6 +2841,7 @@ pub(super) fn open_for_launch_for_actor(
         &route,
         id,
         now,
+        Some(&launch_admission.projection),
     )
 }
 
@@ -2910,7 +2943,7 @@ fn reserve_open(
     model::fields(v, &["client_request_id", "lane_id", "route"])?;
     let lane = model::text(v, "lane_id")?;
     let route = config.route(model::text(v, "route")?)?;
-    reserve_open_route(tx, owner_manager_id, lane, &route, id, now)
+    reserve_open_route(tx, owner_manager_id, lane, &route, id, now, None)
 }
 
 fn reserve_open_route(
@@ -2920,6 +2953,7 @@ fn reserve_open_route(
     route: &crate::config::Route,
     id: &str,
     now: i64,
+    prevalidated_admission: Option<&super::provider_conditions::RouteAdmissionProjection>,
 ) -> Result<Value> {
     if meta(tx, "execution_mode")?.unwrap_or(Value::Null)["new_work"] != "enabled" {
         return Err(Error::new("ADMISSION_DISABLED", "new work is disabled"));
@@ -2934,7 +2968,13 @@ fn reserve_open_route(
     if let Some(existing) = existing {
         return Err(Error::new("LANE_ALREADY_OWNED", existing));
     }
-    let admission = super::launcher::route_admission(tx, route, None, Some(id))?;
+    let admission = match prevalidated_admission {
+        // Launch-open carries the fresh configured-route projection captured
+        // before its parent Operation's Attempt identity changes. Re-reading
+        // the roster here would see that in-flight transition as unknown.
+        Some(admission) => admission.clone(),
+        None => super::launcher::route_admission(tx, route, None, Some(id))?,
+    };
     super::launcher::require_route_admission(&admission)?;
     let binding = model::new_id();
     let instance = model::new_id();

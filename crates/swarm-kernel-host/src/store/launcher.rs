@@ -4249,7 +4249,8 @@ pub(super) fn launch_workspace_plan(
     operation_id: &str,
     config: &Config,
 ) -> Result<crate::workspace::WorkspaceLeasePlan> {
-    launch_workspace_plan_inner(db, actor, operation_id, config)
+    let (plan, _) = launch_workspace_plan_inner(db, actor, operation_id, config)?;
+    Ok(plan)
 }
 
 fn launch_workspace_plan_inner(
@@ -4257,9 +4258,13 @@ fn launch_workspace_plan_inner(
     actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
-) -> Result<crate::workspace::WorkspaceLeasePlan> {
+) -> Result<(
+    crate::workspace::WorkspaceLeasePlan,
+    provider_conditions::RouteAdmissionProjection,
+)> {
     actor.require_current(db)?;
-    require_route_admission(&current_launch_admission(db, operation_id, config)?)?;
+    let admission = current_launch_admission(db, operation_id, config)?;
+    require_route_admission(&admission)?;
     let operation = super::operations::get_operation(db, operation_id)?;
     let pending = operation["state"] == "queued"
         && operation["result"]["launch_state"] == "pending_workspace";
@@ -4394,7 +4399,7 @@ fn launch_workspace_plan_inner(
         expected_baseline_commit,
     };
     plan.validate()?;
-    Ok(plan)
+    Ok((plan, admission))
 }
 
 fn launch_child_request_id(operation_id: &str, phase: &str) -> String {
@@ -4798,7 +4803,7 @@ pub(super) fn launch_after_workspace_held(
             return fail_launch(tx, operation_id, "route_admission_unavailable", now);
         }
     }
-    let plan = launch_workspace_plan_inner(tx, actor, operation_id, config)?;
+    let (plan, open_admission) = launch_workspace_plan_inner(tx, actor, operation_id, config)?;
     if lease.state != "held"
         || lease.operation_id != operation_id
         || lease.plan_digest != plan.plan_digest
@@ -4835,6 +4840,23 @@ pub(super) fn launch_after_workspace_held(
             "Task, Attempt, or launch facts changed after workspace preparation",
         ));
     }
+    let configured_route = config.route(&launch_request.preview.route)?;
+    let configured_route_json = serde_json::to_value(configured_route)?;
+    let configured_route_sha256 = format!(
+        "sha256:{}",
+        model::digest(model::canonical(&configured_route_json)?.as_bytes())
+    );
+    // Carry this fresh admission through the launch's Attempt transition. The
+    // nested agent.open reservation runs later in the same Immediate tx, after
+    // the parent Operation's attempt_id is bound; rescanning then would treat
+    // that transaction-local parent as an unknown second root.
+    let launch_open_admission = super::operations::LaunchOpenAdmission {
+        parent_operation_id: operation_id.to_owned(),
+        lease_id: lease.lease_id.clone(),
+        lease_generation: lease.generation,
+        configured_route_sha256,
+        projection: open_admission,
+    };
 
     let task_id = model::text(&preview["task"], "task_id")?.to_owned();
     let task_revision = model::positive(&preview["task"], "revision")?;
@@ -4962,6 +4984,7 @@ pub(super) fn launch_after_workspace_held(
             now,
             &lease.lease_id,
             lease.generation,
+            &launch_open_admission,
         )?;
         retain_launch_open(
             tx,
