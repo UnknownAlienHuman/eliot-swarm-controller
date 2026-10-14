@@ -1365,7 +1365,7 @@ fn public_position(position: &Value) -> Value {
         "task_revision":position["task_revision"],
         "attempt_id":position["attempt_id"],
         "actor_client_id":position["actor_client_id"],
-        "actor_context":position["actor_context"],
+        "actor_context":public_endpoint_context(&position["actor_context"]),
         "participation_basis_kind":position.pointer("/participation_basis/kind").cloned().unwrap_or(Value::Null),
         "decision":position["decision"],
         "autonomy_digest":position["autonomy_digest"],
@@ -2296,8 +2296,21 @@ fn canonical_sources(members: &[Member], gaps: &mut Vec<Value>) -> Value {
     json!(sources.into_iter().collect::<Vec<_>>())
 }
 
+fn public_endpoint_context(context: &Value) -> Value {
+    let mut public = context.clone();
+    if let Some(actor) = public.get_mut("actor").and_then(Value::as_object_mut)
+        && let Some(basis) = actor.remove("participation_basis")
+    {
+        actor.insert("participation_basis_kind".into(), basis["kind"].clone());
+    }
+    public
+}
+
 fn public_cell(cell: &Value) -> Value {
     let mut public = cell.clone();
+    if let Some(context) = public.get_mut("updated_by_context") {
+        *context = public_endpoint_context(context);
+    }
     if let Some(facts) = public.get_mut("facts").and_then(Value::as_object_mut) {
         if let Some(bases) = facts
             .get_mut("member_basis_set")
@@ -2315,6 +2328,11 @@ fn public_cell(cell: &Value) -> Value {
         for field in ["offers", "requirements", "carrier_constraints"] {
             if let Some(items) = facts.get_mut(field).and_then(Value::as_array_mut) {
                 for item in items {
+                    for context_name in ["context", "member_context"] {
+                        if let Some(context) = item.get_mut(context_name) {
+                            *context = public_endpoint_context(context);
+                        }
+                    }
                     let client_id = item.get("client_id").cloned().unwrap_or(Value::Null);
                     let kind = item
                         .pointer("/participation_basis/kind")
