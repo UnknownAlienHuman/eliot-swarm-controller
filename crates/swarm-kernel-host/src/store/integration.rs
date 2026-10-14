@@ -421,6 +421,10 @@ fn sync_integration(
         retain_cell_version(tx, &cell_scope_id, &request.contract_key, &old_cell)?;
     }
     let cell_record_key = cell_record_key(&cell_scope_id, &request.contract_key, &cell_id);
+    let previous_revision = previous_cell
+        .as_ref()
+        .and_then(|cell| cell["state_revision"].as_i64())
+        .unwrap_or(0);
     let prior_cell = if membership_changed {
         None
     } else {
@@ -430,7 +434,11 @@ fn sync_integration(
         .as_ref()
         .and_then(|cell| cell.get("state_revision"))
         .and_then(Value::as_i64)
-        .unwrap_or(0);
+        .unwrap_or(if membership_changed {
+            previous_revision
+        } else {
+            0
+        });
     let prior_digest = prior_cell
         .as_ref()
         .and_then(|cell| cell.get("material_digest"))
